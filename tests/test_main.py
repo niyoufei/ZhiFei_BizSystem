@@ -129,9 +129,17 @@ class TestIndexEndpoint:
         response = client.get("/")
         assert response.status_code == 200
         page = response.text
-        assert '<button type="button" id="btnUploadShigong">上传施组</button>' in page
         assert (
-            '<button type="button" id="btnScoreShigong" class="secondary">评分施组</button>' in page
+            '<button type="button" id="btnUploadMaterials" onclick="return window.__zhifeiFallbackClick(event, \'btnUploadMaterials\')">上传资料</button>'
+            in page
+        )
+        assert (
+            '<button type="button" id="btnUploadShigong" onclick="return window.__zhifeiFallbackClick(event, \'btnUploadShigong\')">上传施组</button>'
+            in page
+        )
+        assert (
+            '<button type="button" id="btnScoreShigong" class="secondary" onclick="return window.__zhifeiFallbackClick(event, \'btnScoreShigong\')">评分施组</button>'
+            in page
         )
         assert "safeClick('btnUploadMaterials', uploadMaterialsAction);" in page
         assert "safeClick('btnUploadShigong', uploadShigongAction);" in page
