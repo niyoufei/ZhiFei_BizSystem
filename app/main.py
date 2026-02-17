@@ -6387,31 +6387,155 @@ def index(
             if (key) headers['X-API-Key'] = key;
             return headers;
           }
-          function fallbackRefreshAfter(actionId) {
+          async function fallbackRefreshMaterialsTable(projectId) {
+            const pid = String(projectId || '').trim();
+            if (!pid) return;
+            const table = document.getElementById('materialsTable');
+            const tbody = table ? table.querySelector('tbody') : null;
+            const emptyEl = document.getElementById('materialsEmpty');
+            if (tbody) tbody.innerHTML = '';
+            let res;
+            let text = '';
+            let rows = [];
+            try {
+              res = await fetch('/api/v1/projects/' + encodeURIComponent(pid) + '/materials?t=' + Date.now(), {
+                method: 'GET',
+                headers: fallbackAuthHeaders(),
+                cache: 'no-store',
+              });
+              text = await res.text();
+              rows = fallbackParseJson(text);
+            } catch (_) {
+              if (emptyEl) {
+                emptyEl.textContent = '资料列表加载失败，请稍后重试。';
+                emptyEl.style.display = 'block';
+              }
+              return;
+            }
+            if (!res.ok || !Array.isArray(rows)) {
+              if (emptyEl) {
+                emptyEl.textContent = '资料列表加载失败（HTTP ' + String((res && res.status) || 0) + '）';
+                emptyEl.style.display = 'block';
+              }
+              return;
+            }
+            if (!rows.length) {
+              if (emptyEl) {
+                emptyEl.textContent = '暂无资料，请下方添加。';
+                emptyEl.style.display = 'block';
+              }
+              return;
+            }
+            if (emptyEl) emptyEl.style.display = 'none';
+            rows.forEach((m) => {
+              const tr = document.createElement('tr');
+              const mid = fallbackEscapeHtml(String((m && m.id) || ''));
+              const fn = fallbackEscapeHtml(String((m && m.filename) || ''));
+              const createdAt = fallbackEscapeHtml(String((m && m.created_at) || '').slice(0, 19));
+              tr.innerHTML =
+                '<td>' + fn + '</td>'
+                + '<td>' + createdAt + '</td>'
+                + '<td><button type="button" class="btn-danger js-delete-material" data-material-id="' + mid + '" data-filename="' + fn + '" onclick="return window.__zhifeiFallbackDelete(event, \'material\', this.getAttribute(\'data-material-id\'), this.getAttribute(\'data-filename\'))">删除</button></td>';
+              if (tbody) tbody.appendChild(tr);
+            });
+          }
+          async function fallbackRefreshSubmissionsTable(projectId) {
+            const pid = String(projectId || '').trim();
+            if (!pid) return;
+            const table = document.getElementById('submissionsTable');
+            const tbody = table ? table.querySelector('tbody') : null;
+            const emptyEl = document.getElementById('submissionsEmpty');
+            if (tbody) tbody.innerHTML = '';
+            let res;
+            let text = '';
+            let rows = [];
+            try {
+              res = await fetch('/api/v1/projects/' + encodeURIComponent(pid) + '/submissions?t=' + Date.now(), {
+                method: 'GET',
+                headers: fallbackAuthHeaders(),
+                cache: 'no-store',
+              });
+              text = await res.text();
+              rows = fallbackParseJson(text);
+            } catch (_) {
+              if (emptyEl) {
+                emptyEl.textContent = '施组列表加载失败，请稍后重试。';
+                emptyEl.style.display = 'block';
+              }
+              return;
+            }
+            if (!res.ok || !Array.isArray(rows)) {
+              if (emptyEl) {
+                emptyEl.textContent = '施组列表加载失败（HTTP ' + String((res && res.status) || 0) + '）';
+                emptyEl.style.display = 'block';
+              }
+              return;
+            }
+            if (!rows.length) {
+              if (emptyEl) {
+                emptyEl.textContent = '暂无施组，请下方添加。';
+                emptyEl.style.display = 'block';
+              }
+              return;
+            }
+            if (emptyEl) emptyEl.style.display = 'none';
+            rows.forEach((s) => {
+              const tr = document.createElement('tr');
+              const sid = fallbackEscapeHtml(String((s && s.id) || ''));
+              const fn = fallbackEscapeHtml(String((s && s.filename) || ''));
+              const createdAt = fallbackEscapeHtml(String((s && s.created_at) || '').slice(0, 19));
+              const report = (s && s.report) || {};
+              const pred = report && report.pred_total_score != null ? report.pred_total_score : null;
+              const rule = report && report.rule_total_score != null ? report.rule_total_score : null;
+              let scoreHtml = '-';
+              if (pred != null) {
+                scoreHtml = fallbackEscapeHtml(String(pred));
+                if (rule != null) {
+                  scoreHtml += '<div class="note">规则: ' + fallbackEscapeHtml(String(rule)) + '</div>';
+                }
+              } else if (s && s.total_score != null) {
+                scoreHtml = fallbackEscapeHtml(String(s.total_score));
+              }
+              tr.innerHTML =
+                '<td>' + fn + '</td>'
+                + '<td>' + scoreHtml + '</td>'
+                + '<td>' + createdAt + '</td>'
+                + '<td><button type="button" class="btn-danger js-delete-submission" data-submission-id="' + sid + '" data-filename="' + fn + '" onclick="return window.__zhifeiFallbackDelete(event, \'submission\', this.getAttribute(\'data-submission-id\'), this.getAttribute(\'data-filename\'))">删除</button></td>';
+              if (tbody) tbody.appendChild(tr);
+            });
+          }
+          async function fallbackRefreshAfter(actionId) {
+            const projectId = fallbackGetProjectId();
             if (actionId === 'btnUploadMaterials') {
-              if (typeof refreshMaterials === 'function') refreshMaterials();
-              if (typeof refreshFeedMaterials === 'function') refreshFeedMaterials();
+              if (typeof refreshMaterials === 'function') await Promise.resolve(refreshMaterials(projectId));
+              else await fallbackRefreshMaterialsTable(projectId);
+              if (typeof refreshFeedMaterials === 'function') await Promise.resolve(refreshFeedMaterials(projectId));
+              else await fallbackRefreshMaterialsTable(projectId);
               return;
             }
             if (actionId === 'btnUploadShigong' || actionId === 'btnScoreShigong') {
-              if (typeof refreshSubmissions === 'function') refreshSubmissions();
+              if (typeof refreshSubmissions === 'function') await Promise.resolve(refreshSubmissions(projectId));
+              else await fallbackRefreshSubmissionsTable(projectId);
               return;
             }
             if (actionId === 'btnUploadFeed') {
-              if (typeof refreshMaterials === 'function') refreshMaterials();
-              if (typeof refreshFeedMaterials === 'function') refreshFeedMaterials();
+              if (typeof refreshMaterials === 'function') await Promise.resolve(refreshMaterials(projectId));
+              else await fallbackRefreshMaterialsTable(projectId);
+              if (typeof refreshFeedMaterials === 'function') await Promise.resolve(refreshFeedMaterials(projectId));
+              else await fallbackRefreshMaterialsTable(projectId);
               return;
             }
             if (actionId === 'btnRefreshFeedMaterials') {
-              if (typeof refreshFeedMaterials === 'function') refreshFeedMaterials();
+              if (typeof refreshFeedMaterials === 'function') await Promise.resolve(refreshFeedMaterials(projectId));
+              else await fallbackRefreshMaterialsTable(projectId);
               return;
             }
             if (actionId === 'btnAddGroundTruth' || actionId === 'btnRefreshGroundTruth') {
-              if (typeof refreshGroundTruth === 'function') refreshGroundTruth();
+              if (typeof refreshGroundTruth === 'function') await Promise.resolve(refreshGroundTruth(projectId));
               return;
             }
             if (actionId === 'btnEvolve') {
-              if (typeof refreshGroundTruth === 'function') refreshGroundTruth();
+              if (typeof refreshGroundTruth === 'function') await Promise.resolve(refreshGroundTruth(projectId));
             }
           }
           function fallbackRenderPayloadForAction(actionId, projectId) {
@@ -6513,6 +6637,55 @@ def index(
               const saved = await fallbackRunAction('btnWeightsSave');
               if (!saved) return false;
             }
+            if (actionId === 'btnUploadMaterials' || actionId === 'btnUploadShigong') {
+              const formId = actionId === 'btnUploadMaterials' ? 'uploadMaterial' : 'uploadShigong';
+              const typeLabel = actionId === 'btnUploadMaterials' ? '资料' : '施组';
+              const form = document.getElementById(formId);
+              const fileInput = form && form.querySelector ? form.querySelector('input[name="file"]') : null;
+              const files = Array.from((fileInput && fileInput.files) || []);
+              if (!files.length) {
+                fallbackSetResult(cfg.resultId, '请先选择至少 1 个' + typeLabel + '文件。', true);
+                fallbackSetOutput('[' + actionId + '] 未选择文件');
+                return false;
+              }
+              let okCount = 0;
+              let failCount = 0;
+              const details = [];
+              const headers = fallbackAuthHeaders();
+              for (const f of files) {
+                const fd = new FormData();
+                fd.append('file', f);
+                try {
+                  const res = await fetch(cfg.path(projectId), {
+                    method: cfg.method || 'POST',
+                    headers,
+                    body: fd,
+                  });
+                  const text = await res.text();
+                  if (res.ok) {
+                    okCount += 1;
+                    details.push('[成功] ' + String((f && f.name) || ''));
+                  } else {
+                    failCount += 1;
+                    let detail = text || '';
+                    try {
+                      const j = JSON.parse(text || '{}');
+                      detail = (j && j.detail) || detail;
+                    } catch (_) {}
+                    details.push('[失败] ' + String((f && f.name) || '') + ' -> HTTP ' + String(res.status || 0) + ' ' + String(detail).slice(0, 120));
+                  }
+                } catch (err) {
+                  failCount += 1;
+                  details.push('[失败] ' + String((f && f.name) || '') + ' -> ' + String((err && err.message) || err || '网络异常'));
+                }
+              }
+              const summary = typeLabel + '上传完成：成功 ' + okCount + '，失败 ' + failCount;
+              fallbackSetResult(cfg.resultId, summary, failCount > 0);
+              fallbackSetOutput('[' + actionId + '] ' + summary + '\\n' + details.join('\\n'));
+              if (okCount > 0) await fallbackRefreshAfter(actionId);
+              if (fileInput && failCount === 0) fileInput.value = '';
+              return failCount === 0;
+            }
             const req = fallbackRenderPayloadForAction(actionId, projectId);
             let res;
             let text = '';
@@ -6539,7 +6712,7 @@ def index(
             if (res.ok) {
               const rendered = fallbackRenderActionSuccess(actionId, cfg.resultId, res.status, text);
               if (!rendered) fallbackSetResult(cfg.resultId, '[' + actionId + '] 请求成功 (HTTP ' + String(res.status) + ')', false);
-              fallbackRefreshAfter(actionId);
+              await fallbackRefreshAfter(actionId);
               if (actionId === 'btnWeightsSave') {
                 try {
                   const parsed = JSON.parse(text || '{}');
