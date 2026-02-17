@@ -124,17 +124,29 @@ class TestIndexEndpoint:
         ):
             assert f"safeClick('{button_id}'" in page
 
-    def test_index_upload_buttons_use_form_submit_with_fallback(self, client):
-        """Upload buttons should stay submit-capable for non-JS fallback while JS may hijack onsubmit."""
+    def test_index_upload_buttons_use_inline_fallback_click_and_form_submit_compat(self, client):
+        """Upload/score buttons should keep submit fallback while inline fallback click avoids full-page jumps."""
         response = client.get("/")
         assert response.status_code == 200
         page = response.text
-        assert '<button type="submit" id="btnUploadMaterials">上传资料</button>' in page
-        assert 'id="btnUploadShigong" name="submit_action" value="upload"' in page
         assert (
-            'id="btnScoreShigong" class="secondary" formaction="/web/score_shigong" name="submit_action" value="score"'
+            '<button type="submit" id="btnUploadMaterials" onclick="if (window.__zhifeiFallbackClick) '
+            "{ return window.__zhifeiFallbackClick(event, 'btnUploadMaterials'); } return true;\">上传资料</button>"
             in page
         )
+        assert (
+            'id="btnUploadShigong" name="submit_action" value="upload" onclick="if (window.__zhifeiFallbackClick) '
+            "{ return window.__zhifeiFallbackClick(event, 'btnUploadShigong'); } return true;\""
+            in page
+        )
+        assert (
+            'id="btnScoreShigong" class="secondary" formaction="/web/score_shigong" name="submit_action" value="score" onclick="if (window.__zhifeiFallbackClick) '
+            "{ return window.__zhifeiFallbackClick(event, 'btnScoreShigong'); } return true;\""
+            in page
+        )
+        assert "btnUploadMaterials: { resultId: 'materialsActionStatus'" in page
+        assert "btnUploadShigong: { resultId: 'shigongActionStatus'" in page
+        assert "btnScoreShigong: { resultId: 'shigongActionStatus'" in page
         assert "safeClick('btnUploadMaterials', uploadMaterialsAction);" not in page
         assert "safeClick('btnUploadShigong', uploadShigongAction);" not in page
         assert "safeClick('btnScoreShigong', scoreShigongAction);" not in page

@@ -6001,7 +6001,7 @@ def index(
             <strong>添加资料：</strong>
             <input type="hidden" name="project_id" id="uploadMaterialProjectId" value="__SELECTED_PROJECT_ID__" />
             <input type="file" name="file" accept=".txt,.pdf,.doc,.docx,.json,.xlsx,.xls" multiple />
-            <button type="submit" id="btnUploadMaterials">上传资料</button>
+            <button type="submit" id="btnUploadMaterials" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadMaterials'); } return true;">上传资料</button>
             <span class="note">支持一次选择多个文件（Mac 按 Command，Windows 按 Ctrl）。</span>
           </form>
           <p id="materialsActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
@@ -6037,8 +6037,8 @@ def index(
             <strong>添加施组：</strong>
             <input type="hidden" name="project_id" id="uploadShigongProjectId" value="__SELECTED_PROJECT_ID__" />
             <input type="file" name="file" accept=".txt,.docx,.pdf,.json,.xlsx,.xls" multiple />
-            <button type="submit" id="btnUploadShigong" name="submit_action" value="upload">上传施组</button>
-            <button type="submit" id="btnScoreShigong" class="secondary" formaction="/web/score_shigong" name="submit_action" value="score">评分施组</button>
+            <button type="submit" id="btnUploadShigong" name="submit_action" value="upload" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadShigong'); } return true;">上传施组</button>
+            <button type="submit" id="btnScoreShigong" class="secondary" formaction="/web/score_shigong" name="submit_action" value="score" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnScoreShigong'); } return true;">评分施组</button>
             <span class="note">支持一次选择多个文件（Mac 按 Command，Windows 按 Ctrl）。</span>
           </form>
           <p id="shigongActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
@@ -6180,9 +6180,9 @@ def index(
           const FALLBACK_ACTIONS = {
             btnWeightsSave: { resultId: 'output', method: 'PUT', path: (pid) => '/api/v1/projects/' + pid + '/expert-profile', loading: '专家配置保存中...' },
             btnWeightsApply: { resultId: 'output', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/rescore', loading: '按当前关注度重算中...' },
-            btnUploadMaterials: { resultId: 'output', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/materials', loading: '资料上传中...' },
-            btnUploadShigong: { resultId: 'output', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/shigong', loading: '施组上传中...' },
-            btnScoreShigong: { resultId: 'output', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/rescore', loading: '施组评分中...' },
+            btnUploadMaterials: { resultId: 'materialsActionStatus', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/materials', loading: '资料上传中...' },
+            btnUploadShigong: { resultId: 'shigongActionStatus', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/shigong', loading: '施组上传中...' },
+            btnScoreShigong: { resultId: 'shigongActionStatus', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/rescore', loading: '施组评分中...' },
             btnCompare: { resultId: 'compareResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare', loading: '对比排名加载中...' },
             btnCompareReport: { resultId: 'compareReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare_report', loading: '对比报告生成中...' },
             btnInsights: { resultId: 'insightsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/insights', loading: '洞察分析中...' },
@@ -6361,6 +6361,13 @@ def index(
             }
             if (aid === 'btnAdaptive' || aid === 'btnAdaptivePatch' || aid === 'btnAdaptiveValidate' || aid === 'btnAdaptiveApply') {
               fallbackSetResultHtml(resultId, '<strong>自适应结果</strong><pre>' + fallbackEscapeHtml(text || '{}') + '</pre>');
+              return true;
+            }
+            if (aid === 'btnScoreShigong') {
+              const updated = Number(
+                (data && (data.updated_submissions ?? data.reports_generated ?? data.submission_count)) || 0
+              );
+              fallbackSetResult(resultId, '评分完成：已重算 ' + updated + ' 份。', false);
               return true;
             }
             if (aid === 'btnUploadMaterials' || aid === 'btnUploadShigong' || aid === 'btnScoreShigong' || aid === 'btnLearning' || aid === 'btnEvolve' || aid === 'btnRefreshGroundTruth' || aid === 'btnUploadFeed' || aid === 'btnAddGroundTruth' || aid === 'btnRefreshFeedMaterials' || aid === 'btnWritingGuidance' || aid === 'btnCompilationInstructions') {
