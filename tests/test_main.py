@@ -1,0 +1,2174 @@
+"""Tests for app/main.py FastAPI endpoints."""
+
+from __future__ import annotations
+
+import re
+from io import BytesIO
+from unittest.mock import MagicMock, patch
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.main import app, create_app
+
+
+@pytest.fixture
+def client():
+    """Create a test client."""
+    return TestClient(app)
+
+
+class TestCreateApp:
+    """Tests for create_app factory function."""
+
+    def test_create_app_returns_fastapi(self):
+        """create_app should return the FastAPI app instance."""
+        result = create_app()
+        assert result is app
+
+
+class TestIndexEndpoint:
+    """Tests for GET / index endpoint."""
+
+    def test_index_returns_html(self, client):
+        """Index endpoint should return HTML page."""
+        response = client.get("/")
+        assert response.status_code == 200
+        assert "<html>" in response.text
+        assert "青天评标系统" in response.text
+
+    def test_index_contains_forms(self, client):
+        """Index page should contain all forms."""
+        response = client.get("/")
+        assert "createProject" in response.text
+        assert "uploadMaterial" in response.text
+        assert "uploadShigong" in response.text
+
+    def test_index_replaces_server_side_placeholders(self, client):
+        """Index page should not leak template placeholders."""
+        response = client.get("/")
+        assert "__PROJECT_OPTIONS__" not in response.text
+        assert "__CREATE_NOTICE_HTML__" not in response.text
+        assert "__EXPERT_PROFILE_STATUS__" not in response.text
+        assert "__EXPERT_WEIGHTS_ROWS__" not in response.text
+        assert "__EXPERT_WEIGHTS_SUMMARY__" not in response.text
+        assert "__GLOBAL_NOTICE_HTML__" not in response.text
+        assert "__SELECTED_PROJECT_ID__" not in response.text
+
+    def test_index_renders_16_dimension_weight_sliders(self, client):
+        """Index page should render 16-dimension focus sliders on first paint."""
+        response = client.get("/")
+        assert response.status_code == 200
+        for i in range(1, 17):
+            dim_id = f"{i:02d}"
+            assert f'id="w_{dim_id}"' in response.text
+
+    def test_index_contains_web_fallback_forms(self, client):
+        """Index page should keep non-JS fallback routes for upload/delete actions."""
+        response = client.get("/")
+        assert response.status_code == 200
+        assert 'id="deleteProjectForm"' in response.text
+        assert 'action="/web/delete_project"' in response.text
+        assert 'action="/web/upload_materials"' in response.text
+        assert 'action="/web/upload_shigong"' in response.text
+
+    def test_index_head_returns_200(self, client):
+        """HEAD / should be available to avoid browser connectivity false alarms."""
+        response = client.head("/")
+        assert response.status_code == 200
+
+    def test_index_frontend_does_not_double_read_fetch_response_body(self, client):
+        """UI handlers should not call res.text() after res.json() on the same response."""
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert "showJson('output', res.ok ? data : await res.text())" not in page
+        assert "showJson('output', res.ok ? data : (data.detail || await res.text()))" not in page
+        assert "function formatApiOutput" in page
+
+    def test_index_frontend_has_non_blocking_handlers_for_compare_and_adaptive(self, client):
+        """Section 5/6 buttons should stay clickable and show explicit project-selection feedback."""
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert "const NON_BLOCKING_ACTION_BUTTON_IDS" in page
+        assert "function ensureProjectForAction" in page
+        assert "setResultLoading('compareResult'" in page
+        assert "setResultLoading('adaptiveResult'" in page
+
+    def test_index_frontend_has_no_broken_multiline_regex_literal(self, client):
+        """Rendered JS should not contain regex literals split by line breaks (would break entire script)."""
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert re.search(r"replace\(/\s*\n\s*/g", page) is None
+        assert "replace(/\\n/g" in page
+
+    def test_index_frontend_binds_core_buttons_for_sections_5_6_7(self, client):
+        """Core buttons in sections 5/6/7 should have safeClick bindings in generated page."""
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        for button_id in (
+            "btnCompare",
+            "btnCompareReport",
+            "btnInsights",
+            "btnLearning",
+            "btnAdaptive",
+            "btnAdaptivePatch",
+            "btnAdaptiveValidate",
+            "btnAdaptiveApply",
+            "btnEvolve",
+            "btnWritingGuidance",
+            "btnCompilationInstructions",
+        ):
+            assert f"safeClick('{button_id}'" in page
+
+    def test_index_shigong_upload_uses_button_handlers_without_form_navigation(self, client):
+        """Shigong upload/score should use button handlers to avoid full-page form navigation."""
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert '<button type="button" id="btnUploadShigong">上传施组</button>' in page
+        assert (
+            '<button type="button" id="btnScoreShigong" class="secondary">评分施组</button>' in page
+        )
+        assert "safeClick('btnUploadMaterials', uploadMaterialsAction);" in page
+        assert "safeClick('btnUploadShigong', uploadShigongAction);" in page
+        assert "safeClick('btnScoreShigong', scoreShigongAction);" in page
+        assert "function captureViewportY()" not in page
+        assert "function restoreViewportY(y)" not in page
+        assert "let uploadShigongInFlight = false;" in page
+        assert "let scoreShigongInFlight = false;" in page
+        assert "/submissions?t=' + Date.now()" in page
+
+
+class TestWebCreateProjectFallback:
+    """Tests for non-JS project creation fallback endpoint."""
+
+    def test_web_create_project_empty_name_redirects_error(self, client):
+        response = client.post("/web/create_project", data={"name": "   "}, follow_redirects=False)
+        assert response.status_code == 303
+        assert "create_error=" in response.headers.get("location", "")
+
+    @patch("app.main.create_project")
+    def test_web_create_project_success_redirects_ok(self, mock_create_project, client):
+        response = client.post(
+            "/web/create_project", data={"name": "测试项目"}, follow_redirects=False
+        )
+        assert response.status_code == 303
+        assert "create_ok=" in response.headers.get("location", "")
+        assert mock_create_project.called
+
+
+class TestWebFallbackOps:
+    """Tests for non-JS fallback operation endpoints."""
+
+    def test_web_delete_project_missing_id(self, client):
+        response = client.post(
+            "/web/delete_project", data={"project_id": ""}, follow_redirects=False
+        )
+        assert response.status_code == 303
+        assert "msg_type=error" in response.headers.get("location", "")
+
+    @patch("app.main._delete_project_cascade")
+    def test_web_delete_project_success(self, mock_delete, client):
+        mock_delete.return_value = {"project_name": "项目A"}
+        response = client.post(
+            "/web/delete_project", data={"project_id": "p1"}, follow_redirects=False
+        )
+        assert response.status_code == 303
+        location = response.headers.get("location", "")
+        assert "msg_type=success" in location
+        assert "project_id" not in location
+        mock_delete.assert_called_once()
+
+    def test_web_upload_materials_requires_file(self, client):
+        response = client.post(
+            "/web/upload_materials", data={"project_id": "p1"}, follow_redirects=False
+        )
+        assert response.status_code == 303
+        assert "msg_type=error" in response.headers.get("location", "")
+
+    def test_web_upload_materials_get_fallback_redirects(self, client):
+        response = client.get("/web/upload_materials", follow_redirects=False)
+        assert response.status_code == 303
+        location = response.headers.get("location", "")
+        assert "msg_type=error" in location
+        assert "%E4%B8%8A%E4%BC%A0%E8%B5%84%E6%96%99" in location
+
+    def test_web_upload_materials_put_fallback_redirects(self, client):
+        response = client.put("/web/upload_materials", follow_redirects=False)
+        assert response.status_code == 303
+        location = response.headers.get("location", "")
+        assert "msg_type=error" in location
+        assert "%E4%B8%8A%E4%BC%A0%E8%B5%84%E6%96%99" in location
+
+    @patch("app.main.upload_material")
+    def test_web_upload_materials_partial_success(self, mock_upload_material, client):
+        def _side_effect(*args, **kwargs):
+            file_obj = kwargs.get("file")
+            if file_obj and file_obj.filename == "bad.txt":
+                raise ValueError("bad file")
+            return {"status": "ok"}
+
+        mock_upload_material.side_effect = _side_effect
+        response = client.post(
+            "/web/upload_materials",
+            data={"project_id": "p1"},
+            files=[
+                ("file", ("good.txt", BytesIO(b"ok"), "text/plain")),
+                ("file", ("bad.txt", BytesIO(b"bad"), "text/plain")),
+            ],
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        location = response.headers.get("location", "")
+        assert "project_id=p1" in location
+        assert "msg_type=error" in location
+
+    @patch("app.main.upload_shigong")
+    def test_web_upload_shigong_success(self, mock_upload_shigong, client):
+        mock_upload_shigong.return_value = {"id": "s1"}
+        response = client.post(
+            "/web/upload_shigong",
+            data={"project_id": "p1"},
+            files=[("file", ("a.txt", BytesIO(b"demo"), "text/plain"))],
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        location = response.headers.get("location", "")
+        assert "project_id=p1" in location
+        assert "msg_type=success" in location
+
+    def test_web_upload_shigong_get_fallback_redirects(self, client):
+        response = client.get("/web/upload_shigong", follow_redirects=False)
+        assert response.status_code == 303
+        location = response.headers.get("location", "")
+        assert "msg_type=error" in location
+        assert "%E4%B8%8A%E4%BC%A0%E5%B9%B6%E8%AF%84%E5%88%86" in location
+
+    def test_web_upload_shigong_put_fallback_redirects(self, client):
+        response = client.put("/web/upload_shigong", follow_redirects=False)
+        assert response.status_code == 303
+        location = response.headers.get("location", "")
+        assert "msg_type=error" in location
+        assert "%E4%B8%8A%E4%BC%A0%E5%B9%B6%E8%AF%84%E5%88%86" in location
+
+    @patch("app.main.rescore_project_submissions")
+    def test_web_score_shigong_success_uses_reports_generated(self, mock_rescore, client):
+        from types import SimpleNamespace
+
+        mock_rescore.return_value = SimpleNamespace(reports_generated=3)
+        response = client.post(
+            "/web/score_shigong",
+            data={"project_id": "p1"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        location = response.headers.get("location", "")
+        assert "msg_type=success" in location
+        assert "%E5%B7%B2%E9%87%8D%E7%AE%97+3+%E4%BB%BD" in location
+        assert "#section-shigong" in location
+
+
+class TestCleanupE2EEndpoint:
+    """Tests for /projects/cleanup_e2e endpoint."""
+
+    @patch("app.main._delete_project_cascade")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_cleanup_e2e_projects_only_matches_prefix(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_delete,
+        client,
+    ):
+        mock_load_projects.return_value = [
+            {"id": "1", "name": "E2E_20260210_100000"},
+            {"id": "2", "name": "正式项目A"},
+            {"id": "3", "name": "E2E_20260210_110000"},
+        ]
+        mock_delete.return_value = {"project_id": "1"}
+        response = client.post("/api/v1/projects/cleanup_e2e?prefix=E2E_")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["matched"] == 2
+        assert data["removed_count"] == 2
+        assert data["failed_count"] == 0
+        assert mock_delete.call_count == 2
+
+
+class TestMetricsEndpoint:
+    """Tests for Prometheus metrics endpoint."""
+
+    def test_metrics_returns_200(self, client):
+        """GET /metrics should return 200."""
+        response = client.get("/metrics")
+        assert response.status_code == 200
+
+    def test_metrics_returns_text_plain(self, client):
+        """GET /metrics should return text/plain content type."""
+        response = client.get("/metrics")
+        assert "text/plain" in response.headers["content-type"]
+
+    def test_metrics_contains_prometheus_format(self, client):
+        """Metrics response should contain Prometheus format."""
+        response = client.get("/metrics")
+        content = response.text
+        assert "# HELP" in content
+        assert "# TYPE" in content
+
+    def test_metrics_contains_qingtian_metrics(self, client):
+        """Metrics should contain qingtian custom metrics."""
+        response = client.get("/metrics")
+        content = response.text
+        assert "qingtian_" in content
+
+    def test_metrics_contains_project_stats(self, client):
+        """Metrics should contain project statistics."""
+        response = client.get("/metrics")
+        content = response.text
+        assert "qingtian_projects_total" in content
+        assert "qingtian_submissions_total" in content
+
+    @patch("app.main.load_projects")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_metrics_updates_project_stats(
+        self, mock_ensure_dirs, mock_submissions, mock_projects, client
+    ):
+        """Metrics endpoint should update project stats."""
+        mock_projects.return_value = [{"id": "1"}, {"id": "2"}]
+        mock_submissions.return_value = [{"id": "s1"}, {"id": "s2"}, {"id": "s3"}]
+
+        response = client.get("/metrics")
+        assert response.status_code == 200
+        # 指标应该被更新（验证通过无异常即可）
+
+    @patch("app.main.ensure_data_dirs")
+    def test_metrics_handles_stats_error_gracefully(self, mock_ensure_dirs, client):
+        """Metrics should not fail if stats collection errors."""
+        mock_ensure_dirs.side_effect = Exception("Test error")
+
+        response = client.get("/metrics")
+        # 应该仍然返回 200，即使统计收集失败
+        assert response.status_code == 200
+
+
+class TestHealthEndpoints:
+    """Tests for health check endpoints."""
+
+    def test_health_returns_healthy(self, client):
+        """GET /health should return healthy status."""
+        response = client.get("/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "healthy"
+        assert data["version"] == "1.0.0"
+
+    def test_health_response_structure(self, client):
+        """Health response should have correct structure."""
+        response = client.get("/health")
+        data = response.json()
+        assert "status" in data
+        assert "version" in data
+
+    @patch("app.main.load_config")
+    @patch("app.main.ensure_data_dirs")
+    def test_ready_returns_ready_when_all_checks_pass(
+        self, mock_ensure_dirs, mock_load_config, client
+    ):
+        """GET /ready should return ready when all checks pass."""
+        mock_load_config.return_value = MagicMock()
+        mock_ensure_dirs.return_value = None
+
+        response = client.get("/ready")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ready"
+        assert data["checks"]["config"] is True
+        assert data["checks"]["data_dirs"] is True
+
+    @patch("app.main.load_config")
+    @patch("app.main.ensure_data_dirs")
+    def test_ready_returns_not_ready_when_config_fails(
+        self, mock_ensure_dirs, mock_load_config, client
+    ):
+        """GET /ready should return not_ready when config check fails."""
+        mock_load_config.side_effect = Exception("Config error")
+        mock_ensure_dirs.return_value = None
+
+        response = client.get("/ready")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "not_ready"
+        assert data["checks"]["config"] is False
+        assert data["checks"]["data_dirs"] is True
+
+    @patch("app.main.load_config")
+    @patch("app.main.ensure_data_dirs")
+    def test_ready_returns_not_ready_when_data_dirs_fails(
+        self, mock_ensure_dirs, mock_load_config, client
+    ):
+        """GET /ready should return not_ready when data_dirs check fails."""
+        mock_load_config.return_value = MagicMock()
+        mock_ensure_dirs.side_effect = Exception("Cannot create dirs")
+
+        response = client.get("/ready")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "not_ready"
+        assert data["checks"]["config"] is True
+        assert data["checks"]["data_dirs"] is False
+
+    def test_ready_response_structure(self, client):
+        """Ready response should have correct structure."""
+        response = client.get("/ready")
+        data = response.json()
+        assert "status" in data
+        assert "checks" in data
+        assert isinstance(data["checks"], dict)
+
+
+class TestScoreEndpoint:
+    """Tests for POST /score endpoint."""
+
+    @patch("app.main.load_config")
+    @patch("app.main.score_text")
+    @patch("app.main.get_cached_score")
+    def test_score_endpoint_success(self, mock_cached, mock_score, mock_config, client):
+        """Score endpoint should return score report."""
+        from app.schemas import LogicLockResult, ScoreReport
+
+        mock_cached.return_value = None
+        mock_config.return_value = MagicMock(rubric={}, lexicon={})
+        mock_score.return_value = ScoreReport(
+            total_score=85.0,
+            dimension_scores={},
+            logic_lock=LogicLockResult(
+                definition_score=1.0,
+                analysis_score=1.0,
+                solution_score=1.0,
+                breaks=[],
+                evidence=[],
+            ),
+            penalties=[],
+            suggestions=[],
+            meta={},
+            judge_mode="local",
+            judge_source="scorer",
+            fallback_reason="",
+        )
+        response = client.post("/api/v1/score", json={"text": "测试文本"})
+        assert response.status_code == 200
+        mock_score.assert_called_once()
+
+
+class TestProjectsEndpoints:
+    """Tests for /projects endpoints."""
+
+    @patch("app.main.save_projects")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_create_project_success(self, mock_ensure, mock_load, mock_save, client):
+        """Create project should return project record."""
+        mock_load.return_value = []
+        response = client.post("/api/v1/projects", json={"name": "测试项目"})
+        assert response.status_code == 200
+        data = response.json()
+        assert "id" in data
+        assert data["name"] == "测试项目"
+        mock_save.assert_called_once()
+
+    @patch("app.main.save_projects")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_create_project_with_meta(self, mock_ensure, mock_load, mock_save, client):
+        """Create project with meta should include meta."""
+        mock_load.return_value = []
+        response = client.post(
+            "/api/v1/projects", json={"name": "测试项目", "meta": {"key": "value"}}
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["meta"] == {"key": "value"}
+
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_projects_empty(self, mock_ensure, mock_load, client):
+        """List projects should return empty list when no projects."""
+        mock_load.return_value = []
+        response = client.get("/api/v1/projects")
+        assert response.status_code == 200
+        assert response.json() == []
+
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_projects_with_data(self, mock_ensure, mock_load, client):
+        """List projects should return all projects."""
+        mock_load.return_value = [
+            {
+                "id": "p1",
+                "name": "项目1",
+                "meta": {},
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+        response = client.get("/api/v1/projects")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["name"] == "项目1"
+
+
+class TestExpertProfileEndpoints:
+    """Tests for /projects/{project_id}/expert-profile and rescore endpoints."""
+
+    @patch("app.main.save_expert_profiles")
+    @patch("app.main.save_projects")
+    @patch("app.main.load_expert_profiles")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_project_expert_profile_auto_create_default(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_profiles,
+        mock_save_projects,
+        mock_save_profiles,
+        client,
+    ):
+        mock_load_projects.return_value = [
+            {"id": "p1", "name": "项目1", "meta": {}, "created_at": "2026-01-01T00:00:00Z"}
+        ]
+        mock_load_profiles.return_value = []
+
+        response = client.get("/api/v1/projects/p1/expert-profile")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project"]["id"] == "p1"
+        assert data["project"]["region"] == "合肥"
+        assert data["expert_profile"]["weights_raw"]["01"] == 5
+        assert data["expert_profile"]["weights_raw"]["16"] == 5
+        assert data["expert_profile"]["norm_rule_version"] == "v1_m=0.5+a/10_norm=sum"
+        mock_save_profiles.assert_called_once()
+        mock_save_projects.assert_called_once()
+
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_update_project_expert_profile_locked_without_force_unlock(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        client,
+    ):
+        mock_load_projects.return_value = [
+            {
+                "id": "p1",
+                "name": "项目1",
+                "meta": {},
+                "status": "submitted_to_qingtian",
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+        weights = {f"{i:02d}": 5 for i in range(1, 17)}
+        response = client.put(
+            "/api/v1/projects/p1/expert-profile",
+            json={"name": "锁定测试", "weights_raw": weights},
+        )
+        assert response.status_code == 409
+        assert "force_unlock=true" in response.json()["detail"]
+
+    @patch("app.main.save_expert_profiles")
+    @patch("app.main.save_projects")
+    @patch("app.main.load_expert_profiles")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_update_project_expert_profile_locked_with_force_unlock(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_profiles,
+        mock_save_projects,
+        mock_save_profiles,
+        client,
+    ):
+        mock_load_projects.return_value = [
+            {
+                "id": "p1",
+                "name": "项目1",
+                "meta": {},
+                "status": "submitted_to_qingtian",
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+        mock_load_profiles.return_value = []
+        weights = {f"{i:02d}": 5 for i in range(1, 17)}
+        response = client.put(
+            "/api/v1/projects/p1/expert-profile",
+            json={"name": "锁定解锁测试", "weights_raw": weights, "force_unlock": True},
+        )
+        assert response.status_code == 200
+        mock_save_profiles.assert_called_once()
+        mock_save_projects.assert_called_once()
+
+    @patch("app.main.save_expert_profiles")
+    @patch("app.main.save_projects")
+    @patch("app.main.load_expert_profiles")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_update_project_expert_profile_success(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_profiles,
+        mock_save_projects,
+        mock_save_profiles,
+        client,
+    ):
+        mock_load_projects.return_value = [
+            {"id": "p1", "name": "项目1", "meta": {}, "created_at": "2026-01-01T00:00:00Z"}
+        ]
+        mock_load_profiles.return_value = []
+        weights = {f"{i:02d}": 5 for i in range(1, 17)}
+        weights["02"] = 10
+        response = client.put(
+            "/api/v1/projects/p1/expert-profile",
+            json={"name": "安全偏重", "weights_raw": weights},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["expert_profile"]["name"] == "安全偏重"
+        assert data["project"]["expert_profile_id"] == data["expert_profile"]["id"]
+        norm = data["expert_profile"]["weights_norm"]
+        assert abs(sum(norm.values()) - 1.0) < 1e-6
+        assert norm["02"] > norm["01"]
+        mock_save_profiles.assert_called_once()
+        mock_save_projects.assert_called_once()
+
+    @patch("app.main.record_history_score")
+    @patch("app.main.save_score_reports")
+    @patch("app.main.load_score_reports")
+    @patch("app.main.save_submissions")
+    @patch("app.main.load_submissions")
+    @patch("app.main.score_text")
+    @patch("app.main.load_config")
+    @patch("app.main.save_projects")
+    @patch("app.main.load_expert_profiles")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_rescore_project_success(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_profiles,
+        mock_save_projects,
+        mock_load_config,
+        mock_score_text,
+        mock_load_submissions,
+        mock_save_submissions,
+        mock_load_score_reports,
+        mock_save_score_reports,
+        mock_record_history,
+        client,
+    ):
+        mock_load_projects.return_value = [
+            {
+                "id": "p1",
+                "name": "项目1",
+                "meta": {},
+                "created_at": "2026-01-01T00:00:00Z",
+                "expert_profile_id": "ep1",
+            }
+        ]
+        mock_load_profiles.return_value = [
+            {
+                "id": "ep1",
+                "name": "默认",
+                "weights_raw": {f"{i:02d}": 5 for i in range(1, 17)},
+                "weights_norm": {f"{i:02d}": 1 / 16 for i in range(1, 17)},
+                "norm_rule_version": "v1_m=0.5+a/10_norm=sum",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "f1.txt",
+                "text": "test content",
+                "total_score": 60.0,
+                "report": {},
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+        mock_load_score_reports.return_value = []
+        mock_load_config.return_value = MagicMock(rubric={}, lexicon={})
+        mock_score_text.return_value = MagicMock(
+            model_dump=lambda: {
+                "total_score": 88.8,
+                "dimension_scores": {},
+                "penalties": [],
+                "suggestions": [],
+            }
+        )
+
+        response = client.post(
+            "/api/v1/projects/p1/rescore",
+            json={"scoring_engine_version": "v2", "scope": "project"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["ok"] is True
+        assert data["submission_count"] == 1
+        assert data["reports_generated"] == 1
+        mock_save_submissions.assert_called_once()
+        mock_save_score_reports.assert_called_once()
+        mock_record_history.assert_called_once()
+
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_rescore_project_locked_without_force_unlock(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        client,
+    ):
+        mock_load_projects.return_value = [
+            {
+                "id": "p1",
+                "name": "项目1",
+                "meta": {},
+                "status": "submitted_to_qingtian",
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+        response = client.post(
+            "/api/v1/projects/p1/rescore",
+            json={"scoring_engine_version": "v2", "scope": "project"},
+        )
+        assert response.status_code == 409
+        assert "force_unlock=true" in response.json()["detail"]
+
+
+class TestMaterialsEndpoint:
+    """Tests for /projects/{project_id}/materials endpoint."""
+
+    @patch("app.main.save_materials")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.MATERIALS_DIR")
+    def test_upload_material_success(
+        self, mock_dir, mock_ensure, mock_load_proj, mock_load_mat, mock_save, client, tmp_path
+    ):
+        """Upload material should save file and return record."""
+        mock_dir.__truediv__ = lambda self, x: tmp_path / x
+        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_load_mat.return_value = []
+
+        file_content = b"test content"
+        response = client.post(
+            "/api/v1/projects/p1/materials",
+            files={"file": ("test.txt", BytesIO(file_content), "text/plain")},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert "material" in data
+
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_upload_material_project_not_found(self, mock_ensure, mock_load, client):
+        """Upload material should return 404 if project not found."""
+        mock_load.return_value = []
+        response = client.post(
+            "/api/v1/projects/nonexistent/materials",
+            files={"file": ("test.txt", BytesIO(b"test"), "text/plain")},
+        )
+        assert response.status_code == 404
+        assert "项目不存在" in response.json()["detail"]
+
+    @patch("app.main.save_materials")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.MATERIALS_DIR")
+    def test_upload_material_accepts_doc_extension(
+        self, mock_dir, mock_ensure, mock_load_proj, mock_load_mat, mock_save, client, tmp_path
+    ):
+        mock_dir.__truediv__ = lambda self, x: tmp_path / x
+        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_load_mat.return_value = []
+
+        response = client.post(
+            "/api/v1/projects/p1/materials",
+            files={"file": ("招标文件.DOC ", BytesIO(b"doc-bytes"), "application/msword")},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert data["material"]["filename"] == "招标文件.DOC"
+
+    @patch("app.main.save_materials")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.MATERIALS_DIR")
+    def test_upload_material_accepts_by_mime_without_extension(
+        self, mock_dir, mock_ensure, mock_load_proj, mock_load_mat, mock_save, client, tmp_path
+    ):
+        mock_dir.__truediv__ = lambda self, x: tmp_path / x
+        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_load_mat.return_value = []
+
+        response = client.post(
+            "/api/v1/projects/p1/materials",
+            files={"file": ("招标文件", BytesIO(b"%PDF-1.4\\n"), "application/pdf")},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert data["material"]["filename"] == "招标文件"
+
+    @patch("app.main.save_materials")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.MATERIALS_DIR")
+    def test_upload_material_replaces_existing_same_filename(
+        self, mock_dir, mock_ensure, mock_load_proj, mock_load_mat, mock_save, client, tmp_path
+    ):
+        mock_dir.__truediv__ = lambda self, x: tmp_path / x
+        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_load_mat.return_value = [
+            {
+                "id": "m-old",
+                "project_id": "p1",
+                "filename": "test.txt",
+                "path": str(tmp_path / "old.txt"),
+                "created_at": "2026-02-17T00:00:00+00:00",
+            },
+            {
+                "id": "m-dup",
+                "project_id": "p1",
+                "filename": " test.txt ",
+                "path": str(tmp_path / "dup.txt"),
+                "created_at": "2026-02-17T00:00:01+00:00",
+            },
+            {
+                "id": "m-other",
+                "project_id": "p1",
+                "filename": "other.txt",
+                "path": str(tmp_path / "other.txt"),
+                "created_at": "2026-02-17T00:00:02+00:00",
+            },
+        ]
+
+        response = client.post(
+            "/api/v1/projects/p1/materials",
+            files={"file": ("test.txt", BytesIO(b"new content"), "text/plain")},
+        )
+        assert response.status_code == 200
+        saved_materials = mock_save.call_args[0][0]
+        same_name = [
+            m
+            for m in saved_materials
+            if m.get("project_id") == "p1" and m.get("filename") == "test.txt"
+        ]
+        assert len(same_name) == 1
+        assert same_name[0]["id"] == "m-old"
+
+
+class TestShigongEndpoint:
+    """Tests for /projects/{project_id}/shigong endpoint."""
+
+    @patch("app.main.save_submissions")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.load_config")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.score_text")
+    def test_upload_shigong_success(
+        self,
+        mock_score,
+        mock_ensure,
+        mock_load_proj,
+        mock_config,
+        mock_profiles,
+        mock_load_sub,
+        mock_save_sub,
+        client,
+    ):
+        """Upload shigong should score and save submission."""
+        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_config.return_value = MagicMock(rubric={}, lexicon={})
+        mock_profiles.return_value = []
+        mock_load_sub.return_value = []
+        mock_score.return_value = MagicMock(
+            model_dump=lambda: {"total_score": 80.0, "dimension_scores": {}, "penalties": []}
+        )
+
+        response = client.post(
+            "/api/v1/projects/p1/shigong",
+            files={"file": ("test.txt", BytesIO(b"test content"), "text/plain")},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "id" in data
+        assert data["project_id"] == "p1"
+
+    @patch("app.main.save_submissions")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.load_config")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.score_text")
+    def test_upload_shigong_with_learning_profile(
+        self,
+        mock_score,
+        mock_ensure,
+        mock_load_proj,
+        mock_config,
+        mock_profiles,
+        mock_load_sub,
+        mock_save_sub,
+        client,
+    ):
+        """Upload shigong should use learning profile multipliers."""
+        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_config.return_value = MagicMock(rubric={}, lexicon={})
+        mock_profiles.return_value = [{"project_id": "p1", "dimension_multipliers": {"D01": 1.2}}]
+        mock_load_sub.return_value = []
+        mock_score.return_value = MagicMock(model_dump=lambda: {"total_score": 80.0})
+
+        response = client.post(
+            "/api/v1/projects/p1/shigong",
+            files={"file": ("test.txt", BytesIO(b"test"), "text/plain")},
+        )
+        assert response.status_code == 200
+        # Check multipliers were passed
+        call_args = mock_score.call_args
+        assert call_args.kwargs.get("dimension_multipliers") == {"D01": 1.2}
+
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_upload_shigong_project_not_found(self, mock_ensure, mock_load, client):
+        """Upload shigong should return 404 if project not found."""
+        mock_load.return_value = []
+        response = client.post(
+            "/api/v1/projects/nonexistent/shigong",
+            files={"file": ("test.txt", BytesIO(b"test"), "text/plain")},
+        )
+        assert response.status_code == 404
+
+    @patch("app.main.record_history_score")
+    @patch("app.main.save_submissions")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.load_config")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.score_text")
+    def test_upload_shigong_deduplicates_recent_same_file(
+        self,
+        mock_score,
+        mock_ensure,
+        mock_load_proj,
+        mock_config,
+        mock_profiles,
+        mock_load_sub,
+        mock_save_sub,
+        mock_record_history,
+        client,
+    ):
+        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_config.return_value = MagicMock(rubric={}, lexicon={})
+        mock_profiles.return_value = []
+        saved_state = []
+
+        def _load_state():
+            return list(saved_state)
+
+        def _save_state(submissions):
+            saved_state[:] = list(submissions)
+
+        mock_load_sub.side_effect = _load_state
+        mock_save_sub.side_effect = _save_state
+        mock_score.return_value = MagicMock(
+            model_dump=lambda: {"total_score": 81.0, "dimension_scores": {}, "penalties": []}
+        )
+
+        first = client.post(
+            "/api/v1/projects/p1/shigong",
+            files={"file": ("dup.txt", BytesIO(b"same content"), "text/plain")},
+        )
+        second = client.post(
+            "/api/v1/projects/p1/shigong",
+            files={"file": ("dup.txt", BytesIO(b"same content"), "text/plain")},
+        )
+        assert first.status_code == 200
+        assert second.status_code == 200
+        first_data = first.json()
+        second_data = second.json()
+        assert second_data["id"] == first_data["id"]
+        assert len(saved_state) == 1
+        assert mock_save_sub.call_count == 1
+        assert mock_score.call_count == 1
+        mock_record_history.assert_called_once()
+
+
+class TestScoreForProjectEndpoint:
+    """Tests for /projects/{project_id}/score endpoint."""
+
+    @patch("app.main.save_submissions")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.load_config")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.score_text")
+    def test_score_for_project_success(
+        self,
+        mock_score,
+        mock_ensure,
+        mock_load_proj,
+        mock_config,
+        mock_profiles,
+        mock_load_sub,
+        mock_save_sub,
+        client,
+    ):
+        """Score for project should return submission record."""
+        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_config.return_value = MagicMock(rubric={}, lexicon={})
+        mock_profiles.return_value = []
+        mock_load_sub.return_value = []
+        mock_score.return_value = MagicMock(model_dump=lambda: {"total_score": 75.0})
+
+        response = client.post("/api/v1/projects/p1/score", json={"text": "测试文本"})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["filename"] == "inline"
+
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_score_for_project_not_found(self, mock_ensure, mock_load, client):
+        """Score for project should return 404 if project not found."""
+        mock_load.return_value = []
+        response = client.post("/api/v1/projects/nonexistent/score", json={"text": "test"})
+        assert response.status_code == 404
+
+    @patch("app.main.save_submissions")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.load_config")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.score_text")
+    def test_score_for_project_with_learning_profile(
+        self,
+        mock_score,
+        mock_ensure,
+        mock_load_proj,
+        mock_config,
+        mock_profiles,
+        mock_load_sub,
+        mock_save_sub,
+        client,
+    ):
+        """Score for project should use learning profile multipliers."""
+        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_config.return_value = MagicMock(rubric={}, lexicon={})
+        mock_profiles.return_value = [{"project_id": "p1", "dimension_multipliers": {"D01": 1.3}}]
+        mock_load_sub.return_value = []
+        mock_score.return_value = MagicMock(model_dump=lambda: {"total_score": 78.0})
+
+        response = client.post("/api/v1/projects/p1/score", json={"text": "测试文本"})
+        assert response.status_code == 200
+        # Check multipliers were passed
+        call_args = mock_score.call_args
+        assert call_args.kwargs.get("dimension_multipliers") == {"D01": 1.3}
+
+
+class TestSubmissionsEndpoint:
+    """Tests for /projects/{project_id}/submissions endpoint."""
+
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_submissions_empty(self, mock_ensure, mock_load, client):
+        """List submissions should return empty list when no submissions."""
+        mock_load.return_value = []
+        response = client.get("/api/v1/projects/p1/submissions")
+        assert response.status_code == 200
+        assert response.json() == []
+
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_submissions_filtered(self, mock_ensure, mock_load, client):
+        """List submissions should filter by project_id."""
+        mock_load.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "f1.txt",
+                "total_score": 80.0,
+                "report": {},
+                "text": "t1",
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            {
+                "id": "s2",
+                "project_id": "p2",
+                "filename": "f2.txt",
+                "total_score": 70.0,
+                "report": {},
+                "text": "t2",
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+        ]
+        response = client.get("/api/v1/projects/p1/submissions")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["id"] == "s1"
+
+
+class TestCompareEndpoints:
+    """Tests for /projects/{project_id}/compare endpoints."""
+
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_compare_no_submissions(self, mock_ensure, mock_load, client):
+        """Compare should return 404 if no submissions."""
+        mock_load.return_value = []
+        response = client.get("/api/v1/projects/p1/compare")
+        assert response.status_code == 404
+        assert "暂无施组记录" in response.json()["detail"]
+
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_compare_with_submissions(self, mock_ensure, mock_load, client):
+        """Compare should return rankings and stats."""
+        mock_load.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "f1.txt",
+                "total_score": 80.0,
+                "report": {
+                    "dimension_scores": {"D01": {"score": 20.0}},
+                    "penalties": [{"code": "P001"}],
+                },
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            {
+                "id": "s2",
+                "project_id": "p1",
+                "filename": "f2.txt",
+                "total_score": 70.0,
+                "report": {
+                    "dimension_scores": {"D01": {"score": 18.0}},
+                    "penalties": [],
+                },
+                "created_at": "2026-01-02T00:00:00Z",
+            },
+        ]
+        response = client.get("/api/v1/projects/p1/compare")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert len(data["rankings"]) == 2
+        # First should have higher score
+        assert data["rankings"][0]["total_score"] == 80.0
+
+    @patch("app.main.build_compare_narrative")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_compare_report_success(self, mock_ensure, mock_load, mock_narrative, client):
+        """Compare report should return narrative."""
+        mock_load.return_value = [{"id": "s1", "project_id": "p1"}]
+        mock_narrative.return_value = {
+            "summary": "test summary",
+            "top_submission": {"id": "s1"},
+            "bottom_submission": {"id": "s1"},
+            "key_diffs": [],
+        }
+        response = client.get("/api/v1/projects/p1/compare_report")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_compare_report_no_submissions(self, mock_ensure, mock_load, client):
+        """Compare report should return 404 if no submissions."""
+        mock_load.return_value = []
+        response = client.get("/api/v1/projects/p1/compare_report")
+        assert response.status_code == 404
+
+
+class TestAdaptiveEndpoints:
+    """Tests for /projects/{project_id}/adaptive* endpoints."""
+
+    @patch("app.main.build_adaptive_suggestions")
+    @patch("app.main.load_config")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_adaptive_suggestions_success(
+        self, mock_ensure, mock_load, mock_config, mock_build, client
+    ):
+        """Adaptive suggestions should return suggestions."""
+        mock_load.return_value = [{"id": "s1", "project_id": "p1"}]
+        mock_config.return_value = MagicMock(lexicon={})
+        mock_build.return_value = {"penalty_stats": {}, "suggestions": []}
+        response = client.get("/api/v1/projects/p1/adaptive")
+        assert response.status_code == 200
+
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_adaptive_no_submissions(self, mock_ensure, mock_load, client):
+        """Adaptive should return 404 if no submissions."""
+        mock_load.return_value = []
+        response = client.get("/api/v1/projects/p1/adaptive")
+        assert response.status_code == 404
+
+    @patch("app.main.build_adaptive_patch")
+    @patch("app.main.build_adaptive_suggestions")
+    @patch("app.main.load_config")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_adaptive_patch_success(
+        self, mock_ensure, mock_load, mock_config, mock_suggestions, mock_patch, client
+    ):
+        """Adaptive patch should return patch."""
+        mock_load.return_value = [{"id": "s1", "project_id": "p1"}]
+        mock_config.return_value = MagicMock(lexicon={})
+        mock_suggestions.return_value = {"penalty_stats": {}}
+        mock_patch.return_value = {"lexicon_additions": {}, "rubric_adjustments": {}}
+        response = client.get("/api/v1/projects/p1/adaptive_patch")
+        assert response.status_code == 200
+
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_adaptive_patch_no_submissions(self, mock_ensure, mock_load, client):
+        """Adaptive patch should return 404 if no submissions."""
+        mock_load.return_value = []
+        response = client.get("/api/v1/projects/p1/adaptive_patch")
+        assert response.status_code == 404
+
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_adaptive_validate_no_submissions(self, mock_ensure, mock_load, client):
+        """Adaptive validate should return 404 if no submissions."""
+        mock_load.return_value = []
+        response = client.get("/api/v1/projects/p1/adaptive_validate")
+        assert response.status_code == 404
+
+    @patch("app.main.score_text")
+    @patch("app.main.load_config")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_adaptive_validate_success(
+        self, mock_ensure, mock_load, mock_config, mock_score, client
+    ):
+        """Adaptive validate should compare old and new scores."""
+        mock_load.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "f1.txt",
+                "total_score": 80.0,
+                "text": "test text",
+            }
+        ]
+        mock_config.return_value = MagicMock(rubric={}, lexicon={})
+        mock_score.return_value = MagicMock(model_dump=lambda: {"total_score": 82.0})
+        response = client.get("/api/v1/projects/p1/adaptive_validate")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["avg_delta"] == 2.0
+        assert len(data["comparisons"]) == 1
+
+    @patch("app.main.score_text")
+    @patch("app.main.load_config")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_adaptive_validate_no_text(
+        self, mock_ensure, mock_load, mock_config, mock_score, client
+    ):
+        """Adaptive validate should skip submissions without text."""
+        mock_load.return_value = [
+            {"id": "s1", "project_id": "p1", "filename": "f1.txt", "total_score": 80.0}
+        ]
+        mock_config.return_value = MagicMock(rubric={}, lexicon={})
+        response = client.get("/api/v1/projects/p1/adaptive_validate")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["avg_delta"] == 0.0
+        assert len(data["comparisons"]) == 0
+
+
+class TestInsightsEndpoint:
+    """Tests for /projects/{project_id}/insights endpoint."""
+
+    @patch("app.main.build_project_insights")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_insights_success(self, mock_ensure, mock_load, mock_insights, client):
+        """Insights should return project insights."""
+        mock_load.return_value = [{"id": "s1", "project_id": "p1"}]
+        mock_insights.return_value = {
+            "dimension_avg": {},
+            "weakest_dims": [],
+            "frequent_penalties": [],
+            "recommendations": [],
+        }
+        response = client.get("/api/v1/projects/p1/insights")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_insights_no_submissions(self, mock_ensure, mock_load, client):
+        """Insights should return 404 if no submissions."""
+        mock_load.return_value = []
+        response = client.get("/api/v1/projects/p1/insights")
+        assert response.status_code == 404
+
+
+class TestLearningEndpoints:
+    """Tests for /projects/{project_id}/learning endpoints."""
+
+    @patch("app.main.save_learning_profiles")
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.build_learning_profile")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_update_learning_profile_success(
+        self, mock_ensure, mock_load_sub, mock_build, mock_load_prof, mock_save, client
+    ):
+        """Update learning profile should save and return profile."""
+        mock_load_sub.return_value = [{"id": "s1", "project_id": "p1"}]
+        mock_build.return_value = {
+            "dimension_multipliers": {"D01": 1.1},
+            "rationale": {"D01": "test rationale"},
+        }
+        mock_load_prof.return_value = []
+        response = client.post("/api/v1/projects/p1/learning")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        mock_save.assert_called_once()
+
+    @patch("app.main.save_learning_profiles")
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.build_learning_profile")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_update_learning_profile_replaces_existing(
+        self, mock_ensure, mock_load_sub, mock_build, mock_load_prof, mock_save, client
+    ):
+        """Update learning profile should replace existing profile."""
+        mock_load_sub.return_value = [{"id": "s1", "project_id": "p1"}]
+        mock_build.return_value = {
+            "dimension_multipliers": {"D01": 1.2},
+            "rationale": {"D01": "new rationale"},
+        }
+        mock_load_prof.return_value = [{"project_id": "p1", "dimension_multipliers": {"D01": 1.0}}]
+        response = client.post("/api/v1/projects/p1/learning")
+        assert response.status_code == 200
+        # Verify old profile was removed
+        call_args = mock_save.call_args[0][0]
+        p1_profiles = [p for p in call_args if p.get("project_id") == "p1"]
+        assert len(p1_profiles) == 1
+
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_update_learning_profile_no_submissions(self, mock_ensure, mock_load, client):
+        """Update learning profile should return 404 if no submissions."""
+        mock_load.return_value = []
+        response = client.post("/api/v1/projects/p1/learning")
+        assert response.status_code == 404
+
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_learning_profile_success(self, mock_ensure, mock_load, client):
+        """Get learning profile should return existing profile."""
+        mock_load.return_value = [
+            {
+                "project_id": "p1",
+                "dimension_multipliers": {"D01": 1.1},
+                "rationale": {"D01": "test"},
+                "updated_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+        response = client.get("/api/v1/projects/p1/learning")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_learning_profile_not_found(self, mock_ensure, mock_load, client):
+        """Get learning profile should return 404 if not found."""
+        mock_load.return_value = []
+        response = client.get("/api/v1/projects/p1/learning")
+        assert response.status_code == 404
+        assert "暂无学习画像" in response.json()["detail"]
+
+
+class TestAdaptiveApplyEndpoint:
+    """Tests for /projects/{project_id}/adaptive_apply endpoint."""
+
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_adaptive_apply_no_submissions(self, mock_ensure, mock_load, client):
+        """Adaptive apply should return 404 if no submissions."""
+        mock_load.return_value = []
+        response = client.post("/api/v1/projects/p1/adaptive_apply")
+        assert response.status_code == 404
+
+    @patch("yaml.safe_dump")
+    @patch("pathlib.Path")
+    @patch("app.main.apply_adaptive_patch")
+    @patch("app.main.build_adaptive_patch")
+    @patch("app.main.build_adaptive_suggestions")
+    @patch("app.main.load_config")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_adaptive_apply_success(
+        self,
+        mock_ensure,
+        mock_load_sub,
+        mock_config,
+        mock_suggestions,
+        mock_patch,
+        mock_apply,
+        mock_path,
+        mock_yaml_dump,
+        client,
+    ):
+        """Adaptive apply should update lexicon and return result."""
+        mock_load_sub.return_value = [{"id": "s1", "project_id": "p1"}]
+        mock_config.return_value = MagicMock(lexicon={})
+        mock_suggestions.return_value = {"penalty_stats": {}}
+        mock_patch.return_value = {"lexicon_additions": {}, "rubric_adjustments": {}}
+        mock_apply.return_value = ({"updated": True}, ["change1", "change2"])
+
+        # Mock Path operations
+        mock_lexicon_path = MagicMock()
+        mock_lexicon_path.read_text.return_value = "old: content"
+        mock_backup_path = MagicMock()
+        mock_backup_path.__str__ = MagicMock(return_value="/backup/path.yaml")
+        mock_lexicon_path.with_name.return_value = mock_backup_path
+
+        # Configure Path mock chain
+        mock_path_instance = MagicMock()
+        mock_path_instance.resolve.return_value.parent.__truediv__ = (
+            lambda self, x: mock_lexicon_path
+        )
+        mock_path.return_value = mock_path_instance
+
+        response = client.post("/api/v1/projects/p1/adaptive_apply")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["applied"] is True
+        assert "changes" in data
+
+
+class TestMainExecution:
+    """Tests for main module execution."""
+
+    def test_app_title(self):
+        """App should have correct title."""
+        assert app.title == "青天评标系统 API"
+
+    def test_app_version(self):
+        """App should have correct version."""
+        assert app.version == "1.0.0"
+
+
+class TestApiI18n:
+    """Tests for API i18n support via Accept-Language header."""
+
+    def test_parse_accept_language_none(self):
+        """parse_accept_language should return default locale for None."""
+        from app.main import parse_accept_language
+
+        assert parse_accept_language(None) == "zh"
+
+    def test_parse_accept_language_empty(self):
+        """parse_accept_language should return default locale for empty string."""
+        from app.main import parse_accept_language
+
+        assert parse_accept_language("") == "zh"
+
+    def test_parse_accept_language_simple_zh(self):
+        """parse_accept_language should parse simple zh."""
+        from app.main import parse_accept_language
+
+        assert parse_accept_language("zh") == "zh"
+
+    def test_parse_accept_language_simple_en(self):
+        """parse_accept_language should parse simple en."""
+        from app.main import parse_accept_language
+
+        assert parse_accept_language("en") == "en"
+
+    def test_parse_accept_language_with_region(self):
+        """parse_accept_language should handle regional variants."""
+        from app.main import parse_accept_language
+
+        assert parse_accept_language("zh-CN") == "zh"
+        assert parse_accept_language("en-US") == "en"
+        assert parse_accept_language("en-GB") == "en"
+
+    def test_parse_accept_language_with_quality(self):
+        """parse_accept_language should respect quality values."""
+        from app.main import parse_accept_language
+
+        # en has higher quality
+        assert parse_accept_language("zh;q=0.8,en;q=0.9") == "en"
+        # zh has higher quality
+        assert parse_accept_language("en;q=0.8,zh;q=0.9") == "zh"
+
+    def test_parse_accept_language_complex(self):
+        """parse_accept_language should handle complex Accept-Language."""
+        from app.main import parse_accept_language
+
+        assert parse_accept_language("en-US,en;q=0.9,zh;q=0.8") == "en"
+        assert parse_accept_language("zh-CN,zh;q=0.9,en;q=0.8") == "zh"
+
+    def test_parse_accept_language_unsupported(self):
+        """parse_accept_language should fall back for unsupported languages."""
+        from app.main import parse_accept_language
+
+        assert parse_accept_language("fr") == "zh"
+        assert parse_accept_language("de-DE,fr;q=0.9") == "zh"
+
+    def test_parse_accept_language_invalid_quality(self):
+        """parse_accept_language should handle invalid quality values."""
+        from app.main import parse_accept_language
+
+        assert parse_accept_language("en;q=invalid") == "en"
+
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_upload_material_error_zh(self, mock_ensure, mock_load, client):
+        """Upload material should return Chinese error with Accept-Language: zh."""
+        mock_load.return_value = []
+        response = client.post(
+            "/api/v1/projects/nonexistent/materials",
+            files={"file": ("test.txt", BytesIO(b"test"), "text/plain")},
+            headers={"Accept-Language": "zh"},
+        )
+        assert response.status_code == 404
+        assert "项目不存在" in response.json()["detail"]
+
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_upload_material_error_en(self, mock_ensure, mock_load, client):
+        """Upload material should return English error with Accept-Language: en."""
+        mock_load.return_value = []
+        response = client.post(
+            "/api/v1/projects/nonexistent/materials",
+            files={"file": ("test.txt", BytesIO(b"test"), "text/plain")},
+            headers={"Accept-Language": "en"},
+        )
+        assert response.status_code == 404
+        assert "Project not found" in response.json()["detail"]
+
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_compare_error_zh(self, mock_ensure, mock_load, client):
+        """Compare should return Chinese error with Accept-Language: zh."""
+        mock_load.return_value = []
+        response = client.get(
+            "/api/v1/projects/p1/compare",
+            headers={"Accept-Language": "zh"},
+        )
+        assert response.status_code == 404
+        assert "暂无施组记录" in response.json()["detail"]
+
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_compare_error_en(self, mock_ensure, mock_load, client):
+        """Compare should return English error with Accept-Language: en."""
+        mock_load.return_value = []
+        response = client.get(
+            "/api/v1/projects/p1/compare",
+            headers={"Accept-Language": "en"},
+        )
+        assert response.status_code == 404
+        assert "No submission records" in response.json()["detail"]
+
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_learning_profile_error_zh(self, mock_ensure, mock_load, client):
+        """Get learning profile should return Chinese error."""
+        mock_load.return_value = []
+        response = client.get(
+            "/api/v1/projects/p1/learning",
+            headers={"Accept-Language": "zh"},
+        )
+        assert response.status_code == 404
+        assert "暂无学习画像" in response.json()["detail"]
+
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_learning_profile_error_en(self, mock_ensure, mock_load, client):
+        """Get learning profile should return English error."""
+        mock_load.return_value = []
+        response = client.get(
+            "/api/v1/projects/p1/learning",
+            headers={"Accept-Language": "en"},
+        )
+        assert response.status_code == 404
+        assert "No learning profile" in response.json()["detail"]
+
+    @patch("app.main.reload_config")
+    def test_config_reload_message_zh(self, mock_reload, client):
+        """Config reload should return Chinese message."""
+        response = client.post(
+            "/api/v1/config/reload",
+            headers={"Accept-Language": "zh"},
+        )
+        assert response.status_code == 200
+        assert "配置已重新加载" in response.json()["message"]
+
+    @patch("app.main.reload_config")
+    def test_config_reload_message_en(self, mock_reload, client):
+        """Config reload should return English message."""
+        response = client.post(
+            "/api/v1/config/reload",
+            headers={"Accept-Language": "en"},
+        )
+        assert response.status_code == 200
+        assert "Configuration reloaded" in response.json()["message"]
+
+    def test_accept_language_with_region_code(self, client):
+        """API should accept regional language codes like zh-CN."""
+        from app.main import parse_accept_language
+
+        assert parse_accept_language("zh-CN,zh;q=0.9,en;q=0.8") == "zh"
+        assert parse_accept_language("en-US,en;q=0.9,zh;q=0.8") == "en"
+
+
+class TestEdgeCases:
+    """Tests for edge cases and error handling."""
+
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_compare_dimension_avg_calculation(self, mock_ensure, mock_load, client):
+        """Compare should correctly calculate dimension averages."""
+        mock_load.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "f1.txt",
+                "total_score": 80.0,
+                "report": {
+                    "dimension_scores": {"D01": {"score": 20.0}, "D02": {"score": 30.0}},
+                    "penalties": [],
+                },
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            {
+                "id": "s2",
+                "project_id": "p1",
+                "filename": "f2.txt",
+                "total_score": 70.0,
+                "report": {
+                    "dimension_scores": {"D01": {"score": 24.0}, "D02": {"score": 26.0}},
+                    "penalties": [],
+                },
+                "created_at": "2026-01-02T00:00:00Z",
+            },
+        ]
+        response = client.get("/api/v1/projects/p1/compare")
+        assert response.status_code == 200
+        data = response.json()
+        # D01 avg: (20 + 24) / 2 = 22
+        assert data["dimension_avg"]["D01"] == 22.0
+        # D02 avg: (30 + 26) / 2 = 28
+        assert data["dimension_avg"]["D02"] == 28.0
+
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_compare_penalty_stats_aggregation(self, mock_ensure, mock_load, client):
+        """Compare should correctly aggregate penalty stats."""
+        mock_load.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "f1.txt",
+                "total_score": 80.0,
+                "report": {
+                    "dimension_scores": {},
+                    "penalties": [{"code": "P001"}, {"code": "P002"}],
+                },
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            {
+                "id": "s2",
+                "project_id": "p1",
+                "filename": "f2.txt",
+                "total_score": 70.0,
+                "report": {
+                    "dimension_scores": {},
+                    "penalties": [{"code": "P001"}],
+                },
+                "created_at": "2026-01-02T00:00:00Z",
+            },
+        ]
+        response = client.get("/api/v1/projects/p1/compare")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["penalty_stats"]["P001"] == 2
+        assert data["penalty_stats"]["P002"] == 1
+
+
+class TestCacheEndpoints:
+    """Tests for cache-related endpoints."""
+
+    def test_cache_stats_returns_200(self, client):
+        """GET /api/v1/cache/stats should return 200."""
+        response = client.get("/api/v1/cache/stats")
+        assert response.status_code == 200
+
+    def test_cache_stats_structure(self, client):
+        """Cache stats should have correct structure."""
+        response = client.get("/api/v1/cache/stats")
+        data = response.json()
+        assert "total_requests" in data
+        assert "hits" in data
+        assert "misses" in data
+        assert "evictions" in data
+        assert "size" in data
+        assert "hit_rate" in data
+
+    def test_cache_stats_types(self, client):
+        """Cache stats should have correct types."""
+        response = client.get("/api/v1/cache/stats")
+        data = response.json()
+        assert isinstance(data["total_requests"], int)
+        assert isinstance(data["hits"], int)
+        assert isinstance(data["misses"], int)
+        assert isinstance(data["evictions"], int)
+        assert isinstance(data["size"], int)
+        assert isinstance(data["hit_rate"], float)
+
+    def test_cache_clear_returns_200(self, client):
+        """POST /api/v1/cache/clear should return 200."""
+        response = client.post("/api/v1/cache/clear")
+        assert response.status_code == 200
+
+    def test_cache_clear_structure(self, client):
+        """Cache clear response should have correct structure."""
+        response = client.post("/api/v1/cache/clear")
+        data = response.json()
+        assert "cleared" in data
+        assert "count" in data
+        assert "message" in data
+
+    def test_cache_clear_zh_message(self, client):
+        """Cache clear should return Chinese message with Accept-Language: zh."""
+        response = client.post(
+            "/api/v1/cache/clear",
+            headers={"Accept-Language": "zh"},
+        )
+        data = response.json()
+        # 当缓存为空时，应返回 "缓存为空" 或 "缓存已清空"
+        assert "缓存" in data["message"]
+
+    def test_cache_clear_en_message(self, client):
+        """Cache clear should return English message with Accept-Language: en."""
+        response = client.post(
+            "/api/v1/cache/clear",
+            headers={"Accept-Language": "en"},
+        )
+        data = response.json()
+        # 应返回 "Cache cleared" 或 "Cache is empty"
+        assert "Cache" in data["message"] or "cache" in data["message"]
+
+    @patch("app.main.get_cached_score")
+    @patch("app.main.cache_score_result")
+    @patch("app.main.load_config")
+    @patch("app.main.score_text")
+    def test_score_endpoint_uses_cache(
+        self, mock_score, mock_config, mock_cache_set, mock_cache_get, client
+    ):
+        """Score endpoint should check cache first."""
+        from app.schemas import LogicLockResult, ScoreReport
+
+        # 模拟缓存未命中
+        mock_cache_get.return_value = None
+        mock_config.return_value = MagicMock(rubric={}, lexicon={})
+        mock_score.return_value = ScoreReport(
+            total_score=85.0,
+            dimension_scores={},
+            logic_lock=LogicLockResult(
+                definition_score=1.0,
+                analysis_score=1.0,
+                solution_score=1.0,
+                breaks=[],
+                evidence=[],
+            ),
+            penalties=[],
+            suggestions=[],
+            meta={},
+            judge_mode="local",
+            judge_source="scorer",
+            fallback_reason="",
+        )
+
+        response = client.post("/api/v1/score", json={"text": "测试文本"})
+        assert response.status_code == 200
+
+        # 验证缓存被检查
+        mock_cache_get.assert_called_once_with("测试文本")
+        # 验证结果被缓存
+        mock_cache_set.assert_called_once()
+
+    @patch("app.main.get_cached_score")
+    @patch("app.main.load_config")
+    @patch("app.main.score_text")
+    def test_score_endpoint_returns_cached_result(
+        self, mock_score, mock_config, mock_cache_get, client
+    ):
+        """Score endpoint should return cached result when available."""
+        # 模拟缓存命中
+        cached_result = {
+            "total_score": 90.0,
+            "dimension_scores": {},
+            "logic_lock": {
+                "definition_score": 1.0,
+                "analysis_score": 1.0,
+                "solution_score": 1.0,
+                "breaks": [],
+                "evidence": [],
+            },
+            "penalties": [],
+            "penalties_logic_lock": [],
+            "penalties_empty_promises": [],
+            "penalties_action_missing": [],
+            "suggestions": [],
+            "meta": {},
+            "judge_mode": "local",
+            "judge_source": "scorer",
+            "fallback_reason": "",
+        }
+        mock_cache_get.return_value = cached_result
+
+        response = client.post("/api/v1/score", json={"text": "缓存测试"})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_score"] == 90.0
+
+        # 验证 score_text 没有被调用（使用了缓存）
+        mock_score.assert_not_called()
+
+
+class TestProjectLevelCacheIntegration:
+    """Tests for project-level endpoint cache integration."""
+
+    @patch("app.main.get_cached_score")
+    @patch("app.main.cache_score_result")
+    @patch("app.main.save_submissions")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.load_config")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.score_text")
+    def test_upload_shigong_uses_cache(
+        self,
+        mock_score,
+        mock_ensure,
+        mock_load_proj,
+        mock_config,
+        mock_profiles,
+        mock_load_sub,
+        mock_save_sub,
+        mock_cache_set,
+        mock_cache_get,
+        client,
+    ):
+        """Upload shigong should check cache first."""
+        # 模拟缓存未命中
+        mock_cache_get.return_value = None
+        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_config.return_value = MagicMock(rubric={}, lexicon={})
+        mock_profiles.return_value = []
+        mock_load_sub.return_value = []
+        mock_score.return_value = MagicMock(
+            model_dump=lambda: {"total_score": 80.0, "dimension_scores": {}, "penalties": []}
+        )
+
+        response = client.post(
+            "/api/v1/projects/p1/shigong",
+            files={"file": ("test.txt", BytesIO(b"test content"), "text/plain")},
+        )
+        assert response.status_code == 200
+
+        # 验证缓存被检查（不带 config_hash，因为没有 multipliers）
+        mock_cache_get.assert_called_once_with("test content", None)
+        # 验证结果被缓存
+        mock_cache_set.assert_called_once()
+
+    @patch("app.main.get_cached_score")
+    @patch("app.main.save_submissions")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.load_config")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.score_text")
+    def test_upload_shigong_returns_cached_result(
+        self,
+        mock_score,
+        mock_ensure,
+        mock_load_proj,
+        mock_config,
+        mock_profiles,
+        mock_load_sub,
+        mock_save_sub,
+        mock_cache_get,
+        client,
+    ):
+        """Upload shigong should return cached result when available."""
+        # 模拟缓存命中
+        cached_result = {
+            "total_score": 88.0,
+            "dimension_scores": {},
+            "penalties": [],
+        }
+        mock_cache_get.return_value = cached_result
+        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_config.return_value = MagicMock(rubric={}, lexicon={})
+        mock_profiles.return_value = []
+        mock_load_sub.return_value = []
+
+        response = client.post(
+            "/api/v1/projects/p1/shigong",
+            files={"file": ("test.txt", BytesIO(b"cached text"), "text/plain")},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_score"] == 88.0
+
+        # 验证 score_text 没有被调用（使用了缓存）
+        mock_score.assert_not_called()
+
+    @patch("app.main.get_cached_score")
+    @patch("app.main.cache_score_result")
+    @patch("app.main.save_submissions")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.load_config")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.score_text")
+    def test_upload_shigong_cache_with_multipliers(
+        self,
+        mock_score,
+        mock_ensure,
+        mock_load_proj,
+        mock_config,
+        mock_profiles,
+        mock_load_sub,
+        mock_save_sub,
+        mock_cache_set,
+        mock_cache_get,
+        client,
+    ):
+        """Upload shigong should use config_hash when multipliers exist."""
+        # 模拟缓存未命中
+        mock_cache_get.return_value = None
+        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_config.return_value = MagicMock(rubric={}, lexicon={})
+        mock_profiles.return_value = [{"project_id": "p1", "dimension_multipliers": {"D01": 1.2}}]
+        mock_load_sub.return_value = []
+        mock_score.return_value = MagicMock(
+            model_dump=lambda: {"total_score": 82.0, "dimension_scores": {}, "penalties": []}
+        )
+
+        response = client.post(
+            "/api/v1/projects/p1/shigong",
+            files={"file": ("test.txt", BytesIO(b"test content"), "text/plain")},
+        )
+        assert response.status_code == 200
+
+        # 验证缓存被检查时包含 config_hash
+        call_args = mock_cache_get.call_args
+        assert call_args[0][0] == "test content"
+        # config_hash 应该不是 None（因为有 multipliers）
+        assert call_args[0][1] is not None
+
+    @patch("app.main.get_cached_score")
+    @patch("app.main.cache_score_result")
+    @patch("app.main.save_submissions")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.load_config")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.score_text")
+    def test_score_for_project_uses_cache(
+        self,
+        mock_score,
+        mock_ensure,
+        mock_load_proj,
+        mock_config,
+        mock_profiles,
+        mock_load_sub,
+        mock_save_sub,
+        mock_cache_set,
+        mock_cache_get,
+        client,
+    ):
+        """Score for project should check cache first."""
+        # 模拟缓存未命中
+        mock_cache_get.return_value = None
+        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_config.return_value = MagicMock(rubric={}, lexicon={})
+        mock_profiles.return_value = []
+        mock_load_sub.return_value = []
+        mock_score.return_value = MagicMock(
+            model_dump=lambda: {"total_score": 75.0, "dimension_scores": {}, "penalties": []}
+        )
+
+        response = client.post("/api/v1/projects/p1/score", json={"text": "测试文本"})
+        assert response.status_code == 200
+
+        # 验证缓存被检查
+        mock_cache_get.assert_called_once_with("测试文本", None)
+        # 验证结果被缓存
+        mock_cache_set.assert_called_once()
+
+    @patch("app.main.get_cached_score")
+    @patch("app.main.save_submissions")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.load_config")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.score_text")
+    def test_score_for_project_returns_cached_result(
+        self,
+        mock_score,
+        mock_ensure,
+        mock_load_proj,
+        mock_config,
+        mock_profiles,
+        mock_load_sub,
+        mock_save_sub,
+        mock_cache_get,
+        client,
+    ):
+        """Score for project should return cached result when available."""
+        # 模拟缓存命中
+        cached_result = {
+            "total_score": 92.0,
+            "dimension_scores": {},
+            "penalties": [],
+        }
+        mock_cache_get.return_value = cached_result
+        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_config.return_value = MagicMock(rubric={}, lexicon={})
+        mock_profiles.return_value = []
+        mock_load_sub.return_value = []
+
+        response = client.post("/api/v1/projects/p1/score", json={"text": "缓存测试"})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_score"] == 92.0
+
+        # 验证 score_text 没有被调用（使用了缓存）
+        mock_score.assert_not_called()
+
+    @patch("app.main.get_cached_score")
+    @patch("app.main.cache_score_result")
+    @patch("app.main.save_submissions")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.load_config")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.score_text")
+    def test_score_for_project_cache_with_multipliers(
+        self,
+        mock_score,
+        mock_ensure,
+        mock_load_proj,
+        mock_config,
+        mock_profiles,
+        mock_load_sub,
+        mock_save_sub,
+        mock_cache_set,
+        mock_cache_get,
+        client,
+    ):
+        """Score for project should use config_hash when multipliers exist."""
+        # 模拟缓存未命中
+        mock_cache_get.return_value = None
+        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_config.return_value = MagicMock(rubric={}, lexicon={})
+        mock_profiles.return_value = [{"project_id": "p1", "dimension_multipliers": {"D01": 1.3}}]
+        mock_load_sub.return_value = []
+        mock_score.return_value = MagicMock(
+            model_dump=lambda: {"total_score": 78.0, "dimension_scores": {}, "penalties": []}
+        )
+
+        response = client.post("/api/v1/projects/p1/score", json={"text": "测试文本"})
+        assert response.status_code == 200
+
+        # 验证缓存被检查时包含 config_hash
+        call_args = mock_cache_get.call_args
+        assert call_args[0][0] == "测试文本"
+        # config_hash 应该不是 None（因为有 multipliers）
+        assert call_args[0][1] is not None
+
+
+class TestComputeMultipliersHash:
+    """Tests for _compute_multipliers_hash helper function."""
+
+    def test_compute_multipliers_hash_same_input(self):
+        """Same multipliers should produce same hash."""
+        from app.main import _compute_multipliers_hash
+
+        hash1 = _compute_multipliers_hash({"D01": 1.2, "D02": 1.1})
+        hash2 = _compute_multipliers_hash({"D01": 1.2, "D02": 1.1})
+        assert hash1 == hash2
+
+    def test_compute_multipliers_hash_different_input(self):
+        """Different multipliers should produce different hash."""
+        from app.main import _compute_multipliers_hash
+
+        hash1 = _compute_multipliers_hash({"D01": 1.2})
+        hash2 = _compute_multipliers_hash({"D01": 1.3})
+        assert hash1 != hash2
+
+    def test_compute_multipliers_hash_order_independent(self):
+        """Hash should be order independent."""
+        from app.main import _compute_multipliers_hash
+
+        hash1 = _compute_multipliers_hash({"D01": 1.2, "D02": 1.1})
+        hash2 = _compute_multipliers_hash({"D02": 1.1, "D01": 1.2})
+        assert hash1 == hash2
+
+    def test_compute_multipliers_hash_empty(self):
+        """Empty dict should produce valid hash."""
+        from app.main import _compute_multipliers_hash
+
+        hash_value = _compute_multipliers_hash({})
+        assert hash_value is not None
+        assert len(hash_value) == 16  # 截断为 16 字符
