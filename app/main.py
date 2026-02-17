@@ -6001,7 +6001,7 @@ def index(
             <strong>添加资料：</strong>
             <input type="hidden" name="project_id" id="uploadMaterialProjectId" value="__SELECTED_PROJECT_ID__" />
             <input type="file" name="file" accept=".txt,.pdf,.doc,.docx,.json,.xlsx,.xls" multiple />
-            <button type="button" id="btnUploadMaterials" onclick="return window.__zhifeiFallbackClick(event, 'btnUploadMaterials')">上传资料</button>
+            <button type="submit" id="btnUploadMaterials">上传资料</button>
             <span class="note">支持一次选择多个文件（Mac 按 Command，Windows 按 Ctrl）。</span>
           </form>
           <p id="materialsActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
@@ -6037,8 +6037,8 @@ def index(
             <strong>添加施组：</strong>
             <input type="hidden" name="project_id" id="uploadShigongProjectId" value="__SELECTED_PROJECT_ID__" />
             <input type="file" name="file" accept=".txt,.docx,.pdf,.json,.xlsx,.xls" multiple />
-            <button type="button" id="btnUploadShigong" onclick="return window.__zhifeiFallbackClick(event, 'btnUploadShigong')">上传施组</button>
-            <button type="button" id="btnScoreShigong" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnScoreShigong')">评分施组</button>
+            <button type="submit" id="btnUploadShigong">上传施组</button>
+            <button type="submit" id="btnScoreShigong" class="secondary" formaction="/web/score_shigong">评分施组</button>
             <span class="note">支持一次选择多个文件（Mac 按 Command，Windows 按 Ctrl）。</span>
           </form>
           <p id="shigongActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
@@ -7868,10 +7868,6 @@ def index(
             scoreShigongInFlight = false;
           }
         }
-        safeClick('btnUploadMaterials', uploadMaterialsAction);
-        safeClick('btnUploadShigong', uploadShigongAction);
-        safeClick('btnScoreShigong', scoreShigongAction);
-
         function updateTableEmptyState(tableId, emptyId) {
           const table = document.getElementById(tableId);
           const tbody = table ? table.querySelector('tbody') : null;

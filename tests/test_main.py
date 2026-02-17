@@ -124,26 +124,17 @@ class TestIndexEndpoint:
         ):
             assert f"safeClick('{button_id}'" in page
 
-    def test_index_shigong_upload_uses_button_handlers_without_form_navigation(self, client):
-        """Shigong upload/score should use button handlers to avoid full-page form navigation."""
+    def test_index_upload_buttons_use_form_submit_with_fallback(self, client):
+        """Upload buttons should stay submit-capable for non-JS fallback while JS may hijack onsubmit."""
         response = client.get("/")
         assert response.status_code == 200
         page = response.text
-        assert (
-            '<button type="button" id="btnUploadMaterials" onclick="return window.__zhifeiFallbackClick(event, \'btnUploadMaterials\')">上传资料</button>'
-            in page
-        )
-        assert (
-            '<button type="button" id="btnUploadShigong" onclick="return window.__zhifeiFallbackClick(event, \'btnUploadShigong\')">上传施组</button>'
-            in page
-        )
-        assert (
-            '<button type="button" id="btnScoreShigong" class="secondary" onclick="return window.__zhifeiFallbackClick(event, \'btnScoreShigong\')">评分施组</button>'
-            in page
-        )
-        assert "safeClick('btnUploadMaterials', uploadMaterialsAction);" in page
-        assert "safeClick('btnUploadShigong', uploadShigongAction);" in page
-        assert "safeClick('btnScoreShigong', scoreShigongAction);" in page
+        assert '<button type="submit" id="btnUploadMaterials">上传资料</button>' in page
+        assert '<button type="submit" id="btnUploadShigong">上传施组</button>' in page
+        assert 'id="btnScoreShigong" class="secondary" formaction="/web/score_shigong"' in page
+        assert "safeClick('btnUploadMaterials', uploadMaterialsAction);" not in page
+        assert "safeClick('btnUploadShigong', uploadShigongAction);" not in page
+        assert "safeClick('btnScoreShigong', scoreShigongAction);" not in page
         assert "function captureViewportY()" not in page
         assert "function restoreViewportY(y)" not in page
         assert "let uploadShigongInFlight = false;" in page
