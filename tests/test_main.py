@@ -130,8 +130,11 @@ class TestIndexEndpoint:
         assert response.status_code == 200
         page = response.text
         assert '<button type="submit" id="btnUploadMaterials">上传资料</button>' in page
-        assert '<button type="submit" id="btnUploadShigong">上传施组</button>' in page
-        assert 'id="btnScoreShigong" class="secondary" formaction="/web/score_shigong"' in page
+        assert 'id="btnUploadShigong" name="submit_action" value="upload"' in page
+        assert (
+            'id="btnScoreShigong" class="secondary" formaction="/web/score_shigong" name="submit_action" value="score"'
+            in page
+        )
         assert "safeClick('btnUploadMaterials', uploadMaterialsAction);" not in page
         assert "safeClick('btnUploadShigong', uploadShigongAction);" not in page
         assert "safeClick('btnScoreShigong', scoreShigongAction);" not in page
@@ -139,6 +142,11 @@ class TestIndexEndpoint:
         assert "function restoreViewportY(y)" not in page
         assert "let uploadShigongInFlight = false;" in page
         assert "let scoreShigongInFlight = false;" in page
+        assert "let shigongSubmitIntent = 'upload';" in page
+        assert (
+            "const isScoreSubmit = sid === 'btnScoreShigong' || shigongSubmitIntent === 'score';"
+            in page
+        )
         assert "/submissions?t=' + Date.now()" in page
 
 

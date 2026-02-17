@@ -6037,8 +6037,8 @@ def index(
             <strong>添加施组：</strong>
             <input type="hidden" name="project_id" id="uploadShigongProjectId" value="__SELECTED_PROJECT_ID__" />
             <input type="file" name="file" accept=".txt,.docx,.pdf,.json,.xlsx,.xls" multiple />
-            <button type="submit" id="btnUploadShigong">上传施组</button>
-            <button type="submit" id="btnScoreShigong" class="secondary" formaction="/web/score_shigong">评分施组</button>
+            <button type="submit" id="btnUploadShigong" name="submit_action" value="upload">上传施组</button>
+            <button type="submit" id="btnScoreShigong" class="secondary" formaction="/web/score_shigong" name="submit_action" value="score">评分施组</button>
             <span class="note">支持一次选择多个文件（Mac 按 Command，Windows 按 Ctrl）。</span>
           </form>
           <p id="shigongActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
@@ -7746,12 +7746,27 @@ def index(
         const formShigong = document.getElementById('uploadShigong');
         let uploadShigongInFlight = false;
         let scoreShigongInFlight = false;
+        let shigongSubmitIntent = 'upload';
+        const btnUploadShigong = document.getElementById('btnUploadShigong');
+        const btnScoreShigong = document.getElementById('btnScoreShigong');
+        if (btnUploadShigong) {
+          btnUploadShigong.addEventListener('click', () => { shigongSubmitIntent = 'upload'; });
+        }
+        if (btnScoreShigong) {
+          btnScoreShigong.addEventListener('click', () => { shigongSubmitIntent = 'score'; });
+        }
         if (formShigong) {
           formShigong.onsubmit = async (e) => {
             e.preventDefault();
             e.stopPropagation();
-            const sid = e && e.submitter ? String(e.submitter.id || '') : '';
-            if (sid === 'btnScoreShigong') await scoreShigongAction();
+            let sid = e && e.submitter ? String(e.submitter.id || '') : '';
+            if (!sid) {
+              const active = document.activeElement;
+              sid = active && active.id ? String(active.id) : '';
+            }
+            const isScoreSubmit = sid === 'btnScoreShigong' || shigongSubmitIntent === 'score';
+            shigongSubmitIntent = 'upload';
+            if (isScoreSubmit) await scoreShigongAction();
             else await uploadShigongAction();
             return false;
           };
