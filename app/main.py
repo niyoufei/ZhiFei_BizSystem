@@ -7243,8 +7243,8 @@ def index(
         <div id="learningResult" class="result-block" style="display:none"></div>
       </div>
 
-      <div class="section card">
-        <h2>6) 自适应优化</h2>
+      <div class="section card" id="section-adaptive" style="display:none">
+        <h2>6) 自适应优化（高级维护）</h2>
         <p style="font-size:12px;color:#64748b;margin:-4px 0 8px 0">基于本项目施组扣分统计给出词库/规则优化建议 → 生成补丁 → 验证效果 → 应用补丁（需 API Key）。</p>
         <div class="action-row" style="margin-bottom:6px">
           <button type="button" id="btnAdaptive" onclick="return window.__zhifeiFallbackClick(event, 'btnAdaptive')">自适应建议</button>
@@ -7319,8 +7319,12 @@ def index(
           <button type="button" id="btnWritingGuidance" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnWritingGuidance')">查看编制指导</button>
           <button type="button" id="btnCompilationInstructions" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnCompilationInstructions')">编制系统指令（可导出为编制约束）</button>
         </div>
-        <details style="margin:12px 0 8px 0;padding:10px;border:1px dashed #cbd5e1;border-radius:8px;background:#f8fafc">
-          <summary style="cursor:pointer"><strong>V2 反演校准闭环（高级，可忽略）</strong></summary>
+        <details open style="margin:12px 0 8px 0;padding:10px;border:2px solid #f59e0b;border-radius:8px;background:#fff7ed">
+          <summary style="cursor:pointer;color:#9a3412"><strong>V2 反演校准闭环（核心能力，强烈建议执行）</strong></summary>
+          <p style="margin:8px 0 10px 0;color:#7c2d12;font-size:13px">
+            该闭环会自动训练并部署校准器（CV闸门）、回填预测分，并联动补丁影子评估/发布。
+            为使系统评分持续逼近青天标准，建议每次录入真实评标后执行一次「一键闭环执行」。
+          </p>
           <div style="margin-top:8px">
             <button type="button" id="btnRebuildDelta" class="secondary">重建 DELTA_CASE</button>
             <button type="button" id="btnRebuildSamples" class="secondary">重建 FEATURE_ROW</button>
