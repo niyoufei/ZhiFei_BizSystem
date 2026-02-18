@@ -6737,9 +6737,162 @@ def index(
     <body>
       <h1>青天评标系统 - 上传与对比 (v2)</h1>
       <p style="margin:-8px 0 16px 0;padding:10px;background:#e0f2fe;border-radius:6px;font-size:14px;">
-        <strong>首次使用：</strong>① 创建项目 → ② 刷新并选择项目 → ③ 上传施组文件 → 自动评分。数据保存在本机，无需额外配置。
+        <strong>首次使用：</strong>① 创建项目 → ② 刷新并选择项目 → ③ 上传施组文件 → ④ 点击“评分施组”出分。数据保存在本机，无需额外配置。
       </p>
       __GLOBAL_NOTICE_HTML__
+      <script>
+        (function () {
+          // Early fallback shim: guarantees visible response even if later scripts crash.
+          if (window.__zhifeiEarlyFallbackReady) return;
+          window.__zhifeiEarlyFallbackReady = true;
+
+          function pickProjectId() {
+            const sel = document.getElementById('projectSelect');
+            return (sel && sel.value) ? String(sel.value) : '';
+          }
+          function apiHeaders(isJson) {
+            const h = {};
+            try {
+              const k = localStorage.getItem('api_key') || '';
+              if (k) h['X-API-Key'] = k;
+            } catch (_) {}
+            if (isJson) h['Content-Type'] = 'application/json';
+            return h;
+          }
+          function esc(v) {
+            return String(v == null ? '' : v)
+              .replace(/&/g, '&amp;')
+              .replace(/</g, '&lt;')
+              .replace(/>/g, '&gt;')
+              .replace(/"/g, '&quot;')
+              .replace(/'/g, '&#39;');
+          }
+          function setResult(resultId, text, isError) {
+            const el = resultId ? document.getElementById(resultId) : null;
+            if (!el) return;
+            el.style.display = 'block';
+            el.innerHTML = '<span class="' + (isError ? 'error' : 'success') + '">' + esc(text || '') + '</span>';
+          }
+          function setResultHtml(resultId, html) {
+            const el = resultId ? document.getElementById(resultId) : null;
+            if (!el) return;
+            el.style.display = 'block';
+            el.innerHTML = html || '';
+          }
+          function setOutput(text) {
+            const out = document.getElementById('output');
+            if (out) out.textContent = String(text || '');
+          }
+          function parseJson(text) {
+            try { return JSON.parse(text || '{}'); } catch (_) { return {}; }
+          }
+          function selectedScoreScaleMax() {
+            const el = document.getElementById('scoreScaleSelect');
+            const raw = (el && el.value) ? String(el.value).trim() : '100';
+            return raw === '5' ? 5 : 100;
+          }
+
+          const EARLY_ACTIONS = {
+            btnCompare: { resultId: 'compareResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare', loading: '对比排名加载中...' },
+            btnCompareReport: { resultId: 'compareReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare_report', loading: '对比报告生成中...' },
+            btnInsights: { resultId: 'insightsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/insights', loading: '洞察分析中...' },
+            btnLearning: { resultId: 'learningResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/learning', loading: '学习画像生成中...' },
+            btnAdaptive: { resultId: 'adaptiveResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/adaptive', loading: '自适应建议生成中...' },
+            btnAdaptivePatch: { resultId: 'adaptivePatchResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/adaptive_patch', loading: '补丁生成中...' },
+            btnAdaptiveValidate: { resultId: 'adaptiveValidateResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/adaptive_validate', loading: '验证效果计算中...' },
+            btnAdaptiveApply: { resultId: 'adaptiveApplyResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/adaptive_apply', loading: '应用补丁中...' },
+            btnRefreshGroundTruth: { resultId: 'evolveResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/ground_truth', loading: '真实评标列表刷新中...' },
+            btnRefreshGroundTruthSubmissionOptions: { resultId: 'evolveResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/submissions', loading: '施组选项刷新中...' },
+            btnEvolve: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/evolve', loading: '学习进化执行中...' },
+            btnWritingGuidance: { resultId: 'guidanceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/writing_guidance', loading: '正在生成编制指导...' },
+            btnCompilationInstructions: { resultId: 'compilationInstructionsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compilation_instructions', loading: '正在生成编制系统指令...' },
+            btnScoreShigong: { resultId: 'shigongActionStatus', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/rescore', loading: '施组评分中...' },
+          };
+          window.__ZHIFEI_FALLBACK_ACTIONS = window.__ZHIFEI_FALLBACK_ACTIONS || {};
+          Object.keys(EARLY_ACTIONS).forEach((k) => { window.__ZHIFEI_FALLBACK_ACTIONS[k] = EARLY_ACTIONS[k]; });
+
+          async function runEarlyAction(actionId) {
+            const cfg = EARLY_ACTIONS[String(actionId || '')];
+            if (!cfg) return true;
+            const projectId = pickProjectId();
+            if (!projectId) {
+              setResult(cfg.resultId, '请先在「2) 选择项目」中选择项目', true);
+              setOutput('[' + actionId + '] 缺少项目ID');
+              return false;
+            }
+            setResult(cfg.resultId, cfg.loading || '处理中...', false);
+            let url = cfg.path(projectId);
+            let method = cfg.method || 'GET';
+            let headers = apiHeaders(false);
+            let body;
+            if (actionId === 'btnScoreShigong') {
+              headers = apiHeaders(true);
+              body = JSON.stringify({
+                scope: 'project',
+                scoring_engine_version: 'v2',
+                score_scale_max: selectedScoreScaleMax(),
+              });
+            }
+            let res;
+            let text = '';
+            try {
+              res = await fetch(url, { method, headers, body });
+              text = await res.text();
+            } catch (err) {
+              setResult(cfg.resultId, '网络异常：' + String((err && err.message) || err || 'unknown'), true);
+              setOutput('[' + actionId + '] 网络异常');
+              return false;
+            }
+            const data = parseJson(text);
+            setOutput('[' + actionId + '] HTTP ' + String(res.status || 0) + '\n' + (text || ''));
+            if (!res.ok) {
+              setResult(cfg.resultId, '[' + actionId + '] 请求失败：' + String((data && data.detail) || ('HTTP ' + res.status)), true);
+              return false;
+            }
+            if (actionId === 'btnCompare') {
+              const rows = Array.isArray(data.rankings) ? data.rankings : [];
+              const html = '<strong>排名</strong><table><tr><th>文件名</th><th>总分</th><th>时间</th></tr>' +
+                (rows.length
+                  ? rows.map((r) => '<tr><td>' + esc(r.filename || '') + '</td><td>' + esc(r.total_score) + '</td><td>' + esc(r.created_at || '') + '</td></tr>').join('')
+                  : '<tr><td colspan="3">暂无施组评分数据</td></tr>') +
+                '</table>';
+              setResultHtml(cfg.resultId, html);
+              return true;
+            }
+            if (actionId === 'btnRefreshGroundTruthSubmissionOptions') {
+              const sel = document.getElementById('groundTruthSubmissionSelect');
+              const subs = Array.isArray(data) ? data : [];
+              if (sel) {
+                sel.innerHTML = '';
+                const lead = document.createElement('option');
+                lead.value = '';
+                lead.textContent = subs.length ? '-- 请选择步骤4已上传施组文件 --' : '-- 暂无施组，请先在步骤4上传 --';
+                sel.appendChild(lead);
+                subs.forEach((s) => {
+                  const opt = document.createElement('option');
+                  opt.value = String((s && s.id) || '');
+                  opt.textContent = String((s && s.filename) || '未命名施组');
+                  sel.appendChild(opt);
+                });
+              }
+              setResult(cfg.resultId, '施组选项刷新完成：共 ' + subs.length + ' 份。', false);
+              return true;
+            }
+            setResultHtml(cfg.resultId, '<pre>' + esc(text || '{}') + '</pre>');
+            return true;
+          }
+
+          window.__zhifeiFallbackClick = function (ev, actionId) {
+            if (ev) {
+              if (typeof ev.preventDefault === 'function') ev.preventDefault();
+              if (typeof ev.stopPropagation === 'function') ev.stopPropagation();
+              if (typeof ev.stopImmediatePropagation === 'function') ev.stopImmediatePropagation();
+            }
+            runEarlyAction(actionId);
+            return false;
+          };
+        })();
+      </script>
 
       <div class="section card">
         <h2>1) 创建项目</h2>
@@ -6987,7 +7140,7 @@ def index(
           if (bootScoreScaleEl) {
             bootScoreScaleEl.value = BOOTSTRAP_SCORE_SCALE_MAX === '5' ? '5' : '100';
           }
-          const FALLBACK_ACTIONS = {
+          const FALLBACK_ACTIONS = Object.assign(window.__ZHIFEI_FALLBACK_ACTIONS || {}, {
             btnWeightsSave: { resultId: 'output', method: 'PUT', path: (pid) => '/api/v1/projects/' + pid + '/expert-profile', loading: '专家配置保存中...' },
             btnWeightsApply: { resultId: 'output', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/rescore', loading: '按当前关注度重算中...' },
             btnUploadMaterials: { resultId: 'materialsActionStatus', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/materials', loading: '资料上传中...' },
@@ -7009,7 +7162,8 @@ def index(
             btnEvolve: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/evolve', loading: '学习进化执行中...' },
             btnWritingGuidance: { resultId: 'guidanceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/writing_guidance', loading: '正在生成编制指导...' },
             btnCompilationInstructions: { resultId: 'compilationInstructionsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compilation_instructions', loading: '正在生成编制系统指令...' },
-          };
+          });
+          window.__ZHIFEI_FALLBACK_ACTIONS = FALLBACK_ACTIONS;
 
           function fallbackGetProjectId() {
             const sel = document.getElementById('projectSelect');
@@ -7672,7 +7826,7 @@ def index(
             try {
               await fn(ev);
             } catch (err) {
-              const cfg = FALLBACK_ACTIONS[id] || {};
+              const cfg = (window.__ZHIFEI_FALLBACK_ACTIONS && window.__ZHIFEI_FALLBACK_ACTIONS[id]) || {};
               const msg = '执行失败：' + String((err && err.message) || err || '未知错误');
               if (cfg.resultId && typeof setResultError === 'function') {
                 setResultError(cfg.resultId, msg);
