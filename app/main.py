@@ -8987,13 +8987,16 @@ def index(
           let html = '<p class="' + klass + '">' + title + '</p>';
           const data = payload && typeof payload === 'object' ? payload : {};
           if (ok) {
+            const summary = (data.calibrator_summary && typeof data.calibrator_summary === 'object') ? data.calibrator_summary : {};
             const metrics = data.metrics || {};
-            const cv = data.calibrator_cv_metrics || {};
-            const baseline = data.calibrator_baseline_metrics || {};
-            const gate = data.calibrator_gate || {};
-            const modelType = data.calibrator_model_type || data.model_type || '-';
-            const version = data.calibrator_version || '-';
-            const gatePassed = data.calibrator_gate_passed ?? metrics.gate_passed;
+            const cv = summary.cv_metrics || data.calibrator_cv_metrics || {};
+            const baseline = summary.baseline_metrics || data.calibrator_baseline_metrics || {};
+            const gate = summary.gate || data.calibrator_gate || {};
+            const modelType = summary.model_type || data.calibrator_model_type || data.model_type || '-';
+            const version = summary.calibrator_version || data.calibrator_version || '-';
+            const gatePassed = summary.gate_passed ?? data.calibrator_gate_passed ?? metrics.gate_passed;
+            const sampleCount = summary.sample_count;
+            const skippedReason = summary.skipped_reason || '';
             const cvMae = cv.mae ?? metrics.cv_mae;
             const cvRmse = cv.rmse ?? metrics.cv_rmse;
             const cvSpearman = cv.spearman ?? metrics.cv_spearman;
@@ -9005,13 +9008,16 @@ def index(
             const cvMode = cv.mode ?? metrics.cv_mode;
             const cvPredCount = cv.pred_count ?? metrics.cv_pred_count;
             const gateText = typeof gatePassed === 'boolean' ? (gatePassed ? '通过' : '未通过') : '-';
-            html += '<p style="margin:4px 0"><b>模型</b>：' + modelType + '；<b>版本</b>：' + version + '；<b>闸门</b>：' + gateText + '</p>';
+            html += '<p style="margin:4px 0"><b>校准摘要</b>：模型=' + modelType + '；版本=' + version + '；闸门=' + gateText + (sampleCount != null ? ('；样本=' + sampleCount) : '') + '</p>';
+            if (skippedReason) {
+              html += '<p style="margin:4px 0;color:#9a3412"><b>提示</b>：本次未训练校准器（' + skippedReason + '）。</p>';
+            }
             if (cvMae !== undefined || baselineMae !== undefined) {
               html += '<p style="margin:4px 0"><b>CV</b> MAE=' + fmtMetric(cvMae) + ' RMSE=' + fmtMetric(cvRmse) + ' Spearman=' + fmtMetric(cvSpearman) + '（' + (cvMode || '-') + ', n=' + (cvPredCount || 0) + '）</p>';
               html += '<p style="margin:4px 0"><b>Baseline</b> MAE=' + fmtMetric(baselineMae) + ' RMSE=' + fmtMetric(baselineRmse) + ' Spearman=' + fmtMetric(baselineSpearman) + '</p>';
               html += '<p style="margin:4px 0"><b>闸门阈值</b> MAE改进≥' + fmtMetric(improveThreshold) + '，Spearman不下降超过' + fmtMetric(spearmanTolerance) + '</p>';
             }
-            const candidates = Array.isArray(data.calibrator_auto_candidates) ? data.calibrator_auto_candidates : [];
+            const candidates = Array.isArray(summary.auto_candidates) ? summary.auto_candidates : (Array.isArray(data.calibrator_auto_candidates) ? data.calibrator_auto_candidates : []);
             if (candidates.length) {
               const rows = candidates.map((c) => {
                 const gt = c.gate_passed === true ? '通过' : '未通过';
