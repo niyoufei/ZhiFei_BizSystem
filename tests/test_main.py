@@ -667,6 +667,7 @@ class TestExpertProfileEndpoints:
         mock_save_profiles.assert_called_once()
         mock_save_projects.assert_called_once()
 
+    @patch("app.main._run_feedback_closed_loop")
     @patch("app.main.record_history_score")
     @patch("app.main.save_score_reports")
     @patch("app.main.load_score_reports")
@@ -691,6 +692,7 @@ class TestExpertProfileEndpoints:
         mock_load_score_reports,
         mock_save_score_reports,
         mock_record_history,
+        mock_feedback_loop,
         client,
     ):
         mock_load_projects.return_value = [
@@ -747,6 +749,7 @@ class TestExpertProfileEndpoints:
         mock_save_submissions.assert_called_once()
         mock_save_score_reports.assert_called_once()
         mock_record_history.assert_called_once()
+        mock_feedback_loop.assert_called_once_with("p1", locale="zh", trigger="rescore")
 
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
@@ -771,6 +774,59 @@ class TestExpertProfileEndpoints:
         )
         assert response.status_code == 409
         assert "force_unlock=true" in response.json()["detail"]
+
+
+class TestFeedbackLoopHooks:
+    @patch("app.main._run_feedback_closed_loop")
+    @patch("app.main.save_calibration_samples")
+    @patch("app.main.load_calibration_samples")
+    @patch("app.main.save_delta_cases")
+    @patch("app.main.load_delta_cases")
+    @patch("app.main.save_qingtian_results")
+    @patch("app.main.load_qingtian_results")
+    @patch("app.main.save_evidence_units")
+    @patch("app.main.load_evidence_units")
+    @patch("app.main.save_score_reports")
+    @patch("app.main.load_score_reports")
+    @patch("app.main.save_submissions")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_delete_submission_triggers_feedback_loop(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_submissions,
+        mock_save_submissions,
+        mock_load_score_reports,
+        mock_save_score_reports,
+        mock_load_evidence_units,
+        mock_save_evidence_units,
+        mock_load_qingtian_results,
+        mock_save_qingtian_results,
+        mock_load_delta_cases,
+        mock_save_delta_cases,
+        mock_load_calibration_samples,
+        mock_save_calibration_samples,
+        mock_feedback_loop,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1"}]
+        mock_load_submissions.return_value = [
+            {"id": "s1", "project_id": "p1", "filename": "f1.txt", "path": ""}
+        ]
+        mock_load_score_reports.return_value = [
+            {"id": "r1", "project_id": "p1", "submission_id": "s1"}
+        ]
+        mock_load_evidence_units.return_value = [{"submission_id": "s1"}]
+        mock_load_qingtian_results.return_value = [{"submission_id": "s1"}]
+        mock_load_delta_cases.return_value = [{"submission_id": "s1"}]
+        mock_load_calibration_samples.return_value = [{"submission_id": "s1"}]
+
+        response = client.delete("/api/v1/projects/p1/submissions/s1")
+        assert response.status_code == 200
+        assert response.json()["ok"] is True
+        mock_feedback_loop.assert_called_once_with("p1", locale="zh", trigger="delete_submission")
 
 
 class TestMaterialsEndpoint:
@@ -1206,10 +1262,23 @@ class TestCompareEndpoints:
         # First should have higher score
         assert data["rankings"][0]["total_score"] == 80.0
 
+    @patch("app.main.load_calibration_models")
+    @patch("app.main.load_projects")
     @patch("app.main.load_submissions")
     @patch("app.main.ensure_data_dirs")
-    def test_compare_prefers_pred_total_score(self, mock_ensure, mock_load, client):
+    def test_compare_prefers_pred_total_score(
+        self, mock_ensure, mock_load, mock_load_projects, mock_load_models, client
+    ):
         """Compare ranking should prioritize pred_total_score and keep rule_total_score trace."""
+        mock_load_projects.return_value = [{"id": "p1", "calibrator_version_locked": "calib1"}]
+        mock_load_models.return_value = [
+            {
+                "calibrator_version": "calib1",
+                "deployed": True,
+                "created_at": "2026-01-02T00:00:00Z",
+                "train_filter": {"project_id": "p1"},
+            }
+        ]
         mock_load.return_value = [
             {
                 "id": "s1",
@@ -1264,12 +1333,29 @@ class TestCompareEndpoints:
         assert data["project_id"] == "p1"
 
     @patch("app.main.build_compare_narrative")
+    @patch("app.main.load_calibration_models")
+    @patch("app.main.load_projects")
     @patch("app.main.load_submissions")
     @patch("app.main.ensure_data_dirs")
     def test_compare_report_enriches_pred_and_rule(
-        self, mock_ensure, mock_load, mock_narrative, client
+        self,
+        mock_ensure,
+        mock_load,
+        mock_load_projects,
+        mock_load_models,
+        mock_narrative,
+        client,
     ):
         """Compare narrative should be built with pred-priority total and expose trace scores."""
+        mock_load_projects.return_value = [{"id": "p1", "calibrator_version_locked": "calib1"}]
+        mock_load_models.return_value = [
+            {
+                "calibrator_version": "calib1",
+                "deployed": True,
+                "created_at": "2026-01-02T00:00:00Z",
+                "train_filter": {"project_id": "p1"},
+            }
+        ]
         mock_load.return_value = [
             {
                 "id": "s1",

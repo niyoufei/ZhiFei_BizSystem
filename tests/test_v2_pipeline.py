@@ -301,6 +301,121 @@ class TestCalibratorEndpoints:
         mock_save_reports.assert_called_once()
         mock_save_submissions.assert_called_once()
 
+    @patch("app.main.save_submissions")
+    @patch("app.main.save_score_reports")
+    @patch("app.main.load_score_reports")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_calibration_models")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_apply_calibration_prediction_blends_rule_and_llm(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_models,
+        mock_load_submissions,
+        mock_load_reports,
+        mock_save_reports,
+        mock_save_submissions,
+    ):
+        mock_load_projects.return_value = [
+            {"id": "p1", "name": "项目1", "calibrator_version_locked": "calib1", "meta": {}}
+        ]
+        mock_load_models.return_value = [
+            {
+                "calibrator_version": "calib1",
+                "deployed": True,
+                "created_at": "2026-02-06T12:00:00Z",
+                "train_filter": {"project_id": "p1"},
+                "model_artifact": {
+                    "model_type": "offset",
+                    "bias": 80.0,  # raw llm score => 100 (clip), then bounded by delta cap
+                    "sigma": 2.0,
+                },
+            }
+        ]
+        mock_load_submissions.return_value = [
+            {"id": "s1", "project_id": "p1", "text": "test", "report": {"rule_total_score": 30.0}}
+        ]
+        mock_load_reports.return_value = [
+            {
+                "id": "r1",
+                "submission_id": "s1",
+                "project_id": "p1",
+                "rule_total_score": 30.0,
+                "created_at": "2026-02-06T12:00:01Z",
+            }
+        ]
+
+        resp = _client().post("/api/v1/projects/p1/calibration/predict")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["model_version"] == "calib1"
+        assert data["updated_reports"] == 1
+        assert data["updated_submissions"] == 1
+
+        saved_submissions = mock_save_submissions.call_args[0][0]
+        report = saved_submissions[0]["report"]
+        # rule=30, raw llm=100, bounded llm=65 (delta cap 35), fused=30*0.7+65*0.3=40.5
+        assert report["llm_total_score"] == 65.0
+        assert report["pred_total_score"] == 40.5
+        assert report["total_score"] == 40.5
+        assert report["score_blend"]["rule_weight"] == 0.7
+        assert report["score_blend"]["llm_weight"] == 0.3
+
+    @patch("app.main.save_submissions")
+    @patch("app.main.save_score_reports")
+    @patch("app.main.load_score_reports")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_calibration_models")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_apply_calibration_prediction_rejects_cross_project_model(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_models,
+        mock_load_submissions,
+        mock_load_reports,
+        mock_save_reports,
+        mock_save_submissions,
+    ):
+        mock_load_projects.return_value = [
+            {"id": "p1", "name": "项目1", "calibrator_version_locked": "calib1"}
+        ]
+        mock_load_models.return_value = [
+            {
+                "calibrator_version": "calib1",
+                "deployed": True,
+                "created_at": "2026-02-06T12:00:00Z",
+                "train_filter": {"project_id": "p2"},
+                "model_artifact": {"model_type": "offset", "bias": 10.0, "sigma": 2.0},
+            }
+        ]
+        mock_load_submissions.return_value = [
+            {"id": "s1", "project_id": "p1", "text": "test", "report": {"rule_total_score": 82.0}}
+        ]
+        mock_load_reports.return_value = [
+            {
+                "id": "r1",
+                "submission_id": "s1",
+                "project_id": "p1",
+                "rule_total_score": 82.0,
+                "created_at": "2026-02-06T12:00:01Z",
+            }
+        ]
+
+        resp = _client().post("/api/v1/projects/p1/calibration/predict")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["model_version"] is None
+        assert data["updated_reports"] == 0
+        assert data["updated_submissions"] == 0
+        mock_save_reports.assert_not_called()
+        mock_save_submissions.assert_not_called()
+
 
 class TestSubmissionListWithLatest:
     @patch("app.main.load_score_reports")
