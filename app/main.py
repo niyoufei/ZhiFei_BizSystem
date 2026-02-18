@@ -261,6 +261,9 @@ DEFAULT_REGION = "合肥"
 DEFAULT_QINGTIAN_MODEL_VERSION = "qingtian-2026.02"
 DEFAULT_SCORING_ENGINE_LOCKED = "v2.0.0"
 DEFAULT_CALIBRATOR_LOCKED = None
+DEFAULT_RULE_SCORE_WEIGHT = 0.7
+DEFAULT_LLM_SCORE_WEIGHT = 0.3
+DEFAULT_LLM_DELTA_CAP = 35.0
 DEFAULT_NORM_RULE_VERSION = "v1_m=0.5+a/10_norm=sum"
 PROFILE_LOCKED_STATUSES = {"submitted_to_qingtian"}
 DEFAULT_CHAPTER_REQUIREMENTS = {
@@ -768,7 +771,9 @@ def _build_score_report_snapshot(
         "consistency_bonus": float(report.get("consistency_bonus", 0.0)),
         "pred_dim_scores": report.get("pred_dim_scores"),
         "pred_total_score": report.get("pred_total_score"),
+        "llm_total_score": report.get("llm_total_score"),
         "pred_confidence": report.get("pred_confidence"),
+        "score_blend": report.get("score_blend"),
         "penalties": report.get("penalties", []),
         "lint_findings": report.get("lint_findings", []),
         "suggestions": report.get("suggestions", []),
@@ -951,7 +956,9 @@ def _build_v2_report_payload(
         "consistency_checks": v2_result.get("consistency_checks", []),
         "pred_dim_scores": None,
         "pred_total_score": None,
+        "llm_total_score": None,
         "pred_confidence": None,
+        "score_blend": None,
         "penalties": v2_result.get("penalties", []),
         "lint_findings": v2_result.get("lint_findings", []),
         "suggestions": v2_result.get("suggestions", []),
@@ -1071,6 +1078,62 @@ def _apply_deployed_patch_to_report(project_id: str, report: Dict[str, object]) 
     report["meta"]["patch_status"] = patch.get("status")
 
 
+def _clip_score(value: float, low: float = 0.0, high: float = 100.0) -> float:
+    return max(low, min(high, float(value)))
+
+
+def _resolve_score_blend_weights(project: Dict[str, object]) -> tuple[float, float, float]:
+    meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
+    blend_raw = meta.get("score_blend") if isinstance(meta, dict) else {}
+    blend_cfg = blend_raw if isinstance(blend_raw, dict) else {}
+
+    def _f(v: object, default: float) -> float:
+        try:
+            return float(v)
+        except Exception:
+            return default
+
+    rule_w = _f(
+        blend_cfg.get("rule_weight", blend_cfg.get("rule", DEFAULT_RULE_SCORE_WEIGHT)),
+        DEFAULT_RULE_SCORE_WEIGHT,
+    )
+    llm_w = _f(
+        blend_cfg.get("llm_weight", blend_cfg.get("llm", DEFAULT_LLM_SCORE_WEIGHT)),
+        DEFAULT_LLM_SCORE_WEIGHT,
+    )
+    delta_cap = _f(blend_cfg.get("llm_delta_cap", DEFAULT_LLM_DELTA_CAP), DEFAULT_LLM_DELTA_CAP)
+
+    rule_w = max(0.0, rule_w)
+    llm_w = max(0.0, llm_w)
+    total = rule_w + llm_w
+    if total <= 1e-9:
+        rule_w, llm_w = DEFAULT_RULE_SCORE_WEIGHT, DEFAULT_LLM_SCORE_WEIGHT
+        total = rule_w + llm_w
+    rule_w /= total
+    llm_w /= total
+    delta_cap = max(0.0, delta_cap)
+    return rule_w, llm_w, delta_cap
+
+
+def _fuse_rule_and_llm_scores(
+    *,
+    rule_total: float,
+    llm_total_raw: float,
+    project: Dict[str, object],
+) -> tuple[float, float, Dict[str, float]]:
+    rule = _clip_score(rule_total)
+    llm_raw = _clip_score(llm_total_raw)
+    rule_w, llm_w, delta_cap = _resolve_score_blend_weights(project)
+    llm_bounded = _clip_score(max(rule - delta_cap, min(rule + delta_cap, llm_raw)))
+    fused = _clip_score(rule * rule_w + llm_bounded * llm_w)
+    blend_info = {
+        "rule_weight": round(rule_w, 4),
+        "llm_weight": round(llm_w, 4),
+        "llm_delta_cap": round(delta_cap, 2),
+    }
+    return round(fused, 2), round(llm_bounded, 2), blend_info
+
+
 def _apply_prediction_to_report(
     report: Dict[str, object],
     *,
@@ -1080,8 +1143,10 @@ def _apply_prediction_to_report(
     model = _select_calibrator_model(project)
     if not model:
         report["pred_total_score"] = None
+        report["llm_total_score"] = None
         report["pred_confidence"] = None
         report["pred_dim_scores"] = None
+        report["score_blend"] = None
         # `total_score` is the primary score used by UI/sorting.
         report["total_score"] = float(
             report.get("rule_total_score", report.get("total_score", 0.0))
@@ -1091,8 +1156,10 @@ def _apply_prediction_to_report(
     artifact = model.get("model_artifact") or model.get("artifact") or {}
     if not isinstance(artifact, dict):
         report["pred_total_score"] = None
+        report["llm_total_score"] = None
         report["pred_confidence"] = None
         report["pred_dim_scores"] = None
+        report["score_blend"] = None
         report["total_score"] = float(
             report.get("rule_total_score", report.get("total_score", 0.0))
         )
@@ -1104,8 +1171,10 @@ def _apply_prediction_to_report(
     except Exception as e:
         # 预测模型不应影响主流程可用性；失败时保留 rule 分并显式记录错误。
         report["pred_total_score"] = None
+        report["llm_total_score"] = None
         report["pred_confidence"] = None
         report["pred_dim_scores"] = None
+        report["score_blend"] = None
         report["total_score"] = float(
             report.get("rule_total_score", report.get("total_score", 0.0))
         )
@@ -1115,11 +1184,23 @@ def _apply_prediction_to_report(
         report["meta"]["calibrator_error"] = f"{type(e).__name__}: {e}"
         return str(model.get("calibrator_version") or "")
 
-    report["pred_total_score"] = pred
-    report["pred_confidence"] = conf
+    rule_total = float(report.get("rule_total_score", report.get("total_score", 0.0)))
+    fused_total, llm_total, blend_info = _fuse_rule_and_llm_scores(
+        rule_total=rule_total,
+        llm_total_raw=float(pred),
+        project=project,
+    )
+    report["pred_total_score"] = fused_total
+    report["llm_total_score"] = llm_total
+    report["pred_confidence"] = {
+        **conf,
+        "raw_llm_score": float(pred),
+        "bounded_llm_score": llm_total,
+    }
+    report["score_blend"] = blend_info
     report["pred_dim_scores"] = None
-    report["total_score"] = float(pred)
-    submission_like["total_score"] = float(pred)
+    report["total_score"] = float(fused_total)
+    submission_like["total_score"] = float(fused_total)
     report.setdefault("meta", {})
     report["meta"]["calibrator_version"] = model.get("calibrator_version")
     return str(model.get("calibrator_version") or "")
@@ -1132,12 +1213,18 @@ def _to_float_or_none(value: Any) -> Optional[float]:
         return None
 
 
-def _resolve_submission_score_fields(submission: Dict[str, object]) -> Dict[str, object]:
+def _resolve_submission_score_fields(
+    submission: Dict[str, object],
+    *,
+    allow_pred_score: bool = True,
+) -> Dict[str, object]:
     report = submission.get("report")
     pred_total = None
     rule_total = None
     if isinstance(report, dict):
         pred_total = _to_float_or_none(report.get("pred_total_score"))
+        if not allow_pred_score:
+            pred_total = None
         rule_total = _to_float_or_none(report.get("rule_total_score"))
         if rule_total is None:
             rule_total = _to_float_or_none(report.get("total_score"))
@@ -1350,6 +1437,155 @@ def _refresh_project_reflection_objects(project_id: str) -> None:
     all_samples = [s for s in load_calibration_samples() if str(s.get("project_id")) != project_id]
     all_samples.extend(samples)
     save_calibration_samples(all_samples)
+
+
+def _auto_update_project_weights_from_delta_cases(project_id: str) -> Dict[str, object]:
+    """
+    基于 DELTA_CASE 的维度偏差自动微调 16 维关注度。
+    规则：
+    - rule_dim > qt_dim（正偏差） -> 关注度下调
+    - rule_dim < qt_dim（负偏差） -> 关注度上调
+    """
+    projects = load_projects()
+    project = next((p for p in projects if str(p.get("id")) == project_id), None)
+    if project is None:
+        return {"updated": False, "reason": "project_not_found"}
+
+    delta_cases = [d for d in load_delta_cases() if str(d.get("project_id")) == project_id]
+    if len(delta_cases) < 2:
+        return {
+            "updated": False,
+            "reason": "insufficient_delta_cases",
+            "sample_count": len(delta_cases),
+        }
+
+    dim_stats: Dict[str, Dict[str, float]] = {
+        dim_id: {"sum": 0.0, "count": 0.0} for dim_id in DIMENSION_IDS
+    }
+    for case in delta_cases:
+        dim_errors = case.get("dim_errors") or {}
+        if not isinstance(dim_errors, dict):
+            continue
+        for dim_id, raw_err in dim_errors.items():
+            did = _normalize_dimension_id(str(dim_id))
+            try:
+                err = float(raw_err)
+            except Exception:
+                continue
+            dim_stats[did]["sum"] += err
+            dim_stats[did]["count"] += 1.0
+
+    candidates: List[Dict[str, object]] = []
+    for dim_id in DIMENSION_IDS:
+        count = int(dim_stats[dim_id]["count"])
+        if count < 2:
+            continue
+        mean_error = dim_stats[dim_id]["sum"] / float(count)
+        if abs(mean_error) < 0.8:
+            continue
+        candidates.append(
+            {
+                "dim_id": dim_id,
+                "count": count,
+                "mean_error": round(mean_error, 3),
+                "abs_mean_error": abs(mean_error),
+                "step": -1 if mean_error > 0 else 1,
+            }
+        )
+
+    if not candidates:
+        return {
+            "updated": False,
+            "reason": "no_adjustable_dimensions",
+            "sample_count": len(delta_cases),
+        }
+
+    candidates.sort(key=lambda x: float(x.get("abs_mean_error") or 0.0), reverse=True)
+    top_dims = candidates[:4]
+
+    profiles = load_expert_profiles()
+    profile, created = _ensure_project_expert_profile(project, profiles)
+    if created:
+        save_expert_profiles(profiles)
+        save_projects(projects)
+
+    weights_raw = _coerce_weights_raw(dict(profile.get("weights_raw") or _default_weights_raw()))
+    new_weights_raw = dict(weights_raw)
+    changed_dims: List[Dict[str, object]] = []
+    for item in top_dims:
+        dim_id = str(item.get("dim_id"))
+        step = int(item.get("step") or 0)
+        before = int(new_weights_raw.get(dim_id, 5))
+        after = max(0, min(10, before + step))
+        if after == before:
+            continue
+        new_weights_raw[dim_id] = after
+        changed_dims.append(
+            {
+                "dim_id": dim_id,
+                "before": before,
+                "after": after,
+                "mean_error": item.get("mean_error"),
+                "count": item.get("count"),
+            }
+        )
+
+    if not changed_dims:
+        return {"updated": False, "reason": "weights_unchanged", "sample_count": len(delta_cases)}
+
+    auto_name = (
+        f"{project.get('name', '项目')}_auto_feedback_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    )
+    new_profile = _new_expert_profile(auto_name, new_weights_raw)
+    profiles.append(new_profile)
+    save_expert_profiles(profiles)
+
+    project["expert_profile_id"] = new_profile["id"]
+    project["updated_at"] = _now_iso()
+    save_projects(projects)
+
+    return {
+        "updated": True,
+        "sample_count": len(delta_cases),
+        "changed_dims": changed_dims,
+        "new_profile_id": new_profile["id"],
+    }
+
+
+def _run_feedback_closed_loop(project_id: str, *, locale: str, trigger: str) -> Dict[str, object]:
+    """
+    反馈信号闭环：刷新样本 -> 自动调权重 -> 自动反演校准。
+    所有步骤为 best-effort，不影响主流程返回。
+    """
+    result: Dict[str, object] = {
+        "ok": True,
+        "project_id": project_id,
+        "trigger": trigger,
+        "weight_update": {"updated": False},
+        "auto_run": None,
+    }
+    try:
+        _refresh_project_reflection_objects(project_id)
+    except Exception as exc:
+        result["ok"] = False
+        result["refresh_error"] = str(exc)
+        return result
+
+    try:
+        result["weight_update"] = _auto_update_project_weights_from_delta_cases(project_id)
+    except Exception as exc:
+        result["weight_update"] = {"updated": False, "error": str(exc)}
+
+    try:
+        auto_resp = auto_run_reflection_pipeline(project_id=project_id, api_key=None, locale=locale)
+        if hasattr(auto_resp, "model_dump"):
+            result["auto_run"] = auto_resp.model_dump()
+        else:
+            result["auto_run"] = dict(auto_resp)
+    except Exception as exc:
+        result["auto_run"] = {"ok": False, "error": str(exc)}
+        result["ok"] = False
+    return result
 
 
 def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, object]) -> None:
@@ -2407,6 +2643,11 @@ def rescore_project_submissions(
     save_evidence_units(all_evidence_units)
     project["updated_at"] = _now_iso()
     save_projects(projects)
+    # 重评分属于有效反馈信号：自动刷新样本并触发校准/调权重闭环（best-effort）。
+    try:
+        _run_feedback_closed_loop(project_id, locale=locale, trigger="rescore")
+    except Exception:
+        pass
 
     return RescoreResponse(
         ok=True,
@@ -3272,24 +3513,54 @@ def list_submissions(
     返回指定项目下的所有历史评分记录，包括评分报告详情。
     """
     ensure_data_dirs()
-    submissions = [s for s in load_submissions() if s["project_id"] == project_id]
-    if with_ != "latest_report":
-        return [SubmissionRecord(**s) for s in submissions]
-
     projects = load_projects()
-    project = next((p for p in projects if str(p.get("id")) == project_id), {})
+    project = next((p for p in projects if str(p.get("id")) == project_id), {"id": project_id})
+    allow_pred_score = _select_calibrator_model(project) is not None
+
+    submissions = [s for s in load_submissions() if s["project_id"] == project_id]
+
+    def _view_submission(item: Dict[str, object]) -> Dict[str, object]:
+        view = dict(item)
+        report_obj = item.get("report")
+        if not isinstance(report_obj, dict):
+            return view
+        report = dict(report_obj)
+        rule_total = _to_float_or_none(report.get("rule_total_score"))
+        if rule_total is None:
+            rule_total = _to_float_or_none(report.get("total_score"))
+        if rule_total is None:
+            rule_total = _to_float_or_none(item.get("total_score"))
+        if rule_total is None:
+            rule_total = 0.0
+        if not allow_pred_score:
+            report["pred_total_score"] = None
+            report["llm_total_score"] = None
+            report["pred_confidence"] = None
+            report["score_blend"] = None
+            report["total_score"] = round(float(rule_total), 2)
+            view["total_score"] = round(float(rule_total), 2)
+        view["report"] = report
+        return view
+
+    submissions_view = [_view_submission(s) for s in submissions]
+    if with_ != "latest_report":
+        return [SubmissionRecord(**s) for s in submissions_view]
+
     latest_reports = _latest_records_by_submission(
         [r for r in load_score_reports() if str(r.get("project_id")) == project_id]
     )
 
     rows: List[Dict[str, object]] = []
-    for s in submissions:
+    for s in submissions_view:
         sid = str(s.get("id"))
         latest = latest_reports.get(sid, {})
         suggestions = latest.get("suggestions") or []
         top_gain = 0.0
         if suggestions and isinstance(suggestions[0], dict):
             top_gain = float(suggestions[0].get("expected_gain", 0.0))
+        pred_total = latest.get("pred_total_score")
+        if not allow_pred_score:
+            pred_total = None
         rows.append(
             {
                 "submission_id": sid,
@@ -3299,7 +3570,7 @@ def list_submissions(
                     "rule_total_score": float(
                         latest.get("rule_total_score", s.get("total_score", 0.0))
                     ),
-                    "pred_total_score": latest.get("pred_total_score"),
+                    "pred_total_score": pred_total,
                     "rank_by_pred": None,
                     "rank_by_rule": None,
                     "top_expected_gain": round(top_gain, 2),
@@ -3379,6 +3650,11 @@ def _delete_submission_record(project_id: str, submission_id: str, locale: str) 
         s for s in calibration_samples if str(s.get("submission_id")) != submission_id
     ]
     save_calibration_samples(calibration_samples)
+    # 删除属于显式反馈信号：自动刷新样本并触发校准/调权重闭环（best-effort）。
+    try:
+        _run_feedback_closed_loop(project_id, locale=locale, trigger="delete_submission")
+    except Exception:
+        pass
 
 
 @router.delete(
@@ -3434,7 +3710,9 @@ def get_latest_submission_report(submission_id: str) -> LatestReportResponse:
             "scoring_engine_version": latest.get("scoring_engine_version"),
             "rule_total_score": latest.get("rule_total_score"),
             "pred_total_score": latest.get("pred_total_score"),
+            "llm_total_score": latest.get("llm_total_score"),
             "pred_confidence": latest.get("pred_confidence"),
+            "score_blend": latest.get("score_blend"),
             "rule_dim_scores": latest.get("rule_dim_scores", {}),
             "pred_dim_scores": latest.get("pred_dim_scores"),
             "penalties": latest.get("penalties", []),
@@ -3455,7 +3733,9 @@ def get_latest_submission_report(submission_id: str) -> LatestReportResponse:
         report_obj.setdefault("submission_id", submission_id)
         report_obj.setdefault("rule_total_score", report_obj.get("total_score", 0.0))
         report_obj.setdefault("pred_total_score", report_obj.get("pred_total_score"))
+        report_obj.setdefault("llm_total_score", report_obj.get("llm_total_score"))
         report_obj.setdefault("pred_confidence", report_obj.get("pred_confidence"))
+        report_obj.setdefault("score_blend", report_obj.get("score_blend"))
         report_obj.setdefault("rule_dim_scores", report_obj.get("rule_dim_scores", {}))
         report_obj.setdefault("penalties", report_obj.get("penalties", []))
         report_obj.setdefault("lint_findings", report_obj.get("lint_findings", []))
@@ -3472,7 +3752,9 @@ def get_latest_submission_report(submission_id: str) -> LatestReportResponse:
 
     ui_summary = {
         "pred_total_score": report_obj.get("pred_total_score"),
+        "llm_total_score": report_obj.get("llm_total_score"),
         "pred_confidence": report_obj.get("pred_confidence"),
+        "score_blend": report_obj.get("score_blend"),
         "rule_total_score": report_obj.get("rule_total_score", report_obj.get("total_score")),
         "top10_suggestions": suggestions[:10],
         "top_conflicts": top_conflicts,
@@ -4504,12 +4786,15 @@ def compare_submissions(
     支持 Accept-Language header 进行多语言响应。
     """
     ensure_data_dirs()
+    projects = load_projects()
+    project = next((p for p in projects if str(p.get("id")) == project_id), {"id": project_id})
+    allow_pred_score = _select_calibrator_model(project) is not None
     submissions = [s for s in load_submissions() if s["project_id"] == project_id]
     if not submissions:
         raise HTTPException(status_code=404, detail=t("api.no_submissions", locale=locale))
     rankings = []
     for s in submissions:
-        score_fields = _resolve_submission_score_fields(s)
+        score_fields = _resolve_submission_score_fields(s, allow_pred_score=allow_pred_score)
         rankings.append(
             {
                 "submission_id": s["id"],
@@ -4568,13 +4853,16 @@ def compare_report(
     支持 Accept-Language header 进行多语言响应。
     """
     ensure_data_dirs()
+    projects = load_projects()
+    project = next((p for p in projects if str(p.get("id")) == project_id), {"id": project_id})
+    allow_pred_score = _select_calibrator_model(project) is not None
     submissions = [s for s in load_submissions() if s["project_id"] == project_id]
     if not submissions:
         raise HTTPException(status_code=404, detail=t("api.no_submissions", locale=locale))
     submissions_for_compare = []
     by_id: Dict[str, Dict[str, object]] = {}
     for s in submissions:
-        score_fields = _resolve_submission_score_fields(s)
+        score_fields = _resolve_submission_score_fields(s, allow_pred_score=allow_pred_score)
         item = dict(s)
         item["total_score"] = float(score_fields["total_score"])
         report = item.get("report")
@@ -4595,7 +4883,9 @@ def compare_report(
         source_submission = by_id.get(sid)
         if not source_submission:
             continue
-        score_fields = _resolve_submission_score_fields(source_submission)
+        score_fields = _resolve_submission_score_fields(
+            source_submission, allow_pred_score=allow_pred_score
+        )
         row["pred_total_score"] = score_fields["pred_total_score"]
         row["rule_total_score"] = score_fields["rule_total_score"]
         row["score_source"] = score_fields["score_source"]
@@ -6052,6 +6342,14 @@ def index(
             for dim_id in DIMENSION_IDS
         ]
     )
+    selected_project_for_view = (
+        next((p for p in projects if str(p.get("id", "")) == selected_project_id), {})
+        if selected_project_id
+        else {}
+    )
+    allow_pred_initial = bool(selected_project_for_view) and (
+        _select_calibrator_model(selected_project_for_view) is not None
+    )
     initial_material_rows: List[str] = []
     initial_submission_rows: List[str] = []
     if selected_project_id:
@@ -6093,13 +6391,19 @@ def index(
                 report = report_obj if isinstance(report_obj, dict) else {}
                 pred_total = report.get("pred_total_score")
                 rule_total = report.get("rule_total_score")
+                if not allow_pred_initial:
+                    pred_total = None
+                llm_total = report.get("llm_total_score")
                 primary_total = pred_total if pred_total is not None else s.get("total_score")
                 if pred_total is not None:
                     score_cell = html_lib.escape(str(pred_total))
+                    note_items: List[str] = []
                     if rule_total is not None:
-                        score_cell += (
-                            '<div class="note">规则: ' + html_lib.escape(str(rule_total)) + "</div>"
-                        )
+                        note_items.append("规则: " + html_lib.escape(str(rule_total)))
+                    if llm_total is not None:
+                        note_items.append("LLM: " + html_lib.escape(str(llm_total)))
+                    if note_items:
+                        score_cell += '<div class="note">' + " / ".join(note_items) + "</div>"
                 else:
                     score_cell = (
                         "-" if primary_total is None else html_lib.escape(str(primary_total))
@@ -6724,12 +7028,14 @@ def index(
               const report = (s && s.report) || {};
               const pred = report && report.pred_total_score != null ? report.pred_total_score : null;
               const rule = report && report.rule_total_score != null ? report.rule_total_score : null;
+              const llm = report && report.llm_total_score != null ? report.llm_total_score : null;
               let scoreHtml = '-';
               if (pred != null) {
                 scoreHtml = fallbackEscapeHtml(String(pred));
-                if (rule != null) {
-                  scoreHtml += '<div class="note">规则: ' + fallbackEscapeHtml(String(rule)) + '</div>';
-                }
+                const notes = [];
+                if (rule != null) notes.push('规则: ' + fallbackEscapeHtml(String(rule)));
+                if (llm != null) notes.push('LLM: ' + fallbackEscapeHtml(String(llm)));
+                if (notes.length) scoreHtml += '<div class="note">' + notes.join(' / ') + '</div>';
               } else if (s && s.total_score != null) {
                 scoreHtml = fallbackEscapeHtml(String(s.total_score));
               }
@@ -8264,10 +8570,14 @@ def index(
             const rep = (s && typeof s === 'object') ? (s.report || {}) : {};
             const pred = (rep && rep.pred_total_score != null) ? rep.pred_total_score : null;
             const rule = (rep && rep.rule_total_score != null) ? rep.rule_total_score : null;
+            const llm = (rep && rep.llm_total_score != null) ? rep.llm_total_score : null;
             let scoreHtml = '-';
             if (pred != null) {
               scoreHtml = escapeHtmlText(String(pred));
-              if (rule != null) scoreHtml += '<div class="note">规则: ' + escapeHtmlText(String(rule)) + '</div>';
+              const notes = [];
+              if (rule != null) notes.push('规则: ' + escapeHtmlText(String(rule)));
+              if (llm != null) notes.push('LLM: ' + escapeHtmlText(String(llm)));
+              if (notes.length) scoreHtml += '<div class="note">' + notes.join(' / ') + '</div>';
             } else if (s && s.total_score != null) {
               scoreHtml = escapeHtmlText(String(s.total_score));
             }
