@@ -50,6 +50,8 @@ class TestIndexEndpoint:
         assert 'id="groundTruthSubmissionSelect"' in response.text
         assert 'id="groundTruthFile"' not in response.text
         assert "/ground_truth/from_submission" in response.text
+        assert 'id="section-adaptive" style="display:none"' in response.text
+        assert "V2 反演校准闭环（核心能力，强烈建议执行）" in response.text
 
     def test_index_replaces_server_side_placeholders(self, client):
         """Index page should not leak template placeholders."""

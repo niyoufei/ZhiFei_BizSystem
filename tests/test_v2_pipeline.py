@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -1673,3 +1674,158 @@ class TestEvaluationEndpoint:
         assert data["project_count"] == 2
         assert "aggregate" in data
         assert "v2_calib" in data["aggregate"]
+
+
+class TestScoringMeceInjection:
+    @patch("app.main._rebuild_project_anchors_and_requirements")
+    @patch("app.main.save_materials")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_upload_material_triggers_constraint_sync(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        mock_save_materials,
+        mock_rebuild_constraints,
+    ):
+        mock_load_projects.return_value = [{"id": "p1"}]
+        mock_load_materials.return_value = []
+        mock_rebuild_constraints.return_value = ([{"id": "a1"}], [{"id": "r1"}])
+        resp = _client().post(
+            "/api/v1/projects/p1/materials",
+            files=[("file", ("a.txt", b"hello", "text/plain"))],
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["constraint_sync"]["rebuilt"] is True
+        assert data["constraint_sync"]["anchors"] == 1
+        assert data["constraint_sync"]["requirements"] == 1
+        mock_rebuild_constraints.assert_called_once_with("p1")
+        mock_save_materials.assert_called_once()
+
+    @patch("app.main._apply_prediction_to_report")
+    @patch("app.main._apply_deployed_patch_to_report")
+    @patch("app.main.score_text_v2")
+    @patch("app.main._build_runtime_custom_requirements")
+    @patch("app.main._constraints_need_rebuild")
+    @patch("app.main._rebuild_project_anchors_and_requirements")
+    @patch("app.main.load_project_requirements")
+    @patch("app.main.load_project_anchors")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_project_context")
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.load_learning_profiles")
+    def test_score_submission_includes_mece_input_snapshot(
+        self,
+        mock_load_learning_profiles,
+        mock_load_evolution_reports,
+        mock_load_project_context,
+        mock_load_materials,
+        mock_load_project_anchors,
+        mock_load_project_requirements,
+        mock_rebuild_constraints,
+        mock_constraints_need_rebuild,
+        mock_build_runtime_custom_requirements,
+        mock_score_text_v2,
+        mock_apply_patch,
+        mock_apply_predict,
+    ):
+        from app.main import _score_submission_for_project
+
+        mock_load_learning_profiles.return_value = []
+        mock_load_evolution_reports.return_value = {}
+        mock_load_project_context.return_value = {
+            "p1": {"text": "必须体现关键线路与验收闭环", "updated_at": "2026-02-19T00:00:00+00:00"}
+        }
+        mock_load_materials.return_value = [
+            {"id": "m1", "project_id": "p1", "created_at": "2026-02-18T00:00:00+00:00"}
+        ]
+        mock_load_project_anchors.return_value = [
+            {"id": "a_old", "project_id": "p1", "created_at": "2026-02-17T00:00:00+00:00"}
+        ]
+        mock_load_project_requirements.return_value = [
+            {"id": "r_old", "project_id": "p1", "created_at": "2026-02-17T00:00:00+00:00"}
+        ]
+        mock_constraints_need_rebuild.return_value = True
+        mock_rebuild_constraints.return_value = (
+            [{"id": "a1", "project_id": "p1", "created_at": "2026-02-19T00:00:01+00:00"}],
+            [
+                {
+                    "id": "r1",
+                    "project_id": "p1",
+                    "dimension_id": "01",
+                    "req_label": "工期节点",
+                    "req_type": "presence",
+                    "patterns": {"keywords": ["工期", "节点"]},
+                    "mandatory": True,
+                    "weight": 1.0,
+                    "created_at": "2026-02-19T00:00:01+00:00",
+                }
+            ],
+        )
+        mock_build_runtime_custom_requirements.return_value = (
+            [
+                {
+                    "id": "runtime-1",
+                    "project_id": "p1",
+                    "dimension_id": "01",
+                    "req_label": "自定义评分指令",
+                    "req_type": "semantic",
+                    "patterns": {"hints": ["闭环"]},
+                    "mandatory": False,
+                    "weight": 0.6,
+                    "created_at": "2026-02-19T00:00:01+00:00",
+                }
+            ],
+            {"runtime_custom_requirements": 1},
+        )
+        mock_score_text_v2.return_value = {
+            "engine_version": "v2",
+            "rule_total_score": 81.2,
+            "dim_total_80": 63.0,
+            "dim_total_90": 70.9,
+            "consistency_bonus": 2.0,
+            "consistency_checks": [],
+            "rule_dim_scores": {},
+            "penalties": [],
+            "lint_findings": [],
+            "suggestions": [],
+            "requirement_hits": [],
+            "mandatory_req_hit_rate": 0.9,
+            "requirement_pack_versions": ["v1"],
+            "evidence_units_count": 0,
+            "evidence_units": [],
+        }
+
+        project = {
+            "id": "p1",
+            "region": "合肥",
+            "scoring_engine_version_locked": "v2",
+            "meta": {"score_scale_max": 100},
+        }
+        config = SimpleNamespace(lexicon={})
+        report, evidence = _score_submission_for_project(
+            submission_id="s1",
+            text="测试施组文本",
+            project_id="p1",
+            project=project,
+            config=config,
+            multipliers={},
+            profile_snapshot=None,
+            scoring_engine_version="v2",
+        )
+        assert evidence == []
+        assert report["rule_total_score"] == 81.2
+        injection = (report.get("meta") or {}).get("input_injection") or {}
+        assert injection["constraints_rebuilt"] is True
+        assert injection["runtime_custom_requirements_count"] == 1
+        assert injection["mece_inputs"]["custom_instructions_injected"] is True
+        assert injection["mece_inputs"]["bid_requirements_loaded"] is True
+        # base requirements + runtime custom requirements 都应传入评分引擎
+        assert mock_score_text_v2.call_args.kwargs["requirements"]
+        assert len(mock_score_text_v2.call_args.kwargs["requirements"]) == 2
+        mock_apply_patch.assert_called_once()
+        mock_apply_predict.assert_called_once()

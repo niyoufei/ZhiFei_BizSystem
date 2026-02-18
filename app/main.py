@@ -571,6 +571,259 @@ def _resolve_project_scoring_context(
     return {}, None, project
 
 
+def _parse_iso_datetime(value: object) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except Exception:
+        return None
+
+
+def _latest_record_time(
+    rows: List[Dict[str, object]], field: str = "created_at"
+) -> Optional[datetime]:
+    latest: Optional[datetime] = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        dt = _parse_iso_datetime(row.get(field))
+        if dt is None:
+            continue
+        if latest is None or dt > latest:
+            latest = dt
+    return latest
+
+
+def _load_project_context_text(project_id: str) -> str:
+    ctx = load_project_context().get(project_id) or {}
+    return str(ctx.get("text") or "").strip()
+
+
+def _build_constraints_source_text(project_id: str) -> str:
+    materials_text = _merge_materials_text(project_id).strip()
+    context_text = _load_project_context_text(project_id)
+    if not context_text:
+        return materials_text
+    marker = "--- 项目上下文（投喂包/自定义指令） ---"
+    if materials_text:
+        return f"{materials_text}\n\n{marker}\n{context_text}".strip()
+    return f"{marker}\n{context_text}".strip()
+
+
+def _constraints_need_rebuild(
+    project_id: str,
+    anchors: List[Dict[str, object]],
+    requirements: List[Dict[str, object]],
+) -> bool:
+    source_rows = [m for m in load_materials() if str(m.get("project_id")) == project_id]
+    source_latest = _latest_record_time(source_rows, field="created_at")
+    ctx_data = load_project_context().get(project_id) or {}
+    ctx_updated = _parse_iso_datetime(ctx_data.get("updated_at"))
+    if ctx_updated is not None and (source_latest is None or ctx_updated > source_latest):
+        source_latest = ctx_updated
+    if source_latest is None:
+        return not anchors or not requirements
+    constraints_latest = _latest_record_time(anchors, field="created_at")
+    req_latest = _latest_record_time(requirements, field="created_at")
+    if req_latest is not None and (constraints_latest is None or req_latest > constraints_latest):
+        constraints_latest = req_latest
+    if constraints_latest is None:
+        return True
+    return source_latest > constraints_latest
+
+
+def _to_text_items(raw: object, *, max_items: int = 24) -> List[str]:
+    items: List[str] = []
+    if isinstance(raw, list):
+        for v in raw:
+            s = str(v or "").strip()
+            if not s:
+                continue
+            items.append(s)
+    elif isinstance(raw, str):
+        for line in raw.replace("；", "\n").replace(";", "\n").splitlines():
+            s = line.strip()
+            if s:
+                items.append(s)
+    dedup: List[str] = []
+    seen: set[str] = set()
+    for item in items:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(item)
+        if len(dedup) >= max(1, int(max_items)):
+            break
+    return dedup
+
+
+def _build_runtime_custom_requirements(
+    project_id: str,
+    *,
+    project: Dict[str, object],
+) -> tuple[List[Dict[str, object]], Dict[str, object]]:
+    evo = load_evolution_reports().get(project_id) or {}
+    compilation = (
+        evo.get("compilation_instructions")
+        if isinstance(evo.get("compilation_instructions"), dict)
+        else {}
+    )
+    required_sections = _to_text_items(compilation.get("required_sections"), max_items=20)
+    required_charts = _to_text_items(compilation.get("required_charts_images"), max_items=20)
+    mandatory_elements = _to_text_items(compilation.get("mandatory_elements"), max_items=24)
+
+    custom_text_items: List[str] = []
+    meta_obj = project.get("meta") if isinstance(project.get("meta"), dict) else {}
+    custom_text_items.extend(
+        _to_text_items((meta_obj or {}).get("custom_scoring_instructions"), max_items=20)
+    )
+    # 允许在项目上下文里用“指令:”行注入运行时评分提示，避免另开配置入口。
+    context_text = _load_project_context_text(project_id)
+    for line in context_text.splitlines():
+        s = line.strip()
+        if not s or len(s) > 120:
+            continue
+        if any(mark in s for mark in ("指令", "要求", "必须", "禁止", "关注")):
+            custom_text_items.append(s)
+    custom_text_items = _to_text_items(custom_text_items, max_items=20)
+
+    runtime_requirements: List[Dict[str, object]] = []
+    created_at = _now_iso()
+    req_index = 0
+
+    def _append_req(
+        *,
+        dim_id: str,
+        label: str,
+        hints: List[str],
+        mandatory: bool,
+        weight: float,
+        kind: str,
+    ) -> None:
+        nonlocal req_index
+        if not hints:
+            return
+        req_index += 1
+        runtime_requirements.append(
+            {
+                "id": f"runtime-{project_id[:8]}-{kind}-{req_index}",
+                "project_id": project_id,
+                "dimension_id": dim_id,
+                "req_label": label,
+                "req_type": "semantic",
+                "patterns": {"hints": hints},
+                "mandatory": mandatory,
+                "weight": float(weight),
+                "source_anchor_id": None,
+                "source_pack_id": "runtime_custom",
+                "source_pack_version": "v2-runtime",
+                "priority": 90.0,
+                "override_key": f"runtime::{kind}::{req_index}",
+                "lint": {},
+                "created_at": created_at,
+            }
+        )
+
+    for item in required_sections:
+        _append_req(
+            dim_id="01",
+            label=f"编制系统指令-必备章节：{item}",
+            hints=[item],
+            mandatory=True,
+            weight=1.1,
+            kind="section",
+        )
+    for item in required_charts:
+        _append_req(
+            dim_id="12",
+            label=f"编制系统指令-图表要求：{item}",
+            hints=[item],
+            mandatory=False,
+            weight=0.8,
+            kind="chart",
+        )
+    for item in mandatory_elements:
+        _append_req(
+            dim_id="09",
+            label=f"编制系统指令-必备要素：{item}",
+            hints=[item],
+            mandatory=True,
+            weight=1.0,
+            kind="element",
+        )
+    for item in custom_text_items:
+        _append_req(
+            dim_id="01",
+            label=f"自定义评分指令：{item}",
+            hints=[item],
+            mandatory=False,
+            weight=0.6,
+            kind="custom",
+        )
+
+    meta = {
+        "required_sections": len(required_sections),
+        "required_charts_images": len(required_charts),
+        "mandatory_elements": len(mandatory_elements),
+        "custom_instruction_lines": len(custom_text_items),
+        "runtime_custom_requirements": len(runtime_requirements),
+        "project_context_chars": len(context_text),
+    }
+    return runtime_requirements, meta
+
+
+def _infer_weights_source(project_id: str, profile_snapshot: Optional[Dict[str, object]]) -> str:
+    if profile_snapshot:
+        return "expert_profile"
+    evo = load_evolution_reports().get(project_id) or {}
+    evo_mult = (evo.get("scoring_evolution") or {}).get("dimension_multipliers") or {}
+    if isinstance(evo_mult, dict) and evo_mult:
+        return "evolution"
+    if any(str(p.get("project_id")) == project_id for p in load_learning_profiles()):
+        return "learning_profile"
+    return "default_uniform"
+
+
+def _build_scoring_input_injection_meta(
+    *,
+    project_id: str,
+    text: str,
+    anchors_count: int,
+    base_requirements_count: int,
+    runtime_custom_requirements_count: int,
+    weights_norm: Dict[str, float],
+    profile_snapshot: Optional[Dict[str, object]],
+    constraints_rebuilt: bool,
+    runtime_req_meta: Dict[str, object],
+) -> Dict[str, object]:
+    material_rows = [m for m in load_materials() if str(m.get("project_id")) == project_id]
+    context_text = _load_project_context_text(project_id)
+    return {
+        "mece_inputs": {
+            "project_materials_extracted": len(material_rows) > 0,
+            "shigong_parsed": bool(str(text or "").strip()),
+            "bid_requirements_loaded": base_requirements_count > 0,
+            "attention_16d_weights_injected": bool(weights_norm),
+            "custom_instructions_injected": runtime_custom_requirements_count > 0
+            or bool(context_text.strip()),
+        },
+        "materials_count": len(material_rows),
+        "project_context_chars": len(context_text),
+        "anchors_count": int(anchors_count),
+        "requirements_count": int(base_requirements_count),
+        "runtime_custom_requirements_count": int(runtime_custom_requirements_count),
+        "weights_source": _infer_weights_source(project_id, profile_snapshot),
+        "weights_sum": round(sum(float(weights_norm.get(d, 0.0)) for d in DIMENSION_IDS), 6),
+        "constraints_rebuilt": bool(constraints_rebuilt),
+        "runtime_instruction_breakdown": runtime_req_meta,
+    }
+
+
 def _get_rubric_dim_cfg(rubric_dimensions: Dict[str, object], dim_id: str) -> Dict[str, object]:
     for k, v in (rubric_dimensions or {}).items():
         if _normalize_dimension_id(str(k)) == dim_id and isinstance(v, dict):
@@ -1474,6 +1727,8 @@ def _score_submission_for_project(
 ) -> tuple[Dict[str, object], List[Dict[str, object]]]:
     engine_version = _determine_engine_version(project, scoring_engine_version)
     if engine_version == "v2":
+        anchors_from_payload = anchors is not None
+        requirements_from_payload = requirements is not None
         anchors = (
             anchors
             if anchors is not None
@@ -1484,21 +1739,33 @@ def _score_submission_for_project(
             if requirements is not None
             else [r for r in load_project_requirements() if str(r.get("project_id")) == project_id]
         )
+        constraints_rebuilt = False
         if not anchors or not requirements:
             anchors, requirements = _rebuild_project_anchors_and_requirements(project_id)
+            constraints_rebuilt = True
+        elif (
+            not anchors_from_payload or not requirements_from_payload
+        ) and _constraints_need_rebuild(project_id, anchors, requirements):
+            anchors, requirements = _rebuild_project_anchors_and_requirements(project_id)
+            constraints_rebuilt = True
 
         weights_norm = (
             dict(profile_snapshot.get("weights_norm") or {})
             if profile_snapshot
             else _weights_from_multipliers(multipliers)
         )
+        runtime_custom_requirements, runtime_req_meta = _build_runtime_custom_requirements(
+            project_id,
+            project=project,
+        )
+        effective_requirements = list(requirements) + list(runtime_custom_requirements)
         v2_result = score_text_v2(
             submission_id=submission_id,
             text=text,
             lexicon=config.lexicon,
             weights_norm=weights_norm,
             anchors=anchors,
-            requirements=requirements,
+            requirements=effective_requirements,
         )
         report = _build_v2_report_payload(
             v2_result,
@@ -1507,6 +1774,19 @@ def _score_submission_for_project(
             profile_snapshot=profile_snapshot,
             scoring_engine_version=scoring_engine_version,
         )
+        report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+        report_meta["input_injection"] = _build_scoring_input_injection_meta(
+            project_id=project_id,
+            text=text,
+            anchors_count=len(anchors),
+            base_requirements_count=len(requirements),
+            runtime_custom_requirements_count=len(runtime_custom_requirements),
+            weights_norm=weights_norm,
+            profile_snapshot=profile_snapshot,
+            constraints_rebuilt=constraints_rebuilt,
+            runtime_req_meta=runtime_req_meta,
+        )
+        report["meta"] = report_meta
         _apply_deployed_patch_to_report(project_id, report)
         submission_like = {"id": submission_id, "project_id": project_id, "text": text}
         _apply_prediction_to_report(report, submission_like=submission_like, project=project)
@@ -1964,7 +2244,7 @@ def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, 
 def _rebuild_project_anchors_and_requirements(
     project_id: str,
 ) -> tuple[List[Dict[str, object]], List[Dict[str, object]]]:
-    merged_text = _merge_materials_text(project_id)
+    merged_text = _build_constraints_source_text(project_id)
     project = next((p for p in load_projects() if str(p.get("id")) == project_id), {})
     region = str(project.get("region") or DEFAULT_REGION)
     scoring_engine_version = str(
@@ -3305,7 +3585,18 @@ def upload_material(
     }
     materials.append(record)
     save_materials(materials)
-    return {"status": "ok", "material": record}
+    # 材料更新后立即重建锚点/要求，避免后续评分继续使用旧约束。
+    constraint_sync: Dict[str, object] = {"rebuilt": False}
+    try:
+        anchors, requirements = _rebuild_project_anchors_and_requirements(project_id)
+        constraint_sync = {
+            "rebuilt": True,
+            "anchors": len(anchors),
+            "requirements": len(requirements),
+        }
+    except Exception as exc:
+        constraint_sync = {"rebuilt": False, "error": f"{type(exc).__name__}: {exc}"}
+    return {"status": "ok", "material": record, "constraint_sync": constraint_sync}
 
 
 @router.get(
