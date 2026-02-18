@@ -45,6 +45,9 @@ class TestIndexEndpoint:
         assert "uploadShigong" in response.text
         assert 'id="scoreScaleSelect"' in response.text
         assert 'name="score_scale_max"' in response.text
+        assert 'id="groundTruthSubmissionSelect"' in response.text
+        assert 'id="groundTruthFile"' not in response.text
+        assert "/ground_truth/from_submission" in response.text
 
     def test_index_replaces_server_side_placeholders(self, client):
         """Index page should not leak template placeholders."""
@@ -124,6 +127,7 @@ class TestIndexEndpoint:
             "btnEvolve",
             "btnWritingGuidance",
             "btnCompilationInstructions",
+            "btnRefreshGroundTruthSubmissionOptions",
         ):
             assert f"safeClick('{button_id}'" in page
 

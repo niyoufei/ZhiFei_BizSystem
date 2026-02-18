@@ -132,6 +132,7 @@ from app.schemas import (
     ExpertProfileUpdate,
     GroundTruthBatchResponse,
     GroundTruthCreate,
+    GroundTruthFromSubmissionCreate,
     GroundTruthRecord,
     HealthResponse,
     InsightsReport,
@@ -5530,6 +5531,64 @@ def add_ground_truth(
 
 
 @router.post(
+    "/projects/{project_id}/ground_truth/from_submission",
+    response_model=GroundTruthRecord,
+    tags=["自我学习与进化"],
+    responses={**RESPONSES_401, **RESPONSES_404, **RESPONSES_422},
+)
+def add_ground_truth_from_submission(
+    project_id: str,
+    payload: GroundTruthFromSubmissionCreate,
+    api_key: Optional[str] = Depends(verify_api_key),
+    locale: str = Depends(get_locale),
+) -> GroundTruthRecord:
+    """从“步骤4已上传施组”中选择一份文件录入真实评标结果，避免重复上传。"""
+    ensure_data_dirs()
+    _assert_valid_final_score(payload.final_score)
+    projects = load_projects()
+    if not any(p["id"] == project_id for p in projects):
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+
+    submission_id = str(payload.submission_id or "").strip()
+    submissions = load_submissions()
+    submission = next(
+        (
+            s
+            for s in submissions
+            if str(s.get("id")) == submission_id and str(s.get("project_id")) == project_id
+        ),
+        None,
+    )
+    if not submission:
+        raise HTTPException(status_code=404, detail="未找到对应施组，请先在步骤4上传施组。")
+
+    shigong_text = str(submission.get("text") or "").strip()
+    if len(shigong_text) < 50:
+        raise HTTPException(status_code=422, detail="该施组文本过短，暂不支持录入真实评标。")
+
+    record = _new_ground_truth_record(
+        project_id=project_id,
+        shigong_text=shigong_text,
+        judge_scores=[float(x) for x in payload.judge_scores],
+        final_score=float(payload.final_score),
+        source=payload.source,
+        judge_weights=None,
+    )
+    record["source_submission_id"] = submission_id
+    record["source_submission_filename"] = submission.get("filename")
+
+    records = load_ground_truth()
+    records.append(record)
+    save_ground_truth(records)
+    _sync_ground_truth_record_to_qingtian(project_id, record)
+    try:
+        _run_feedback_closed_loop(project_id, locale=locale, trigger="ground_truth_add")
+    except Exception:
+        pass
+    return GroundTruthRecord(**record)
+
+
+@router.post(
     "/projects/{project_id}/ground_truth/from_file",
     response_model=GroundTruthRecord,
     tags=["自我学习与进化"],
@@ -6043,6 +6102,25 @@ def compat_auto_run_reflection(
     locale: str = Depends(get_locale),
 ) -> ReflectionAutoRunResponse:
     return auto_run_reflection_pipeline(project_id=project_id, api_key=api_key, locale=locale)
+
+
+@compat_router.post(
+    "/projects/{project_id}/ground_truth/from_submission",
+    response_model=GroundTruthRecord,
+    tags=["自我学习与进化"],
+)
+def compat_add_ground_truth_from_submission(
+    project_id: str,
+    payload: GroundTruthFromSubmissionCreate,
+    api_key: Optional[str] = Depends(verify_api_key),
+    locale: str = Depends(get_locale),
+) -> GroundTruthRecord:
+    return add_ground_truth_from_submission(
+        project_id=project_id,
+        payload=payload,
+        api_key=api_key,
+        locale=locale,
+    )
 
 
 @compat_router.post(
@@ -6836,13 +6914,16 @@ def index(
         <table id="feedMaterialsTable"><thead><tr><th>文件名</th><th>上传时间</th><th>操作</th></tr></thead><tbody></tbody></table>
         <p id="feedMaterialsEmpty" style="font-size:13px;color:#64748b;margin:6px 0 10px 0;display:none">暂无投喂包，请在上方或「3) 项目资料」上传。</p>
         <div style="margin-bottom:10px">
-          <strong>真实评标录入：</strong>文件选择 + 评委分 + 最终分 →
+          <strong>真实评标录入：</strong>从步骤4已上传施组中选择 + 评委分 + 最终分 →
           <button type="button" id="btnAddGroundTruth" onclick="return window.__zhifeiFallbackClick(event, 'btnAddGroundTruth')">录入所选文件</button>
         </div>
         <div class="field-group">
           <label>施组文件：</label>
-          <input type="file" id="groundTruthFile" accept=".txt,.docx,.pdf,.json,.xlsx,.xls" multiple style="margin-left:8px" />
-          <span class="note">支持一次选择多个文件，点击「录入所选文件」后将逐个解析并保存</span>
+          <select id="groundTruthSubmissionSelect" style="margin-left:8px;min-width:360px">
+            <option value="">-- 请选择步骤4已上传施组文件 --</option>
+          </select>
+          <button type="button" id="btnRefreshGroundTruthSubmissionOptions" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnRefreshGroundTruthSubmissionOptions')">刷新施组选项</button>
+          <span class="note">无需重复上传，直接复用「4) 项目施组」已上传文件。</span>
         </div>
         <div class="field-group">
           评委1：<input type="number" id="gtJ1" step="0.01" style="width:70px" />
@@ -6921,9 +7002,10 @@ def index(
             btnAdaptiveValidate: { resultId: 'adaptiveValidateResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/adaptive_validate', loading: '验证效果计算中...' },
             btnAdaptiveApply: { resultId: 'adaptiveApplyResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/adaptive_apply', loading: '应用补丁中...' },
             btnRefreshGroundTruth: { resultId: 'evolveResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/ground_truth', loading: '真实评标列表刷新中...' },
+            btnRefreshGroundTruthSubmissionOptions: { resultId: 'evolveResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/submissions', loading: '施组选项刷新中...' },
             btnRefreshFeedMaterials: { resultId: 'evolveResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials', loading: '投喂包列表刷新中...' },
             btnUploadFeed: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/materials', loading: '投喂包上传中...' },
-            btnAddGroundTruth: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/ground_truth/from_files', loading: '真实评标录入中...' },
+            btnAddGroundTruth: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/ground_truth/from_submission', loading: '真实评标录入中...' },
             btnEvolve: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/evolve', loading: '学习进化执行中...' },
             btnWritingGuidance: { resultId: 'guidanceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/writing_guidance', loading: '正在生成编制指导...' },
             btnCompilationInstructions: { resultId: 'compilationInstructionsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compilation_instructions', loading: '正在生成编制系统指令...' },
@@ -7259,6 +7341,9 @@ def index(
             if (actionId === 'btnUploadShigong' || actionId === 'btnScoreShigong') {
               if (typeof refreshSubmissions === 'function') await Promise.resolve(refreshSubmissions(projectId));
               else await fallbackRefreshSubmissionsTable(projectId);
+              if (typeof refreshGroundTruthSubmissionOptions === 'function') {
+                await Promise.resolve(refreshGroundTruthSubmissionOptions(projectId));
+              }
               return;
             }
             if (actionId === 'btnUploadFeed') {
@@ -7275,6 +7360,12 @@ def index(
             }
             if (actionId === 'btnAddGroundTruth' || actionId === 'btnRefreshGroundTruth') {
               if (typeof refreshGroundTruth === 'function') await Promise.resolve(refreshGroundTruth(projectId));
+              return;
+            }
+            if (actionId === 'btnRefreshGroundTruthSubmissionOptions') {
+              if (typeof refreshGroundTruthSubmissionOptions === 'function') {
+                await Promise.resolve(refreshGroundTruthSubmissionOptions(projectId));
+              }
               return;
             }
             if (actionId === 'btnEvolve') {
@@ -7333,19 +7424,20 @@ def index(
               return { body: JSON.stringify(payload), headers: fallbackJsonBodyHeaders() };
             }
             if (actionId === 'btnAddGroundTruth') {
-              const fd = new FormData();
-              const files = Array.from(((document.getElementById('groundTruthFile') || {}).files) || []);
-              files.forEach((f) => fd.append('files', f));
+              const selectedSubmissionId = String(((document.getElementById('groundTruthSubmissionSelect') || {}).value) || '').trim();
               const j1 = parseFloat(((document.getElementById('gtJ1') || {}).value || '0')) || 0;
               const j2 = parseFloat(((document.getElementById('gtJ2') || {}).value || '0')) || 0;
               const j3 = parseFloat(((document.getElementById('gtJ3') || {}).value || '0')) || 0;
               const j4 = parseFloat(((document.getElementById('gtJ4') || {}).value || '0')) || 0;
               const j5 = parseFloat(((document.getElementById('gtJ5') || {}).value || '0')) || 0;
               const finalScore = parseFloat(((document.getElementById('gtFinal') || {}).value || '0')) || 0;
-              fd.append('judge_scores', JSON.stringify([j1, j2, j3, j4, j5]));
-              fd.append('final_score', String(finalScore));
-              fd.append('source', '青天大模型');
-              return { body: fd, headers: fallbackAuthHeaders() };
+              const payload = {
+                submission_id: selectedSubmissionId,
+                judge_scores: [j1, j2, j3, j4, j5],
+                final_score: finalScore,
+                source: '青天大模型',
+              };
+              return { body: JSON.stringify(payload), headers: fallbackJsonBodyHeaders() };
             }
             if (actionId === 'btnAdaptiveApply') {
               let key = fallbackApiKey();
@@ -7430,6 +7522,14 @@ def index(
               if (okCount > 0) await fallbackRefreshAfter(actionId);
               if (fileInput && failCount === 0) fileInput.value = '';
               return failCount === 0;
+            }
+            if (actionId === 'btnAddGroundTruth') {
+              const selectedSubmissionId = String(((document.getElementById('groundTruthSubmissionSelect') || {}).value) || '').trim();
+              if (!selectedSubmissionId) {
+                fallbackSetResult(cfg.resultId, '请先在“施组文件”下拉框选择步骤4已上传施组。', true);
+                fallbackSetOutput('[' + actionId + '] 未选择施组文件');
+                return false;
+              }
             }
             const req = fallbackRenderPayloadForAction(actionId, projectId);
             let res;
@@ -7679,7 +7779,7 @@ def index(
         let projectMetaById = {};
         const PROJECT_REQUIRED_BUTTON_IDS = [
           'deleteCurrentProject', 'btnWeightsReset', 'btnWeightsSave', 'btnWeightsApply',
-          'btnRefreshGroundTruth', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
+          'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
           'btnEvolve', 'btnWritingGuidance', 'btnCompilationInstructions',
           'btnRebuildDelta', 'btnRebuildSamples', 'btnTrainCalibratorV2', 'btnApplyCalibPredict',
           'btnAutoRunReflection', 'btnEvalMetricsV2', 'btnEvalSummaryV2',
@@ -7689,7 +7789,7 @@ def index(
           'btnUploadMaterials', 'btnRefreshMaterials', 'btnUploadShigong', 'btnScoreShigong', 'btnRefreshSubmissions',
           'btnCompare', 'btnCompareReport', 'btnInsights', 'btnLearning',
           'btnAdaptive', 'btnAdaptivePatch', 'btnAdaptiveValidate', 'btnAdaptiveApply',
-          'btnRefreshGroundTruth', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
+          'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
           'btnEvolve', 'btnWritingGuidance', 'btnCompilationInstructions',
           'btnRebuildDelta', 'btnRebuildSamples', 'btnTrainCalibratorV2', 'btnApplyCalibPredict',
           'btnAutoRunReflection', 'btnEvalMetricsV2', 'btnEvalSummaryV2',
@@ -7697,7 +7797,7 @@ def index(
         ];
         const PROJECT_REQUIRED_INPUT_IDS = [
           'scoreScaleSelect',
-          'feedFile', 'groundTruthFile', 'groundTruthScope', 'groundTruthOtherProject',
+          'feedFile', 'groundTruthSubmissionSelect', 'groundTruthScope', 'groundTruthOtherProject',
           'gtJ1', 'gtJ2', 'gtJ3', 'gtJ4', 'gtJ5', 'gtFinal', 'patchType', 'patchIdInput',
         ];
         function setActionStatus(id, msg, isError=false) {
@@ -7832,8 +7932,17 @@ def index(
             const scaleSel = document.getElementById('scoreScaleSelect');
             if (scaleSel) scaleSel.value = '100';
           }
+          const gtSubmissionSel = document.getElementById('groundTruthSubmissionSelect');
+          if (gtSubmissionSel) {
+            gtSubmissionSel.innerHTML = '';
+            const opt = document.createElement('option');
+            opt.value = '';
+            opt.textContent = hasProject ? '-- 待加载步骤4施组文件 --' : '-- 请先选择项目 --';
+            gtSubmissionSel.appendChild(opt);
+            gtSubmissionSel.value = '';
+          }
           document.querySelectorAll(
-            '#uploadMaterial input[type="file"], #uploadShigong input[type="file"], #feedFile, #groundTruthFile'
+            '#uploadMaterial input[type="file"], #uploadShigong input[type="file"], #feedFile'
           ).forEach((el) => { if (el) el.value = ''; });
           setActionStatus(
             'materialsActionStatus',
@@ -8325,6 +8434,7 @@ def index(
             (typeof refreshMaterials === 'function') ? refreshMaterials(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshFeedMaterials === 'function') ? refreshFeedMaterials(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshGroundTruth === 'function') ? refreshGroundTruth(selectedId, switchSeq) : Promise.resolve(),
+            (typeof refreshGroundTruthSubmissionOptions === 'function') ? refreshGroundTruthSubmissionOptions(selectedId, switchSeq) : Promise.resolve(),
           ]);
           if (isStaleProjectResponse(selectedId, switchSeq)) return;
           setSelectMsg('已切换项目并自动刷新下方所有区域。', false);
@@ -8834,6 +8944,79 @@ def index(
             if (tbody) tbody.appendChild(tr);
           });
           updateTableEmptyState('submissionsTable', 'submissionsEmpty');
+          await refreshGroundTruthSubmissionOptions(id, switchSeq);
+        }
+        async function refreshGroundTruthSubmissionOptions(expectedProjectId=null, switchSeq=null) {
+          const id = expectedProjectId || pid();
+          const sel = document.getElementById('groundTruthSubmissionSelect');
+          if (!sel) return;
+          const prev = String(sel.value || '');
+          sel.innerHTML = '';
+          const pendingOpt = document.createElement('option');
+          pendingOpt.value = '';
+          if (!id) {
+            pendingOpt.textContent = '-- 请先选择项目 --';
+            sel.appendChild(pendingOpt);
+            sel.value = '';
+            return;
+          }
+          pendingOpt.textContent = '-- 加载步骤4施组中... --';
+          sel.appendChild(pendingOpt);
+          sel.disabled = true;
+          let res;
+          try {
+            res = await fetch('/api/v1/projects/' + id + '/submissions?t=' + Date.now(), { cache: 'no-store' });
+          } catch (_) {
+            sel.innerHTML = '';
+            const errOpt = document.createElement('option');
+            errOpt.value = '';
+            errOpt.textContent = '-- 施组列表加载失败，请稍后重试 --';
+            sel.appendChild(errOpt);
+            sel.value = '';
+            sel.disabled = false;
+            return;
+          }
+          if (isStaleProjectResponse(id, switchSeq)) {
+            sel.disabled = false;
+            return;
+          }
+          const subs = await res.json().catch(() => []);
+          sel.innerHTML = '';
+          const leadOpt = document.createElement('option');
+          leadOpt.value = '';
+          if (!res.ok || !Array.isArray(subs)) {
+            leadOpt.textContent = '-- 施组列表加载失败，请稍后重试 --';
+            sel.appendChild(leadOpt);
+            sel.value = '';
+            sel.disabled = false;
+            return;
+          }
+          if (!subs.length) {
+            leadOpt.textContent = '-- 暂无施组，请先在步骤4上传 --';
+            sel.appendChild(leadOpt);
+            sel.value = '';
+            sel.disabled = false;
+            return;
+          }
+          leadOpt.textContent = '-- 请选择步骤4已上传施组文件 --';
+          sel.appendChild(leadOpt);
+          subs.forEach((s) => {
+            const opt = document.createElement('option');
+            opt.value = String((s && s.id) || '');
+            const report = (s && s.report) || {};
+            const status = String((report && report.scoring_status) || '').toLowerCase();
+            const statusLabel = status === 'pending' ? '待评分' : (status === 'scored' ? '已评分' : '');
+            const createdAt = String((s && s.created_at) || '').slice(0, 19);
+            const suffix = [createdAt, statusLabel].filter(Boolean).join(' / ');
+            opt.textContent = String((s && s.filename) || '未命名施组') + (suffix ? ('（' + suffix + '）') : '');
+            sel.appendChild(opt);
+          });
+          if (prev && subs.some((s) => String((s && s.id) || '') === prev)) {
+            sel.value = prev;
+          } else {
+            sel.value = '';
+          }
+          sel.disabled = false;
         }
         async function refreshMaterials(expectedProjectId=null, switchSeq=null) {
           const id = expectedProjectId || pid();
@@ -9047,6 +9230,12 @@ def index(
         });
         safeChange('groundTruthOtherProject', refreshGroundTruth);
         safeClick('btnRefreshGroundTruth', refreshGroundTruth);
+        safeClick('btnRefreshGroundTruthSubmissionOptions', async () => {
+          if (!ensureProjectForAction('evolveResult')) return;
+          setResultLoading('evolveResult', '施组选项刷新中...');
+          await refreshGroundTruthSubmissionOptions();
+          setResultSuccess('evolveResult', '施组选项已刷新：请在下拉框中选择步骤4已上传施组。');
+        });
 
         function showJson(id, data) {
           const out = document.getElementById('output');
@@ -9518,22 +9707,29 @@ def index(
         safeClick('btnAddGroundTruth', async () => {
           if (!ensureProjectForAction('evolveResult')) return;
           const projectId = actionProjectId();
-          const fileInput = document.getElementById('groundTruthFile');
-          const files = Array.from((fileInput && fileInput.files) || []);
+          const submissionSelect = document.getElementById('groundTruthSubmissionSelect');
+          const submissionId = String((submissionSelect && submissionSelect.value) || '').trim();
+          if (!submissionId) {
+            setResultError('evolveResult', '请先在“施组文件”下拉框选择步骤4已上传施组。');
+            return;
+          }
           const j1 = parseFloat(document.getElementById('gtJ1').value) || 0, j2 = parseFloat(document.getElementById('gtJ2').value) || 0, j3 = parseFloat(document.getElementById('gtJ3').value) || 0, j4 = parseFloat(document.getElementById('gtJ4').value) || 0, j5 = parseFloat(document.getElementById('gtJ5').value) || 0;
           const finalScore = parseFloat(document.getElementById('gtFinal').value) || 0;
-          const headers = storageGet('api_key') ? { 'X-API-Key': storageGet('api_key') } : {};
-          const requestCount = files.length > 0 ? files.length : 1;
-          setResultLoading('evolveResult', '真实评标录入中（请求 ' + requestCount + ' 次）...');
-          document.getElementById('output').textContent = '真实评标录入中（请求 ' + requestCount + ' 次）...';
-          const fd = new FormData();
-          files.forEach(f => fd.append('files', f));
-          fd.append('judge_scores', JSON.stringify([j1, j2, j3, j4, j5]));
-          fd.append('final_score', String(finalScore));
-          fd.append('source', '青天大模型');
+          setResultLoading('evolveResult', '真实评标录入中（基于步骤4已上传施组）...');
+          document.getElementById('output').textContent = '真实评标录入中（基于步骤4已上传施组）...';
+          const payload = {
+            submission_id: submissionId,
+            judge_scores: [j1, j2, j3, j4, j5],
+            final_score: finalScore,
+            source: '青天大模型',
+          };
           let res, data;
           try {
-            res = await fetch('/api/v1/projects/' + projectId + '/ground_truth/from_files', { method: 'POST', headers, body: fd });
+            res = await fetch('/api/v1/projects/' + projectId + '/ground_truth/from_submission', {
+              method: 'POST',
+              headers: apiHeaders(true),
+              body: JSON.stringify(payload),
+            });
             data = await res.json().catch(() => ({}));
           } catch (err) {
             document.getElementById('output').textContent = '真实评标录入失败：' + String((err && err.message) || err || '网络异常');
@@ -9546,25 +9742,15 @@ def index(
             evolveErr.style.display = 'block';
             return;
           }
-          const okCount = Number(data.success_count || 0);
-          const failCount = Number(data.failed_count || 0);
-          const details = (data.items || []).map(it => {
-            if (it.ok) {
-              if (it.detail) return '[成功] ' + it.filename + '（告警：' + it.detail + '）';
-              return '[成功] ' + it.filename;
-            }
-            return '[失败] ' + it.filename + ' -> ' + (it.detail || '未知错误');
-          });
+          const sourceName = String((submissionSelect && submissionSelect.options && submissionSelect.selectedIndex >= 0 && submissionSelect.options[submissionSelect.selectedIndex] && submissionSelect.options[submissionSelect.selectedIndex].textContent) || submissionId);
           const evolveEl = document.getElementById('evolveResult');
-          if (okCount > 0) {
-            evolveEl.innerHTML = '<p class="success">真实评标录入完成：成功 ' + okCount + ' 条，失败 ' + failCount + ' 条。</p><pre style="margin:6px 0 0 0">' + details.join(NL) + '</pre>';
-            evolveEl.style.display = 'block';
-            refreshGroundTruth();
-          } else {
-            evolveEl.innerHTML = '<p class="error">真实评标录入失败，请检查文件与分值。</p><pre style="margin:6px 0 0 0">' + details.join(NL) + '</pre>';
-            evolveEl.style.display = 'block';
-          }
-          if (fileInput) fileInput.value = '';
+          evolveEl.innerHTML =
+            '<p class="success">真实评标录入完成：已记录 1 条。</p>' +
+            '<p style="margin:6px 0 0 0"><strong>施组：</strong>' + escapeHtmlText(sourceName) + '</p>' +
+            '<p style="margin:4px 0 0 0"><strong>最终分：</strong>' + escapeHtmlText(String(data.final_score != null ? data.final_score : finalScore)) + '</p>';
+          evolveEl.style.display = 'block';
+          if (submissionSelect) submissionSelect.value = '';
+          refreshGroundTruth();
         });
         safeClick('btnEvolve', async () => {
           if (!ensureProjectForAction('evolveResult')) return;
