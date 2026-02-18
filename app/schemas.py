@@ -743,8 +743,12 @@ class GroundTruthRecord(BaseModel):
     id: str
     project_id: str
     shigong_text: str
-    judge_scores: List[float] = Field(..., description="5个评委得分")
+    judge_scores: List[float] = Field(..., description="5或7个评委得分")
+    judge_count: Optional[int] = Field(None, description="评委人数（5或7）")
+    score_scale_max: Optional[int] = Field(None, description="该条真实评分的原始满分制（5或100）")
     final_score: float = Field(..., description="最终得分")
+    final_score_raw: Optional[float] = Field(None, description="原始录入最终分（按项目满分制）")
+    final_score_100: Optional[float] = Field(None, description="归一化到100分制后的最终分")
     judge_weights: Optional[List[float]] = Field(None, description="5个评委关注度/权重")
     source: str = Field(default="青天大模型", description="来源")
     created_at: str

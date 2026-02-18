@@ -1490,6 +1490,18 @@ def _convert_score_from_100(score: object, score_scale_max: int) -> Optional[flo
     return round(clipped * factor, 2)
 
 
+def _convert_score_to_100(score: object, score_scale_max: int) -> Optional[float]:
+    value = _to_float_or_none(score)
+    if value is None:
+        return None
+    scale = float(_normalize_score_scale_max(score_scale_max))
+    if scale <= 0:
+        return None
+    clipped = _clip_score(value, 0.0, scale)
+    normalized = clipped * (100.0 / scale)
+    return round(_clip_score(normalized, 0.0, 100.0), 2)
+
+
 def _resolve_score_blend_weights(project: Dict[str, object]) -> tuple[float, float, float]:
     meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
     blend_raw = meta.get("score_blend") if isinstance(meta, dict) else {}
@@ -1914,9 +1926,45 @@ def _refresh_project_reflection_objects(project_id: str) -> None:
     latest_reports = _latest_records_by_submission(
         [r for r in load_score_reports() if str(r.get("project_id")) == project_id]
     )
-    latest_qt = _latest_records_by_submission(
-        [q for q in load_qingtian_results() if str(q.get("submission_id")) in submissions_by_id]
-    )
+    projects = load_projects()
+    project = next((p for p in projects if str(p.get("id")) == project_id), {})
+    project_score_scale = _resolve_project_score_scale_max(project) if project else 100
+
+    qingtian_results = load_qingtian_results()
+    qingtian_changed = False
+    scoped_qt: List[Dict[str, object]] = []
+    for q in qingtian_results:
+        sid = str(q.get("submission_id") or "")
+        if sid not in submissions_by_id:
+            continue
+        raw_payload = q.get("raw_payload") if isinstance(q.get("raw_payload"), dict) else {}
+        normalized_record = _ground_truth_record_for_learning(
+            {
+                "final_score": raw_payload.get("final_score"),
+                "final_score_raw": raw_payload.get("final_score_raw"),
+                "final_score_100": raw_payload.get("final_score_100"),
+                "score_scale_max": raw_payload.get("score_scale_max"),
+                "judge_scores": raw_payload.get("judge_scores") or [],
+            },
+            default_score_scale_max=project_score_scale,
+        )
+        normalized_qt_score = float(normalized_record.get("final_score", 0.0))
+        old_qt_score = _to_float_or_none(q.get("qt_total_score"))
+        if old_qt_score is None or abs(old_qt_score - normalized_qt_score) > 1e-6:
+            q["qt_total_score"] = normalized_qt_score
+            qingtian_changed = True
+        merged_payload = dict(raw_payload or {})
+        merged_payload["final_score_raw"] = normalized_record.get("final_score_raw")
+        merged_payload["final_score_100"] = normalized_qt_score
+        merged_payload["score_scale_max"] = normalized_record.get("score_scale_max")
+        if merged_payload != raw_payload:
+            q["raw_payload"] = merged_payload
+            qingtian_changed = True
+        scoped_qt.append(q)
+    if qingtian_changed:
+        save_qingtian_results(qingtian_results)
+
+    latest_qt = _latest_records_by_submission(scoped_qt)
 
     delta_cases = build_delta_cases(
         project_id=project_id,
@@ -2048,6 +2096,79 @@ def _auto_update_project_weights_from_delta_cases(project_id: str) -> Dict[str, 
         "sample_count": len(delta_cases),
         "changed_dims": changed_dims,
         "new_profile_id": new_profile["id"],
+        "new_weights_norm": dict(new_profile.get("weights_norm") or {}),
+        "new_dimension_multipliers": _weights_norm_to_dimension_multipliers(
+            dict(new_profile.get("weights_norm") or {})
+        ),
+    }
+
+
+def _sync_feedback_weights_to_evolution(
+    project_id: str,
+    weight_update: Dict[str, object],
+) -> Dict[str, object]:
+    if not bool(weight_update.get("updated")):
+        return {"synced": False, "reason": "weight_not_updated"}
+    multipliers = weight_update.get("new_dimension_multipliers") or {}
+    if not isinstance(multipliers, dict) or not multipliers:
+        return {"synced": False, "reason": "missing_multipliers"}
+    reports = load_evolution_reports()
+    evo = reports.get(project_id) or {}
+    scoring_evolution = (
+        evo.get("scoring_evolution") if isinstance(evo.get("scoring_evolution"), dict) else {}
+    )
+    scoring_evolution = dict(scoring_evolution or {})
+    scoring_evolution["dimension_multipliers"] = {
+        dim_id: float(multipliers.get(dim_id, 1.0)) for dim_id in DIMENSION_IDS
+    }
+    scoring_evolution.setdefault("rationale", {})
+    scoring_evolution["updated_by_feedback"] = True
+    scoring_evolution["updated_by_feedback_at"] = _now_iso()
+    evo["scoring_evolution"] = scoring_evolution
+    evo.setdefault("project_id", project_id)
+    evo.setdefault("sample_count", 0)
+    evo["updated_at"] = _now_iso()
+    reports[project_id] = evo
+    save_evolution_reports(reports)
+    return {
+        "synced": True,
+        "dimension_multipliers_count": len(scoring_evolution.get("dimension_multipliers") or {}),
+    }
+
+
+def _refresh_evolution_report_from_ground_truth(project_id: str) -> Dict[str, object]:
+    projects = load_projects()
+    project = next((p for p in projects if str(p.get("id")) == project_id), None)
+    if project is None:
+        return {"refreshed": False, "reason": "project_not_found"}
+    project_score_scale = _resolve_project_score_scale_max(project)
+    records_raw = [r for r in load_ground_truth() if str(r.get("project_id")) == project_id]
+    records = [
+        _ground_truth_record_for_learning(
+            r if isinstance(r, dict) else {},
+            default_score_scale_max=project_score_scale,
+        )
+        for r in records_raw
+    ]
+    ctx_data = load_project_context().get(project_id) or {}
+    project_context = str(ctx_data.get("text") or "").strip()
+    materials_text = _merge_materials_text(project_id)
+    if materials_text:
+        project_context = (
+            (project_context + "\n\n" + materials_text) if project_context else materials_text
+        )
+
+    report = build_evolution_report(project_id, records, project_context)
+    reports = load_evolution_reports()
+    prev = reports.get(project_id) or {}
+    # 自动闭环刷新时仅更新规则进化结果与编制指导；保留已有 LLM 增强来源标记。
+    if isinstance(prev.get("enhanced_by"), str):
+        report["enhanced_by"] = prev.get("enhanced_by")
+    reports[project_id] = report
+    save_evolution_reports(reports)
+    return {
+        "refreshed": True,
+        "sample_count": int(report.get("sample_count", 0) or 0),
     }
 
 
@@ -2061,7 +2182,9 @@ def _run_feedback_closed_loop(project_id: str, *, locale: str, trigger: str) -> 
         "project_id": project_id,
         "trigger": trigger,
         "weight_update": {"updated": False},
+        "weight_sync_to_evolution": {"synced": False},
         "auto_run": None,
+        "evolution_refresh": {"refreshed": False},
     }
     try:
         _refresh_project_reflection_objects(project_id)
@@ -2074,6 +2197,12 @@ def _run_feedback_closed_loop(project_id: str, *, locale: str, trigger: str) -> 
         result["weight_update"] = _auto_update_project_weights_from_delta_cases(project_id)
     except Exception as exc:
         result["weight_update"] = {"updated": False, "error": str(exc)}
+    try:
+        result["weight_sync_to_evolution"] = _sync_feedback_weights_to_evolution(
+            project_id, result["weight_update"]
+        )
+    except Exception as exc:
+        result["weight_sync_to_evolution"] = {"synced": False, "error": str(exc)}
 
     try:
         auto_resp = auto_run_reflection_pipeline(project_id=project_id, api_key=None, locale=locale)
@@ -2084,6 +2213,10 @@ def _run_feedback_closed_loop(project_id: str, *, locale: str, trigger: str) -> 
     except Exception as exc:
         result["auto_run"] = {"ok": False, "error": str(exc)}
         result["ok"] = False
+    try:
+        result["evolution_refresh"] = _refresh_evolution_report_from_ground_truth(project_id)
+    except Exception as exc:
+        result["evolution_refresh"] = {"refreshed": False, "error": str(exc)}
     return result
 
 
@@ -2206,6 +2339,11 @@ def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, 
         str((r.get("raw_payload") or {}).get("ground_truth_record_id") or "") == source_gt_id
         for r in qt_results
     )
+    project_score_scale = _resolve_project_score_scale_max(project)
+    gt_for_learning = _ground_truth_record_for_learning(
+        gt_record,
+        default_score_scale_max=project_score_scale,
+    )
     if not exists:
         qt_results.append(
             {
@@ -2214,7 +2352,7 @@ def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, 
                 "qingtian_model_version": str(
                     project.get("qingtian_model_version") or DEFAULT_QINGTIAN_MODEL_VERSION
                 ),
-                "qt_total_score": float(gt_record.get("final_score", 0.0)),
+                "qt_total_score": float(gt_for_learning.get("final_score", 0.0)),
                 "qt_dim_scores": None,
                 "qt_reasons": [
                     {
@@ -2227,6 +2365,9 @@ def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, 
                     "source": gt_record.get("source"),
                     "judge_scores": gt_record.get("judge_scores"),
                     "final_score": gt_record.get("final_score"),
+                    "final_score_raw": gt_for_learning.get("final_score_raw"),
+                    "final_score_100": gt_for_learning.get("final_score"),
+                    "score_scale_max": gt_for_learning.get("score_scale_max"),
                 },
                 "created_at": _now_iso(),
             }
@@ -5920,9 +6061,39 @@ def _parse_judge_scores_form(judge_scores: str) -> List[float]:
         raise HTTPException(status_code=422, detail=f"评委得分格式错误：{e}")
 
 
-def _assert_valid_final_score(final_score: float) -> None:
-    if not (0 <= final_score <= 100):
-        raise HTTPException(status_code=422, detail="最终得分应在 0～100 之间。")
+def _assert_valid_final_score(final_score: float, *, score_scale_max: int = 100) -> None:
+    scale = _normalize_score_scale_max(score_scale_max, default=100)
+    if not (0 <= float(final_score) <= float(scale)):
+        raise HTTPException(status_code=422, detail=f"最终得分应在 0～{scale} 之间。")
+
+
+def _ground_truth_record_for_learning(
+    record: Dict[str, object],
+    *,
+    default_score_scale_max: int,
+) -> Dict[str, object]:
+    score_scale_max = _normalize_score_scale_max(
+        record.get("score_scale_max"),
+        default=default_score_scale_max,
+    )
+    final_raw = _to_float_or_none(record.get("final_score_raw"))
+    if final_raw is None:
+        final_raw = _to_float_or_none(record.get("final_score"))
+    if final_raw is None:
+        final_raw = 0.0
+    final_100 = _to_float_or_none(record.get("final_score_100"))
+    if final_100 is None:
+        final_100 = _convert_score_to_100(final_raw, score_scale_max)
+    final_100 = float(final_100 if final_100 is not None else 0.0)
+    judge_scores = record.get("judge_scores") or []
+    judge_count = len(judge_scores) if isinstance(judge_scores, list) else 0
+    normalized = dict(record)
+    normalized["score_scale_max"] = score_scale_max
+    normalized["final_score_raw"] = round(float(final_raw), 2)
+    normalized["final_score_100"] = round(final_100, 2)
+    normalized["final_score"] = round(final_100, 2)
+    normalized["judge_count"] = judge_count
+    return normalized
 
 
 def _new_ground_truth_record(
@@ -5931,14 +6102,23 @@ def _new_ground_truth_record(
     judge_scores: List[float],
     final_score: float,
     source: str,
+    score_scale_max: int,
     judge_weights: Optional[List[float]] = None,
 ) -> Dict[str, object]:
+    score_scale = _normalize_score_scale_max(score_scale_max, default=100)
+    final_raw = float(final_score)
+    final_100 = _convert_score_to_100(final_raw, score_scale)
+    final_100 = float(final_100 if final_100 is not None else 0.0)
     return {
         "id": str(uuid4()),
         "project_id": project_id,
         "shigong_text": shigong_text,
-        "judge_scores": judge_scores,
-        "final_score": final_score,
+        "judge_scores": [float(x) for x in judge_scores],
+        "judge_count": len(judge_scores),
+        "score_scale_max": score_scale,
+        "final_score": round(final_raw, 2),
+        "final_score_raw": round(final_raw, 2),
+        "final_score_100": round(final_100, 2),
         "judge_weights": judge_weights,
         "source": source,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -5967,10 +6147,12 @@ def add_ground_truth(
             status_code=422,
             detail="施组全文过短，至少 50 字以便学习分析。",
         )
-    _assert_valid_final_score(payload.final_score)
     projects = load_projects()
-    if not any(p["id"] == project_id for p in projects):
+    project = next((p for p in projects if p["id"] == project_id), None)
+    if project is None:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    score_scale_max = _resolve_project_score_scale_max(project)
+    _assert_valid_final_score(payload.final_score, score_scale_max=score_scale_max)
     records = load_ground_truth()
     record = _new_ground_truth_record(
         project_id=project_id,
@@ -5978,6 +6160,7 @@ def add_ground_truth(
         judge_scores=payload.judge_scores,
         final_score=payload.final_score,
         source=payload.source,
+        score_scale_max=score_scale_max,
         judge_weights=payload.judge_weights,
     )
     records.append(record)
@@ -6004,10 +6187,12 @@ def add_ground_truth_from_submission(
 ) -> GroundTruthRecord:
     """从“步骤4已上传施组”中选择一份文件录入真实评标结果，避免重复上传。"""
     ensure_data_dirs()
-    _assert_valid_final_score(payload.final_score)
     projects = load_projects()
-    if not any(p["id"] == project_id for p in projects):
+    project = next((p for p in projects if p["id"] == project_id), None)
+    if project is None:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    score_scale_max = _resolve_project_score_scale_max(project)
+    _assert_valid_final_score(payload.final_score, score_scale_max=score_scale_max)
 
     submission_id = str(payload.submission_id or "").strip()
     submissions = load_submissions()
@@ -6032,6 +6217,7 @@ def add_ground_truth_from_submission(
         judge_scores=[float(x) for x in payload.judge_scores],
         final_score=float(payload.final_score),
         source=payload.source,
+        score_scale_max=score_scale_max,
         judge_weights=None,
     )
     record["source_submission_id"] = submission_id
@@ -6069,10 +6255,12 @@ async def add_ground_truth_from_file(
     """
     ensure_data_dirs()
     projects = load_projects()
-    if not any(p["id"] == project_id for p in projects):
+    project = next((p for p in projects if p["id"] == project_id), None)
+    if project is None:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    score_scale_max = _resolve_project_score_scale_max(project)
     judge_scores_list = _parse_judge_scores_form(judge_scores)
-    _assert_valid_final_score(final_score)
+    _assert_valid_final_score(final_score, score_scale_max=score_scale_max)
     content = await file.read()
     try:
         shigong_text = _read_uploaded_file_content(content, file.filename or "")
@@ -6087,6 +6275,7 @@ async def add_ground_truth_from_file(
         judge_scores=judge_scores_list,
         final_score=final_score,
         source=source,
+        score_scale_max=score_scale_max,
         judge_weights=None,
     )
     records.append(record)
@@ -6119,10 +6308,12 @@ async def add_ground_truth_from_files(
     """
     ensure_data_dirs()
     projects = load_projects()
-    if not any(p["id"] == project_id for p in projects):
+    project = next((p for p in projects if p["id"] == project_id), None)
+    if project is None:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    score_scale_max = _resolve_project_score_scale_max(project)
     judge_scores_list = _parse_judge_scores_form(judge_scores)
-    _assert_valid_final_score(final_score)
+    _assert_valid_final_score(final_score, score_scale_max=score_scale_max)
 
     items: List[Dict[str, object]] = []
     success_records: List[Dict[str, object]] = []
@@ -6139,6 +6330,7 @@ async def add_ground_truth_from_files(
                 judge_scores=judge_scores_list,
                 final_score=final_score,
                 source=source,
+                score_scale_max=score_scale_max,
                 judge_weights=None,
             )
             success_records.append(record)
@@ -6292,9 +6484,18 @@ def evolve_project(
     """
     ensure_data_dirs()
     projects = load_projects()
-    if not any(p["id"] == project_id for p in projects):
+    project = next((p for p in projects if p["id"] == project_id), None)
+    if project is None:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    records = [r for r in load_ground_truth() if r.get("project_id") == project_id]
+    project_score_scale = _resolve_project_score_scale_max(project)
+    records_raw = [r for r in load_ground_truth() if r.get("project_id") == project_id]
+    records = [
+        _ground_truth_record_for_learning(
+            r if isinstance(r, dict) else {},
+            default_score_scale_max=project_score_scale,
+        )
+        for r in records_raw
+    ]
     ctx_data = load_project_context().get(project_id) or {}
     project_context = (ctx_data.get("text") or "").strip()
     materials_text = _merge_materials_text(project_id)

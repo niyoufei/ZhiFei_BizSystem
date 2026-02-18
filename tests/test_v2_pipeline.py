@@ -1829,3 +1829,121 @@ class TestScoringMeceInjection:
         assert len(mock_score_text_v2.call_args.kwargs["requirements"]) == 2
         mock_apply_patch.assert_called_once()
         mock_apply_predict.assert_called_once()
+
+
+class TestEvolutionClosedLoop:
+    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main.save_ground_truth")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_add_ground_truth_from_submission_normalizes_5_scale_final_score(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_submissions,
+        mock_load_ground_truth,
+        mock_save_ground_truth,
+        mock_sync_qt,
+    ):
+        mock_load_projects.return_value = [
+            {"id": "p1", "name": "项目1", "meta": {"score_scale_max": 5}}
+        ]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "样本施组.pdf",
+                "text": "这是足够长的施组正文。" * 20,
+            }
+        ]
+        mock_load_ground_truth.return_value = []
+        payload = {
+            "submission_id": "s1",
+            "judge_scores": [4.2, 4.3, 4.4, 4.1, 4.2],
+            "final_score": 4.3,
+            "source": "青天大模型",
+        }
+        resp = _client().post("/api/v1/projects/p1/ground_truth/from_submission", json=payload)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["final_score"] == 4.3
+        assert data["score_scale_max"] == 5
+        assert data["final_score_100"] == 86.0
+        assert data["judge_count"] == 5
+        assert mock_sync_qt.called
+        synced_record = mock_sync_qt.call_args.args[1]
+        assert float(synced_record["final_score_100"]) == 86.0
+        mock_save_ground_truth.assert_called_once()
+
+    @patch("app.main.save_evolution_reports")
+    @patch("app.main.load_evolution_reports")
+    def test_sync_feedback_weights_to_evolution_persists_multipliers(
+        self, mock_load_reports, mock_save_reports
+    ):
+        from app.main import _sync_feedback_weights_to_evolution
+
+        mock_load_reports.return_value = {"p1": {"project_id": "p1", "sample_count": 3}}
+        result = _sync_feedback_weights_to_evolution(
+            "p1",
+            {
+                "updated": True,
+                "new_dimension_multipliers": {"01": 1.1, "02": 0.9},
+            },
+        )
+        assert result["synced"] is True
+        payload = mock_save_reports.call_args.args[0]
+        assert payload["p1"]["scoring_evolution"]["dimension_multipliers"]["01"] == 1.1
+        assert payload["p1"]["scoring_evolution"]["dimension_multipliers"]["02"] == 0.9
+
+    @patch("app.main.save_evolution_reports")
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.enhance_evolution_report_with_llm")
+    @patch("app.main.build_evolution_report")
+    @patch("app.main.load_project_context")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_evolve_project_uses_normalized_ground_truth_scores(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_ground_truth,
+        mock_load_context,
+        mock_build_report,
+        mock_enhance,
+        mock_load_reports,
+        mock_save_reports,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 5}}]
+        mock_load_ground_truth.return_value = [
+            {
+                "id": "g1",
+                "project_id": "p1",
+                "shigong_text": "A" * 200,
+                "judge_scores": [4.0, 4.1, 4.2, 4.3, 4.4],
+                "final_score": 4.0,
+                "score_scale_max": 5,
+            }
+        ]
+        mock_load_context.return_value = {}
+        mock_build_report.return_value = {
+            "project_id": "p1",
+            "sample_count": 1,
+            "high_score_logic": ["x"],
+            "writing_guidance": ["y"],
+            "scoring_evolution": {"dimension_multipliers": {}},
+            "compilation_instructions": {},
+            "updated_at": "2026-02-19T00:00:00+00:00",
+        }
+        mock_enhance.return_value = None
+        mock_load_reports.return_value = {}
+
+        resp = _client().post("/api/v1/projects/p1/evolve")
+        assert resp.status_code == 200
+        args = mock_build_report.call_args.args
+        used_records = args[1]
+        assert len(used_records) == 1
+        # 4.0/5 => 80.0，进化学习统一按 100 分口径计算
+        assert float(used_records[0]["final_score"]) == 80.0

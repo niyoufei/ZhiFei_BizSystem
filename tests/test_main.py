@@ -922,7 +922,7 @@ class TestMaterialsEndpoint:
         self, mock_dir, mock_ensure, mock_load_proj, mock_load_mat, mock_save, client, tmp_path
     ):
         mock_dir.__truediv__ = lambda self, x: tmp_path / x
-        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_load_proj.return_value = [{"id": "p1", "scoring_engine_version_locked": "v1"}]
         mock_load_mat.return_value = []
 
         response = client.post(
@@ -1213,7 +1213,10 @@ class TestScoreForProjectEndpoint:
         mock_load_sub.return_value = []
         mock_score.return_value = MagicMock(model_dump=lambda: {"total_score": 78.0})
 
-        response = client.post("/api/v1/projects/p1/score", json={"text": "测试文本"})
+        with patch("app.main.get_cached_score", return_value=None), patch(
+            "app.main.cache_score_result"
+        ), patch("app.main.load_evolution_reports", return_value={}):
+            response = client.post("/api/v1/projects/p1/score", json={"text": "测试文本"})
         assert response.status_code == 200
         # Check multipliers were passed
         call_args = mock_score.call_args
