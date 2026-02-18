@@ -1,0 +1,39 @@
+name: Feature Request
+description: Propose a new capability or enhancement.
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user/problem does this solve?
+      placeholder: Describe the current pain point.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution
+      description: What do you want to build?
+      placeholder: Describe the desired behavior and API/UI impact.
+    validations:
+      required: true
+
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints
+      description: Any scope, compliance, or compatibility constraints?
+      placeholder: e.g. Hefei only, QingTian model only, preserve backward compatibility.
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      description: How do we know it is done?
+      placeholder: |
+        - [ ] API added
+        - [ ] UI updated
+        - [ ] Tests pass
