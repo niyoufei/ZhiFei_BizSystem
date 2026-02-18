@@ -743,6 +743,82 @@ class TestGroundTruthAutoSync:
     @patch("app.main.load_submissions")
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
+    def test_add_ground_truth_from_submission_supports_7_judges(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_submissions,
+        mock_load_records,
+        mock_save_records,
+        mock_sync,
+    ):
+        mock_load_projects.return_value = [{"id": "p1"}]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "demo.txt",
+                "text": "施组正文内容" * 30,
+            }
+        ]
+        mock_load_records.return_value = []
+        payload = {
+            "submission_id": "s1",
+            "judge_scores": [80, 81, 82, 83, 84, 85, 86],
+            "final_score": 82.0,
+            "source": "青天大模型",
+        }
+        resp = _client().post("/api/v1/projects/p1/ground_truth/from_submission", json=payload)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["judge_count"] == 7
+        assert len(data["judge_scores"]) == 7
+        mock_save_records.assert_called_once()
+        mock_sync.assert_called_once()
+
+    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main.save_ground_truth")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_add_ground_truth_from_submission_rejects_invalid_judge_count(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_submissions,
+        mock_load_records,
+        mock_save_records,
+        mock_sync,
+    ):
+        mock_load_projects.return_value = [{"id": "p1"}]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "demo.txt",
+                "text": "施组正文内容" * 30,
+            }
+        ]
+        mock_load_records.return_value = []
+        payload = {
+            "submission_id": "s1",
+            "judge_scores": [80, 81, 82, 83, 84, 85],
+            "final_score": 82.0,
+            "source": "青天大模型",
+        }
+        resp = _client().post("/api/v1/projects/p1/ground_truth/from_submission", json=payload)
+        assert resp.status_code == 422
+        assert "5 或 7" in resp.json()["detail"]
+        mock_save_records.assert_not_called()
+        mock_sync.assert_not_called()
+
+    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main.save_ground_truth")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
     def test_compat_add_ground_truth_from_submission_triggers_sync(
         self,
         mock_ensure,
@@ -799,6 +875,36 @@ class TestGroundTruthAutoSync:
             },
         )
         assert resp.status_code == 200
+        mock_sync.assert_called_once()
+
+    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main.save_ground_truth")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_add_ground_truth_from_file_supports_7_judges(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_records,
+        mock_save_records,
+        mock_sync,
+    ):
+        mock_load_projects.return_value = [{"id": "p1"}]
+        mock_load_records.return_value = []
+        file_content = ("施组正文内容" * 30).encode("utf-8")
+        resp = _client().post(
+            "/api/v1/projects/p1/ground_truth/from_file",
+            files={"file": ("gt.txt", file_content, "text/plain")},
+            data={
+                "judge_scores": "[80,81,82,83,84,85,86]",
+                "final_score": "82",
+                "source": "青天大模型",
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["judge_count"] == 7
         mock_sync.assert_called_once()
 
     @patch("app.main._sync_ground_truth_record_to_qingtian")

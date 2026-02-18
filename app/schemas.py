@@ -758,10 +758,10 @@ class GroundTruthCreate(BaseModel):
     """录入真实评标结果"""
 
     shigong_text: str = Field(..., description="施组全文")
-    judge_scores: List[float] = Field(..., min_length=5, max_length=5, description="5个评委得分")
+    judge_scores: List[float] = Field(..., description="5或7个评委得分")
     final_score: float = Field(..., description="最终得分")
     judge_weights: Optional[List[float]] = Field(
-        None, min_length=5, max_length=5, description="5个评委关注度"
+        None, description="评委关注度/权重（长度需与评委人数一致）"
     )
     source: str = Field(default="青天大模型", description="来源")
 
@@ -770,7 +770,7 @@ class GroundTruthFromSubmissionCreate(BaseModel):
     """从已上传施组中选择一份录入真实评标结果"""
 
     submission_id: str = Field(..., description="施组提交ID（来自步骤4已上传列表）")
-    judge_scores: List[float] = Field(..., min_length=5, max_length=5, description="5个评委得分")
+    judge_scores: List[float] = Field(..., description="5或7个评委得分")
     final_score: float = Field(..., description="最终得分")
     source: str = Field(default="青天大模型", description="来源")
 

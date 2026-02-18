@@ -6051,14 +6051,60 @@ def get_project_context_endpoint(
     )
 
 
+def _normalize_judge_scores_or_422(
+    judge_scores: object,
+    *,
+    field_name: str = "judge_scores",
+) -> List[float]:
+    if not isinstance(judge_scores, list):
+        raise HTTPException(status_code=422, detail=f"{field_name} 必须为数组。")
+    judge_count = len(judge_scores)
+    if judge_count not in (5, 7):
+        raise HTTPException(status_code=422, detail=f"{field_name} 必须为 5 或 7 个评委得分。")
+    normalized: List[float] = []
+    for idx, value in enumerate(judge_scores, start=1):
+        try:
+            normalized.append(float(value))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{field_name}[{idx}] 不是有效数字：{exc}",
+            )
+    return normalized
+
+
+def _normalize_judge_weights_or_422(
+    judge_weights: object,
+    *,
+    expected_count: int,
+) -> Optional[List[float]]:
+    if judge_weights is None:
+        return None
+    if not isinstance(judge_weights, list):
+        raise HTTPException(status_code=422, detail="judge_weights 必须为数组。")
+    if len(judge_weights) != expected_count:
+        raise HTTPException(
+            status_code=422,
+            detail=f"judge_weights 长度需与 judge_scores 一致（当前应为 {expected_count}）。",
+        )
+    normalized: List[float] = []
+    for idx, value in enumerate(judge_weights, start=1):
+        try:
+            normalized.append(float(value))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"judge_weights[{idx}] 不是有效数字：{exc}",
+            )
+    return normalized
+
+
 def _parse_judge_scores_form(judge_scores: str) -> List[float]:
     try:
         scores = json.loads(judge_scores)
-        if not isinstance(scores, list) or len(scores) != 5:
-            raise ValueError("judge_scores 必须为长度为 5 的数组")
-        return [float(x) for x in scores]
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"评委得分格式错误：{e}")
+    return _normalize_judge_scores_or_422(scores)
 
 
 def _assert_valid_final_score(final_score: float, *, score_scale_max: int = 100) -> None:
@@ -6106,6 +6152,11 @@ def _new_ground_truth_record(
     judge_weights: Optional[List[float]] = None,
 ) -> Dict[str, object]:
     score_scale = _normalize_score_scale_max(score_scale_max, default=100)
+    normalized_judge_scores = _normalize_judge_scores_or_422(judge_scores)
+    normalized_judge_weights = _normalize_judge_weights_or_422(
+        judge_weights,
+        expected_count=len(normalized_judge_scores),
+    )
     final_raw = float(final_score)
     final_100 = _convert_score_to_100(final_raw, score_scale)
     final_100 = float(final_100 if final_100 is not None else 0.0)
@@ -6113,13 +6164,13 @@ def _new_ground_truth_record(
         "id": str(uuid4()),
         "project_id": project_id,
         "shigong_text": shigong_text,
-        "judge_scores": [float(x) for x in judge_scores],
-        "judge_count": len(judge_scores),
+        "judge_scores": normalized_judge_scores,
+        "judge_count": len(normalized_judge_scores),
         "score_scale_max": score_scale,
         "final_score": round(final_raw, 2),
         "final_score_raw": round(final_raw, 2),
         "final_score_100": round(final_100, 2),
-        "judge_weights": judge_weights,
+        "judge_weights": normalized_judge_weights,
         "source": source,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -6138,7 +6189,7 @@ def add_ground_truth(
     locale: str = Depends(get_locale),
 ) -> GroundTruthRecord:
     """
-    录入真实评标结果（如青天大模型在交易中心评标后的施组+5评委得分+最终得分）。
+    录入真实评标结果（如青天大模型在交易中心评标后的施组+5/7评委得分+最终得分）。
     用于系统学习高分逻辑并进化。
     """
     ensure_data_dirs()
@@ -6243,7 +6294,7 @@ def add_ground_truth_from_submission(
 async def add_ground_truth_from_file(
     project_id: str,
     file: UploadFile = File(...),
-    judge_scores: str = Form(..., description="5个评委得分，JSON 数组如 [1,2,3,4,5]"),
+    judge_scores: str = Form(..., description="5或7个评委得分，JSON 数组如 [1,2,3,4,5]"),
     final_score: float = Form(...),
     source: str = Form("青天大模型"),
     api_key: Optional[str] = Depends(verify_api_key),
@@ -6297,7 +6348,7 @@ async def add_ground_truth_from_file(
 async def add_ground_truth_from_files(
     project_id: str,
     files: List[UploadFile] = File(...),
-    judge_scores: str = Form(..., description="5个评委得分，JSON 数组如 [1,2,3,4,5]"),
+    judge_scores: str = Form(..., description="5或7个评委得分，JSON 数组如 [1,2,3,4,5]"),
     final_score: float = Form(...),
     source: str = Form("青天大模型"),
     api_key: Optional[str] = Depends(verify_api_key),
@@ -6548,7 +6599,7 @@ def get_writing_guidance(
     return WritingGuidance(
         project_id=project_id,
         guidance=[
-            "请先录入「真实评标结果」（施组+5评委得分+最终得分），再点击「学习进化」生成编制指导。"
+            "请先录入「真实评标结果」（施组+5/7评委得分+最终得分），再点击「学习进化」生成编制指导。"
         ],
         high_score_logic=[],
         sample_count=0,
@@ -7754,7 +7805,7 @@ def index(
 
       <div class="section card">
         <h2>7) 自我学习与进化</h2>
-        <p style="font-size:13px;color:#64748b;margin:0 0 6px 0">上传项目投喂包（招标/清单/图纸等合并文本），录入交易中心真实评标结果（5评委+最终得分），系统学习高分逻辑并生成编制指导。</p>
+        <p style="font-size:13px;color:#64748b;margin:0 0 6px 0">上传项目投喂包（招标/清单/图纸等合并文本），录入交易中心真实评标结果（5/7评委+最终得分），系统学习高分逻辑并生成编制指导。</p>
         <p style="font-size:12px;color:#475569;margin:0 0 10px 0">系统会将学习到的高分逻辑与编制指导持久保存，并用于本项目的预评分权重与编制系统指令；再次执行学习进化可基于新录入的真实评标升级这些经验。</p>
         <div style="margin-bottom:10px">
           <strong>真实评标列表（本项目 / 其它项目）</strong>
@@ -7768,7 +7819,7 @@ def index(
           </select>
           <button type="button" id="btnRefreshGroundTruth" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnRefreshGroundTruth')">刷新</button>
         </div>
-        <table id="groundTruthTable"><thead><tr><th>序号</th><th>施组摘要</th><th>评委1–5分</th><th>最终分</th><th>来源</th><th>操作</th></tr></thead><tbody></tbody></table>
+        <table id="groundTruthTable"><thead><tr><th>序号</th><th>施组摘要</th><th>评委分（5/7）</th><th>最终分</th><th>来源</th><th>操作</th></tr></thead><tbody></tbody></table>
         <p id="groundTruthEmpty" style="font-size:13px;color:#64748b;margin:6px 0 10px 0;display:none">暂无真实评标，请下方录入。</p>
         <div style="margin-bottom:10px">
           <strong>投喂包（即本项目资料）：</strong>上传后可在下方查看文件名与上传时间。
@@ -7799,11 +7850,21 @@ def index(
           <span class="note">无需重复上传，直接复用「4) 项目施组」已上传文件。</span>
         </div>
         <div class="field-group">
-          评委1：<input type="number" id="gtJ1" step="0.01" style="width:70px" />
-          评委2：<input type="number" id="gtJ2" step="0.01" style="width:70px" />
-          评委3：<input type="number" id="gtJ3" step="0.01" style="width:70px" />
-          评委4：<input type="number" id="gtJ4" step="0.01" style="width:70px" />
-          评委5：<input type="number" id="gtJ5" step="0.01" style="width:70px" />
+          <label style="margin-right:8px">评委人数：</label>
+          <select id="gtJudgeCount">
+            <option value="5" selected>5位评委</option>
+            <option value="7">7位评委</option>
+          </select>
+          <span class="note">默认 5 位，可切换到 7 位评委录入。</span>
+        </div>
+        <div class="field-group">
+          <span id="gtJWrap1" style="display:inline-flex;align-items:center;margin-right:8px">评委1：<input type="number" id="gtJ1" step="0.01" style="width:70px;margin-left:4px" /></span>
+          <span id="gtJWrap2" style="display:inline-flex;align-items:center;margin-right:8px">评委2：<input type="number" id="gtJ2" step="0.01" style="width:70px;margin-left:4px" /></span>
+          <span id="gtJWrap3" style="display:inline-flex;align-items:center;margin-right:8px">评委3：<input type="number" id="gtJ3" step="0.01" style="width:70px;margin-left:4px" /></span>
+          <span id="gtJWrap4" style="display:inline-flex;align-items:center;margin-right:8px">评委4：<input type="number" id="gtJ4" step="0.01" style="width:70px;margin-left:4px" /></span>
+          <span id="gtJWrap5" style="display:inline-flex;align-items:center;margin-right:8px">评委5：<input type="number" id="gtJ5" step="0.01" style="width:70px;margin-left:4px" /></span>
+          <span id="gtJWrap6" style="display:none;align-items:center;margin-right:8px">评委6：<input type="number" id="gtJ6" step="0.01" style="width:70px;margin-left:4px" /></span>
+          <span id="gtJWrap7" style="display:none;align-items:center;margin-right:8px">评委7：<input type="number" id="gtJ7" step="0.01" style="width:70px;margin-left:4px" /></span>
           最终得分：<input type="number" id="gtFinal" step="0.01" style="width:70px" />
         </div>
         <div class="action-row" style="margin-bottom:10px">
@@ -8303,15 +8364,19 @@ def index(
             }
             if (actionId === 'btnAddGroundTruth') {
               const selectedSubmissionId = String(((document.getElementById('groundTruthSubmissionSelect') || {}).value) || '').trim();
-              const j1 = parseFloat(((document.getElementById('gtJ1') || {}).value || '0')) || 0;
-              const j2 = parseFloat(((document.getElementById('gtJ2') || {}).value || '0')) || 0;
-              const j3 = parseFloat(((document.getElementById('gtJ3') || {}).value || '0')) || 0;
-              const j4 = parseFloat(((document.getElementById('gtJ4') || {}).value || '0')) || 0;
-              const j5 = parseFloat(((document.getElementById('gtJ5') || {}).value || '0')) || 0;
+              const judgeScores = (typeof collectGroundTruthJudgeScores === 'function')
+                ? collectGroundTruthJudgeScores()
+                : [
+                    parseFloat(((document.getElementById('gtJ1') || {}).value || '0')) || 0,
+                    parseFloat(((document.getElementById('gtJ2') || {}).value || '0')) || 0,
+                    parseFloat(((document.getElementById('gtJ3') || {}).value || '0')) || 0,
+                    parseFloat(((document.getElementById('gtJ4') || {}).value || '0')) || 0,
+                    parseFloat(((document.getElementById('gtJ5') || {}).value || '0')) || 0,
+                  ];
               const finalScore = parseFloat(((document.getElementById('gtFinal') || {}).value || '0')) || 0;
               const payload = {
                 submission_id: selectedSubmissionId,
-                judge_scores: [j1, j2, j3, j4, j5],
+                judge_scores: judgeScores,
                 final_score: finalScore,
                 source: '青天大模型',
               };
@@ -8619,6 +8684,34 @@ def index(
         function selectedScoreScaleLabel() {
           return selectedScoreScaleMax() === 5 ? '5分制' : '100分制';
         }
+        function selectedGroundTruthJudgeCount() {
+          const el = document.getElementById('gtJudgeCount');
+          const raw = (el && el.value) ? String(el.value).trim() : '5';
+          return raw === '7' ? 7 : 5;
+        }
+        function syncGroundTruthJudgeInputs() {
+          const count = selectedGroundTruthJudgeCount();
+          for (let i = 1; i <= 7; i += 1) {
+            const wrap = document.getElementById('gtJWrap' + String(i));
+            const input = document.getElementById('gtJ' + String(i));
+            const enabled = i <= count;
+            if (wrap) wrap.style.display = enabled ? 'inline-flex' : 'none';
+            if (input) {
+              input.disabled = !enabled;
+              if (!enabled) input.value = '';
+            }
+          }
+        }
+        function collectGroundTruthJudgeScores() {
+          const count = selectedGroundTruthJudgeCount();
+          const scores = [];
+          for (let i = 1; i <= count; i += 1) {
+            const input = document.getElementById('gtJ' + String(i));
+            const value = parseFloat(((input || {}).value || '0'));
+            scores.push(Number.isFinite(value) ? value : 0);
+          }
+          return scores;
+        }
         function applyProjectScoreScale(projectId) {
           const el = document.getElementById('scoreScaleSelect');
           if (!el) return;
@@ -8676,7 +8769,7 @@ def index(
         const PROJECT_REQUIRED_INPUT_IDS = [
           'scoreScaleSelect',
           'feedFile', 'groundTruthSubmissionSelect', 'groundTruthScope', 'groundTruthOtherProject',
-          'gtJ1', 'gtJ2', 'gtJ3', 'gtJ4', 'gtJ5', 'gtFinal', 'patchType', 'patchIdInput',
+          'gtJudgeCount', 'gtJ1', 'gtJ2', 'gtJ3', 'gtJ4', 'gtJ5', 'gtJ6', 'gtJ7', 'gtFinal', 'patchType', 'patchIdInput',
         ];
         function setActionStatus(id, msg, isError=false) {
           const el = document.getElementById(id);
@@ -8802,10 +8895,13 @@ def index(
             gtOther.style.display = 'none';
             gtOther.value = '';
           }
-          ['gtJ1', 'gtJ2', 'gtJ3', 'gtJ4', 'gtJ5', 'gtFinal', 'patchIdInput'].forEach((id) => {
+          ['gtJudgeCount', 'gtJ1', 'gtJ2', 'gtJ3', 'gtJ4', 'gtJ5', 'gtJ6', 'gtJ7', 'gtFinal', 'patchIdInput'].forEach((id) => {
             const el = document.getElementById(id);
             if (el) el.value = '';
           });
+          const judgeCountSel = document.getElementById('gtJudgeCount');
+          if (judgeCountSel) judgeCountSel.value = '5';
+          if (typeof syncGroundTruthJudgeInputs === 'function') syncGroundTruthJudgeInputs();
           if (!hasProject) {
             const scaleSel = document.getElementById('scoreScaleSelect');
             if (scaleSel) scaleSel.value = '100';
@@ -10148,8 +10244,10 @@ def index(
           if (emptyEl) emptyEl.style.display = 'none';
           list.forEach((r, idx) => {
             const summary = (r.shigong_text || '').slice(0, 50);
-            const scores = (r.judge_scores || []).slice(0, 5);
-            const scoresStr = scores.length ? scores.map(s => s.toFixed(1)).join(', ') : '-';
+            const scores = Array.isArray(r.judge_scores) ? r.judge_scores : [];
+            const scoresStr = scores.length
+              ? (scores.map(s => Number(s).toFixed(1)).join(', ') + '（' + scores.length + '人）')
+              : '-';
             const tr = document.createElement('tr');
             const st = r.shigong_text || '';
             const actionCell = isCurrent
@@ -10188,6 +10286,9 @@ def index(
             otherSel.value = '';
           }
           refreshGroundTruth();
+        });
+        safeChange('gtJudgeCount', function() {
+          syncGroundTruthJudgeInputs();
         });
         safeChange('groundTruthOtherProject', refreshGroundTruth);
         safeClick('btnRefreshGroundTruth', refreshGroundTruth);
@@ -10674,13 +10775,13 @@ def index(
             setResultError('evolveResult', '请先在“施组文件”下拉框选择步骤4已上传施组。');
             return;
           }
-          const j1 = parseFloat(document.getElementById('gtJ1').value) || 0, j2 = parseFloat(document.getElementById('gtJ2').value) || 0, j3 = parseFloat(document.getElementById('gtJ3').value) || 0, j4 = parseFloat(document.getElementById('gtJ4').value) || 0, j5 = parseFloat(document.getElementById('gtJ5').value) || 0;
+          const judgeScores = collectGroundTruthJudgeScores();
           const finalScore = parseFloat(document.getElementById('gtFinal').value) || 0;
           setResultLoading('evolveResult', '真实评标录入中（基于步骤4已上传施组）...');
           document.getElementById('output').textContent = '真实评标录入中（基于步骤4已上传施组）...';
           const payload = {
             submission_id: submissionId,
-            judge_scores: [j1, j2, j3, j4, j5],
+            judge_scores: judgeScores,
             final_score: finalScore,
             source: '青天大模型',
           };
@@ -10708,6 +10809,7 @@ def index(
           evolveEl.innerHTML =
             '<p class="success">真实评标录入完成：已记录 1 条。</p>' +
             '<p style="margin:6px 0 0 0"><strong>施组：</strong>' + escapeHtmlText(sourceName) + '</p>' +
+            '<p style="margin:4px 0 0 0"><strong>评委人数：</strong>' + escapeHtmlText(String(judgeScores.length)) + ' 位</p>' +
             '<p style="margin:4px 0 0 0"><strong>最终分：</strong>' + escapeHtmlText(String(data.final_score != null ? data.final_score : finalScore)) + '</p>';
           evolveEl.style.display = 'block';
           if (submissionSelect) submissionSelect.value = '';
@@ -10953,6 +11055,7 @@ def index(
 
         // 关闭“硬接管”兜底，避免覆盖 safeClick 的详细渲染结果。
         initWeightsSection();
+        syncGroundTruthJudgeInputs();
         updateProjectBoundControlsState();
         refreshProjects();
 
