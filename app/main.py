@@ -4010,6 +4010,12 @@ def auto_run_reflection_pipeline(
 
     calibrator_version = None
     calibrator_deployed = False
+    calibrator_model_type = None
+    calibrator_gate_passed = None
+    calibrator_cv_metrics: Dict[str, Any] = {}
+    calibrator_baseline_metrics: Dict[str, Any] = {}
+    calibrator_gate: Dict[str, Any] = {}
+    calibrator_auto_candidates: List[Dict[str, Any]] = []
     if len(samples) >= 3:
         feature_rows = [
             {
@@ -4023,6 +4029,7 @@ def auto_run_reflection_pipeline(
         # “最强自动校准”：多候选 + CV 闸门 + 自动选择最佳模型
         model_artifact = train_best_calibrator_auto(feature_rows, alpha=1.0)
         selected_type = str(model_artifact.get("model_type") or "ridge")
+        calibrator_model_type = selected_type
 
         # 统一用 CV 口径做上线闸门（避免 in-sample 过拟合）
         cv = cross_validate_calibrator(
@@ -4065,6 +4072,46 @@ def auto_run_reflection_pipeline(
         model_artifact["metrics"]["gate_improve_threshold"] = round(improve_threshold, 4)
         model_artifact["metrics"]["gate_spearman_tolerance"] = spearman_tolerance
         model_artifact["gate_passed"] = gate_passed
+
+        calibrator_gate_passed = bool(gate_passed)
+        calibrator_cv_metrics = {
+            "mae": cv_metrics.get("mae"),
+            "rmse": cv_metrics.get("rmse"),
+            "spearman": cv_metrics.get("spearman"),
+            "mode": cv.get("mode"),
+            "pred_count": cv.get("pred_count"),
+        }
+        calibrator_baseline_metrics = {
+            "mae": baseline_metrics.get("mae"),
+            "rmse": baseline_metrics.get("rmse"),
+            "spearman": baseline_metrics.get("spearman"),
+        }
+        calibrator_gate = {
+            "passed": bool(gate_passed),
+            "improve_threshold": round(improve_threshold, 4),
+            "spearman_tolerance": spearman_tolerance,
+        }
+        best_selection = model_artifact.get("best_selection") or {}
+        raw_candidates = best_selection.get("candidates") or []
+        if isinstance(raw_candidates, list):
+            calibrator_auto_candidates = []
+            for item in raw_candidates:
+                if not isinstance(item, dict):
+                    continue
+                metrics = item.get("metrics") or {}
+                cv_item = item.get("cv") or {}
+                calibrator_auto_candidates.append(
+                    {
+                        "model_type": str(item.get("model_type") or ""),
+                        "ok": bool(item.get("ok")),
+                        "gate_passed": bool(item.get("gate_passed")),
+                        "cv_mae": metrics.get("cv_mae"),
+                        "cv_rmse": metrics.get("cv_rmse"),
+                        "cv_spearman": metrics.get("cv_spearman"),
+                        "cv_mode": cv_item.get("mode"),
+                        "cv_pred_count": cv_item.get("pred_count"),
+                    }
+                )
 
         calibrator_version = (
             f"calib_auto_{selected_type}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
@@ -4178,6 +4225,12 @@ def auto_run_reflection_pipeline(
         calibration_samples=len(samples),
         calibrator_version=calibrator_version,
         calibrator_deployed=calibrator_deployed,
+        calibrator_model_type=calibrator_model_type,
+        calibrator_gate_passed=calibrator_gate_passed,
+        calibrator_cv_metrics=calibrator_cv_metrics,
+        calibrator_baseline_metrics=calibrator_baseline_metrics,
+        calibrator_gate=calibrator_gate,
+        calibrator_auto_candidates=calibrator_auto_candidates,
         prediction_updated_reports=updated_reports,
         prediction_updated_submissions=updated_submissions,
         patch_id=patch_id,
@@ -8837,6 +8890,54 @@ def index(
           const klass = ok ? 'success' : 'error';
           el.innerHTML = '<p class="' + klass + '">' + title + '</p><pre style="margin:0">' + JSON.stringify(payload, null, 2) + '</pre>';
         }
+        function fmtMetric(v) {
+          if (typeof v !== 'number' || Number.isNaN(v)) return '-';
+          return Number(v).toFixed(4);
+        }
+        function showCalibratorSummaryBlock(id, ok, title, payload) {
+          const el = document.getElementById(id);
+          if (!el) return;
+          el.style.display = 'block';
+          const klass = ok ? 'success' : 'error';
+          let html = '<p class="' + klass + '">' + title + '</p>';
+          const data = payload && typeof payload === 'object' ? payload : {};
+          if (ok) {
+            const metrics = data.metrics || {};
+            const cv = data.calibrator_cv_metrics || {};
+            const baseline = data.calibrator_baseline_metrics || {};
+            const gate = data.calibrator_gate || {};
+            const modelType = data.calibrator_model_type || data.model_type || '-';
+            const version = data.calibrator_version || '-';
+            const gatePassed = data.calibrator_gate_passed ?? metrics.gate_passed;
+            const cvMae = cv.mae ?? metrics.cv_mae;
+            const cvRmse = cv.rmse ?? metrics.cv_rmse;
+            const cvSpearman = cv.spearman ?? metrics.cv_spearman;
+            const baselineMae = baseline.mae ?? metrics.baseline_mae;
+            const baselineRmse = baseline.rmse ?? metrics.baseline_rmse;
+            const baselineSpearman = baseline.spearman ?? metrics.baseline_spearman;
+            const improveThreshold = gate.improve_threshold ?? metrics.gate_improve_threshold;
+            const spearmanTolerance = gate.spearman_tolerance ?? metrics.gate_spearman_tolerance;
+            const cvMode = cv.mode ?? metrics.cv_mode;
+            const cvPredCount = cv.pred_count ?? metrics.cv_pred_count;
+            const gateText = typeof gatePassed === 'boolean' ? (gatePassed ? '通过' : '未通过') : '-';
+            html += '<p style="margin:4px 0"><b>模型</b>：' + modelType + '；<b>版本</b>：' + version + '；<b>闸门</b>：' + gateText + '</p>';
+            if (cvMae !== undefined || baselineMae !== undefined) {
+              html += '<p style="margin:4px 0"><b>CV</b> MAE=' + fmtMetric(cvMae) + ' RMSE=' + fmtMetric(cvRmse) + ' Spearman=' + fmtMetric(cvSpearman) + '（' + (cvMode || '-') + ', n=' + (cvPredCount || 0) + '）</p>';
+              html += '<p style="margin:4px 0"><b>Baseline</b> MAE=' + fmtMetric(baselineMae) + ' RMSE=' + fmtMetric(baselineRmse) + ' Spearman=' + fmtMetric(baselineSpearman) + '</p>';
+              html += '<p style="margin:4px 0"><b>闸门阈值</b> MAE改进≥' + fmtMetric(improveThreshold) + '，Spearman不下降超过' + fmtMetric(spearmanTolerance) + '</p>';
+            }
+            const candidates = Array.isArray(data.calibrator_auto_candidates) ? data.calibrator_auto_candidates : [];
+            if (candidates.length) {
+              const rows = candidates.map((c) => {
+                const gt = c.gate_passed === true ? '通过' : '未通过';
+                return '<tr><td style="padding:2px 8px;border:1px solid #dbe3ef">' + (c.model_type || '-') + '</td><td style="padding:2px 8px;border:1px solid #dbe3ef">' + gt + '</td><td style="padding:2px 8px;border:1px solid #dbe3ef">' + fmtMetric(c.cv_mae) + '</td><td style="padding:2px 8px;border:1px solid #dbe3ef">' + fmtMetric(c.cv_spearman) + '</td></tr>';
+              }).join('');
+              html += '<details style="margin:6px 0"><summary>候选模型对比（auto）</summary><table style="border-collapse:collapse;font-size:12px;margin-top:4px"><thead><tr><th style="padding:2px 8px;border:1px solid #dbe3ef">模型</th><th style="padding:2px 8px;border:1px solid #dbe3ef">闸门</th><th style="padding:2px 8px;border:1px solid #dbe3ef">CV MAE</th><th style="padding:2px 8px;border:1px solid #dbe3ef">CV Spearman</th></tr></thead><tbody>' + rows + '</tbody></table></details>';
+            }
+          }
+          html += '<pre style="margin:0">' + JSON.stringify(payload, null, 2) + '</pre>';
+          el.innerHTML = html;
+        }
         safeClick('btnRebuildDelta', async () => {
           const projectId = actionProjectId();
           setResultLoading('deltaResult', '正在重建 DELTA_CASE...');
@@ -8860,7 +8961,7 @@ def index(
           const res = await fetch('/api/v1/calibration/train', { method: 'POST', headers: apiHeaders(true), body: JSON.stringify(body) });
           const data = await res.json().catch(() => ({}));
           showJson('output', formatApiOutput(res, data));
-          showBlock('calibTrainResult', res.ok, res.ok ? '校准器训练完成' : '校准器训练失败', data);
+          showCalibratorSummaryBlock('calibTrainResult', res.ok, res.ok ? '校准器训练完成' : '校准器训练失败', data);
         });
         safeClick('btnApplyCalibPredict', async () => {
           const projectId = actionProjectId();
@@ -8876,7 +8977,7 @@ def index(
           const res = await fetch('/api/v1/projects/' + projectId + '/reflection/auto_run', { method: 'POST', headers: apiHeaders(false) });
           const data = await res.json().catch(() => ({}));
           showJson('output', formatApiOutput(res, data));
-          showBlock('calibTrainResult', res.ok, res.ok ? '一键闭环执行完成' : '一键闭环执行失败', data);
+          showCalibratorSummaryBlock('calibTrainResult', res.ok, res.ok ? '一键闭环执行完成' : '一键闭环执行失败', data);
         });
         safeClick('btnEvalMetricsV2', async () => {
           const projectId = actionProjectId();

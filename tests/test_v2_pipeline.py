@@ -747,7 +747,57 @@ class TestAutoRunReflection:
         assert data["ok"] is True
         assert data["project_id"] == "p1"
         assert data["calibrator_deployed"] is True
+        assert data["calibrator_model_type"] == "offset"
+        assert data["calibrator_gate_passed"] is True
+        assert "mae" in data["calibrator_cv_metrics"]
+        assert "mae" in data["calibrator_baseline_metrics"]
+        assert data["calibrator_gate"]["passed"] is True
+        assert isinstance(data["calibrator_auto_candidates"], list)
         assert data["patch_deployed"] is True
+
+    @patch("app.main.load_calibration_samples")
+    @patch("app.main.load_delta_cases")
+    @patch("app.main._refresh_project_reflection_objects")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_auto_run_reflection_without_enough_samples(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_refresh,
+        mock_load_delta,
+        mock_load_samples,
+    ):
+        mock_load_projects.return_value = [{"id": "p1"}]
+        mock_load_delta.return_value = []
+        mock_load_samples.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "feature_schema_version": "v2",
+                "x_features": {"rule_total_score": 80},
+                "y_label": 81,
+            },
+            {
+                "id": "s2",
+                "project_id": "p1",
+                "feature_schema_version": "v2",
+                "x_features": {"rule_total_score": 82},
+                "y_label": 83,
+            },
+        ]
+
+        resp = _client().post("/api/v1/projects/p1/reflection/auto_run")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["calibrator_version"] is None
+        assert data["calibrator_deployed"] is False
+        assert data["calibrator_model_type"] is None
+        assert data["calibrator_gate_passed"] is None
+        assert data["calibrator_cv_metrics"] == {}
+        assert data["calibrator_baseline_metrics"] == {}
+        assert data["calibrator_gate"] == {}
+        assert data["calibrator_auto_candidates"] == []
 
 
 class TestScoringFactorsEndpoint:

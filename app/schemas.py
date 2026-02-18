@@ -487,6 +487,12 @@ class ReflectionAutoRunResponse(BaseModel):
     calibration_samples: int
     calibrator_version: Optional[str] = None
     calibrator_deployed: bool = False
+    calibrator_model_type: Optional[str] = None
+    calibrator_gate_passed: Optional[bool] = None
+    calibrator_cv_metrics: Dict[str, Any] = Field(default_factory=dict)
+    calibrator_baseline_metrics: Dict[str, Any] = Field(default_factory=dict)
+    calibrator_gate: Dict[str, Any] = Field(default_factory=dict)
+    calibrator_auto_candidates: List[Dict[str, Any]] = Field(default_factory=list)
     prediction_updated_reports: int = 0
     prediction_updated_submissions: int = 0
     patch_id: Optional[str] = None
