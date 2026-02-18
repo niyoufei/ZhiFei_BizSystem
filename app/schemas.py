@@ -332,12 +332,25 @@ class CalibratorTrainRequest(BaseModel):
     auto_deploy: bool = Field(default=False, description="闸门通过后是否自动上线")
 
 
+class CalibratorSummary(BaseModel):
+    calibrator_version: Optional[str] = None
+    model_type: Optional[str] = None
+    gate_passed: Optional[bool] = None
+    cv_metrics: Dict[str, Any] = Field(default_factory=dict)
+    baseline_metrics: Dict[str, Any] = Field(default_factory=dict)
+    gate: Dict[str, Any] = Field(default_factory=dict)
+    auto_candidates: List[Dict[str, Any]] = Field(default_factory=list)
+    sample_count: Optional[int] = None
+    skipped_reason: Optional[str] = None
+
+
 class CalibratorModelRecord(BaseModel):
     calibrator_version: str
     model_type: str
     feature_schema_version: str
     train_filter: Dict[str, Any] = Field(default_factory=dict)
     metrics: Dict[str, Any] = Field(default_factory=dict)
+    calibrator_summary: CalibratorSummary = Field(default_factory=CalibratorSummary)
     artifact_uri: str
     deployed: bool = False
     created_at: str
@@ -487,6 +500,7 @@ class ReflectionAutoRunResponse(BaseModel):
     calibration_samples: int
     calibrator_version: Optional[str] = None
     calibrator_deployed: bool = False
+    calibrator_summary: CalibratorSummary = Field(default_factory=CalibratorSummary)
     calibrator_model_type: Optional[str] = None
     calibrator_gate_passed: Optional[bool] = None
     calibrator_cv_metrics: Dict[str, Any] = Field(default_factory=dict)

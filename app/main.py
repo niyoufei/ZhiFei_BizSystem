@@ -1215,6 +1215,69 @@ def _latest_records_by_submission(records: List[Dict[str, object]]) -> Dict[str,
     return latest
 
 
+def _extract_auto_candidates(model_artifact: Dict[str, Any]) -> List[Dict[str, Any]]:
+    best_selection = model_artifact.get("best_selection") or {}
+    raw_candidates = best_selection.get("candidates") or []
+    if not isinstance(raw_candidates, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    for item in raw_candidates:
+        if not isinstance(item, dict):
+            continue
+        metrics = item.get("metrics") or {}
+        cv_item = item.get("cv") or {}
+        normalized.append(
+            {
+                "model_type": str(item.get("model_type") or ""),
+                "ok": bool(item.get("ok")),
+                "gate_passed": bool(item.get("gate_passed")),
+                "cv_mae": metrics.get("cv_mae"),
+                "cv_rmse": metrics.get("cv_rmse"),
+                "cv_spearman": metrics.get("cv_spearman"),
+                "cv_mode": cv_item.get("mode"),
+                "cv_pred_count": cv_item.get("pred_count"),
+            }
+        )
+    return normalized
+
+
+def _build_calibrator_summary(
+    *,
+    model_type: Optional[str],
+    calibrator_version: Optional[str],
+    gate_passed: Optional[bool],
+    cv_metrics: Optional[Dict[str, Any]] = None,
+    baseline_metrics: Optional[Dict[str, Any]] = None,
+    improve_threshold: Optional[float] = None,
+    spearman_tolerance: Optional[float] = None,
+    auto_candidates: Optional[List[Dict[str, Any]]] = None,
+    sample_count: Optional[int] = None,
+    skipped_reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    gate_payload: Dict[str, Any] = {}
+    if gate_passed is not None:
+        gate_payload["passed"] = bool(gate_passed)
+    if improve_threshold is not None:
+        gate_payload["improve_threshold"] = round(float(improve_threshold), 4)
+    if spearman_tolerance is not None:
+        gate_payload["spearman_tolerance"] = float(spearman_tolerance)
+
+    summary: Dict[str, Any] = {
+        "calibrator_version": calibrator_version,
+        "model_type": model_type,
+        "gate_passed": gate_passed,
+        "cv_metrics": cv_metrics or {},
+        "baseline_metrics": baseline_metrics or {},
+        "gate": gate_payload,
+        "auto_candidates": auto_candidates or [],
+    }
+    if sample_count is not None:
+        summary["sample_count"] = int(sample_count)
+    if skipped_reason:
+        summary["skipped_reason"] = skipped_reason
+    return summary
+
+
 def _refresh_project_reflection_objects(project_id: str) -> None:
     submissions = [s for s in load_submissions() if str(s.get("project_id")) == project_id]
     submissions_by_id = {str(s.get("id")): s for s in submissions}
@@ -3570,7 +3633,29 @@ def train_calibrator(
     model_artifact["metrics"]["gate_spearman_tolerance"] = spearman_tolerance
     model_artifact["gate_passed"] = gate_passed
 
+    auto_candidates = _extract_auto_candidates(model_artifact)
     version = f"{version_prefix}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    calibrator_summary = _build_calibrator_summary(
+        model_type=selected_type,
+        calibrator_version=version,
+        gate_passed=bool(gate_passed),
+        cv_metrics={
+            "mae": cv_metrics.get("mae"),
+            "rmse": cv_metrics.get("rmse"),
+            "spearman": cv_metrics.get("spearman"),
+            "mode": cv.get("mode"),
+            "pred_count": cv.get("pred_count"),
+        },
+        baseline_metrics={
+            "mae": baseline_metrics.get("mae"),
+            "rmse": baseline_metrics.get("rmse"),
+            "spearman": baseline_metrics.get("spearman"),
+        },
+        improve_threshold=improve_threshold,
+        spearman_tolerance=spearman_tolerance,
+        auto_candidates=auto_candidates,
+        sample_count=len(feature_rows),
+    )
     record = {
         "calibrator_version": version,
         "model_type": selected_type,
@@ -3580,6 +3665,7 @@ def train_calibrator(
             **(model_artifact.get("metrics") or {}),
             "gate_passed": bool(gate_passed),
         },
+        "calibrator_summary": calibrator_summary,
         "artifact_uri": f"json://calibration_models/{version}",
         "model_artifact": model_artifact,
         "deployed": False,
@@ -4010,12 +4096,21 @@ def auto_run_reflection_pipeline(
 
     calibrator_version = None
     calibrator_deployed = False
-    calibrator_model_type = None
-    calibrator_gate_passed = None
-    calibrator_cv_metrics: Dict[str, Any] = {}
-    calibrator_baseline_metrics: Dict[str, Any] = {}
-    calibrator_gate: Dict[str, Any] = {}
-    calibrator_auto_candidates: List[Dict[str, Any]] = []
+    calibrator_summary = _build_calibrator_summary(
+        model_type=None,
+        calibrator_version=None,
+        gate_passed=None,
+        sample_count=len(samples),
+        skipped_reason="insufficient_samples" if len(samples) < 3 else None,
+    )
+    calibrator_model_type = calibrator_summary.get("model_type")
+    calibrator_gate_passed = calibrator_summary.get("gate_passed")
+    calibrator_cv_metrics: Dict[str, Any] = calibrator_summary.get("cv_metrics") or {}
+    calibrator_baseline_metrics: Dict[str, Any] = calibrator_summary.get("baseline_metrics") or {}
+    calibrator_gate: Dict[str, Any] = calibrator_summary.get("gate") or {}
+    calibrator_auto_candidates: List[Dict[str, Any]] = (
+        calibrator_summary.get("auto_candidates") or []
+    )
     if len(samples) >= 3:
         feature_rows = [
             {
@@ -4073,49 +4168,37 @@ def auto_run_reflection_pipeline(
         model_artifact["metrics"]["gate_spearman_tolerance"] = spearman_tolerance
         model_artifact["gate_passed"] = gate_passed
 
-        calibrator_gate_passed = bool(gate_passed)
-        calibrator_cv_metrics = {
-            "mae": cv_metrics.get("mae"),
-            "rmse": cv_metrics.get("rmse"),
-            "spearman": cv_metrics.get("spearman"),
-            "mode": cv.get("mode"),
-            "pred_count": cv.get("pred_count"),
-        }
-        calibrator_baseline_metrics = {
-            "mae": baseline_metrics.get("mae"),
-            "rmse": baseline_metrics.get("rmse"),
-            "spearman": baseline_metrics.get("spearman"),
-        }
-        calibrator_gate = {
-            "passed": bool(gate_passed),
-            "improve_threshold": round(improve_threshold, 4),
-            "spearman_tolerance": spearman_tolerance,
-        }
-        best_selection = model_artifact.get("best_selection") or {}
-        raw_candidates = best_selection.get("candidates") or []
-        if isinstance(raw_candidates, list):
-            calibrator_auto_candidates = []
-            for item in raw_candidates:
-                if not isinstance(item, dict):
-                    continue
-                metrics = item.get("metrics") or {}
-                cv_item = item.get("cv") or {}
-                calibrator_auto_candidates.append(
-                    {
-                        "model_type": str(item.get("model_type") or ""),
-                        "ok": bool(item.get("ok")),
-                        "gate_passed": bool(item.get("gate_passed")),
-                        "cv_mae": metrics.get("cv_mae"),
-                        "cv_rmse": metrics.get("cv_rmse"),
-                        "cv_spearman": metrics.get("cv_spearman"),
-                        "cv_mode": cv_item.get("mode"),
-                        "cv_pred_count": cv_item.get("pred_count"),
-                    }
-                )
-
+        auto_candidates = _extract_auto_candidates(model_artifact)
         calibrator_version = (
             f"calib_auto_{selected_type}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
         )
+        calibrator_summary = _build_calibrator_summary(
+            model_type=selected_type,
+            calibrator_version=calibrator_version,
+            gate_passed=bool(gate_passed),
+            cv_metrics={
+                "mae": cv_metrics.get("mae"),
+                "rmse": cv_metrics.get("rmse"),
+                "spearman": cv_metrics.get("spearman"),
+                "mode": cv.get("mode"),
+                "pred_count": cv.get("pred_count"),
+            },
+            baseline_metrics={
+                "mae": baseline_metrics.get("mae"),
+                "rmse": baseline_metrics.get("rmse"),
+                "spearman": baseline_metrics.get("spearman"),
+            },
+            improve_threshold=improve_threshold,
+            spearman_tolerance=spearman_tolerance,
+            auto_candidates=auto_candidates,
+            sample_count=len(feature_rows),
+        )
+        calibrator_model_type = calibrator_summary.get("model_type")
+        calibrator_gate_passed = calibrator_summary.get("gate_passed")
+        calibrator_cv_metrics = calibrator_summary.get("cv_metrics") or {}
+        calibrator_baseline_metrics = calibrator_summary.get("baseline_metrics") or {}
+        calibrator_gate = calibrator_summary.get("gate") or {}
+        calibrator_auto_candidates = calibrator_summary.get("auto_candidates") or []
         record = {
             "calibrator_version": calibrator_version,
             "model_type": selected_type,
@@ -4125,6 +4208,7 @@ def auto_run_reflection_pipeline(
                 **(model_artifact.get("metrics") or {}),
                 "gate_passed": bool(gate_passed),
             },
+            "calibrator_summary": calibrator_summary,
             "artifact_uri": f"json://calibration_models/{calibrator_version}",
             "model_artifact": model_artifact,
             "deployed": bool(gate_passed),
@@ -4225,6 +4309,7 @@ def auto_run_reflection_pipeline(
         calibration_samples=len(samples),
         calibrator_version=calibrator_version,
         calibrator_deployed=calibrator_deployed,
+        calibrator_summary=calibrator_summary,
         calibrator_model_type=calibrator_model_type,
         calibrator_gate_passed=calibrator_gate_passed,
         calibrator_cv_metrics=calibrator_cv_metrics,

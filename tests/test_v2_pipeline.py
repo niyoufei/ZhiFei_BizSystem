@@ -154,6 +154,11 @@ class TestCalibratorEndpoints:
         assert data["model_type"] in {"offset", "linear1d", "isotonic1d", "ridge"}
         assert data["calibrator_version"].startswith("calib_auto_")
         assert data["metrics"]["gate_passed"] is True
+        assert data["calibrator_summary"]["model_type"] == data["model_type"]
+        assert data["calibrator_summary"]["gate_passed"] is True
+        assert "mae" in data["calibrator_summary"]["cv_metrics"]
+        assert "mae" in data["calibrator_summary"]["baseline_metrics"]
+        assert isinstance(data["calibrator_summary"]["auto_candidates"], list)
         mock_save_models.assert_called_once()
 
     @patch("app.main.save_submissions")
@@ -747,6 +752,9 @@ class TestAutoRunReflection:
         assert data["ok"] is True
         assert data["project_id"] == "p1"
         assert data["calibrator_deployed"] is True
+        assert data["calibrator_summary"]["model_type"] == "offset"
+        assert data["calibrator_summary"]["gate_passed"] is True
+        assert "mae" in data["calibrator_summary"]["cv_metrics"]
         assert data["calibrator_model_type"] == "offset"
         assert data["calibrator_gate_passed"] is True
         assert "mae" in data["calibrator_cv_metrics"]
@@ -792,6 +800,8 @@ class TestAutoRunReflection:
         data = resp.json()
         assert data["calibrator_version"] is None
         assert data["calibrator_deployed"] is False
+        assert data["calibrator_summary"]["sample_count"] == 2
+        assert data["calibrator_summary"]["skipped_reason"] == "insufficient_samples"
         assert data["calibrator_model_type"] is None
         assert data["calibrator_gate_passed"] is None
         assert data["calibrator_cv_metrics"] == {}
