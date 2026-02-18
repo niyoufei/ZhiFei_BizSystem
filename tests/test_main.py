@@ -2356,6 +2356,7 @@ class TestProjectLevelCacheIntegration:
 
     @patch("app.main.get_cached_score")
     @patch("app.main.cache_score_result")
+    @patch("app.main.load_evolution_reports")
     @patch("app.main.save_submissions")
     @patch("app.main.load_submissions")
     @patch("app.main.load_learning_profiles")
@@ -2372,12 +2373,16 @@ class TestProjectLevelCacheIntegration:
         mock_profiles,
         mock_load_sub,
         mock_save_sub,
+        mock_load_evolution_reports,
         mock_cache_set,
         mock_cache_get,
         client,
     ):
         """Score for project should check cache first."""
         # 模拟缓存未命中
+        mock_load_evolution_reports.return_value = {
+            "p1": {"scoring_evolution": {"total_score_scale": 1.1}}
+        }
         mock_cache_get.return_value = None
         mock_load_proj.return_value = [{"id": "p1"}]
         mock_config.return_value = MagicMock(rubric={}, lexicon={})
@@ -2389,13 +2394,19 @@ class TestProjectLevelCacheIntegration:
 
         response = client.post("/api/v1/projects/p1/score", json={"text": "测试文本"})
         assert response.status_code == 200
+        data = response.json()
+        assert data["total_score"] == 82.5
 
         # 验证缓存被检查
         mock_cache_get.assert_called_once_with("测试文本", None)
         # 验证结果被缓存
         mock_cache_set.assert_called_once()
+        cached_report = mock_cache_set.call_args[0][1]
+        assert cached_report["total_score"] == 75.0
+        assert cached_report["rule_total_score"] == 75.0
 
     @patch("app.main.get_cached_score")
+    @patch("app.main.load_evolution_reports")
     @patch("app.main.save_submissions")
     @patch("app.main.load_submissions")
     @patch("app.main.load_learning_profiles")
@@ -2412,6 +2423,7 @@ class TestProjectLevelCacheIntegration:
         mock_profiles,
         mock_load_sub,
         mock_save_sub,
+        mock_load_evolution_reports,
         mock_cache_get,
         client,
     ):
@@ -2422,6 +2434,9 @@ class TestProjectLevelCacheIntegration:
             "dimension_scores": {},
             "penalties": [],
         }
+        mock_load_evolution_reports.return_value = {
+            "p1": {"scoring_evolution": {"total_score_scale": 1.1}}
+        }
         mock_cache_get.return_value = cached_result
         mock_load_proj.return_value = [{"id": "p1"}]
         mock_config.return_value = MagicMock(rubric={}, lexicon={})
@@ -2431,9 +2446,54 @@ class TestProjectLevelCacheIntegration:
         response = client.post("/api/v1/projects/p1/score", json={"text": "缓存测试"})
         assert response.status_code == 200
         data = response.json()
-        assert data["total_score"] == 92.0
+        assert data["total_score"] == 100.0
 
         # 验证 score_text 没有被调用（使用了缓存）
+        mock_score.assert_not_called()
+
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.get_cached_score")
+    @patch("app.main.save_submissions")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.load_config")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.score_text")
+    def test_score_for_project_cached_result_applies_scale_once(
+        self,
+        mock_score,
+        mock_ensure,
+        mock_load_proj,
+        mock_config,
+        mock_profiles,
+        mock_load_sub,
+        mock_save_sub,
+        mock_cache_get,
+        mock_load_evolution_reports,
+        client,
+    ):
+        """Cached raw report should apply evolution total scale only once at read time."""
+        mock_load_evolution_reports.return_value = {
+            "p1": {"scoring_evolution": {"total_score_scale": 1.1}}
+        }
+        mock_cache_get.return_value = {
+            "total_score": 80.0,
+            "rule_total_score": 80.0,
+            "dimension_scores": {},
+            "penalties": [],
+        }
+        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_config.return_value = MagicMock(rubric={}, lexicon={})
+        mock_profiles.return_value = []
+        mock_load_sub.return_value = []
+
+        response = client.post("/api/v1/projects/p1/score", json={"text": "缓存缩放测试"})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_score"] == 88.0
+        assert data["report"]["total_score"] == 88.0
+        assert data["report"]["rule_total_score"] == 88.0
         mock_score.assert_not_called()
 
     @patch("app.main.get_cached_score")
@@ -2505,6 +2565,30 @@ class TestComputeMultipliersHash:
         hash1 = _compute_multipliers_hash({"D01": 1.2, "D02": 1.1})
         hash2 = _compute_multipliers_hash({"D02": 1.1, "D01": 1.2})
         assert hash1 == hash2
+
+
+class TestEvolutionTotalScale:
+    """Tests for evolution total-score scale helper."""
+
+    def test_apply_evolution_total_scale_scales_pred_and_total_consistently(self):
+        from app.main import _apply_evolution_total_scale
+
+        report = {
+            "total_score": 65.0,
+            "rule_total_score": 70.0,
+            "pred_total_score": 65.0,
+            "llm_total_score": 60.0,
+        }
+        with patch(
+            "app.main.load_evolution_reports",
+            return_value={"p1": {"scoring_evolution": {"total_score_scale": 1.1}}},
+        ):
+            _apply_evolution_total_scale("p1", report)
+
+        assert report["pred_total_score"] == 71.5
+        assert report["rule_total_score"] == 77.0
+        assert report["llm_total_score"] == 66.0
+        assert report["total_score"] == 71.5
 
     def test_compute_multipliers_hash_empty(self):
         """Empty dict should produce valid hash."""

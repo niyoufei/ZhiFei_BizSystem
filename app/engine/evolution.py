@@ -144,7 +144,7 @@ def build_evolution_report(
         )
 
     # A、评分系统进化：基于高/低分组在本系统各维度得分差异，建议维度权重，使预评分更贴近青天
-    scoring_evolution = _build_scoring_evolution(high_group, low_group)
+    scoring_evolution = _build_scoring_evolution(high_group, low_group, analyses)
 
     # B、编制系统指令：可导出为编制施组时的系统指令，强制按此输出内容与图表
     compilation_instructions = _build_compilation_instructions(high_score_logic, writing_guidance)
@@ -169,18 +169,30 @@ def _empty_scoring_evolution() -> Dict[str, Any]:
 
 
 def _build_scoring_evolution(
-    high_group: List[Dict[str, Any]], low_group: List[Dict[str, Any]]
+    high_group: List[Dict[str, Any]],
+    low_group: List[Dict[str, Any]],
+    analyses: List[Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     """
     根据高分组与低分组在本系统各维度得分差异，给出维度权重建议，
     用于评分时使本系统预评分更贴近青天最终分。
+    若 analyses 有数据，额外计算 total_score_scale 使本系统总分贴近青天平均分。
     """
     multipliers: Dict[str, float] = {}
     rationale: Dict[str, str] = {}
     goal = "使本系统预评分更贴近合肥市公共资源交易中心青天大模型评分。"
+    total_score_scale: float | None = None
 
     if not high_group:
         return {"dimension_multipliers": {}, "rationale": {}, "goal": goal}
+
+    # 总分对齐：本系统平均分 vs 青天平均分，计算缩放因子
+    if analyses:
+        avg_our = sum(a.get("our_total", 0.0) for a in analyses) / len(analyses)
+        avg_final = sum(a.get("final_score", 0.0) for a in analyses) / len(analyses)
+        if avg_our > 1.0 and avg_final > 1.0:
+            raw_scale = avg_final / avg_our
+            total_score_scale = max(0.85, min(1.15, raw_scale))
 
     dim_ids = set()
     for a in high_group + low_group:
@@ -188,6 +200,9 @@ def _build_scoring_evolution(
     if not dim_ids:
         return {"dimension_multipliers": {}, "rationale": {}, "goal": goal}
 
+    # 降低阈值、扩大调整范围，使进化权重对评分影响更明显
+    delta_threshold = 0.4
+    mult_max, mult_min = 1.25, 0.75
     for dim_id in sorted(dim_ids):
         high_vals = [(a.get("our_dimensions") or {}).get(dim_id, 0.0) for a in high_group]
         low_vals = [(a.get("our_dimensions") or {}).get(dim_id, 0.0) for a in low_group]
@@ -195,13 +210,13 @@ def _build_scoring_evolution(
         avg_low = sum(low_vals) / len(low_vals) if low_vals else 0.0
         delta = avg_high - avg_low
         dim_name = (DIMENSIONS.get(dim_id) or {}).get("name", dim_id)
-        if delta >= 0.8:
-            multipliers[dim_id] = min(1.15, 1.0 + delta * 0.03)
+        if delta >= delta_threshold:
+            multipliers[dim_id] = min(mult_max, 1.0 + delta * 0.05)
             rationale[
                 dim_id
             ] = f"高分施组在本系统「{dim_name}」得分明显更高，建议适当提高权重以贴近青天。"
-        elif delta <= -0.8:
-            multipliers[dim_id] = max(0.85, 1.0 + delta * 0.03)
+        elif delta <= -delta_threshold:
+            multipliers[dim_id] = max(mult_min, 1.0 + delta * 0.05)
             rationale[
                 dim_id
             ] = f"低分施组在本系统「{dim_name}」得分反而偏高，建议略降权重以贴近青天。"
@@ -209,11 +224,14 @@ def _build_scoring_evolution(
             multipliers[dim_id] = 1.0
             rationale[dim_id] = f"「{dim_name}」高/低分组差异不大，保持权重。"
 
-    return {
+    result: Dict[str, Any] = {
         "dimension_multipliers": multipliers,
         "rationale": rationale,
         "goal": goal,
     }
+    if total_score_scale is not None:
+        result["total_score_scale"] = round(total_score_scale, 4)
+    return result
 
 
 def _default_compilation_instructions(guidance_items: List[str]) -> Dict[str, Any]:

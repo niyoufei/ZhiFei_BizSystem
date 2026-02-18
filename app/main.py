@@ -2870,6 +2870,7 @@ def rescore_project_submissions(
             anchors=anchors,
             requirements=requirements,
         )
+        _apply_evolution_total_scale(project_id, report)
         all_evidence_units = _replace_submission_evidence_units(
             all_evidence_units,
             submission_id=str(submission.get("id")),
@@ -3530,6 +3531,38 @@ def _get_effective_dimension_multipliers(project_id: str) -> Dict[str, float]:
     return multipliers
 
 
+def _get_evolution_total_score_scale(project_id: str) -> float | None:
+    """进化报告中的总分缩放因子，用于使本系统总分贴近青天平均分。"""
+    reports = load_evolution_reports()
+    evo = reports.get(project_id) or {}
+    se = evo.get("scoring_evolution") or {}
+    scale = se.get("total_score_scale")
+    if scale is not None and isinstance(scale, (int, float)):
+        return float(scale)
+    return None
+
+
+def _apply_evolution_total_scale(project_id: str, report: Dict[str, object]) -> None:
+    """若进化报告有 total_score_scale，对总分进行缩放（原地修改 report）。"""
+    scale = _get_evolution_total_score_scale(project_id)
+    if scale is None or abs(scale - 1.0) < 1e-6:
+        return
+    for key in ("total_score", "rule_total_score", "pred_total_score", "llm_total_score"):
+        v = report.get(key)
+        if v is not None:
+            try:
+                report[key] = round(min(100.0, max(0.0, float(v) * scale)), 2)
+            except (TypeError, ValueError):
+                pass
+    # 若存在 pred_total_score，则保持 total_score 与展示/排序主分一致。
+    pred_total = _to_float_or_none(report.get("pred_total_score"))
+    rule_total = _to_float_or_none(report.get("rule_total_score"))
+    if pred_total is not None:
+        report["total_score"] = pred_total
+    elif rule_total is not None:
+        report["total_score"] = rule_total
+
+
 @router.post(
     "/projects/{project_id}/shigong",
     response_model=SubmissionRecord,
@@ -3648,7 +3681,7 @@ def score_text_for_project(
         if cached_result is not None:
             report = dict(cached_result)
         else:
-            report, _ = _score_submission_for_project(
+            raw_report, _ = _score_submission_for_project(
                 submission_id=submission_id,
                 text=payload.text,
                 project_id=project_id,
@@ -3658,7 +3691,10 @@ def score_text_for_project(
                 profile_snapshot=profile_snapshot,
                 scoring_engine_version=scoring_engine_version,
             )
-            cache_score_result(payload.text, report, config_hash)
+            # 缓存仅存“未缩放原始分”，避免后续读取时重复应用 total_score_scale。
+            cache_score_result(payload.text, raw_report, config_hash)
+            report = dict(raw_report)
+        _apply_evolution_total_scale(project_id, report)
         evidence_units: List[Dict[str, object]] = []
     else:
         report, evidence_units = _score_submission_for_project(
@@ -3671,6 +3707,7 @@ def score_text_for_project(
             profile_snapshot=profile_snapshot,
             scoring_engine_version=scoring_engine_version,
         )
+        _apply_evolution_total_scale(project_id, report)
 
     record = {
         "id": submission_id,
@@ -6025,6 +6062,45 @@ def get_writing_guidance(
         sample_count=0,
         updated_at=None,
     )
+
+
+@router.get(
+    "/projects/{project_id}/scoring_context",
+    tags=["自我学习与进化"],
+    responses=RESPONSES_404,
+)
+def get_scoring_context(project_id: str) -> Dict[str, object]:
+    """
+    返回当前项目评分生效的维度权重与总分缩放，用于诊断进化是否生效。
+    source: evolution | expert_profile | learning_profile | none
+    """
+    ensure_data_dirs()
+    projects = load_projects()
+    if not any(p["id"] == project_id for p in projects):
+        raise HTTPException(status_code=404, detail="项目不存在")
+    multipliers, profile_snapshot, _ = _resolve_project_scoring_context(project_id)
+    scale = _get_evolution_total_score_scale(project_id)
+    source = "none"
+    if profile_snapshot:
+        source = "expert_profile"
+    elif (
+        load_evolution_reports()
+        .get(project_id, {})
+        .get("scoring_evolution", {})
+        .get("dimension_multipliers")
+    ):
+        source = "evolution"
+    elif any(p.get("project_id") == project_id for p in load_learning_profiles()):
+        source = "learning_profile"
+    return {
+        "project_id": project_id,
+        "source": source,
+        "dimension_multipliers": multipliers,
+        "total_score_scale": scale,
+        "has_non_default_multipliers": any(
+            abs(float(multipliers.get(d, 1.0)) - 1.0) > 0.01 for d in DIMENSION_IDS
+        ),
+    }
 
 
 @router.get(
