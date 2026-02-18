@@ -7572,6 +7572,11 @@ def index(
             try {
               await fn(ev);
             } catch (err) {
+              const cfg = FALLBACK_ACTIONS[id] || {};
+              const msg = '执行失败：' + String((err && err.message) || err || '未知错误');
+              if (cfg.resultId && typeof setResultError === 'function') {
+                setResultError(cfg.resultId, msg);
+              }
               reportClientError('按钮[' + id + ']执行失败', err);
             }
           };
@@ -9364,6 +9369,7 @@ def index(
         });
 
         safeClick('btnAdaptive', async () => {
+          if (!ensureProjectForAction('adaptiveResult')) return;
           setResultLoading('adaptiveResult', '自适应建议生成中...');
           const projectId = actionProjectId();
           const res = await fetch('/api/v1/projects/' + projectId + '/adaptive');
@@ -9387,6 +9393,7 @@ def index(
         });
 
         safeClick('btnAdaptivePatch', async () => {
+          if (!ensureProjectForAction('adaptivePatchResult')) return;
           setResultLoading('adaptivePatchResult', '补丁生成中...');
           const projectId = actionProjectId();
           const res = await fetch('/api/v1/projects/' + projectId + '/adaptive_patch');
@@ -9409,6 +9416,7 @@ def index(
         });
 
         safeClick('btnAdaptiveValidate', async () => {
+          if (!ensureProjectForAction('adaptiveValidateResult')) return;
           setResultLoading('adaptiveValidateResult', '验证效果计算中...');
           const projectId = actionProjectId();
           const res = await fetch('/api/v1/projects/' + projectId + '/adaptive_validate');
@@ -9428,6 +9436,7 @@ def index(
         });
 
         safeClick('btnAdaptiveApply', async () => {
+          if (!ensureProjectForAction('adaptiveApplyResult')) return;
           setResultLoading('adaptiveApplyResult', '应用补丁中...');
           const projectId = actionProjectId();
           const storedApiKey = storageGet('api_key');
@@ -9452,6 +9461,7 @@ def index(
         });
 
         safeClick('btnUploadFeed', async () => {
+          if (!ensureProjectForAction('evolveResult')) return;
           const projectId = actionProjectId();
           const feedInput = document.getElementById('feedFile');
           const files = Array.from((feedInput && feedInput.files) || []);
@@ -9506,6 +9516,7 @@ def index(
           if (feedInput && failCount === 0) feedInput.value = '';
         });
         safeClick('btnAddGroundTruth', async () => {
+          if (!ensureProjectForAction('evolveResult')) return;
           const projectId = actionProjectId();
           const fileInput = document.getElementById('groundTruthFile');
           const files = Array.from((fileInput && fileInput.files) || []);
@@ -9556,6 +9567,7 @@ def index(
           if (fileInput) fileInput.value = '';
         });
         safeClick('btnEvolve', async () => {
+          if (!ensureProjectForAction('evolveResult')) return;
           const projectId = actionProjectId();
           setResultLoading('evolveResult', '学习进化执行中...');
           const res = await fetch('/api/v1/projects/' + projectId + '/evolve', { method: 'POST', headers: apiHeaders(false) });
@@ -9576,6 +9588,7 @@ def index(
           } else { el.innerHTML = '<span class="error">' + (data.detail || '请求失败，若需认证请设置 API Key') + '</span>'; }
         });
         safeClick('btnWritingGuidance', async () => {
+          if (!ensureProjectForAction('guidanceResult')) return;
           const projectId = actionProjectId();
           setResultLoading('guidanceResult', '正在生成编制指导...');
           const res = await fetch('/api/v1/projects/' + projectId + '/writing_guidance');
@@ -9591,6 +9604,7 @@ def index(
           } else { el.innerHTML = '<span class="error">' + (data.detail || '') + '</span>'; }
         });
         safeClick('btnCompilationInstructions', async () => {
+          if (!ensureProjectForAction('compilationInstructionsResult')) return;
           const projectId = actionProjectId();
           setResultLoading('compilationInstructionsResult', '正在生成编制系统指令...');
           const res = await fetch('/api/v1/projects/' + projectId + '/compilation_instructions');

@@ -127,6 +127,26 @@ class TestIndexEndpoint:
         ):
             assert f"safeClick('{button_id}'" in page
 
+    def test_index_frontend_section_5_6_7_actions_have_explicit_project_guard(self, client):
+        """Section 5/6/7 action handlers should proactively show project-selection errors instead of silent failure."""
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        for guard_result_id in (
+            "compareResult",
+            "compareReportResult",
+            "insightsResult",
+            "learningResult",
+            "adaptiveResult",
+            "adaptivePatchResult",
+            "adaptiveValidateResult",
+            "adaptiveApplyResult",
+            "evolveResult",
+            "guidanceResult",
+            "compilationInstructionsResult",
+        ):
+            assert f"ensureProjectForAction('{guard_result_id}')" in page
+
     def test_index_upload_buttons_use_inline_fallback_click_and_form_submit_compat(self, client):
         """Upload/score buttons should keep submit fallback while inline fallback click avoids full-page jumps."""
         response = client.get("/")
