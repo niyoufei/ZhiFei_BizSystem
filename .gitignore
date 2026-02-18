@@ -1,0 +1,98 @@
+# =========================
+# OS / Filesystem junk
+# =========================
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.Spotlight-V100/
+.Trashes/
+
+# =========================
+# Editor / IDE
+# =========================
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+*~
+
+# =========================
+# Python bytecode / caches
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+
+# =========================
+# Coverage / test artifacts
+# =========================
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# =========================
+# Packaging / build outputs
+# =========================
+build/
+dist/
+site/
+.eggs/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+MANIFEST
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Runtime logs / pid / temp
+# =========================
+*.log
+*.pid
+*.pid.lock
+*.out
+*.err
+*.tmp
+*.temp
+
+# =========================
+# Local env / secrets
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# Project local generated files
+# =========================
+data/materials/
+data/submissions/
+data/*.json
+
+# Generated report outputs (keep code, ignore generated artifacts)
+report_*.json
+sample_report*.json
+*.bak
+*.bak_*

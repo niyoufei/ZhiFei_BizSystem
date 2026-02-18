@@ -1,0 +1,1075 @@
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field
+
+# ==================== 健康检查模型 ====================
+
+
+class HealthResponse(BaseModel):
+    """健康检查响应"""
+
+    status: str = Field(..., description="服务状态：healthy/unhealthy")
+    version: str = Field(..., description="API 版本号")
+
+    model_config = {"json_schema_extra": {"examples": [{"status": "healthy", "version": "1.0.0"}]}}
+
+
+class ReadyResponse(BaseModel):
+    """就绪检查响应"""
+
+    status: str = Field(..., description="就绪状态：ready/not_ready")
+    checks: dict = Field(..., description="各组件检查结果")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "status": "ready",
+                    "checks": {
+                        "config": True,
+                        "data_dirs": True,
+                    },
+                }
+            ]
+        }
+    }
+
+
+class ConfigStatusResponse(BaseModel):
+    """配置状态响应"""
+
+    cached: bool = Field(..., description="配置是否已缓存")
+    rubric_path: str = Field(..., description="评分规则文件路径")
+    lexicon_path: str = Field(..., description="词库文件路径")
+    needs_reload: bool = Field(..., description="配置文件是否已变更需要重载")
+    rubric_mtime: float = Field(..., description="缓存的评分规则文件修改时间")
+    lexicon_mtime: float = Field(..., description="缓存的词库文件修改时间")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "cached": True,
+                    "rubric_path": "/app/resources/rubric.yaml",
+                    "lexicon_path": "/app/resources/lexicon.yaml",
+                    "needs_reload": False,
+                    "rubric_mtime": 1738680000.0,
+                    "lexicon_mtime": 1738680000.0,
+                }
+            ]
+        }
+    }
+
+
+class LLMBackendStatus(BaseModel):
+    """进化 LLM 后端配置状态（不暴露密钥）"""
+
+    evolution_backend: str = Field(..., description="当前进化后端：rules | spark | openai | gemini")
+    spark_configured: bool = Field(..., description="是否已配置 SPARK_APIPASSWORD")
+    openai_configured: bool = Field(..., description="是否已配置 OPENAI_API_KEY")
+    gemini_configured: bool = Field(..., description="是否已配置 GEMINI_API_KEY")
+
+
+class ConfigReloadResponse(BaseModel):
+    """配置重载响应"""
+
+    reloaded: bool = Field(..., description="是否成功重载")
+    message: str = Field(..., description="操作结果消息")
+
+    model_config = {
+        "json_schema_extra": {"examples": [{"reloaded": True, "message": "配置已重新加载"}]}
+    }
+
+
+# ==================== 错误响应模型 ====================
+
+
+class ErrorDetail(BaseModel):
+    """错误详情"""
+
+    detail: str = Field(..., description="错误描述信息")
+
+    model_config = {"json_schema_extra": {"examples": [{"detail": "项目不存在"}]}}
+
+
+class ValidationErrorItem(BaseModel):
+    """验证错误项"""
+
+    loc: List[str] = Field(..., description="错误位置路径")
+    msg: str = Field(..., description="错误信息")
+    type: str = Field(..., description="错误类型")
+
+
+class ValidationErrorResponse(BaseModel):
+    """422 验证错误响应"""
+
+    detail: List[ValidationErrorItem] = Field(..., description="验证错误列表")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "detail": [
+                        {
+                            "loc": ["body", "text"],
+                            "msg": "field required",
+                            "type": "value_error.missing",
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+
+
+# 常用错误响应定义，用于 OpenAPI responses 参数
+RESPONSES_404 = {
+    404: {
+        "model": ErrorDetail,
+        "description": "资源不存在",
+        "content": {"application/json": {"example": {"detail": "项目不存在"}}},
+    }
+}
+
+RESPONSES_401 = {
+    401: {
+        "model": ErrorDetail,
+        "description": "认证失败",
+        "content": {"application/json": {"example": {"detail": "API Key 无效或缺失"}}},
+    }
+}
+
+RESPONSES_422 = {
+    422: {
+        "model": ValidationErrorResponse,
+        "description": "请求参数验证失败",
+    }
+}
+
+RESPONSES_409 = {
+    409: {
+        "model": ErrorDetail,
+        "description": "资源状态冲突（需解锁后操作）",
+        "content": {
+            "application/json": {
+                "example": {"detail": "项目已进入青天评标阶段，默认锁定配置变更与重算。"}
+            }
+        },
+    }
+}
+
+RESPONSES_NO_SUBMISSIONS = {
+    404: {
+        "model": ErrorDetail,
+        "description": "无施组记录",
+        "content": {"application/json": {"example": {"detail": "暂无施组记录"}}},
+    }
+}
+
+RESPONSES_NO_PROFILE = {
+    404: {
+        "model": ErrorDetail,
+        "description": "无学习画像",
+        "content": {"application/json": {"example": {"detail": "暂无学习画像"}}},
+    }
+}
+
+
+# ==================== 业务模型 ====================
+
+
+class ScoreRequest(BaseModel):
+    """评分请求体"""
+
+    text: str = Field(..., description="施工组织设计纯文本")
+    project_type: Optional[str] = Field(None, description="项目类型，可选用于扩展规则")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "text": "一、工程概况\n本工程为某市政道路改造项目...\n\n二、施工部署\n本工程采用分段施工方式...",
+                    "project_type": "市政道路",
+                }
+            ]
+        }
+    }
+
+
+class ProjectCreate(BaseModel):
+    """项目创建请求"""
+
+    name: str = Field(..., description="项目名称")
+    meta: Optional[Dict[str, Any]] = Field(None, description="项目元数据（可选）")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "name": "XX市政道路改造工程",
+                    "meta": {"location": "北京", "budget": "5000万"},
+                }
+            ]
+        }
+    }
+
+
+class ProjectRecord(BaseModel):
+    """项目记录"""
+
+    id: str = Field(..., description="项目唯一标识符")
+    name: str = Field(..., description="项目名称")
+    meta: Optional[Dict[str, Any]] = Field(None, description="项目元数据")
+    region: Optional[str] = Field(None, description="项目所属地区")
+    expert_profile_id: Optional[str] = Field(None, description="生效专家配置ID")
+    qingtian_model_version: Optional[str] = Field(None, description="青天模型版本")
+    scoring_engine_version_locked: Optional[str] = Field(None, description="评分引擎锁定版本")
+    calibrator_version_locked: Optional[str] = Field(None, description="校准器锁定版本")
+    status: Optional[str] = Field(None, description="项目状态")
+    created_at: str = Field(..., description="创建时间（ISO 8601格式）")
+    updated_at: Optional[str] = Field(None, description="更新时间（ISO 8601格式）")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "id": "550e8400-e29b-41d4-a716-446655440000",
+                    "name": "XX市政道路改造工程",
+                    "meta": {"location": "北京", "budget": "5000万"},
+                    "created_at": "2026-02-04T12:00:00+00:00",
+                }
+            ]
+        }
+    }
+
+
+class MaterialRecord(BaseModel):
+    id: str
+    project_id: str
+    filename: str
+    path: str
+    created_at: str
+
+
+class ExpertProfileRecord(BaseModel):
+    id: str = Field(..., description="专家配置ID")
+    name: str = Field(..., description="配置名称")
+    weights_raw: Dict[str, int] = Field(..., description="16维原始关注度(0..10)")
+    weights_norm: Dict[str, float] = Field(..., description="16维归一化权重(sum=1)")
+    norm_rule_version: str = Field(..., description="归一化规则版本")
+    created_at: str = Field(..., description="创建时间（ISO 8601格式）")
+    updated_at: str = Field(..., description="更新时间（ISO 8601格式）")
+
+
+class ExpertProfileUpdate(BaseModel):
+    name: Optional[str] = Field(None, description="配置名称，不传时自动命名")
+    weights_raw: Dict[str, int] = Field(..., description="16维原始关注度(0..10)")
+    force_unlock: bool = Field(False, description="项目已锁定时是否强制解锁本次操作")
+
+
+class ProjectExpertProfileResponse(BaseModel):
+    project: ProjectRecord
+    expert_profile: ExpertProfileRecord
+
+
+class RescoreRequest(BaseModel):
+    scoring_engine_version: str = Field(
+        default="v2",
+        description="评分引擎版本标识",
+    )
+    scope: str = Field(
+        default="project",
+        description="重算范围：project | submission",
+    )
+    submission_id: Optional[str] = Field(
+        None,
+        description="当 scope=submission 时指定提交ID",
+    )
+    rebuild_anchors: bool = Field(False, description="是否重建锚点（预留）")
+    rebuild_requirements: bool = Field(False, description="是否重建要求矩阵（预留）")
+    retrain_calibrator: bool = Field(False, description="是否重训校准器（预留）")
+    force_unlock: bool = Field(False, description="项目已锁定时是否强制解锁本次重算")
+
+
+class RescoreResponse(BaseModel):
+    ok: bool
+    project_id: str
+    scoring_engine_version: str
+    expert_profile_id_used: Optional[str] = None
+    submission_count: int
+    reports_generated: int
+    started_at: str
+    finished_at: str
+
+
+class QingTianResultCreate(BaseModel):
+    qingtian_model_version: Optional[str] = Field(None, description="青天模型版本")
+    qt_total_score: float = Field(..., description="青天总分(0..100)")
+    qt_dim_scores: Optional[Dict[str, float]] = Field(None, description="青天16维分数，可空")
+    qt_reasons: List[Dict[str, Any]] = Field(default_factory=list, description="青天扣分/加分原因")
+    raw_payload: Dict[str, Any] = Field(default_factory=dict, description="青天原始响应")
+
+
+class QingTianResultRecord(BaseModel):
+    id: str
+    submission_id: str
+    qingtian_model_version: str
+    qt_total_score: float
+    qt_dim_scores: Optional[Dict[str, float]] = None
+    qt_reasons: List[Dict[str, Any]] = Field(default_factory=list)
+    raw_payload: Dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+
+
+class CalibratorTrainRequest(BaseModel):
+    project_id: Optional[str] = Field(None, description="仅用某项目样本训练")
+    model_type: str = Field(
+        default="auto", description="支持 auto/ridge/offset/linear1d/isotonic1d"
+    )
+    alpha: float = Field(default=1.0, ge=0.0, description="ridge 正则强度")
+    auto_deploy: bool = Field(default=False, description="闸门通过后是否自动上线")
+
+
+class CalibratorModelRecord(BaseModel):
+    calibrator_version: str
+    model_type: str
+    feature_schema_version: str
+    train_filter: Dict[str, Any] = Field(default_factory=dict)
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+    artifact_uri: str
+    deployed: bool = False
+    created_at: str
+
+
+class CalibratorDeployRequest(BaseModel):
+    calibrator_version: str
+    project_id: Optional[str] = Field(None, description="可选：绑定到某个项目")
+
+
+class CalibratorPredictResponse(BaseModel):
+    ok: bool
+    project_id: str
+    model_version: Optional[str] = None
+    updated_reports: int = 0
+    updated_submissions: int = 0
+
+
+class LatestReportResponse(BaseModel):
+    report: Dict[str, Any]
+    ui_summary: Dict[str, Any]
+
+
+class ProjectPreScoreListResponse(BaseModel):
+    project_id: str
+    expert_profile_id: Optional[str] = None
+    submissions: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class ScoringFactorsResponse(BaseModel):
+    """评分体系总览（用于对外分析与复核）"""
+
+    engine_version: str = Field(..., description="当前评分引擎版本")
+    project_id: Optional[str] = Field(None, description="可选：按项目返回定制要求")
+    dimension_count: int = Field(..., description="维度数量（固定16）")
+    dimensions: List[Dict[str, Any]] = Field(default_factory=list, description="维度评分因子列表")
+    penalty_rules: List[Dict[str, Any]] = Field(default_factory=list, description="扣分规则列表")
+    lint_issue_codes: List[str] = Field(default_factory=list, description="静态检查问题码")
+    consistency_anchors: List[str] = Field(default_factory=list, description="一致性校验锚点")
+    chapter_requirements: Dict[str, List[str]] = Field(
+        default_factory=dict, description="章节/图文/要素要求"
+    )
+    capability_flags: Dict[str, bool] = Field(default_factory=dict, description="能力覆盖标识")
+    source: Dict[str, str] = Field(default_factory=dict, description="数据来源说明")
+    updated_at: str = Field(..., description="生成时间")
+
+
+class ScoringFactorsMarkdownResponse(BaseModel):
+    """评分体系Markdown导出"""
+
+    project_id: Optional[str] = None
+    markdown: str
+
+
+class AnalysisBundleResponse(BaseModel):
+    """面向外部模型分析的一体化文本包"""
+
+    project_id: str
+    markdown: str
+    generated_at: str
+
+
+class SelfCheckItem(BaseModel):
+    name: str
+    ok: bool
+    detail: Optional[str] = None
+
+
+class SelfCheckResponse(BaseModel):
+    ok: bool
+    checked_at: str
+    items: List[SelfCheckItem] = Field(default_factory=list)
+
+
+class DeltaCaseRecord(BaseModel):
+    id: str
+    project_id: str
+    submission_id: str
+    report_id: Optional[str] = None
+    qingtian_result_id: Optional[str] = None
+    total_error: float
+    dim_errors: Dict[str, float] = Field(default_factory=dict)
+    reason_alignment: List[Dict[str, Any]] = Field(default_factory=list)
+    miss_types: Dict[str, int] = Field(default_factory=dict)
+    created_at: str
+
+
+class CalibrationSampleRecord(BaseModel):
+    id: str
+    project_id: str
+    submission_id: str
+    report_id: Optional[str] = None
+    qingtian_result_id: Optional[str] = None
+    feature_schema_version: str
+    x_features: Dict[str, float] = Field(default_factory=dict)
+    y_label: float
+    created_at: str
+
+
+class PatchMineRequest(BaseModel):
+    patch_type: str = Field(default="threshold", description="keywords|regex|requirement|threshold")
+    top_k: int = Field(default=3, ge=1, le=20)
+
+
+class PatchPackageRecord(BaseModel):
+    id: str
+    project_id: str
+    patch_type: str
+    patch_payload: Dict[str, Any] = Field(default_factory=dict)
+    target_symptom: Dict[str, Any] = Field(default_factory=dict)
+    rollback_pointer: Optional[str] = None
+    status: str = Field(
+        default="candidate", description="candidate|shadow_pass|deployed|rolled_back"
+    )
+    shadow_metrics: Optional[Dict[str, Any]] = None
+    created_at: str
+    updated_at: str
+
+
+class PatchShadowEvalResponse(BaseModel):
+    ok: bool
+    patch_id: str
+    gate_passed: bool
+    metrics_before_after: Dict[str, Any] = Field(default_factory=dict)
+
+
+class PatchDeployRequest(BaseModel):
+    action: str = Field(default="deploy", description="deploy|rollback")
+    rollback_to_version: Optional[str] = None
+
+
+class PatchDeploymentRecord(BaseModel):
+    id: str
+    patch_id: str
+    project_id: str
+    action: str
+    deployed: bool
+    metrics_before_after: Dict[str, Any] = Field(default_factory=dict)
+    rollback_to_version: Optional[str] = None
+    created_at: str
+
+
+class ReflectionAutoRunResponse(BaseModel):
+    ok: bool
+    project_id: str
+    delta_cases: int
+    calibration_samples: int
+    calibrator_version: Optional[str] = None
+    calibrator_deployed: bool = False
+    prediction_updated_reports: int = 0
+    prediction_updated_submissions: int = 0
+    patch_id: Optional[str] = None
+    patch_gate_passed: Optional[bool] = None
+    patch_deployed: bool = False
+
+
+class ProjectEvaluationResponse(BaseModel):
+    project_id: str
+    sample_count_qt: int
+    variants: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    acceptance: Dict[str, bool] = Field(default_factory=dict)
+    computed_at: str
+
+
+class EvaluationSummaryResponse(BaseModel):
+    project_count: int
+    project_ids: List[str] = Field(default_factory=list)
+    aggregate: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    acceptance_pass_count: Dict[str, int] = Field(default_factory=dict)
+    computed_at: str
+
+
+class ProjectAnchorRecord(BaseModel):
+    id: str
+    project_id: str
+    anchor_key: str
+    anchor_value: Any
+    value_num: Optional[float] = None
+    value_unit: Optional[str] = None
+    source_doc_id: Optional[str] = None
+    source_locator: str
+    confidence: float
+    created_at: str
+
+
+class ProjectRequirementRecord(BaseModel):
+    id: str
+    project_id: str
+    dimension_id: str
+    req_label: str
+    req_type: str
+    patterns: Dict[str, Any]
+    mandatory: bool
+    weight: float
+    source_anchor_id: Optional[str] = None
+    source_pack_id: Optional[str] = None
+    source_pack_version: Optional[str] = None
+    priority: Optional[float] = None
+    lint: Dict[str, Any] = Field(default_factory=dict)
+    version_locked: Optional[str] = None
+    created_at: str
+
+
+class ConstraintPack(BaseModel):
+    project_id: str
+    expert_profile_snapshot: Optional[ExpertProfileRecord] = None
+    anchors_required: List[Dict[str, Any]] = Field(default_factory=list)
+    requirements_mandatory: List[Dict[str, Any]] = Field(default_factory=list)
+    dimension_thresholds: Dict[str, Dict[str, float]] = Field(default_factory=dict)
+    priority_order: List[str] = Field(default_factory=list)
+    requirement_pack_versions: List[str] = Field(default_factory=list)
+    generated_at: str
+
+
+class SubmissionRecord(BaseModel):
+    """施组提交记录"""
+
+    id: str = Field(..., description="提交记录唯一标识符")
+    project_id: str = Field(..., description="所属项目ID")
+    filename: str = Field(..., description="上传的文件名")
+    total_score: float = Field(..., description="评分总分（0-100）")
+    report: Dict[str, Any] = Field(..., description="完整评分报告")
+    created_at: str = Field(..., description="提交时间（ISO 8601格式）")
+    text: Optional[str] = Field(None, description="施组文本原文（可选返回）")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "id": "660e8400-e29b-41d4-a716-446655440001",
+                    "project_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "filename": "施工组织设计_v1.txt",
+                    "total_score": 78.5,
+                    "report": {
+                        "total_score": 78.5,
+                        "dimension_scores": {},
+                        "penalties": [],
+                        "suggestions": [],
+                    },
+                    "created_at": "2026-02-04T14:30:00+00:00",
+                    "text": None,
+                }
+            ]
+        }
+    }
+
+
+class CompareReport(BaseModel):
+    """多次提交对比报告"""
+
+    project_id: str = Field(..., description="项目ID")
+    rankings: List[Dict[str, Any]] = Field(..., description="按总分排序的提交列表")
+    dimension_avg: Dict[str, float] = Field(..., description="各维度平均分")
+    penalty_stats: Dict[str, int] = Field(..., description="扣分项统计")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "project_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "rankings": [
+                        {
+                            "submission_id": "sub-001",
+                            "filename": "施组_v2.txt",
+                            "total_score": 85.0,
+                        },
+                        {
+                            "submission_id": "sub-002",
+                            "filename": "施组_v1.txt",
+                            "total_score": 72.5,
+                        },
+                    ],
+                    "dimension_avg": {"D01": 15.5, "D02": 12.0, "D03": 18.0},
+                    "penalty_stats": {"EMPTY_PROMISE": 3, "ACTION_MISSING": 2},
+                }
+            ]
+        }
+    }
+
+
+class InsightsReport(BaseModel):
+    project_id: str
+    dimension_avg: Dict[str, float]
+    weakest_dims: List[Dict[str, Any]]
+    frequent_penalties: List[Dict[str, Any]]
+    recommendations: List[Dict[str, Any]]
+
+
+class LearningProfile(BaseModel):
+    project_id: str
+    dimension_multipliers: Dict[str, float]
+    rationale: Dict[str, str]
+    updated_at: str
+
+
+class CompareNarrative(BaseModel):
+    project_id: str
+    summary: str
+    top_submission: Dict[str, Any]
+    bottom_submission: Dict[str, Any]
+    key_diffs: List[Dict[str, Any]]
+    score_overview: Dict[str, Any] = Field(default_factory=dict, description="总体分数分布与波动")
+    dimension_diagnostics: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="维度差距诊断（含证据与改进动作）",
+    )
+    penalty_diagnostics: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="扣分项诊断（频次、影响范围、原因样本、优化动作）",
+    )
+    submission_diagnostics: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="分文件诊断（强弱维度与重点扣分）",
+    )
+    priority_actions: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="编制优化优先级动作清单",
+    )
+    submission_optimization_cards: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="逐文件优化卡片（文件级优先动作与页码定位）",
+    )
+    submission_scorecards: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="逐份施组得分/失分明细（按文件名列出维度得分与扣分项）",
+    )
+
+
+class AdaptiveSuggestions(BaseModel):
+    project_id: str
+    penalty_stats: Dict[str, int]
+    suggestions: List[Dict[str, Any]]
+    source: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AdaptivePatch(BaseModel):
+    project_id: str
+    lexicon_additions: Dict[str, Any]
+    rubric_adjustments: Dict[str, Any]
+    source: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AdaptiveApplyResult(BaseModel):
+    project_id: str
+    applied: bool
+    changes: List[str]
+    backup_path: str
+    source: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AdaptiveValidation(BaseModel):
+    project_id: str
+    avg_delta: float
+    comparisons: List[Dict[str, Any]]
+
+
+# ==================== 自我学习与进化 ====================
+
+
+class ProjectContextIn(BaseModel):
+    """投喂包/项目背景文本（招标文件、清单、图纸、设计等合并后的内容）"""
+
+    text: str = Field(..., description="项目背景文本内容")
+    filename: Optional[str] = Field(None, description="来源文件名，如 投喂包.txt")
+
+
+class ProjectContextOut(BaseModel):
+    project_id: str
+    text: str
+    filename: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class GroundTruthRecord(BaseModel):
+    """单条真实评标记录（青天大模型等外部评标结果）"""
+
+    id: str
+    project_id: str
+    shigong_text: str
+    judge_scores: List[float] = Field(..., description="5个评委得分")
+    final_score: float = Field(..., description="最终得分")
+    judge_weights: Optional[List[float]] = Field(None, description="5个评委关注度/权重")
+    source: str = Field(default="青天大模型", description="来源")
+    created_at: str
+
+
+class GroundTruthCreate(BaseModel):
+    """录入真实评标结果"""
+
+    shigong_text: str = Field(..., description="施组全文")
+    judge_scores: List[float] = Field(..., min_length=5, max_length=5, description="5个评委得分")
+    final_score: float = Field(..., description="最终得分")
+    judge_weights: Optional[List[float]] = Field(
+        None, min_length=5, max_length=5, description="5个评委关注度"
+    )
+    source: str = Field(default="青天大模型", description="来源")
+
+
+class GroundTruthBatchItem(BaseModel):
+    """批量录入中的单文件结果"""
+
+    filename: str = Field(..., description="上传文件名")
+    ok: bool = Field(..., description="该文件是否录入成功")
+    record: Optional[GroundTruthRecord] = Field(None, description="成功时返回的记录")
+    detail: Optional[str] = Field(None, description="失败或告警信息")
+
+
+class GroundTruthBatchResponse(BaseModel):
+    """批量录入真实评标结果"""
+
+    project_id: str
+    total_files: int
+    success_count: int
+    failed_count: int
+    items: List[GroundTruthBatchItem] = Field(default_factory=list)
+
+
+class EvolutionReport(BaseModel):
+    """进化报告：基于真实评标学习的高分逻辑与编制建议；含评分进化与编制系统指令。"""
+
+    project_id: str
+    high_score_logic: List[str] = Field(..., description="高分逻辑总结")
+    writing_guidance: List[str] = Field(..., description="编制指导")
+    sample_count: int = Field(0, description="参与学习的真实评标条数")
+    updated_at: str
+    scoring_evolution: Optional[Dict[str, Any]] = Field(
+        None,
+        description="评分系统进化建议（维度权重等），使预评分更贴近青天",
+    )
+    compilation_instructions: Optional[Dict[str, Any]] = Field(
+        None,
+        description="编制系统指令（必备章节/图表/要素），可导出为编制约束",
+    )
+    enhanced_by: Optional[str] = Field(
+        None,
+        description="若由 LLM 增强则标识后端：spark | openai | gemini；仅规则时为 None",
+    )
+
+
+class CompilationInstructions(BaseModel):
+    """编制系统指令：用于约束施组编制输出（内容、图表、必备要素）。"""
+
+    project_id: str
+    required_sections: List[str] = Field(default_factory=list, description="必备章节/模块")
+    required_charts_images: List[str] = Field(default_factory=list, description="必备图表或图片")
+    mandatory_elements: List[str] = Field(default_factory=list, description="必备表述要素")
+    forbidden_patterns: List[str] = Field(default_factory=list, description="禁止的表述模式")
+    guidance_items: List[str] = Field(default_factory=list, description="编制指导条目")
+    high_score_summary: List[str] = Field(default_factory=list, description="高分逻辑摘要")
+
+
+class WritingGuidance(BaseModel):
+    """编制指导（供前端/编制人使用）"""
+
+    project_id: str
+    guidance: List[str] = Field(..., description="编制建议条目")
+    high_score_logic: List[str] = Field(default_factory=list, description="高分逻辑摘要")
+    sample_count: int = 0
+    updated_at: Optional[str] = None
+
+
+# ==================== 历史记录与趋势分析模型 ====================
+
+
+class ScoreHistoryEntry(BaseModel):
+    """评分历史记录条目"""
+
+    id: str = Field(..., description="记录唯一标识符")
+    project_id: str = Field(..., description="项目ID")
+    submission_id: str = Field(..., description="提交记录ID")
+    filename: str = Field(..., description="文件名")
+    total_score: float = Field(..., description="总分")
+    dimension_scores: Dict[str, float] = Field(..., description="各维度得分")
+    penalty_count: int = Field(..., description="扣分项数量")
+    created_at: str = Field(..., description="创建时间（ISO 8601格式）")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "id": "hist-001",
+                    "project_id": "proj-001",
+                    "submission_id": "sub-001",
+                    "filename": "施组_v1.txt",
+                    "total_score": 75.5,
+                    "dimension_scores": {"D01": 15.0, "D02": 12.5, "D03": 18.0},
+                    "penalty_count": 3,
+                    "created_at": "2026-02-04T10:00:00+00:00",
+                }
+            ]
+        }
+    }
+
+
+class TrendPoint(BaseModel):
+    """趋势数据点"""
+
+    submission_id: str = Field(..., description="提交记录ID")
+    filename: str = Field(..., description="文件名")
+    total_score: float = Field(..., description="总分")
+    created_at: str = Field(..., description="时间点")
+
+
+class DimensionTrend(BaseModel):
+    """维度趋势"""
+
+    dimension_id: str = Field(..., description="维度ID")
+    dimension_name: str = Field(..., description="维度名称")
+    scores: List[float] = Field(..., description="历史分数序列")
+    trend: str = Field(..., description="趋势方向：improving/declining/stable")
+    avg_score: float = Field(..., description="平均分")
+    latest_score: float = Field(..., description="最新分数")
+
+
+class TrendAnalysis(BaseModel):
+    """趋势分析报告"""
+
+    project_id: str = Field(..., description="项目ID")
+    total_submissions: int = Field(..., description="总提交次数")
+    score_history: List[TrendPoint] = Field(..., description="总分历史序列")
+    overall_trend: str = Field(..., description="整体趋势：improving/declining/stable")
+    avg_score: float = Field(..., description="平均总分")
+    best_score: float = Field(..., description="最高分")
+    worst_score: float = Field(..., description="最低分")
+    latest_score: float = Field(..., description="最新分数")
+    score_improvement: float = Field(..., description="分数提升（最新-首次）")
+    dimension_trends: List[DimensionTrend] = Field(..., description="各维度趋势")
+    penalty_trend: List[int] = Field(..., description="扣分项数量趋势")
+    recommendations: List[str] = Field(..., description="基于趋势的改进建议")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "project_id": "proj-001",
+                    "total_submissions": 5,
+                    "score_history": [
+                        {
+                            "submission_id": "sub-001",
+                            "filename": "v1.txt",
+                            "total_score": 70.0,
+                            "created_at": "2026-02-01T10:00:00",
+                        },
+                        {
+                            "submission_id": "sub-002",
+                            "filename": "v2.txt",
+                            "total_score": 78.5,
+                            "created_at": "2026-02-02T10:00:00",
+                        },
+                    ],
+                    "overall_trend": "improving",
+                    "avg_score": 74.25,
+                    "best_score": 78.5,
+                    "worst_score": 70.0,
+                    "latest_score": 78.5,
+                    "score_improvement": 8.5,
+                    "dimension_trends": [],
+                    "penalty_trend": [5, 3],
+                    "recommendations": ["继续优化工程概况部分"],
+                }
+            ]
+        }
+    }
+
+
+class ProjectScoreHistory(BaseModel):
+    """项目评分历史"""
+
+    project_id: str = Field(..., description="项目ID")
+    entries: List[ScoreHistoryEntry] = Field(..., description="历史记录列表")
+    total_count: int = Field(..., description="记录总数")
+
+
+class EvidenceSpan(BaseModel):
+    start_index: int
+    end_index: int
+    snippet: str
+
+
+class SubScore(BaseModel):
+    name: str
+    score: float
+    hits: List[str]
+    evidence: List[EvidenceSpan]
+
+
+class DimensionScore(BaseModel):
+    id: str
+    name: str
+    module: str
+    score: float
+    max_score: float
+    hits: List[str]
+    evidence: List[EvidenceSpan]
+    sub_scores: Optional[List[SubScore]] = None
+
+
+class LogicLockResult(BaseModel):
+    definition_score: float
+    analysis_score: float
+    solution_score: float
+    breaks: List[str]
+    evidence: List[EvidenceSpan]
+
+
+class Penalty(BaseModel):
+    code: str
+    message: str
+    evidence_span: Optional[EvidenceSpan]
+    deduct: Optional[float] = None
+    tags: Optional[List[str]] = None
+
+
+class Suggestion(BaseModel):
+    dimension: str
+    action: str
+    expected_gain: float
+
+
+class ScoreReport(BaseModel):
+    """完整评分报告"""
+
+    total_score: float = Field(..., description="总分（0-100）")
+    dimension_scores: Dict[str, DimensionScore] = Field(..., description="各维度得分详情")
+    logic_lock: LogicLockResult = Field(..., description="逻辑锁分析结果")
+    penalties: List[Penalty] = Field(default_factory=list, description="扣分项列表")
+    penalties_logic_lock: List[Penalty] = Field(default_factory=list, description="逻辑锁扣分")
+    penalties_empty_promises: List[Penalty] = Field(default_factory=list, description="空承诺扣分")
+    penalties_action_missing: List[Penalty] = Field(
+        default_factory=list, description="缺少行动扣分"
+    )
+    suggestions: List[Suggestion] = Field(default_factory=list, description="改进建议")
+    meta: Dict[str, Any] = Field(default_factory=dict, description="评分元数据")
+    judge_mode: Optional[str] = Field(None, description="评判模式")
+    judge_source: Optional[str] = Field(None, description="评判来源")
+    spark_called: Optional[bool] = Field(None, description="是否调用Spark")
+    fallback_reason: Optional[str] = Field(None, description="回退原因")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "total_score": 78.5,
+                    "dimension_scores": {
+                        "D01": {
+                            "id": "D01",
+                            "name": "工程概况",
+                            "module": "overview",
+                            "score": 15.0,
+                            "max_score": 20.0,
+                            "hits": ["工程概况", "项目背景"],
+                            "evidence": [
+                                {"start_index": 0, "end_index": 50, "snippet": "一、工程概况..."}
+                            ],
+                            "sub_scores": None,
+                        }
+                    },
+                    "logic_lock": {
+                        "definition_score": 8.0,
+                        "analysis_score": 7.5,
+                        "solution_score": 8.0,
+                        "breaks": [],
+                        "evidence": [],
+                    },
+                    "penalties": [
+                        {
+                            "code": "EMPTY_PROMISE",
+                            "message": "缺少具体数据支撑",
+                            "evidence_span": None,
+                            "deduct": 2.0,
+                            "tags": ["quality"],
+                        }
+                    ],
+                    "penalties_logic_lock": [],
+                    "penalties_empty_promises": [],
+                    "penalties_action_missing": [],
+                    "suggestions": [
+                        {
+                            "dimension": "D01",
+                            "action": "补充项目规模数据",
+                            "expected_gain": 3.0,
+                        }
+                    ],
+                    "meta": {"text_length": 5000, "scored_at": "2026-02-04T12:00:00"},
+                    "judge_mode": "local",
+                    "judge_source": None,
+                    "spark_called": False,
+                    "fallback_reason": None,
+                }
+            ]
+        }
+    }
+
+
+# ==================== 缓存相关模型 ====================
+
+
+class CacheStatsResponse(BaseModel):
+    """缓存统计响应"""
+
+    total_requests: int = Field(..., description="总请求数")
+    hits: int = Field(..., description="缓存命中数")
+    misses: int = Field(..., description="缓存未命中数")
+    evictions: int = Field(..., description="缓存驱逐数")
+    size: int = Field(..., description="当前缓存条目数")
+    hit_rate: float = Field(..., description="缓存命中率（0.0-1.0）")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "total_requests": 100,
+                    "hits": 75,
+                    "misses": 25,
+                    "evictions": 5,
+                    "size": 50,
+                    "hit_rate": 0.75,
+                }
+            ]
+        }
+    }
+
+
+class CacheClearResponse(BaseModel):
+    """缓存清空响应"""
+
+    cleared: bool = Field(..., description="是否成功清空")
+    count: int = Field(..., description="清除的缓存条目数")
+    message: str = Field(..., description="操作结果消息")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{"cleared": True, "count": 50, "message": "已清空 50 条缓存"}]
+        }
+    }
