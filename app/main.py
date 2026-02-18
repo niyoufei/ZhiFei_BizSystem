@@ -264,6 +264,7 @@ DEFAULT_CALIBRATOR_LOCKED = None
 DEFAULT_RULE_SCORE_WEIGHT = 0.7
 DEFAULT_LLM_SCORE_WEIGHT = 0.3
 DEFAULT_LLM_DELTA_CAP = 35.0
+DEFAULT_SCORE_SCALE_MAX = 100
 DEFAULT_NORM_RULE_VERSION = "v1_m=0.5+a/10_norm=sum"
 PROFILE_LOCKED_STATUSES = {"submitted_to_qingtian"}
 DEFAULT_CHAPTER_REQUIREMENTS = {
@@ -357,6 +358,14 @@ def _ensure_project_v2_fields(
         changed = True
     if not project.get("updated_at"):
         project["updated_at"] = project.get("created_at") or _now_iso()
+        changed = True
+    meta = project.get("meta")
+    if not isinstance(meta, dict):
+        project["meta"] = {}
+        meta = project["meta"]
+        changed = True
+    if "score_scale_max" not in meta:
+        meta["score_scale_max"] = DEFAULT_SCORE_SCALE_MAX
         changed = True
     return changed
 
@@ -1082,6 +1091,35 @@ def _clip_score(value: float, low: float = 0.0, high: float = 100.0) -> float:
     return max(low, min(high, float(value)))
 
 
+def _normalize_score_scale_max(value: object, default: int = DEFAULT_SCORE_SCALE_MAX) -> int:
+    try:
+        numeric = int(float(value))
+    except (TypeError, ValueError):
+        numeric = int(default)
+    return 5 if numeric == 5 else 100
+
+
+def _resolve_project_score_scale_max(project: Dict[str, object]) -> int:
+    meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
+    return _normalize_score_scale_max(
+        (meta or {}).get("score_scale_max"),
+        default=DEFAULT_SCORE_SCALE_MAX,
+    )
+
+
+def _score_scale_label(score_scale_max: int) -> str:
+    return "5分制" if int(score_scale_max) == 5 else "100分制"
+
+
+def _convert_score_from_100(score: object, score_scale_max: int) -> Optional[float]:
+    value = _to_float_or_none(score)
+    if value is None:
+        return None
+    clipped = _clip_score(value, 0.0, 100.0)
+    factor = float(_normalize_score_scale_max(score_scale_max)) / 100.0
+    return round(clipped * factor, 2)
+
+
 def _resolve_score_blend_weights(project: Dict[str, object]) -> tuple[float, float, float]:
     meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
     blend_raw = meta.get("score_blend") if isinstance(meta, dict) else {}
@@ -1217,6 +1255,7 @@ def _resolve_submission_score_fields(
     submission: Dict[str, object],
     *,
     allow_pred_score: bool = True,
+    score_scale_max: int = DEFAULT_SCORE_SCALE_MAX,
 ) -> Dict[str, object]:
     report = submission.get("report")
     pred_total = None
@@ -1234,10 +1273,15 @@ def _resolve_submission_score_fields(
     primary_total = pred_total if pred_total is not None else rule_total
     if primary_total is None:
         primary_total = fallback_total if fallback_total is not None else 0.0
+    total_display = _convert_score_from_100(primary_total, score_scale_max)
+    pred_display = _convert_score_from_100(pred_total, score_scale_max)
+    rule_display = _convert_score_from_100(rule_total, score_scale_max)
+    if total_display is None:
+        total_display = 0.0
     return {
-        "total_score": round(float(primary_total), 2),
-        "pred_total_score": round(float(pred_total), 2) if pred_total is not None else None,
-        "rule_total_score": round(float(rule_total), 2) if rule_total is not None else None,
+        "total_score": round(float(total_display), 2),
+        "pred_total_score": round(float(pred_display), 2) if pred_display is not None else None,
+        "rule_total_score": round(float(rule_display), 2) if rule_display is not None else None,
         "score_source": "pred" if pred_total is not None else "rule",
     }
 
@@ -2630,6 +2674,16 @@ def rescore_project_submissions(
 
     project_changed = _ensure_project_v2_fields(project)
     _assert_project_profile_operation_unlocked(project, bool(payload.force_unlock))
+    score_scale_max = _normalize_score_scale_max(
+        payload.score_scale_max,
+        default=_resolve_project_score_scale_max(project),
+    )
+    project_meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
+    project_meta = dict(project_meta or {})
+    if int(project_meta.get("score_scale_max", DEFAULT_SCORE_SCALE_MAX)) != score_scale_max:
+        project_meta["score_scale_max"] = score_scale_max
+        project["meta"] = project_meta
+        project_changed = True
     profiles = load_expert_profiles()
     profile, created = _ensure_project_expert_profile(project, profiles)
     if created:
@@ -2691,6 +2745,11 @@ def rescore_project_submissions(
             new_units=evidence_units,
         )
         _mark_report_scored(report, trigger="manual_rescore")
+        report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+        report_meta = dict(report_meta or {})
+        report_meta["score_scale_max"] = score_scale_max
+        report_meta["score_scale_label"] = _score_scale_label(score_scale_max)
+        report["meta"] = report_meta
 
         submission["report"] = report
         submission["total_score"] = float(
@@ -2741,6 +2800,8 @@ def rescore_project_submissions(
         expert_profile_id_used=str(profile.get("id")),
         submission_count=len(targets),
         reports_generated=generated,
+        score_scale_max=score_scale_max,
+        score_scale_label=_score_scale_label(score_scale_max),
         started_at=started_at,
         finished_at=_now_iso(),
     )
@@ -3547,6 +3608,8 @@ def list_submissions(
     projects = load_projects()
     project = next((p for p in projects if str(p.get("id")) == project_id), {"id": project_id})
     allow_pred_score = _select_calibrator_model(project) is not None
+    score_scale_max = _resolve_project_score_scale_max(project)
+    score_scale_max = _resolve_project_score_scale_max(project)
 
     submissions = [s for s in load_submissions() if s["project_id"] == project_id]
 
@@ -3554,6 +3617,9 @@ def list_submissions(
         view = dict(item)
         report_obj = item.get("report")
         if not isinstance(report_obj, dict):
+            total_display = _convert_score_from_100(item.get("total_score"), score_scale_max)
+            if total_display is not None:
+                view["total_score"] = total_display
             return view
         report = dict(report_obj)
         rule_total = _to_float_or_none(report.get("rule_total_score"))
@@ -3570,6 +3636,28 @@ def list_submissions(
             report["score_blend"] = None
             report["total_score"] = round(float(rule_total), 2)
             view["total_score"] = round(float(rule_total), 2)
+        raw_total = _to_float_or_none(report.get("total_score"))
+        raw_rule = _to_float_or_none(report.get("rule_total_score"))
+        raw_pred = _to_float_or_none(report.get("pred_total_score"))
+        raw_llm = _to_float_or_none(report.get("llm_total_score"))
+        report["raw_total_score_100"] = raw_total
+        report["raw_rule_total_score_100"] = raw_rule
+        report["raw_pred_total_score_100"] = raw_pred
+        report["raw_llm_total_score_100"] = raw_llm
+        report["score_scale_max"] = score_scale_max
+        report["score_scale_label"] = _score_scale_label(score_scale_max)
+        display_pred = _convert_score_from_100(raw_pred, score_scale_max)
+        display_rule = _convert_score_from_100(raw_rule, score_scale_max)
+        display_llm = _convert_score_from_100(raw_llm, score_scale_max)
+        display_total = _convert_score_from_100(raw_total, score_scale_max)
+        if display_total is None:
+            display_total = _convert_score_from_100(item.get("total_score"), score_scale_max)
+        report["pred_total_score"] = display_pred
+        report["rule_total_score"] = display_rule
+        report["llm_total_score"] = display_llm
+        report["total_score"] = display_total
+        if display_total is not None:
+            view["total_score"] = display_total
         view["report"] = report
         return view
 
@@ -3589,22 +3677,26 @@ def list_submissions(
         top_gain = 0.0
         if suggestions and isinstance(suggestions[0], dict):
             top_gain = float(suggestions[0].get("expected_gain", 0.0))
-        pred_total = latest.get("pred_total_score")
+        pred_total_raw = latest.get("pred_total_score")
         if not allow_pred_score:
-            pred_total = None
+            pred_total_raw = None
+        rule_total_raw = float(latest.get("rule_total_score", s.get("total_score", 0.0)))
+        pred_total = _convert_score_from_100(pred_total_raw, score_scale_max)
+        rule_total = _convert_score_from_100(rule_total_raw, score_scale_max)
+        top_gain_display = _convert_score_from_100(top_gain, score_scale_max)
         rows.append(
             {
                 "submission_id": sid,
                 "bidder_name": s.get("bidder_name") or s.get("filename") or sid,
                 "latest_report": {
                     "report_id": latest.get("id"),
-                    "rule_total_score": float(
-                        latest.get("rule_total_score", s.get("total_score", 0.0))
-                    ),
+                    "rule_total_score": float(rule_total if rule_total is not None else 0.0),
                     "pred_total_score": pred_total,
                     "rank_by_pred": None,
                     "rank_by_rule": None,
-                    "top_expected_gain": round(top_gain, 2),
+                    "top_expected_gain": round(
+                        float(top_gain_display if top_gain_display is not None else 0.0), 2
+                    ),
                     "updated_at": latest.get("created_at") or s.get("created_at"),
                 },
             }
@@ -4820,6 +4912,7 @@ def compare_submissions(
     projects = load_projects()
     project = next((p for p in projects if str(p.get("id")) == project_id), {"id": project_id})
     allow_pred_score = _select_calibrator_model(project) is not None
+    score_scale_max = _resolve_project_score_scale_max(project)
     submissions_all = [s for s in load_submissions() if s["project_id"] == project_id]
     if not submissions_all:
         raise HTTPException(status_code=404, detail=t("api.no_submissions", locale=locale))
@@ -4828,7 +4921,11 @@ def compare_submissions(
         raise HTTPException(status_code=404, detail="暂无已评分施组，请先点击“评分施组”。")
     rankings = []
     for s in submissions:
-        score_fields = _resolve_submission_score_fields(s, allow_pred_score=allow_pred_score)
+        score_fields = _resolve_submission_score_fields(
+            s,
+            allow_pred_score=allow_pred_score,
+            score_scale_max=score_scale_max,
+        )
         rankings.append(
             {
                 "submission_id": s["id"],
@@ -4890,6 +4987,7 @@ def compare_report(
     projects = load_projects()
     project = next((p for p in projects if str(p.get("id")) == project_id), {"id": project_id})
     allow_pred_score = _select_calibrator_model(project) is not None
+    score_scale_max = _resolve_project_score_scale_max(project)
     submissions_all = [s for s in load_submissions() if s["project_id"] == project_id]
     if not submissions_all:
         raise HTTPException(status_code=404, detail=t("api.no_submissions", locale=locale))
@@ -4899,15 +4997,24 @@ def compare_report(
     submissions_for_compare = []
     by_id: Dict[str, Dict[str, object]] = {}
     for s in submissions:
-        score_fields = _resolve_submission_score_fields(s, allow_pred_score=allow_pred_score)
+        score_fields_display = _resolve_submission_score_fields(
+            s,
+            allow_pred_score=allow_pred_score,
+            score_scale_max=score_scale_max,
+        )
+        score_fields_raw = _resolve_submission_score_fields(
+            s,
+            allow_pred_score=allow_pred_score,
+            score_scale_max=100,
+        )
         item = dict(s)
-        item["total_score"] = float(score_fields["total_score"])
+        item["total_score"] = float(score_fields_raw["total_score"])
         report = item.get("report")
         report = dict(report) if isinstance(report, dict) else {}
-        report["pred_total_score"] = score_fields["pred_total_score"]
-        report["rule_total_score"] = score_fields["rule_total_score"]
+        report["pred_total_score"] = score_fields_raw["pred_total_score"]
+        report["rule_total_score"] = score_fields_raw["rule_total_score"]
         item["report"] = report
-        item["score_source"] = score_fields["score_source"]
+        item["score_source"] = score_fields_display["score_source"]
         submissions_for_compare.append(item)
         by_id[str(item.get("id") or "")] = item
 
@@ -4921,7 +5028,9 @@ def compare_report(
         if not source_submission:
             continue
         score_fields = _resolve_submission_score_fields(
-            source_submission, allow_pred_score=allow_pred_score
+            source_submission,
+            allow_pred_score=allow_pred_score,
+            score_scale_max=score_scale_max,
         )
         row["pred_total_score"] = score_fields["pred_total_score"]
         row["rule_total_score"] = score_fields["rule_total_score"]
@@ -6179,6 +6288,7 @@ def web_upload_shigong(
 @app.post("/web/score_shigong", include_in_schema=False)
 def web_score_shigong(
     project_id: str = Form(""),
+    score_scale_max: int = Form(DEFAULT_SCORE_SCALE_MAX),
     api_key: Optional[str] = Depends(verify_api_key),
     locale: str = Depends(get_locale),
 ):
@@ -6196,6 +6306,7 @@ def web_score_shigong(
             payload=RescoreRequest(
                 scoring_engine_version="v2",
                 scope="project",
+                score_scale_max=score_scale_max,
                 rebuild_anchors=False,
                 rebuild_requirements=False,
                 retrain_calibrator=False,
@@ -6405,6 +6516,11 @@ def index(
         if selected_project_id
         else {}
     )
+    score_scale_initial = (
+        _resolve_project_score_scale_max(selected_project_for_view)
+        if selected_project_for_view
+        else DEFAULT_SCORE_SCALE_MAX
+    )
     allow_pred_initial = bool(selected_project_for_view) and (
         _select_calibrator_model(selected_project_for_view) is not None
     )
@@ -6447,14 +6563,21 @@ def index(
                 filename = html_lib.escape(filename_raw)
                 report_obj = s.get("report")
                 report = report_obj if isinstance(report_obj, dict) else {}
-                pred_total = report.get("pred_total_score")
-                rule_total = report.get("rule_total_score")
+                pred_total_raw = report.get("pred_total_score")
+                rule_total_raw = report.get("rule_total_score")
                 if not allow_pred_initial:
-                    pred_total = None
-                llm_total = report.get("llm_total_score")
+                    pred_total_raw = None
+                llm_total_raw = report.get("llm_total_score")
+                pred_total = _convert_score_from_100(pred_total_raw, score_scale_initial)
+                rule_total = _convert_score_from_100(rule_total_raw, score_scale_initial)
+                llm_total = _convert_score_from_100(llm_total_raw, score_scale_initial)
                 scoring_status = str(report.get("scoring_status") or "").strip().lower()
                 is_pending = scoring_status == "pending"
-                primary_total = pred_total if pred_total is not None else s.get("total_score")
+                primary_total = (
+                    pred_total
+                    if pred_total is not None
+                    else _convert_score_from_100(s.get("total_score"), score_scale_initial)
+                )
                 if is_pending:
                     score_cell = '<span class="note">待评分</span>'
                 elif pred_total is not None:
@@ -6635,6 +6758,11 @@ def index(
             <input type="file" name="file" accept=".txt,.docx,.pdf,.json,.xlsx,.xls" multiple />
             <button type="submit" id="btnUploadShigong" name="submit_action" value="upload" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadShigong'); } return true;">上传施组</button>
             <button type="submit" id="btnScoreShigong" class="secondary" formaction="/web/score_shigong" name="submit_action" value="score" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnScoreShigong'); } return true;">评分施组</button>
+            <span style="margin-left:8px;color:#334155;font-size:13px">满分标准：</span>
+            <select id="scoreScaleSelect" name="score_scale_max" style="margin-left:4px">
+              <option value="100">100分制</option>
+              <option value="5">5分制</option>
+            </select>
             <span class="note">支持一次选择多个文件（Mac 按 Command，Windows 按 Ctrl）。</span>
           </form>
           <p id="shigongActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
@@ -6773,6 +6901,11 @@ def index(
 
       <script>
         (function () {
+          const BOOTSTRAP_SCORE_SCALE_MAX = "__PROJECT_SCORE_SCALE_MAX__";
+          const bootScoreScaleEl = document.getElementById('scoreScaleSelect');
+          if (bootScoreScaleEl) {
+            bootScoreScaleEl.value = BOOTSTRAP_SCORE_SCALE_MAX === '5' ? '5' : '100';
+          }
           const FALLBACK_ACTIONS = {
             btnWeightsSave: { resultId: 'output', method: 'PUT', path: (pid) => '/api/v1/projects/' + pid + '/expert-profile', loading: '专家配置保存中...' },
             btnWeightsApply: { resultId: 'output', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/rescore', loading: '按当前关注度重算中...' },
@@ -6963,7 +7096,8 @@ def index(
               const updated = Number(
                 (data && (data.updated_submissions ?? data.reports_generated ?? data.submission_count)) || 0
               );
-              fallbackSetResult(resultId, '评分完成：已重算 ' + updated + ' 份。', false);
+              const scaleLabel = (data && data.score_scale_label) ? String(data.score_scale_label) : selectedScoreScaleLabel();
+              fallbackSetResult(resultId, '评分完成（' + scaleLabel + '）：已重算 ' + updated + ' 份。', false);
               return true;
             }
             if (aid === 'btnUploadMaterials' || aid === 'btnUploadShigong' || aid === 'btnScoreShigong' || aid === 'btnLearning' || aid === 'btnEvolve' || aid === 'btnRefreshGroundTruth' || aid === 'btnUploadFeed' || aid === 'btnAddGroundTruth' || aid === 'btnRefreshFeedMaterials' || aid === 'btnWritingGuidance' || aid === 'btnCompilationInstructions') {
@@ -7156,6 +7290,7 @@ def index(
               const payload = {
                 scoring_engine_version: 'v2',
                 scope: 'project',
+                score_scale_max: selectedScoreScaleMax(),
                 rebuild_anchors: false,
                 rebuild_requirements: false,
                 retrain_calibrator: false,
@@ -7189,6 +7324,7 @@ def index(
               const payload = {
                 scoring_engine_version: 'v2',
                 scope: 'project',
+                score_scale_max: selectedScoreScaleMax(),
                 rebuild_anchors: false,
                 rebuild_requirements: false,
                 retrain_calibrator: false,
@@ -7492,6 +7628,21 @@ def index(
           const sel = document.getElementById('projectSelect');
           return pickProjectFromSelect(sel);
         }
+        function selectedScoreScaleMax() {
+          const el = document.getElementById('scoreScaleSelect');
+          const raw = (el && el.value) ? String(el.value).trim() : '100';
+          return raw === '5' ? 5 : 100;
+        }
+        function selectedScoreScaleLabel() {
+          return selectedScoreScaleMax() === 5 ? '5分制' : '100分制';
+        }
+        function applyProjectScoreScale(projectId) {
+          const el = document.getElementById('scoreScaleSelect');
+          if (!el) return;
+          const meta = projectMetaById[String(projectId || '')] || {};
+          const raw = String((meta && meta.score_scale_max) != null ? meta.score_scale_max : '100');
+          el.value = (raw === '5') ? '5' : '100';
+        }
         function apiHeaders(isJson=true) {
           const k = storageGet('api_key');
           const h = {};
@@ -7520,6 +7671,7 @@ def index(
         };
         const DIM_IDS = Array.from({ length: 16 }, (_, i) => String(i + 1).padStart(2, '0'));
         let expertProfileLocked = false;
+        let projectMetaById = {};
         const PROJECT_REQUIRED_BUTTON_IDS = [
           'deleteCurrentProject', 'btnWeightsReset', 'btnWeightsSave', 'btnWeightsApply',
           'btnRefreshGroundTruth', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
@@ -7539,6 +7691,7 @@ def index(
           'btnMinePatchV2', 'btnShadowPatchV2', 'btnDeployPatchV2', 'btnRollbackPatchV2',
         ];
         const PROJECT_REQUIRED_INPUT_IDS = [
+          'scoreScaleSelect',
           'feedFile', 'groundTruthFile', 'groundTruthScope', 'groundTruthOtherProject',
           'gtJ1', 'gtJ2', 'gtJ3', 'gtJ4', 'gtJ5', 'gtFinal', 'patchType', 'patchIdInput',
         ];
@@ -7670,6 +7823,10 @@ def index(
             const el = document.getElementById(id);
             if (el) el.value = '';
           });
+          if (!hasProject) {
+            const scaleSel = document.getElementById('scoreScaleSelect');
+            if (scaleSel) scaleSel.value = '100';
+          }
           document.querySelectorAll(
             '#uploadMaterial input[type="file"], #uploadShigong input[type="file"], #feedFile, #groundTruthFile'
           ).forEach((el) => { if (el) el.value = ''; });
@@ -7871,6 +8028,7 @@ def index(
               body: JSON.stringify({
                 scoring_engine_version: 'v2',
                 scope: 'project',
+                score_scale_max: selectedScoreScaleMax(),
                 rebuild_anchors: false,
                 rebuild_requirements: false,
                 retrain_calibrator: false,
@@ -7891,7 +8049,7 @@ def index(
             return;
           }
           setExpertProfileStatus(
-            '重算完成：共处理 ' + (data.submission_count || 0) + ' 份，生成 ' + (data.reports_generated || 0) + ' 份报告。'
+            '重算完成（' + ((data && data.score_scale_label) ? data.score_scale_label : selectedScoreScaleLabel()) + '）：共处理 ' + (data.submission_count || 0) + ' 份，生成 ' + (data.reports_generated || 0) + ' 份报告。'
           );
           const out = document.getElementById('output');
           if (out) out.textContent = JSON.stringify(data, null, 2);
@@ -8100,6 +8258,10 @@ def index(
           let list = [];
           try { list = JSON.parse(text); } catch (e) { list = []; }
           if (!Array.isArray(list)) list = [];
+          projectMetaById = {};
+          list.forEach((p) => {
+            if (p && p.id) projectMetaById[String(p.id)] = (p.meta && typeof p.meta === 'object') ? p.meta : {};
+          });
           list = list.slice().sort((a, b) => {
             const an = String((a && a.name) || '');
             const bn = String((b && b.name) || '');
@@ -8136,6 +8298,7 @@ def index(
           } else {
             storageRemove('selected_project_id');
           }
+          applyProjectScoreScale(sel.value || '');
           await onProjectChanged();
         }
         async function onProjectChanged() {
@@ -8144,6 +8307,7 @@ def index(
           const switchSeq = projectSwitchSeq;
           if (selectedId) storageSet('selected_project_id', selectedId);
           else storageRemove('selected_project_id');
+          applyProjectScoreScale(selectedId);
           updateProjectBoundControlsState();
           resetProjectPanelsToStandby(selectedId);
           if (!selectedId) {
@@ -8459,15 +8623,20 @@ def index(
               return;
             }
             const o = document.getElementById('output');
-            if (o) o.textContent = '施组评分中...';
-            setActionStatus('shigongActionStatus', '施组评分中...', false);
+            const scaleLabel = selectedScoreScaleLabel();
+            if (o) o.textContent = '施组评分中（' + scaleLabel + '）...';
+            setActionStatus('shigongActionStatus', '施组评分中（' + scaleLabel + '）...', false);
             let res;
             let data = {};
             try {
               res = await fetch('/api/v1/projects/' + projectId + '/rescore', {
                 method: 'POST',
                 headers: apiHeaders(true),
-                body: JSON.stringify({ scope: 'project', scoring_engine_version: 'v2' }),
+                body: JSON.stringify({
+                  scope: 'project',
+                  scoring_engine_version: 'v2',
+                  score_scale_max: selectedScoreScaleMax(),
+                }),
               });
               data = await res.json().catch(() => ({}));
             } catch (err) {
@@ -8485,8 +8654,9 @@ def index(
             const updated = Number(
               (data && (data.updated_submissions ?? data.reports_generated ?? data.submission_count)) || 0
             );
-            if (o) o.textContent = '施组评分完成：已重算 ' + updated + ' 份。';
-            setActionStatus('shigongActionStatus', '评分完成：已重算 ' + updated + ' 份。', false);
+            const doneScaleLabel = (data && data.score_scale_label) ? String(data.score_scale_label) : scaleLabel;
+            if (o) o.textContent = '施组评分完成（' + doneScaleLabel + '）：已重算 ' + updated + ' 份。';
+            setActionStatus('shigongActionStatus', '评分完成（' + doneScaleLabel + '）：已重算 ' + updated + ' 份。', false);
             await refreshSubmissions(projectId, projectSwitchSeq);
           } finally {
             scoreShigongInFlight = false;
@@ -9640,6 +9810,7 @@ def index(
     html = html.replace("__MATERIALS_EMPTY_DISPLAY__", initial_materials_empty_display)
     html = html.replace("__SUBMISSION_ROWS__", initial_submission_rows_html)
     html = html.replace("__SUBMISSIONS_EMPTY_DISPLAY__", initial_submissions_empty_display)
+    html = html.replace("__PROJECT_SCORE_SCALE_MAX__", str(score_scale_initial))
     return Response(
         content=html.encode("utf-8"),
         media_type="text/html; charset=utf-8",

@@ -43,6 +43,8 @@ class TestIndexEndpoint:
         assert "createProject" in response.text
         assert "uploadMaterial" in response.text
         assert "uploadShigong" in response.text
+        assert 'id="scoreScaleSelect"' in response.text
+        assert 'name="score_scale_max"' in response.text
 
     def test_index_replaces_server_side_placeholders(self, client):
         """Index page should not leak template placeholders."""
@@ -54,6 +56,7 @@ class TestIndexEndpoint:
         assert "__EXPERT_WEIGHTS_SUMMARY__" not in response.text
         assert "__GLOBAL_NOTICE_HTML__" not in response.text
         assert "__SELECTED_PROJECT_ID__" not in response.text
+        assert "__PROJECT_SCORE_SCALE_MAX__" not in response.text
 
     def test_index_renders_16_dimension_weight_sliders(self, client):
         """Index page should render 16-dimension focus sliders on first paint."""
@@ -739,13 +742,15 @@ class TestExpertProfileEndpoints:
 
         response = client.post(
             "/api/v1/projects/p1/rescore",
-            json={"scoring_engine_version": "v2", "scope": "project"},
+            json={"scoring_engine_version": "v2", "scope": "project", "score_scale_max": 5},
         )
         assert response.status_code == 200
         data = response.json()
         assert data["ok"] is True
         assert data["submission_count"] == 1
         assert data["reports_generated"] == 1
+        assert data["score_scale_max"] == 5
+        assert data["score_scale_label"] == "5分制"
         mock_save_submissions.assert_called_once()
         mock_save_score_reports.assert_called_once()
         mock_record_history.assert_called_once()
@@ -1215,6 +1220,43 @@ class TestSubmissionsEndpoint:
         data = response.json()
         assert len(data) == 1
         assert data[0]["id"] == "s1"
+
+    @patch("app.main.load_projects")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_submissions_applies_project_score_scale(
+        self, mock_ensure, mock_load_submissions, mock_load_projects, client
+    ):
+        """List submissions should render scaled score values based on project meta score_scale_max."""
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 5}}]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "f1.txt",
+                "total_score": 80.0,
+                "report": {
+                    "scoring_status": "scored",
+                    "total_score": 80.0,
+                    "rule_total_score": 70.0,
+                    "pred_total_score": 80.0,
+                    "llm_total_score": 78.0,
+                },
+                "text": "t1",
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+        response = client.get("/api/v1/projects/p1/submissions")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["total_score"] == 3.5
+        assert data[0]["report"]["pred_total_score"] is None
+        assert data[0]["report"]["rule_total_score"] == 3.5
+        assert data[0]["report"]["llm_total_score"] is None
+        assert data[0]["report"]["score_scale_max"] == 5
+        assert data[0]["report"]["score_scale_label"] == "5分制"
+        assert data[0]["report"]["raw_total_score_100"] == 70.0
 
 
 class TestCompareEndpoints:
