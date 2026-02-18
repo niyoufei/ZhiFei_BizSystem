@@ -1111,6 +1111,36 @@ def _apply_prediction_to_report(
     return str(model.get("calibrator_version") or "")
 
 
+def _to_float_or_none(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_submission_score_fields(submission: Dict[str, object]) -> Dict[str, object]:
+    report = submission.get("report")
+    pred_total = None
+    rule_total = None
+    if isinstance(report, dict):
+        pred_total = _to_float_or_none(report.get("pred_total_score"))
+        rule_total = _to_float_or_none(report.get("rule_total_score"))
+        if rule_total is None:
+            rule_total = _to_float_or_none(report.get("total_score"))
+    fallback_total = _to_float_or_none(submission.get("total_score"))
+    if rule_total is None:
+        rule_total = fallback_total
+    primary_total = pred_total if pred_total is not None else rule_total
+    if primary_total is None:
+        primary_total = fallback_total if fallback_total is not None else 0.0
+    return {
+        "total_score": round(float(primary_total), 2),
+        "pred_total_score": round(float(pred_total), 2) if pred_total is not None else None,
+        "rule_total_score": round(float(rule_total), 2) if rule_total is not None else None,
+        "score_source": "pred" if pred_total is not None else "rule",
+    }
+
+
 def _score_submission_for_project(
     *,
     submission_id: str,
@@ -4446,30 +4476,34 @@ def compare_submissions(
     submissions = [s for s in load_submissions() if s["project_id"] == project_id]
     if not submissions:
         raise HTTPException(status_code=404, detail=t("api.no_submissions", locale=locale))
-    rankings = sorted(
-        [
+    rankings = []
+    for s in submissions:
+        score_fields = _resolve_submission_score_fields(s)
+        rankings.append(
             {
                 "submission_id": s["id"],
                 "filename": s["filename"],
-                "total_score": s["total_score"],
+                "total_score": score_fields["total_score"],
+                "pred_total_score": score_fields["pred_total_score"],
+                "rule_total_score": score_fields["rule_total_score"],
+                "score_source": score_fields["score_source"],
                 "created_at": s["created_at"],
             }
-            for s in submissions
-        ],
-        key=lambda x: x["total_score"],
-        reverse=True,
-    )
+        )
+    rankings = sorted(rankings, key=lambda x: float(x["total_score"]), reverse=True)
     dimension_totals: dict[str, float] = {}
     dimension_counts: dict[str, int] = {}
     penalty_stats: dict[str, int] = {}
     for s in submissions:
-        report = s["report"]
-        for dim_id, dim in report.get("dimension_scores", {}).items():
+        report = s.get("report") if isinstance(s.get("report"), dict) else {}
+        for dim_id, dim in (report.get("dimension_scores") or {}).items():
             dimension_totals[dim_id] = dimension_totals.get(dim_id, 0.0) + float(
                 dim.get("score", 0.0)
             )
             dimension_counts[dim_id] = dimension_counts.get(dim_id, 0) + 1
-        for p in report.get("penalties", []):
+        for p in report.get("penalties") or []:
+            if not isinstance(p, dict):
+                continue
             code = p.get("code", "UNKNOWN")
             penalty_stats[code] = penalty_stats.get(code, 0) + 1
 
@@ -4506,7 +4540,34 @@ def compare_report(
     submissions = [s for s in load_submissions() if s["project_id"] == project_id]
     if not submissions:
         raise HTTPException(status_code=404, detail=t("api.no_submissions", locale=locale))
-    narrative = build_compare_narrative(submissions)
+    submissions_for_compare = []
+    by_id: Dict[str, Dict[str, object]] = {}
+    for s in submissions:
+        score_fields = _resolve_submission_score_fields(s)
+        item = dict(s)
+        item["total_score"] = float(score_fields["total_score"])
+        report = item.get("report")
+        report = dict(report) if isinstance(report, dict) else {}
+        report["pred_total_score"] = score_fields["pred_total_score"]
+        report["rule_total_score"] = score_fields["rule_total_score"]
+        item["report"] = report
+        item["score_source"] = score_fields["score_source"]
+        submissions_for_compare.append(item)
+        by_id[str(item.get("id") or "")] = item
+
+    narrative = build_compare_narrative(submissions_for_compare)
+    for key in ("top_submission", "bottom_submission"):
+        row = narrative.get(key)
+        if not isinstance(row, dict):
+            continue
+        sid = str(row.get("id") or "")
+        source_submission = by_id.get(sid)
+        if not source_submission:
+            continue
+        score_fields = _resolve_submission_score_fields(source_submission)
+        row["pred_total_score"] = score_fields["pred_total_score"]
+        row["rule_total_score"] = score_fields["rule_total_score"]
+        row["score_source"] = score_fields["score_source"]
     return CompareNarrative(project_id=project_id, **narrative)
 
 
@@ -8466,8 +8527,9 @@ def index(
           const el = document.getElementById('compareResult');
           el.style.display = 'block';
           if (res.ok && data.rankings) {
-            el.innerHTML = '<strong>排名</strong><table><tr><th>文件名</th><th>总分</th><th>时间</th></tr>' +
-              data.rankings.map(r => '<tr><td>' + r.filename + '</td><td>' + r.total_score + '</td><td>' + r.created_at + '</td></tr>').join('') + '</table>';
+            const scoreSource = (s) => (s === 'pred' ? '预测' : '规则');
+            el.innerHTML = '<strong>排名</strong><table><tr><th>文件名</th><th>总分(优先预测)</th><th>规则分(追溯)</th><th>来源</th><th>时间</th></tr>' +
+              data.rankings.map(r => '<tr><td>' + r.filename + '</td><td>' + r.total_score + '</td><td>' + (r.rule_total_score ?? '-') + '</td><td>' + scoreSource(r.score_source) + '</td><td>' + r.created_at + '</td></tr>').join('') + '</table>';
           } else {
             el.innerHTML = '<span class="error">' + (data.detail || '请求失败') + '</span>';
           }
@@ -8491,11 +8553,17 @@ def index(
               .replace(/\"/g, '&quot;')
               .replace(/'/g, '&#39;');
             const escMultiline = (v) => esc(v).replace(/\\n/g, '<br/>');
+            const scoreText = (row) => {
+              if (!row) return '-';
+              const source = row.score_source === 'pred' ? '预测' : '规则';
+              const rule = row.rule_total_score == null ? '-' : row.rule_total_score;
+              return esc(row.total_score) + ' 分（规则 ' + esc(rule) + '，来源 ' + source + '）';
+            };
             let html = '<p><strong>摘要</strong>: ' + (data.summary || '') + '</p>';
             if (data.top_submission && data.top_submission.filename)
-              html += '<p>最高: ' + data.top_submission.filename + ' — ' + data.top_submission.total_score + ' 分</p>';
+              html += '<p>最高: ' + data.top_submission.filename + ' — ' + scoreText(data.top_submission) + '</p>';
             if (data.bottom_submission && data.bottom_submission.filename)
-              html += '<p>最低: ' + data.bottom_submission.filename + ' — ' + data.bottom_submission.total_score + ' 分</p>';
+              html += '<p>最低: ' + data.bottom_submission.filename + ' — ' + scoreText(data.bottom_submission) + '</p>';
             if (data.submission_scorecards && data.submission_scorecards.length) {
               html += '<strong>逐份施组得分项/失分项（按文件）</strong>' +
                 data.submission_scorecards.map((card, idx) => {

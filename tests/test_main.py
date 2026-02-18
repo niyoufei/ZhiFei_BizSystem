@@ -1206,6 +1206,46 @@ class TestCompareEndpoints:
         # First should have higher score
         assert data["rankings"][0]["total_score"] == 80.0
 
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_compare_prefers_pred_total_score(self, mock_ensure, mock_load, client):
+        """Compare ranking should prioritize pred_total_score and keep rule_total_score trace."""
+        mock_load.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "f1.txt",
+                "total_score": 95.0,
+                "report": {
+                    "rule_total_score": 70.0,
+                    "pred_total_score": 65.0,
+                    "dimension_scores": {},
+                    "penalties": [],
+                },
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            {
+                "id": "s2",
+                "project_id": "p1",
+                "filename": "f2.txt",
+                "total_score": 80.0,
+                "report": {
+                    "rule_total_score": 75.0,
+                    "pred_total_score": 90.0,
+                    "dimension_scores": {},
+                    "penalties": [],
+                },
+                "created_at": "2026-01-02T00:00:00Z",
+            },
+        ]
+        response = client.get("/api/v1/projects/p1/compare")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["rankings"][0]["submission_id"] == "s2"
+        assert data["rankings"][0]["total_score"] == 90.0
+        assert data["rankings"][0]["rule_total_score"] == 75.0
+        assert data["rankings"][0]["score_source"] == "pred"
+
     @patch("app.main.build_compare_narrative")
     @patch("app.main.load_submissions")
     @patch("app.main.ensure_data_dirs")
@@ -1222,6 +1262,49 @@ class TestCompareEndpoints:
         assert response.status_code == 200
         data = response.json()
         assert data["project_id"] == "p1"
+
+    @patch("app.main.build_compare_narrative")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_compare_report_enriches_pred_and_rule(
+        self, mock_ensure, mock_load, mock_narrative, client
+    ):
+        """Compare narrative should be built with pred-priority total and expose trace scores."""
+        mock_load.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "f1.txt",
+                "total_score": 91.0,
+                "report": {"rule_total_score": 70.0, "pred_total_score": 65.0},
+            },
+            {
+                "id": "s2",
+                "project_id": "p1",
+                "filename": "f2.txt",
+                "total_score": 82.0,
+                "report": {"rule_total_score": 80.0, "pred_total_score": 90.0},
+            },
+        ]
+
+        def _fake_narrative(rows):
+            row_map = {str(x.get("id")): x for x in rows}
+            assert float(row_map["s1"]["total_score"]) == 65.0
+            assert float(row_map["s2"]["total_score"]) == 90.0
+            return {
+                "summary": "ok",
+                "top_submission": {"id": "s2", "filename": "f2.txt", "total_score": 90.0},
+                "bottom_submission": {"id": "s1", "filename": "f1.txt", "total_score": 65.0},
+                "key_diffs": [],
+            }
+
+        mock_narrative.side_effect = _fake_narrative
+        response = client.get("/api/v1/projects/p1/compare_report")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["top_submission"]["pred_total_score"] == 90.0
+        assert data["top_submission"]["rule_total_score"] == 80.0
+        assert data["top_submission"]["score_source"] == "pred"
 
     @patch("app.main.load_submissions")
     @patch("app.main.ensure_data_dirs")
