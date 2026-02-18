@@ -260,7 +260,7 @@ DIMENSION_IDS = sorted(DIMENSIONS.keys())
 DEFAULT_REGION = "合肥"
 DEFAULT_QINGTIAN_MODEL_VERSION = "qingtian-2026.02"
 DEFAULT_SCORING_ENGINE_LOCKED = "v2.0.0"
-DEFAULT_CALIBRATOR_LOCKED = "calib_ridge_v1"
+DEFAULT_CALIBRATOR_LOCKED = None
 DEFAULT_NORM_RULE_VERSION = "v1_m=0.5+a/10_norm=sum"
 PROFILE_LOCKED_STATUSES = {"submitted_to_qingtian"}
 DEFAULT_CHAPTER_REQUIREMENTS = {
@@ -345,7 +345,8 @@ def _ensure_project_v2_fields(
     if include_engine_defaults and not project.get("scoring_engine_version_locked"):
         project["scoring_engine_version_locked"] = DEFAULT_SCORING_ENGINE_LOCKED
         changed = True
-    if include_engine_defaults and not project.get("calibrator_version_locked"):
+    # 校准器锁定版本默认留空，避免误套历史/跨项目模型。
+    if include_engine_defaults and "calibrator_version_locked" not in project:
         project["calibrator_version_locked"] = DEFAULT_CALIBRATOR_LOCKED
         changed = True
     if not project.get("status"):
@@ -972,16 +973,29 @@ def _build_v2_report_payload(
 
 
 def _select_calibrator_model(project: Dict[str, object]) -> Optional[Dict[str, object]]:
-    models = load_calibration_models()
+    models = sorted(
+        load_calibration_models(), key=lambda x: str(x.get("created_at", "")), reverse=True
+    )
     if not models:
         return None
+    project_id = str(project.get("id") or "")
     locked_version = str(project.get("calibrator_version_locked") or "")
+
+    def _scope_project_id(model: Dict[str, object]) -> str:
+        return str(((model.get("train_filter") or {}).get("project_id") or "")).strip()
+
+    def _compatible(model: Dict[str, object]) -> bool:
+        # 仅允许同项目训练出的校准器生效，避免跨项目污染总分。
+        return _scope_project_id(model) == project_id
+
     if locked_version:
-        for model in sorted(models, key=lambda x: str(x.get("created_at", "")), reverse=True):
+        for model in models:
             if str(model.get("calibrator_version") or "") == locked_version:
-                return model
-    for model in sorted(models, key=lambda x: str(x.get("created_at", "")), reverse=True):
-        if bool(model.get("deployed")):
+                return model if _compatible(model) else None
+        return None
+
+    for model in models:
+        if bool(model.get("deployed")) and _compatible(model):
             return model
     return None
 
@@ -3703,17 +3717,21 @@ def train_calibrator(
     }
 
     models = load_calibration_models()
-    if payload.auto_deploy and bool(gate_passed):
+    train_scope_project_id = str(payload.project_id or "").strip()
+    if payload.auto_deploy and bool(gate_passed) and train_scope_project_id:
         for m in models:
-            m["deployed"] = False
+            if (
+                str(((m.get("train_filter") or {}).get("project_id") or ""))
+                == train_scope_project_id
+            ):
+                m["deployed"] = False
         record["deployed"] = True
-        if payload.project_id:
-            projects = load_projects()
-            for p in projects:
-                if str(p.get("id")) == payload.project_id:
-                    p["calibrator_version_locked"] = version
-                    p["updated_at"] = _now_iso()
-            save_projects(projects)
+        projects = load_projects()
+        for p in projects:
+            if str(p.get("id")) == train_scope_project_id:
+                p["calibrator_version_locked"] = version
+                p["updated_at"] = _now_iso()
+        save_projects(projects)
     models.append(record)
     save_calibration_models(models)
     return CalibratorModelRecord(**record)
@@ -3754,8 +3772,20 @@ def deploy_calibrator(
     if target is None:
         raise HTTPException(status_code=404, detail="校准器版本不存在")
 
+    target_scope = str(((target.get("train_filter") or {}).get("project_id") or "")).strip()
+    bind_project_id = str(payload.project_id or "").strip()
+    if bind_project_id:
+        if target_scope and target_scope != bind_project_id:
+            raise HTTPException(status_code=422, detail="校准器与目标项目不匹配，禁止跨项目部署")
+        if not target_scope:
+            target.setdefault("train_filter", {})
+            target["train_filter"]["project_id"] = bind_project_id
+            target_scope = bind_project_id
+
     for model in models:
-        model["deployed"] = False
+        model_scope = str(((model.get("train_filter") or {}).get("project_id") or "")).strip()
+        if target_scope and model_scope == target_scope:
+            model["deployed"] = False
     target["deployed"] = True
     save_calibration_models(models)
 
@@ -4247,7 +4277,8 @@ def auto_run_reflection_pipeline(
         models = load_calibration_models()
         if record["deployed"]:
             for m in models:
-                m["deployed"] = False
+                if str(((m.get("train_filter") or {}).get("project_id") or "")) == project_id:
+                    m["deployed"] = False
             project["calibrator_version_locked"] = calibrator_version
             project["updated_at"] = _now_iso()
             save_projects(projects)

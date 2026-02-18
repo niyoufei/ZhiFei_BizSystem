@@ -267,6 +267,7 @@ class TestCalibratorEndpoints:
                 "calibrator_version": "calib1",
                 "deployed": True,
                 "created_at": "2026-02-06T12:00:00Z",
+                "train_filter": {"project_id": "p1"},
                 "model_artifact": {
                     "feature_keys": ["rule_total_score"],
                     "means": [80.0],
