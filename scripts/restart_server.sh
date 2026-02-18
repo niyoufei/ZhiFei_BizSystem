@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+
+PORT="${PORT:-8000}"
+STRICT="${STRICT:-0}"
+PID_FILE="build/server.pid"
+LOG_FILE="build/server.log"
+LOCK_DIR="build/.restart.lock"
+SCREEN_SESSION="zhifei_server_${PORT}"
+
+if [[ -x ".venv/bin/python" ]]; then
+  PYTHON_BIN=".venv/bin/python"
+else
+  PYTHON_BIN="python3"
+fi
+
+mkdir -p build
+
+preflight_python_runtime() {
+  local tmp_log
+  tmp_log="$(mktemp "${TMPDIR:-/tmp}/zhifei_pycheck.XXXXXX")"
+  if "$PYTHON_BIN" - <<'PY' > /dev/null 2>"$tmp_log"; then
+import fastapi  # noqa: F401
+import pydantic  # noqa: F401
+import pydantic_core  # noqa: F401
+PY
+    rm -f "$tmp_log"
+    return 0
+  fi
+
+  if grep -qi "incompatible architecture" "$tmp_log"; then
+    local shell_arch py_arch
+    shell_arch="$(arch 2>/dev/null || uname -m)"
+    py_arch="$("$PYTHON_BIN" -c 'import platform; print(platform.machine())' 2>/dev/null || echo unknown)"
+    echo "Python 依赖架构不匹配，无法启动服务。"
+    echo "当前终端架构: $shell_arch"
+    echo "当前虚拟环境 Python 架构: $py_arch"
+    echo "请在当前终端执行以下命令修复虚拟环境："
+    echo "  rm -rf .venv"
+    echo "  python3 -m venv .venv"
+    echo "  .venv/bin/python -m pip install -r requirements.txt"
+    echo "如你在 Rosetta 终端中运行，请先切换到原生终端再重建 .venv。"
+  else
+    echo "Python 运行时预检查失败（前80行）："
+    sed -n '1,80p' "$tmp_log" || true
+  fi
+  rm -f "$tmp_log"
+  return 1
+}
+
+acquire_lock() {
+  local attempts=120
+  local i
+  for i in $(seq 1 "$attempts"); do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      trap 'rmdir "$LOCK_DIR" >/dev/null 2>&1 || true' EXIT
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "Failed to acquire restart lock: $LOCK_DIR"
+  return 1
+}
+
+stop_by_pid_file() {
+  if [[ -f "$PID_FILE" ]]; then
+    local old_pid
+    old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [[ -n "${old_pid}" ]] && kill -0 "$old_pid" 2>/dev/null; then
+      echo "Stopping existing server by pid: $old_pid"
+      kill "$old_pid" 2>/dev/null || true
+      sleep 1
+      if kill -0 "$old_pid" 2>/dev/null; then
+        kill -9 "$old_pid" 2>/dev/null || true
+      fi
+    fi
+    rm -f "$PID_FILE"
+  fi
+}
+
+stop_by_port() {
+  local pids
+  pids="$(lsof -nP -iTCP:${PORT} -sTCP:LISTEN -t 2>/dev/null || true)"
+  if [[ -n "$pids" ]]; then
+    echo "Stopping process(es) on :$PORT -> $pids"
+    for p in $pids; do
+      kill "$p" 2>/dev/null || true
+    done
+    sleep 1
+    pids="$(lsof -nP -iTCP:${PORT} -sTCP:LISTEN -t 2>/dev/null || true)"
+    if [[ -n "$pids" ]]; then
+      for p in $pids; do
+        kill -9 "$p" 2>/dev/null || true
+      done
+    fi
+  fi
+}
+
+start_server_process() {
+  if command -v screen >/dev/null 2>&1; then
+    # Prefer detached screen session for stronger keepalive in restricted shells.
+    screen -S "$SCREEN_SESSION" -X quit >/dev/null 2>&1 || true
+    screen -wipe >/dev/null 2>&1 || true
+    if screen -dmS "$SCREEN_SESSION" env ROOT_DIR="$ROOT_DIR" PORT="$PORT" PYTHON_BIN="$PYTHON_BIN" LOG_FILE="$ROOT_DIR/$LOG_FILE" /bin/zsh -lc 'cd "$ROOT_DIR" && PORT="$PORT" "$PYTHON_BIN" -m app.main --no-browser >>"$LOG_FILE" 2>&1'; then
+      START_MODE="screen"
+      return 0
+    fi
+  fi
+
+  nohup "$PYTHON_BIN" -m app.main --no-browser >"$LOG_FILE" 2>&1 &
+  START_MODE="nohup"
+  return 0
+}
+
+wait_until_ready() {
+  local attempts=30
+  for _ in $(seq 1 "$attempts"); do
+    if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+check_endpoint_coverage() {
+  local openapi
+  if ! openapi="$(curl -fsS "http://127.0.0.1:${PORT}/openapi.json" 2>/dev/null)"; then
+    echo "Warning: unable to fetch openapi.json, skip endpoint coverage check."
+    return 0
+  fi
+  local required_paths=(
+    "/api/v1/projects/{project_id}/ground_truth/from_files"
+    "/api/v1/projects/{project_id}/expert-profile"
+    "/api/v1/projects/{project_id}/rescore"
+    "/api/v1/scoring/factors"
+    "/api/v1/system/self_check"
+  )
+  local missing=()
+  local p
+  for p in "${required_paths[@]}"; do
+    if ! printf '%s' "$openapi" | grep -Fq "\"$p\""; then
+      missing+=("$p")
+    fi
+  done
+  if [[ "${#missing[@]}" -gt 0 ]]; then
+    echo "Warning: running server is missing key V2 endpoints:"
+    for p in "${missing[@]}"; do
+      echo "  - $p"
+    done
+    if [[ "$STRICT" == "1" ]]; then
+      echo "Strict mode enabled, treat missing endpoints as failure."
+      return 1
+    fi
+  else
+    echo "Endpoint coverage: OK"
+  fi
+  return 0
+}
+
+echo "Restarting server on http://127.0.0.1:${PORT}"
+acquire_lock
+stop_by_pid_file
+stop_by_port
+preflight_python_runtime
+
+START_MODE="unknown"
+start_server_process
+
+if wait_until_ready; then
+  new_pid="$(lsof -nP -iTCP:${PORT} -sTCP:LISTEN -t 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$new_pid" ]]; then
+    echo "$new_pid" >"$PID_FILE"
+  else
+    rm -f "$PID_FILE"
+  fi
+  echo "Server started successfully. pid=$new_pid"
+  echo "Start mode: $START_MODE"
+  echo "URL: http://127.0.0.1:${PORT}/"
+  echo "Log: $ROOT_DIR/$LOG_FILE"
+  check_endpoint_coverage
+  exit 0
+fi
+
+echo "Server failed to become ready. Recent logs:"
+tail -n 80 "$LOG_FILE" || true
+exit 1

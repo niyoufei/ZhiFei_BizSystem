@@ -1,0 +1,13 @@
+apiVersion: 1
+
+providers:
+  - name: "擎天施组评分系统仪表盘"
+    orgId: 1
+    folder: "Qingtian"
+    folderUid: "qingtian"
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

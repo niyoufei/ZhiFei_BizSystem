@@ -1,0 +1,37 @@
+# Prometheus 配置 - 擎天施组评分系统
+# 文档: https://prometheus.io/docs/prometheus/latest/configuration/configuration/
+
+global:
+  scrape_interval: 15s        # 默认抓取间隔
+  evaluation_interval: 15s    # 规则评估间隔
+  scrape_timeout: 10s         # 抓取超时
+
+# Alertmanager 配置
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+# 告警规则文件
+rule_files:
+  - "alerts/*.yml"
+
+# 抓取目标配置
+scrape_configs:
+  # Prometheus 自身监控
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # 擎天施组评分系统
+  - job_name: "qingtian"
+    static_configs:
+      - targets: ["host.docker.internal:8000"]  # macOS/Windows Docker
+        labels:
+          app: "qingtian"
+          env: "development"
+    # 如果在 Linux Docker 中运行，使用以下配置：
+    # - targets: ["172.17.0.1:8000"]
+    metrics_path: "/metrics"
+    scheme: http

@@ -1,0 +1,249 @@
+adaptive_hints:
+- 若高优维度长期偏低，可提高其权重或下调阈值。
+dimensions:
+  '01':
+    max_score: 10
+    per_hit: 2.5
+    suggested_gain: 1.5
+    suggestion: 补充工程概况、施工范围与目标指标，明确项目理解。
+    suggestion_threshold: 6
+    weight: 5
+  '02':
+    max_score: 10
+    per_hit: 2.5
+    suggested_gain: 1.5
+    suggestion: 增加安全管理组织架构与安全检查频次。
+    suggestion_threshold: 6
+    weight: 5
+  '03':
+    max_score: 10
+    per_hit: 2.5
+    suggested_gain: 1.2
+    suggestion: 完善文明施工措施与现场围挡、扬尘控制。
+    suggestion_threshold: 6
+    weight: 5
+  '04':
+    max_score: 10
+    per_hit: 2.5
+    suggested_gain: 1.2
+    suggestion: 补充材料验收、样板与进场检验流程。
+    suggestion_threshold: 6
+    weight: 5
+  '05':
+    max_score: 10
+    per_hit: 2.5
+    suggested_gain: 1.0
+    suggestion: 描述新工艺/新技术的应用场景和优势。
+    suggestion_threshold: 6
+    weight: 5
+  '06':
+    max_score: 10
+    per_hit: 2.5
+    suggested_gain: 1.5
+    suggestion: 明确关键工序的控制点和验收标准。
+    suggestion_threshold: 6
+    weight: 5
+  '07':
+    max_score: 10
+    per_hit: 2.5
+    sub_items:
+    - id: 07-1
+      keywords:
+      - 危大工程
+      - 重难点
+      - 重点难点
+      - 专项方案
+      - 论证
+      name: 危大工程/重点难点识别完整
+      weight: 2
+    - id: 07-2
+      keywords:
+      - 风险
+      - 隐患
+      - 难点
+      - 易导致
+      - 影响
+      - 不利因素
+      - 可能
+      name: 风险点分析到位
+      regex:
+      - 易\s*导致
+      - 可能\s*发生
+      - 存在\s*(?:较大|一定|突出)?\s*(?:风险|隐患|难点|问题)
+      weight: 2
+    - id: 07-3
+      keywords:
+      - 控制在
+      - 不大于
+      - 不小于
+      - 频次
+      - 责任人
+      - 验收
+      - 旁站
+      name: 措施参数化落地
+      regex:
+      - (?:控制在|不大于|不小于|≤|≥|<|>)\s*\d+(?:\.\d+)?
+      - (?:每日|每周|每月|每班|每次|每\d+天|每\d+小时|\d+次/天|\d+次/周)
+      - (?:项目经理|技术负责人|施工员|质检员|安全员|资料员|材料员|班组长)\S{0,10}(?:负责|牵头|组织|落实)
+      - (?:报验|签认|验收|旁站|自检|互检|交接检|隐蔽验收)
+      weight: 2
+    - id: 07-4
+      keywords:
+      - 监测
+      - 旁站
+      - 报验
+      - 签认
+      - 隐蔽验收
+      - 销项
+      name: 监测与验收闭环
+      weight: 2
+    - id: 07-5
+      keywords:
+      - 应急预案
+      - 处置
+      - 停工
+      - 复工条件
+      - 整改
+      name: 应急与纠偏
+      weight: 2
+    suggested_gain: 1.5
+    suggestion: 识别重难点与危大工程并提出专项控制。
+    suggestion_threshold: 6
+    weight: 5
+  08:
+    max_score: 10
+    per_hit: 2.5
+    suggested_gain: 1.5
+    suggestion: 完善质量保障体系与质量责任制。
+    suggestion_threshold: 6
+    weight: 5
+  09:
+    max_score: 10
+    per_hit: 2.5
+    sub_items:
+    - id: 09-1
+      keywords:
+      - 总控计划
+      - 月计划
+      - 周计划
+      - 日计划
+      name: 计划体系
+      weight: 2
+    - id: 09-2
+      keywords:
+      - 节点
+      - 关键线路
+      - 里程碑
+      - 倒排
+      - 穿插
+      name: 节点与关键线路
+      weight: 2
+    - id: 09-3
+      keywords:
+      - 劳动力
+      - 机械
+      - 材料保障
+      - 冗余
+      - 调配
+      name: 资源与人机保障
+      weight: 2
+    - id: 09-4
+      keywords:
+      - 纠偏
+      - 赶工
+      - 调整
+      - 追赶
+      - 索赔工期
+      - 顺延条件
+      name: 纠偏机制
+      weight: 2
+    - id: 09-5
+      keywords:
+      - 每日
+      - 每周
+      - 例会
+      - 调度会
+      - '17:00'
+      - 日报
+      - 周报
+      name: 例会与跟踪频次
+      weight: 2
+    suggested_gain: 1.5
+    suggestion: 补充进度计划、关键里程碑与纠偏措施。
+    suggestion_threshold: 6
+    weight: 5
+  '10':
+    max_score: 10
+    per_hit: 2.5
+    suggested_gain: 1.2
+    suggestion: 增加专项施工工艺流程与参数。
+    suggestion_threshold: 6
+    weight: 5
+  '11':
+    max_score: 10
+    per_hit: 2.5
+    suggested_gain: 1.2
+    suggestion: 明确岗位配置、班组规模与技能要求。
+    suggestion_threshold: 6
+    weight: 5
+  '12':
+    max_score: 10
+    per_hit: 2.5
+    suggested_gain: 1.2
+    suggestion: 补充总体施工工艺流程与工序衔接。
+    suggestion_threshold: 6
+    weight: 5
+  '13':
+    max_score: 10
+    per_hit: 2.5
+    suggested_gain: 1.2
+    suggestion: 补充设备清单、使用频次与保障措施。
+    suggestion_threshold: 6
+    weight: 5
+  '14':
+    max_score: 10
+    per_hit: 2.5
+    suggested_gain: 1.2
+    suggestion: 增加设计协调、图纸会审与深化流程。
+    suggestion_threshold: 6
+    weight: 5
+  '15':
+    max_score: 10
+    per_hit: 2.5
+    suggested_gain: 1.0
+    suggestion: 补充总体配置计划与资源平衡安排。
+    suggestion_threshold: 6
+    weight: 5
+  '16':
+    max_score: 10
+    per_hit: 2.5
+    suggested_gain: 1.2
+    suggestion: 说明技术措施可行性与验证依据。
+    suggestion_threshold: 6
+    weight: 5
+llm_merge_policy:
+  base_rules_weight: 0.6
+  llm_weight: 0.4
+  max_adjustment: 10.0
+llm_weight_profile:
+  high_priority_dims:
+  - '07'
+  - 09
+  - '02'
+  - '03'
+  high_priority_multiplier: 1.4
+  normal_multiplier: 1.0
+logic_lock:
+  break_penalty: 5
+  max_bonus: 20
+  max_step_score: 5
+penalties:
+  action_missing:
+    deduct_per: 0.5
+    max_deduct: 5.0
+    window: 60
+  empty_promises:
+    deduct: 0.5
+    max_deduct: 3.0
+    window: 40
+version: v1

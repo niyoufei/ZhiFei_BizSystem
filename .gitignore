@@ -94,5 +94,6 @@ data/*.json
 # Generated report outputs (keep code, ignore generated artifacts)
 report_*.json
 sample_report*.json
+qingtian_report_word.txt
 *.bak
 *.bak_*

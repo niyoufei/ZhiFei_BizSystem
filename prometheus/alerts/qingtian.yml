@@ -1,0 +1,176 @@
+# 擎天施组评分系统 - Prometheus 告警规则
+# 文档: https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/
+
+groups:
+  # 服务可用性告警
+  - name: qingtian_availability
+    rules:
+      - alert: QingtianServiceDown
+        expr: up{job="qingtian"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "擎天评分服务不可用"
+          description: "擎天评分服务已离线超过 1 分钟。"
+
+      - alert: QingtianHighErrorRate
+        expr: |
+          (
+            sum(rate(qingtian_http_requests_total{status=~"5.."}[5m]))
+            /
+            sum(rate(qingtian_http_requests_total[5m]))
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "擎天服务错误率过高"
+          description: "5xx 错误率超过 5%，当前值: {{ $value | printf \"%.2f\" }}%"
+
+      - alert: QingtianServiceUnhealthy
+        expr: qingtian_health_status == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "擎天服务健康检查失败"
+          description: "健康检查端点返回不健康状态超过 2 分钟。"
+
+  # 性能告警
+  - name: qingtian_performance
+    rules:
+      - alert: QingtianHighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(qingtian_http_request_duration_seconds_bucket[5m])) by (le, endpoint)
+          ) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "擎天服务延迟过高"
+          description: "端点 {{ $labels.endpoint }} 的 P95 延迟超过 5 秒，当前值: {{ $value | printf \"%.2f\" }}s"
+
+      - alert: QingtianScoringTimeout
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(qingtian_scoring_duration_seconds_bucket[5m])) by (le)
+          ) > 30
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "评分处理超时"
+          description: "P99 评分处理时间超过 30 秒，当前值: {{ $value | printf \"%.2f\" }}s"
+
+      - alert: QingtianHighRequestRate
+        expr: sum(rate(qingtian_http_requests_total[1m])) > 100
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "请求量异常增加"
+          description: "每秒请求数超过 100，当前值: {{ $value | printf \"%.2f\" }} req/s"
+
+  # 缓存告警
+  - name: qingtian_cache
+    rules:
+      - alert: QingtianLowCacheHitRate
+        expr: |
+          (
+            sum(rate(qingtian_cache_hits_total[10m]))
+            /
+            (sum(rate(qingtian_cache_hits_total[10m])) + sum(rate(qingtian_cache_misses_total[10m])))
+          ) < 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "缓存命中率过低"
+          description: "缓存命中率低于 50%，当前值: {{ $value | printf \"%.2f\" }}%。考虑调整缓存策略。"
+
+      - alert: QingtianHighCacheEvictions
+        expr: rate(qingtian_cache_evictions_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "缓存淘汰频繁"
+          description: "缓存淘汰速率超过 10/s，当前值: {{ $value | printf \"%.2f\" }}/s。考虑增加缓存大小。"
+
+      - alert: QingtianCacheSizeHigh
+        expr: qingtian_cache_size > 900
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "缓存接近容量上限"
+          description: "缓存条目数量: {{ $value }}，接近默认上限 1000。"
+
+  # 业务指标告警
+  - name: qingtian_business
+    rules:
+      - alert: QingtianLowAverageScore
+        expr: |
+          avg(qingtian_scoring_score_value) < 60
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "平均评分偏低"
+          description: "30 分钟内平均评分低于 60 分，当前值: {{ $value | printf \"%.1f\" }}。可能需要检查输入数据质量。"
+
+      - alert: QingtianNoScoringActivity
+        expr: |
+          sum(increase(qingtian_scoring_requests_total[1h])) == 0
+        for: 2h
+        labels:
+          severity: info
+        annotations:
+          summary: "长时间无评分活动"
+          description: "过去 2 小时内没有评分请求，系统可能处于闲置状态。"
+
+      - alert: QingtianProjectCountHigh
+        expr: qingtian_projects_total > 100
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "项目数量较多"
+          description: "当前项目数量: {{ $value }}。考虑定期清理旧项目数据。"
+
+  # 速率限制告警
+  - name: qingtian_rate_limit
+    rules:
+      - alert: QingtianRateLimitTriggered
+        expr: sum(rate(qingtian_rate_limit_exceeded_total[5m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "触发速率限制"
+          description: "有请求触发了速率限制，可能存在异常流量或需要调整限制阈值。"
+
+  # 资源告警（需要 node_exporter 或容器指标）
+  - name: qingtian_resources
+    rules:
+      - alert: QingtianHighMemoryUsage
+        expr: |
+          process_resident_memory_bytes{job="qingtian"} / 1024 / 1024 > 512
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "内存使用过高"
+          description: "进程内存使用超过 512MB，当前值: {{ $value | printf \"%.0f\" }}MB"
+
+      - alert: QingtianHighCPUUsage
+        expr: |
+          rate(process_cpu_seconds_total{job="qingtian"}[5m]) > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU 使用率过高"
+          description: "进程 CPU 使用率超过 80%，当前值: {{ $value | printf \"%.0f\" }}%"

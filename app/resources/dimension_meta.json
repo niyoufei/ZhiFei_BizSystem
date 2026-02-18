@@ -1,0 +1,18 @@
+[
+  {"id":"01","label_cn":"工程项目整体理解与实施路径","keywords_seed":["总体策划","施工目标","实施路径","统筹"],"actions_seed":["组织","统筹","实施"],"role_seed":["项目经理","技术负责人"],"acceptance_seed":["验收","签认","报验"]},
+  {"id":"02","label_cn":"安全生产管理体系与控制措施","keywords_seed":["安全生产","隐患排查","应急预案","危大工程"],"actions_seed":["检查","整改","管控"],"role_seed":["安全员","项目经理"],"acceptance_seed":["旁站","验收","签认"]},
+  {"id":"03","label_cn":"文明施工管理体系与实施措施","keywords_seed":["文明施工","扬尘治理","噪声控制","围挡"],"actions_seed":["治理","巡检","落实"],"role_seed":["施工员","安全员"],"acceptance_seed":["检查","验收"]},
+  {"id":"04","label_cn":"材料与部品采购及管理机制","keywords_seed":["材料进场","报验","复检","标识"],"actions_seed":["抽检","报验","复检"],"role_seed":["材料员","质检员"],"acceptance_seed":["报验","签认","验收"]},
+  {"id":"05","label_cn":"四新技术的应用与实施方案","keywords_seed":["新技术","新工艺","BIM","智慧工地"],"actions_seed":["应用","实施","验证"],"role_seed":["技术负责人","施工员"],"acceptance_seed":["验证","验收"]},
+  {"id":"06","label_cn":"工程关键工序识别与控制措施","keywords_seed":["关键工序","关键线路","接口","连续作业"],"actions_seed":["控制","交底","旁站"],"role_seed":["施工员","技术负责人"],"acceptance_seed":["交接检","隐蔽验收"]},
+  {"id":"07","label_cn":"工程重难点及危险性较大工程管控","keywords_seed":["重难点","危大工程","专项方案","监测"],"actions_seed":["论证","监测","纠偏"],"role_seed":["技术负责人","安全员"],"acceptance_seed":["旁站","验收","签认"]},
+  {"id":"08","label_cn":"工程质量管理体系与保证措施","keywords_seed":["质量保证","样板引路","三检","实测实量"],"actions_seed":["质检","复核","整改"],"role_seed":["质检员","技术负责人"],"acceptance_seed":["验收","报验"]},
+  {"id":"09","label_cn":"工期目标保障与进度控制措施","keywords_seed":["进度计划","里程碑","节点","纠偏"],"actions_seed":["调度","赶工","纠偏"],"role_seed":["施工员","项目经理"],"acceptance_seed":["日报","周报","签认"]},
+  {"id":"10","label_cn":"专项施工工艺与技术方案","keywords_seed":["专项工艺","工艺参数","验收标准"],"actions_seed":["实施","控制","验收"],"role_seed":["技术负责人","施工员"],"acceptance_seed":["验收","签认"]},
+  {"id":"11","label_cn":"人力资源配置与管理方案","keywords_seed":["劳动力","班组","工种","倒班"],"actions_seed":["调配","排班","培训"],"role_seed":["项目经理","施工员"],"acceptance_seed":["考核","交底"]},
+  {"id":"12","label_cn":"总体施工工艺流程与组织逻辑","keywords_seed":["施工工艺","流程","工序衔接"],"actions_seed":["组织","衔接","实施"],"role_seed":["技术负责人","施工员"],"acceptance_seed":["交底","验收"]},
+  {"id":"13","label_cn":"物资与施工设备配置方案","keywords_seed":["机械设备","设备清单","保养","备用"],"actions_seed":["调配","维保","验收"],"role_seed":["设备管理员","材料员"],"acceptance_seed":["进场验收","保养记录"]},
+  {"id":"14","label_cn":"设计协调与深化实施能力","keywords_seed":["图纸会审","深化设计","设计变更"],"actions_seed":["会审","深化","协调"],"role_seed":["技术负责人","设计协调员"],"acceptance_seed":["会签","签认"]},
+  {"id":"15","label_cn":"总体资源配置与实施计划","keywords_seed":["资源配置","总控","平衡","动态调配"],"actions_seed":["统筹","调配","优化"],"role_seed":["项目经理","施工员"],"acceptance_seed":["计划审批","节点验收"]},
+  {"id":"16","label_cn":"技术措施的可行性与落地性","keywords_seed":["可行性","落地","实操","验证"],"actions_seed":["验证","试行","落实"],"role_seed":["技术负责人","施工员"],"acceptance_seed":["验证记录","验收"]}
+]

@@ -1,0 +1,109 @@
+# 中文翻译 - 青天评标系统
+# Chinese translations for Qingtian Scoring System
+
+# 报告标题
+report:
+  title: 《青天视角评分报告》
+  title_word: 《青天评标官终版报告》
+  section_a: "A. 评分结论（总分、判分来源）"
+  section_a_word: "A. 评分结论（总分/置信度/判分来源spark_api）"
+  section_b: "B. 高优维度诊断（定义要点→缺陷→改进→证据）"
+  section_b_word: "B. 高优维度诊断（定义要点/缺陷/改进/证据）"
+  section_c: "C. 扣分清单（Top 10，按扣分值排序）"
+  section_d: "D. 一次性提升清单（Top 8，可执行动作）"
+  section_e: "E. 附：证据索引说明"
+
+# 评分相关
+scoring:
+  total_score: "总分（0-100）"
+  confidence: "置信度（0-1）"
+  judge_mode: judge_mode
+  judge_source: judge_source
+  spark_called: spark_called
+  high_priority_strategy: 高优维度权重策略
+  expected_gain: 预计加分
+
+# 维度诊断
+dimension:
+  definition_points: 定义要点
+  defects: 缺陷
+  improvements: 改进
+  evidence: 证据
+  no_evidence: 未检索到证据片段
+  no_definition: 未在文本中提取到明确要点。
+  default_defect: 参数/频次/验收/责任等落地要素表述不足。
+  default_improvement: 建议补充可量化参数与验收闭环（报验/签认），并明确责任岗位与频次。
+
+# 扣分项
+penalty:
+  deduct: 扣
+  points: 分
+  reason: 原因
+  evidence: 证据
+  qingtian_comment: 青天评语
+  code_action: "措施缺'参数/频次/验收/责任'要素，落地性不足。"
+  code_empty: 表述偏承诺型，缺可核查指标与闭环动作。
+
+# 缺失标签
+tags:
+  needs_completion: 需补齐
+  missing_param: 参数
+  missing_freq: 频次
+  missing_acceptance: 验收
+  missing_role: 责任
+
+# 模板动作
+templates:
+  template_07: 由【责任岗位】牵头（建议：技术负责人），按【频次】执行危大清单识别与专项方案闭环，完成验算/论证并设置监测预警阈值【阈值/参数】；关键节点实施旁站/验收【验收动作】，并设置应急处置与复工条件。
+  template_09: 由【责任岗位】牵头（建议：施工员），建立总控/月/周/日计划联动，锁定关键线路与节点销项，资源调配按【频次】（建议：每日+每周）；纠偏触发阈值【阈值/参数】，执行日清周结与报验/签认闭环。
+  template_02: 由【责任岗位】牵头（建议：安全员），实施风险分级与隐患排查，频次【频次】（建议：每日+每周），危大专项按方案执行；班前教育与旁站/验收【验收动作】闭环，控制指标【阈值/参数】并落实应急预案。
+  template_03: 由【责任岗位】牵头（建议：施工员），落实围挡与出入口管理，扬尘治理采用PM10/喷淋/雾炮（如适用）并按【频次】（建议：每日+每周）巡检；噪声/光污染控制指标【阈值/参数】，场地清洁与垃圾分类按【检查动作】闭环，投诉响应限时处置。
+  template_default: 由【责任岗位】牵头，按【频次】执行检查复核，控制指标【阈值/参数】，并完成【验收动作】闭环。
+  action_fix: 由【责任岗位】牵头，补齐【频次】与【验收动作】闭环，补充【阈值/参数】
+  empty_fix: 将承诺改为量化指标【阈值/参数】并明确【频次】与【验收动作】
+
+# 附录说明
+appendix:
+  evidence_note: start_index/end_index/snippet 表示原文区间与片段引用。
+  spark_hint: 如配置 Spark 凭证即可获得"青天Spark Judge 真评"并替换高优维度诊断内容。
+
+# API 响应消息
+api:
+  config_reloaded: 配置已重新加载
+  project_not_found: 项目不存在
+  no_submissions: 暂无施组记录
+  no_profile: 暂无学习画像
+  api_key_invalid: API Key 无效或缺失
+  cache_cleared: 缓存已清空
+  cache_empty: 缓存为空，无需清理
+  healthy: healthy
+  unhealthy: unhealthy
+  ready: ready
+  not_ready: not_ready
+
+# 状态描述
+status:
+  healthy: 健康
+  unhealthy: 不健康
+  ready: 就绪
+  not_ready: 未就绪
+
+# CLI 输出消息
+cli:
+  report_generated: "已生成报告："
+  docx_generated: "已生成 DOCX 报告："
+  files_found: "找到 {count} 个文件待处理"
+  output_dir: "输出目录："
+  parallel_mode_thread: "并行模式：{workers} 个工作线程"
+  parallel_mode_process: "并行模式：{workers} 个工作进程"
+  processing: "处理中"
+  parallel_processing: "并行处理"
+  file_unit: "文件"
+  processing_file: "处理："
+  score_label: "得分："
+  error_label: "错误："
+  completed: "处理完成：{success}/{total} 成功"
+  summary_report: "汇总报告："
+  warning_skip_path: "警告：跳过不存在的路径"
+  error_no_files: "错误：没有找到要处理的文件"
+  error_executor: "错误：executor 参数仅支持 'thread' 或 'process'，当前值："

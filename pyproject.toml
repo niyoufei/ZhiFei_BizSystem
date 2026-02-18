@@ -1,0 +1,46 @@
+[project]
+name = "zhifei-bizsystem"
+version = "1.0.0"
+description = "施工组织设计评标评分系统"
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+  "fastapi",
+  "pydantic",
+  "python-docx",
+  "PyYAML",
+  "typer",
+  "uvicorn",
+]
+[project.optional-dependencies]
+dev = [
+  "black",
+  "httpx",
+  "pre-commit",
+  "pygments<2.19",
+  "pytest",
+  "pytest-cov",
+  "ruff",
+]
+[project.scripts]
+zhifei-score = "app.cli:app"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+pythonpath = ["."]

@@ -1,0 +1,48 @@
+# Pre-commit hooks configuration
+# 安装: pip install pre-commit && pre-commit install
+# 手动运行: pre-commit run --all-files
+
+repos:
+  # 通用代码质量检查
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        name: 清理尾随空格
+      - id: end-of-file-fixer
+        name: 确保文件末尾换行
+      - id: check-yaml
+        name: 检查 YAML 语法
+      - id: check-json
+        name: 检查 JSON 语法
+      - id: check-added-large-files
+        name: 检查大文件
+        args: ['--maxkb=1000']
+      - id: check-merge-conflict
+        name: 检查合并冲突标记
+      - id: detect-private-key
+        name: 检测私钥泄露
+
+  # Ruff - 快速 Python linter
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.2.1
+    hooks:
+      - id: ruff
+        name: Ruff 代码检查
+        args: [--fix]
+      - id: ruff-format
+        name: Ruff 代码格式化
+
+  # pyproject.toml 格式检查
+  - repo: https://github.com/tox-dev/pyproject-fmt
+    rev: 1.7.0
+    hooks:
+      - id: pyproject-fmt
+        name: 格式化 pyproject.toml
+
+# 配置说明:
+# - trailing-whitespace: 自动删除行尾空格
+# - end-of-file-fixer: 确保文件以换行符结尾
+# - check-yaml/json: 验证配置文件语法
+# - ruff: 快速 Python linter，替代 flake8/isort/pyupgrade
+# - ruff-format: 代码格式化，替代 black

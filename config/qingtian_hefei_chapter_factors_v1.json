@@ -1,0 +1,248 @@
+{
+  "pack_id": "qingtian_hefei_chapter_factors_v1",
+  "version": "qthf_chapter_factors_v1_2026-02-11",
+  "enable_scope": {
+    "region": "合肥",
+    "scoring_engine_min": "v2"
+  },
+  "requirements": [
+    {
+      "id": "REQ-ALL-RISK-001",
+      "dimension_ids": [
+        "01",
+        "02",
+        "03",
+        "04",
+        "05",
+        "06",
+        "07",
+        "08",
+        "09",
+        "10",
+        "11",
+        "12",
+        "13",
+        "14",
+        "15",
+        "16"
+      ],
+      "req_label": "本章必须体现重点难点/风险点及对应措施",
+      "req_type": "semantic",
+      "mandatory": true,
+      "weight": 2.0,
+      "patterns": {
+        "risk_terms": [
+          "重点难点",
+          "风险点",
+          "主要风险",
+          "难点分析",
+          "风险分析",
+          "风险识别",
+          "风险源",
+          "不利因素",
+          "隐患",
+          "瓶颈",
+          "可能导致",
+          "易导致"
+        ],
+        "measure_terms": [
+          "措施",
+          "对策",
+          "管控",
+          "落实",
+          "执行",
+          "实施",
+          "设置",
+          "配置",
+          "增设",
+          "旁站",
+          "巡检",
+          "复核",
+          "报验",
+          "验收",
+          "交底"
+        ],
+        "linkage_rule": {
+          "same_dimension_scope": true,
+          "within_same_heading_or_neighbor_units": 2
+        }
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "high",
+        "why_it_matters": "本章缺少重点难点/风险点及对应措施，现场不可执行且易被青天扣分。",
+        "fix_template": "【重点难点/风险点】{风险描述}\\n【措施】采取{措施}，控制要点为{参数/阈值}；{执行频次}由{责任岗位}实施。\\n【验收】完成后进行{验收动作}并形成{记录表/台账}。"
+      }
+    },
+    {
+      "id": "REQ-01-INFOMGMT-001",
+      "dimension_id": "01",
+      "req_label": "维度01必须包含完整标题“信息化管理”及闭环内容",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 2.0,
+      "patterns": {
+        "heading_exact": "信息化管理",
+        "content_terms_any2": {
+          "modules": [
+            "实名制",
+            "门禁",
+            "视频",
+            "视频巡检",
+            "环境监测",
+            "扬尘监测",
+            "设备管理",
+            "质量巡检",
+            "安全隐患",
+            "闭环",
+            "进度填报",
+            "日报",
+            "周报",
+            "预警"
+          ],
+          "ops": [
+            "频次",
+            "每日",
+            "每周",
+            "阈值",
+            "超限",
+            "处置",
+            "整改",
+            "复核",
+            "留痕",
+            "导出",
+            "权限"
+          ]
+        }
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "high",
+        "why_it_matters": "缺少“信息化管理”完整章节/内容，无法体现项目数字化管控闭环。",
+        "fix_template": "【信息化管理】\\n模块：{人员/视频/环境/设备/质量/安全/进度}\\n采集：{数据项}，频次：{每日/每周/实时}\\n阈值：{触发条件}\\n处置：{责任岗位}在{时限}内{整改/复核}并形成{记录/报表}。"
+      }
+    },
+    {
+      "id": "REQ-03-GREEN-001",
+      "dimension_id": "03",
+      "req_label": "维度03必须包含完整标题“绿色工地”及至少3类环保要点",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 2.0,
+      "patterns": {
+        "heading_exact": "绿色工地",
+        "topic_terms_at_least3": {
+          "topics": [
+            "扬尘",
+            "噪声",
+            "污水",
+            "固废",
+            "节能",
+            "节水",
+            "节材",
+            "绿色施工",
+            "围挡",
+            "硬化",
+            "冲洗",
+            "喷淋",
+            "雾炮",
+            "沉淀池",
+            "垃圾分类"
+          ],
+          "minimum": 3
+        },
+        "must_include_measure_and_acceptance": {
+          "measure_terms": [
+            "设置",
+            "配置",
+            "启停",
+            "覆盖",
+            "冲洗",
+            "喷淋",
+            "洒水",
+            "清运",
+            "分类"
+          ],
+          "acceptance_terms": [
+            "检查",
+            "验收",
+            "巡检",
+            "记录",
+            "台账",
+            "整改闭环"
+          ]
+        }
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "high",
+        "why_it_matters": "缺少“绿色工地”完整章节/内容，文明施工与环保控制缺乏可执行标准。",
+        "fix_template": "【绿色工地】\\n对象：{扬尘/噪声/污水/固废/节能节水}\\n措施：{设施/启停条件/频次}由{责任岗位}实施\\n验收：{巡检/记录/整改闭环}，形成{台账/检查表}。"
+      }
+    },
+    {
+      "id": "REQ-02-LAOBAO-001",
+      "dimension_id": "02",
+      "req_label": "维度02必须体现劳保用品配置矩阵",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.6,
+      "patterns": {
+        "must_have_terms": [
+          "劳保用品",
+          "配置"
+        ],
+        "should_have_terms_any2": {
+          "terms": [
+            "数量",
+            "质量要求",
+            "标准",
+            "发放",
+            "领用",
+            "存储",
+            "台账",
+            "岗位匹配",
+            "更换频次",
+            "验收"
+          ],
+          "minimum": 2
+        }
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "medium",
+        "why_it_matters": "未形成劳保用品岗位匹配与配置闭环，现场难以检查。",
+        "fix_template": "【劳保用品配置矩阵】岗位/工种—用品—数量/标准—发放/更换频次—领用签字—存储要求—检查/验收记录。"
+      }
+    },
+    {
+      "id": "REQ-06-KEYPROC-001",
+      "dimension_id": "06",
+      "req_label": "维度06必须包含关键工序控制点表（工序内容/重点难点/措施/验收）",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 2.0,
+      "patterns": {
+        "table_header_terms_all": [
+          "工序内容",
+          "重点难点",
+          "措施",
+          "验收"
+        ],
+        "fallback_line_terms_all": [
+          "工序内容",
+          "重点难点",
+          "措施",
+          "验收"
+        ],
+        "within_dimension_scope": true
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "high",
+        "why_it_matters": "缺少关键工序控制点表（工序内容/重点难点/措施/验收），不符合现场可执行的工序管控表达。",
+        "fix_template": "【关键工序控制点表】\\n工序内容：{工序}\\n重点难点：{难点/风险}\\n措施：{措施}（写入参数/频次/责任岗位）\\n验收：{验收动作}（写入记录表编号/签认要求）"
+      }
+    }
+  ]
+}
