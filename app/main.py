@@ -553,17 +553,18 @@ def _resolve_project_scoring_context(
                 profile = item
                 break
 
-    if profile and isinstance(profile.get("weights_norm"), dict):
-        multipliers = _weights_norm_to_dimension_multipliers(profile.get("weights_norm", {}))
-        return multipliers, profile, project
-
-    # 向后兼容：历史项目仍可使用学习画像/进化建议
+    # 进化权重优先：用户执行学习进化后，使预评分贴近青天，优先采用进化产出的 dimension_multipliers
     reports = load_evolution_reports()
     evo = reports.get(project_id) or {}
     se = evo.get("scoring_evolution") or {}
     mult = se.get("dimension_multipliers") or {}
     if mult:
         return dict(mult), None, project
+
+    if profile and isinstance(profile.get("weights_norm"), dict):
+        multipliers = _weights_norm_to_dimension_multipliers(profile.get("weights_norm", {}))
+        return multipliers, profile, project
+
     for p in load_learning_profiles():
         if p.get("project_id") == project_id:
             return dict(p.get("dimension_multipliers") or {}), None, project
@@ -2824,7 +2825,11 @@ def rescore_project_submissions(
 
     if str(payload.scoring_engine_version or "").strip():
         project["scoring_engine_version_locked"] = payload.scoring_engine_version
-    multipliers = _weights_norm_to_dimension_multipliers(profile.get("weights_norm", {}))
+    # 使用 _resolve_project_scoring_context 获取 multipliers，使进化产出的 dimension_multipliers 在评分时生效
+    multipliers, profile_snapshot, _ = _resolve_project_scoring_context(project_id)
+    if not multipliers and profile:
+        multipliers = _weights_norm_to_dimension_multipliers(profile.get("weights_norm", {}))
+    profile_for_meta = profile_snapshot if profile_snapshot else profile
     config = load_config()
     submissions = load_submissions()
 
@@ -2860,7 +2865,7 @@ def rescore_project_submissions(
             project=project,
             config=config,
             multipliers=multipliers,
-            profile_snapshot=profile,
+            profile_snapshot=profile_snapshot,
             scoring_engine_version=payload.scoring_engine_version,
             anchors=anchors,
             requirements=requirements,
@@ -2882,13 +2887,15 @@ def rescore_project_submissions(
             report.get("total_score", report.get("rule_total_score", 0.0))
         )
         submission["updated_at"] = now
-        submission["expert_profile_id_used"] = profile.get("id")
+        submission["expert_profile_id_used"] = (
+            profile_for_meta.get("id") if profile_for_meta else None
+        )
 
         snapshot = _build_score_report_snapshot(
             submission_id=str(submission.get("id")),
             project=project,
             report=report,
-            profile_snapshot=profile,
+            profile_snapshot=profile_for_meta,
             scoring_engine_version=payload.scoring_engine_version,
         )
         score_reports.append(snapshot)
