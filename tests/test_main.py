@@ -43,6 +43,8 @@ class TestIndexEndpoint:
         assert "createProject" in response.text
         assert "uploadMaterial" in response.text
         assert "uploadShigong" in response.text
+        assert 'id="projectDeleteSelect"' in response.text
+        assert 'id="deleteSelectedProjects"' in response.text
         assert 'id="scoreScaleSelect"' in response.text
         assert 'name="score_scale_max"' in response.text
         assert 'id="groundTruthSubmissionSelect"' in response.text
@@ -77,6 +79,19 @@ class TestIndexEndpoint:
         assert 'action="/web/delete_project"' in response.text
         assert 'action="/web/upload_materials"' in response.text
         assert 'action="/web/upload_shigong"' in response.text
+
+    def test_index_frontend_has_batch_project_delete_handler(self, client):
+        """Section 2 should support selecting multiple projects and batch deleting them."""
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert (
+            "const deleteSelectedProjectsBtn = document.getElementById('deleteSelectedProjects');"
+            in page
+        )
+        assert "const delSel = document.getElementById('projectDeleteSelect');" in page
+        assert "正在批量删除项目…" in page
+        assert "batch_delete_projects" in page
 
     def test_index_head_returns_200(self, client):
         """HEAD / should be available to avoid browser connectivity false alarms."""

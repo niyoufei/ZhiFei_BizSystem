@@ -7142,6 +7142,11 @@ def index(
             <input type="hidden" name="project_id" id="deleteProjectId" value="__SELECTED_PROJECT_ID__" />
             <button type="submit" id="deleteCurrentProject" class="secondary" style="background:#dc2626">删除当前项目</button>
           </form>
+          <div class="inline-form" style="align-items:center;gap:6px">
+            <span style="margin-left:4px;font-size:12px;color:#475569">批量删除：</span>
+            <select id="projectDeleteSelect" multiple size="3" style="min-width:260px;max-width:420px"></select>
+            <button type="button" id="deleteSelectedProjects" class="secondary" style="background:#b91c1c">删除所选项目</button>
+          </div>
         </div>
         <details style="margin-top:8px">
           <summary style="cursor:pointer;color:#334155;font-size:13px">高级工具（系统诊断 / 评分体系 / 分析包）</summary>
@@ -8736,6 +8741,10 @@ def index(
         async function refreshProjects() {
           setSelectMsg('正在加载…', false);
           const current = pid() || storageGet('selected_project_id') || '';
+          const deleteSel = document.getElementById('projectDeleteSelect');
+          const prevDeleteIds = deleteSel
+            ? Array.from(deleteSel.selectedOptions || []).map((o) => String(o.value || ''))
+            : [];
           let res, text;
           try {
             res = await fetch('/api/v1/projects');
@@ -8779,6 +8788,27 @@ def index(
             o.textContent = (p.name || p.id) + ' (' + (p.id || '').slice(0,8) + '…)';
             sel.appendChild(o);
           });
+          if (deleteSel) {
+            deleteSel.innerHTML = '';
+            if (!list.length) {
+              const emptyOpt = document.createElement('option');
+              emptyOpt.value = '';
+              emptyOpt.disabled = true;
+              emptyOpt.textContent = '-- 暂无项目 --';
+              deleteSel.appendChild(emptyOpt);
+            } else {
+              list.forEach((p) => {
+                const o = document.createElement('option');
+                o.value = p.id;
+                o.textContent = (p.name || p.id) + ' (' + (p.id || '').slice(0,8) + '…)';
+                if (prevDeleteIds.includes(String(p.id))) o.selected = true;
+                deleteSel.appendChild(o);
+              });
+            }
+            deleteSel.disabled = !list.length;
+          }
+          const deleteSelectedBtn = document.getElementById('deleteSelectedProjects');
+          if (deleteSelectedBtn) deleteSelectedBtn.disabled = !list.length;
           if (current && list.some(p => p.id === current)) {
             sel.value = current;
           } else if (list.length > 0) {
@@ -8863,6 +8893,64 @@ def index(
               try { const j = JSON.parse(text || '{}'); detail = (j && j.detail) || detail; } catch (_) {}
               setSelectMsg('删除失败: ' + res.status + ' ' + String(detail || '').slice(0, 120), true);
             }
+          };
+        }
+        const deleteSelectedProjectsBtn = document.getElementById('deleteSelectedProjects');
+        if (deleteSelectedProjectsBtn) {
+          deleteSelectedProjectsBtn.onclick = async () => {
+            const delSel = document.getElementById('projectDeleteSelect');
+            const selectedOptions = delSel ? Array.from(delSel.selectedOptions || []) : [];
+            const ids = selectedOptions.map((o) => String(o.value || '')).filter(Boolean);
+            if (!ids.length) {
+              setSelectMsg('请先在“批量删除”列表中选择项目（可按 Command/Ctrl 多选）。', true);
+              return;
+            }
+            const labels = selectedOptions.map((o) => String(o.textContent || o.value || ''));
+            const ok = confirm(
+              '确认删除所选 ' + ids.length + ' 个项目？\\n\\n'
+              + labels.join('\\n')
+              + '\\n\\n此操作不可恢复，并会删除对应项目全部资料与记录。'
+            );
+            if (!ok) return;
+            setSelectMsg('正在批量删除项目…', false);
+            const failed = [];
+            let removedCount = 0;
+            for (const id of ids) {
+              try {
+                const res = await fetch(
+                  '/api/v1/projects/' + encodeURIComponent(id),
+                  { method: 'DELETE', headers: apiHeaders(false) }
+                );
+                const text = await res.text();
+                if (res.status === 204) {
+                  removedCount += 1;
+                } else {
+                  let detail = text || '';
+                  try { const j = JSON.parse(text || '{}'); detail = (j && j.detail) || detail; } catch (_) {}
+                  failed.push({ project_id: id, detail: String(detail || ('HTTP ' + res.status)).slice(0, 160) });
+                }
+              } catch (err) {
+                failed.push({ project_id: id, detail: String((err && err.message) || err || '网络异常') });
+              }
+            }
+            const out = document.getElementById('output');
+            if (out) {
+              out.textContent = JSON.stringify(
+                { action: 'batch_delete_projects', requested: ids.length, removed_count: removedCount, failed_count: failed.length, failed },
+                null,
+                2
+              );
+            }
+            if (failed.length) {
+              setSelectMsg('批量删除完成：成功 ' + removedCount + '，失败 ' + failed.length + '。', true);
+            } else {
+              setSelectMsg('批量删除完成：已删除 ' + removedCount + ' 个项目。', false);
+            }
+            await refreshProjects();
+            if (typeof refreshSubmissions === 'function') refreshSubmissions();
+            if (typeof refreshMaterials === 'function') refreshMaterials();
+            if (typeof refreshFeedMaterials === 'function') refreshFeedMaterials();
+            if (typeof refreshGroundTruth === 'function') refreshGroundTruth();
           };
         }
         safeClick('btnCleanupE2EProjects', async () => {
