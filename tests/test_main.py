@@ -265,14 +265,14 @@ class TestWebFallbackOps:
         assert response.status_code == 303
         location = response.headers.get("location", "")
         assert "msg_type=error" in location
-        assert "%E4%B8%8A%E4%BC%A0%E5%B9%B6%E8%AF%84%E5%88%86" in location
+        assert "%E4%B8%8A%E4%BC%A0%E6%96%BD%E7%BB%84" in location
 
     def test_web_upload_shigong_put_fallback_redirects(self, client):
         response = client.put("/web/upload_shigong", follow_redirects=False)
         assert response.status_code == 303
         location = response.headers.get("location", "")
         assert "msg_type=error" in location
-        assert "%E4%B8%8A%E4%BC%A0%E5%B9%B6%E8%AF%84%E5%88%86" in location
+        assert "%E4%B8%8A%E4%BC%A0%E6%96%BD%E7%BB%84" in location
 
     @patch("app.main.rescore_project_submissions")
     def test_web_score_shigong_success_uses_reports_generated(self, mock_rescore, client):
@@ -842,7 +842,7 @@ class TestMaterialsEndpoint:
     ):
         """Upload material should save file and return record."""
         mock_dir.__truediv__ = lambda self, x: tmp_path / x
-        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_load_proj.return_value = [{"id": "p1", "scoring_engine_version_locked": "v1"}]
         mock_load_mat.return_value = []
 
         file_content = b"test content"
@@ -979,7 +979,7 @@ class TestShigongEndpoint:
         mock_save_sub,
         client,
     ):
-        """Upload shigong should score and save submission."""
+        """Upload shigong should only persist as pending without immediate scoring."""
         mock_load_proj.return_value = [{"id": "p1"}]
         mock_config.return_value = MagicMock(rubric={}, lexicon={})
         mock_profiles.return_value = []
@@ -996,6 +996,9 @@ class TestShigongEndpoint:
         data = response.json()
         assert "id" in data
         assert data["project_id"] == "p1"
+        assert data["total_score"] == 0.0
+        assert data["report"]["scoring_status"] == "pending"
+        mock_score.assert_not_called()
 
     @patch("app.main.save_submissions")
     @patch("app.main.load_submissions")
@@ -1015,7 +1018,7 @@ class TestShigongEndpoint:
         mock_save_sub,
         client,
     ):
-        """Upload shigong should use learning profile multipliers."""
+        """Upload shigong should stay pending even when project has learning profile."""
         mock_load_proj.return_value = [{"id": "p1"}]
         mock_config.return_value = MagicMock(rubric={}, lexicon={})
         mock_profiles.return_value = [{"project_id": "p1", "dimension_multipliers": {"D01": 1.2}}]
@@ -1027,9 +1030,9 @@ class TestShigongEndpoint:
             files={"file": ("test.txt", BytesIO(b"test"), "text/plain")},
         )
         assert response.status_code == 200
-        # Check multipliers were passed
-        call_args = mock_score.call_args
-        assert call_args.kwargs.get("dimension_multipliers") == {"D01": 1.2}
+        data = response.json()
+        assert data["report"]["scoring_status"] == "pending"
+        mock_score.assert_not_called()
 
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
@@ -1094,8 +1097,8 @@ class TestShigongEndpoint:
         assert second_data["id"] == first_data["id"]
         assert len(saved_state) == 1
         assert mock_save_sub.call_count == 1
-        assert mock_score.call_count == 1
-        mock_record_history.assert_called_once()
+        assert mock_score.call_count == 0
+        mock_record_history.assert_not_called()
 
 
 class TestScoreForProjectEndpoint:
@@ -1320,7 +1323,14 @@ class TestCompareEndpoints:
     @patch("app.main.ensure_data_dirs")
     def test_compare_report_success(self, mock_ensure, mock_load, mock_narrative, client):
         """Compare report should return narrative."""
-        mock_load.return_value = [{"id": "s1", "project_id": "p1"}]
+        mock_load.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "total_score": 81.0,
+                "report": {"total_score": 81.0, "scoring_status": "scored"},
+            }
+        ]
         mock_narrative.return_value = {
             "summary": "test summary",
             "top_submission": {"id": "s1"},
@@ -1400,6 +1410,22 @@ class TestCompareEndpoints:
         response = client.get("/api/v1/projects/p1/compare_report")
         assert response.status_code == 404
 
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_compare_requires_scored_submissions(self, mock_ensure, mock_load, client):
+        """Compare should require scored submissions."""
+        mock_load.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "total_score": 0.0,
+                "report": {"scoring_status": "pending"},
+            }
+        ]
+        response = client.get("/api/v1/projects/p1/compare")
+        assert response.status_code == 404
+        assert "请先点击“评分施组”" in response.json()["detail"]
+
 
 class TestAdaptiveEndpoints:
     """Tests for /projects/{project_id}/adaptive* endpoints."""
@@ -1412,7 +1438,14 @@ class TestAdaptiveEndpoints:
         self, mock_ensure, mock_load, mock_config, mock_build, client
     ):
         """Adaptive suggestions should return suggestions."""
-        mock_load.return_value = [{"id": "s1", "project_id": "p1"}]
+        mock_load.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "total_score": 86.0,
+                "report": {"total_score": 86.0, "scoring_status": "scored"},
+            }
+        ]
         mock_config.return_value = MagicMock(lexicon={})
         mock_build.return_value = {"penalty_stats": {}, "suggestions": []}
         response = client.get("/api/v1/projects/p1/adaptive")
@@ -1510,7 +1543,14 @@ class TestInsightsEndpoint:
     @patch("app.main.ensure_data_dirs")
     def test_insights_success(self, mock_ensure, mock_load, mock_insights, client):
         """Insights should return project insights."""
-        mock_load.return_value = [{"id": "s1", "project_id": "p1"}]
+        mock_load.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "total_score": 88.0,
+                "report": {"total_score": 88.0, "scoring_status": "scored"},
+            }
+        ]
         mock_insights.return_value = {
             "dimension_avg": {},
             "weakest_dims": [],
@@ -1530,6 +1570,22 @@ class TestInsightsEndpoint:
         response = client.get("/api/v1/projects/p1/insights")
         assert response.status_code == 404
 
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_insights_requires_scored_submissions(self, mock_ensure, mock_load, client):
+        """Insights should require scored submissions."""
+        mock_load.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "total_score": 0.0,
+                "report": {"scoring_status": "pending"},
+            }
+        ]
+        response = client.get("/api/v1/projects/p1/insights")
+        assert response.status_code == 404
+        assert "请先点击“评分施组”" in response.json()["detail"]
+
 
 class TestLearningEndpoints:
     """Tests for /projects/{project_id}/learning endpoints."""
@@ -1543,7 +1599,14 @@ class TestLearningEndpoints:
         self, mock_ensure, mock_load_sub, mock_build, mock_load_prof, mock_save, client
     ):
         """Update learning profile should save and return profile."""
-        mock_load_sub.return_value = [{"id": "s1", "project_id": "p1"}]
+        mock_load_sub.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "total_score": 90.0,
+                "report": {"total_score": 90.0, "scoring_status": "scored"},
+            }
+        ]
         mock_build.return_value = {
             "dimension_multipliers": {"D01": 1.1},
             "rationale": {"D01": "test rationale"},
@@ -1564,7 +1627,14 @@ class TestLearningEndpoints:
         self, mock_ensure, mock_load_sub, mock_build, mock_load_prof, mock_save, client
     ):
         """Update learning profile should replace existing profile."""
-        mock_load_sub.return_value = [{"id": "s1", "project_id": "p1"}]
+        mock_load_sub.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "total_score": 90.0,
+                "report": {"total_score": 90.0, "scoring_status": "scored"},
+            }
+        ]
         mock_build.return_value = {
             "dimension_multipliers": {"D01": 1.2},
             "rationale": {"D01": "new rationale"},
@@ -1584,6 +1654,24 @@ class TestLearningEndpoints:
         mock_load.return_value = []
         response = client.post("/api/v1/projects/p1/learning")
         assert response.status_code == 404
+
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_update_learning_profile_requires_scored_submissions(
+        self, mock_ensure, mock_load, client
+    ):
+        """Learning profile update should require scored submissions."""
+        mock_load.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "total_score": 0.0,
+                "report": {"scoring_status": "pending"},
+            }
+        ]
+        response = client.post("/api/v1/projects/p1/learning")
+        assert response.status_code == 404
+        assert "请先点击“评分施组”" in response.json()["detail"]
 
     @patch("app.main.load_learning_profiles")
     @patch("app.main.ensure_data_dirs")
@@ -2077,7 +2165,7 @@ class TestProjectLevelCacheIntegration:
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
     @patch("app.main.score_text")
-    def test_upload_shigong_uses_cache(
+    def test_upload_shigong_upload_only_skips_cache_and_scoring(
         self,
         mock_score,
         mock_ensure,
@@ -2090,7 +2178,7 @@ class TestProjectLevelCacheIntegration:
         mock_cache_get,
         client,
     ):
-        """Upload shigong should check cache first."""
+        """Upload shigong should not trigger scoring/cache in upload-only workflow."""
         # 模拟缓存未命中
         mock_cache_get.return_value = None
         mock_load_proj.return_value = [{"id": "p1"}]
@@ -2106,11 +2194,11 @@ class TestProjectLevelCacheIntegration:
             files={"file": ("test.txt", BytesIO(b"test content"), "text/plain")},
         )
         assert response.status_code == 200
-
-        # 验证缓存被检查（不带 config_hash，因为没有 multipliers）
-        mock_cache_get.assert_called_once_with("test content", None)
-        # 验证结果被缓存
-        mock_cache_set.assert_called_once()
+        data = response.json()
+        assert data["report"]["scoring_status"] == "pending"
+        mock_cache_get.assert_not_called()
+        mock_cache_set.assert_not_called()
+        mock_score.assert_not_called()
 
     @patch("app.main.get_cached_score")
     @patch("app.main.save_submissions")
@@ -2120,7 +2208,7 @@ class TestProjectLevelCacheIntegration:
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
     @patch("app.main.score_text")
-    def test_upload_shigong_returns_cached_result(
+    def test_upload_shigong_upload_only_ignores_existing_cache(
         self,
         mock_score,
         mock_ensure,
@@ -2151,9 +2239,9 @@ class TestProjectLevelCacheIntegration:
         )
         assert response.status_code == 200
         data = response.json()
-        assert data["total_score"] == 88.0
-
-        # 验证 score_text 没有被调用（使用了缓存）
+        assert data["total_score"] == 0.0
+        assert data["report"]["scoring_status"] == "pending"
+        mock_cache_get.assert_not_called()
         mock_score.assert_not_called()
 
     @patch("app.main.get_cached_score")
@@ -2165,7 +2253,7 @@ class TestProjectLevelCacheIntegration:
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
     @patch("app.main.score_text")
-    def test_upload_shigong_cache_with_multipliers(
+    def test_upload_shigong_upload_only_with_profile_still_skips_cache(
         self,
         mock_score,
         mock_ensure,
@@ -2178,7 +2266,7 @@ class TestProjectLevelCacheIntegration:
         mock_cache_get,
         client,
     ):
-        """Upload shigong should use config_hash when multipliers exist."""
+        """Upload shigong should stay pending even if profile multipliers exist."""
         # 模拟缓存未命中
         mock_cache_get.return_value = None
         mock_load_proj.return_value = [{"id": "p1"}]
@@ -2194,12 +2282,11 @@ class TestProjectLevelCacheIntegration:
             files={"file": ("test.txt", BytesIO(b"test content"), "text/plain")},
         )
         assert response.status_code == 200
-
-        # 验证缓存被检查时包含 config_hash
-        call_args = mock_cache_get.call_args
-        assert call_args[0][0] == "test content"
-        # config_hash 应该不是 None（因为有 multipliers）
-        assert call_args[0][1] is not None
+        data = response.json()
+        assert data["report"]["scoring_status"] == "pending"
+        mock_cache_get.assert_not_called()
+        mock_cache_set.assert_not_called()
+        mock_score.assert_not_called()
 
     @patch("app.main.get_cached_score")
     @patch("app.main.cache_score_result")

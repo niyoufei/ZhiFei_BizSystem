@@ -1242,6 +1242,62 @@ def _resolve_submission_score_fields(
     }
 
 
+def _submission_is_scored(submission: Dict[str, object]) -> bool:
+    report_obj = submission.get("report")
+    if isinstance(report_obj, dict):
+        status = str(report_obj.get("scoring_status") or "").strip().lower()
+        if status == "pending":
+            return False
+        if status == "scored":
+            return True
+        if _to_float_or_none(report_obj.get("rule_total_score")) is not None:
+            return True
+        if _to_float_or_none(report_obj.get("pred_total_score")) is not None:
+            return True
+        if _to_float_or_none(report_obj.get("total_score")) is not None:
+            return True
+    return _to_float_or_none(submission.get("total_score")) is not None
+
+
+def _mark_report_scored(report: Dict[str, object], *, trigger: str) -> None:
+    report["scoring_status"] = "scored"
+    report["scoring_trigger"] = trigger
+    report["scored_at"] = _now_iso()
+
+
+def _build_pending_submission_report(
+    *,
+    project: Dict[str, object],
+    scoring_engine_version: str,
+) -> Dict[str, object]:
+    return {
+        "scoring_status": "pending",
+        "scoring_trigger": "upload_only",
+        "queued_at": _now_iso(),
+        "total_score": None,
+        "rule_total_score": None,
+        "pred_total_score": None,
+        "llm_total_score": None,
+        "pred_confidence": None,
+        "score_blend": None,
+        "dimension_scores": {},
+        "rule_dim_scores": {},
+        "pred_dim_scores": None,
+        "penalties": [],
+        "lint_findings": [],
+        "suggestions": [],
+        "requirement_hits": [],
+        "mandatory_req_hit_rate": None,
+        "evidence_units_count": 0,
+        "meta": {
+            "engine_version": _determine_engine_version(project, scoring_engine_version),
+            "region": project.get("region", DEFAULT_REGION),
+            "scoring_engine_version": scoring_engine_version,
+            "queued_for_scoring": True,
+        },
+    }
+
+
 def _score_submission_for_project(
     *,
     submission_id: str,
@@ -1293,6 +1349,7 @@ def _score_submission_for_project(
         _apply_deployed_patch_to_report(project_id, report)
         submission_like = {"id": submission_id, "project_id": project_id, "text": text}
         _apply_prediction_to_report(report, submission_like=submission_like, project=project)
+        _mark_report_scored(report, trigger="score_engine")
         return report, list(v2_result.get("evidence_units") or [])
 
     legacy = score_text(
@@ -1320,6 +1377,7 @@ def _score_submission_for_project(
         legacy["meta"]["expert_profile_snapshot"] = profile_snapshot
         legacy["meta"]["expert_profile_id"] = profile_snapshot.get("id")
     _apply_deployed_patch_to_report(project_id, legacy)
+    _mark_report_scored(legacy, trigger="score_engine")
     return legacy, []
 
 
@@ -1609,12 +1667,40 @@ def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, 
             matched_submission = s
             break
 
-    created_submission = False
+    scored_submission = False
+    submission_changed = False
     evidence_units_new: List[Dict[str, object]] = []
+    now_iso = _now_iso()
     if matched_submission is None:
-        submission_id = str(uuid4())
+        matched_submission = {
+            "id": str(uuid4()),
+            "project_id": project_id,
+            "filename": f"ground_truth_{source_gt_id[:8]}.txt",
+            "total_score": 0.0,
+            "report": _build_pending_submission_report(
+                project=project,
+                scoring_engine_version=scoring_engine_version,
+            ),
+            "text": gt_text,
+            "created_at": now_iso,
+            "updated_at": now_iso,
+            "expert_profile_id_used": profile_snapshot.get("id") if profile_snapshot else None,
+            "source_ground_truth_id": source_gt_id,
+            "bidder_name": f"GT_{source_gt_id[:8]}",
+        }
+        submissions.append(matched_submission)
+        submission_changed = True
+
+    if str(matched_submission.get("source_ground_truth_id") or "") != source_gt_id:
+        matched_submission["source_ground_truth_id"] = source_gt_id
+        submission_changed = True
+    if gt_text.strip() and str(matched_submission.get("text") or "").strip() != gt_text.strip():
+        matched_submission["text"] = gt_text
+        submission_changed = True
+
+    if not _submission_is_scored(matched_submission):
         report, evidence_units_new = _score_submission_for_project(
-            submission_id=submission_id,
+            submission_id=str(matched_submission.get("id")),
             text=gt_text,
             project_id=project_id,
             project=project,
@@ -1623,24 +1709,22 @@ def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, 
             profile_snapshot=profile_snapshot,
             scoring_engine_version=scoring_engine_version,
         )
-        matched_submission = {
-            "id": submission_id,
-            "project_id": project_id,
-            "filename": f"ground_truth_{source_gt_id[:8]}.txt",
-            "total_score": float(report.get("total_score", report.get("rule_total_score", 0.0))),
-            "report": report,
-            "text": gt_text,
-            "created_at": _now_iso(),
-            "updated_at": _now_iso(),
-            "expert_profile_id_used": profile_snapshot.get("id") if profile_snapshot else None,
-            "source_ground_truth_id": source_gt_id,
-            "bidder_name": f"GT_{source_gt_id[:8]}",
-        }
-        submissions.append(matched_submission)
-        created_submission = True
-    save_submissions(submissions)
+        _mark_report_scored(report, trigger="ground_truth_sync")
+        matched_submission["report"] = report
+        matched_submission["total_score"] = float(
+            report.get("total_score", report.get("rule_total_score", 0.0))
+        )
+        matched_submission["expert_profile_id_used"] = (
+            profile_snapshot.get("id") if profile_snapshot else None
+        )
+        matched_submission["updated_at"] = _now_iso()
+        scored_submission = True
+        submission_changed = True
 
-    if created_submission:
+    if submission_changed:
+        save_submissions(submissions)
+
+    if scored_submission:
         snapshots = load_score_reports()
         snapshots.append(
             _build_score_report_snapshot(
@@ -1860,7 +1944,7 @@ async def _web_405_fallback_handler(request: Request, exc: StarletteHTTPExceptio
             message = "请在主页选择文件后点击“上传资料”提交。"
             anchor = "#section-materials"
             if path == "/web/upload_shigong":
-                message = "请在主页选择文件后点击“上传并评分”提交。"
+                message = "请在主页选择文件后点击“上传施组”提交。"
                 anchor = "#section-shigong"
             return RedirectResponse(
                 url=_web_upload_redirect_url(project_id, message, anchor),
@@ -2606,6 +2690,7 @@ def rescore_project_submissions(
             submission_id=str(submission.get("id")),
             new_units=evidence_units,
         )
+        _mark_report_scored(report, trigger="manual_rescore")
 
         submission["report"] = report
         submission["total_score"] = float(
@@ -3264,11 +3349,10 @@ def upload_shigong(
     locale: str = Depends(get_locale),
 ) -> SubmissionRecord:
     """
-    上传施工组织设计文档并评分。
+    上传施工组织设计文档（仅上传，不自动评分）。
 
-    上传 TXT 格式的施组文档，系统将自动进行评分分析并保存提交记录。
-    如果项目已有学习画像，将应用自适应权重进行评分。
-    支持评分结果缓存，相同文本和配置重复评分时直接返回缓存结果。
+    上传 TXT / DOCX / PDF / JSON / XLSX 格式施组文档并保存解析文本。
+    上传后提交会进入“待评分”状态，需手动调用“评分施组”才会产生分数。
 
     **需要 API Key 认证**
 
@@ -3298,88 +3382,35 @@ def upload_shigong(
     )
     if duplicate is not None:
         return SubmissionRecord(**duplicate)
-    config = load_config()
-    multipliers, profile_snapshot, project = _resolve_project_scoring_context(project_id)
-    submission_id = str(uuid4())
-    scoring_engine_version = str(project.get("scoring_engine_version_locked") or "v1")
-    engine_version = _determine_engine_version(project, scoring_engine_version)
 
-    if engine_version == "v1":
-        config_hash = _compute_multipliers_hash(multipliers) if multipliers else None
-        cached_result = get_cached_score(text, config_hash)
-        if cached_result is not None:
-            report = dict(cached_result)
-        else:
-            report, _ = _score_submission_for_project(
-                submission_id=submission_id,
-                text=text,
-                project_id=project_id,
-                project=project,
-                config=config,
-                multipliers=multipliers,
-                profile_snapshot=profile_snapshot,
-                scoring_engine_version=scoring_engine_version,
-            )
-            cache_score_result(text, report, config_hash)
-        evidence_units: List[Dict[str, object]] = []
-    else:
-        report, evidence_units = _score_submission_for_project(
-            submission_id=submission_id,
-            text=text,
-            project_id=project_id,
-            project=project,
-            config=config,
-            multipliers=multipliers,
-            profile_snapshot=profile_snapshot,
-            scoring_engine_version=scoring_engine_version,
-        )
+    _, profile_snapshot, project = _resolve_project_scoring_context(project_id)
+    scoring_engine_version = str(project.get("scoring_engine_version_locked") or "v1")
+    submission_id = str(uuid4())
+
+    report = _build_pending_submission_report(
+        project=project,
+        scoring_engine_version=scoring_engine_version,
+    )
+    if profile_snapshot:
+        report_meta = report.get("meta")
+        report_meta = report_meta if isinstance(report_meta, dict) else {}
+        report_meta["expert_profile_snapshot"] = profile_snapshot
+        report_meta["expert_profile_id"] = profile_snapshot.get("id")
+        report["meta"] = report_meta
 
     record = {
         "id": submission_id,
         "project_id": project_id,
         "filename": normalized_filename,
-        "total_score": float(report.get("total_score", report.get("rule_total_score", 0.0))),
+        "total_score": 0.0,
         "report": report,
         "text": text,
         "created_at": now_utc.isoformat(),
+        "updated_at": now_utc.isoformat(),
         "expert_profile_id_used": profile_snapshot.get("id") if profile_snapshot else None,
     }
     submissions.append(record)
     save_submissions(submissions)
-
-    snapshots = load_score_reports()
-    snapshots.append(
-        _build_score_report_snapshot(
-            submission_id=submission_id,
-            project=project,
-            report=report,
-            profile_snapshot=profile_snapshot,
-            scoring_engine_version=scoring_engine_version,
-        )
-    )
-    save_score_reports(snapshots)
-    if evidence_units:
-        all_units = load_evidence_units()
-        all_units = _replace_submission_evidence_units(
-            all_units,
-            submission_id=submission_id,
-            new_units=evidence_units,
-        )
-        save_evidence_units(all_units)
-
-    # 记录评分历史
-    dimension_scores = {
-        dim_id: dim.get("score", 0.0) for dim_id, dim in report.get("dimension_scores", {}).items()
-    }
-    penalty_count = len(report.get("penalties", []))
-    record_history_score(
-        project_id=project_id,
-        submission_id=submission_id,
-        filename=normalized_filename,
-        total_score=float(report.get("total_score", report.get("rule_total_score", 0.0))),
-        dimension_scores=dimension_scores,
-        penalty_count=penalty_count,
-    )
 
     return SubmissionRecord(**record)
 
@@ -4789,9 +4820,12 @@ def compare_submissions(
     projects = load_projects()
     project = next((p for p in projects if str(p.get("id")) == project_id), {"id": project_id})
     allow_pred_score = _select_calibrator_model(project) is not None
-    submissions = [s for s in load_submissions() if s["project_id"] == project_id]
-    if not submissions:
+    submissions_all = [s for s in load_submissions() if s["project_id"] == project_id]
+    if not submissions_all:
         raise HTTPException(status_code=404, detail=t("api.no_submissions", locale=locale))
+    submissions = [s for s in submissions_all if _submission_is_scored(s)]
+    if not submissions:
+        raise HTTPException(status_code=404, detail="暂无已评分施组，请先点击“评分施组”。")
     rankings = []
     for s in submissions:
         score_fields = _resolve_submission_score_fields(s, allow_pred_score=allow_pred_score)
@@ -4856,9 +4890,12 @@ def compare_report(
     projects = load_projects()
     project = next((p for p in projects if str(p.get("id")) == project_id), {"id": project_id})
     allow_pred_score = _select_calibrator_model(project) is not None
-    submissions = [s for s in load_submissions() if s["project_id"] == project_id]
-    if not submissions:
+    submissions_all = [s for s in load_submissions() if s["project_id"] == project_id]
+    if not submissions_all:
         raise HTTPException(status_code=404, detail=t("api.no_submissions", locale=locale))
+    submissions = [s for s in submissions_all if _submission_is_scored(s)]
+    if not submissions:
+        raise HTTPException(status_code=404, detail="暂无已评分施组，请先点击“评分施组”。")
     submissions_for_compare = []
     by_id: Dict[str, Dict[str, object]] = {}
     for s in submissions:
@@ -4910,9 +4947,12 @@ def adaptive_suggestions(
     支持 Accept-Language header 进行多语言响应。
     """
     ensure_data_dirs()
-    submissions = [s for s in load_submissions() if s["project_id"] == project_id]
-    if not submissions:
+    submissions_all = [s for s in load_submissions() if s["project_id"] == project_id]
+    if not submissions_all:
         raise HTTPException(status_code=404, detail=t("api.no_submissions", locale=locale))
+    submissions = [s for s in submissions_all if _submission_is_scored(s)]
+    if not submissions:
+        raise HTTPException(status_code=404, detail="暂无已评分施组，请先点击“评分施组”。")
     config = load_config()
     result = build_adaptive_suggestions(submissions, config.lexicon)
     return AdaptiveSuggestions(project_id=project_id, **result)
@@ -5092,9 +5132,12 @@ def project_insights(
     支持 Accept-Language header 进行多语言响应。
     """
     ensure_data_dirs()
-    submissions = [s for s in load_submissions() if s["project_id"] == project_id]
-    if not submissions:
+    submissions_all = [s for s in load_submissions() if s["project_id"] == project_id]
+    if not submissions_all:
         raise HTTPException(status_code=404, detail=t("api.no_submissions", locale=locale))
+    submissions = [s for s in submissions_all if _submission_is_scored(s)]
+    if not submissions:
+        raise HTTPException(status_code=404, detail="暂无已评分施组，请先点击“评分施组”。")
     insights = build_project_insights(submissions)
     return InsightsReport(project_id=project_id, **insights)
 
@@ -5121,9 +5164,12 @@ def update_learning_profile(
     支持 Accept-Language header 进行多语言响应。
     """
     ensure_data_dirs()
-    submissions = [s for s in load_submissions() if s["project_id"] == project_id]
-    if not submissions:
+    submissions_all = [s for s in load_submissions() if s["project_id"] == project_id]
+    if not submissions_all:
         raise HTTPException(status_code=404, detail=t("api.no_submissions", locale=locale))
+    submissions = [s for s in submissions_all if _submission_is_scored(s)]
+    if not submissions:
+        raise HTTPException(status_code=404, detail="暂无已评分施组，请先点击“评分施组”。")
     profile = build_learning_profile(submissions)
     profiles = load_learning_profiles()
     record = {
@@ -5367,6 +5413,10 @@ def add_ground_truth(
     records.append(record)
     save_ground_truth(records)
     _sync_ground_truth_record_to_qingtian(project_id, record)
+    try:
+        _run_feedback_closed_loop(project_id, locale=locale, trigger="ground_truth_add")
+    except Exception:
+        pass
     return GroundTruthRecord(**record)
 
 
@@ -5414,6 +5464,10 @@ async def add_ground_truth_from_file(
     records.append(record)
     save_ground_truth(records)
     _sync_ground_truth_record_to_qingtian(project_id, record)
+    try:
+        _run_feedback_closed_loop(project_id, locale=locale, trigger="ground_truth_add")
+    except Exception:
+        pass
     return GroundTruthRecord(**record)
 
 
@@ -5489,6 +5543,10 @@ async def add_ground_truth_from_files(
                     _sync_ground_truth_record_to_qingtian(project_id, record)
                 except Exception as e:
                     item["detail"] = f"已保存，但同步青天失败：{e}"
+        try:
+            _run_feedback_closed_loop(project_id, locale=locale, trigger="ground_truth_batch_add")
+        except Exception:
+            pass
 
     success_count = sum(1 for item in items if item.get("ok"))
     failed_count = len(items) - success_count
@@ -6181,7 +6239,7 @@ def web_score_shigong(
 def web_upload_shigong_get_fallback(project_id: str = ""):
     return RedirectResponse(
         url=_web_upload_redirect_url(
-            project_id, "请在主页选择文件后点击“上传并评分”提交。", "#section-shigong"
+            project_id, "请在主页选择文件后点击“上传施组”提交。", "#section-shigong"
         ),
         status_code=303,
     )
@@ -6394,8 +6452,12 @@ def index(
                 if not allow_pred_initial:
                     pred_total = None
                 llm_total = report.get("llm_total_score")
+                scoring_status = str(report.get("scoring_status") or "").strip().lower()
+                is_pending = scoring_status == "pending"
                 primary_total = pred_total if pred_total is not None else s.get("total_score")
-                if pred_total is not None:
+                if is_pending:
+                    score_cell = '<span class="note">待评分</span>'
+                elif pred_total is not None:
                     score_cell = html_lib.escape(str(pred_total))
                     note_items: List[str] = []
                     if rule_total is not None:
@@ -7029,8 +7091,12 @@ def index(
               const pred = report && report.pred_total_score != null ? report.pred_total_score : null;
               const rule = report && report.rule_total_score != null ? report.rule_total_score : null;
               const llm = report && report.llm_total_score != null ? report.llm_total_score : null;
+              const scoringStatus = String((report && report.scoring_status) || '').toLowerCase();
+              const isPending = scoringStatus === 'pending';
               let scoreHtml = '-';
-              if (pred != null) {
+              if (isPending) {
+                scoreHtml = '<span class="note">待评分</span>';
+              } else if (pred != null) {
                 scoreHtml = fallbackEscapeHtml(String(pred));
                 const notes = [];
                 if (rule != null) notes.push('规则: ' + fallbackEscapeHtml(String(rule)));
@@ -8366,10 +8432,10 @@ def index(
                 details.push('[失败] ' + f.name + ' -> ' + String((err && err.message) || err || '网络异常'));
               }
             }
-            if (o) o.textContent = '施组上传完成：成功 ' + okCount + '，失败 ' + failCount + NL + details.join(NL);
+            if (o) o.textContent = '施组上传完成：成功 ' + okCount + '，失败 ' + failCount + '。成功文件已入库，待点击“评分施组”后出分。' + NL + details.join(NL);
             setActionStatus(
               'shigongActionStatus',
-              '上传完成：成功 ' + okCount + '，失败 ' + failCount + '。',
+              '上传完成：成功 ' + okCount + '，失败 ' + failCount + '。成功文件待评分。',
               failCount > 0
             );
             if (okCount > 0) await refreshSubmissions(projectId, projectSwitchSeq);
@@ -8571,8 +8637,12 @@ def index(
             const pred = (rep && rep.pred_total_score != null) ? rep.pred_total_score : null;
             const rule = (rep && rep.rule_total_score != null) ? rep.rule_total_score : null;
             const llm = (rep && rep.llm_total_score != null) ? rep.llm_total_score : null;
+            const scoringStatus = String((rep && rep.scoring_status) || '').toLowerCase();
+            const isPending = scoringStatus === 'pending';
             let scoreHtml = '-';
-            if (pred != null) {
+            if (isPending) {
+              scoreHtml = '<span class="note">待评分</span>';
+            } else if (pred != null) {
               scoreHtml = escapeHtmlText(String(pred));
               const notes = [];
               if (rule != null) notes.push('规则: ' + escapeHtmlText(String(rule)));
@@ -8860,6 +8930,7 @@ def index(
         }
 
         safeClick('btnCompare', async () => {
+          if (!ensureProjectForAction('compareResult')) return;
           setResultLoading('compareResult', '对比排名加载中...');
           const projectId = actionProjectId();
           const res = await fetch('/api/v1/projects/' + projectId + '/compare');
@@ -8877,6 +8948,7 @@ def index(
         });
 
         safeClick('btnCompareReport', async () => {
+          if (!ensureProjectForAction('compareReportResult')) return;
           setResultLoading('compareReportResult', '对比报告生成中...');
           const projectId = actionProjectId();
           const res = await fetch('/api/v1/projects/' + projectId + '/compare_report');
@@ -9078,6 +9150,7 @@ def index(
         });
 
         safeClick('btnInsights', async () => {
+          if (!ensureProjectForAction('insightsResult')) return;
           setResultLoading('insightsResult', '洞察分析中...');
           const projectId = actionProjectId();
           const res = await fetch('/api/v1/projects/' + projectId + '/insights');
@@ -9102,6 +9175,7 @@ def index(
         });
 
         safeClick('btnLearning', async () => {
+          if (!ensureProjectForAction('learningResult')) return;
           setResultLoading('learningResult', '学习画像生成中...');
           const projectId = actionProjectId();
           const res = await fetch('/api/v1/projects/' + projectId + '/learning', { method: 'POST' });
