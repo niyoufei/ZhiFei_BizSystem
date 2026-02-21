@@ -12,6 +12,7 @@ classifiers = [
 ]
 dependencies = [
   "fastapi",
+  "numpy",
   "pydantic",
   "python-docx",
   "PyYAML",

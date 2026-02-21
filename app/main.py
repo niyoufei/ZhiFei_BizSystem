@@ -96,6 +96,7 @@ from app.engine.reflection import (
     mine_patch_package,
 )
 from app.engine.scorer import score_text
+from app.engine.surrogate_learning import calibrate_weights
 from app.engine.v2_scorer import compute_v2_rule_total, score_text_v2
 from app.i18n import DEFAULT_LOCALE, SUPPORTED_LOCALES, t
 from app.metrics import get_metrics, record_score, update_project_stats
@@ -307,6 +308,20 @@ def _normalize_weights(weights_raw: Dict[str, int]) -> Dict[str, float]:
     }
     total = sum(multipliers.values()) or 1.0
     return {dim_id: multipliers[dim_id] / total for dim_id in DIMENSION_IDS}
+
+
+def _weights_raw_from_norm(weights_norm: Dict[str, float]) -> Dict[str, int]:
+    """
+    将归一化权重反推为 0..10 的关注度整数（用于专家配置落库与前端滑杆展示）。
+    """
+    total_dims = max(1, len(DIMENSION_IDS))
+    out: Dict[str, int] = {}
+    for dim_id in DIMENSION_IDS:
+        w = max(0.0, float(weights_norm.get(dim_id, 1.0 / total_dims)))
+        multiplier = w * total_dims
+        raw = int(round((multiplier - 0.5) * 10.0))
+        out[dim_id] = max(0, min(10, raw))
+    return out
 
 
 def _coerce_weights_raw(weights_raw: Dict[str, int]) -> Dict[str, int]:
@@ -1341,6 +1356,8 @@ def _build_v2_report_payload(
         "penalties": v2_result.get("penalties", []),
         "lint_findings": v2_result.get("lint_findings", []),
         "suggestions": v2_result.get("suggestions", []),
+        "probe_dimensions": v2_result.get("probe_dimensions", []),
+        "pre_flight": v2_result.get("pre_flight", {}),
         "requirement_hits": v2_result.get("requirement_hits", []),
         "mandatory_req_hit_rate": v2_result.get("mandatory_req_hit_rate"),
         "requirement_pack_versions": v2_result.get("requirement_pack_versions", []),
@@ -1771,14 +1788,20 @@ def _score_submission_for_project(
             project=project,
         )
         effective_requirements = list(requirements) + list(runtime_custom_requirements)
-        v2_result = score_text_v2(
-            submission_id=submission_id,
-            text=text,
-            lexicon=config.lexicon,
-            weights_norm=weights_norm,
-            anchors=anchors,
-            requirements=effective_requirements,
-        )
+        meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
+        strict_pre_flight = bool(meta.get("enforce_gb_redline", False))
+        try:
+            v2_result = score_text_v2(
+                submission_id=submission_id,
+                text=text,
+                lexicon=config.lexicon,
+                weights_norm=weights_norm,
+                anchors=anchors,
+                requirements=effective_requirements,
+                strict_pre_flight=strict_pre_flight,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         report = _build_v2_report_payload(
             v2_result,
             text=text,
@@ -1986,13 +2009,99 @@ def _refresh_project_reflection_objects(project_id: str) -> None:
     save_calibration_samples(all_samples)
 
 
-def _auto_update_project_weights_from_delta_cases(project_id: str) -> Dict[str, object]:
-    """
-    基于 DELTA_CASE 的维度偏差自动微调 16 维关注度。
-    规则：
-    - rule_dim > qt_dim（正偏差） -> 关注度下调
-    - rule_dim < qt_dim（负偏差） -> 关注度上调
-    """
+def _build_feedback_records_for_project(project_id: str) -> List[Dict[str, object]]:
+    projects = load_projects()
+    project = next((p for p in projects if str(p.get("id")) == project_id), None)
+    if project is None:
+        return []
+    project_score_scale = _resolve_project_score_scale_max(project)
+    submissions = [s for s in load_submissions() if str(s.get("project_id")) == project_id]
+    submissions_by_id: Dict[str, Dict[str, object]] = {str(s.get("id")): s for s in submissions}
+
+    feedback_records: List[Dict[str, object]] = []
+    ground_truth_rows = [r for r in load_ground_truth() if str(r.get("project_id")) == project_id]
+    for row in ground_truth_rows:
+        if not isinstance(row, dict):
+            continue
+        judge_scores = row.get("judge_scores")
+        if not isinstance(judge_scores, list) or len(judge_scores) not in (5, 7):
+            continue
+        source_submission_id = str(row.get("source_submission_id") or "").strip()
+        sub = submissions_by_id.get(source_submission_id) if source_submission_id else None
+        if sub is None:
+            gt_text = str(row.get("shigong_text") or "").strip()
+            if gt_text:
+                sub = next(
+                    (
+                        s
+                        for s in submissions
+                        if str(s.get("text") or "").strip() == gt_text and _submission_is_scored(s)
+                    ),
+                    None,
+                )
+        if sub is None:
+            continue
+
+        report = sub.get("report") if isinstance(sub.get("report"), dict) else {}
+        pred_raw = _to_float_or_none(report.get("pred_total_score"))
+        if pred_raw is None:
+            pred_raw = _to_float_or_none(report.get("rule_total_score"))
+        if pred_raw is None:
+            pred_raw = _to_float_or_none(report.get("total_score"))
+        if pred_raw is None:
+            pred_raw = _to_float_or_none(sub.get("total_score"))
+        if pred_raw is None:
+            continue
+
+        predicted_total_100 = _convert_score_to_100(float(pred_raw), project_score_scale)
+        if predicted_total_100 is None:
+            continue
+
+        row_scale = _normalize_score_scale_max(
+            row.get("score_scale_max"),
+            default=project_score_scale,
+        )
+        tags_by_judge = row.get("qualitative_tags_by_judge")
+        judge_feedbacks: List[Dict[str, object]] = []
+        for idx, score_raw in enumerate(judge_scores):
+            score_value = _to_float_or_none(score_raw)
+            if score_value is None:
+                score_value = 0.0
+            score_100 = _convert_score_to_100(score_value, row_scale)
+            if score_100 is None:
+                score_100 = 0.0
+            tags: List[str] = []
+            if isinstance(tags_by_judge, list) and idx < len(tags_by_judge):
+                candidate = tags_by_judge[idx]
+                if isinstance(candidate, list):
+                    tags = [str(x).strip() for x in candidate if str(x).strip()]
+            judge_feedbacks.append(
+                {
+                    "judge_index": idx + 1,
+                    "score": round(float(score_100), 4),
+                    "qualitative_tags": tags,
+                }
+            )
+
+        normalized_row = _ground_truth_record_for_learning(
+            row,
+            default_score_scale_max=project_score_scale,
+        )
+        feedback_records.append(
+            {
+                "id": str(row.get("id") or ""),
+                "project_id": project_id,
+                "submission_id": str(sub.get("id") or ""),
+                "predicted_total_score": round(float(predicted_total_100), 4),
+                "final_total_score": round(float(normalized_row.get("final_score", 0.0)), 4),
+                "judge_feedbacks": judge_feedbacks,
+                "created_at": str(row.get("created_at") or _now_iso()),
+            }
+        )
+    return feedback_records
+
+
+def _auto_update_from_delta_cases(project_id: str) -> Dict[str, object]:
     projects = load_projects()
     project = next((p for p in projects if str(p.get("id")) == project_id), None)
     if project is None:
@@ -2096,11 +2205,73 @@ def _auto_update_project_weights_from_delta_cases(project_id: str) -> Dict[str, 
         "sample_count": len(delta_cases),
         "changed_dims": changed_dims,
         "new_profile_id": new_profile["id"],
+        "strategy": "delta_case_fallback",
         "new_weights_norm": dict(new_profile.get("weights_norm") or {}),
         "new_dimension_multipliers": _weights_norm_to_dimension_multipliers(
             dict(new_profile.get("weights_norm") or {})
         ),
     }
+
+
+def _auto_update_project_weights_from_delta_cases(project_id: str) -> Dict[str, object]:
+    """
+    优先使用「总分+标签」定向反演（模块一/二）；
+    若反馈样本不足再回退到 DELTA_CASE 规则。
+    """
+    projects = load_projects()
+    project = next((p for p in projects if str(p.get("id")) == project_id), None)
+    if project is None:
+        return {"updated": False, "reason": "project_not_found"}
+
+    profiles = load_expert_profiles()
+    profile, created = _ensure_project_expert_profile(project, profiles)
+    if created:
+        save_expert_profiles(profiles)
+        save_projects(projects)
+
+    feedback_records = _build_feedback_records_for_project(project_id)
+    if feedback_records:
+        current_weights_norm = dict(profile.get("weights_norm") or {})
+        calibrated = calibrate_weights(
+            current_weights_norm,
+            feedback_records,
+            half_life_days=30.0,
+            lr_tag=0.08,
+            lr_global=0.004,
+            ridge_lambda=0.06,
+            min_weight=0.005,
+        )
+        new_weights_norm = dict(calibrated.get("weights_norm") or {})
+        if new_weights_norm:
+            new_weights_raw = _weights_raw_from_norm(new_weights_norm)
+            auto_name = f"{project.get('name', '项目')}_tag_guided_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            new_profile = _new_expert_profile(auto_name, new_weights_raw)
+            # 保留算法输出的精确归一化权重，避免反推整数造成信息损失
+            new_profile["weights_norm"] = {
+                dim_id: float(new_weights_norm.get(dim_id, 1.0 / len(DIMENSION_IDS)))
+                for dim_id in DIMENSION_IDS
+            }
+            profiles.append(new_profile)
+            save_expert_profiles(profiles)
+
+            project["expert_profile_id"] = new_profile["id"]
+            project["updated_at"] = _now_iso()
+            save_projects(projects)
+
+            return {
+                "updated": True,
+                "strategy": "tag_guided_calibration",
+                "sample_count": len(feedback_records),
+                "new_profile_id": new_profile["id"],
+                "calibration_stats": calibrated.get("stats") or {},
+                "new_weights_norm": dict(new_profile.get("weights_norm") or {}),
+                "new_dimension_multipliers": _weights_norm_to_dimension_multipliers(
+                    dict(new_profile.get("weights_norm") or {})
+                ),
+            }
+
+    # 回退：历史 DELTA_CASE 方案
+    return _auto_update_from_delta_cases(project_id)
 
 
 def _sync_feedback_weights_to_evolution(
@@ -6099,6 +6270,35 @@ def _normalize_judge_weights_or_422(
     return normalized
 
 
+def _normalize_qualitative_tags_or_422(
+    tags_by_judge: object,
+    *,
+    expected_count: int,
+) -> Optional[List[List[str]]]:
+    if tags_by_judge is None:
+        return None
+    if not isinstance(tags_by_judge, list):
+        raise HTTPException(status_code=422, detail="qualitative_tags_by_judge 必须为数组。")
+    if len(tags_by_judge) != expected_count:
+        raise HTTPException(
+            status_code=422,
+            detail=f"qualitative_tags_by_judge 长度需与 judge_scores 一致（当前应为 {expected_count}）。",
+        )
+    normalized: List[List[str]] = []
+    for idx, tags in enumerate(tags_by_judge, start=1):
+        if tags is None:
+            normalized.append([])
+            continue
+        if not isinstance(tags, list):
+            raise HTTPException(
+                status_code=422,
+                detail=f"qualitative_tags_by_judge[{idx}] 必须为字符串数组。",
+            )
+        clean_tags = [str(x).strip() for x in tags if str(x).strip()]
+        normalized.append(clean_tags)
+    return normalized
+
+
 def _parse_judge_scores_form(judge_scores: str) -> List[float]:
     try:
         scores = json.loads(judge_scores)
@@ -6150,11 +6350,16 @@ def _new_ground_truth_record(
     source: str,
     score_scale_max: int,
     judge_weights: Optional[List[float]] = None,
+    qualitative_tags_by_judge: Optional[List[List[str]]] = None,
 ) -> Dict[str, object]:
     score_scale = _normalize_score_scale_max(score_scale_max, default=100)
     normalized_judge_scores = _normalize_judge_scores_or_422(judge_scores)
     normalized_judge_weights = _normalize_judge_weights_or_422(
         judge_weights,
+        expected_count=len(normalized_judge_scores),
+    )
+    normalized_tags = _normalize_qualitative_tags_or_422(
+        qualitative_tags_by_judge,
         expected_count=len(normalized_judge_scores),
     )
     final_raw = float(final_score)
@@ -6171,6 +6376,7 @@ def _new_ground_truth_record(
         "final_score_raw": round(final_raw, 2),
         "final_score_100": round(final_100, 2),
         "judge_weights": normalized_judge_weights,
+        "qualitative_tags_by_judge": normalized_tags,
         "source": source,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -6213,6 +6419,7 @@ def add_ground_truth(
         source=payload.source,
         score_scale_max=score_scale_max,
         judge_weights=payload.judge_weights,
+        qualitative_tags_by_judge=payload.qualitative_tags_by_judge,
     )
     records.append(record)
     save_ground_truth(records)
@@ -6270,6 +6477,7 @@ def add_ground_truth_from_submission(
         source=payload.source,
         score_scale_max=score_scale_max,
         judge_weights=None,
+        qualitative_tags_by_judge=payload.qualitative_tags_by_judge,
     )
     record["source_submission_id"] = submission_id
     record["source_submission_filename"] = submission.get("filename")
@@ -6328,6 +6536,7 @@ async def add_ground_truth_from_file(
         source=source,
         score_scale_max=score_scale_max,
         judge_weights=None,
+        qualitative_tags_by_judge=None,
     )
     records.append(record)
     save_ground_truth(records)
@@ -6383,6 +6592,7 @@ async def add_ground_truth_from_files(
                 source=source,
                 score_scale_max=score_scale_max,
                 judge_weights=None,
+                qualitative_tags_by_judge=None,
             )
             success_records.append(record)
             items.append(

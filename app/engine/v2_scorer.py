@@ -4,6 +4,8 @@ import re
 from typing import Any, Dict, List, Tuple
 
 from app.engine.evidence_units import build_evidence_units
+from app.engine.preflight import PreFlightFatalError, pre_flight_check
+from app.engine.template_rag import build_probe_template_suggestions, compute_probe_dimensions
 
 DIMENSION_IDS = [f"{i:02d}" for i in range(1, 17)]
 DIM_BASE_LEGACY_MAX = 80.0
@@ -808,6 +810,8 @@ def _build_lint_findings(
 def _build_suggestions(
     dim_scores: Dict[str, Dict[str, Any]],
     weights_norm: Dict[str, float],
+    *,
+    probe_dimensions: List[Dict[str, Any]] | None = None,
 ) -> List[Dict[str, Any]]:
     suggestions: List[Dict[str, Any]] = []
     for dim_id, score_item in dim_scores.items():
@@ -837,6 +841,9 @@ def _build_suggestions(
             -float(weights_norm.get(str(x.get("dimension_id")), 1.0 / 16)),
         )
     )
+    if probe_dimensions:
+        rag_suggestions = build_probe_template_suggestions(probe_dimensions, threshold=0.8)
+        suggestions = rag_suggestions + suggestions
     return suggestions
 
 
@@ -849,7 +856,17 @@ def score_text_v2(
     anchors: List[Dict[str, Any]] | None = None,
     requirements: List[Dict[str, Any]] | None = None,
     evidence_units: List[Dict[str, Any]] | None = None,
+    strict_pre_flight: bool = False,
 ) -> Dict[str, Any]:
+    pre_flight_result: Dict[str, object] = {"ok": True, "fatal": False}
+    if strict_pre_flight:
+        try:
+            pre_flight_result = pre_flight_check(text, raise_on_fatal=True)
+        except PreFlightFatalError as exc:
+            raise ValueError(f"红线校验未通过：{exc}") from exc
+    else:
+        pre_flight_result = pre_flight_check(text, raise_on_fatal=False)
+
     anchors = anchors or []
     requirements = requirements or []
     if evidence_units is None:
@@ -912,7 +929,12 @@ def score_text_v2(
         text=text,
         units_by_dim=units_by_dim,
     )
-    suggestions = _build_suggestions(dim_scores, weights_norm)
+    probe_dimensions = compute_probe_dimensions(text=text, dim_scores=dim_scores)
+    suggestions = _build_suggestions(
+        dim_scores,
+        weights_norm,
+        probe_dimensions=probe_dimensions,
+    )
 
     mandatory_total = sum(1 for r in req_hits if r.get("mandatory"))
     mandatory_hit = sum(1 for r in req_hits if r.get("mandatory") and r.get("hit"))
@@ -936,6 +958,8 @@ def score_text_v2(
         "penalties": penalties,
         "lint_findings": lint_findings,
         "suggestions": suggestions,
+        "probe_dimensions": probe_dimensions,
+        "pre_flight": pre_flight_result,
         "requirement_hits": req_hits,
         "mandatory_req_hit_rate": req_hit_rate,
         "requirement_pack_versions": requirement_pack_versions,

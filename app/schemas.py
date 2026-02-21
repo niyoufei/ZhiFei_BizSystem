@@ -750,6 +750,10 @@ class GroundTruthRecord(BaseModel):
     final_score_raw: Optional[float] = Field(None, description="原始录入最终分（按项目满分制）")
     final_score_100: Optional[float] = Field(None, description="归一化到100分制后的最终分")
     judge_weights: Optional[List[float]] = Field(None, description="5个评委关注度/权重")
+    qualitative_tags_by_judge: Optional[List[List[str]]] = Field(
+        None,
+        description="每位评委的定性标签（例：[['扣了进度分'], ['重点表扬了BIM']...]）",
+    )
     source: str = Field(default="青天大模型", description="来源")
     created_at: str
 
@@ -763,6 +767,10 @@ class GroundTruthCreate(BaseModel):
     judge_weights: Optional[List[float]] = Field(
         None, description="评委关注度/权重（长度需与评委人数一致）"
     )
+    qualitative_tags_by_judge: Optional[List[List[str]]] = Field(
+        None,
+        description="每位评委对应的定性标签数组（可选）",
+    )
     source: str = Field(default="青天大模型", description="来源")
 
 
@@ -772,7 +780,33 @@ class GroundTruthFromSubmissionCreate(BaseModel):
     submission_id: str = Field(..., description="施组提交ID（来自步骤4已上传列表）")
     judge_scores: List[float] = Field(..., description="5或7个评委得分")
     final_score: float = Field(..., description="最终得分")
+    qualitative_tags_by_judge: Optional[List[List[str]]] = Field(
+        None,
+        description="每位评委对应的定性标签数组（可选）",
+    )
     source: str = Field(default="青天大模型", description="来源")
+
+
+class JudgeFeedback(BaseModel):
+    """单个评委反馈（用于定向反演）"""
+
+    score: float = Field(..., description="评委给出的总分")
+    qualitative_tags: List[str] = Field(
+        default_factory=list,
+        description="定性标签（例：扣了进度分、重点表扬了BIM）",
+    )
+
+
+class FeedbackRecord(BaseModel):
+    """用于权重反演训练的反馈记录"""
+
+    id: Optional[str] = None
+    project_id: str
+    submission_id: Optional[str] = None
+    predicted_total_score: float = Field(..., description="系统预测总分")
+    final_total_score: Optional[float] = Field(None, description="真实最终总分")
+    judge_feedbacks: List[JudgeFeedback] = Field(default_factory=list)
+    created_at: str = Field(..., description="反馈时间（ISO 8601）")
 
 
 class GroundTruthBatchItem(BaseModel):
