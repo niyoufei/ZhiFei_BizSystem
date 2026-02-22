@@ -79,6 +79,10 @@ from app.engine.compare import build_compare_narrative
 from app.engine.dimensions import DIMENSIONS
 from app.engine.evaluation import evaluate_project_variants
 from app.engine.evolution import build_evolution_report
+from app.engine.feature_distillation import (
+    select_top_logic_skeletons,
+    update_feature_confidence,
+)
 from app.engine.history import (
     analyze_trend,
     get_history,
@@ -2391,6 +2395,102 @@ def _run_feedback_closed_loop(project_id: str, *, locale: str, trigger: str) -> 
     return result
 
 
+def _collect_applied_feature_ids_from_report(
+    report: Dict[str, object],
+    *,
+    top_k_per_probe: int = 2,
+) -> List[str]:
+    """
+    从评分报告中提取“本轮建议所采用”的高分骨架特征 ID。
+    优先使用 suggestions[*].applied_feature_ids；
+    若历史报告缺字段，则按探针维度回填 top-k 活跃特征。
+    """
+    feature_ids: set[str] = set()
+    probe_ids: set[str] = set()
+
+    suggestions = report.get("suggestions")
+    if isinstance(suggestions, list):
+        for item in suggestions:
+            if not isinstance(item, dict):
+                continue
+            raw_feature_ids = item.get("applied_feature_ids")
+            if isinstance(raw_feature_ids, list):
+                for fid in raw_feature_ids:
+                    s = str(fid or "").strip()
+                    if s:
+                        feature_ids.add(s)
+            dim_id = str(item.get("dimension_id") or "").strip().upper()
+            if dim_id.startswith("P"):
+                probe_ids.add(dim_id)
+
+    # 回填：旧报告无 applied_feature_ids 时，按低分探针补全
+    if not probe_ids:
+        probes = report.get("probe_dimensions")
+        if isinstance(probes, list):
+            for probe in probes:
+                if not isinstance(probe, dict):
+                    continue
+                probe_id = str(probe.get("id") or "").strip().upper()
+                score_rate = _to_float_or_none(probe.get("score_rate"))
+                if probe_id.startswith("P") and (score_rate is None or score_rate < 0.8):
+                    probe_ids.add(probe_id)
+
+    for probe_id in sorted(probe_ids):
+        for feature in select_top_logic_skeletons(
+            dimension_ids=[probe_id],
+            top_k=max(1, int(top_k_per_probe)),
+        ):
+            fid = str(feature.feature_id or "").strip()
+            if fid:
+                feature_ids.add(fid)
+
+    return sorted(feature_ids)
+
+
+def _auto_update_feature_confidence_on_ground_truth(
+    *,
+    report: Dict[str, object],
+    gt_record: Dict[str, object],
+    project_score_scale_max: int,
+) -> Dict[str, object]:
+    """
+    真实评标录入后，立即执行一次 feature confidence 闭环更新。
+    """
+    applied_feature_ids = _collect_applied_feature_ids_from_report(report)
+    if not applied_feature_ids:
+        return {"updated": 0, "retired": 0, "reason": "no_applied_feature_ids"}
+
+    gt_for_learning = _ground_truth_record_for_learning(
+        gt_record,
+        default_score_scale_max=project_score_scale_max,
+    )
+    actual_score_100 = _to_float_or_none(gt_for_learning.get("final_score"))
+    if actual_score_100 is None:
+        return {"updated": 0, "retired": 0, "reason": "missing_actual_score"}
+
+    pred_score_100 = _to_float_or_none(report.get("pred_total_score"))
+    if pred_score_100 is None:
+        pred_score_100 = _to_float_or_none(report.get("total_score"))
+    if pred_score_100 is None:
+        pred_score_100 = _to_float_or_none(report.get("rule_total_score"))
+    if pred_score_100 is None:
+        return {"updated": 0, "retired": 0, "reason": "missing_predicted_score"}
+
+    # 兜底兼容：若项目为5分制且报告字段偶发为5分口径，则转回100分口径。
+    if int(project_score_scale_max) == 5 and pred_score_100 <= 5.0:
+        pred_score_100 = float(_convert_score_to_100(pred_score_100, 5) or 0.0)
+
+    update_result = update_feature_confidence(
+        applied_feature_ids=applied_feature_ids,
+        actual_score=float(actual_score_100),
+        predicted_score=float(pred_score_100),
+    )
+    update_result["applied_feature_ids"] = applied_feature_ids
+    update_result["actual_score_100"] = round(float(actual_score_100), 2)
+    update_result["predicted_score_100"] = round(float(pred_score_100), 2)
+    return update_result
+
+
 def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, object]) -> None:
     projects = load_projects()
     project = _find_project(project_id, projects)
@@ -2506,16 +2606,54 @@ def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, 
         )
 
     qt_results = load_qingtian_results()
-    exists = any(
-        str((r.get("raw_payload") or {}).get("ground_truth_record_id") or "") == source_gt_id
-        for r in qt_results
+    matched_qt = next(
+        (
+            r
+            for r in qt_results
+            if str((r.get("raw_payload") or {}).get("ground_truth_record_id") or "") == source_gt_id
+        ),
+        None,
     )
     project_score_scale = _resolve_project_score_scale_max(project)
     gt_for_learning = _ground_truth_record_for_learning(
         gt_record,
         default_score_scale_max=project_score_scale,
     )
-    if not exists:
+    feature_confidence_update: Dict[str, object] = {
+        "updated": 0,
+        "retired": 0,
+        "reason": "not_executed",
+    }
+    report_for_feedback = matched_submission.get("report")
+    if isinstance(report_for_feedback, dict):
+        try:
+            feature_confidence_update = _auto_update_feature_confidence_on_ground_truth(
+                report=report_for_feedback,
+                gt_record=gt_record,
+                project_score_scale_max=project_score_scale,
+            )
+        except Exception as exc:
+            feature_confidence_update = {
+                "updated": 0,
+                "retired": 0,
+                "reason": "feature_confidence_update_error",
+                "error": str(exc),
+            }
+
+    if source_gt_id:
+        all_gt_records = load_ground_truth()
+        changed_gt = False
+        for row in all_gt_records:
+            if str(row.get("id") or "") != source_gt_id:
+                continue
+            row["feature_confidence_update"] = feature_confidence_update
+            row["updated_at"] = _now_iso()
+            changed_gt = True
+            break
+        if changed_gt:
+            save_ground_truth(all_gt_records)
+
+    if matched_qt is None:
         qt_results.append(
             {
                 "id": str(uuid4()),
@@ -2539,10 +2677,18 @@ def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, 
                     "final_score_raw": gt_for_learning.get("final_score_raw"),
                     "final_score_100": gt_for_learning.get("final_score"),
                     "score_scale_max": gt_for_learning.get("score_scale_max"),
+                    "feature_confidence_update": feature_confidence_update,
                 },
                 "created_at": _now_iso(),
             }
         )
+        save_qingtian_results(qt_results)
+    else:
+        raw_payload = matched_qt.get("raw_payload")
+        if not isinstance(raw_payload, dict):
+            raw_payload = {}
+        raw_payload["feature_confidence_update"] = feature_confidence_update
+        matched_qt["raw_payload"] = raw_payload
         save_qingtian_results(qt_results)
 
     if str(project.get("status") or "") == "scoring_preparation":

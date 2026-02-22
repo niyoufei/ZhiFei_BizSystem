@@ -809,6 +809,35 @@ class FeedbackRecord(BaseModel):
     created_at: str = Field(..., description="反馈时间（ISO 8601）")
 
 
+class ExtractedFeature(BaseModel):
+    """语义解构后的高分逻辑骨架（防查重存储）"""
+
+    feature_id: str = Field(..., description="特征唯一ID")
+    dimension_id: str = Field(..., description="关联维度ID")
+    logic_skeleton: List[str] = Field(
+        default_factory=list,
+        description="抽象逻辑骨架，禁止原文摘抄",
+    )
+    confidence_score: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="特征置信度，基于真实反馈自动更新",
+    )
+    usage_count: int = Field(default=0, ge=0, description="特征被系统采纳次数")
+    active: bool = Field(default=True, description="是否活跃（软删除后为False）")
+    retired_at: Optional[str] = Field(None, description="软删除时间")
+    created_at: Optional[str] = Field(None, description="创建时间")
+    updated_at: Optional[str] = Field(None, description="更新时间")
+
+
+class ExtractedFeatureStore(BaseModel):
+    """高分逻辑骨架特征库"""
+
+    schema_version: str = Field(default="v1")
+    features: List[ExtractedFeature] = Field(default_factory=list)
+
+
 class GroundTruthBatchItem(BaseModel):
     """批量录入中的单文件结果"""
 

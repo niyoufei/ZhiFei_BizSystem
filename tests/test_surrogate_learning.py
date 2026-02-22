@@ -96,3 +96,8 @@ def test_probe_template_suggestions_trigger_under_80_percent() -> None:
     suggestions = build_probe_template_suggestions(probes, threshold=0.8)
     assert suggestions
     assert any(s.get("dimension_id") == "P02" for s in suggestions)
+    p02 = next((s for s in suggestions if s.get("dimension_id") == "P02"), None)
+    assert p02 is not None
+    assert isinstance(p02.get("logic_skeletons"), list)
+    assert p02.get("references")
+    assert isinstance(p02.get("applied_feature_ids"), list)

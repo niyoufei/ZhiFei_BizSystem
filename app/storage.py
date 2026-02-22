@@ -26,6 +26,7 @@ DELTA_CASES_PATH = DATA_DIR / "delta_cases.json"
 CALIBRATION_SAMPLES_PATH = DATA_DIR / "calibration_samples.json"
 PATCH_PACKAGES_PATH = DATA_DIR / "patch_packages.json"
 PATCH_DEPLOYMENTS_PATH = DATA_DIR / "patch_deployments.json"
+HIGH_SCORE_FEATURES_PATH = DATA_DIR / "high_score_features.json"
 
 
 def ensure_data_dirs() -> None:
@@ -221,3 +222,12 @@ def load_patch_deployments() -> List[Dict[str, Any]]:
 
 def save_patch_deployments(data: List[Dict[str, Any]]) -> None:
     save_json(PATCH_DEPLOYMENTS_PATH, data)
+
+
+def load_high_score_features() -> List[Dict[str, Any]]:
+    """高分逻辑骨架特征库（可更新置信度）"""
+    return load_json(HIGH_SCORE_FEATURES_PATH, [])
+
+
+def save_high_score_features(data: List[Dict[str, Any]]) -> None:
+    save_json(HIGH_SCORE_FEATURES_PATH, data)
