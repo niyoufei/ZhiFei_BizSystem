@@ -3908,6 +3908,7 @@ MATERIAL_ALLOWED_EXTS = (
     ".xls",
     ".xlsm",
     ".csv",
+    ".dxf",
 )
 MATERIAL_ALLOWED_MIME_TOKENS = (
     "text/plain",
@@ -3917,6 +3918,11 @@ MATERIAL_ALLOWED_MIME_TOKENS = (
     "wordprocessingml",
     "spreadsheetml",
     "ms-excel",
+    "application/dxf",
+    "image/vnd.dxf",
+    "application/acad",
+    "application/x-autocad",
+    "drawing/x-dxf",
 )
 
 
@@ -3993,7 +3999,7 @@ def upload_material(
     """
     上传项目材料文件。
 
-    上传招标文件、清单等项目参考材料。支持 .txt、.pdf、.doc、.docx、.json、.xlsx/.xls。
+    上传招标文件、清单、图纸等项目参考材料。支持 .txt、.pdf、.doc、.docx、.json、.xlsx/.xls、.dxf。
     资料会持久保存，用于项目投喂包、学习与进化等。
 
     **需要 API Key 认证**（未配置 API_KEYS 时无需）
@@ -4007,7 +4013,8 @@ def upload_material(
         raise HTTPException(status_code=422, detail="资料文件名为空，请重试或重命名后上传。")
     if not _is_allowed_material_upload(normalized_name, file.content_type or ""):
         raise HTTPException(
-            status_code=422, detail="资料支持 .txt、.pdf、.doc、.docx、.json、.xlsx/.xls 格式"
+            status_code=422,
+            detail="资料支持 .txt、.pdf、.doc、.docx、.json、.xlsx/.xls、.dxf 格式",
         )
     projects = load_projects()
     if not any(p["id"] == project_id for p in projects):
@@ -4204,8 +4211,169 @@ def delete_material(
     return {"ok": True, "id": material_id}
 
 
+def _decode_dxf_text(content: bytes) -> str:
+    if b"\x00" in content[:4096]:
+        raise ValueError("DXF 解析失败：检测到二进制 DXF，请先另存为 ASCII DXF。")
+    for encoding in ("utf-8-sig", "gb18030", "latin-1"):
+        try:
+            return content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return content.decode("utf-8", errors="ignore")
+
+
+def _iter_dxf_group_pairs(text: str) -> List[tuple[int, str]]:
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    pairs: List[tuple[int, str]] = []
+    idx = 0
+    while idx + 1 < len(lines):
+        code_raw = lines[idx].strip()
+        value = lines[idx + 1].strip()
+        idx += 2
+        if not code_raw:
+            continue
+        try:
+            code = int(code_raw)
+        except ValueError:
+            continue
+        pairs.append((code, value))
+    return pairs
+
+
+def _extract_dxf_text(content: bytes) -> str:
+    raw_text = _decode_dxf_text(content)
+    pairs = _iter_dxf_group_pairs(raw_text)
+    if not pairs:
+        return "[DXF解析摘要]\n未读取到有效 DXF 组码。"
+
+    acadver = ""
+    codepage = ""
+    insunits: Optional[int] = None
+    unit_map = {
+        0: "未指定",
+        1: "英寸",
+        2: "英尺",
+        4: "毫米",
+        5: "厘米",
+        6: "米",
+        20: "秒",
+        21: "分",
+        22: "时",
+    }
+    for i, (code, value) in enumerate(pairs[:-1]):
+        if code != 9:
+            continue
+        key = value.upper()
+        next_code, next_value = pairs[i + 1]
+        if key == "$ACADVER" and next_code in (1, 3):
+            acadver = next_value.strip()
+        elif key == "$DWGCODEPAGE" and next_code in (1, 3):
+            codepage = next_value.strip()
+        elif key == "$INSUNITS" and next_code in (70, 280):
+            try:
+                insunits = int(float(next_value.strip()))
+            except Exception:
+                insunits = None
+
+    text_entity_types = {"TEXT", "MTEXT", "ATTDEF", "ATTRIB"}
+    entity_counts: Dict[str, int] = {}
+    extracted_texts: List[str] = []
+    layers: set[str] = set()
+    blocks: set[str] = set()
+
+    in_entities = False
+    waiting_section_name = False
+    current_entity_type = ""
+    current_entity_texts: List[str] = []
+    current_layer = ""
+    current_block = ""
+
+    def _flush_entity() -> None:
+        nonlocal current_entity_type, current_entity_texts, current_layer, current_block
+        if not current_entity_type:
+            return
+        entity_counts[current_entity_type] = entity_counts.get(current_entity_type, 0) + 1
+        if current_layer:
+            layers.add(current_layer)
+        if current_block:
+            blocks.add(current_block)
+        for item in current_entity_texts:
+            if not item:
+                continue
+            normalized = (
+                item.replace("\\P", "\n")
+                .replace("\\~", " ")
+                .replace("{", "")
+                .replace("}", "")
+                .strip()
+            )
+            if normalized and normalized not in extracted_texts:
+                extracted_texts.append(normalized)
+        current_entity_type = ""
+        current_entity_texts = []
+        current_layer = ""
+        current_block = ""
+
+    for code, value in pairs:
+        token = value.upper().strip()
+        if waiting_section_name and code == 2:
+            in_entities = token == "ENTITIES"
+            waiting_section_name = False
+            continue
+
+        if code == 0:
+            if token == "SECTION":
+                _flush_entity()
+                waiting_section_name = True
+                continue
+            if token in {"ENDSEC", "EOF"}:
+                _flush_entity()
+                in_entities = False
+                continue
+            if in_entities:
+                _flush_entity()
+                current_entity_type = token
+                continue
+
+        if not in_entities or not current_entity_type:
+            continue
+        if code == 8:
+            current_layer = value.strip()
+            continue
+        if code == 2 and current_entity_type == "INSERT":
+            current_block = value.strip()
+            continue
+        if code in (1, 3) and current_entity_type in text_entity_types:
+            current_entity_texts.append(value)
+
+    _flush_entity()
+
+    summary_lines = ["[DXF解析摘要]"]
+    if acadver:
+        summary_lines.append(f"ACAD版本: {acadver}")
+    if codepage:
+        summary_lines.append(f"编码页: {codepage}")
+    if insunits is not None:
+        summary_lines.append(f"插入单位: {insunits}({unit_map.get(insunits, '未知')})")
+    if entity_counts:
+        top_entities = sorted(entity_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        summary_lines.append(
+            "实体统计: " + "、".join(f"{etype}:{count}" for etype, count in top_entities)
+        )
+    if layers:
+        summary_lines.append("图层: " + "、".join(sorted(layers)[:20]))
+    if blocks:
+        summary_lines.append("块参照: " + "、".join(sorted(blocks)[:20]))
+
+    if extracted_texts:
+        summary_lines.append("")
+        summary_lines.append("[DXF文本实体提取]")
+        summary_lines.extend(extracted_texts[:160])
+    return "\n".join(summary_lines).strip()
+
+
 def _read_uploaded_file_content(content: bytes, filename: str) -> str:
-    """根据文件名解析上传文件为文本，支持 .txt、.docx、.pdf、.json、.xlsx"""
+    """根据文件名解析上传文件为文本，支持 .txt、.docx、.pdf、.json、.xlsx/.xls、.dxf"""
     name = filename.lower()
     if name.endswith(".txt"):
         return content.decode("utf-8", errors="ignore")
@@ -4242,7 +4410,14 @@ def _read_uploaded_file_content(content: bytes, filename: str) -> str:
             return "\n".join(parts)
         except Exception as e:
             raise ValueError(f"Excel 解析失败: {e}") from e
-    raise ValueError("仅支持 .txt、.docx、.pdf、.json、.xlsx/.xls")
+    if name.endswith(".dxf"):
+        try:
+            return _extract_dxf_text(content)
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(f"DXF 解析失败: {e}") from e
+    raise ValueError("仅支持 .txt、.docx、.pdf、.json、.xlsx/.xls、.dxf")
 
 
 def _merge_materials_text(project_id: str) -> str:
@@ -4327,7 +4502,7 @@ def upload_shigong(
     """
     上传施工组织设计文档（仅上传，不自动评分）。
 
-    上传 TXT / DOCX / PDF / JSON / XLSX 格式施组文档并保存解析文本。
+    上传 TXT / DOCX / PDF / JSON / XLSX / DXF 格式施组文档并保存解析文本。
     上传后提交会进入“待评分”状态，需手动调用“评分施组”才会产生分数。
 
     **需要 API Key 认证**
@@ -7050,7 +7225,7 @@ def get_compilation_instructions(
     include_in_schema=False,
 )
 async def parse_file_to_text(file: UploadFile = File(...)) -> Dict[str, str]:
-    """解析上传文件为纯文本。支持 .txt、.docx、.pdf、.json、.xlsx/.xls"""
+    """解析上传文件为纯文本。支持 .txt、.docx、.pdf、.json、.xlsx/.xls、.dxf"""
     content = await file.read()
     try:
         text = _read_uploaded_file_content(content, file.filename or "")
@@ -8066,7 +8241,7 @@ def index(
 
       <div class="section card" id="section-materials">
         <h2>3) 项目资料</h2>
-        <p style="font-size:13px;color:#64748b;margin:-8px 0 8px 0">支持 .txt、.pdf、.doc、.docx、.json、.xlsx/.xls。用于项目投喂包与学习进化。创建项目后建议先上传招标/清单等资料。</p>
+        <p style="font-size:13px;color:#64748b;margin:-8px 0 8px 0">支持 .txt、.pdf、.doc、.docx、.json、.xlsx/.xls、.dxf。用于项目投喂包与学习进化。创建项目后建议先上传招标/清单/图纸资料。</p>
         <div style="margin-bottom:10px">
           <strong>本项目资料列表</strong>
           <button type="button" id="btnRefreshMaterials" class="secondary" style="margin-left:8px">刷新</button>
@@ -8077,7 +8252,7 @@ def index(
           <form id="uploadMaterial" method="post" action="/web/upload_materials" enctype="multipart/form-data" class="inline-form">
             <strong>添加资料：</strong>
             <input type="hidden" name="project_id" id="uploadMaterialProjectId" value="__SELECTED_PROJECT_ID__" />
-            <input type="file" name="file" accept=".txt,.pdf,.doc,.docx,.json,.xlsx,.xls" multiple />
+            <input type="file" name="file" accept=".txt,.pdf,.doc,.docx,.json,.xlsx,.xls,.dxf" multiple />
             <button type="submit" id="btnUploadMaterials" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadMaterials'); } return true;">上传资料</button>
             <span class="note">支持一次选择多个文件（Mac 按 Command，Windows 按 Ctrl）。</span>
           </form>
@@ -8102,7 +8277,7 @@ def index(
 
       <div class="section card" id="section-shigong">
         <h2>4) 项目施组</h2>
-        <p style="font-size:13px;color:#64748b;margin:-8px 0 8px 0">每份施组单独打分。支持 .txt、.docx、.pdf、.json、.xlsx/.xls。基于下方列表进行对比与洞察。</p>
+        <p style="font-size:13px;color:#64748b;margin:-8px 0 8px 0">每份施组单独打分。支持 .txt、.docx、.pdf、.json、.xlsx/.xls、.dxf。基于下方列表进行对比与洞察。</p>
         <div style="margin-bottom:10px">
           <strong>本项目施组列表</strong>
           <button type="button" id="btnRefreshSubmissions" class="secondary" style="margin-left:8px">刷新</button>
@@ -8113,7 +8288,7 @@ def index(
           <form id="uploadShigong" method="post" action="/web/upload_shigong" enctype="multipart/form-data" class="inline-form">
             <strong>添加施组：</strong>
             <input type="hidden" name="project_id" id="uploadShigongProjectId" value="__SELECTED_PROJECT_ID__" />
-            <input type="file" name="file" accept=".txt,.docx,.pdf,.json,.xlsx,.xls" multiple />
+            <input type="file" name="file" accept=".txt,.docx,.pdf,.json,.xlsx,.xls,.dxf" multiple />
             <button type="submit" id="btnUploadShigong" name="submit_action" value="upload" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadShigong'); } return true;">上传施组</button>
             <button type="submit" id="btnScoreShigong" class="secondary" formaction="/web/score_shigong" name="submit_action" value="score" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnScoreShigong'); } return true;">评分施组</button>
             <span style="margin-left:8px;color:#334155;font-size:13px">满分标准：</span>
@@ -8182,7 +8357,7 @@ def index(
         </div>
         <div class="field-group">
           <label>上传文件：</label>
-          <input type="file" id="feedFile" accept=".txt,.pdf,.doc,.docx,.json,.xlsx,.xls" multiple style="margin-left:8px" />
+          <input type="file" id="feedFile" accept=".txt,.pdf,.doc,.docx,.json,.xlsx,.xls,.dxf" multiple style="margin-left:8px" />
           <button type="button" id="btnUploadFeed" onclick="return window.__zhifeiFallbackClick(event, 'btnUploadFeed')">上传并保存投喂包</button>
           <span class="note">支持一次选择多个文件。</span>
           <p id="feedActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>

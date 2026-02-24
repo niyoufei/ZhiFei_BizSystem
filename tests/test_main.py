@@ -52,6 +52,7 @@ class TestIndexEndpoint:
         assert "/ground_truth/from_submission" in response.text
         assert 'id="section-adaptive" style="display:none"' in response.text
         assert "V2 反演校准闭环（核心能力，强烈建议执行）" in response.text
+        assert ".dxf" in response.text
 
     def test_index_replaces_server_side_placeholders(self, client):
         """Index page should not leak template placeholders."""
@@ -960,6 +961,30 @@ class TestMaterialsEndpoint:
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
     @patch("app.main.MATERIALS_DIR")
+    def test_upload_material_accepts_dxf_extension(
+        self, mock_dir, mock_ensure, mock_load_proj, mock_load_mat, mock_save, client, tmp_path
+    ):
+        mock_dir.__truediv__ = lambda self, x: tmp_path / x
+        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_load_mat.return_value = []
+
+        dxf_content = (
+            "0\nSECTION\n2\nENTITIES\n0\nTEXT\n8\nA-TEXT\n1\n总平面布置图\n0\nENDSEC\n0\nEOF\n"
+        ).encode("utf-8")
+        response = client.post(
+            "/api/v1/projects/p1/materials",
+            files={"file": ("总图.dxf", BytesIO(dxf_content), "application/dxf")},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert data["material"]["filename"] == "总图.dxf"
+
+    @patch("app.main.save_materials")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.MATERIALS_DIR")
     def test_upload_material_replaces_existing_same_filename(
         self, mock_dir, mock_ensure, mock_load_proj, mock_load_mat, mock_save, client, tmp_path
     ):
@@ -1145,6 +1170,23 @@ class TestShigongEndpoint:
         assert mock_save_sub.call_count == 1
         assert mock_score.call_count == 0
         mock_record_history.assert_not_called()
+
+
+class TestDXFParser:
+    def test_read_uploaded_file_content_extracts_text_from_dxf(self):
+        from app.main import _read_uploaded_file_content
+
+        dxf_content = (
+            "0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1032\n9\n$INSUNITS\n70\n6\n0\nENDSEC\n"
+            "0\nSECTION\n2\nENTITIES\n0\nTEXT\n8\nA-TEXT\n1\n总平面布置图\n"
+            "0\nMTEXT\n8\nA-NOTE\n3\n施工进度\n1\n计划节点与验收\n0\nENDSEC\n0\nEOF\n"
+        ).encode("utf-8")
+        text = _read_uploaded_file_content(dxf_content, "sample.dxf")
+        assert "DXF解析摘要" in text
+        assert "ACAD版本: AC1032" in text
+        assert "插入单位: 6(米)" in text
+        assert "总平面布置图" in text
+        assert "计划节点与验收" in text
 
 
 class TestScoreForProjectEndpoint:
