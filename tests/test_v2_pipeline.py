@@ -1928,6 +1928,7 @@ class TestScoringMeceInjection:
         injection = (report.get("meta") or {}).get("input_injection") or {}
         assert injection["constraints_rebuilt"] is True
         assert injection["runtime_custom_requirements_count"] == 1
+        assert injection["material_type_counts"]["tender_qa"] == 1
         assert injection["mece_inputs"]["custom_instructions_injected"] is True
         assert injection["mece_inputs"]["bid_requirements_loaded"] is True
         # base requirements + runtime custom requirements 都应传入评分引擎

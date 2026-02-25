@@ -38,6 +38,14 @@ def _extract_sentences_with_keywords(text: str, keywords: List[str], limit: int 
     return hits
 
 
+def _extract_material_section(text: str, section_name: str) -> str:
+    pattern = rf"===\s*{re.escape(section_name)}\s*===\s*(.*?)(?=\n===\s*[^=\n]+?\s*===|\Z)"
+    m = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+    if not m:
+        return ""
+    return str(m.group(1) or "").strip()
+
+
 def _is_v2_engine(version: str | None) -> bool:
     value = str(version or "").strip().lower()
     if value.startswith("v2"):
@@ -205,6 +213,67 @@ def extract_project_anchors_from_text(project_id: str, text: str) -> List[Dict[s
     if scope_sentences:
         add_anchor("project_scope", scope_sentences, confidence=0.72)
 
+    tender_section = _extract_material_section(text, "招标文件和答疑")
+    boq_section = _extract_material_section(text, "清单")
+    drawing_section = _extract_material_section(text, "图纸")
+    site_photo_section = _extract_material_section(text, "现场照片")
+
+    if tender_section:
+        qa_hits = _extract_sentences_with_keywords(
+            tender_section,
+            ["答疑", "澄清", "变更", "签证", "工期", "质量标准", "计价规则"],
+            limit=4,
+        )
+        if qa_hits:
+            add_anchor(
+                "qa_clarifications",
+                qa_hits,
+                confidence=0.82,
+                source_locator="materials_tender_qa",
+            )
+
+    if boq_section:
+        boq_hits = _extract_sentences_with_keywords(
+            boq_section,
+            ["工程量", "清单", "综合单价", "措施费", "暂估价", "甲供材", "设备"],
+            limit=5,
+        )
+        if boq_hits:
+            add_anchor(
+                "boq_cost_control_points",
+                boq_hits,
+                confidence=0.84,
+                source_locator="materials_boq",
+            )
+
+    if drawing_section:
+        drawing_hits = _extract_sentences_with_keywords(
+            drawing_section,
+            ["图纸", "平面", "剖面", "节点", "BIM", "碰撞", "深化", "机电综合"],
+            limit=5,
+        )
+        if drawing_hits:
+            add_anchor(
+                "drawing_coordination_points",
+                drawing_hits,
+                confidence=0.84,
+                source_locator="materials_drawing",
+            )
+
+    if site_photo_section:
+        photo_hits = _extract_sentences_with_keywords(
+            site_photo_section,
+            ["临边", "高处", "深基坑", "塔吊", "脚手架", "扬尘", "围挡", "积水", "消防"],
+            limit=5,
+        )
+        if photo_hits:
+            add_anchor(
+                "site_photo_risk_points",
+                photo_hits,
+                confidence=0.8,
+                source_locator="materials_site_photo",
+            )
+
     return anchors
 
 
@@ -335,6 +404,73 @@ def build_project_requirements_from_anchors(
                 {"keywords": ["工程范围", "施工范围", "工程内容"]},
                 mandatory=True,
                 weight=1.3,
+                source_anchor_id=aid,
+            )
+        elif key == "qa_clarifications":
+            add_req(
+                "01",
+                "答疑澄清与计价/工期边界应在施组中闭环响应",
+                "consistency",
+                {"expected": a.get("anchor_value")},
+                mandatory=True,
+                weight=1.8,
+                source_anchor_id=aid,
+            )
+        elif key == "boq_cost_control_points":
+            add_req(
+                "13",
+                "物资设备配置应与清单计价口径一致",
+                "semantic",
+                {"hints": a.get("anchor_value")},
+                mandatory=True,
+                weight=1.7,
+                source_anchor_id=aid,
+            )
+            add_req(
+                "15",
+                "总体配置计划需映射清单关键工程量与措施项",
+                "presence",
+                {"keywords": ["工程量", "清单", "综合单价", "措施费", "设备"]},
+                mandatory=True,
+                weight=1.8,
+                source_anchor_id=aid,
+            )
+        elif key == "drawing_coordination_points":
+            add_req(
+                "14",
+                "设计协调与深化应响应图纸节点及碰撞风险",
+                "semantic",
+                {"hints": a.get("anchor_value")},
+                mandatory=True,
+                weight=1.9,
+                source_anchor_id=aid,
+            )
+            add_req(
+                "16",
+                "技术措施可行性应包含图纸落地与节点做法",
+                "presence",
+                {"keywords": ["节点", "深化", "图纸", "BIM", "碰撞"]},
+                mandatory=True,
+                weight=1.6,
+                source_anchor_id=aid,
+            )
+        elif key == "site_photo_risk_points":
+            add_req(
+                "07",
+                "重难点及危大工程应覆盖现场风险实况",
+                "semantic",
+                {"hints": a.get("anchor_value")},
+                mandatory=True,
+                weight=1.8,
+                source_anchor_id=aid,
+            )
+            add_req(
+                "02",
+                "安全生产措施应对应现场照片识别的隐患点",
+                "presence",
+                {"keywords": ["临边", "高处", "深基坑", "塔吊", "脚手架", "消防"]},
+                mandatory=True,
+                weight=1.6,
                 source_anchor_id=aid,
             )
 

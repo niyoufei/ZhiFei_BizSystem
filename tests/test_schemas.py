@@ -104,6 +104,7 @@ class TestMaterialRecord:
         )
         assert mat.id == "mat-001"
         assert mat.project_id == "proj-001"
+        assert mat.material_type == "tender_qa"
         assert mat.filename == "招标文件.pdf"
         assert mat.path == "/uploads/招标文件.pdf"
 

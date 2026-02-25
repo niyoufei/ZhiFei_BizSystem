@@ -248,6 +248,7 @@ class ProjectRecord(BaseModel):
 class MaterialRecord(BaseModel):
     id: str
     project_id: str
+    material_type: str = "tender_qa"
     filename: str
     path: str
     created_at: str

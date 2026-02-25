@@ -7,6 +7,7 @@ from io import BytesIO
 from unittest.mock import MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.main import app, create_app
@@ -42,6 +43,9 @@ class TestIndexEndpoint:
         response = client.get("/")
         assert "createProject" in response.text
         assert "uploadMaterial" in response.text
+        assert "uploadMaterialBoq" in response.text
+        assert "uploadMaterialDrawing" in response.text
+        assert "uploadMaterialPhoto" in response.text
         assert "uploadShigong" in response.text
         assert 'id="projectDeleteSelect"' in response.text
         assert 'id="deleteSelectedProjects"' in response.text
@@ -190,6 +194,9 @@ class TestIndexEndpoint:
             in page
         )
         assert "btnUploadMaterials: { resultId: 'materialsActionStatus'" in page
+        assert "btnUploadBoq: { resultId: 'materialsActionStatusBoq'" in page
+        assert "btnUploadDrawing: { resultId: 'materialsActionStatusDrawing'" in page
+        assert "btnUploadSitePhotos: { resultId: 'materialsActionStatusPhoto'" in page
         assert "btnUploadShigong: { resultId: 'shigongActionStatus'" in page
         assert "btnScoreShigong: { resultId: 'shigongActionStatus'" in page
         assert "safeClick('btnUploadMaterials', uploadMaterialsAction);" not in page
@@ -557,7 +564,9 @@ class TestProjectsEndpoints:
         )
         assert response.status_code == 200
         data = response.json()
-        assert data["meta"] == {"key": "value"}
+        assert data["meta"]["key"] == "value"
+        assert data["meta"]["enforce_material_gate"] is True
+        assert "required_material_types" in data["meta"]
 
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
@@ -729,6 +738,7 @@ class TestExpertProfileEndpoints:
         mock_save_projects.assert_called_once()
 
     @patch("app.main._run_feedback_closed_loop")
+    @patch("app.main._validate_material_gate_for_scoring")
     @patch("app.main.record_history_score")
     @patch("app.main.save_score_reports")
     @patch("app.main.load_score_reports")
@@ -753,6 +763,7 @@ class TestExpertProfileEndpoints:
         mock_load_score_reports,
         mock_save_score_reports,
         mock_record_history,
+        mock_material_gate,
         mock_feedback_loop,
         client,
     ):
@@ -797,6 +808,17 @@ class TestExpertProfileEndpoints:
                 "suggestions": [],
             }
         )
+        mock_material_gate.return_value = (
+            {
+                "project_id": "p1",
+                "total_files": 3,
+                "counts_by_type": {"tender_qa": 1, "boq": 1, "drawing": 1},
+                "total_parsed_chars": 26000,
+                "parse_fail_ratio": 0.0,
+                "gate": {"passed": True, "issues": []},
+            },
+            [],
+        )
 
         response = client.post(
             "/api/v1/projects/p1/rescore",
@@ -837,6 +859,63 @@ class TestExpertProfileEndpoints:
         )
         assert response.status_code == 409
         assert "force_unlock=true" in response.json()["detail"]
+
+    @patch("app.main._validate_material_gate_for_scoring")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_expert_profiles")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_rescore_project_rejects_when_material_gate_failed(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_profiles,
+        mock_load_submissions,
+        mock_material_gate,
+        client,
+    ):
+        mock_load_projects.return_value = [
+            {
+                "id": "p1",
+                "name": "项目1",
+                "meta": {},
+                "created_at": "2026-01-01T00:00:00Z",
+                "expert_profile_id": "ep1",
+            }
+        ]
+        mock_load_profiles.return_value = [
+            {
+                "id": "ep1",
+                "name": "默认",
+                "weights_raw": {f"{i:02d}": 5 for i in range(1, 17)},
+                "weights_norm": {f"{i:02d}": 1 / 16 for i in range(1, 17)},
+                "norm_rule_version": "v1_m=0.5+a/10_norm=sum",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "f1.txt",
+                "text": "test content",
+                "total_score": 60.0,
+                "report": {},
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+        mock_material_gate.side_effect = HTTPException(
+            status_code=422,
+            detail="资料门禁未通过：缺少必需资料类型：清单",
+        )
+
+        response = client.post(
+            "/api/v1/projects/p1/rescore",
+            json={"scoring_engine_version": "v2", "scope": "project"},
+        )
+        assert response.status_code == 422
+        assert "资料门禁未通过" in response.json()["detail"]
 
 
 class TestFeedbackLoopHooks:
@@ -918,6 +997,77 @@ class TestMaterialsEndpoint:
         assert data["status"] == "ok"
         assert "material" in data
 
+    @patch("app.main.save_materials")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.MATERIALS_DIR")
+    def test_upload_material_persists_material_type(
+        self, mock_dir, mock_ensure, mock_load_proj, mock_load_mat, mock_save, client, tmp_path
+    ):
+        mock_dir.__truediv__ = lambda self, x: tmp_path / x
+        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_load_mat.return_value = []
+
+        response = client.post(
+            "/api/v1/projects/p1/materials",
+            data={"material_type": "boq"},
+            files={"file": ("工程量清单.xlsx", BytesIO(b"excel"), "application/octet-stream")},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["material"]["material_type"] == "boq"
+        saved_materials = mock_save.call_args[0][0]
+        assert any(m.get("material_type") == "boq" for m in saved_materials)
+
+    @patch("app.main.save_materials")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.MATERIALS_DIR")
+    def test_upload_material_same_filename_different_type_kept_separately(
+        self, mock_dir, mock_ensure, mock_load_proj, mock_load_mat, mock_save, client, tmp_path
+    ):
+        mock_dir.__truediv__ = lambda self, x: tmp_path / x
+        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_load_mat.return_value = [
+            {
+                "id": "m-old",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "test.txt",
+                "path": str(tmp_path / "old.txt"),
+                "created_at": "2026-02-17T00:00:00+00:00",
+            }
+        ]
+
+        response = client.post(
+            "/api/v1/projects/p1/materials",
+            data={"material_type": "boq"},
+            files={"file": ("test.txt", BytesIO(b"new content"), "text/plain")},
+        )
+        assert response.status_code == 200
+        saved_materials = mock_save.call_args[0][0]
+        same_name = [
+            m
+            for m in saved_materials
+            if m.get("project_id") == "p1" and m.get("filename") == "test.txt"
+        ]
+        assert len(same_name) == 2
+        assert {m.get("material_type") for m in same_name} == {"tender_qa", "boq"}
+
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_upload_material_invalid_material_type(self, mock_ensure, mock_load, client):
+        mock_load.return_value = [{"id": "p1"}]
+        response = client.post(
+            "/api/v1/projects/p1/materials",
+            data={"material_type": "bad_type"},
+            files={"file": ("test.txt", BytesIO(b"test"), "text/plain")},
+        )
+        assert response.status_code == 422
+        assert "material_type" in response.json()["detail"]
+
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
     def test_upload_material_project_not_found(self, mock_ensure, mock_load, client):
@@ -929,6 +1079,31 @@ class TestMaterialsEndpoint:
         )
         assert response.status_code == 404
         assert "项目不存在" in response.json()["detail"]
+
+    @patch("app.main._validate_material_gate_for_scoring")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_materials_health_success(
+        self, mock_ensure, mock_load_projects, mock_material_gate, client
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_material_gate.return_value = (
+            {
+                "project_id": "p1",
+                "total_files": 4,
+                "counts_by_type": {"tender_qa": 1, "boq": 1, "drawing": 1, "site_photo": 1},
+                "total_parsed_chars": 32000,
+                "parse_fail_ratio": 0.0,
+                "gate": {"passed": True, "issues": []},
+            },
+            [],
+        )
+        response = client.get("/api/v1/projects/p1/materials/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["gate"]["passed"] is True
+        mock_material_gate.assert_called_once()
 
     @patch("app.main.save_materials")
     @patch("app.main.load_materials")

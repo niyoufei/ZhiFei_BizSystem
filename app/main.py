@@ -30,6 +30,14 @@ try:
     from docx import Document
 except Exception:
     Document = None
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
 from fastapi import (
     APIRouter,
     Depends,
@@ -272,6 +280,18 @@ DEFAULT_LLM_SCORE_WEIGHT = 0.3
 DEFAULT_LLM_DELTA_CAP = 35.0
 DEFAULT_SCORE_SCALE_MAX = 100
 DEFAULT_NORM_RULE_VERSION = "v1_m=0.5+a/10_norm=sum"
+DEFAULT_ENFORCE_MATERIAL_GATE = True
+DEFAULT_REQUIRED_MATERIAL_TYPES = ["tender_qa", "boq", "drawing"]
+DEFAULT_MIN_PARSED_CHARS_BY_TYPE = {
+    "tender_qa": 12000,
+    "boq": 2000,
+    "drawing": 1500,
+    "site_photo": 200,
+}
+DEFAULT_MIN_TOTAL_PARSED_CHARS = 18000
+DEFAULT_MAX_MATERIAL_PARSE_FAIL_RATIO = 0.6
+DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR = 200
+DEFAULT_PDF_OCR_MAX_PAGES = 30
 PROFILE_LOCKED_STATUSES = {"submitted_to_qingtian"}
 DEFAULT_CHAPTER_REQUIREMENTS = {
     "required_sections": [
@@ -389,6 +409,21 @@ def _ensure_project_v2_fields(
         changed = True
     if "score_scale_max" not in meta:
         meta["score_scale_max"] = DEFAULT_SCORE_SCALE_MAX
+        changed = True
+    if "enforce_material_gate" not in meta:
+        meta["enforce_material_gate"] = DEFAULT_ENFORCE_MATERIAL_GATE
+        changed = True
+    if "required_material_types" not in meta:
+        meta["required_material_types"] = list(DEFAULT_REQUIRED_MATERIAL_TYPES)
+        changed = True
+    if "min_parsed_chars_by_type" not in meta:
+        meta["min_parsed_chars_by_type"] = dict(DEFAULT_MIN_PARSED_CHARS_BY_TYPE)
+        changed = True
+    if "min_total_parsed_chars" not in meta:
+        meta["min_total_parsed_chars"] = int(DEFAULT_MIN_TOTAL_PARSED_CHARS)
+        changed = True
+    if "max_material_parse_fail_ratio" not in meta:
+        meta["max_material_parse_fail_ratio"] = float(DEFAULT_MAX_MATERIAL_PARSE_FAIL_RATIO)
         changed = True
     return changed
 
@@ -822,19 +857,44 @@ def _build_scoring_input_injection_meta(
     profile_snapshot: Optional[Dict[str, object]],
     constraints_rebuilt: bool,
     runtime_req_meta: Dict[str, object],
+    material_quality_snapshot: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     material_rows = [m for m in load_materials() if str(m.get("project_id")) == project_id]
+    material_type_counts: Dict[str, int] = {}
+    for row in material_rows:
+        key = _normalize_material_type(row.get("material_type"), filename=row.get("filename"))
+        material_type_counts[key] = material_type_counts.get(key, 0) + 1
+    snapshot = material_quality_snapshot if isinstance(material_quality_snapshot, dict) else None
+    if snapshot:
+        snapshot_type_counts = snapshot.get("counts_by_type")
+        if isinstance(snapshot_type_counts, dict) and snapshot_type_counts:
+            material_type_counts = {
+                str(k): int(_to_float_or_none(v) or 0) for k, v in snapshot_type_counts.items()
+            }
+        materials_count = int(_to_float_or_none(snapshot.get("total_files")) or len(material_rows))
+        total_parsed_chars = int(_to_float_or_none(snapshot.get("total_parsed_chars")) or 0)
+        parse_fail_ratio = float(_to_float_or_none(snapshot.get("parse_fail_ratio")) or 0.0)
+    else:
+        materials_count = len(material_rows)
+        total_parsed_chars = 0
+        parse_fail_ratio = 0.0
     context_text = _load_project_context_text(project_id)
+    gate = snapshot.get("gate") if isinstance(snapshot, dict) else {}
+    gate_passed = bool((gate or {}).get("passed", True))
     return {
         "mece_inputs": {
-            "project_materials_extracted": len(material_rows) > 0,
+            "project_materials_extracted": materials_count > 0,
             "shigong_parsed": bool(str(text or "").strip()),
             "bid_requirements_loaded": base_requirements_count > 0,
             "attention_16d_weights_injected": bool(weights_norm),
             "custom_instructions_injected": runtime_custom_requirements_count > 0
             or bool(context_text.strip()),
+            "materials_quality_gate_passed": gate_passed,
         },
-        "materials_count": len(material_rows),
+        "materials_count": materials_count,
+        "material_type_counts": material_type_counts,
+        "materials_total_parsed_chars": total_parsed_chars,
+        "materials_parse_fail_ratio": round(parse_fail_ratio, 4),
         "project_context_chars": len(context_text),
         "anchors_count": int(anchors_count),
         "requirements_count": int(base_requirements_count),
@@ -843,6 +903,7 @@ def _build_scoring_input_injection_meta(
         "weights_sum": round(sum(float(weights_norm.get(d, 0.0)) for d in DIMENSION_IDS), 6),
         "constraints_rebuilt": bool(constraints_rebuilt),
         "runtime_instruction_breakdown": runtime_req_meta,
+        "material_gate": gate if isinstance(gate, dict) else {},
     }
 
 
@@ -1760,6 +1821,7 @@ def _score_submission_for_project(
     scoring_engine_version: str,
     anchors: Optional[List[Dict[str, object]]] = None,
     requirements: Optional[List[Dict[str, object]]] = None,
+    material_quality_snapshot: Optional[Dict[str, object]] = None,
 ) -> tuple[Dict[str, object], List[Dict[str, object]]]:
     engine_version = _determine_engine_version(project, scoring_engine_version)
     if engine_version == "v2":
@@ -1816,6 +1878,11 @@ def _score_submission_for_project(
             profile_snapshot=profile_snapshot,
             scoring_engine_version=scoring_engine_version,
         )
+        snapshot_for_meta = (
+            dict(material_quality_snapshot)
+            if isinstance(material_quality_snapshot, dict)
+            else _build_material_quality_snapshot(project_id)
+        )
         report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
         report_meta["input_injection"] = _build_scoring_input_injection_meta(
             project_id=project_id,
@@ -1827,7 +1894,12 @@ def _score_submission_for_project(
             profile_snapshot=profile_snapshot,
             constraints_rebuilt=constraints_rebuilt,
             runtime_req_meta=runtime_req_meta,
+            material_quality_snapshot=snapshot_for_meta,
         )
+        report_meta["material_quality"] = snapshot_for_meta
+        gate_obj = snapshot_for_meta.get("gate")
+        if isinstance(gate_obj, dict):
+            report_meta["material_gate"] = gate_obj
         report["meta"] = report_meta
         _apply_deployed_patch_to_report(project_id, report)
         submission_like = {"id": submission_id, "project_id": project_id, "text": text}
@@ -3415,6 +3487,7 @@ def create_project(
         "created_at": _now_iso(),
         "updated_at": _now_iso(),
     }
+    _ensure_project_v2_fields(record)
     projects.append(record)
     save_projects(projects)
     return ProjectRecord(**record)
@@ -3591,6 +3664,12 @@ def rescore_project_submissions(
     if not targets:
         raise HTTPException(status_code=404, detail=t("api.no_submissions", locale=locale))
 
+    material_quality_snapshot, _ = _validate_material_gate_for_scoring(
+        project_id,
+        project,
+        raise_on_fail=True,
+    )
+
     score_reports = load_score_reports()
     all_evidence_units = load_evidence_units()
     generated = 0
@@ -3610,6 +3689,7 @@ def rescore_project_submissions(
             scoring_engine_version=payload.scoring_engine_version,
             anchors=anchors,
             requirements=requirements,
+            material_quality_snapshot=material_quality_snapshot,
         )
         _apply_evolution_total_scale(project_id, report)
         all_evidence_units = _replace_submission_evidence_units(
@@ -3900,32 +3980,124 @@ def cleanup_e2e_projects(
     }
 
 
-MATERIAL_ALLOWED_EXTS = (
-    ".txt",
-    ".pdf",
-    ".doc",
-    ".docx",
-    ".docm",
-    ".json",
-    ".xlsx",
-    ".xls",
-    ".xlsm",
-    ".csv",
-    ".dxf",
+MATERIAL_TYPE_DEFAULT = "tender_qa"
+MATERIAL_TYPE_LABELS = {
+    "tender_qa": "招标文件和答疑",
+    "boq": "清单",
+    "drawing": "图纸",
+    "site_photo": "现场照片",
+}
+MATERIAL_TYPE_ALIASES = {
+    "": MATERIAL_TYPE_DEFAULT,
+    "material": MATERIAL_TYPE_DEFAULT,
+    "materials": MATERIAL_TYPE_DEFAULT,
+    "tender": "tender_qa",
+    "bid": "tender_qa",
+    "qa": "tender_qa",
+    "qa_reply": "tender_qa",
+    "list": "boq",
+    "bill_of_quantities": "boq",
+    "drawing_file": "drawing",
+    "drawings": "drawing",
+    "photo": "site_photo",
+    "photos": "site_photo",
+    "site_images": "site_photo",
+}
+MATERIAL_TYPE_ALLOWED_EXTS: Dict[str, tuple[str, ...]] = {
+    # tender_qa 兼容旧版“单一资料上传”入口，保留宽松后缀集合。
+    "tender_qa": (
+        ".txt",
+        ".md",
+        ".pdf",
+        ".doc",
+        ".docx",
+        ".docm",
+        ".json",
+        ".xlsx",
+        ".xls",
+        ".xlsm",
+        ".csv",
+        ".dxf",
+        ".dwg",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+        ".bmp",
+        ".tif",
+        ".tiff",
+    ),
+    "boq": (".xlsx", ".xls", ".xlsm", ".csv", ".pdf", ".doc", ".docx", ".txt", ".json"),
+    "drawing": (
+        ".pdf",
+        ".doc",
+        ".docx",
+        ".xlsx",
+        ".xls",
+        ".dxf",
+        ".dwg",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+        ".bmp",
+        ".tif",
+        ".tiff",
+        ".json",
+        ".txt",
+    ),
+    "site_photo": (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"),
+}
+MATERIAL_ALLOWED_EXTS = tuple(
+    sorted({ext for exts in MATERIAL_TYPE_ALLOWED_EXTS.values() for ext in exts})
 )
-MATERIAL_ALLOWED_MIME_TOKENS = (
-    "text/plain",
-    "application/pdf",
-    "application/json",
-    "application/msword",
-    "wordprocessingml",
-    "spreadsheetml",
-    "ms-excel",
-    "application/dxf",
-    "image/vnd.dxf",
-    "application/acad",
-    "application/x-autocad",
-    "drawing/x-dxf",
+MATERIAL_TYPE_ALLOWED_MIME_TOKENS: Dict[str, tuple[str, ...]] = {
+    "tender_qa": (
+        "text/plain",
+        "text/markdown",
+        "text/csv",
+        "application/pdf",
+        "application/json",
+        "application/msword",
+        "wordprocessingml",
+        "spreadsheetml",
+        "ms-excel",
+        "application/dxf",
+        "image/vnd.dxf",
+        "application/acad",
+        "application/x-autocad",
+        "drawing/x-dxf",
+        "image/",
+    ),
+    "boq": (
+        "text/plain",
+        "text/csv",
+        "application/pdf",
+        "application/json",
+        "application/msword",
+        "wordprocessingml",
+        "spreadsheetml",
+        "ms-excel",
+    ),
+    "drawing": (
+        "text/plain",
+        "application/pdf",
+        "application/json",
+        "application/msword",
+        "wordprocessingml",
+        "spreadsheetml",
+        "ms-excel",
+        "application/dxf",
+        "image/vnd.dxf",
+        "application/acad",
+        "application/x-autocad",
+        "drawing/x-dxf",
+        "image/",
+    ),
+    "site_photo": ("image/",),
+}
+MATERIAL_ALLOWED_MIME_TOKENS = tuple(
+    sorted({token for tokens in MATERIAL_TYPE_ALLOWED_MIME_TOKENS.values() for token in tokens})
 )
 
 
@@ -3937,12 +4109,72 @@ def _normalize_uploaded_filename(filename: str) -> str:
     return base
 
 
-def _is_allowed_material_upload(filename: str, content_type: str) -> bool:
+def _infer_material_type_from_filename(filename: object) -> str:
+    normalized = _normalize_uploaded_filename(str(filename or "")).lower()
+    ext = Path(normalized).suffix.lower()
+    name = normalized
+
+    if ext in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
+        if any(k in name for k in ("现场", "实景", "照片", "photo", "image", "img")):
+            return "site_photo"
+        return "drawing"
+    if ext in {".dxf", ".dwg"}:
+        return "drawing"
+    if ext in {".xlsx", ".xls", ".xlsm", ".csv"}:
+        return "boq"
+    if any(k in name for k in ("清单", "boq", "bill_of_quantities", "工程量")):
+        return "boq"
+    if any(k in name for k in ("图纸", "总图", "平面", "立面", "剖面", "cad", "详图", "节点图")):
+        return "drawing"
+    if any(k in name for k in ("现场", "实景", "照片", "photo", "image", "img")):
+        return "site_photo"
+    return MATERIAL_TYPE_DEFAULT
+
+
+def _normalize_material_type(material_type: object, *, filename: object = "") -> str:
+    raw = str(material_type or "").strip().lower().replace("-", "_")
+    if not raw:
+        return _infer_material_type_from_filename(filename)
+    normalized = MATERIAL_TYPE_ALIASES.get(raw, raw)
+    if normalized in MATERIAL_TYPE_LABELS:
+        return normalized
+    return _infer_material_type_from_filename(filename)
+
+
+def _parse_material_type_or_422(material_type: object, *, filename: object = "") -> str:
+    raw = str(material_type or "").strip()
+    if not raw:
+        return _normalize_material_type("", filename=filename)
+    normalized = _normalize_material_type(raw, filename=filename)
+    raw_key = raw.lower().replace("-", "_")
+    if raw_key in MATERIAL_TYPE_ALIASES or raw_key in MATERIAL_TYPE_LABELS:
+        return normalized
+    supported = "、".join(MATERIAL_TYPE_LABELS.keys())
+    raise HTTPException(status_code=422, detail=f"material_type 不支持：{raw}（支持：{supported}）")
+
+
+def _material_type_label(material_type: object, *, filename: object = "") -> str:
+    return MATERIAL_TYPE_LABELS.get(
+        _normalize_material_type(material_type, filename=filename), "项目资料"
+    )
+
+
+def _material_type_ext_hint(material_type: object, *, filename: object = "") -> str:
+    normalized = _normalize_material_type(material_type, filename=filename)
+    exts = MATERIAL_TYPE_ALLOWED_EXTS.get(normalized) or MATERIAL_ALLOWED_EXTS
+    return "、".join(exts)
+
+
+def _is_allowed_material_upload(filename: str, content_type: str, material_type: str) -> bool:
     normalized = _normalize_uploaded_filename(filename).lower()
-    if normalized and any(normalized.endswith(ext) for ext in MATERIAL_ALLOWED_EXTS):
+    allowed_exts = MATERIAL_TYPE_ALLOWED_EXTS.get(material_type) or MATERIAL_ALLOWED_EXTS
+    if normalized and any(normalized.endswith(ext) for ext in allowed_exts):
         return True
     ctype = str(content_type or "").lower().strip()
-    return any(token in ctype for token in MATERIAL_ALLOWED_MIME_TOKENS)
+    allowed_tokens = (
+        MATERIAL_TYPE_ALLOWED_MIME_TOKENS.get(material_type) or MATERIAL_ALLOWED_MIME_TOKENS
+    )
+    return any(token in ctype for token in allowed_tokens)
 
 
 SUBMISSION_DUPLICATE_WINDOW_SECONDS = 15
@@ -3996,14 +4228,18 @@ def _find_recent_duplicate_submission(
 def upload_material(
     project_id: str,
     file: UploadFile = File(...),
+    material_type: str = Form(MATERIAL_TYPE_DEFAULT),
     api_key: Optional[str] = Depends(verify_api_key),
     locale: str = Depends(get_locale),
 ) -> dict:
     """
-    上传项目材料文件。
+    上传项目材料文件（支持按资料分类上传）。
 
-    上传招标文件、清单、图纸等项目参考材料。支持 .txt、.pdf、.doc、.docx、.json、.xlsx/.xls、.dxf。
-    资料会持久保存，用于项目投喂包、学习与进化等。
+    material_type:
+    - tender_qa: 招标文件和答疑
+    - boq: 清单
+    - drawing: 图纸
+    - site_photo: 现场照片
 
     **需要 API Key 认证**（未配置 API_KEYS 时无需）
 
@@ -4012,17 +4248,24 @@ def upload_material(
     ensure_data_dirs()
     raw_name = file.filename or ""
     normalized_name = _normalize_uploaded_filename(raw_name)
+    normalized_material_type = _parse_material_type_or_422(material_type, filename=normalized_name)
     if not normalized_name:
         raise HTTPException(status_code=422, detail="资料文件名为空，请重试或重命名后上传。")
-    if not _is_allowed_material_upload(normalized_name, file.content_type or ""):
+    if not _is_allowed_material_upload(
+        normalized_name, file.content_type or "", normalized_material_type
+    ):
         raise HTTPException(
             status_code=422,
-            detail="资料支持 .txt、.pdf、.doc、.docx、.json、.xlsx/.xls、.dxf 格式",
+            detail=(
+                _material_type_label(normalized_material_type)
+                + "支持："
+                + _material_type_ext_hint(normalized_material_type)
+            ),
         )
     projects = load_projects()
     if not any(p["id"] == project_id for p in projects):
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    project_dir = MATERIALS_DIR / project_id
+    project_dir = MATERIALS_DIR / project_id / normalized_material_type
     project_dir.mkdir(parents=True, exist_ok=True)
     target = project_dir / normalized_name
     content = file.file.read()
@@ -4033,6 +4276,8 @@ def upload_material(
         str(m.get("id"))
         for m in materials
         if m.get("project_id") == project_id
+        and _normalize_material_type(m.get("material_type"), filename=m.get("filename"))
+        == normalized_material_type
         and _normalize_uploaded_filename(m.get("filename", "")) == normalized_name
         and m.get("id")
     ]
@@ -4041,12 +4286,15 @@ def upload_material(
         for m in materials
         if not (
             m.get("project_id") == project_id
+            and _normalize_material_type(m.get("material_type"), filename=m.get("filename"))
+            == normalized_material_type
             and _normalize_uploaded_filename(m.get("filename", "")) == normalized_name
         )
     ]
     record = {
         "id": existing_ids[0] if existing_ids else str(uuid4()),
         "project_id": project_id,
+        "material_type": normalized_material_type,
         "filename": normalized_name,
         "path": str(target),
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -4080,7 +4328,32 @@ def list_materials(project_id: str, locale: str = Depends(get_locale)) -> list[M
     if not any(p["id"] == project_id for p in projects):
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
     materials = [m for m in load_materials() if m.get("project_id") == project_id]
-    return [MaterialRecord(**m) for m in materials]
+    materials.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
+    normalized_rows: List[dict] = []
+    for material in materials:
+        row = dict(material)
+        row["material_type"] = _normalize_material_type(
+            row.get("material_type"), filename=row.get("filename")
+        )
+        normalized_rows.append(row)
+    return [MaterialRecord(**m) for m in normalized_rows]
+
+
+@router.get(
+    "/projects/{project_id}/materials/health",
+    tags=["项目管理"],
+    responses={**RESPONSES_404},
+)
+def get_materials_health(project_id: str, locale: str = Depends(get_locale)) -> dict:
+    """返回项目资料解析质量与门禁状态（不触发评分）。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    try:
+        project = _find_project(project_id, projects)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    snapshot, _ = _validate_material_gate_for_scoring(project_id, project, raise_on_fail=False)
+    return snapshot
 
 
 @router.get(
@@ -4375,16 +4648,59 @@ def _extract_dxf_text(content: bytes) -> str:
     return "\n".join(summary_lines).strip()
 
 
+def _extract_binary_text_snippet(content: bytes, *, max_chars: int = 4000) -> str:
+    decoded = content.decode("utf-8", errors="ignore")
+    cleaned = "".join(ch if ch.isprintable() else " " for ch in decoded)
+    compact = " ".join(cleaned.split())
+    if not compact:
+        return ""
+    return compact[: max(256, int(max_chars))]
+
+
+def _extract_image_content(content: bytes, filename: str) -> str:
+    lines = [f"[图像资料] 文件: {filename}", f"字节数: {len(content)}"]
+    if Image is None:
+        lines.append("图像解析: 当前环境未安装 Pillow，已纳入文件元信息。")
+        return "\n".join(lines)
+    try:
+        with Image.open(io.BytesIO(content)) as img:
+            lines.append(f"格式: {img.format or '未知'}")
+            lines.append(f"尺寸: {img.width}x{img.height}")
+            lines.append(f"模式: {img.mode}")
+            if pytesseract is not None:
+                try:
+                    ocr_text = str(
+                        pytesseract.image_to_string(img, lang="chi_sim+eng") or ""
+                    ).strip()
+                except Exception:
+                    ocr_text = ""
+                if ocr_text:
+                    lines.append("[OCR文本提取]")
+                    lines.append(ocr_text[:4000])
+                else:
+                    lines.append("OCR文本提取: 未识别到有效文本。")
+            else:
+                lines.append("OCR文本提取: 当前环境未安装 pytesseract，已纳入图像元信息。")
+    except Exception as exc:
+        lines.append(f"图像解析失败: {exc}")
+    return "\n".join(lines)
+
+
 def _read_uploaded_file_content(content: bytes, filename: str) -> str:
-    """根据文件名解析上传文件为文本，支持 .txt、.docx、.pdf、.json、.xlsx/.xls、.dxf"""
+    """根据文件名解析上传文件为文本，覆盖招标/清单/图纸/现场照片常见格式。"""
     name = filename.lower()
-    if name.endswith(".txt"):
+    if name.endswith(".txt") or name.endswith(".md") or name.endswith(".csv"):
         return content.decode("utf-8", errors="ignore")
     if name.endswith(".docx"):
         if Document is None:
             raise ValueError("DOCX 解析不可用：请安装与当前系统架构兼容的 python-docx/lxml。")
         doc = Document(io.BytesIO(content))
         return "\n".join(p.text for p in doc.paragraphs)
+    if name.endswith(".doc") or name.endswith(".docm"):
+        snippet = _extract_binary_text_snippet(content)
+        if snippet:
+            return snippet
+        return f"[DOC资料] 文件: {filename}（当前环境未启用结构化解析，已纳入文件元信息）"
     if name.endswith(".pdf"):
         if pymupdf is None:
             raise ValueError("PDF 解析不可用：请安装与当前系统架构兼容的 PyMuPDF。")
@@ -4395,12 +4711,36 @@ def _read_uploaded_file_content(content: bytes, filename: str) -> str:
                 # Embed stable page markers so downstream diagnostics can map evidence to pages.
                 page_text = page.get_text() or ""
                 parts.append(f"[PAGE:{idx}]\n{page_text}")
-            return "\n\n".join(parts).strip()
+            merged_pdf_text = "\n\n".join(parts).strip()
+            text_chars = len(merged_pdf_text.replace("\n", "").strip())
+            need_ocr = text_chars < DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR
+            if need_ocr and pytesseract is not None and Image is not None:
+                ocr_chunks: List[str] = []
+                for idx, page in enumerate(doc, start=1):
+                    if idx > DEFAULT_PDF_OCR_MAX_PAGES:
+                        break
+                    try:
+                        pix = page.get_pixmap(matrix=pymupdf.Matrix(2.0, 2.0), alpha=False)
+                        with Image.open(io.BytesIO(pix.tobytes("png"))) as img:
+                            ocr_text = str(
+                                pytesseract.image_to_string(img, lang="chi_sim+eng") or ""
+                            ).strip()
+                    except Exception:
+                        ocr_text = ""
+                    if ocr_text:
+                        ocr_chunks.append(f"[PAGE_OCR:{idx}]\n{ocr_text[:5000]}")
+                if ocr_chunks:
+                    merged_pdf_text = (
+                        merged_pdf_text + "\n\n[PDF_OCR_FALLBACK]\n" + "\n\n".join(ocr_chunks)
+                    ).strip()
+            if not merged_pdf_text:
+                return f"[PDF资料] 文件: {filename}（未提取到有效文本）"
+            return merged_pdf_text
         finally:
             doc.close()
     if name.endswith(".json"):
         return content.decode("utf-8", errors="ignore")
-    if name.endswith(".xlsx") or name.endswith(".xls"):
+    if name.endswith(".xlsx") or name.endswith(".xls") or name.endswith(".xlsm"):
         try:
             import openpyxl
 
@@ -4420,28 +4760,229 @@ def _read_uploaded_file_content(content: bytes, filename: str) -> str:
             raise
         except Exception as e:
             raise ValueError(f"DXF 解析失败: {e}") from e
-    raise ValueError("仅支持 .txt、.docx、.pdf、.json、.xlsx/.xls、.dxf")
+    if name.endswith(".dwg"):
+        return f"[DWG图纸] 文件: {filename}，字节数: {len(content)}（已纳入文件元信息，建议同步上传 PDF/DXF 便于文本解析）"
+    if name.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")):
+        return _extract_image_content(content, filename)
+    snippet = _extract_binary_text_snippet(content, max_chars=2000)
+    if snippet:
+        return snippet
+    raise ValueError(
+        "仅支持 .txt、.md、.csv、.doc/.docx/.docm、.pdf、.json、.xlsx/.xls/.xlsm、.dxf/.dwg、图片格式"
+    )
 
 
 def _merge_materials_text(project_id: str) -> str:
-    """将本项目已上传的资料文件内容合并为一段文本，供学习进化使用。"""
+    """将本项目已上传资料按分类合并为文本，作为评分与学习进化的依据。"""
     materials = [m for m in load_materials() if m.get("project_id") == project_id]
-    parts = []
-    for m in materials:
-        path = m.get("path")
+    if not materials:
+        return ""
+    groups: Dict[str, List[dict]] = {}
+    for material in materials:
+        mat_type = _normalize_material_type(
+            material.get("material_type"), filename=material.get("filename")
+        )
+        groups.setdefault(mat_type, []).append(material)
+    merge_order = ["tender_qa", "boq", "drawing", "site_photo"]
+    for key in sorted(groups.keys()):
+        if key not in merge_order:
+            merge_order.append(key)
+
+    sections: List[str] = []
+    for mat_type in merge_order:
+        rows = groups.get(mat_type) or []
+        if not rows:
+            continue
+        rows.sort(key=lambda x: str(x.get("created_at", "")))
+        section_lines: List[str] = [f"=== {_material_type_label(mat_type)} ==="]
+        for row in rows:
+            path = row.get("path")
+            filename = str(row.get("filename") or "")
+            created_at = str(row.get("created_at") or "")[:19]
+            if not path:
+                section_lines.append(f"--- {filename} ---\n[资料缺失] 未记录路径。")
+                continue
+            p = Path(path)
+            if not p.exists():
+                section_lines.append(f"--- {filename} ---\n[资料缺失] 文件已不存在：{path}")
+                continue
+            try:
+                content = p.read_bytes()
+                text = _read_uploaded_file_content(content, p.name).strip()
+                if text:
+                    section_lines.append(f"--- {p.name} ({created_at}) ---\n{text}")
+                else:
+                    section_lines.append(
+                        f"--- {p.name} ({created_at}) ---\n[资料为空] 文件解析后为空内容。"
+                    )
+            except Exception as exc:
+                section_lines.append(
+                    f"--- {p.name} ({created_at}) ---\n[资料解析失败] {type(exc).__name__}: {exc}"
+                )
+        sections.append("\n\n".join(section_lines))
+    return "\n\n".join(sections).strip()
+
+
+def _build_material_quality_snapshot(project_id: str) -> Dict[str, object]:
+    rows = [m for m in load_materials() if str(m.get("project_id")) == project_id]
+    counts_by_type: Dict[str, int] = {}
+    parsed_ok_by_type: Dict[str, int] = {}
+    parsed_fail_by_type: Dict[str, int] = {}
+    chars_by_type: Dict[str, int] = {}
+    parsed_fail_details: List[Dict[str, str]] = []
+    parsed_ok_files = 0
+    parsed_failed_files = 0
+    for row in rows:
+        filename = str(row.get("filename") or "")
+        mat_type = _normalize_material_type(row.get("material_type"), filename=filename)
+        counts_by_type[mat_type] = counts_by_type.get(mat_type, 0) + 1
+        path = str(row.get("path") or "").strip()
         if not path:
+            parsed_failed_files += 1
+            parsed_fail_by_type[mat_type] = parsed_fail_by_type.get(mat_type, 0) + 1
+            parsed_fail_details.append(
+                {"filename": filename, "material_type": mat_type, "reason": "missing_path"}
+            )
             continue
         p = Path(path)
         if not p.exists():
+            parsed_failed_files += 1
+            parsed_fail_by_type[mat_type] = parsed_fail_by_type.get(mat_type, 0) + 1
+            parsed_fail_details.append(
+                {"filename": filename, "material_type": mat_type, "reason": "path_not_exists"}
+            )
             continue
         try:
             content = p.read_bytes()
             text = _read_uploaded_file_content(content, p.name)
-            if text.strip():
-                parts.append(f"--- {p.name} ---\n{text.strip()}")
-        except Exception:
+            chars = len(str(text or "").strip())
+            parsed_ok_files += 1
+            parsed_ok_by_type[mat_type] = parsed_ok_by_type.get(mat_type, 0) + 1
+            chars_by_type[mat_type] = chars_by_type.get(mat_type, 0) + chars
+        except Exception as exc:
+            parsed_failed_files += 1
+            parsed_fail_by_type[mat_type] = parsed_fail_by_type.get(mat_type, 0) + 1
+            parsed_fail_details.append(
+                {
+                    "filename": filename,
+                    "material_type": mat_type,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    total_files = len(rows)
+    total_chars = int(sum(chars_by_type.values()))
+    fail_ratio = (float(parsed_failed_files) / float(total_files)) if total_files > 0 else 0.0
+    return {
+        "project_id": project_id,
+        "total_files": total_files,
+        "counts_by_type": counts_by_type,
+        "parsed_ok_files": parsed_ok_files,
+        "parsed_failed_files": parsed_failed_files,
+        "parsed_ok_by_type": parsed_ok_by_type,
+        "parsed_fail_by_type": parsed_fail_by_type,
+        "chars_by_type": chars_by_type,
+        "total_parsed_chars": total_chars,
+        "parse_fail_ratio": round(fail_ratio, 4),
+        "parsed_fail_details": parsed_fail_details[:20],
+    }
+
+
+def _resolve_material_gate_config(project: Dict[str, object]) -> Dict[str, object]:
+    meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
+    enforce = bool(meta.get("enforce_material_gate", DEFAULT_ENFORCE_MATERIAL_GATE))
+    required_raw = meta.get("required_material_types", DEFAULT_REQUIRED_MATERIAL_TYPES)
+    required_types: List[str] = []
+    if isinstance(required_raw, list):
+        for item in required_raw:
+            key = _normalize_material_type(item)
+            if key not in required_types:
+                required_types.append(key)
+    if not required_types:
+        required_types = list(DEFAULT_REQUIRED_MATERIAL_TYPES)
+
+    min_chars_map = dict(DEFAULT_MIN_PARSED_CHARS_BY_TYPE)
+    raw_map = meta.get("min_parsed_chars_by_type")
+    if isinstance(raw_map, dict):
+        for k, v in raw_map.items():
+            key = _normalize_material_type(k)
+            numeric = _to_float_or_none(v)
+            if numeric is None:
+                continue
+            min_chars_map[key] = max(0, int(round(numeric)))
+
+    total_chars = _to_float_or_none(meta.get("min_total_parsed_chars"))
+    min_total_chars = (
+        max(0, int(round(total_chars)))
+        if total_chars is not None
+        else int(DEFAULT_MIN_TOTAL_PARSED_CHARS)
+    )
+    fail_ratio_raw = _to_float_or_none(meta.get("max_material_parse_fail_ratio"))
+    max_fail_ratio = (
+        min(1.0, max(0.0, float(fail_ratio_raw)))
+        if fail_ratio_raw is not None
+        else float(DEFAULT_MAX_MATERIAL_PARSE_FAIL_RATIO)
+    )
+    return {
+        "enforce": enforce,
+        "required_types": required_types,
+        "min_chars_by_type": min_chars_map,
+        "min_total_chars": min_total_chars,
+        "max_fail_ratio": max_fail_ratio,
+    }
+
+
+def _validate_material_gate_for_scoring(
+    project_id: str,
+    project: Dict[str, object],
+    *,
+    raise_on_fail: bool = True,
+) -> tuple[Dict[str, object], List[str]]:
+    snapshot = _build_material_quality_snapshot(project_id)
+    cfg = _resolve_material_gate_config(project)
+    counts_by_type = snapshot.get("counts_by_type") if isinstance(snapshot, dict) else {}
+    chars_by_type = snapshot.get("chars_by_type") if isinstance(snapshot, dict) else {}
+    counts_by_type = counts_by_type if isinstance(counts_by_type, dict) else {}
+    chars_by_type = chars_by_type if isinstance(chars_by_type, dict) else {}
+    issues: List[str] = []
+    required_types = cfg.get("required_types") if isinstance(cfg, dict) else []
+    required_types = required_types if isinstance(required_types, list) else []
+    for tpe in required_types:
+        label = _material_type_label(tpe)
+        count = int(counts_by_type.get(tpe, 0))
+        if count <= 0:
+            issues.append(f"缺少必需资料类型：{label}")
             continue
-    return "\n\n".join(parts) if parts else ""
+        min_chars = int((cfg.get("min_chars_by_type") or {}).get(tpe, 0))
+        parsed_chars = int(chars_by_type.get(tpe, 0))
+        if parsed_chars < min_chars:
+            issues.append(f"{label}解析文本不足：{parsed_chars} 字（要求至少 {min_chars} 字）")
+
+    total_parsed_chars = int(snapshot.get("total_parsed_chars", 0))
+    min_total_chars = int(cfg.get("min_total_chars", DEFAULT_MIN_TOTAL_PARSED_CHARS))
+    if total_parsed_chars < min_total_chars:
+        issues.append(
+            f"项目资料总解析文本不足：{total_parsed_chars} 字（要求至少 {min_total_chars} 字）"
+        )
+
+    parse_fail_ratio = _to_float_or_none(snapshot.get("parse_fail_ratio")) or 0.0
+    max_fail_ratio = float(cfg.get("max_fail_ratio", DEFAULT_MAX_MATERIAL_PARSE_FAIL_RATIO))
+    if parse_fail_ratio > max_fail_ratio:
+        issues.append(f"资料解析失败比例过高：{parse_fail_ratio:.1%}（阈值 {max_fail_ratio:.1%}）")
+
+    snapshot["gate"] = {
+        "enforce": bool(cfg.get("enforce", False)),
+        "required_types": required_types,
+        "min_chars_by_type": cfg.get("min_chars_by_type", {}),
+        "min_total_chars": min_total_chars,
+        "max_fail_ratio": max_fail_ratio,
+        "issues": issues,
+        "passed": len(issues) == 0,
+    }
+
+    if raise_on_fail and bool(cfg.get("enforce", False)) and issues:
+        detail = "；".join(issues)
+        raise HTTPException(status_code=422, detail=f"资料门禁未通过：{detail}")
+    return snapshot, issues
 
 
 def _compute_multipliers_hash(multipliers: dict) -> str:
@@ -7523,6 +8064,7 @@ def web_delete_project(
 @app.post("/web/upload_materials", include_in_schema=False)
 def web_upload_materials(
     project_id: str = Form(""),
+    material_type: str = Form(MATERIAL_TYPE_DEFAULT),
     file: List[UploadFile] = File(default=[]),
     api_key: Optional[str] = Depends(verify_api_key),
 ):
@@ -7549,7 +8091,13 @@ def web_upload_materials(
     first_error = ""
     for f in files:
         try:
-            upload_material(project_id=pid, file=f, api_key=api_key, locale="zh")
+            upload_material(
+                project_id=pid,
+                file=f,
+                material_type=material_type,
+                api_key=api_key,
+                locale="zh",
+            )
             ok_count += 1
         except Exception as exc:  # noqa: BLE001 - web fallback should keep processing
             fail_count += 1
@@ -7915,9 +8463,13 @@ def index(
                 material_id = html_lib.escape(str(m.get("id", "")))
                 filename_raw = str(m.get("filename", ""))
                 filename = html_lib.escape(filename_raw)
+                material_type_label = html_lib.escape(
+                    _material_type_label(m.get("material_type"), filename=m.get("filename"))
+                )
                 created_at = html_lib.escape(str(m.get("created_at", ""))[:19])
                 initial_material_rows.append(
                     "<tr>"
+                    + f"<td>{material_type_label}</td>"
                     + f"<td>{filename}</td>"
                     + f"<td>{created_at}</td>"
                     + (
@@ -8014,6 +8566,13 @@ def index(
         .action-row { display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin: 8px 0; }
         .action-row button { position:relative; z-index:2; pointer-events:auto; }
         .upload-box { margin-top:14px; padding:12px 12px 10px 12px; border-top:1px solid var(--border); border-radius:10px; background:#fbfdff; }
+        .upload-panel-title { margin:0 0 8px 0; font-size:22px; font-weight:700; color:#1e293b; }
+        .upload-zones { display:grid; grid-template-columns: 1fr; gap:12px; margin-top:12px; }
+        .upload-zone { border:1px solid var(--border); border-radius:12px; background:#f8fafc; padding:12px; }
+        .upload-zone h4 { margin:0 0 8px 0; font-size:18px; color:#1e293b; }
+        .upload-zone .inline-form { width:100%; }
+        .upload-zone input[type="file"] { flex:1 1 360px; min-width:260px; }
+        .upload-zone .note { display:block; width:100%; }
         .field-group { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-bottom:8px; }
         .field-group p { flex-basis:100%; margin:6px 0 0 0; }
         .note { font-size:12px; color:#64748b; }
@@ -8244,22 +8803,61 @@ def index(
 
       <div class="section card" id="section-materials">
         <h2>3) 项目资料</h2>
-        <p style="font-size:13px;color:#64748b;margin:-8px 0 8px 0">支持 .txt、.pdf、.doc、.docx、.json、.xlsx/.xls、.dxf。用于项目投喂包与学习进化。创建项目后建议先上传招标/清单/图纸资料。</p>
+        <p style="font-size:13px;color:#64748b;margin:-8px 0 8px 0">评分会读取本区资料并注入到锚点/要求矩阵中，作为后续施组打分依据。请按资料类型上传，避免混投。</p>
         <div style="margin-bottom:10px">
           <strong>本项目资料列表</strong>
           <button type="button" id="btnRefreshMaterials" class="secondary" style="margin-left:8px">刷新</button>
         </div>
-        <table id="materialsTable"><thead><tr><th>文件名</th><th>上传时间</th><th>操作</th></tr></thead><tbody>__MATERIAL_ROWS__</tbody></table>
+        <table id="materialsTable"><thead><tr><th>资料类型</th><th>文件名</th><th>上传时间</th><th>操作</th></tr></thead><tbody>__MATERIAL_ROWS__</tbody></table>
         <p id="materialsEmpty" style="font-size:13px;color:#64748b;margin:6px 0 0 0;display:__MATERIALS_EMPTY_DISPLAY__">暂无资料，请下方添加。</p>
         <div class="upload-box">
-          <form id="uploadMaterial" method="post" action="/web/upload_materials" enctype="multipart/form-data" class="inline-form">
-            <strong>添加资料：</strong>
-            <input type="hidden" name="project_id" id="uploadMaterialProjectId" value="__SELECTED_PROJECT_ID__" />
-            <input type="file" name="file" accept=".txt,.pdf,.doc,.docx,.json,.xlsx,.xls,.dxf" multiple />
-            <button type="submit" id="btnUploadMaterials" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadMaterials'); } return true;">上传资料</button>
-            <span class="note">支持一次选择多个文件（Mac 按 Command，Windows 按 Ctrl）。</span>
-          </form>
-          <p id="materialsActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
+          <h3 class="upload-panel-title">文件上传区</h3>
+          <div class="upload-zones">
+            <div class="upload-zone">
+              <h4>招标文件和答疑（可多选）</h4>
+              <form id="uploadMaterial" method="post" action="/web/upload_materials" enctype="multipart/form-data" class="inline-form">
+                <input type="hidden" name="project_id" id="uploadMaterialProjectId" value="__SELECTED_PROJECT_ID__" />
+                <input type="hidden" name="material_type" value="tender_qa" />
+                <input type="file" name="file" accept=".txt,.md,.pdf,.doc,.docx,.docm,.json" multiple />
+                <button type="submit" id="btnUploadMaterials" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadMaterials'); } return true;">上传资料</button>
+                <span class="note">支持：TXT/MD/PDF/DOC/DOCX/DOCM/JSON，支持一次选择多个文件。</span>
+              </form>
+              <p id="materialsActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
+            </div>
+            <div class="upload-zone">
+              <h4>清单（可多选）</h4>
+              <form id="uploadMaterialBoq" method="post" action="/web/upload_materials" enctype="multipart/form-data" class="inline-form">
+                <input type="hidden" name="project_id" id="uploadMaterialBoqProjectId" value="__SELECTED_PROJECT_ID__" />
+                <input type="hidden" name="material_type" value="boq" />
+                <input type="file" name="file" accept=".xlsx,.xls,.xlsm,.csv,.pdf,.doc,.docx,.txt,.json" multiple />
+                <button type="submit" id="btnUploadBoq" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadBoq'); } return true;">上传清单</button>
+                <span class="note">支持：XLSX/XLS/XLSM/CSV/PDF/DOC/DOCX/TXT/JSON，支持一次选择多个文件。</span>
+              </form>
+              <p id="materialsActionStatusBoq" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
+            </div>
+            <div class="upload-zone">
+              <h4>图纸（可多选，支持 DXF ASCII）</h4>
+              <form id="uploadMaterialDrawing" method="post" action="/web/upload_materials" enctype="multipart/form-data" class="inline-form">
+                <input type="hidden" name="project_id" id="uploadMaterialDrawingProjectId" value="__SELECTED_PROJECT_ID__" />
+                <input type="hidden" name="material_type" value="drawing" />
+                <input type="file" name="file" accept=".pdf,.doc,.docx,.xlsx,.xls,.dxf,.dwg,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff,.json,.txt" multiple />
+                <button type="submit" id="btnUploadDrawing" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadDrawing'); } return true;">上传图纸</button>
+                <span class="note">支持：PDF/DOC/DOCX/XLSX/XLS/DXF/DWG/图片/JSON/TXT，支持一次选择多个文件。</span>
+              </form>
+              <p id="materialsActionStatusDrawing" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
+            </div>
+            <div class="upload-zone">
+              <h4>现场照片（可多选）</h4>
+              <form id="uploadMaterialPhoto" method="post" action="/web/upload_materials" enctype="multipart/form-data" class="inline-form">
+                <input type="hidden" name="project_id" id="uploadMaterialPhotoProjectId" value="__SELECTED_PROJECT_ID__" />
+                <input type="hidden" name="material_type" value="site_photo" />
+                <input type="file" name="file" accept=".png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff" multiple />
+                <button type="submit" id="btnUploadSitePhotos" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadSitePhotos'); } return true;">上传照片</button>
+                <span class="note">支持：PNG/JPG/JPEG/WEBP/BMP/TIF/TIFF，支持一次选择多个文件。</span>
+              </form>
+              <p id="materialsActionStatusPhoto" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -8463,6 +9061,9 @@ def index(
             btnWeightsSave: { resultId: 'output', method: 'PUT', path: (pid) => '/api/v1/projects/' + pid + '/expert-profile', loading: '专家配置保存中...' },
             btnWeightsApply: { resultId: 'output', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/rescore', loading: '按当前关注度重算中...' },
             btnUploadMaterials: { resultId: 'materialsActionStatus', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/materials', loading: '资料上传中...' },
+            btnUploadBoq: { resultId: 'materialsActionStatusBoq', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/materials', loading: '清单上传中...' },
+            btnUploadDrawing: { resultId: 'materialsActionStatusDrawing', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/materials', loading: '图纸上传中...' },
+            btnUploadSitePhotos: { resultId: 'materialsActionStatusPhoto', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/materials', loading: '现场照片上传中...' },
             btnUploadShigong: { resultId: 'shigongActionStatus', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/shigong', loading: '施组上传中...' },
             btnScoreShigong: { resultId: 'shigongActionStatus', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/rescore', loading: '施组评分中...' },
             btnCompare: { resultId: 'compareResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare', loading: '对比排名加载中...' },
@@ -8483,6 +9084,42 @@ def index(
             btnCompilationInstructions: { resultId: 'compilationInstructionsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compilation_instructions', loading: '正在生成编制系统指令...' },
           });
           window.__ZHIFEI_FALLBACK_ACTIONS = FALLBACK_ACTIONS;
+          const FALLBACK_MATERIAL_UPLOAD_ACTIONS = {
+            btnUploadMaterials: {
+              formId: 'uploadMaterial',
+              materialType: 'tender_qa',
+              resultId: 'materialsActionStatus',
+              typeLabel: '招标文件和答疑',
+            },
+            btnUploadBoq: {
+              formId: 'uploadMaterialBoq',
+              materialType: 'boq',
+              resultId: 'materialsActionStatusBoq',
+              typeLabel: '清单',
+            },
+            btnUploadDrawing: {
+              formId: 'uploadMaterialDrawing',
+              materialType: 'drawing',
+              resultId: 'materialsActionStatusDrawing',
+              typeLabel: '图纸',
+            },
+            btnUploadSitePhotos: {
+              formId: 'uploadMaterialPhoto',
+              materialType: 'site_photo',
+              resultId: 'materialsActionStatusPhoto',
+              typeLabel: '现场照片',
+            },
+          };
+          function fallbackMaterialUploadActionConfig(actionId) {
+            return FALLBACK_MATERIAL_UPLOAD_ACTIONS[String(actionId || '').trim()] || null;
+          }
+          function materialTypeLabel(typeKey) {
+            const t = String(typeKey || '').trim();
+            if (t === 'boq') return '清单';
+            if (t === 'drawing') return '图纸';
+            if (t === 'site_photo') return '现场照片';
+            return '招标文件和答疑';
+          }
 
           function fallbackGetProjectId() {
             const sel = document.getElementById('projectSelect');
@@ -8655,7 +9292,7 @@ def index(
               fallbackSetResult(resultId, '评分完成（' + scaleLabel + '）：已重算 ' + updated + ' 份。', false);
               return true;
             }
-            if (aid === 'btnUploadMaterials' || aid === 'btnUploadShigong' || aid === 'btnScoreShigong' || aid === 'btnLearning' || aid === 'btnEvolve' || aid === 'btnRefreshGroundTruth' || aid === 'btnUploadFeed' || aid === 'btnAddGroundTruth' || aid === 'btnRefreshFeedMaterials' || aid === 'btnWritingGuidance' || aid === 'btnCompilationInstructions') {
+            if (aid === 'btnUploadMaterials' || aid === 'btnUploadBoq' || aid === 'btnUploadDrawing' || aid === 'btnUploadSitePhotos' || aid === 'btnUploadShigong' || aid === 'btnScoreShigong' || aid === 'btnLearning' || aid === 'btnEvolve' || aid === 'btnRefreshGroundTruth' || aid === 'btnUploadFeed' || aid === 'btnAddGroundTruth' || aid === 'btnRefreshFeedMaterials' || aid === 'btnWritingGuidance' || aid === 'btnCompilationInstructions') {
               fallbackSetResultHtml(resultId, '<span class="success">[' + fallbackEscapeHtml(aid) + '] 请求成功 (HTTP ' + fallbackEscapeHtml(status) + ')</span><pre>' + fallbackEscapeHtml(text || '{}') + '</pre>');
               return true;
             }
@@ -8723,9 +9360,11 @@ def index(
               const tr = document.createElement('tr');
               const mid = fallbackEscapeHtml(String((m && m.id) || ''));
               const fn = fallbackEscapeHtml(String((m && m.filename) || ''));
+              const mt = fallbackEscapeHtml(materialTypeLabel((m && m.material_type) || 'tender_qa'));
               const createdAt = fallbackEscapeHtml(String((m && m.created_at) || '').slice(0, 19));
               tr.innerHTML =
-                '<td>' + fn + '</td>'
+                '<td>' + mt + '</td>'
+                + '<td>' + fn + '</td>'
                 + '<td>' + createdAt + '</td>'
                 + '<td><button type="button" class="btn-danger js-delete-material" data-material-id="' + mid + '" data-filename="' + fn + '">删除</button></td>';
               if (tbody) tbody.appendChild(tr);
@@ -8804,7 +9443,7 @@ def index(
           }
           async function fallbackRefreshAfter(actionId) {
             const projectId = fallbackGetProjectId();
-            if (actionId === 'btnUploadMaterials') {
+            if (fallbackMaterialUploadActionConfig(actionId)) {
               if (typeof refreshMaterials === 'function') await Promise.resolve(refreshMaterials(projectId));
               else await fallbackRefreshMaterialsTable(projectId);
               if (typeof refreshFeedMaterials === 'function') await Promise.resolve(refreshFeedMaterials(projectId));
@@ -8868,12 +9507,14 @@ def index(
               files.forEach((f) => fd.append('file', f));
               return { body: fd, headers: fallbackAuthHeaders() };
             }
-            if (actionId === 'btnUploadMaterials') {
-              const form = document.getElementById('uploadMaterial');
+            const materialUploadCfg = fallbackMaterialUploadActionConfig(actionId);
+            if (materialUploadCfg) {
+              const form = document.getElementById(materialUploadCfg.formId);
               const fileInput = form && form.querySelector ? form.querySelector('input[name="file"]') : null;
               const files = Array.from((fileInput && fileInput.files) || []);
               const fd = new FormData();
               files.forEach((f) => fd.append('file', f));
+              fd.append('material_type', materialUploadCfg.materialType);
               return { body: fd, headers: fallbackAuthHeaders() };
             }
             if (actionId === 'btnUploadShigong') {
@@ -8951,9 +9592,10 @@ def index(
               const saved = await fallbackRunAction('btnWeightsSave');
               if (!saved) return false;
             }
-            if (actionId === 'btnUploadMaterials' || actionId === 'btnUploadShigong') {
-              const formId = actionId === 'btnUploadMaterials' ? 'uploadMaterial' : 'uploadShigong';
-              const typeLabel = actionId === 'btnUploadMaterials' ? '资料' : '施组';
+            const materialActionCfg = fallbackMaterialUploadActionConfig(actionId);
+            if (materialActionCfg || actionId === 'btnUploadShigong') {
+              const formId = materialActionCfg ? materialActionCfg.formId : 'uploadShigong';
+              const typeLabel = materialActionCfg ? materialActionCfg.typeLabel : '施组';
               const form = document.getElementById(formId);
               const fileInput = form && form.querySelector ? form.querySelector('input[name="file"]') : null;
               const files = Array.from((fileInput && fileInput.files) || []);
@@ -8969,6 +9611,7 @@ def index(
               for (const f of files) {
                 const fd = new FormData();
                 fd.append('file', f);
+                if (materialActionCfg) fd.append('material_type', materialActionCfg.materialType);
                 try {
                   const res = await fetch(cfg.path(projectId), {
                     method: cfg.method || 'POST',
@@ -9291,7 +9934,7 @@ def index(
           'btnMinePatchV2', 'btnShadowPatchV2', 'btnDeployPatchV2', 'btnRollbackPatchV2',
         ];
         const NON_BLOCKING_ACTION_BUTTON_IDS = [
-          'btnUploadMaterials', 'btnRefreshMaterials', 'btnUploadShigong', 'btnScoreShigong', 'btnRefreshSubmissions',
+          'btnUploadMaterials', 'btnUploadBoq', 'btnUploadDrawing', 'btnUploadSitePhotos', 'btnRefreshMaterials', 'btnUploadShigong', 'btnScoreShigong', 'btnRefreshSubmissions',
           'btnCompare', 'btnCompareReport', 'btnInsights', 'btnLearning',
           'btnAdaptive', 'btnAdaptivePatch', 'btnAdaptiveValidate', 'btnAdaptiveApply',
           'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
@@ -9313,7 +9956,7 @@ def index(
         }
         function syncProjectHiddenInputs(projectId) {
           const value = projectId || '';
-          ['deleteProjectId', 'uploadMaterialProjectId', 'uploadShigongProjectId'].forEach((id) => {
+          ['deleteProjectId', 'uploadMaterialProjectId', 'uploadMaterialBoqProjectId', 'uploadMaterialDrawingProjectId', 'uploadMaterialPhotoProjectId', 'uploadShigongProjectId'].forEach((id) => {
             const el = document.getElementById(id);
             if (el) el.value = value;
           });
@@ -9362,6 +10005,9 @@ def index(
           });
           if (!hasProject) {
             setActionStatus('materialsActionStatus', '请先在「2) 选择项目」中选择项目。', true);
+            setActionStatus('materialsActionStatusBoq', '请先在「2) 选择项目」中选择项目。', true);
+            setActionStatus('materialsActionStatusDrawing', '请先在「2) 选择项目」中选择项目。', true);
+            setActionStatus('materialsActionStatusPhoto', '请先在「2) 选择项目」中选择项目。', true);
             setActionStatus('shigongActionStatus', '请先在「2) 选择项目」中选择项目。', true);
             setActionStatus('feedActionStatus', '请先在「2) 选择项目」中选择项目。', true);
           }
@@ -9450,11 +10096,26 @@ def index(
             gtSubmissionSel.value = '';
           }
           document.querySelectorAll(
-            '#uploadMaterial input[type="file"], #uploadShigong input[type="file"], #feedFile'
+            '#uploadMaterial input[type="file"], #uploadMaterialBoq input[type="file"], #uploadMaterialDrawing input[type="file"], #uploadMaterialPhoto input[type="file"], #uploadShigong input[type="file"], #feedFile'
           ).forEach((el) => { if (el) el.value = ''; });
           setActionStatus(
             'materialsActionStatus',
-            hasProject ? '待机：可上传资料或点击“刷新”。' : '请先在「2) 选择项目」中选择项目。',
+            hasProject ? '待机：可上传招标文件和答疑。' : '请先在「2) 选择项目」中选择项目。',
+            !hasProject
+          );
+          setActionStatus(
+            'materialsActionStatusBoq',
+            hasProject ? '待机：可上传清单。' : '请先在「2) 选择项目」中选择项目。',
+            !hasProject
+          );
+          setActionStatus(
+            'materialsActionStatusDrawing',
+            hasProject ? '待机：可上传图纸。' : '请先在「2) 选择项目」中选择项目。',
+            !hasProject
+          );
+          setActionStatus(
+            'materialsActionStatusPhoto',
+            hasProject ? '待机：可上传现场照片。' : '请先在「2) 选择项目」中选择项目。',
             !hasProject
           );
           setActionStatus(
@@ -10144,53 +10805,73 @@ def index(
           return pid();
         }
 
-        const formMaterial = document.getElementById('uploadMaterial');
-        let uploadMaterialsInFlight = false;
-        if (formMaterial) {
-          formMaterial.onsubmit = async (e) => {
+        const MATERIAL_UPLOAD_CONFIGS = {
+          tender_qa: { formId: 'uploadMaterial', statusId: 'materialsActionStatus', typeLabel: '招标文件和答疑' },
+          boq: { formId: 'uploadMaterialBoq', statusId: 'materialsActionStatusBoq', typeLabel: '清单' },
+          drawing: { formId: 'uploadMaterialDrawing', statusId: 'materialsActionStatusDrawing', typeLabel: '图纸' },
+          site_photo: { formId: 'uploadMaterialPhoto', statusId: 'materialsActionStatusPhoto', typeLabel: '现场照片' },
+        };
+        const uploadMaterialsInFlightByType = {};
+        function bindMaterialUploadForm(materialType) {
+          const cfg = MATERIAL_UPLOAD_CONFIGS[materialType];
+          if (!cfg) return;
+          const form = document.getElementById(cfg.formId);
+          if (!form) return;
+          form.onsubmit = async (e) => {
             e.preventDefault();
             e.stopPropagation();
-            await uploadMaterialsAction();
+            await uploadMaterialsAction(materialType);
             return false;
           };
         }
-        async function uploadMaterialsAction() {
-          if (uploadMaterialsInFlight) {
-            setActionStatus('materialsActionStatus', '资料上传进行中，请稍候…', false);
+        bindMaterialUploadForm('tender_qa');
+        bindMaterialUploadForm('boq');
+        bindMaterialUploadForm('drawing');
+        bindMaterialUploadForm('site_photo');
+        async function uploadMaterialsAction(materialType = 'tender_qa') {
+          const cfg = MATERIAL_UPLOAD_CONFIGS[materialType] || MATERIAL_UPLOAD_CONFIGS.tender_qa;
+          if (uploadMaterialsInFlightByType[materialType]) {
+            setActionStatus(cfg.statusId, cfg.typeLabel + '上传进行中，请稍候…', false);
             return;
           }
-          uploadMaterialsInFlight = true;
+          uploadMaterialsInFlightByType[materialType] = true;
           try {
             const projectId = pid();
             if (!projectId) {
               const o = document.getElementById('output');
               if (o) o.textContent = '请先选择项目';
-              setActionStatus('materialsActionStatus', '上传失败：请先选择项目。', true);
+              setActionStatus(cfg.statusId, '上传失败：请先选择项目。', true);
               updateProjectBoundControlsState();
               return;
             }
-            const fileInput = formMaterial && formMaterial.querySelector ? formMaterial.querySelector('input[name="file"]') : null;
+            const form = document.getElementById(cfg.formId);
+            const fileInput = form && form.querySelector ? form.querySelector('input[name="file"]') : null;
             const files = Array.from((fileInput && fileInput.files) || []);
             if (!files.length) {
               const o = document.getElementById('output');
               if (o) o.textContent = '请先选择要上传的文件';
-              setActionStatus('materialsActionStatus', '请先选择至少 1 个资料文件。', true);
+              setActionStatus(cfg.statusId, '请先选择至少 1 个' + cfg.typeLabel + '文件。', true);
               return;
             }
             const headers = {};
             const apiKey = storageGet('api_key');
             if (apiKey) headers['X-API-Key'] = apiKey;
             const out = document.getElementById('output');
-            if (out) out.textContent = '资料上传中（' + files.length + ' 个）...';
-            setActionStatus('materialsActionStatus', '资料上传中（' + files.length + ' 个）...', false);
+            if (out) out.textContent = cfg.typeLabel + '上传中（' + files.length + ' 个）...';
+            setActionStatus(cfg.statusId, cfg.typeLabel + '上传中（' + files.length + ' 个）...', false);
             let okCount = 0;
             let failCount = 0;
             const details = [];
             for (const f of files) {
               const fd = new FormData();
               fd.append('file', f);
+              fd.append('material_type', materialType);
               try {
-                const res = await fetch('/api/v1/projects/' + projectId + '/materials', { method: 'POST', headers, body: fd });
+                const res = await fetch('/api/v1/projects/' + projectId + '/materials', {
+                  method: 'POST',
+                  headers,
+                  body: fd,
+                });
                 const text = await res.text();
                 if (res.ok) {
                   okCount += 1;
@@ -10206,9 +10887,9 @@ def index(
                 details.push('[失败] ' + f.name + ' -> ' + String((err && err.message) || err || '网络异常'));
               }
             }
-            if (out) out.textContent = '资料上传完成：成功 ' + okCount + '，失败 ' + failCount + NL + details.join(NL);
+            if (out) out.textContent = cfg.typeLabel + '上传完成：成功 ' + okCount + '，失败 ' + failCount + NL + details.join(NL);
             setActionStatus(
-              'materialsActionStatus',
+              cfg.statusId,
               '上传完成：成功 ' + okCount + '，失败 ' + failCount + '。',
               failCount > 0
             );
@@ -10218,7 +10899,7 @@ def index(
             }
             if (fileInput && failCount === 0) fileInput.value = '';
           } finally {
-            uploadMaterialsInFlight = false;
+            uploadMaterialsInFlightByType[materialType] = false;
           }
         }
 
@@ -10652,7 +11333,9 @@ def index(
           if (emptyEl) emptyEl.style.display = 'none';
           mats.forEach(m => {
             const tr = document.createElement('tr');
+            const typeLabel = materialTypeLabel((m && m.material_type) || 'tender_qa');
             tr.innerHTML =
+              '<td>' + escapeHtmlText(typeLabel) + '</td>' +
               '<td>' + escapeHtmlText(m.filename || '') + '</td>' +
               '<td>' + escapeHtmlText((m.created_at || '').slice(0,19)) + '</td>' +
               '<td><button type="button" class="btn-danger js-delete-material" data-material-id="' + escapeHtmlText(String(m.id || '')) + '" data-filename="' + escapeHtmlText(String(m.filename || '')) + '">删除</button></td>';
