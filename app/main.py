@@ -360,6 +360,9 @@ def _ensure_project_v2_fields(
     project: Dict[str, object], *, include_engine_defaults: bool = True
 ) -> bool:
     changed = False
+    if not project.get("created_at"):
+        project["created_at"] = _now_iso()
+        changed = True
     if not project.get("region"):
         project["region"] = DEFAULT_REGION
         changed = True

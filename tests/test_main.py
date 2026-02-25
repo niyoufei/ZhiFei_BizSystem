@@ -586,6 +586,22 @@ class TestProjectsEndpoints:
         assert len(data) == 1
         assert data[0]["name"] == "项目1"
 
+    @patch("app.main.save_projects")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_projects_backfills_missing_created_at(
+        self, mock_ensure, mock_load, mock_save, client
+    ):
+        """List projects should tolerate legacy records without created_at."""
+        mock_load.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        response = client.get("/api/v1/projects")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["id"] == "p1"
+        assert data[0]["created_at"]
+        mock_save.assert_called_once()
+
 
 class TestExpertProfileEndpoints:
     """Tests for /projects/{project_id}/expert-profile and rescore endpoints."""
