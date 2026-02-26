@@ -1920,6 +1920,8 @@ class TestMaterialAdvancedParsing:
         assert summary["retrieval_file_total"] == 3
         assert summary["retrieval_file_hit"] == 1
         assert summary["retrieval_file_coverage_rate"] == pytest.approx(0.3333, abs=1e-4)
+        assert summary["retrieval_unhit_file_count"] == 2
+        assert "boq.xlsx" in (summary.get("retrieval_unhit_filenames") or [])
         assert "boq" in (summary.get("uncovered_types") or [])
         assert "drawing" in (summary.get("uncovered_types") or [])
         assert summary["fallback_total"] == 1
@@ -1935,6 +1937,8 @@ class TestMaterialAdvancedParsing:
                     "retrieval_hit": 1,
                     "retrieval_file_total": 2,
                     "retrieval_file_hit": 1,
+                    "retrieval_selected_filenames": ["a.txt", "b.txt"],
+                    "retrieval_hit_filenames": ["a.txt"],
                     "consistency_total": 2,
                     "consistency_hit": 1,
                     "fallback_total": 1,
@@ -1965,6 +1969,8 @@ class TestMaterialAdvancedParsing:
                     "retrieval_hit": 1,
                     "retrieval_file_total": 1,
                     "retrieval_file_hit": 1,
+                    "retrieval_selected_filenames": ["c.txt"],
+                    "retrieval_hit_filenames": ["c.txt"],
                     "consistency_total": 1,
                     "consistency_hit": 1,
                     "fallback_total": 0,
@@ -1989,6 +1995,8 @@ class TestMaterialAdvancedParsing:
         assert merged["retrieval_file_total"] == 3
         assert merged["retrieval_file_hit"] == 2
         assert merged["retrieval_file_coverage_rate"] == pytest.approx(0.6667, abs=1e-4)
+        assert merged["retrieval_unhit_file_count"] == 1
+        assert "b.txt" in (merged.get("retrieval_unhit_filenames") or [])
         assert merged["consistency_total"] == 3
         assert merged["consistency_hit"] == 2
         assert merged["fallback_total"] == 1

@@ -1326,6 +1326,8 @@ def _build_material_utilization_summary(
             return None
         return round(float(hit_cnt) / float(total_cnt), 4)
 
+    unhit_files = sorted(retrieval_file_total_set - retrieval_file_hit_set)
+
     return {
         "retrieval_total": retrieval_total,
         "retrieval_hit": retrieval_hit,
@@ -1338,6 +1340,8 @@ def _build_material_utilization_summary(
         ),
         "retrieval_selected_filenames": sorted(retrieval_file_total_set)[:120],
         "retrieval_hit_filenames": sorted(retrieval_file_hit_set)[:120],
+        "retrieval_unhit_filenames": unhit_files[:120],
+        "retrieval_unhit_file_count": len(unhit_files),
         "consistency_total": consistency_total,
         "consistency_hit": consistency_hit,
         "consistency_hit_rate": _rate(consistency_hit, consistency_total),
@@ -1444,6 +1448,8 @@ def _aggregate_material_utilization_summaries(
     fallback_hit = 0
     retrieval_file_total = 0
     retrieval_file_hit = 0
+    retrieval_selected_filenames: set[str] = set()
+    retrieval_hit_filenames: set[str] = set()
     query_terms_count = 0
     query_numeric_terms_count = 0
 
@@ -1471,6 +1477,18 @@ def _aggregate_material_utilization_summaries(
         retrieval_hit += int(_to_float_or_none(raw.get("retrieval_hit")) or 0)
         retrieval_file_total += int(_to_float_or_none(raw.get("retrieval_file_total")) or 0)
         retrieval_file_hit += int(_to_float_or_none(raw.get("retrieval_file_hit")) or 0)
+        selected_files_raw = raw.get("retrieval_selected_filenames")
+        if isinstance(selected_files_raw, list):
+            for item in selected_files_raw:
+                filename = str(item or "").strip()
+                if filename:
+                    retrieval_selected_filenames.add(filename)
+        hit_files_raw = raw.get("retrieval_hit_filenames")
+        if isinstance(hit_files_raw, list):
+            for item in hit_files_raw:
+                filename = str(item or "").strip()
+                if filename:
+                    retrieval_hit_filenames.add(filename)
         query_terms_count += int(_to_float_or_none(raw.get("query_terms_count")) or 0)
         query_numeric_terms_count += int(
             _to_float_or_none(raw.get("query_numeric_terms_count")) or 0
@@ -1529,6 +1547,8 @@ def _aggregate_material_utilization_summaries(
             "fallback_hit_rate": _rate(row["fallback_hit"], row["fallback_total"]),
         }
 
+    retrieval_unhit_filenames = sorted(retrieval_selected_filenames - retrieval_hit_filenames)
+
     return {
         "retrieval_total": retrieval_total,
         "retrieval_hit": retrieval_hit,
@@ -1536,6 +1556,10 @@ def _aggregate_material_utilization_summaries(
         "retrieval_file_total": retrieval_file_total,
         "retrieval_file_hit": retrieval_file_hit,
         "retrieval_file_coverage_rate": _rate(retrieval_file_hit, retrieval_file_total),
+        "retrieval_selected_filenames": sorted(retrieval_selected_filenames)[:120],
+        "retrieval_hit_filenames": sorted(retrieval_hit_filenames)[:120],
+        "retrieval_unhit_filenames": retrieval_unhit_filenames[:120],
+        "retrieval_unhit_file_count": len(retrieval_unhit_filenames),
         "consistency_total": consistency_total,
         "consistency_hit": consistency_hit,
         "consistency_hit_rate": _rate(consistency_hit, consistency_total),
@@ -1566,6 +1590,7 @@ def _build_material_utilization_alerts(
     fallback_hit = int(_to_float_or_none(data.get("fallback_hit")) or 0)
     retrieval_file_total = int(_to_float_or_none(data.get("retrieval_file_total")) or 0)
     retrieval_file_coverage_rate = _to_float_or_none(data.get("retrieval_file_coverage_rate"))
+    retrieval_unhit_count = int(_to_float_or_none(data.get("retrieval_unhit_file_count")) or 0)
 
     if retrieval_total <= 0:
         alerts.append("评分未命中任何资料检索锚点，资料引用不足。")
@@ -1590,6 +1615,10 @@ def _build_material_utilization_alerts(
         alerts.append(
             "资料文件覆盖率偏低（"
             + f"{retrieval_file_coverage_rate * 100:.1f}%），可能仅引用了少量文件。"
+        )
+    if retrieval_unhit_count > 0 and retrieval_file_total >= 3:
+        alerts.append(
+            f"有 {retrieval_unhit_count} 份已检索资料未形成命中证据，建议补充对应章节引用。"
         )
 
     uncovered_raw = data.get("uncovered_types")
@@ -14098,6 +14127,10 @@ def index(
           const fallbackHit = Number(summary.fallback_hit || 0);
           const retrievalFileTotal = Number(summary.retrieval_file_total || 0);
           const retrievalFileHit = Number(summary.retrieval_file_hit || 0);
+          const retrievalUnhitFileCount = Number(summary.retrieval_unhit_file_count || 0);
+          const retrievalUnhitFilenames = Array.isArray(summary.retrieval_unhit_filenames)
+            ? summary.retrieval_unhit_filenames
+            : [];
           const queryTermsCount = Number(summary.query_terms_count || 0);
           const queryNumericTermsCount = Number(summary.query_numeric_terms_count || 0);
           const byType = (summary.by_type && typeof summary.by_type === 'object') ? summary.by_type : {};
@@ -14141,6 +14174,7 @@ def index(
             + '<table><tr><th>维度</th><th>命中/总数</th><th>命中率</th></tr>'
             + '<tr><td>资料检索锚点</td><td>' + escapeHtmlText(retrievalHit) + ' / ' + escapeHtmlText(retrievalTotal) + '</td><td>' + escapeHtmlText(toPct(summary.retrieval_hit_rate)) + '</td></tr>'
             + '<tr><td>检索文件覆盖</td><td>' + escapeHtmlText(retrievalFileHit) + ' / ' + escapeHtmlText(retrievalFileTotal) + '</td><td>' + escapeHtmlText(toPct(summary.retrieval_file_coverage_rate)) + '</td></tr>'
+            + '<tr><td>未命中资料文件</td><td>' + escapeHtmlText(retrievalUnhitFileCount) + ' / ' + escapeHtmlText(retrievalFileTotal) + '</td><td>建议优先补齐这些文件的章节引用</td></tr>'
             + '<tr><td>跨资料一致性</td><td>' + escapeHtmlText(consistencyHit) + ' / ' + escapeHtmlText(consistencyTotal) + '</td><td>' + escapeHtmlText(toPct(summary.consistency_hit_rate)) + '</td></tr>'
             + '<tr><td>关键词兜底</td><td>' + escapeHtmlText(fallbackHit) + ' / ' + escapeHtmlText(fallbackTotal) + '</td><td>' + escapeHtmlText(toPct(summary.fallback_hit_rate)) + '</td></tr>'
             + '<tr><td>查询特征规模</td><td>' + escapeHtmlText(queryTermsCount) + ' + ' + escapeHtmlText(queryNumericTermsCount) + '</td><td>文本词 + 数字约束</td></tr>'
@@ -14187,6 +14221,12 @@ def index(
             html += '<ul style="margin:6px 0 0 18px;color:#9f1239">'
               + alerts.map((a) => '<li>' + escapeHtmlText(a) + '</li>').join('')
               + '</ul>';
+          }
+          if (retrievalUnhitFilenames.length) {
+            html += '<details style="margin-top:8px"><summary>未形成命中证据的资料文件（Top 10）</summary>';
+            html += '<ul style="margin:6px 0 0 18px;color:#92400e">'
+              + retrievalUnhitFilenames.slice(0, 10).map((name) => '<li>' + escapeHtmlText(name) + '</li>').join('')
+              + '</ul></details>';
           }
           if (bySubmission.length) {
             html += '<details style="margin-top:8px"><summary>按施组查看门禁结果</summary>';
