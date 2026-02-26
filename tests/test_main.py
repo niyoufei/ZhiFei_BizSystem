@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import re
+import tempfile
 from io import BytesIO
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1444,6 +1446,64 @@ class TestMaterialAdvancedParsing:
         boq_req = next(r for r in reqs if r.get("material_type") == "boq")
         assert boq_req.get("req_type") == "material_consistency"
         assert boq_req.get("source_pack_id") == "runtime_material_consistency"
+
+    def test_build_material_consistency_requirements_fallback_for_available_types(self):
+        from app.main import _build_material_consistency_requirements
+
+        reqs = _build_material_consistency_requirements(
+            "p1",
+            [],
+            available_material_types=["tender_qa", "boq", "drawing"],
+        )
+        assert len(reqs) == 3
+        boq_req = next(r for r in reqs if r.get("material_type") == "boq")
+        terms = (boq_req.get("patterns") or {}).get("must_hit_terms") or []
+        assert "工程量" in terms
+        assert (boq_req.get("patterns") or {}).get("source_mode") == "fallback_keywords"
+
+    @patch("app.main.load_materials")
+    @patch("app.main._read_uploaded_file_content")
+    def test_select_material_retrieval_chunks_keeps_type_diversity(
+        self, mock_read_uploaded_file_content, mock_load_materials
+    ):
+        from app.main import _select_material_retrieval_chunks
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tender = Path(tmp) / "tender.txt"
+            boq = Path(tmp) / "boq.txt"
+            drawing = Path(tmp) / "drawing.txt"
+            tender.write_text("答疑 工期 质量标准 节点 闭环", encoding="utf-8")
+            boq.write_text("工程量 综合单价 措施费", encoding="utf-8")
+            drawing.write_text("图纸 节点 剖面 深化 BIM", encoding="utf-8")
+            mock_load_materials.return_value = [
+                {
+                    "project_id": "p1",
+                    "material_type": "tender_qa",
+                    "filename": "tender.txt",
+                    "path": str(tender),
+                    "created_at": "2026-02-26T00:00:01+00:00",
+                },
+                {
+                    "project_id": "p1",
+                    "material_type": "boq",
+                    "filename": "boq.txt",
+                    "path": str(boq),
+                    "created_at": "2026-02-26T00:00:02+00:00",
+                },
+                {
+                    "project_id": "p1",
+                    "material_type": "drawing",
+                    "filename": "drawing.txt",
+                    "path": str(drawing),
+                    "created_at": "2026-02-26T00:00:03+00:00",
+                },
+            ]
+            mock_read_uploaded_file_content.side_effect = lambda _content, filename: Path(
+                tmp, filename
+            ).read_text(encoding="utf-8")
+            chunks = _select_material_retrieval_chunks("p1", "工期 节点 工程量", top_k=6)
+            types = {str(c.get("material_type")) for c in chunks}
+            assert {"tender_qa", "boq", "drawing"}.issubset(types)
 
 
 class TestScoreForProjectEndpoint:

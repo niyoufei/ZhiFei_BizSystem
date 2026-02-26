@@ -833,9 +833,24 @@ def _build_runtime_custom_requirements(
         submission_text,
         top_k=12,
     )
+    material_rows = [m for m in load_materials() if str(m.get("project_id")) == project_id]
+    available_material_types: List[str] = []
+    for row in material_rows:
+        key = _normalize_material_type(row.get("material_type"), filename=row.get("filename"))
+        if key not in available_material_types:
+            available_material_types.append(key)
+    retrieval_types = sorted(
+        {
+            str(c.get("material_type") or "")
+            for c in retrieval_chunks
+            if str(c.get("material_type") or "").strip()
+        }
+    )
     retrieval_requirements = _build_material_retrieval_requirements(project_id, retrieval_chunks)
     consistency_requirements = _build_material_consistency_requirements(
-        project_id, retrieval_chunks
+        project_id,
+        retrieval_chunks,
+        available_material_types=available_material_types,
     )
     runtime_requirements.extend(retrieval_requirements)
     runtime_requirements.extend(consistency_requirements)
@@ -850,6 +865,11 @@ def _build_runtime_custom_requirements(
         "material_retrieval_chunks": len(retrieval_chunks),
         "material_retrieval_requirements": len(retrieval_requirements),
         "material_consistency_requirements": len(consistency_requirements),
+        "material_available_types": available_material_types,
+        "material_retrieval_types": retrieval_types,
+        "material_retrieval_missing_types": [
+            t for t in available_material_types if t not in retrieval_types
+        ],
         "material_retrieval_preview": [
             {
                 "material_type": c.get("material_type"),
@@ -858,6 +878,7 @@ def _build_runtime_custom_requirements(
                 "dimension_id": c.get("dimension_id"),
                 "score": c.get("score"),
                 "matched_terms": c.get("matched_terms"),
+                "selected_via": c.get("selected_via"),
             }
             for c in retrieval_chunks[:8]
         ],
@@ -1952,6 +1973,9 @@ def _score_submission_for_project(
                 _to_float_or_none(runtime_req_meta.get("material_consistency_requirements")) or 0
             ),
             "consistency_preview": runtime_req_meta.get("material_consistency_preview") or [],
+            "available_types": runtime_req_meta.get("material_available_types") or [],
+            "retrieval_types": runtime_req_meta.get("material_retrieval_types") or [],
+            "missing_types": runtime_req_meta.get("material_retrieval_missing_types") or [],
         }
         gate_obj = snapshot_for_meta.get("gate")
         if isinstance(gate_obj, dict):
@@ -5348,10 +5372,13 @@ def _select_material_retrieval_chunks(
 
     rows = [m for m in load_materials() if str(m.get("project_id")) == project_id]
     rows.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+    available_types: List[str] = []
     candidates: List[Dict[str, object]] = []
     for row in rows:
         filename = str(row.get("filename") or "")
         mat_type = _normalize_material_type(row.get("material_type"), filename=filename)
+        if mat_type not in available_types:
+            available_types.append(mat_type)
         path = str(row.get("path") or "").strip()
         if not path:
             continue
@@ -5399,7 +5426,37 @@ def _select_material_retrieval_chunks(
             str(x.get("chunk_id")),
         )
     )
-    return candidates[: max(1, int(top_k))]
+    target_k = max(1, int(top_k))
+    selected: List[Dict[str, object]] = []
+    seen_chunk_ids: set[str] = set()
+
+    # 先保证“每个已上传资料类型至少取一个块”，避免单一资料类型垄断检索。
+    for mat_type in available_types:
+        best = next((c for c in candidates if str(c.get("material_type")) == mat_type), None)
+        if not best:
+            continue
+        chunk_id = str(best.get("chunk_id") or "")
+        if chunk_id in seen_chunk_ids:
+            continue
+        row = dict(best)
+        row["selected_via"] = "type_quota"
+        selected.append(row)
+        seen_chunk_ids.add(chunk_id)
+        if len(selected) >= target_k:
+            return selected
+
+    # 再按全局相关性补齐 top_k。
+    for candidate in candidates:
+        chunk_id = str(candidate.get("chunk_id") or "")
+        if chunk_id in seen_chunk_ids:
+            continue
+        row = dict(candidate)
+        row["selected_via"] = "global_rank"
+        selected.append(row)
+        seen_chunk_ids.add(chunk_id)
+        if len(selected) >= target_k:
+            break
+    return selected
 
 
 def _build_material_retrieval_requirements(
@@ -5452,6 +5509,8 @@ def _build_material_retrieval_requirements(
 def _build_material_consistency_requirements(
     project_id: str,
     retrieval_chunks: List[Dict[str, object]],
+    *,
+    available_material_types: Optional[List[str]] = None,
 ) -> List[Dict[str, object]]:
     now = _now_iso()
     grouped: Dict[str, List[Dict[str, object]]] = {}
@@ -5459,9 +5518,21 @@ def _build_material_consistency_requirements(
         mat_type = str(chunk.get("material_type") or MATERIAL_TYPE_DEFAULT)
         grouped.setdefault(mat_type, []).append(chunk)
 
+    normalized_available_types: List[str] = []
+    for item in available_material_types or []:
+        key = _normalize_material_type(item)
+        if key and key not in normalized_available_types:
+            normalized_available_types.append(key)
+    for mat_type in normalized_available_types:
+        grouped.setdefault(mat_type, [])
+
     reqs: List[Dict[str, object]] = []
     req_index = 0
-    for mat_type, chunks in grouped.items():
+    ordered_types = normalized_available_types + [
+        mat_type for mat_type in grouped.keys() if mat_type not in normalized_available_types
+    ]
+    for mat_type in ordered_types:
+        chunks = grouped.get(mat_type) or []
         keyword_counter: Counter[str] = Counter()
         preview_terms: List[str] = []
         filenames: List[str] = []
@@ -5479,13 +5550,24 @@ def _build_material_consistency_requirements(
         must_terms = [item for item, _ in keyword_counter.most_common(8)]
         if len(must_terms) < 4:
             must_terms.extend([item for item in preview_terms if item not in must_terms])
+        if len(must_terms) < 3:
+            must_terms.extend(
+                [
+                    item
+                    for item in MATERIAL_TYPE_KEYWORDS.get(mat_type, [])
+                    if item not in must_terms
+                ]
+            )
         must_terms = _to_text_items(must_terms, max_items=8)
         if not must_terms:
             continue
 
         req_index += 1
         minimum_terms = 2 if mat_type in {"tender_qa", "boq", "drawing"} else 1
-        mandatory = mat_type in {"tender_qa", "boq", "drawing"}
+        mandatory = mat_type in {"tender_qa", "boq", "drawing"} and (
+            (not normalized_available_types) or (mat_type in normalized_available_types)
+        )
+        source_mode = "retrieval_chunks" if chunks else "fallback_keywords"
         dim_id = (MATERIAL_TYPE_DIMENSION_PRIORITY.get(mat_type) or ["01"])[0]
         reqs.append(
             {
@@ -5500,6 +5582,7 @@ def _build_material_consistency_requirements(
                     "material_type": mat_type,
                     "sample_filenames": _to_text_items(filenames, max_items=3),
                     "within_dimension_scope": False,
+                    "source_mode": source_mode,
                 },
                 "mandatory": mandatory,
                 "weight": 1.1 if mandatory else 0.8,
