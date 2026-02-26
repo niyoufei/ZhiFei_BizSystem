@@ -835,6 +835,7 @@ class TestExpertProfileEndpoints:
         assert data["score_scale_label"] == "5分制"
         assert "material_utilization" in data
         assert "material_utilization_alerts" in data
+        assert "material_utilization_gate" in data
         mock_save_submissions.assert_called_once()
         mock_save_score_reports.assert_called_once()
         mock_record_history.assert_called_once()
@@ -1602,6 +1603,63 @@ class TestMaterialAdvancedParsing:
         assert merged["fallback_hit"] == 0
         assert "boq" in (merged.get("uncovered_types") or [])
         assert "drawing" in (merged.get("available_types") or [])
+
+    def test_evaluate_material_utilization_gate_blocks_when_required_types_uncovered(self):
+        from app.main import _evaluate_material_utilization_gate
+
+        summary = {
+            "retrieval_total": 6,
+            "retrieval_hit_rate": 0.6,
+            "consistency_total": 4,
+            "consistency_hit_rate": 0.5,
+            "available_types": ["tender_qa", "boq", "drawing"],
+            "uncovered_types": ["drawing"],
+        }
+        policy = {
+            "enabled": True,
+            "mode": "block",
+            "min_retrieval_hit_rate": 0.2,
+            "min_consistency_hit_rate": 0.2,
+            "max_uncovered_required_types": 0,
+            "min_required_type_coverage_rate": 1.0,
+        }
+        gate = _evaluate_material_utilization_gate(
+            summary,
+            policy=policy,
+            required_types=["tender_qa", "boq", "drawing"],
+        )
+        assert gate["enabled"] is True
+        assert gate["blocked"] is True
+        assert gate["passed"] is False
+        assert "drawing" in (gate.get("uncovered_required_types") or [])
+
+    def test_evaluate_material_utilization_gate_warn_mode(self):
+        from app.main import _evaluate_material_utilization_gate
+
+        summary = {
+            "retrieval_total": 6,
+            "retrieval_hit_rate": 0.1,
+            "consistency_total": 4,
+            "consistency_hit_rate": 0.1,
+            "available_types": ["tender_qa", "boq", "drawing"],
+            "uncovered_types": [],
+        }
+        policy = {
+            "enabled": True,
+            "mode": "warn",
+            "min_retrieval_hit_rate": 0.2,
+            "min_consistency_hit_rate": 0.2,
+            "max_uncovered_required_types": 0,
+            "min_required_type_coverage_rate": 0.6,
+        }
+        gate = _evaluate_material_utilization_gate(
+            summary,
+            policy=policy,
+            required_types=["tender_qa", "boq", "drawing"],
+        )
+        assert gate["warned"] is True
+        assert gate["blocked"] is False
+        assert gate["level"] == "warn"
 
 
 class TestScoreForProjectEndpoint:

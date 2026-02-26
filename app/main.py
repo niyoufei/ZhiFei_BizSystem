@@ -294,6 +294,12 @@ DEFAULT_MIN_PARSED_CHARS_BY_TYPE = {
 }
 DEFAULT_MIN_TOTAL_PARSED_CHARS = 18000
 DEFAULT_MAX_MATERIAL_PARSE_FAIL_RATIO = 0.6
+DEFAULT_ENFORCE_MATERIAL_UTILIZATION_GATE = True
+DEFAULT_MATERIAL_UTILIZATION_GATE_MODE = "block"
+DEFAULT_MIN_MATERIAL_RETRIEVAL_HIT_RATE = 0.25
+DEFAULT_MIN_MATERIAL_CONSISTENCY_HIT_RATE = 0.25
+DEFAULT_MAX_UNCOVERED_REQUIRED_TYPES = 0
+DEFAULT_MIN_REQUIRED_TYPE_COVERAGE_RATE = 0.67
 DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR = 200
 DEFAULT_PDF_OCR_MAX_PAGES = 30
 PROFILE_LOCKED_STATUSES = {"submitted_to_qingtian"}
@@ -428,6 +434,24 @@ def _ensure_project_v2_fields(
         changed = True
     if "max_material_parse_fail_ratio" not in meta:
         meta["max_material_parse_fail_ratio"] = float(DEFAULT_MAX_MATERIAL_PARSE_FAIL_RATIO)
+        changed = True
+    if "enforce_material_utilization_gate" not in meta:
+        meta["enforce_material_utilization_gate"] = bool(DEFAULT_ENFORCE_MATERIAL_UTILIZATION_GATE)
+        changed = True
+    if "material_utilization_gate_mode" not in meta:
+        meta["material_utilization_gate_mode"] = DEFAULT_MATERIAL_UTILIZATION_GATE_MODE
+        changed = True
+    if "min_material_retrieval_hit_rate" not in meta:
+        meta["min_material_retrieval_hit_rate"] = float(DEFAULT_MIN_MATERIAL_RETRIEVAL_HIT_RATE)
+        changed = True
+    if "min_material_consistency_hit_rate" not in meta:
+        meta["min_material_consistency_hit_rate"] = float(DEFAULT_MIN_MATERIAL_CONSISTENCY_HIT_RATE)
+        changed = True
+    if "max_uncovered_required_types" not in meta:
+        meta["max_uncovered_required_types"] = int(DEFAULT_MAX_UNCOVERED_REQUIRED_TYPES)
+        changed = True
+    if "min_required_type_coverage_rate" not in meta:
+        meta["min_required_type_coverage_rate"] = float(DEFAULT_MIN_REQUIRED_TYPE_COVERAGE_RATE)
         changed = True
     return changed
 
@@ -1228,6 +1252,247 @@ def _build_material_utilization_alerts(
         if text and text not in deduped:
             deduped.append(text)
     return deduped[:6]
+
+
+def _resolve_material_utilization_policy(project: Dict[str, object]) -> Dict[str, object]:
+    meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
+
+    def _to_rate(value: object, default: float) -> float:
+        numeric = _to_float_or_none(value)
+        if numeric is None:
+            numeric = default
+        return min(1.0, max(0.0, float(numeric)))
+
+    def _to_nonneg_int(value: object, default: int) -> int:
+        numeric = _to_float_or_none(value)
+        if numeric is None:
+            return int(default)
+        return max(0, int(round(float(numeric))))
+
+    raw_mode = str(
+        meta.get("material_utilization_gate_mode", DEFAULT_MATERIAL_UTILIZATION_GATE_MODE) or ""
+    ).strip()
+    mode = "warn" if raw_mode.lower() == "warn" else "block"
+
+    return {
+        "enabled": bool(
+            meta.get("enforce_material_utilization_gate", DEFAULT_ENFORCE_MATERIAL_UTILIZATION_GATE)
+        ),
+        "mode": mode,
+        "min_retrieval_hit_rate": _to_rate(
+            meta.get("min_material_retrieval_hit_rate"),
+            DEFAULT_MIN_MATERIAL_RETRIEVAL_HIT_RATE,
+        ),
+        "min_consistency_hit_rate": _to_rate(
+            meta.get("min_material_consistency_hit_rate"),
+            DEFAULT_MIN_MATERIAL_CONSISTENCY_HIT_RATE,
+        ),
+        "max_uncovered_required_types": _to_nonneg_int(
+            meta.get("max_uncovered_required_types"),
+            DEFAULT_MAX_UNCOVERED_REQUIRED_TYPES,
+        ),
+        "min_required_type_coverage_rate": _to_rate(
+            meta.get("min_required_type_coverage_rate"),
+            DEFAULT_MIN_REQUIRED_TYPE_COVERAGE_RATE,
+        ),
+    }
+
+
+def _evaluate_material_utilization_gate(
+    summary: Optional[Dict[str, object]],
+    *,
+    policy: Optional[Dict[str, object]] = None,
+    required_types: Optional[List[str]] = None,
+) -> Dict[str, object]:
+    data = summary if isinstance(summary, dict) else {}
+    gate_policy = policy if isinstance(policy, dict) else {}
+    enabled = bool(gate_policy.get("enabled", DEFAULT_ENFORCE_MATERIAL_UTILIZATION_GATE))
+    mode = str(gate_policy.get("mode") or DEFAULT_MATERIAL_UTILIZATION_GATE_MODE).strip().lower()
+    mode = "warn" if mode == "warn" else "block"
+
+    retrieval_total = int(_to_float_or_none(data.get("retrieval_total")) or 0)
+    retrieval_hit_rate = _to_float_or_none(data.get("retrieval_hit_rate"))
+    consistency_total = int(_to_float_or_none(data.get("consistency_total")) or 0)
+    consistency_hit_rate = _to_float_or_none(data.get("consistency_hit_rate"))
+
+    available_raw = data.get("available_types")
+    available_types = (
+        [_normalize_material_type(x) for x in available_raw]
+        if isinstance(available_raw, list)
+        else []
+    )
+    uncovered_raw = data.get("uncovered_types")
+    uncovered_types = (
+        [_normalize_material_type(x) for x in uncovered_raw]
+        if isinstance(uncovered_raw, list)
+        else []
+    )
+
+    required_source = required_types if isinstance(required_types, list) else []
+    normalized_required = []
+    for item in required_source:
+        key = _normalize_material_type(item)
+        if key and key not in normalized_required:
+            normalized_required.append(key)
+    if not normalized_required:
+        normalized_required = list(DEFAULT_REQUIRED_MATERIAL_TYPES)
+
+    required_present = [t for t in normalized_required if t in available_types]
+    uncovered_required = [t for t in required_present if t in uncovered_types]
+    covered_required = [t for t in required_present if t not in uncovered_required]
+    required_coverage_rate = (
+        round(float(len(covered_required)) / float(len(required_present)), 4)
+        if required_present
+        else None
+    )
+
+    min_retrieval = min(
+        1.0,
+        max(
+            0.0,
+            float(
+                _to_float_or_none(gate_policy.get("min_retrieval_hit_rate"))
+                or DEFAULT_MIN_MATERIAL_RETRIEVAL_HIT_RATE
+            ),
+        ),
+    )
+    min_consistency = min(
+        1.0,
+        max(
+            0.0,
+            float(
+                _to_float_or_none(gate_policy.get("min_consistency_hit_rate"))
+                or DEFAULT_MIN_MATERIAL_CONSISTENCY_HIT_RATE
+            ),
+        ),
+    )
+    max_uncovered = max(
+        0,
+        int(
+            round(
+                float(
+                    _to_float_or_none(gate_policy.get("max_uncovered_required_types"))
+                    or DEFAULT_MAX_UNCOVERED_REQUIRED_TYPES
+                )
+            )
+        ),
+    )
+    min_required_coverage = min(
+        1.0,
+        max(
+            0.0,
+            float(
+                _to_float_or_none(gate_policy.get("min_required_type_coverage_rate"))
+                or DEFAULT_MIN_REQUIRED_TYPE_COVERAGE_RATE
+            ),
+        ),
+    )
+
+    reasons: List[str] = []
+    if (
+        retrieval_total > 0
+        and retrieval_hit_rate is not None
+        and retrieval_hit_rate < min_retrieval
+    ):
+        reasons.append(f"资料检索命中率 {retrieval_hit_rate:.1%} 低于阈值 {min_retrieval:.1%}")
+    if (
+        consistency_total > 0
+        and consistency_hit_rate is not None
+        and consistency_hit_rate < min_consistency
+    ):
+        reasons.append(
+            f"跨资料一致性命中率 {consistency_hit_rate:.1%} 低于阈值 {min_consistency:.1%}"
+        )
+    if len(uncovered_required) > max_uncovered:
+        labels = "、".join(_material_type_label(x) for x in uncovered_required)
+        reasons.append(f"关键资料未形成证据：{labels}（允许未覆盖 {max_uncovered} 类）")
+    if required_coverage_rate is not None and required_coverage_rate < min_required_coverage:
+        reasons.append(
+            f"关键资料覆盖率 {required_coverage_rate:.1%} 低于阈值 {min_required_coverage:.1%}"
+        )
+
+    failed = bool(reasons)
+    blocked = bool(enabled and failed and mode == "block")
+    warned = bool(enabled and failed and mode != "block")
+    if not enabled:
+        level = "disabled"
+    elif blocked:
+        level = "blocked"
+    elif warned:
+        level = "warn"
+    else:
+        level = "pass"
+
+    return {
+        "enabled": enabled,
+        "mode": mode,
+        "passed": not failed,
+        "blocked": blocked,
+        "warned": warned,
+        "level": level,
+        "reasons": reasons,
+        "thresholds": {
+            "min_retrieval_hit_rate": min_retrieval,
+            "min_consistency_hit_rate": min_consistency,
+            "max_uncovered_required_types": max_uncovered,
+            "min_required_type_coverage_rate": min_required_coverage,
+        },
+        "required_types": normalized_required,
+        "required_types_present": required_present,
+        "covered_required_types": covered_required,
+        "uncovered_required_types": uncovered_required,
+        "required_type_coverage_rate": required_coverage_rate,
+        "metrics": {
+            "retrieval_total": retrieval_total,
+            "retrieval_hit_rate": retrieval_hit_rate,
+            "consistency_total": consistency_total,
+            "consistency_hit_rate": consistency_hit_rate,
+        },
+    }
+
+
+def _aggregate_material_utilization_gates(gates: List[Dict[str, object]]) -> Dict[str, object]:
+    if not gates:
+        return {
+            "enabled": False,
+            "mode": DEFAULT_MATERIAL_UTILIZATION_GATE_MODE,
+            "blocked_submissions": 0,
+            "warn_submissions": 0,
+            "pass_submissions": 0,
+            "failed_submissions": 0,
+            "failed_filenames": [],
+        }
+    enabled = any(bool(g.get("enabled")) for g in gates if isinstance(g, dict))
+    mode = "block"
+    if all(str(g.get("mode", "")).lower() == "warn" for g in gates if isinstance(g, dict)):
+        mode = "warn"
+    blocked_submissions = 0
+    warn_submissions = 0
+    pass_submissions = 0
+    failed_submissions = 0
+    failed_filenames: List[str] = []
+    for g in gates:
+        if not isinstance(g, dict):
+            continue
+        level = str(g.get("level") or "").strip().lower()
+        passed = bool(g.get("passed", False))
+        if passed:
+            pass_submissions += 1
+        else:
+            failed_submissions += 1
+        if level == "blocked":
+            blocked_submissions += 1
+        elif level == "warn":
+            warn_submissions += 1
+    return {
+        "enabled": enabled,
+        "mode": mode,
+        "blocked_submissions": blocked_submissions,
+        "warn_submissions": warn_submissions,
+        "pass_submissions": pass_submissions,
+        "failed_submissions": failed_submissions,
+        "failed_filenames": failed_filenames,
+    }
 
 
 def _get_rubric_dim_cfg(rubric_dimensions: Dict[str, object], dim_id: str) -> Dict[str, object]:
@@ -2244,14 +2509,46 @@ def _score_submission_for_project(
             runtime_req_meta,
         )
         gate_obj = snapshot_for_meta.get("gate")
+        material_gate_cfg = _resolve_material_gate_config(project)
+        material_required_types = (
+            material_gate_cfg.get("required_types")
+            if isinstance(material_gate_cfg.get("required_types"), list)
+            else []
+        )
+        material_utilization_policy = _resolve_material_utilization_policy(project)
+        utilization_gate = _evaluate_material_utilization_gate(
+            report_meta.get("material_utilization")
+            if isinstance(report_meta.get("material_utilization"), dict)
+            else {},
+            policy=material_utilization_policy,
+            required_types=material_required_types,
+        )
         if isinstance(gate_obj, dict):
             report_meta["material_gate"] = gate_obj
+        report_meta["material_utilization_gate"] = utilization_gate
         report_meta["material_utilization_alerts"] = _build_material_utilization_alerts(
             report_meta.get("material_utilization")
             if isinstance(report_meta.get("material_utilization"), dict)
             else {},
             gate_obj if isinstance(gate_obj, dict) else {},
         )
+        if bool(utilization_gate.get("blocked")):
+            report_meta["score_confidence_level"] = "low"
+            report_meta["score_blocked_by_material_utilization"] = True
+            alerts = (
+                report_meta.get("material_utilization_alerts")
+                if isinstance(report_meta.get("material_utilization_alerts"), list)
+                else []
+            )
+            for reason in utilization_gate.get("reasons") or []:
+                reason_text = str(reason).strip()
+                if reason_text and reason_text not in alerts:
+                    alerts.append("资料利用门禁：" + reason_text)
+            report_meta["material_utilization_alerts"] = alerts[:8]
+        elif bool(utilization_gate.get("warned")):
+            report_meta["score_confidence_level"] = "medium"
+        else:
+            report_meta["score_confidence_level"] = "high"
         report["meta"] = report_meta
         _apply_deployed_patch_to_report(project_id, report)
         submission_like = {"id": submission_id, "project_id": project_id, "text": text}
@@ -4027,6 +4324,8 @@ def rescore_project_submissions(
     generated = 0
     material_utilization_summaries: List[Dict[str, object]] = []
     material_utilization_by_submission: List[Dict[str, object]] = []
+    material_utilization_gates: List[Dict[str, object]] = []
+    failed_gate_filenames: List[str] = []
     now = _now_iso()
     for submission in targets:
         text = submission.get("text") or ""
@@ -4060,11 +4359,23 @@ def rescore_project_submissions(
         material_utilization = report_meta.get("material_utilization")
         if isinstance(material_utilization, dict):
             material_utilization_summaries.append(material_utilization)
+            material_utilization_gate = (
+                report_meta.get("material_utilization_gate")
+                if isinstance(report_meta.get("material_utilization_gate"), dict)
+                else {}
+            )
             detail_item: Dict[str, object] = {
                 "submission_id": str(submission.get("id") or ""),
                 "filename": str(submission.get("filename") or ""),
                 "summary": material_utilization,
             }
+            if material_utilization_gate:
+                detail_item["gate"] = material_utilization_gate
+                material_utilization_gates.append(material_utilization_gate)
+                if not bool(material_utilization_gate.get("passed", True)):
+                    filename_text = str(submission.get("filename") or "")
+                    if filename_text and filename_text not in failed_gate_filenames:
+                        failed_gate_filenames.append(filename_text)
             alerts = report_meta.get("material_utilization_alerts")
             if isinstance(alerts, list):
                 detail_item["alerts"] = [str(x) for x in alerts[:6] if str(x).strip()]
@@ -4124,6 +4435,8 @@ def rescore_project_submissions(
         material_utilization,
         material_gate if isinstance(material_gate, dict) else {},
     )
+    material_utilization_gate = _aggregate_material_utilization_gates(material_utilization_gates)
+    material_utilization_gate["failed_filenames"] = failed_gate_filenames
 
     return RescoreResponse(
         ok=True,
@@ -4136,6 +4449,7 @@ def rescore_project_submissions(
         score_scale_label=_score_scale_label(score_scale_max),
         material_utilization=material_utilization,
         material_utilization_alerts=material_utilization_alerts,
+        material_utilization_gate=material_utilization_gate,
         material_utilization_by_submission=material_utilization_by_submission[:20],
         started_at=started_at,
         finished_at=_now_iso(),
@@ -9314,6 +9628,13 @@ def web_score_shigong(
             )
         )
         msg = f"施组评分完成：已重算 {updated} 份"
+        gate_obj = getattr(result, "material_utilization_gate", {}) or {}
+        blocked_count = int(_to_float_or_none(gate_obj.get("blocked_submissions")) or 0)
+        warn_count = int(_to_float_or_none(gate_obj.get("warn_submissions")) or 0)
+        if blocked_count > 0:
+            msg += f"；资料门禁阻断 {blocked_count} 份"
+        elif warn_count > 0:
+            msg += f"；资料门禁预警 {warn_count} 份"
         return RedirectResponse(
             url="/?project_id="
             + quote_plus(pid)
@@ -9583,6 +9904,13 @@ def index(
                 llm_total = _convert_score_from_100(llm_total_raw, score_scale_initial)
                 scoring_status = str(report.get("scoring_status") or "").strip().lower()
                 is_pending = scoring_status == "pending"
+                report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+                util_gate = (
+                    report_meta.get("material_utilization_gate")
+                    if isinstance(report_meta.get("material_utilization_gate"), dict)
+                    else {}
+                )
+                util_blocked = bool(util_gate.get("blocked"))
                 primary_total = (
                     pred_total
                     if pred_total is not None
@@ -9602,6 +9930,10 @@ def index(
                 else:
                     score_cell = (
                         "-" if primary_total is None else html_lib.escape(str(primary_total))
+                    )
+                if util_blocked:
+                    score_cell += (
+                        '<div class="error">资料利用门禁未达标（建议补齐资料后重评分）</div>'
                     )
                 created_at = html_lib.escape(str(s.get("created_at", ""))[:19])
                 initial_submission_rows.append(
@@ -9815,6 +10147,30 @@ def index(
                 });
               }
               setResult(cfg.resultId, '施组选项刷新完成：共 ' + subs.length + ' 份。', false);
+              return true;
+            }
+            if (actionId === 'btnScoreShigong') {
+              const updated = Number(
+                (data && (data.updated_submissions ?? data.reports_generated ?? data.submission_count)) || 0
+              );
+              const scaleLabel = (data && data.score_scale_label) ? String(data.score_scale_label) : '100分制';
+              const gate = (data && typeof data.material_utilization_gate === 'object')
+                ? data.material_utilization_gate
+                : {};
+              const blockedCount = Number((gate && gate.blocked_submissions) || 0);
+              const warnCount = Number((gate && gate.warn_submissions) || 0);
+              let msg = '评分完成（' + scaleLabel + '）：已重算 ' + updated + ' 份。';
+              if (blockedCount > 0) {
+                msg += ' 资料门禁阻断 ' + blockedCount + ' 份。';
+              } else if (warnCount > 0) {
+                msg += ' 资料门禁预警 ' + warnCount + ' 份。';
+              } else if (gate && gate.enabled) {
+                msg += ' 资料门禁通过。';
+              }
+              setResult(cfg.resultId, msg, blockedCount > 0);
+              if (window.renderMaterialUtilizationPanel && typeof window.renderMaterialUtilizationPanel === 'function') {
+                window.renderMaterialUtilizationPanel(data || {});
+              }
               return true;
             }
             setResultHtml(cfg.resultId, '<pre>' + esc(text || '{}') + '</pre>');
@@ -10370,7 +10726,18 @@ def index(
                 (data && (data.updated_submissions ?? data.reports_generated ?? data.submission_count)) || 0
               );
               const scaleLabel = (data && data.score_scale_label) ? String(data.score_scale_label) : selectedScoreScaleLabel();
-              fallbackSetResult(resultId, '评分完成（' + scaleLabel + '）：已重算 ' + updated + ' 份。', false);
+              const gate = (data && typeof data.material_utilization_gate === 'object') ? data.material_utilization_gate : {};
+              const blockedCount = Number((gate && gate.blocked_submissions) || 0);
+              const warnCount = Number((gate && gate.warn_submissions) || 0);
+              let msg = '评分完成（' + scaleLabel + '）：已重算 ' + updated + ' 份。';
+              if (blockedCount > 0) {
+                msg += ' 资料门禁阻断 ' + blockedCount + ' 份。';
+              } else if (warnCount > 0) {
+                msg += ' 资料门禁预警 ' + warnCount + ' 份。';
+              } else if (gate && gate.enabled) {
+                msg += ' 资料门禁通过。';
+              }
+              fallbackSetResult(resultId, msg, blockedCount > 0);
               if (window.renderMaterialUtilizationPanel && typeof window.renderMaterialUtilizationPanel === 'function') {
                 window.renderMaterialUtilizationPanel(data || {});
               }
@@ -10508,6 +10875,11 @@ def index(
               const llm = report && report.llm_total_score != null ? report.llm_total_score : null;
               const scoringStatus = String((report && report.scoring_status) || '').toLowerCase();
               const isPending = scoringStatus === 'pending';
+              const reportMeta = (report && typeof report.meta === 'object') ? report.meta : {};
+              const utilGate = (reportMeta && typeof reportMeta.material_utilization_gate === 'object')
+                ? reportMeta.material_utilization_gate
+                : {};
+              const utilBlocked = !!(utilGate && utilGate.blocked);
               let scoreHtml = '-';
               if (isPending) {
                 scoreHtml = '<span class="note">待评分</span>';
@@ -10519,6 +10891,9 @@ def index(
                 if (notes.length) scoreHtml += '<div class="note">' + notes.join(' / ') + '</div>';
               } else if (s && s.total_score != null) {
                 scoreHtml = fallbackEscapeHtml(String(s.total_score));
+              }
+              if (utilBlocked) {
+                scoreHtml += '<div class="error">资料利用门禁未达标（建议补齐资料后重评分）</div>';
               }
               tr.innerHTML =
                 '<td>' + fn + '</td>'
@@ -10539,10 +10914,14 @@ def index(
                   material_utilization_alerts: Array.isArray(meta.material_utilization_alerts)
                     ? meta.material_utilization_alerts
                     : [],
+                  material_utilization_gate: (meta && typeof meta.material_utilization_gate === 'object')
+                    ? meta.material_utilization_gate
+                    : {},
                 };
                 break;
               }
               if (utilPayload) window.renderMaterialUtilizationPanel(utilPayload);
+              else window.renderMaterialUtilizationPanel(null);
             }
           }
           async function fallbackRefreshAfter(actionId) {
@@ -11436,9 +11815,19 @@ def index(
             setExpertProfileStatus('重算失败：' + (data.detail || ('HTTP ' + res.status)), true);
             return;
           }
-          setExpertProfileStatus(
-            '重算完成（' + ((data && data.score_scale_label) ? data.score_scale_label : selectedScoreScaleLabel()) + '）：共处理 ' + (data.submission_count || 0) + ' 份，生成 ' + (data.reports_generated || 0) + ' 份报告。'
-          );
+          const gate = (data && typeof data.material_utilization_gate === 'object') ? data.material_utilization_gate : {};
+          const blockedCount = Number((gate && gate.blocked_submissions) || 0);
+          const warnCount = Number((gate && gate.warn_submissions) || 0);
+          let rescoreMsg =
+            '重算完成（' + ((data && data.score_scale_label) ? data.score_scale_label : selectedScoreScaleLabel()) + '）：共处理 ' + (data.submission_count || 0) + ' 份，生成 ' + (data.reports_generated || 0) + ' 份报告。';
+          if (blockedCount > 0) {
+            rescoreMsg += ' 资料门禁阻断 ' + blockedCount + ' 份。';
+          } else if (warnCount > 0) {
+            rescoreMsg += ' 资料门禁预警 ' + warnCount + ' 份。';
+          } else if (gate && gate.enabled) {
+            rescoreMsg += ' 资料门禁通过。';
+          }
+          setExpertProfileStatus(rescoreMsg, blockedCount > 0);
           const out = document.getElementById('output');
           if (out) out.textContent = JSON.stringify(data, null, 2);
           if (typeof renderMaterialUtilizationPanel === 'function') {
@@ -12150,8 +12539,19 @@ def index(
               (data && (data.updated_submissions ?? data.reports_generated ?? data.submission_count)) || 0
             );
             const doneScaleLabel = (data && data.score_scale_label) ? String(data.score_scale_label) : scaleLabel;
-            if (o) o.textContent = '施组评分完成（' + doneScaleLabel + '）：已重算 ' + updated + ' 份。';
-            setActionStatus('shigongActionStatus', '评分完成（' + doneScaleLabel + '）：已重算 ' + updated + ' 份。', false);
+            const gate = (data && typeof data.material_utilization_gate === 'object') ? data.material_utilization_gate : {};
+            const blockedCount = Number((gate && gate.blocked_submissions) || 0);
+            const warnCount = Number((gate && gate.warn_submissions) || 0);
+            let doneMsg = '施组评分完成（' + doneScaleLabel + '）：已重算 ' + updated + ' 份。';
+            if (blockedCount > 0) {
+              doneMsg += ' 资料门禁阻断 ' + blockedCount + ' 份。';
+            } else if (warnCount > 0) {
+              doneMsg += ' 资料门禁预警 ' + warnCount + ' 份。';
+            } else if (gate && gate.enabled) {
+              doneMsg += ' 资料门禁通过。';
+            }
+            if (o) o.textContent = doneMsg;
+            setActionStatus('shigongActionStatus', doneMsg, blockedCount > 0);
             if (typeof renderMaterialUtilizationPanel === 'function') {
               renderMaterialUtilizationPanel(data || {});
             }
@@ -12310,6 +12710,11 @@ def index(
             const llm = (rep && rep.llm_total_score != null) ? rep.llm_total_score : null;
             const scoringStatus = String((rep && rep.scoring_status) || '').toLowerCase();
             const isPending = scoringStatus === 'pending';
+            const repMeta = (rep && typeof rep.meta === 'object') ? rep.meta : {};
+            const utilGate = (repMeta && typeof repMeta.material_utilization_gate === 'object')
+              ? repMeta.material_utilization_gate
+              : {};
+            const utilBlocked = !!(utilGate && utilGate.blocked);
             let scoreHtml = '-';
             if (isPending) {
               scoreHtml = '<span class="note">待评分</span>';
@@ -12321,6 +12726,9 @@ def index(
               if (notes.length) scoreHtml += '<div class="note">' + notes.join(' / ') + '</div>';
             } else if (s && s.total_score != null) {
               scoreHtml = escapeHtmlText(String(s.total_score));
+            }
+            if (utilBlocked) {
+              scoreHtml += '<div class="error">资料利用门禁未达标（建议补齐资料后重评分）</div>';
             }
             tr.innerHTML =
               '<td>' + escapeHtmlText(s.filename || '') + '</td>' +
@@ -12340,6 +12748,9 @@ def index(
               material_utilization_alerts: Array.isArray(meta.material_utilization_alerts)
                 ? meta.material_utilization_alerts
                 : [],
+              material_utilization_gate: (meta && typeof meta.material_utilization_gate === 'object')
+                ? meta.material_utilization_gate
+                : {},
             };
             break;
           }
@@ -12697,6 +13108,12 @@ def index(
           const alerts = Array.isArray(source.material_utilization_alerts)
             ? source.material_utilization_alerts
             : (Array.isArray(source.alerts) ? source.alerts : []);
+          const gate = (source.material_utilization_gate && typeof source.material_utilization_gate === 'object')
+            ? source.material_utilization_gate
+            : (source.gate && typeof source.gate === 'object' ? source.gate : null);
+          const bySubmission = Array.isArray(source.material_utilization_by_submission)
+            ? source.material_utilization_by_submission
+            : [];
           const toPct = (v) => {
             const n = Number(v);
             return Number.isFinite(n) ? (n * 100).toFixed(1) + '%' : '-';
@@ -12714,11 +13131,31 @@ def index(
 
           let html =
             '<strong>资料利用审计（本次评分）</strong>'
+            + (gate && gate.enabled
+              ? (
+                  (gate.blocked_submissions > 0 || gate.blocked)
+                    ? '<p class="error" style="margin:6px 0 8px 0"><strong>门禁状态：阻断</strong>（存在资料利用阈值未达标的施组）</p>'
+                    : (gate.warn_submissions > 0 || gate.warned)
+                      ? '<p style="margin:6px 0 8px 0;color:#9a3412"><strong>门禁状态：预警</strong>（建议补齐资料关联后重评分）</p>'
+                      : '<p class="success" style="margin:6px 0 8px 0"><strong>门禁状态：通过</strong></p>'
+                )
+              : '')
             + '<table><tr><th>维度</th><th>命中/总数</th><th>命中率</th></tr>'
             + '<tr><td>资料检索锚点</td><td>' + escapeHtmlText(retrievalHit) + ' / ' + escapeHtmlText(retrievalTotal) + '</td><td>' + escapeHtmlText(toPct(summary.retrieval_hit_rate)) + '</td></tr>'
             + '<tr><td>跨资料一致性</td><td>' + escapeHtmlText(consistencyHit) + ' / ' + escapeHtmlText(consistencyTotal) + '</td><td>' + escapeHtmlText(toPct(summary.consistency_hit_rate)) + '</td></tr>'
             + '<tr><td>关键词兜底</td><td>' + escapeHtmlText(fallbackHit) + ' / ' + escapeHtmlText(fallbackTotal) + '</td><td>' + escapeHtmlText(toPct(summary.fallback_hit_rate)) + '</td></tr>'
             + '</table>';
+
+          if (gate && gate.enabled) {
+            const blockedCount = Number(gate.blocked_submissions || 0);
+            const warnCount = Number(gate.warn_submissions || 0);
+            const passCount = Number(gate.pass_submissions || 0);
+            html += '<p style="margin:8px 0 0 0;font-size:12px;color:#334155">'
+              + '门禁统计：通过 ' + escapeHtmlText(passCount)
+              + '，预警 ' + escapeHtmlText(warnCount)
+              + '，阻断 ' + escapeHtmlText(blockedCount)
+              + '</p>';
+          }
 
           if (orderedTypes.length) {
             html += '<details open style="margin-top:8px"><summary>按资料类型查看命中情况</summary>';
@@ -12750,6 +13187,26 @@ def index(
             html += '<ul style="margin:6px 0 0 18px;color:#9f1239">'
               + alerts.map((a) => '<li>' + escapeHtmlText(a) + '</li>').join('')
               + '</ul>';
+          }
+          if (bySubmission.length) {
+            html += '<details style="margin-top:8px"><summary>按施组查看门禁结果</summary>';
+            html += '<table><tr><th>施组文件</th><th>门禁状态</th><th>关键原因</th></tr>';
+            html += bySubmission.slice(0, 20).map((row) => {
+              const gateRow = (row && typeof row.gate === 'object') ? row.gate : {};
+              const level = String((gateRow && gateRow.level) || 'unknown');
+              const reasons = Array.isArray(gateRow.reasons)
+                ? gateRow.reasons
+                : (Array.isArray(row.alerts) ? row.alerts : []);
+              const levelLabel = level === 'blocked'
+                ? '<span class="error">阻断</span>'
+                : (level === 'warn' ? '<span style="color:#9a3412">预警</span>' : '<span class="success">通过</span>');
+              return '<tr>'
+                + '<td>' + escapeHtmlText(String((row && row.filename) || '-')) + '</td>'
+                + '<td>' + levelLabel + '</td>'
+                + '<td>' + escapeHtmlText((reasons || []).slice(0, 2).join('；') || '-') + '</td>'
+                + '</tr>';
+            }).join('');
+            html += '</table></details>';
           }
           el.style.display = 'block';
           el.innerHTML = html;
