@@ -293,6 +293,20 @@ DEFAULT_MIN_PARSED_CHARS_BY_TYPE = {
     "drawing": 1500,
     "site_photo": 200,
 }
+DEFAULT_ENFORCE_MATERIAL_DEPTH_GATE = False
+DEFAULT_MIN_PARSED_CHUNKS_BY_TYPE = {
+    "tender_qa": 12,
+    "boq": 3,
+    "drawing": 3,
+    "site_photo": 1,
+}
+DEFAULT_MIN_TOTAL_PARSED_CHUNKS = 20
+DEFAULT_MIN_NUMERIC_TERMS_BY_TYPE = {
+    "tender_qa": 6,
+    "boq": 8,
+    "drawing": 4,
+    "site_photo": 0,
+}
 DEFAULT_MIN_TOTAL_PARSED_CHARS = 18000
 DEFAULT_MAX_MATERIAL_PARSE_FAIL_RATIO = 0.6
 DEFAULT_ENFORCE_MATERIAL_UTILIZATION_GATE = True
@@ -435,6 +449,18 @@ def _ensure_project_v2_fields(
         changed = True
     if "min_parsed_chars_by_type" not in meta:
         meta["min_parsed_chars_by_type"] = dict(DEFAULT_MIN_PARSED_CHARS_BY_TYPE)
+        changed = True
+    if "enforce_material_depth_gate" not in meta:
+        meta["enforce_material_depth_gate"] = bool(DEFAULT_ENFORCE_MATERIAL_DEPTH_GATE)
+        changed = True
+    if "min_parsed_chunks_by_type" not in meta:
+        meta["min_parsed_chunks_by_type"] = dict(DEFAULT_MIN_PARSED_CHUNKS_BY_TYPE)
+        changed = True
+    if "min_numeric_terms_by_type" not in meta:
+        meta["min_numeric_terms_by_type"] = dict(DEFAULT_MIN_NUMERIC_TERMS_BY_TYPE)
+        changed = True
+    if "min_total_parsed_chunks" not in meta:
+        meta["min_total_parsed_chunks"] = int(DEFAULT_MIN_TOTAL_PARSED_CHUNKS)
         changed = True
     if "min_total_parsed_chars" not in meta:
         meta["min_total_parsed_chars"] = int(DEFAULT_MIN_TOTAL_PARSED_CHARS)
@@ -6761,9 +6787,15 @@ def _build_material_quality_snapshot(project_id: str) -> Dict[str, object]:
     parsed_ok_by_type: Dict[str, int] = {}
     parsed_fail_by_type: Dict[str, int] = {}
     chars_by_type: Dict[str, int] = {}
+    chunks_by_type: Dict[str, int] = {}
+    numeric_terms_by_type: Dict[str, int] = {}
+    lexical_terms_by_type: Dict[str, int] = {}
     parsed_fail_details: List[Dict[str, str]] = []
     parsed_ok_files = 0
     parsed_failed_files = 0
+    total_parsed_chunks = 0
+    total_numeric_terms = 0
+    total_lexical_terms = 0
     for row in rows:
         filename = str(row.get("filename") or "")
         mat_type = _normalize_material_type(row.get("material_type"), filename=filename)
@@ -6788,9 +6820,28 @@ def _build_material_quality_snapshot(project_id: str) -> Dict[str, object]:
             content = p.read_bytes()
             text = _read_uploaded_file_content(content, p.name)
             chars = len(str(text or "").strip())
+            chunks = _split_material_text_chunks(text, max_chars=900)
+            chunk_count = len(chunks)
+            numeric_terms = _extract_numeric_terms(text, max_terms=240)
+            numeric_terms_norm = {
+                token
+                for token in (_normalize_numeric_token(item) for item in numeric_terms)
+                if token
+            }
+            lexical_terms = _extract_terms(text, max_terms=200)
             parsed_ok_files += 1
             parsed_ok_by_type[mat_type] = parsed_ok_by_type.get(mat_type, 0) + 1
             chars_by_type[mat_type] = chars_by_type.get(mat_type, 0) + chars
+            chunks_by_type[mat_type] = chunks_by_type.get(mat_type, 0) + chunk_count
+            numeric_terms_by_type[mat_type] = numeric_terms_by_type.get(mat_type, 0) + len(
+                numeric_terms_norm
+            )
+            lexical_terms_by_type[mat_type] = lexical_terms_by_type.get(mat_type, 0) + len(
+                lexical_terms
+            )
+            total_parsed_chunks += chunk_count
+            total_numeric_terms += len(numeric_terms_norm)
+            total_lexical_terms += len(lexical_terms)
         except Exception as exc:
             parsed_failed_files += 1
             parsed_fail_by_type[mat_type] = parsed_fail_by_type.get(mat_type, 0) + 1
@@ -6813,7 +6864,13 @@ def _build_material_quality_snapshot(project_id: str) -> Dict[str, object]:
         "parsed_ok_by_type": parsed_ok_by_type,
         "parsed_fail_by_type": parsed_fail_by_type,
         "chars_by_type": chars_by_type,
+        "chunks_by_type": chunks_by_type,
+        "numeric_terms_by_type": numeric_terms_by_type,
+        "lexical_terms_by_type": lexical_terms_by_type,
         "total_parsed_chars": total_chars,
+        "total_parsed_chunks": int(total_parsed_chunks),
+        "total_numeric_terms": int(total_numeric_terms),
+        "total_lexical_terms": int(total_lexical_terms),
         "parse_fail_ratio": round(fail_ratio, 4),
         "parsed_fail_details": parsed_fail_details[:20],
     }
@@ -6822,6 +6879,9 @@ def _build_material_quality_snapshot(project_id: str) -> Dict[str, object]:
 def _resolve_material_gate_config(project: Dict[str, object]) -> Dict[str, object]:
     meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
     enforce = bool(meta.get("enforce_material_gate", DEFAULT_ENFORCE_MATERIAL_GATE))
+    enforce_depth_gate = bool(
+        meta.get("enforce_material_depth_gate", DEFAULT_ENFORCE_MATERIAL_DEPTH_GATE)
+    )
     required_raw = meta.get("required_material_types", DEFAULT_REQUIRED_MATERIAL_TYPES)
     required_types: List[str] = []
     if isinstance(required_raw, list):
@@ -6842,6 +6902,33 @@ def _resolve_material_gate_config(project: Dict[str, object]) -> Dict[str, objec
                 continue
             min_chars_map[key] = max(0, int(round(numeric)))
 
+    min_chunks_map = dict(DEFAULT_MIN_PARSED_CHUNKS_BY_TYPE)
+    raw_chunks_map = meta.get("min_parsed_chunks_by_type")
+    if isinstance(raw_chunks_map, dict):
+        for k, v in raw_chunks_map.items():
+            key = _normalize_material_type(k)
+            numeric = _to_float_or_none(v)
+            if numeric is None:
+                continue
+            min_chunks_map[key] = max(0, int(round(numeric)))
+
+    min_numeric_terms_map = dict(DEFAULT_MIN_NUMERIC_TERMS_BY_TYPE)
+    raw_numeric_map = meta.get("min_numeric_terms_by_type")
+    if isinstance(raw_numeric_map, dict):
+        for k, v in raw_numeric_map.items():
+            key = _normalize_material_type(k)
+            numeric = _to_float_or_none(v)
+            if numeric is None:
+                continue
+            min_numeric_terms_map[key] = max(0, int(round(numeric)))
+
+    total_chunks_raw = _to_float_or_none(meta.get("min_total_parsed_chunks"))
+    min_total_chunks = (
+        max(0, int(round(total_chunks_raw)))
+        if total_chunks_raw is not None
+        else int(DEFAULT_MIN_TOTAL_PARSED_CHUNKS)
+    )
+
     total_chars = _to_float_or_none(meta.get("min_total_parsed_chars"))
     min_total_chars = (
         max(0, int(round(total_chars)))
@@ -6856,8 +6943,12 @@ def _resolve_material_gate_config(project: Dict[str, object]) -> Dict[str, objec
     )
     return {
         "enforce": enforce,
+        "enforce_depth_gate": enforce_depth_gate,
         "required_types": required_types,
         "min_chars_by_type": min_chars_map,
+        "min_chunks_by_type": min_chunks_map,
+        "min_numeric_terms_by_type": min_numeric_terms_map,
+        "min_total_chunks": min_total_chunks,
         "min_total_chars": min_total_chars,
         "max_fail_ratio": max_fail_ratio,
     }
@@ -6873,9 +6964,16 @@ def _validate_material_gate_for_scoring(
     cfg = _resolve_material_gate_config(project)
     counts_by_type = snapshot.get("counts_by_type") if isinstance(snapshot, dict) else {}
     chars_by_type = snapshot.get("chars_by_type") if isinstance(snapshot, dict) else {}
+    chunks_by_type = snapshot.get("chunks_by_type") if isinstance(snapshot, dict) else {}
+    numeric_terms_by_type = (
+        snapshot.get("numeric_terms_by_type") if isinstance(snapshot, dict) else {}
+    )
     counts_by_type = counts_by_type if isinstance(counts_by_type, dict) else {}
     chars_by_type = chars_by_type if isinstance(chars_by_type, dict) else {}
+    chunks_by_type = chunks_by_type if isinstance(chunks_by_type, dict) else {}
+    numeric_terms_by_type = numeric_terms_by_type if isinstance(numeric_terms_by_type, dict) else {}
     issues: List[str] = []
+    depth_issues: List[str] = []
     required_types = cfg.get("required_types") if isinstance(cfg, dict) else []
     required_types = required_types if isinstance(required_types, list) else []
     for tpe in required_types:
@@ -6888,12 +6986,30 @@ def _validate_material_gate_for_scoring(
         parsed_chars = int(chars_by_type.get(tpe, 0))
         if parsed_chars < min_chars:
             issues.append(f"{label}解析文本不足：{parsed_chars} 字（要求至少 {min_chars} 字）")
+        min_chunks = int((cfg.get("min_chunks_by_type") or {}).get(tpe, 0))
+        parsed_chunks = int(chunks_by_type.get(tpe, 0))
+        if parsed_chunks < min_chunks:
+            depth_issues.append(
+                f"{label}解析分块不足：{parsed_chunks} 段（建议至少 {min_chunks} 段）"
+            )
+        min_numeric_terms = int((cfg.get("min_numeric_terms_by_type") or {}).get(tpe, 0))
+        parsed_numeric_terms = int(numeric_terms_by_type.get(tpe, 0))
+        if min_numeric_terms > 0 and parsed_numeric_terms < min_numeric_terms:
+            depth_issues.append(
+                f"{label}数字约束提取不足：{parsed_numeric_terms} 项（建议至少 {min_numeric_terms} 项）"
+            )
 
     total_parsed_chars = int(snapshot.get("total_parsed_chars", 0))
     min_total_chars = int(cfg.get("min_total_chars", DEFAULT_MIN_TOTAL_PARSED_CHARS))
     if total_parsed_chars < min_total_chars:
         issues.append(
             f"项目资料总解析文本不足：{total_parsed_chars} 字（要求至少 {min_total_chars} 字）"
+        )
+    total_parsed_chunks = int(snapshot.get("total_parsed_chunks", 0))
+    min_total_chunks = int(cfg.get("min_total_chunks", DEFAULT_MIN_TOTAL_PARSED_CHUNKS))
+    if total_parsed_chunks < min_total_chunks:
+        depth_issues.append(
+            f"项目资料总解析分块不足：{total_parsed_chunks} 段（建议至少 {min_total_chunks} 段）"
         )
 
     parse_fail_ratio = _to_float_or_none(snapshot.get("parse_fail_ratio")) or 0.0
@@ -6910,9 +7026,25 @@ def _validate_material_gate_for_scoring(
         "issues": issues,
         "passed": len(issues) == 0,
     }
+    enforce_depth_gate = bool(cfg.get("enforce_depth_gate", DEFAULT_ENFORCE_MATERIAL_DEPTH_GATE))
+    snapshot["depth_gate"] = {
+        "enforce": enforce_depth_gate,
+        "required_types": required_types,
+        "min_chunks_by_type": cfg.get("min_chunks_by_type", {}),
+        "min_numeric_terms_by_type": cfg.get("min_numeric_terms_by_type", {}),
+        "min_total_chunks": min_total_chunks,
+        "issues": depth_issues,
+        "passed": len(depth_issues) == 0,
+    }
 
-    if raise_on_fail and bool(cfg.get("enforce", False)) and issues:
-        detail = "；".join(issues)
+    blocking_reasons: List[str] = []
+    if bool(cfg.get("enforce", False)):
+        blocking_reasons.extend(issues)
+    if enforce_depth_gate:
+        blocking_reasons.extend(depth_issues)
+
+    if raise_on_fail and blocking_reasons:
+        detail = "；".join(blocking_reasons)
         raise HTTPException(status_code=422, detail=f"资料门禁未通过：{detail}")
     return snapshot, issues
 
@@ -6924,7 +7056,10 @@ def _build_scoring_readiness(project_id: str, project: Dict[str, object]) -> Dic
         raise_on_fail=False,
     )
     gate = snapshot.get("gate") if isinstance(snapshot.get("gate"), dict) else {}
-    gate_passed = bool(gate.get("passed", True))
+    depth_gate = snapshot.get("depth_gate") if isinstance(snapshot.get("depth_gate"), dict) else {}
+    depth_enforced = bool(depth_gate.get("enforce", False))
+    depth_passed = bool(depth_gate.get("passed", True))
+    gate_passed = bool(gate.get("passed", True)) and (depth_passed if depth_enforced else True)
 
     submissions = [s for s in load_submissions() if str(s.get("project_id")) == project_id]
     submission_count = len(submissions)
@@ -6941,9 +7076,18 @@ def _build_scoring_readiness(project_id: str, project: Dict[str, object]) -> Dic
     total_files = int(_to_float_or_none(snapshot.get("total_files")) or 0)
     if total_files > 0 and parsed_ok_files < total_files:
         warnings.append(f"存在 {total_files - parsed_ok_files} 份资料解析失败，建议修复后再评分。")
+    depth_issues = depth_gate.get("issues") if isinstance(depth_gate.get("issues"), list) else []
+    depth_issue_texts = [str(x).strip() for x in depth_issues if str(x).strip()]
+    if depth_issue_texts:
+        if depth_enforced:
+            warnings.append("资料深读门禁已开启，需补齐深读质量后才能评分。")
+        else:
+            warnings.append("资料深读预警：建议补充关键约束资料，提高评分稳定性。")
 
     ready = gate_passed and non_empty_submission_count > 0
     issue_texts = [str(x).strip() for x in issues if str(x).strip()]
+    if depth_enforced and depth_issue_texts:
+        issue_texts.extend([f"资料深读门禁：{text}" for text in depth_issue_texts if text])
 
     return {
         "project_id": project_id,
@@ -6954,6 +7098,7 @@ def _build_scoring_readiness(project_id: str, project: Dict[str, object]) -> Dic
         "warnings": warnings[:8],
         "material_quality": snapshot,
         "material_gate": gate,
+        "material_depth_gate": depth_gate,
         "submissions": {
             "total": submission_count,
             "non_empty": non_empty_submission_count,
@@ -13841,9 +13986,16 @@ def index(
           const gate = (source.material_gate && typeof source.material_gate === 'object')
             ? source.material_gate
             : {};
+          const depthGate = (source.material_depth_gate && typeof source.material_depth_gate === 'object')
+            ? source.material_depth_gate
+            : {};
           const submissions = (source.submissions && typeof source.submissions === 'object')
             ? source.submissions
             : {};
+          const depthChunks = Number(materialQuality.total_parsed_chunks || 0);
+          const depthNumeric = Number(materialQuality.total_numeric_terms || 0);
+          const depthPassed = depthGate && depthGate.passed !== false;
+          const depthEnforced = !!(depthGate && depthGate.enforce);
           const toPct = (v) => {
             const n = Number(v);
             return Number.isFinite(n) ? (n * 100).toFixed(1) + '%' : '-';
@@ -13858,6 +14010,9 @@ def index(
           html += '<tr><td>资料门禁</td><td>' + (source.gate_passed ? '<span class="success">通过</span>' : '<span class="error">未通过</span>') + '</td><td>必需资料类型、解析字数、失败率</td></tr>';
           html += '<tr><td>施组上传</td><td>' + (Number(submissions.non_empty || 0) > 0 ? '<span class="success">已上传</span>' : '<span class="error">缺失</span>') + '</td><td>已上传 ' + escapeHtmlText(submissions.non_empty || 0) + ' 份施组</td></tr>';
           html += '<tr><td>资料解析质量</td><td>' + escapeHtmlText(materialQuality.parsed_ok_files || 0) + ' / ' + escapeHtmlText(materialQuality.total_files || 0) + '</td><td>失败率 ' + escapeHtmlText(toPct(materialQuality.parse_fail_ratio)) + '</td></tr>';
+          html += '<tr><td>资料深读质量' + (depthEnforced ? '（门禁）' : '（预警）') + '</td><td>'
+            + (depthPassed ? '<span class="success">达标</span>' : (depthEnforced ? '<span class="error">未达标</span>' : '<span style="color:#9a3412">待增强</span>'))
+            + '</td><td>分块 ' + escapeHtmlText(depthChunks) + ' 段 / 数字约束 ' + escapeHtmlText(depthNumeric) + ' 项</td></tr>';
           html += '</table>';
           if (issues.length) {
             html += '<ul style="margin:6px 0 0 18px;color:#9f1239">'

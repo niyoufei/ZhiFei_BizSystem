@@ -1214,6 +1214,103 @@ class TestMaterialsEndpoint:
         assert data["submissions"]["scored"] == 1
         assert data["generated_at"] == "2026-02-26T00:00:00+00:00"
 
+    @patch("app.main._now_iso", return_value="2026-02-26T00:00:00+00:00")
+    @patch("app.main._submission_is_scored")
+    @patch("app.main.load_submissions")
+    @patch("app.main._resolve_material_utilization_policy")
+    @patch("app.main._validate_material_gate_for_scoring")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_scoring_readiness_blocked_when_depth_gate_enforced_and_failed(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_material_gate,
+        mock_resolve_policy,
+        mock_load_submissions,
+        mock_submission_is_scored,
+        mock_now_iso,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_material_gate.return_value = (
+            {
+                "project_id": "p1",
+                "total_files": 3,
+                "parsed_ok_files": 3,
+                "total_parsed_chunks": 9,
+                "total_numeric_terms": 4,
+                "gate": {"passed": True, "issues": []},
+                "depth_gate": {
+                    "enforce": True,
+                    "passed": False,
+                    "issues": ["图纸解析分块不足：1 段（建议至少 3 段）"],
+                },
+            },
+            [],
+        )
+        mock_resolve_policy.return_value = {"required_types": ["tender_qa", "boq", "drawing"]}
+        mock_load_submissions.return_value = [{"id": "s1", "project_id": "p1", "text": "施组内容"}]
+        mock_submission_is_scored.return_value = False
+
+        response = client.get("/api/v1/projects/p1/scoring_readiness")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["ready"] is False
+        assert data["gate_passed"] is False
+        assert data["issues"][0].startswith("资料深读门禁：")
+        assert data["material_depth_gate"]["enforce"] is True
+        assert data["material_depth_gate"]["passed"] is False
+
+    @patch("app.main._now_iso", return_value="2026-02-26T00:00:00+00:00")
+    @patch("app.main._submission_is_scored")
+    @patch("app.main.load_submissions")
+    @patch("app.main._resolve_material_utilization_policy")
+    @patch("app.main._validate_material_gate_for_scoring")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_scoring_readiness_depth_gate_warn_only_when_not_enforced(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_material_gate,
+        mock_resolve_policy,
+        mock_load_submissions,
+        mock_submission_is_scored,
+        mock_now_iso,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_material_gate.return_value = (
+            {
+                "project_id": "p1",
+                "total_files": 3,
+                "parsed_ok_files": 3,
+                "total_parsed_chunks": 9,
+                "total_numeric_terms": 4,
+                "gate": {"passed": True, "issues": []},
+                "depth_gate": {
+                    "enforce": False,
+                    "passed": False,
+                    "issues": ["清单数字约束提取不足：2 项（建议至少 8 项）"],
+                },
+            },
+            [],
+        )
+        mock_resolve_policy.return_value = {"required_types": ["tender_qa", "boq", "drawing"]}
+        mock_load_submissions.return_value = [{"id": "s1", "project_id": "p1", "text": "施组内容"}]
+        mock_submission_is_scored.return_value = False
+
+        response = client.get("/api/v1/projects/p1/scoring_readiness")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["ready"] is True
+        assert data["gate_passed"] is True
+        assert data["issues"] == []
+        assert any("资料深读预警" in w for w in data["warnings"])
+        assert data["material_depth_gate"]["enforce"] is False
+        assert data["material_depth_gate"]["passed"] is False
+
     @patch("app.main.save_materials")
     @patch("app.main.load_materials")
     @patch("app.main.load_projects")

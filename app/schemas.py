@@ -324,6 +324,7 @@ class ScoringReadinessResponse(BaseModel):
     warnings: List[str] = Field(default_factory=list, description="提醒信息")
     material_quality: Dict[str, Any] = Field(default_factory=dict)
     material_gate: Dict[str, Any] = Field(default_factory=dict)
+    material_depth_gate: Dict[str, Any] = Field(default_factory=dict)
     submissions: Dict[str, Any] = Field(default_factory=dict)
     retrieval_policy: Dict[str, Any] = Field(default_factory=dict)
     generated_at: str
