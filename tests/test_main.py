@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import tempfile
+from collections import Counter
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -1508,6 +1509,71 @@ class TestMaterialAdvancedParsing:
             types = {str(c.get("material_type")) for c in chunks}
             assert {"tender_qa", "boq", "drawing"}.issubset(types)
 
+    @patch("app.main.load_materials")
+    @patch("app.main._split_material_text_chunks")
+    @patch("app.main._read_uploaded_file_content")
+    def test_select_material_retrieval_chunks_respects_per_type_quota(
+        self, mock_read_uploaded_file_content, mock_split_chunks, mock_load_materials
+    ):
+        from app.main import _select_material_retrieval_chunks
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tender = Path(tmp) / "tender.txt"
+            boq = Path(tmp) / "boq.txt"
+            drawing = Path(tmp) / "drawing.txt"
+            tender.write_text(
+                "答疑 工期 节点 质量。\n\n招标条件 工期 质量 节点 约束。",
+                encoding="utf-8",
+            )
+            boq.write_text(
+                "工程量 综合单价 措施费。\n\n工程量 清单 措施项目 计量规则。",
+                encoding="utf-8",
+            )
+            drawing.write_text(
+                "图纸 节点 剖面 深化。\n\nBIM 节点 深化 剖面 图纸。",
+                encoding="utf-8",
+            )
+            mock_load_materials.return_value = [
+                {
+                    "project_id": "p1",
+                    "material_type": "tender_qa",
+                    "filename": "tender.txt",
+                    "path": str(tender),
+                    "created_at": "2026-02-26T00:00:01+00:00",
+                },
+                {
+                    "project_id": "p1",
+                    "material_type": "boq",
+                    "filename": "boq.txt",
+                    "path": str(boq),
+                    "created_at": "2026-02-26T00:00:02+00:00",
+                },
+                {
+                    "project_id": "p1",
+                    "material_type": "drawing",
+                    "filename": "drawing.txt",
+                    "path": str(drawing),
+                    "created_at": "2026-02-26T00:00:03+00:00",
+                },
+            ]
+            mock_read_uploaded_file_content.side_effect = lambda _content, filename: Path(
+                tmp, filename
+            ).read_text(encoding="utf-8")
+            mock_split_chunks.return_value = [
+                "工期 节点 工程量 质量 安全",
+                "BIM 节点 进度 工程量 清单",
+            ]
+            chunks = _select_material_retrieval_chunks(
+                "p1",
+                "工期 节点 工程量",
+                top_k=9,
+                per_type_quota=2,
+            )
+            by_type = Counter(str(c.get("material_type")) for c in chunks)
+            assert by_type["tender_qa"] >= 2
+            assert by_type["boq"] >= 2
+            assert by_type["drawing"] >= 2
+
     def test_build_material_utilization_summary_reports_uncovered_types(self):
         from app.main import _build_material_utilization_summary
 
@@ -1660,6 +1726,67 @@ class TestMaterialAdvancedParsing:
         assert gate["warned"] is True
         assert gate["blocked"] is False
         assert gate["level"] == "warn"
+
+    def test_evaluate_material_utilization_gate_blocks_when_required_upload_missing(self):
+        from app.main import _evaluate_material_utilization_gate
+
+        summary = {
+            "retrieval_total": 8,
+            "retrieval_hit_rate": 0.8,
+            "consistency_total": 4,
+            "consistency_hit_rate": 0.7,
+            "available_types": ["tender_qa"],
+            "uncovered_types": [],
+        }
+        policy = {
+            "enabled": True,
+            "mode": "block",
+            "min_retrieval_total": 2,
+            "min_retrieval_hit_rate": 0.2,
+            "min_consistency_hit_rate": 0.2,
+            "max_uncovered_required_types": 0,
+            "min_required_type_presence_rate": 1.0,
+            "min_required_type_coverage_rate": 0.6,
+        }
+        gate = _evaluate_material_utilization_gate(
+            summary,
+            policy=policy,
+            required_types=["tender_qa", "boq", "drawing"],
+        )
+        assert gate["blocked"] is True
+        assert gate["required_type_presence_rate"] == pytest.approx(0.3333, abs=1e-4)
+        missing = gate.get("required_types_missing_upload") or []
+        assert "boq" in missing
+        assert "drawing" in missing
+
+    def test_evaluate_material_utilization_gate_blocks_when_retrieval_total_low(self):
+        from app.main import _evaluate_material_utilization_gate
+
+        summary = {
+            "retrieval_total": 1,
+            "retrieval_hit_rate": 1.0,
+            "consistency_total": 4,
+            "consistency_hit_rate": 0.7,
+            "available_types": ["tender_qa", "boq", "drawing"],
+            "uncovered_types": [],
+        }
+        policy = {
+            "enabled": True,
+            "mode": "block",
+            "min_retrieval_total": 3,
+            "min_retrieval_hit_rate": 0.2,
+            "min_consistency_hit_rate": 0.2,
+            "max_uncovered_required_types": 0,
+            "min_required_type_presence_rate": 0.6,
+            "min_required_type_coverage_rate": 0.6,
+        }
+        gate = _evaluate_material_utilization_gate(
+            summary,
+            policy=policy,
+            required_types=["tender_qa", "boq", "drawing"],
+        )
+        assert gate["blocked"] is True
+        assert any("资料检索证据数量" in str(x) for x in (gate.get("reasons") or []))
 
 
 class TestScoreForProjectEndpoint:

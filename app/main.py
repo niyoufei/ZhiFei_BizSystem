@@ -298,8 +298,12 @@ DEFAULT_ENFORCE_MATERIAL_UTILIZATION_GATE = True
 DEFAULT_MATERIAL_UTILIZATION_GATE_MODE = "block"
 DEFAULT_MIN_MATERIAL_RETRIEVAL_HIT_RATE = 0.25
 DEFAULT_MIN_MATERIAL_CONSISTENCY_HIT_RATE = 0.25
+DEFAULT_MIN_MATERIAL_RETRIEVAL_TOTAL = 0
 DEFAULT_MAX_UNCOVERED_REQUIRED_TYPES = 0
+DEFAULT_MIN_REQUIRED_TYPE_PRESENCE_RATE = 0.0
 DEFAULT_MIN_REQUIRED_TYPE_COVERAGE_RATE = 0.67
+DEFAULT_MATERIAL_RETRIEVAL_TOP_K = 18
+DEFAULT_MATERIAL_RETRIEVAL_PER_TYPE_QUOTA = 2
 DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR = 200
 DEFAULT_PDF_OCR_MAX_PAGES = 30
 PROFILE_LOCKED_STATUSES = {"submitted_to_qingtian"}
@@ -447,11 +451,23 @@ def _ensure_project_v2_fields(
     if "min_material_consistency_hit_rate" not in meta:
         meta["min_material_consistency_hit_rate"] = float(DEFAULT_MIN_MATERIAL_CONSISTENCY_HIT_RATE)
         changed = True
+    if "min_material_retrieval_total" not in meta:
+        meta["min_material_retrieval_total"] = int(DEFAULT_MIN_MATERIAL_RETRIEVAL_TOTAL)
+        changed = True
     if "max_uncovered_required_types" not in meta:
         meta["max_uncovered_required_types"] = int(DEFAULT_MAX_UNCOVERED_REQUIRED_TYPES)
         changed = True
+    if "min_required_type_presence_rate" not in meta:
+        meta["min_required_type_presence_rate"] = float(DEFAULT_MIN_REQUIRED_TYPE_PRESENCE_RATE)
+        changed = True
     if "min_required_type_coverage_rate" not in meta:
         meta["min_required_type_coverage_rate"] = float(DEFAULT_MIN_REQUIRED_TYPE_COVERAGE_RATE)
+        changed = True
+    if "material_retrieval_top_k" not in meta:
+        meta["material_retrieval_top_k"] = int(DEFAULT_MATERIAL_RETRIEVAL_TOP_K)
+        changed = True
+    if "material_retrieval_per_type_quota" not in meta:
+        meta["material_retrieval_per_type_quota"] = int(DEFAULT_MATERIAL_RETRIEVAL_PER_TYPE_QUOTA)
         changed = True
     return changed
 
@@ -747,6 +763,33 @@ def _to_text_items(raw: object, *, max_items: int = 24) -> List[str]:
     return dedup
 
 
+def _resolve_material_retrieval_config(project: Dict[str, object]) -> Dict[str, int]:
+    meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
+
+    def _resolve_int(raw: object, default: int, *, lower: int, upper: int) -> int:
+        numeric = _to_float_or_none(raw)
+        if numeric is None:
+            numeric = float(default)
+        return max(lower, min(upper, int(round(float(numeric)))))
+
+    top_k = _resolve_int(
+        meta.get("material_retrieval_top_k"),
+        DEFAULT_MATERIAL_RETRIEVAL_TOP_K,
+        lower=6,
+        upper=48,
+    )
+    per_type_quota = _resolve_int(
+        meta.get("material_retrieval_per_type_quota"),
+        DEFAULT_MATERIAL_RETRIEVAL_PER_TYPE_QUOTA,
+        lower=1,
+        upper=6,
+    )
+    return {
+        "top_k": top_k,
+        "per_type_quota": per_type_quota,
+    }
+
+
 def _build_runtime_custom_requirements(
     project_id: str,
     *,
@@ -852,17 +895,42 @@ def _build_runtime_custom_requirements(
             kind="custom",
         )
 
-    retrieval_chunks = _select_material_retrieval_chunks(
-        project_id,
-        submission_text,
-        top_k=12,
-    )
+    retrieval_cfg = _resolve_material_retrieval_config(project)
     material_rows = [m for m in load_materials() if str(m.get("project_id")) == project_id]
     available_material_types: List[str] = []
     for row in material_rows:
         key = _normalize_material_type(row.get("material_type"), filename=row.get("filename"))
         if key not in available_material_types:
             available_material_types.append(key)
+    retrieval_top_k = max(
+        int(retrieval_cfg.get("top_k", DEFAULT_MATERIAL_RETRIEVAL_TOP_K)),
+        len(available_material_types)
+        * int(
+            retrieval_cfg.get(
+                "per_type_quota",
+                DEFAULT_MATERIAL_RETRIEVAL_PER_TYPE_QUOTA,
+            )
+        ),
+    )
+    retrieval_top_k = max(6, min(48, int(retrieval_top_k)))
+    retrieval_per_type_quota = max(
+        1,
+        min(
+            6,
+            int(
+                retrieval_cfg.get(
+                    "per_type_quota",
+                    DEFAULT_MATERIAL_RETRIEVAL_PER_TYPE_QUOTA,
+                )
+            ),
+        ),
+    )
+    retrieval_chunks = _select_material_retrieval_chunks(
+        project_id,
+        submission_text,
+        top_k=retrieval_top_k,
+        per_type_quota=retrieval_per_type_quota,
+    )
     retrieval_types = sorted(
         {
             str(c.get("material_type") or "")
@@ -889,6 +957,9 @@ def _build_runtime_custom_requirements(
         "material_retrieval_chunks": len(retrieval_chunks),
         "material_retrieval_requirements": len(retrieval_requirements),
         "material_consistency_requirements": len(consistency_requirements),
+        "material_retrieval_top_k": retrieval_top_k,
+        "material_retrieval_per_type_quota": retrieval_per_type_quota,
+        "material_available_files": len(material_rows),
         "material_available_types": available_material_types,
         "material_retrieval_types": retrieval_types,
         "material_retrieval_missing_types": [
@@ -1279,6 +1350,10 @@ def _resolve_material_utilization_policy(project: Dict[str, object]) -> Dict[str
             meta.get("enforce_material_utilization_gate", DEFAULT_ENFORCE_MATERIAL_UTILIZATION_GATE)
         ),
         "mode": mode,
+        "min_retrieval_total": _to_nonneg_int(
+            meta.get("min_material_retrieval_total"),
+            DEFAULT_MIN_MATERIAL_RETRIEVAL_TOTAL,
+        ),
         "min_retrieval_hit_rate": _to_rate(
             meta.get("min_material_retrieval_hit_rate"),
             DEFAULT_MIN_MATERIAL_RETRIEVAL_HIT_RATE,
@@ -1290,6 +1365,10 @@ def _resolve_material_utilization_policy(project: Dict[str, object]) -> Dict[str
         "max_uncovered_required_types": _to_nonneg_int(
             meta.get("max_uncovered_required_types"),
             DEFAULT_MAX_UNCOVERED_REQUIRED_TYPES,
+        ),
+        "min_required_type_presence_rate": _to_rate(
+            meta.get("min_required_type_presence_rate"),
+            DEFAULT_MIN_REQUIRED_TYPE_PRESENCE_RATE,
         ),
         "min_required_type_coverage_rate": _to_rate(
             meta.get("min_required_type_coverage_rate"),
@@ -1337,13 +1416,31 @@ def _evaluate_material_utilization_gate(
     if not normalized_required:
         normalized_required = list(DEFAULT_REQUIRED_MATERIAL_TYPES)
 
+    missing_required_upload = [t for t in normalized_required if t not in available_types]
     required_present = [t for t in normalized_required if t in available_types]
     uncovered_required = [t for t in required_present if t in uncovered_types]
     covered_required = [t for t in required_present if t not in uncovered_required]
+    required_presence_rate = (
+        round(float(len(required_present)) / float(len(normalized_required)), 4)
+        if normalized_required
+        else None
+    )
     required_coverage_rate = (
         round(float(len(covered_required)) / float(len(required_present)), 4)
         if required_present
         else None
+    )
+
+    min_retrieval_total = max(
+        0,
+        int(
+            round(
+                float(
+                    _to_float_or_none(gate_policy.get("min_retrieval_total"))
+                    or DEFAULT_MIN_MATERIAL_RETRIEVAL_TOTAL
+                )
+            )
+        ),
     )
 
     min_retrieval = min(
@@ -1387,8 +1484,20 @@ def _evaluate_material_utilization_gate(
             ),
         ),
     )
+    min_required_presence = min(
+        1.0,
+        max(
+            0.0,
+            float(
+                _to_float_or_none(gate_policy.get("min_required_type_presence_rate"))
+                or DEFAULT_MIN_REQUIRED_TYPE_PRESENCE_RATE
+            ),
+        ),
+    )
 
     reasons: List[str] = []
+    if retrieval_total < min_retrieval_total:
+        reasons.append(f"资料检索证据数量 {retrieval_total} 低于阈值 {min_retrieval_total}")
     if (
         retrieval_total > 0
         and retrieval_hit_rate is not None
@@ -1406,6 +1515,13 @@ def _evaluate_material_utilization_gate(
     if len(uncovered_required) > max_uncovered:
         labels = "、".join(_material_type_label(x) for x in uncovered_required)
         reasons.append(f"关键资料未形成证据：{labels}（允许未覆盖 {max_uncovered} 类）")
+    if required_presence_rate is not None and required_presence_rate < min_required_presence:
+        labels = "、".join(_material_type_label(x) for x in missing_required_upload)
+        reasons.append(
+            "关键资料上传覆盖率 "
+            + f"{required_presence_rate:.1%} 低于阈值 {min_required_presence:.1%}"
+            + (f"，缺少：{labels}" if labels else "")
+        )
     if required_coverage_rate is not None and required_coverage_rate < min_required_coverage:
         reasons.append(
             f"关键资料覆盖率 {required_coverage_rate:.1%} 低于阈值 {min_required_coverage:.1%}"
@@ -1432,12 +1548,16 @@ def _evaluate_material_utilization_gate(
         "level": level,
         "reasons": reasons,
         "thresholds": {
+            "min_retrieval_total": min_retrieval_total,
             "min_retrieval_hit_rate": min_retrieval,
             "min_consistency_hit_rate": min_consistency,
             "max_uncovered_required_types": max_uncovered,
+            "min_required_type_presence_rate": min_required_presence,
             "min_required_type_coverage_rate": min_required_coverage,
         },
         "required_types": normalized_required,
+        "required_types_missing_upload": missing_required_upload,
+        "required_type_presence_rate": required_presence_rate,
         "required_types_present": required_present,
         "covered_required_types": covered_required,
         "uncovered_required_types": uncovered_required,
@@ -2343,9 +2463,21 @@ def _resolve_submission_score_fields(
     }
 
 
+def _report_is_blocked(report: Optional[Dict[str, object]]) -> bool:
+    if not isinstance(report, dict):
+        return False
+    status = str(report.get("scoring_status") or "").strip().lower()
+    if status == "blocked":
+        return True
+    meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+    return bool(meta.get("score_blocked_by_material_utilization"))
+
+
 def _submission_is_scored(submission: Dict[str, object]) -> bool:
     report_obj = submission.get("report")
     if isinstance(report_obj, dict):
+        if _report_is_blocked(report_obj):
+            return False
         status = str(report_obj.get("scoring_status") or "").strip().lower()
         if status == "pending":
             return False
@@ -2545,12 +2677,17 @@ def _score_submission_for_project(
                 if reason_text and reason_text not in alerts:
                     alerts.append("资料利用门禁：" + reason_text)
             report_meta["material_utilization_alerts"] = alerts[:8]
+            report["scoring_status"] = "blocked"
+            report["scoring_trigger"] = "material_utilization_gate"
+            report["scored_at"] = _now_iso()
         elif bool(utilization_gate.get("warned")):
             report_meta["score_confidence_level"] = "medium"
         else:
             report_meta["score_confidence_level"] = "high"
         report["meta"] = report_meta
         _apply_deployed_patch_to_report(project_id, report)
+        if _report_is_blocked(report):
+            return report, list(v2_result.get("evidence_units") or [])
         submission_like = {"id": submission_id, "project_id": project_id, "text": text}
         _apply_prediction_to_report(report, submission_like=submission_like, project=project)
         _mark_report_scored(report, trigger="score_engine")
@@ -3278,7 +3415,8 @@ def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, 
             profile_snapshot=profile_snapshot,
             scoring_engine_version=scoring_engine_version,
         )
-        _mark_report_scored(report, trigger="ground_truth_sync")
+        if not _report_is_blocked(report):
+            _mark_report_scored(report, trigger="ground_truth_sync")
         matched_submission["report"] = report
         matched_submission["total_score"] = float(
             report.get("total_score", report.get("rule_total_score", 0.0))
@@ -3320,14 +3458,15 @@ def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, 
             for dim_id, dim in (report.get("dimension_scores") or {}).items()
         }
         penalty_count = len(report.get("penalties", []))
-        record_history_score(
-            project_id=project_id,
-            submission_id=str(matched_submission.get("id")),
-            filename=str(matched_submission.get("filename", "")),
-            total_score=float(report.get("total_score", report.get("rule_total_score", 0.0))),
-            dimension_scores=dimension_scores,
-            penalty_count=penalty_count,
-        )
+        if not _report_is_blocked(report):
+            record_history_score(
+                project_id=project_id,
+                submission_id=str(matched_submission.get("id")),
+                filename=str(matched_submission.get("filename", "")),
+                total_score=float(report.get("total_score", report.get("rule_total_score", 0.0))),
+                dimension_scores=dimension_scores,
+                penalty_count=penalty_count,
+            )
 
     qt_results = load_qingtian_results()
     matched_qt = next(
@@ -4350,7 +4489,8 @@ def rescore_project_submissions(
             submission_id=str(submission.get("id")),
             new_units=evidence_units,
         )
-        _mark_report_scored(report, trigger="manual_rescore")
+        if not _report_is_blocked(report):
+            _mark_report_scored(report, trigger="manual_rescore")
         report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
         report_meta = dict(report_meta or {})
         report_meta["score_scale_max"] = score_scale_max
@@ -4405,14 +4545,15 @@ def rescore_project_submissions(
             for dim_id, dim in report.get("dimension_scores", {}).items()
         }
         penalty_count = len(report.get("penalties", []))
-        record_history_score(
-            project_id=project_id,
-            submission_id=str(submission.get("id")),
-            filename=str(submission.get("filename", "")),
-            total_score=report.get("total_score", 0.0),
-            dimension_scores=dimension_scores,
-            penalty_count=penalty_count,
-        )
+        if not _report_is_blocked(report):
+            record_history_score(
+                project_id=project_id,
+                submission_id=str(submission.get("id")),
+                filename=str(submission.get("filename", "")),
+                total_score=report.get("total_score", 0.0),
+                dimension_scores=dimension_scores,
+                penalty_count=penalty_count,
+            )
 
     save_submissions(submissions)
     save_score_reports(score_reports)
@@ -5978,6 +6119,7 @@ def _select_material_retrieval_chunks(
     submission_text: str,
     *,
     top_k: int = 12,
+    per_type_quota: int = 1,
 ) -> List[Dict[str, object]]:
     query_terms = set(_extract_terms(submission_text, max_terms=60))
     # 确保不同资料类型关键词也参与检索，避免“只用施组词命中”。
@@ -6044,20 +6186,25 @@ def _select_material_retrieval_chunks(
     selected: List[Dict[str, object]] = []
     seen_chunk_ids: set[str] = set()
 
-    # 先保证“每个已上传资料类型至少取一个块”，避免单一资料类型垄断检索。
+    type_quota = max(1, int(per_type_quota))
+    # 先保证“每个已上传资料类型至少取 N 个块”，避免单一资料类型垄断检索。
     for mat_type in available_types:
-        best = next((c for c in candidates if str(c.get("material_type")) == mat_type), None)
-        if not best:
-            continue
-        chunk_id = str(best.get("chunk_id") or "")
-        if chunk_id in seen_chunk_ids:
-            continue
-        row = dict(best)
-        row["selected_via"] = "type_quota"
-        selected.append(row)
-        seen_chunk_ids.add(chunk_id)
-        if len(selected) >= target_k:
-            return selected
+        type_selected = 0
+        for candidate in candidates:
+            if str(candidate.get("material_type") or "") != mat_type:
+                continue
+            chunk_id = str(candidate.get("chunk_id") or "")
+            if chunk_id in seen_chunk_ids:
+                continue
+            row = dict(candidate)
+            row["selected_via"] = "type_quota"
+            selected.append(row)
+            seen_chunk_ids.add(chunk_id)
+            type_selected += 1
+            if len(selected) >= target_k:
+                return selected
+            if type_selected >= type_quota:
+                break
 
     # 再按全局相关性补齐 top_k。
     for candidate in candidates:
@@ -9904,6 +10051,7 @@ def index(
                 llm_total = _convert_score_from_100(llm_total_raw, score_scale_initial)
                 scoring_status = str(report.get("scoring_status") or "").strip().lower()
                 is_pending = scoring_status == "pending"
+                is_blocked = scoring_status == "blocked"
                 report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
                 util_gate = (
                     report_meta.get("material_utilization_gate")
@@ -9918,6 +10066,8 @@ def index(
                 )
                 if is_pending:
                     score_cell = '<span class="note">待评分</span>'
+                elif is_blocked:
+                    score_cell = '<span class="error">待补资料后重评分</span>'
                 elif pred_total is not None:
                     score_cell = html_lib.escape(str(pred_total))
                     note_items: List[str] = []
@@ -10875,6 +11025,7 @@ def index(
               const llm = report && report.llm_total_score != null ? report.llm_total_score : null;
               const scoringStatus = String((report && report.scoring_status) || '').toLowerCase();
               const isPending = scoringStatus === 'pending';
+              const isBlocked = scoringStatus === 'blocked';
               const reportMeta = (report && typeof report.meta === 'object') ? report.meta : {};
               const utilGate = (reportMeta && typeof reportMeta.material_utilization_gate === 'object')
                 ? reportMeta.material_utilization_gate
@@ -10883,6 +11034,8 @@ def index(
               let scoreHtml = '-';
               if (isPending) {
                 scoreHtml = '<span class="note">待评分</span>';
+              } else if (isBlocked) {
+                scoreHtml = '<span class="error">待补资料后重评分</span>';
               } else if (pred != null) {
                 scoreHtml = fallbackEscapeHtml(String(pred));
                 const notes = [];
@@ -12710,6 +12863,7 @@ def index(
             const llm = (rep && rep.llm_total_score != null) ? rep.llm_total_score : null;
             const scoringStatus = String((rep && rep.scoring_status) || '').toLowerCase();
             const isPending = scoringStatus === 'pending';
+            const isBlocked = scoringStatus === 'blocked';
             const repMeta = (rep && typeof rep.meta === 'object') ? rep.meta : {};
             const utilGate = (repMeta && typeof repMeta.material_utilization_gate === 'object')
               ? repMeta.material_utilization_gate
@@ -12718,6 +12872,8 @@ def index(
             let scoreHtml = '-';
             if (isPending) {
               scoreHtml = '<span class="note">待评分</span>';
+            } else if (isBlocked) {
+              scoreHtml = '<span class="error">待补资料后重评分</span>';
             } else if (pred != null) {
               scoreHtml = escapeHtmlText(String(pred));
               const notes = [];
@@ -12820,7 +12976,9 @@ def index(
             opt.value = String((s && s.id) || '');
             const report = (s && s.report) || {};
             const status = String((report && report.scoring_status) || '').toLowerCase();
-            const statusLabel = status === 'pending' ? '待评分' : (status === 'scored' ? '已评分' : '');
+            const statusLabel = status === 'pending'
+              ? '待评分'
+              : (status === 'blocked' ? '已阻断' : (status === 'scored' ? '已评分' : ''));
             const createdAt = String((s && s.created_at) || '').slice(0, 19);
             const suffix = [createdAt, statusLabel].filter(Boolean).join(' / ');
             opt.textContent = String((s && s.filename) || '未命名施组') + (suffix ? ('（' + suffix + '）') : '');
