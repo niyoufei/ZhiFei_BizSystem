@@ -202,8 +202,26 @@ def _match_requirements(
             if isinstance(hints, str):
                 hints = [hints]
             if hints:
-                hit = any(str(h).lower() in lower for h in hints if isinstance(h, str))
-                reason = "semantic_hints"
+                minimum_hint_hits = int(patterns.get("minimum_hint_hits", 1) or 1)
+                hint_hits = _count_hit_terms(
+                    scope_text, [str(h) for h in hints if isinstance(h, str)]
+                )
+                hit = hint_hits >= max(1, minimum_hint_hits)
+                reason = f"semantic_hints:{hint_hits}/{max(1, minimum_hint_hits)}"
+                evaluated = True
+        elif req_type == "material_consistency":
+            terms = patterns.get("must_hit_terms") or patterns.get("hints") or []
+            if isinstance(terms, str):
+                terms = [terms]
+            if terms:
+                minimum_terms = int(patterns.get("minimum_terms", 2) or 2)
+                within_dim = bool(patterns.get("within_dimension_scope", False))
+                target_scope = dim_text if within_dim and dim_text else scope_text
+                hit_terms = _count_hit_terms(
+                    target_scope, [str(t) for t in terms if str(t).strip()]
+                )
+                hit = hit_terms >= max(1, minimum_terms)
+                reason = f"material_consistency:{hit_terms}/{max(1, minimum_terms)}"
                 evaluated = True
         elif req_type == "consistency":
             expected = patterns.get("expected")
@@ -357,10 +375,58 @@ def _match_requirements(
                 "lint_severity": lint.get("severity"),
                 "lint_why_it_matters": lint.get("why_it_matters"),
                 "lint_fix_template": lint.get("fix_template"),
+                "source_pack_id": req.get("source_pack_id"),
+                "source_pack_version": req.get("source_pack_version"),
+                "weight": req.get("weight"),
+                "material_type": patterns.get("material_type") or req.get("material_type"),
             }
         )
 
     return results, dim_stats
+
+
+def _apply_evidence_gate(
+    *,
+    raw_score: float,
+    evidence_count: int,
+    req_stats: Dict[str, int],
+) -> tuple[float, Dict[str, Any]]:
+    cap = 10.0
+    reasons: List[str] = []
+    req_total = int(req_stats.get("total", 0) or 0)
+    req_hit = int(req_stats.get("hit", 0) or 0)
+    mandatory_total = int(req_stats.get("mandatory_total", 0) or 0)
+    mandatory_hit = int(req_stats.get("mandatory_hit", 0) or 0)
+    all_requirements_hit = (
+        req_total > 0 and req_hit >= req_total and mandatory_hit >= mandatory_total
+    )
+
+    if evidence_count <= 0:
+        cap = min(cap, 4.0)
+        reasons.append("evidence_units=0")
+    elif evidence_count == 1 and not all_requirements_hit:
+        cap = min(cap, 6.0)
+        reasons.append("evidence_units=1")
+
+    if req_total >= 3:
+        hit_rate = req_hit / max(1, req_total)
+        if hit_rate < 0.25:
+            cap = min(cap, 5.5)
+            reasons.append("requirement_hit_rate<0.25")
+        elif hit_rate < 0.5:
+            cap = min(cap, 7.0)
+            reasons.append("requirement_hit_rate<0.5")
+    if mandatory_total > 0 and mandatory_hit < mandatory_total:
+        cap = min(cap, 6.2)
+        reasons.append("mandatory_requirement_missing")
+
+    gated_score = min(max(0.0, raw_score), cap)
+    return round(gated_score, 2), {
+        "applied": gated_score + 1e-9 < raw_score,
+        "raw_score": round(float(raw_score), 2),
+        "cap": round(float(cap), 2),
+        "reasons": reasons,
+    }
 
 
 def _score_14_dims(
@@ -415,7 +481,12 @@ def _score_14_dims(
     if mandatory_total > 0 and mandatory_hit < mandatory_total:
         coverage = min(coverage, 1.0)
 
-    dim_score = min(10.0, max(0.0, coverage + closure + landing + specificity))
+    dim_score_raw = min(10.0, max(0.0, coverage + closure + landing + specificity))
+    dim_score, evidence_gate = _apply_evidence_gate(
+        raw_score=dim_score_raw,
+        evidence_count=evidence_count,
+        req_stats=req_stats,
+    )
     return {
         "dim_score": round(dim_score, 2),
         "subscores": {
@@ -428,10 +499,15 @@ def _score_14_dims(
         if req_stats.get("total", 0) > 0
         else None,
         "evidence_count": evidence_count,
+        "evidence_gate": evidence_gate,
     }
 
 
-def _score_dim07(text: str, units: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _score_dim07(
+    text: str,
+    units: List[Dict[str, Any]],
+    req_stats: Dict[str, int],
+) -> Dict[str, Any]:
     corpus = " ".join([u.get("text", "") for u in units]) if units else text
     s1 = (
         2.0
@@ -463,7 +539,12 @@ def _score_dim07(text: str, units: List[Dict[str, Any]]) -> Dict[str, Any]:
         else 0.0
     )
     s5 = 2.0 if any(k in corpus for k in ["应急预案", "处置", "停工", "复工条件", "整改"]) else 0.0
-    dim_score = s1 + s2 + s3 + s4 + s5
+    dim_score_raw = s1 + s2 + s3 + s4 + s5
+    dim_score, evidence_gate = _apply_evidence_gate(
+        raw_score=dim_score_raw,
+        evidence_count=len(units),
+        req_stats=req_stats,
+    )
     return {
         "dim_score": round(dim_score, 2),
         "subscores": {
@@ -475,10 +556,15 @@ def _score_dim07(text: str, units: List[Dict[str, Any]]) -> Dict[str, Any]:
         },
         "coverage_rate": None,
         "evidence_count": len(units),
+        "evidence_gate": evidence_gate,
     }
 
 
-def _score_dim09(text: str, units: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _score_dim09(
+    text: str,
+    units: List[Dict[str, Any]],
+    req_stats: Dict[str, int],
+) -> Dict[str, Any]:
     corpus = " ".join([u.get("text", "") for u in units]) if units else text
     plan_hits = sum(1 for k in ["总控计划", "月计划", "周计划", "日计划"] if k in corpus)
     s1 = 2.0 if plan_hits >= 2 else 0.0
@@ -494,7 +580,12 @@ def _score_dim09(text: str, units: List[Dict[str, Any]]) -> Dict[str, Any]:
         if any(k in corpus for k in ["每日", "每周", "例会", "调度会", "17:00", "日报", "周报"])
         else 0.0
     )
-    dim_score = s1 + s2 + s3 + s4 + s5
+    dim_score_raw = s1 + s2 + s3 + s4 + s5
+    dim_score, evidence_gate = _apply_evidence_gate(
+        raw_score=dim_score_raw,
+        evidence_count=len(units),
+        req_stats=req_stats,
+    )
     return {
         "dim_score": round(dim_score, 2),
         "subscores": {
@@ -506,6 +597,7 @@ def _score_dim09(text: str, units: List[Dict[str, Any]]) -> Dict[str, Any]:
         },
         "coverage_rate": None,
         "evidence_count": len(units),
+        "evidence_gate": evidence_gate,
     }
 
 
@@ -668,6 +760,94 @@ def _consistency_penalties(text: str, anchors: List[Dict[str, Any]]) -> List[Dic
     return penalties
 
 
+def _material_consistency_penalties(
+    requirement_hits: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    penalties: List[Dict[str, Any]] = []
+    by_type: Dict[str, Dict[str, float]] = {}
+    for req in requirement_hits:
+        source_pack_id = str(req.get("source_pack_id") or "")
+        if source_pack_id not in {"runtime_material_consistency", "runtime_material_rag"}:
+            continue
+        mat_type = str(req.get("material_type") or "unknown")
+        stats = by_type.setdefault(
+            mat_type,
+            {"total": 0.0, "hit": 0.0, "mandatory_total": 0.0, "mandatory_hit": 0.0},
+        )
+        stats["total"] += 1.0
+        if bool(req.get("hit")):
+            stats["hit"] += 1.0
+        if bool(req.get("mandatory")):
+            stats["mandatory_total"] += 1.0
+            if bool(req.get("hit")):
+                stats["mandatory_hit"] += 1.0
+
+    total_points = 0.0
+    for mat_type, stats in by_type.items():
+        total = int(stats.get("total", 0) or 0)
+        hit = int(stats.get("hit", 0) or 0)
+        mandatory_total = int(stats.get("mandatory_total", 0) or 0)
+        mandatory_hit = int(stats.get("mandatory_hit", 0) or 0)
+        hit_rate = float(hit / max(1, total))
+        if mandatory_total > 0 and mandatory_hit == 0:
+            points = 1.6
+            reason = f"跨资料一致性缺失：{mat_type}关键约束未在施组体现"
+        elif total >= 3 and hit_rate < 0.35:
+            points = 0.9
+            reason = f"跨资料一致性较弱：{mat_type}命中率仅{hit_rate:.0%}"
+        else:
+            continue
+        penalties.append(
+            {
+                "code": "P-MATCONS-001",
+                "points": points,
+                "reason": reason,
+                "evidence_refs": [],
+                "material_type": mat_type,
+            }
+        )
+        total_points += points
+        if total_points >= 6.0:
+            break
+
+    rag_rows = [
+        req
+        for req in requirement_hits
+        if str(req.get("source_pack_id") or "") == "runtime_material_rag"
+    ]
+    rag_total = len(rag_rows)
+    rag_hit = sum(1 for req in rag_rows if bool(req.get("hit")))
+    rag_hit_rate = float(rag_hit / max(1, rag_total)) if rag_total > 0 else None
+    if rag_total >= 6 and rag_hit_rate is not None and rag_hit_rate < 0.2 and total_points < 6.0:
+        penalties.append(
+            {
+                "code": "P-MATCONS-002",
+                "points": min(1.2, 6.0 - total_points),
+                "reason": f"资料检索命中偏低：{rag_hit}/{rag_total}，施组与上传资料关联不足",
+                "evidence_refs": [],
+            }
+        )
+
+    summary = {
+        "by_material_type": {
+            key: {
+                "total": int(val.get("total", 0) or 0),
+                "hit": int(val.get("hit", 0) or 0),
+                "mandatory_total": int(val.get("mandatory_total", 0) or 0),
+                "mandatory_hit": int(val.get("mandatory_hit", 0) or 0),
+                "hit_rate": round(
+                    float((val.get("hit", 0) or 0) / max(1.0, float(val.get("total", 0) or 0))), 4
+                ),
+            }
+            for key, val in by_type.items()
+        },
+        "rag_total": rag_total,
+        "rag_hit": rag_hit,
+        "rag_hit_rate": round(rag_hit_rate, 4) if rag_hit_rate is not None else None,
+    }
+    return penalties, summary
+
+
 def _build_lint_findings(
     requirement_hits: List[Dict[str, Any]],
     penalties: List[Dict[str, Any]],
@@ -705,13 +885,17 @@ def _build_lint_findings(
             "P-EMPTY-002": "EmptyPromiseWithoutEvidence",
             "P-ACTION-002": "ActionMissingHardElements",
             "P-CONSIST-001": "ConsistencyConflict",
+            "P-MATCONS-001": "MaterialConsistencyGap",
+            "P-MATCONS-002": "MaterialRetrievalWeak",
         }
         if code not in issue_map:
             continue
         findings.append(
             {
                 "issue_code": issue_map[code],
-                "dimension_id": "09" if code == "P-CONSIST-001" else "02",
+                "dimension_id": "09"
+                if code == "P-CONSIST-001"
+                else ("13" if code == "P-MATCONS-001" else "02"),
                 "severity": "high" if code != "P-EMPTY-002" else "medium",
                 "evidence_locator": (p.get("evidence_refs") or [{}])[0].get("locator"),
                 "suggested_heading_path": None,
@@ -894,9 +1078,9 @@ def score_text_v2(
         units = units_by_dim.get(dim_id, [])
         req_stat = req_dim_stats.get(dim_id, {"total": 0, "hit": 0})
         if dim_id == "07":
-            dim_scores[dim_id] = _score_dim07(text, units)
+            dim_scores[dim_id] = _score_dim07(text, units, req_stat)
         elif dim_id == "09":
-            dim_scores[dim_id] = _score_dim09(text, units)
+            dim_scores[dim_id] = _score_dim09(text, units, req_stat)
         else:
             dim_scores[dim_id] = _score_14_dims(dim_id, units, req_stat)
 
@@ -913,6 +1097,10 @@ def score_text_v2(
     penalties.extend(_empty_penalties(text, lexicon))
     penalties.extend(_action_penalties(text, lexicon))
     penalties.extend(_consistency_penalties(text, anchors))
+    material_consistency_penalties, material_consistency_summary = _material_consistency_penalties(
+        req_hits
+    )
+    penalties.extend(material_consistency_penalties)
     penalty_points = round(sum(float(p.get("points", 0.0)) for p in penalties), 2)
 
     rule_total, dim_total_90 = compute_v2_rule_total(
@@ -965,4 +1153,5 @@ def score_text_v2(
         "requirement_pack_versions": requirement_pack_versions,
         "evidence_units_count": len(evidence_units),
         "evidence_units": evidence_units,
+        "material_consistency": material_consistency_summary,
     }

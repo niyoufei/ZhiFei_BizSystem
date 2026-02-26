@@ -117,3 +117,135 @@ def test_v2_score_reaches_100_under_full_credit_conditions() -> None:
     assert report["dim_total_90"] == 90.0
     assert report["consistency_bonus"] == 10.0
     assert report["rule_total_score"] == 100.0
+
+
+def test_semantic_requirement_respects_minimum_hint_hits() -> None:
+    report = score_text_v2(
+        submission_id="s-semantic-min",
+        text="本方案已明确 BIM 平台组织与校核流程。",
+        lexicon=_minimal_lexicon(),
+        anchors=[],
+        requirements=[
+            {
+                "id": "r-sem",
+                "dimension_id": "01",
+                "req_type": "semantic",
+                "mandatory": True,
+                "req_label": "语义命中至少2项",
+                "patterns": {"hints": ["BIM", "碰撞", "深化"], "minimum_hint_hits": 2},
+            }
+        ],
+        evidence_units=[
+            {
+                "dimension_primary": "01",
+                "text": "BIM 流程说明。",
+                "tag_definition": True,
+                "tag_analysis": True,
+                "tag_solution": True,
+                "landing_param": True,
+                "landing_freq": True,
+                "landing_accept": True,
+                "landing_role": True,
+                "specificity_score": 1.0,
+                "anchor_links": [],
+            }
+        ],
+    )
+    req = (report.get("requirement_hits") or [{}])[0]
+    assert req.get("hit") is False
+    assert str(req.get("reason") or "").startswith("semantic_hints:")
+
+
+def test_evidence_gate_caps_dim_score_when_evidence_and_mandatory_missing() -> None:
+    report = score_text_v2(
+        submission_id="s-evidence-cap",
+        text="一般描述文本。",
+        lexicon=_minimal_lexicon(),
+        anchors=[],
+        requirements=[
+            {
+                "id": "r-cap",
+                "dimension_id": "01",
+                "req_type": "presence",
+                "mandatory": True,
+                "req_label": "必须命中",
+                "patterns": {"keywords": ["不存在关键词"]},
+            }
+        ],
+        evidence_units=[
+            {
+                "dimension_primary": "01",
+                "text": "由项目经理牵头，每日检查，报验签认闭环，阈值控制在5%以内。",
+                "tag_definition": True,
+                "tag_analysis": True,
+                "tag_solution": True,
+                "landing_param": True,
+                "landing_freq": True,
+                "landing_accept": True,
+                "landing_role": True,
+                "specificity_score": 1.0,
+                "anchor_links": [],
+            }
+        ],
+    )
+    dim01 = (report.get("rule_dim_scores") or {}).get("01") or {}
+    gate = dim01.get("evidence_gate") or {}
+    assert gate.get("applied") is True
+    assert float(dim01.get("dim_score", 0.0)) <= 6.2
+
+
+def test_material_consistency_penalty_applies_when_cross_material_hits_low() -> None:
+    requirements = [
+        {
+            "id": "mc-boq",
+            "dimension_id": "13",
+            "req_type": "material_consistency",
+            "mandatory": True,
+            "req_label": "BOQ一致性",
+            "source_pack_id": "runtime_material_consistency",
+            "patterns": {
+                "must_hit_terms": ["工程量", "综合单价", "措施费"],
+                "minimum_terms": 2,
+                "material_type": "boq",
+            },
+        },
+        {
+            "id": "mc-drawing",
+            "dimension_id": "14",
+            "req_type": "material_consistency",
+            "mandatory": True,
+            "req_label": "图纸一致性",
+            "source_pack_id": "runtime_material_consistency",
+            "patterns": {
+                "must_hit_terms": ["节点", "剖面", "深化"],
+                "minimum_terms": 2,
+                "material_type": "drawing",
+            },
+        },
+    ]
+    for idx in range(1, 7):
+        requirements.append(
+            {
+                "id": f"rag-{idx}",
+                "dimension_id": "01",
+                "req_type": "semantic",
+                "mandatory": False,
+                "req_label": f"检索{idx}",
+                "source_pack_id": "runtime_material_rag",
+                "patterns": {"hints": [f"关键检索词{idx}"], "minimum_hint_hits": 1},
+            }
+        )
+
+    report = score_text_v2(
+        submission_id="s-material-consistency",
+        text="本施组只描述一般组织架构和常规流程。",
+        lexicon=_minimal_lexicon(),
+        anchors=[],
+        requirements=requirements,
+    )
+    penalty_codes = [str(p.get("code") or "") for p in (report.get("penalties") or [])]
+    assert "P-MATCONS-001" in penalty_codes
+    assert "P-MATCONS-002" in penalty_codes
+    summary = report.get("material_consistency") or {}
+    boq_stats = (summary.get("by_material_type") or {}).get("boq") or {}
+    assert boq_stats.get("mandatory_hit") == 0

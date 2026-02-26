@@ -1407,6 +1407,44 @@ class TestMaterialAdvancedParsing:
         assert "DWG预处理" in text
         assert "建议同时上传 PDF 或 ASCII DXF" in text
 
+    def test_read_uploaded_file_content_dwg_detects_ascii_dxf_payload(self):
+        from app.main import _read_uploaded_file_content
+
+        dxf_content = (
+            "0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1032\n0\nENDSEC\n"
+            "0\nSECTION\n2\nENTITIES\n0\nTEXT\n8\nA-TEXT\n1\n机电综合节点\n0\nENDSEC\n0\nEOF\n"
+        ).encode("utf-8")
+        text = _read_uploaded_file_content(dxf_content, "looks_like.dwg")
+        assert "检测到ASCII DXF内容" in text
+        assert "DXF解析摘要" in text
+
+    def test_build_material_consistency_requirements_from_retrieval_chunks(self):
+        from app.main import _build_material_consistency_requirements
+
+        retrieval_chunks = [
+            {
+                "material_type": "boq",
+                "dimension_id": "13",
+                "filename": "清单.xlsx",
+                "chunk_id": "清单.xlsx#c001",
+                "matched_terms": ["工程量", "综合单价", "措施费"],
+                "chunk_preview": "工程量与综合单价控制要求。",
+            },
+            {
+                "material_type": "drawing",
+                "dimension_id": "14",
+                "filename": "总图.dxf",
+                "chunk_id": "总图.dxf#c002",
+                "matched_terms": ["节点", "剖面", "深化"],
+                "chunk_preview": "节点做法与剖面表达。",
+            },
+        ]
+        reqs = _build_material_consistency_requirements("p1", retrieval_chunks)
+        assert len(reqs) == 2
+        boq_req = next(r for r in reqs if r.get("material_type") == "boq")
+        assert boq_req.get("req_type") == "material_consistency"
+        assert boq_req.get("source_pack_id") == "runtime_material_consistency"
+
 
 class TestScoreForProjectEndpoint:
     """Tests for /projects/{project_id}/score endpoint."""

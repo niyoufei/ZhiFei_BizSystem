@@ -834,7 +834,11 @@ def _build_runtime_custom_requirements(
         top_k=12,
     )
     retrieval_requirements = _build_material_retrieval_requirements(project_id, retrieval_chunks)
+    consistency_requirements = _build_material_consistency_requirements(
+        project_id, retrieval_chunks
+    )
     runtime_requirements.extend(retrieval_requirements)
+    runtime_requirements.extend(consistency_requirements)
 
     meta = {
         "required_sections": len(required_sections),
@@ -845,6 +849,7 @@ def _build_runtime_custom_requirements(
         "project_context_chars": len(context_text),
         "material_retrieval_chunks": len(retrieval_chunks),
         "material_retrieval_requirements": len(retrieval_requirements),
+        "material_consistency_requirements": len(consistency_requirements),
         "material_retrieval_preview": [
             {
                 "material_type": c.get("material_type"),
@@ -855,6 +860,15 @@ def _build_runtime_custom_requirements(
                 "matched_terms": c.get("matched_terms"),
             }
             for c in retrieval_chunks[:8]
+        ],
+        "material_consistency_preview": [
+            {
+                "material_type": req.get("material_type"),
+                "dimension_id": req.get("dimension_id"),
+                "mandatory": req.get("mandatory"),
+                "terms": ((req.get("patterns") or {}).get("must_hit_terms") or [])[:6],
+            }
+            for req in consistency_requirements[:6]
         ],
     }
     return runtime_requirements, meta
@@ -1265,6 +1279,7 @@ def _build_score_report_snapshot(
         "penalties": report.get("penalties", []),
         "lint_findings": report.get("lint_findings", []),
         "suggestions": report.get("suggestions", []),
+        "material_consistency": report.get("material_consistency", {}),
         "created_at": _now_iso(),
     }
 
@@ -1454,6 +1469,7 @@ def _build_v2_report_payload(
         "pre_flight": v2_result.get("pre_flight", {}),
         "requirement_hits": v2_result.get("requirement_hits", []),
         "mandatory_req_hit_rate": v2_result.get("mandatory_req_hit_rate"),
+        "material_consistency": v2_result.get("material_consistency", {}),
         "requirement_pack_versions": v2_result.get("requirement_pack_versions", []),
         "evidence_units_count": int(v2_result.get("evidence_units_count", 0) or 0),
         "meta": {
@@ -1932,6 +1948,10 @@ def _score_submission_for_project(
                 _to_float_or_none(runtime_req_meta.get("material_retrieval_requirements")) or 0
             ),
             "preview": runtime_req_meta.get("material_retrieval_preview") or [],
+            "consistency_requirements": int(
+                _to_float_or_none(runtime_req_meta.get("material_consistency_requirements")) or 0
+            ),
+            "consistency_preview": runtime_req_meta.get("material_consistency_preview") or [],
         }
         gate_obj = snapshot_for_meta.get("gate")
         if isinstance(gate_obj, dict):
@@ -4714,6 +4734,67 @@ def _extract_dxf_text(content: bytes) -> str:
     return "\n".join(summary_lines).strip()
 
 
+def _looks_like_ascii_dxf(content: bytes) -> bool:
+    sample = content[:4096]
+    if not sample or b"\x00" in sample:
+        return False
+    text = sample.decode("latin-1", errors="ignore").replace("\r", "\n").upper()
+    return "SECTION" in text and ("ENTITIES" in text or "HEADER" in text) and "\n0\n" in text
+
+
+def _extract_dwg_binary_markers(content: bytes, *, max_tokens: int = 30) -> Dict[str, object]:
+    sample = content[: min(len(content), 1_500_000)]
+    versions = sorted(
+        {
+            item.decode("ascii", errors="ignore")
+            for item in re.findall(rb"AC10\d{2}", sample)
+            if item
+        }
+    )
+    raw_tokens = re.findall(rb"[A-Za-z_][A-Za-z0-9_./:-]{2,48}", sample)
+    blocklist_prefix = ("http", "https", "xmlns", "schema", "version", "content")
+    token_counter: Counter[str] = Counter()
+    for token_bytes in raw_tokens:
+        token = token_bytes.decode("latin-1", errors="ignore").strip()
+        lower = token.lower()
+        if len(token) < 3:
+            continue
+        if any(lower.startswith(prefix) for prefix in blocklist_prefix):
+            continue
+        if lower in {"acdb", "objectdbx", "autocad", "dwg"}:
+            continue
+        if re.fullmatch(r"[0-9a-f]{8,}", lower):
+            continue
+        token_counter[token] += 1
+    top_tokens = [tok for tok, _ in token_counter.most_common(max(1, int(max_tokens)))]
+    return {"versions": versions, "tokens": top_tokens}
+
+
+def _dwg_converter_command_candidates(
+    binary: str,
+    *,
+    in_path: Path,
+    input_dir: Path,
+    output_dir: Path,
+) -> List[List[str]]:
+    name = Path(binary).name.lower()
+    out_file = output_dir / f"{in_path.stem}.dxf"
+    candidates: List[List[str]] = []
+    if "dwg2dxf" in name:
+        candidates.append([binary, str(in_path), str(out_file)])
+    elif any(mark in name for mark in ("odafileconverter", "oda_file_converter", "teigha")):
+        # ODA/Teigha 不同版本参数略有差异，按候选命令依次尝试。
+        candidates.append([binary, str(input_dir), str(output_dir), "ACAD2018", "DXF", "0", "1"])
+        candidates.append(
+            [binary, str(input_dir), str(output_dir), "ACAD2018", "DXF", "0", "1", "*.DWG"]
+        )
+        candidates.append([binary, str(in_path), str(out_file)])
+    else:
+        candidates.append([binary, str(in_path), str(out_file)])
+        candidates.append([binary, str(input_dir), str(output_dir)])
+    return candidates
+
+
 def _extract_dwg_text(content: bytes, filename: str) -> str:
     """
     DWG 预处理链：
@@ -4721,12 +4802,39 @@ def _extract_dwg_text(content: bytes, filename: str) -> str:
     2) 转换成功后复用 DXF 解析
     3) 无转换器或转换失败时保留元信息并给出明确提示
     """
-    converter_names = [
-        "dwg2dxf",
-        "ODAFileConverter",
-        "oda_file_converter",
-        "TeighaFileConverter",
-    ]
+    if _looks_like_ascii_dxf(content):
+        try:
+            dxf_text = _extract_dxf_text(content)
+            return f"[DWG预处理] 文件: {filename}\n检测到ASCII DXF内容，按DXF解析。\n\n{dxf_text}"
+        except Exception:
+            pass
+
+    converter_names: List[str] = []
+    env_converters_raw = str(os.getenv("DWG_CONVERTER_BIN") or "").strip()
+    if env_converters_raw:
+        for item in re.split(r"[;,]", env_converters_raw):
+            s = item.strip()
+            if s and s not in converter_names:
+                converter_names.append(s)
+    converter_names.extend(
+        [
+            "dwg2dxf",
+            "ODAFileConverter",
+            "oda_file_converter",
+            "TeighaFileConverter",
+        ]
+    )
+    converter_names = list(dict.fromkeys(converter_names))
+    binaries: List[str] = []
+    for name in converter_names:
+        if not name:
+            continue
+        resolved = name if Path(name).exists() else shutil.which(name)
+        if resolved:
+            binaries.append(str(resolved))
+    binaries = list(dict.fromkeys(binaries))
+
+    converter_display = ["dwg2dxf", "ODAFileConverter", "oda_file_converter", "TeighaFileConverter"]
     notes: List[str] = []
     with tempfile.TemporaryDirectory(prefix="dwg_bridge_") as tmpdir:
         tmp_root = Path(tmpdir)
@@ -4737,61 +4845,74 @@ def _extract_dwg_text(content: bytes, filename: str) -> str:
         in_path = input_dir / _normalize_uploaded_filename(filename)
         in_path.write_bytes(content)
 
-        for name in converter_names:
-            binary = shutil.which(name)
-            if not binary:
+        for name in converter_display:
+            if not any(Path(b).name.lower() == name.lower() for b in binaries):
                 notes.append(f"{name}: not_found")
-                continue
-            try:
-                if name == "dwg2dxf":
-                    cmd = [binary, str(in_path), str(output_dir / f"{in_path.stem}.dxf")]
-                else:
-                    cmd = [
-                        binary,
-                        str(input_dir),
-                        str(output_dir),
-                        "ACAD2018",
-                        "DXF",
-                        "0",
-                        "1",
-                    ]
-                completed = subprocess.run(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=40,
-                    check=False,
-                    text=True,
-                )
-                if completed.returncode != 0:
-                    err = (completed.stderr or completed.stdout or "").strip().splitlines()
-                    notes.append(f"{name}: rc={completed.returncode} {err[:1] if err else ''}")
-                    continue
-                dxf_candidates = sorted(output_dir.rglob("*.dxf"))
-                if not dxf_candidates:
-                    notes.append(f"{name}: no_dxf_output")
-                    continue
+        for binary in binaries:
+            cmd_candidates = _dwg_converter_command_candidates(
+                binary,
+                in_path=in_path,
+                input_dir=input_dir,
+                output_dir=output_dir,
+            )
+            for cmd in cmd_candidates:
+                cmd_signature = " ".join(cmd[:3])
                 try:
-                    dxf_text = _extract_dxf_text(dxf_candidates[0].read_bytes())
-                except Exception as exc:  # noqa: BLE001 - converter output might be malformed
-                    notes.append(f"{name}: dxf_parse_failed {type(exc).__name__}: {exc}")
-                    continue
-                head = [
-                    f"[DWG预处理] 文件: {filename}",
-                    f"转换器: {Path(binary).name}",
-                    f"输出DXF: {dxf_candidates[0].name}",
-                ]
-                return "\n".join(head + ["", dxf_text]).strip()
-            except subprocess.TimeoutExpired:
-                notes.append(f"{name}: timeout")
-            except Exception as exc:  # noqa: BLE001 - continue next converter
-                notes.append(f"{name}: exception {type(exc).__name__}: {exc}")
+                    completed = subprocess.run(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=45,
+                        check=False,
+                        text=True,
+                    )
+                    if completed.returncode != 0:
+                        err = (completed.stderr or completed.stdout or "").strip().splitlines()
+                        notes.append(
+                            f"{Path(binary).name}: rc={completed.returncode} {err[0] if err else ''}"
+                        )
+                        continue
+                    dxf_candidates = sorted(
+                        {
+                            *output_dir.rglob("*.dxf"),
+                            *tmp_root.rglob(f"{in_path.stem}.dxf"),
+                        }
+                    )
+                    if not dxf_candidates:
+                        notes.append(f"{Path(binary).name}: no_dxf_output ({cmd_signature})")
+                        continue
+                    for dxf_candidate in dxf_candidates:
+                        try:
+                            dxf_text = _extract_dxf_text(dxf_candidate.read_bytes())
+                        except Exception as exc:  # noqa: BLE001 - converter output might be malformed
+                            notes.append(
+                                f"{Path(binary).name}: dxf_parse_failed {type(exc).__name__}: {exc}"
+                            )
+                            continue
+                        head = [
+                            f"[DWG预处理] 文件: {filename}",
+                            f"转换器: {Path(binary).name}",
+                            f"命令: {cmd_signature}",
+                            f"输出DXF: {dxf_candidate.name}",
+                        ]
+                        return "\n".join(head + ["", dxf_text]).strip()
+                except subprocess.TimeoutExpired:
+                    notes.append(f"{Path(binary).name}: timeout ({cmd_signature})")
+                except Exception as exc:  # noqa: BLE001 - continue next converter
+                    notes.append(f"{Path(binary).name}: exception {type(exc).__name__}: {exc}")
 
+    markers = _extract_dwg_binary_markers(content, max_tokens=26)
+    versions = [str(x) for x in (markers.get("versions") or []) if str(x).strip()]
+    token_preview = [str(x) for x in (markers.get("tokens") or []) if str(x).strip()]
     notes_text = "；".join(notes[:6]) if notes else "未检测到可用转换器"
+    marker_text = "、".join(versions[:4]) if versions else "未识别"
+    tokens_text = "、".join(token_preview[:16]) if token_preview else "未提取到有效标识"
     return (
         f"[DWG图纸] 文件: {filename}，字节数: {len(content)}\n"
         f"DWG预处理: {notes_text}\n"
-        "当前未完成结构化解析，建议同时上传 PDF 或 ASCII DXF 以提升评分准确性。"
+        f"版本标记: {marker_text}\n"
+        f"二进制标识提取: {tokens_text}\n"
+        "当前未完成稳定结构化解析，建议同时上传 PDF 或 ASCII DXF 以提升评分准确性。"
     )
 
 
@@ -5299,6 +5420,7 @@ def _build_material_retrieval_requirements(
         hints = _to_text_items(hints, max_items=8)
         if not hints:
             continue
+        minimum_hint_hits = 2 if mat_type in {"tender_qa", "boq", "drawing"} else 1
         reqs.append(
             {
                 "id": f"runtime-rag-{project_id[:8]}-{idx}",
@@ -5306,14 +5428,87 @@ def _build_material_retrieval_requirements(
                 "dimension_id": dim_id,
                 "req_label": f"资料检索证据：{_material_type_label(mat_type)} / {filename} / {chunk_id}",
                 "req_type": "semantic",
-                "patterns": {"hints": hints},
+                "patterns": {
+                    "hints": hints,
+                    "minimum_hint_hits": minimum_hint_hits,
+                    "material_type": mat_type,
+                    "chunk_id": chunk_id,
+                },
                 "mandatory": False,
                 "weight": 0.7,
+                "material_type": mat_type,
                 "source_anchor_id": None,
                 "source_pack_id": "runtime_material_rag",
                 "source_pack_version": "v2-rag-1",
                 "priority": 88.0,
                 "override_key": f"runtime::material_rag::{chunk_id}",
+                "lint": {},
+                "created_at": now,
+            }
+        )
+    return reqs
+
+
+def _build_material_consistency_requirements(
+    project_id: str,
+    retrieval_chunks: List[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    now = _now_iso()
+    grouped: Dict[str, List[Dict[str, object]]] = {}
+    for chunk in retrieval_chunks:
+        mat_type = str(chunk.get("material_type") or MATERIAL_TYPE_DEFAULT)
+        grouped.setdefault(mat_type, []).append(chunk)
+
+    reqs: List[Dict[str, object]] = []
+    req_index = 0
+    for mat_type, chunks in grouped.items():
+        keyword_counter: Counter[str] = Counter()
+        preview_terms: List[str] = []
+        filenames: List[str] = []
+        for chunk in chunks[:12]:
+            filename = str(chunk.get("filename") or "")
+            if filename:
+                filenames.append(filename)
+            for term in chunk.get("matched_terms") or []:
+                token = str(term or "").strip()
+                if token:
+                    keyword_counter[token] += 1
+            preview_terms.extend(
+                _extract_terms(str(chunk.get("chunk_preview") or ""), max_terms=10)
+            )
+        must_terms = [item for item, _ in keyword_counter.most_common(8)]
+        if len(must_terms) < 4:
+            must_terms.extend([item for item in preview_terms if item not in must_terms])
+        must_terms = _to_text_items(must_terms, max_items=8)
+        if not must_terms:
+            continue
+
+        req_index += 1
+        minimum_terms = 2 if mat_type in {"tender_qa", "boq", "drawing"} else 1
+        mandatory = mat_type in {"tender_qa", "boq", "drawing"}
+        dim_id = (MATERIAL_TYPE_DIMENSION_PRIORITY.get(mat_type) or ["01"])[0]
+        reqs.append(
+            {
+                "id": f"runtime-consistency-{project_id[:8]}-{req_index}",
+                "project_id": project_id,
+                "dimension_id": dim_id,
+                "req_label": f"跨资料一致性：施组需体现{_material_type_label(mat_type)}关键约束",
+                "req_type": "material_consistency",
+                "patterns": {
+                    "must_hit_terms": must_terms,
+                    "minimum_terms": minimum_terms,
+                    "material_type": mat_type,
+                    "sample_filenames": _to_text_items(filenames, max_items=3),
+                    "within_dimension_scope": False,
+                },
+                "mandatory": mandatory,
+                "weight": 1.1 if mandatory else 0.8,
+                "material_type": mat_type,
+                "source_anchor_id": None,
+                "source_pack_id": "runtime_material_consistency",
+                "source_pack_version": "v2-consistency-1",
+                "priority": 92.0,
+                "override_key": f"runtime::material_consistency::{mat_type}",
                 "lint": {},
                 "created_at": now,
             }
