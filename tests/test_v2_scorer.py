@@ -194,6 +194,46 @@ def test_evidence_gate_caps_dim_score_when_evidence_and_mandatory_missing() -> N
     assert float(dim01.get("dim_score", 0.0)) <= 6.2
 
 
+def test_material_consistency_can_require_numeric_constraints() -> None:
+    requirements = [
+        {
+            "id": "mc-duration",
+            "dimension_id": "09",
+            "req_type": "material_consistency",
+            "mandatory": True,
+            "req_label": "工期一致性（含数字）",
+            "source_pack_id": "runtime_material_consistency",
+            "patterns": {
+                "must_hit_terms": ["工期", "里程碑", "节点"],
+                "minimum_terms": 2,
+                "must_hit_numbers": ["120", "30"],
+                "minimum_numbers": 1,
+                "material_type": "tender_qa",
+            },
+        }
+    ]
+    report_hit = score_text_v2(
+        submission_id="s-material-number-hit",
+        text="本施组工期120天，里程碑节点30天完成。",
+        lexicon=_minimal_lexicon(),
+        anchors=[],
+        requirements=requirements,
+    )
+    req_hit = (report_hit.get("requirement_hits") or [{}])[0]
+    assert req_hit.get("hit") is True
+
+    report_miss = score_text_v2(
+        submission_id="s-material-number-miss",
+        text="本施组工期安排合理，里程碑节点按计划推进。",
+        lexicon=_minimal_lexicon(),
+        anchors=[],
+        requirements=requirements,
+    )
+    req_miss = (report_miss.get("requirement_hits") or [{}])[0]
+    assert req_miss.get("hit") is False
+    assert "n0/1" in str(req_miss.get("reason") or "")
+
+
 def test_material_consistency_penalty_applies_when_cross_material_hits_low() -> None:
     requirements = [
         {
@@ -249,3 +289,33 @@ def test_material_consistency_penalty_applies_when_cross_material_hits_low() -> 
     summary = report.get("material_consistency") or {}
     boq_stats = (summary.get("by_material_type") or {}).get("boq") or {}
     assert boq_stats.get("mandatory_hit") == 0
+
+
+def test_material_consistency_penalty_applies_when_file_coverage_low() -> None:
+    requirements = []
+    for idx, name in enumerate(["A", "B", "C", "D"], start=1):
+        requirements.append(
+            {
+                "id": f"rag-file-{idx}",
+                "dimension_id": "01",
+                "req_type": "semantic",
+                "mandatory": False,
+                "req_label": f"文件{name}",
+                "source_pack_id": "runtime_material_rag",
+                "patterns": {
+                    "hints": [f"关键词{name}"],
+                    "minimum_hint_hits": 1,
+                    "source_mode": "global_rank",
+                    "source_filename": f"file_{name}.txt",
+                },
+            }
+        )
+    report = score_text_v2(
+        submission_id="s-material-file-coverage",
+        text="仅体现关键词A，其他资料未体现。",
+        lexicon=_minimal_lexicon(),
+        anchors=[],
+        requirements=requirements,
+    )
+    penalty_codes = [str(p.get("code") or "") for p in (report.get("penalties") or [])]
+    assert "P-MATCONS-004" in penalty_codes

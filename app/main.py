@@ -807,6 +807,70 @@ def _resolve_material_retrieval_config(project: Dict[str, object]) -> Dict[str, 
     }
 
 
+def _build_material_query_features(
+    *,
+    project_id: str,
+    submission_text: str,
+    required_sections: List[str],
+    required_charts: List[str],
+    mandatory_elements: List[str],
+    custom_text_items: List[str],
+    context_text: str,
+) -> Dict[str, object]:
+    seed_lines: List[str] = []
+    seed_lines.extend(required_sections)
+    seed_lines.extend(required_charts)
+    seed_lines.extend(mandatory_elements)
+    seed_lines.extend(custom_text_items)
+    if context_text:
+        seed_lines.append(context_text[:4000])
+
+    project_anchors = [a for a in load_project_anchors() if str(a.get("project_id")) == project_id]
+    for anchor in project_anchors[:80]:
+        key = str(anchor.get("anchor_key") or "").strip()
+        if key:
+            seed_lines.append(key)
+        value = anchor.get("anchor_value")
+        if isinstance(value, list):
+            seed_lines.extend(str(v) for v in value[:6] if str(v).strip())
+        elif isinstance(value, str) and value.strip():
+            seed_lines.append(value.strip())
+        value_num = anchor.get("value_num")
+        if value_num is not None:
+            seed_lines.append(str(value_num))
+
+    project_requirements = [
+        r for r in load_project_requirements() if str(r.get("project_id")) == project_id
+    ]
+    for req in project_requirements[:120]:
+        label = str(req.get("req_label") or "").strip()
+        if label:
+            seed_lines.append(label)
+        patterns = req.get("patterns") if isinstance(req.get("patterns"), dict) else {}
+        for key in ("keywords", "hints", "must_hit_terms"):
+            values = patterns.get(key)
+            if isinstance(values, list):
+                seed_lines.extend(str(v) for v in values[:8] if str(v).strip())
+            elif isinstance(values, str) and values.strip():
+                seed_lines.append(values.strip())
+
+    seed_text = "\n".join(seed_lines)
+    text_terms = _extract_terms(seed_text, max_terms=100)
+    numeric_terms = _extract_numeric_terms(seed_text, max_terms=40)
+    submission_numeric_terms = _extract_numeric_terms(submission_text, max_terms=24)
+    for token in submission_numeric_terms:
+        if token not in numeric_terms:
+            numeric_terms.append(token)
+
+    return {
+        "query_terms": text_terms,
+        "query_numeric_terms": numeric_terms[:60],
+        "seed_lines_count": len(seed_lines),
+        "project_anchor_count": len(project_anchors),
+        "project_requirement_count": len(project_requirements),
+    }
+
+
 def _build_runtime_custom_requirements(
     project_id: str,
     *,
@@ -913,6 +977,15 @@ def _build_runtime_custom_requirements(
         )
 
     retrieval_cfg = _resolve_material_retrieval_config(project)
+    query_features = _build_material_query_features(
+        project_id=project_id,
+        submission_text=submission_text,
+        required_sections=required_sections,
+        required_charts=required_charts,
+        mandatory_elements=mandatory_elements,
+        custom_text_items=custom_text_items,
+        context_text=context_text,
+    )
     material_rows = [m for m in load_materials() if str(m.get("project_id")) == project_id]
     available_material_types: List[str] = []
     available_material_filenames: List[str] = []
@@ -964,6 +1037,8 @@ def _build_runtime_custom_requirements(
         top_k=retrieval_top_k,
         per_type_quota=retrieval_per_type_quota,
         per_file_quota=retrieval_per_file_quota,
+        query_terms_extra=query_features.get("query_terms"),
+        query_numeric_terms=query_features.get("query_numeric_terms"),
     )
     retrieval_selected_filenames: List[str] = []
     for chunk in retrieval_chunks:
@@ -999,6 +1074,17 @@ def _build_runtime_custom_requirements(
         "material_retrieval_top_k": retrieval_top_k,
         "material_retrieval_per_type_quota": retrieval_per_type_quota,
         "material_retrieval_per_file_quota": retrieval_per_file_quota,
+        "material_query_seed_lines": int(query_features.get("seed_lines_count") or 0),
+        "material_query_terms_count": len(query_features.get("query_terms") or []),
+        "material_query_numeric_terms_count": len(query_features.get("query_numeric_terms") or []),
+        "material_query_terms_preview": list((query_features.get("query_terms") or [])[:12]),
+        "material_query_numeric_terms_preview": list(
+            (query_features.get("query_numeric_terms") or [])[:12]
+        ),
+        "material_query_anchor_count": int(query_features.get("project_anchor_count") or 0),
+        "material_query_requirement_count": int(
+            query_features.get("project_requirement_count") or 0
+        ),
         "material_available_files": len(material_rows),
         "material_available_filenames": available_material_filenames[:120],
         "material_available_types": available_material_types,
@@ -1015,6 +1101,7 @@ def _build_runtime_custom_requirements(
                 "dimension_id": c.get("dimension_id"),
                 "score": c.get("score"),
                 "matched_terms": c.get("matched_terms"),
+                "matched_numeric_terms": c.get("matched_numeric_terms"),
                 "selected_via": c.get("selected_via"),
             }
             for c in retrieval_chunks[:8]
@@ -1025,6 +1112,7 @@ def _build_runtime_custom_requirements(
                 "dimension_id": req.get("dimension_id"),
                 "mandatory": req.get("mandatory"),
                 "terms": ((req.get("patterns") or {}).get("must_hit_terms") or [])[:6],
+                "numbers": ((req.get("patterns") or {}).get("must_hit_numbers") or [])[:4],
             }
             for req in consistency_requirements[:6]
         ],
@@ -1229,6 +1317,12 @@ def _build_material_utilization_summary(
         "fallback_total": fallback_total,
         "fallback_hit": fallback_hit,
         "fallback_hit_rate": _rate(fallback_hit, fallback_total),
+        "query_terms_count": int(
+            _to_float_or_none(runtime_req_meta.get("material_query_terms_count")) or 0
+        ),
+        "query_numeric_terms_count": int(
+            _to_float_or_none(runtime_req_meta.get("material_query_numeric_terms_count")) or 0
+        ),
         "by_type": by_type,
         "available_types": available_types,
         "uncovered_types": uncovered_types,
@@ -1250,6 +1344,8 @@ def _aggregate_material_utilization_summaries(
     fallback_hit = 0
     retrieval_file_total = 0
     retrieval_file_hit = 0
+    query_terms_count = 0
+    query_numeric_terms_count = 0
 
     def _rate(hit_cnt: int, total_cnt: int) -> Optional[float]:
         if total_cnt <= 0:
@@ -1275,6 +1371,10 @@ def _aggregate_material_utilization_summaries(
         retrieval_hit += int(_to_float_or_none(raw.get("retrieval_hit")) or 0)
         retrieval_file_total += int(_to_float_or_none(raw.get("retrieval_file_total")) or 0)
         retrieval_file_hit += int(_to_float_or_none(raw.get("retrieval_file_hit")) or 0)
+        query_terms_count += int(_to_float_or_none(raw.get("query_terms_count")) or 0)
+        query_numeric_terms_count += int(
+            _to_float_or_none(raw.get("query_numeric_terms_count")) or 0
+        )
         consistency_total += int(_to_float_or_none(raw.get("consistency_total")) or 0)
         consistency_hit += int(_to_float_or_none(raw.get("consistency_hit")) or 0)
 
@@ -1342,6 +1442,8 @@ def _aggregate_material_utilization_summaries(
         "fallback_total": fallback_total,
         "fallback_hit": fallback_hit,
         "fallback_hit_rate": _rate(fallback_hit, fallback_total),
+        "query_terms_count": query_terms_count,
+        "query_numeric_terms_count": query_numeric_terms_count,
         "by_type": normalized_by_type,
         "available_types": available_types,
         "uncovered_types": uncovered_types,
@@ -5842,6 +5944,38 @@ def _extract_terms(text: str, *, max_terms: int = 40) -> List[str]:
     return [k for k, _ in counter.most_common(max(1, int(max_terms)))]
 
 
+def _normalize_numeric_token(token: object) -> str:
+    raw = str(token or "").strip()
+    if not raw:
+        return ""
+    if not re.fullmatch(r"\d+(?:\.\d+)?", raw):
+        return ""
+    if "." in raw:
+        raw = raw.rstrip("0").rstrip(".")
+    if not raw:
+        return ""
+    if "." not in raw:
+        try:
+            raw = str(int(raw))
+        except Exception:
+            pass
+    return raw
+
+
+def _extract_numeric_terms(text: str, *, max_terms: int = 24) -> List[str]:
+    tokens = re.findall(r"\d+(?:\.\d+)?", str(text or ""))
+    counter: Counter[str] = Counter()
+    for token in tokens:
+        normalized = _normalize_numeric_token(token)
+        if not normalized:
+            continue
+        # 过滤噪声：单字符整数通常无业务含义（页码/编号），保留小数与2位以上整数。
+        if len(normalized) < 2 and "." not in normalized:
+            continue
+        counter[normalized] += 1
+    return [k for k, _ in counter.most_common(max(1, int(max_terms)))]
+
+
 def _build_boq_structured_summary(
     content: bytes,
     filename: str,
@@ -6236,11 +6370,20 @@ def _select_material_retrieval_chunks(
     top_k: int = 12,
     per_type_quota: int = 1,
     per_file_quota: int = 3,
+    query_terms_extra: Optional[List[str]] = None,
+    query_numeric_terms: Optional[List[str]] = None,
 ) -> List[Dict[str, object]]:
     query_terms = set(_extract_terms(submission_text, max_terms=60))
+    if isinstance(query_terms_extra, list):
+        query_terms.update(str(x).strip().lower() for x in query_terms_extra if str(x).strip())
     # 确保不同资料类型关键词也参与检索，避免“只用施组词命中”。
     for kws in MATERIAL_TYPE_KEYWORDS.values():
         query_terms.update(k.lower() for k in kws)
+    numeric_terms = set(_extract_numeric_terms(submission_text, max_terms=24))
+    if isinstance(query_numeric_terms, list):
+        numeric_terms.update(
+            _normalize_numeric_token(x) for x in query_numeric_terms if _normalize_numeric_token(x)
+        )
 
     rows = [m for m in load_materials() if str(m.get("project_id")) == project_id]
     rows.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
@@ -6265,6 +6408,11 @@ def _select_material_retrieval_chunks(
         for idx, chunk in enumerate(chunks, start=1):
             lower = chunk.lower()
             matched_terms = [t for t in query_terms if t and t in lower][:8]
+            chunk_numeric_terms = _extract_numeric_terms(chunk, max_terms=30)
+            chunk_numeric_set = {str(x) for x in chunk_numeric_terms}
+            matched_numeric_terms = [
+                token for token in numeric_terms if token and token in chunk_numeric_set
+            ][:8]
             if not matched_terms:
                 # 兜底：若命中该类型关键词也纳入候选
                 matched_terms = [
@@ -6272,10 +6420,14 @@ def _select_material_retrieval_chunks(
                     for kw in MATERIAL_TYPE_KEYWORDS.get(mat_type, [])
                     if kw.lower() in lower
                 ][:6]
-            if not matched_terms:
+            if not matched_terms and not matched_numeric_terms:
                 continue
             dimension_id = _infer_chunk_dimension_id(mat_type, chunk)
             score = len(matched_terms) + (2 if mat_type in {"boq", "drawing"} else 1)
+            if matched_numeric_terms:
+                score += min(4, len(matched_numeric_terms))
+                if mat_type in {"tender_qa", "boq", "drawing"}:
+                    score += 1
             candidates.append(
                 {
                     "material_type": mat_type,
@@ -6284,6 +6436,7 @@ def _select_material_retrieval_chunks(
                     "dimension_id": dimension_id,
                     "score": score,
                     "matched_terms": matched_terms,
+                    "matched_numeric_terms": matched_numeric_terms,
                     "chunk_preview": chunk[:220],
                 }
             )
@@ -6421,6 +6574,7 @@ def _build_material_consistency_requirements(
     for mat_type in ordered_types:
         chunks = grouped.get(mat_type) or []
         keyword_counter: Counter[str] = Counter()
+        numeric_counter: Counter[str] = Counter()
         preview_terms: List[str] = []
         filenames: List[str] = []
         for chunk in chunks[:12]:
@@ -6431,9 +6585,17 @@ def _build_material_consistency_requirements(
                 token = str(term or "").strip()
                 if token:
                     keyword_counter[token] += 1
+            for token in chunk.get("matched_numeric_terms") or []:
+                numeric = _normalize_numeric_token(token)
+                if numeric:
+                    numeric_counter[numeric] += 1
             preview_terms.extend(
                 _extract_terms(str(chunk.get("chunk_preview") or ""), max_terms=10)
             )
+            for token in _extract_numeric_terms(str(chunk.get("chunk_preview") or ""), max_terms=8):
+                numeric = _normalize_numeric_token(token)
+                if numeric:
+                    numeric_counter[numeric] += 1
         must_terms = [item for item, _ in keyword_counter.most_common(8)]
         if len(must_terms) < 4:
             must_terms.extend([item for item in preview_terms if item not in must_terms])
@@ -6446,11 +6608,17 @@ def _build_material_consistency_requirements(
                 ]
             )
         must_terms = _to_text_items(must_terms, max_items=8)
-        if not must_terms:
+        must_numbers = [item for item, _ in numeric_counter.most_common(4)]
+        if not must_terms and not must_numbers:
             continue
 
         req_index += 1
-        minimum_terms = 2 if mat_type in {"tender_qa", "boq", "drawing"} else 1
+        minimum_terms = (
+            2
+            if (must_terms and mat_type in {"tender_qa", "boq", "drawing"})
+            else (1 if must_terms else 0)
+        )
+        minimum_numbers = 1 if must_numbers else 0
         known_required_types = {"tender_qa", "boq", "drawing", "site_photo"}
         mandatory = mat_type in known_required_types and (
             (not normalized_available_types) or (mat_type in normalized_available_types)
@@ -6467,6 +6635,8 @@ def _build_material_consistency_requirements(
                 "patterns": {
                     "must_hit_terms": must_terms,
                     "minimum_terms": minimum_terms,
+                    "must_hit_numbers": must_numbers,
+                    "minimum_numbers": minimum_numbers,
                     "material_type": mat_type,
                     "sample_filenames": _to_text_items(filenames, max_items=3),
                     "within_dimension_scope": False,
@@ -13387,6 +13557,8 @@ def index(
           const fallbackHit = Number(summary.fallback_hit || 0);
           const retrievalFileTotal = Number(summary.retrieval_file_total || 0);
           const retrievalFileHit = Number(summary.retrieval_file_hit || 0);
+          const queryTermsCount = Number(summary.query_terms_count || 0);
+          const queryNumericTermsCount = Number(summary.query_numeric_terms_count || 0);
           const byType = (summary.by_type && typeof summary.by_type === 'object') ? summary.by_type : {};
           const availableTypes = Array.isArray(summary.available_types) ? summary.available_types : [];
           const uncoveredTypes = Array.isArray(summary.uncovered_types) ? summary.uncovered_types : [];
@@ -13430,6 +13602,7 @@ def index(
             + '<tr><td>检索文件覆盖</td><td>' + escapeHtmlText(retrievalFileHit) + ' / ' + escapeHtmlText(retrievalFileTotal) + '</td><td>' + escapeHtmlText(toPct(summary.retrieval_file_coverage_rate)) + '</td></tr>'
             + '<tr><td>跨资料一致性</td><td>' + escapeHtmlText(consistencyHit) + ' / ' + escapeHtmlText(consistencyTotal) + '</td><td>' + escapeHtmlText(toPct(summary.consistency_hit_rate)) + '</td></tr>'
             + '<tr><td>关键词兜底</td><td>' + escapeHtmlText(fallbackHit) + ' / ' + escapeHtmlText(fallbackTotal) + '</td><td>' + escapeHtmlText(toPct(summary.fallback_hit_rate)) + '</td></tr>'
+            + '<tr><td>查询特征规模</td><td>' + escapeHtmlText(queryTermsCount) + ' + ' + escapeHtmlText(queryNumericTermsCount) + '</td><td>文本词 + 数字约束</td></tr>'
             + '</table>';
 
           if (gate && gate.enabled) {

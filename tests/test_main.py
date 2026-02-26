@@ -1465,6 +1465,27 @@ class TestMaterialAdvancedParsing:
         assert "工程量" in terms
         assert (boq_req.get("patterns") or {}).get("source_mode") == "fallback_keywords"
 
+    def test_build_material_consistency_requirements_includes_numeric_constraints(self):
+        from app.main import _build_material_consistency_requirements
+
+        retrieval_chunks = [
+            {
+                "material_type": "tender_qa",
+                "dimension_id": "09",
+                "filename": "答疑.txt",
+                "chunk_id": "答疑.txt#c001",
+                "matched_terms": ["工期", "节点"],
+                "matched_numeric_terms": ["120", "30"],
+                "chunk_preview": "总工期120日历天，里程碑节点30天。",
+            }
+        ]
+        reqs = _build_material_consistency_requirements("p1", retrieval_chunks)
+        tender_req = next(r for r in reqs if r.get("material_type") == "tender_qa")
+        patterns = tender_req.get("patterns") or {}
+        numbers = patterns.get("must_hit_numbers") or []
+        assert "120" in numbers
+        assert int(patterns.get("minimum_numbers") or 0) >= 1
+
     @patch("app.main.load_materials")
     @patch("app.main._read_uploaded_file_content")
     def test_select_material_retrieval_chunks_keeps_type_diversity(
@@ -1630,6 +1651,41 @@ class TestMaterialAdvancedParsing:
             by_filename = Counter(str(c.get("filename")) for c in chunks)
             assert all(cnt <= 1 for cnt in by_filename.values())
             assert len(by_filename) == 3
+
+    @patch("app.main.load_materials")
+    @patch("app.main._split_material_text_chunks")
+    @patch("app.main._read_uploaded_file_content")
+    def test_select_material_retrieval_chunks_supports_numeric_query_hits(
+        self, mock_read_uploaded_file_content, mock_split_chunks, mock_load_materials
+    ):
+        from app.main import _select_material_retrieval_chunks
+
+        with tempfile.TemporaryDirectory() as tmp:
+            boq = Path(tmp) / "boq.txt"
+            boq.write_text("120 30 8000", encoding="utf-8")
+            mock_load_materials.return_value = [
+                {
+                    "project_id": "p1",
+                    "material_type": "boq",
+                    "filename": "boq.txt",
+                    "path": str(boq),
+                    "created_at": "2026-02-26T00:00:02+00:00",
+                },
+            ]
+            mock_read_uploaded_file_content.return_value = boq.read_text(encoding="utf-8")
+            mock_split_chunks.return_value = ["120 30 8000"]
+            chunks = _select_material_retrieval_chunks(
+                "p1",
+                "120 30",
+                top_k=3,
+                per_type_quota=1,
+                per_file_quota=2,
+                query_terms_extra=[],
+                query_numeric_terms=["120", "30"],
+            )
+            assert chunks
+            numeric_hits = chunks[0].get("matched_numeric_terms") or []
+            assert "120" in numeric_hits or "30" in numeric_hits
 
     def test_build_material_utilization_summary_reports_uncovered_types(self):
         from app.main import _build_material_utilization_summary

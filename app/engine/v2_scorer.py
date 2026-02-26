@@ -78,6 +78,59 @@ def _count_hit_terms(text: str, terms: List[str]) -> int:
     return len(seen)
 
 
+def _normalize_numeric_token(token: object) -> str:
+    raw = str(token or "").strip()
+    if not raw:
+        return ""
+    if not re.fullmatch(r"\d+(?:\.\d+)?", raw):
+        return ""
+    if "." in raw:
+        raw = raw.rstrip("0").rstrip(".")
+    if not raw:
+        return ""
+    if "." not in raw:
+        try:
+            raw = str(int(raw))
+        except Exception:
+            pass
+    return raw
+
+
+def _extract_numeric_tokens(text: str) -> List[str]:
+    raw_tokens = re.findall(r"\d+(?:\.\d+)?", str(text or ""))
+    seen: set[str] = set()
+    out: List[str] = []
+    for raw in raw_tokens:
+        token = _normalize_numeric_token(raw)
+        if not token:
+            continue
+        if len(token) < 2 and "." not in token:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+        if len(out) >= 160:
+            break
+    return out
+
+
+def _count_hit_numbers(text: str, numbers: List[str]) -> int:
+    scope_numbers = set(_extract_numeric_tokens(text))
+    if not scope_numbers:
+        return 0
+    hit = 0
+    seen: set[str] = set()
+    for number in numbers:
+        token = _normalize_numeric_token(number)
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        if token in scope_numbers:
+            hit += 1
+    return hit
+
+
 def _heading_exact_hit(text: str, heading: str, units: List[Dict[str, Any]]) -> bool:
     h = str(heading or "").strip()
     if not h:
@@ -213,15 +266,35 @@ def _match_requirements(
             terms = patterns.get("must_hit_terms") or patterns.get("hints") or []
             if isinstance(terms, str):
                 terms = [terms]
-            if terms:
-                minimum_terms = int(patterns.get("minimum_terms", 2) or 2)
+            numbers = patterns.get("must_hit_numbers") or []
+            if isinstance(numbers, (str, int, float)):
+                numbers = [str(numbers)]
+            if terms or numbers:
+                minimum_terms = int(patterns.get("minimum_terms", 2) or 2) if terms else 0
+                minimum_numbers = int(patterns.get("minimum_numbers", 1) or 1) if numbers else 0
                 within_dim = bool(patterns.get("within_dimension_scope", False))
                 target_scope = dim_text if within_dim and dim_text else scope_text
-                hit_terms = _count_hit_terms(
-                    target_scope, [str(t) for t in terms if str(t).strip()]
+                hit_terms = (
+                    _count_hit_terms(target_scope, [str(t) for t in terms if str(t).strip()])
+                    if terms
+                    else 0
                 )
-                hit = hit_terms >= max(1, minimum_terms)
-                reason = f"material_consistency:{hit_terms}/{max(1, minimum_terms)}"
+                hit_numbers = (
+                    _count_hit_numbers(target_scope, [str(n) for n in numbers if str(n).strip()])
+                    if numbers
+                    else 0
+                )
+                terms_ok = hit_terms >= max(1, minimum_terms) if terms else True
+                numbers_ok = hit_numbers >= max(1, minimum_numbers) if numbers else True
+                hit = terms_ok and numbers_ok
+                if numbers:
+                    reason = (
+                        "material_consistency:"
+                        + f"t{hit_terms}/{max(1, minimum_terms) if terms else 0};"
+                        + f"n{hit_numbers}/{max(1, minimum_numbers)}"
+                    )
+                else:
+                    reason = f"material_consistency:{hit_terms}/{max(1, minimum_terms)}"
                 evaluated = True
         elif req_type == "consistency":
             expected = patterns.get("expected")
@@ -827,6 +900,23 @@ def _material_consistency_penalties(
     rag_total = len(rag_rows)
     rag_hit = sum(1 for req in rag_rows if bool(req.get("hit")))
     rag_hit_rate = float(rag_hit / max(1, rag_total)) if rag_total > 0 else None
+    rag_files_total_set: set[str] = set()
+    rag_files_hit_set: set[str] = set()
+    for req in rag_rows:
+        source_filename = str(req.get("source_filename") or "").strip()
+        if not source_filename:
+            chunk_id = str(req.get("chunk_id") or "").strip()
+            if "#c" in chunk_id:
+                source_filename = chunk_id.split("#c", 1)[0].strip()
+        if source_filename:
+            rag_files_total_set.add(source_filename)
+            if bool(req.get("hit")):
+                rag_files_hit_set.add(source_filename)
+    rag_file_total = len(rag_files_total_set)
+    rag_file_hit = len(rag_files_hit_set)
+    rag_file_coverage_rate = (
+        float(rag_file_hit / max(1, rag_file_total)) if rag_file_total > 0 else None
+    )
     if rag_total >= 6 and rag_hit_rate is not None and rag_hit_rate < 0.2 and total_points < 6.0:
         penalties.append(
             {
@@ -842,6 +932,23 @@ def _material_consistency_penalties(
                 "code": "P-MATCONS-002",
                 "points": min(0.8, 6.0 - total_points),
                 "reason": f"资料检索命中偏弱：{rag_hit}/{rag_total}，建议强化与上传资料的对应关系",
+                "evidence_refs": [],
+            }
+        )
+    if (
+        rag_file_total >= 4
+        and rag_file_coverage_rate is not None
+        and rag_file_coverage_rate < 0.35
+        and total_points < 6.0
+    ):
+        penalties.append(
+            {
+                "code": "P-MATCONS-004",
+                "points": min(0.9, 6.0 - total_points),
+                "reason": (
+                    f"资料检索文件覆盖偏低：{rag_file_hit}/{rag_file_total}，"
+                    "施组仅覆盖少量上传文件"
+                ),
                 "evidence_refs": [],
             }
         )
@@ -872,6 +979,11 @@ def _material_consistency_penalties(
         "rag_total": rag_total,
         "rag_hit": rag_hit,
         "rag_hit_rate": round(rag_hit_rate, 4) if rag_hit_rate is not None else None,
+        "rag_file_total": rag_file_total,
+        "rag_file_hit": rag_file_hit,
+        "rag_file_coverage_rate": round(rag_file_coverage_rate, 4)
+        if rag_file_coverage_rate is not None
+        else None,
         "fallback_total": fallback_total,
         "fallback_hit": fallback_hit,
         "fallback_hit_rate": round(float(fallback_hit / max(1, fallback_total)), 4)
@@ -921,6 +1033,7 @@ def _build_lint_findings(
             "P-MATCONS-001": "MaterialConsistencyGap",
             "P-MATCONS-002": "MaterialRetrievalWeak",
             "P-MATCONS-003": "MaterialFallbackNotCovered",
+            "P-MATCONS-004": "MaterialFileCoverageWeak",
         }
         if code not in issue_map:
             continue
