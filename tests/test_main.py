@@ -1505,6 +1505,36 @@ class TestMaterialAdvancedParsing:
             types = {str(c.get("material_type")) for c in chunks}
             assert {"tender_qa", "boq", "drawing"}.issubset(types)
 
+    def test_build_material_utilization_summary_reports_uncovered_types(self):
+        from app.main import _build_material_utilization_summary
+
+        report = {
+            "requirement_hits": [
+                {
+                    "source_pack_id": "runtime_material_rag",
+                    "material_type": "tender_qa",
+                    "source_mode": "type_quota",
+                    "hit": True,
+                    "label": "资料检索证据：招标文件和答疑 / tender.txt / c1",
+                },
+                {
+                    "source_pack_id": "runtime_material_consistency",
+                    "material_type": "boq",
+                    "source_mode": "fallback_keywords",
+                    "hit": False,
+                    "label": "跨资料一致性：施组需体现清单关键约束",
+                },
+            ]
+        }
+        runtime_meta = {
+            "material_available_types": ["tender_qa", "boq", "drawing"],
+        }
+        summary = _build_material_utilization_summary(report, runtime_meta)
+        assert summary["retrieval_total"] == 1
+        assert summary["retrieval_hit"] == 1
+        assert "boq" in (summary.get("uncovered_types") or [])
+        assert "drawing" in (summary.get("uncovered_types") or [])
+
 
 class TestScoreForProjectEndpoint:
     """Tests for /projects/{project_id}/score endpoint."""

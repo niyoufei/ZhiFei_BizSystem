@@ -379,6 +379,8 @@ def _match_requirements(
                 "source_pack_version": req.get("source_pack_version"),
                 "weight": req.get("weight"),
                 "material_type": patterns.get("material_type") or req.get("material_type"),
+                "source_mode": patterns.get("source_mode"),
+                "chunk_id": patterns.get("chunk_id"),
             }
         )
 
@@ -765,6 +767,8 @@ def _material_consistency_penalties(
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     penalties: List[Dict[str, Any]] = []
     by_type: Dict[str, Dict[str, float]] = {}
+    fallback_total = 0
+    fallback_hit = 0
     for req in requirement_hits:
         source_pack_id = str(req.get("source_pack_id") or "")
         if source_pack_id not in {"runtime_material_consistency", "runtime_material_rag"}:
@@ -781,6 +785,10 @@ def _material_consistency_penalties(
             stats["mandatory_total"] += 1.0
             if bool(req.get("hit")):
                 stats["mandatory_hit"] += 1.0
+        if str(req.get("source_mode") or "") == "fallback_keywords":
+            fallback_total += 1
+            if bool(req.get("hit")):
+                fallback_hit += 1
 
     total_points = 0.0
     for mat_type, stats in by_type.items():
@@ -827,6 +835,25 @@ def _material_consistency_penalties(
                 "evidence_refs": [],
             }
         )
+    elif rag_total >= 3 and rag_hit_rate is not None and rag_hit_rate < 0.34 and total_points < 6.0:
+        penalties.append(
+            {
+                "code": "P-MATCONS-002",
+                "points": min(0.8, 6.0 - total_points),
+                "reason": f"资料检索命中偏弱：{rag_hit}/{rag_total}，建议强化与上传资料的对应关系",
+                "evidence_refs": [],
+            }
+        )
+
+    if fallback_total > 0 and fallback_hit == 0 and total_points < 6.0:
+        penalties.append(
+            {
+                "code": "P-MATCONS-003",
+                "points": min(0.8, 6.0 - total_points),
+                "reason": "部分资料仅触发默认关键词兜底且未命中，说明施组未体现该类资料关键约束",
+                "evidence_refs": [],
+            }
+        )
 
     summary = {
         "by_material_type": {
@@ -844,6 +871,11 @@ def _material_consistency_penalties(
         "rag_total": rag_total,
         "rag_hit": rag_hit,
         "rag_hit_rate": round(rag_hit_rate, 4) if rag_hit_rate is not None else None,
+        "fallback_total": fallback_total,
+        "fallback_hit": fallback_hit,
+        "fallback_hit_rate": round(float(fallback_hit / max(1, fallback_total)), 4)
+        if fallback_total > 0
+        else None,
     }
     return penalties, summary
 
@@ -887,6 +919,7 @@ def _build_lint_findings(
             "P-CONSIST-001": "ConsistencyConflict",
             "P-MATCONS-001": "MaterialConsistencyGap",
             "P-MATCONS-002": "MaterialRetrievalWeak",
+            "P-MATCONS-003": "MaterialFallbackNotCovered",
         }
         if code not in issue_map:
             continue

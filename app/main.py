@@ -968,6 +968,103 @@ def _build_scoring_input_injection_meta(
     }
 
 
+def _build_material_utilization_summary(
+    report: Dict[str, object],
+    runtime_req_meta: Dict[str, object],
+) -> Dict[str, object]:
+    req_hits = (
+        report.get("requirement_hits") if isinstance(report.get("requirement_hits"), list) else []
+    )
+    req_hits = req_hits if isinstance(req_hits, list) else []
+    by_type: Dict[str, Dict[str, object]] = {}
+    retrieval_total = 0
+    retrieval_hit = 0
+    consistency_total = 0
+    consistency_hit = 0
+
+    def _bucket(material_type: str) -> Dict[str, object]:
+        if material_type not in by_type:
+            by_type[material_type] = {
+                "retrieval_total": 0,
+                "retrieval_hit": 0,
+                "consistency_total": 0,
+                "consistency_hit": 0,
+                "fallback_total": 0,
+                "fallback_hit": 0,
+                "sample_labels": [],
+            }
+        return by_type[material_type]
+
+    for row in req_hits:
+        if not isinstance(row, dict):
+            continue
+        source_pack_id = str(row.get("source_pack_id") or "")
+        if source_pack_id not in {"runtime_material_rag", "runtime_material_consistency"}:
+            continue
+        material_type = _normalize_material_type(row.get("material_type"))
+        hit = bool(row.get("hit"))
+        source_mode = str(row.get("source_mode") or "").strip()
+        bucket = _bucket(material_type)
+
+        if source_pack_id == "runtime_material_rag":
+            retrieval_total += 1
+            bucket["retrieval_total"] = int(bucket.get("retrieval_total", 0)) + 1
+            if hit:
+                retrieval_hit += 1
+                bucket["retrieval_hit"] = int(bucket.get("retrieval_hit", 0)) + 1
+        else:
+            consistency_total += 1
+            bucket["consistency_total"] = int(bucket.get("consistency_total", 0)) + 1
+            if hit:
+                consistency_hit += 1
+                bucket["consistency_hit"] = int(bucket.get("consistency_hit", 0)) + 1
+
+        if source_mode == "fallback_keywords":
+            bucket["fallback_total"] = int(bucket.get("fallback_total", 0)) + 1
+            if hit:
+                bucket["fallback_hit"] = int(bucket.get("fallback_hit", 0)) + 1
+
+        label = str(row.get("label") or "").strip()
+        if label:
+            sample_labels = bucket.get("sample_labels")
+            if (
+                isinstance(sample_labels, list)
+                and label not in sample_labels
+                and len(sample_labels) < 3
+            ):
+                sample_labels.append(label)
+
+    available_types_raw = runtime_req_meta.get("material_available_types")
+    available_types = (
+        [_normalize_material_type(x) for x in available_types_raw]
+        if isinstance(available_types_raw, list)
+        else []
+    )
+    uncovered_types = []
+    for material_type in available_types:
+        bucket = by_type.get(material_type) or {}
+        any_hit = int(bucket.get("retrieval_hit", 0)) + int(bucket.get("consistency_hit", 0))
+        if any_hit <= 0:
+            uncovered_types.append(material_type)
+
+    def _rate(hit_cnt: int, total_cnt: int) -> Optional[float]:
+        if total_cnt <= 0:
+            return None
+        return round(float(hit_cnt) / float(total_cnt), 4)
+
+    return {
+        "retrieval_total": retrieval_total,
+        "retrieval_hit": retrieval_hit,
+        "retrieval_hit_rate": _rate(retrieval_hit, retrieval_total),
+        "consistency_total": consistency_total,
+        "consistency_hit": consistency_hit,
+        "consistency_hit_rate": _rate(consistency_hit, consistency_total),
+        "by_type": by_type,
+        "available_types": available_types,
+        "uncovered_types": uncovered_types,
+    }
+
+
 def _get_rubric_dim_cfg(rubric_dimensions: Dict[str, object], dim_id: str) -> Dict[str, object]:
     for k, v in (rubric_dimensions or {}).items():
         if _normalize_dimension_id(str(k)) == dim_id and isinstance(v, dict):
@@ -1977,6 +2074,10 @@ def _score_submission_for_project(
             "retrieval_types": runtime_req_meta.get("material_retrieval_types") or [],
             "missing_types": runtime_req_meta.get("material_retrieval_missing_types") or [],
         }
+        report_meta["material_utilization"] = _build_material_utilization_summary(
+            report,
+            runtime_req_meta,
+        )
         gate_obj = snapshot_for_meta.get("gate")
         if isinstance(gate_obj, dict):
             report_meta["material_gate"] = gate_obj
@@ -5490,6 +5591,7 @@ def _build_material_retrieval_requirements(
                     "minimum_hint_hits": minimum_hint_hits,
                     "material_type": mat_type,
                     "chunk_id": chunk_id,
+                    "source_mode": str(chunk.get("selected_via") or "retrieval_chunks"),
                 },
                 "mandatory": False,
                 "weight": 0.7,
@@ -5564,7 +5666,8 @@ def _build_material_consistency_requirements(
 
         req_index += 1
         minimum_terms = 2 if mat_type in {"tender_qa", "boq", "drawing"} else 1
-        mandatory = mat_type in {"tender_qa", "boq", "drawing"} and (
+        known_required_types = {"tender_qa", "boq", "drawing", "site_photo"}
+        mandatory = mat_type in known_required_types and (
             (not normalized_available_types) or (mat_type in normalized_available_types)
         )
         source_mode = "retrieval_chunks" if chunks else "fallback_keywords"
@@ -5585,7 +5688,9 @@ def _build_material_consistency_requirements(
                     "source_mode": source_mode,
                 },
                 "mandatory": mandatory,
-                "weight": 1.1 if mandatory else 0.8,
+                "weight": 1.1
+                if (mandatory and mat_type in {"tender_qa", "boq", "drawing"})
+                else 0.9,
                 "material_type": mat_type,
                 "source_anchor_id": None,
                 "source_pack_id": "runtime_material_consistency",
