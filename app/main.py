@@ -156,6 +156,8 @@ from app.schemas import (
     LatestReportResponse,
     LearningProfile,
     LLMBackendStatus,
+    MaterialDepthReportMarkdownResponse,
+    MaterialDepthReportResponse,
     MaterialRecord,
     PatchDeploymentRecord,
     PatchDeployRequest,
@@ -1079,6 +1081,12 @@ def _build_runtime_custom_requirements(
             if str(c.get("material_type") or "").strip()
         }
     )
+    retrieval_selected_via_counts: Dict[str, int] = {}
+    for chunk in retrieval_chunks:
+        selected_via = str(chunk.get("selected_via") or "").strip() or "unknown"
+        retrieval_selected_via_counts[selected_via] = (
+            int(retrieval_selected_via_counts.get(selected_via, 0)) + 1
+        )
     retrieval_requirements = _build_material_retrieval_requirements(project_id, retrieval_chunks)
     consistency_requirements = _build_material_consistency_requirements(
         project_id,
@@ -1116,6 +1124,7 @@ def _build_runtime_custom_requirements(
         "material_available_filenames": available_material_filenames[:120],
         "material_available_types": available_material_types,
         "material_retrieval_types": retrieval_types,
+        "material_retrieval_selected_via_counts": retrieval_selected_via_counts,
         "material_retrieval_selected_filenames": retrieval_selected_filenames[:120],
         "material_retrieval_missing_types": [
             t for t in available_material_types if t not in retrieval_types
@@ -5590,6 +5599,70 @@ def get_scoring_readiness(
 
 
 @router.get(
+    "/projects/{project_id}/materials/depth_report",
+    response_model=MaterialDepthReportResponse,
+    tags=["项目管理"],
+    responses={**RESPONSES_404},
+)
+def get_material_depth_report(
+    project_id: str, locale: str = Depends(get_locale)
+) -> MaterialDepthReportResponse:
+    """项目资料深读体检报告（JSON），用于评分前体检。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    try:
+        project = _find_project(project_id, projects)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    payload = _build_material_depth_report(project_id, project)
+    return MaterialDepthReportResponse(**payload)
+
+
+@router.get(
+    "/projects/{project_id}/materials/depth_report/markdown",
+    response_model=MaterialDepthReportMarkdownResponse,
+    tags=["项目管理"],
+    responses={**RESPONSES_404},
+)
+def get_material_depth_report_markdown(
+    project_id: str, locale: str = Depends(get_locale)
+) -> MaterialDepthReportMarkdownResponse:
+    """项目资料深读体检报告（Markdown 文本）。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    try:
+        project = _find_project(project_id, projects)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    payload = _build_material_depth_report(project_id, project)
+    markdown = _render_material_depth_report_markdown(payload)
+    return MaterialDepthReportMarkdownResponse(
+        project_id=project_id,
+        markdown=markdown,
+        generated_at=str(payload.get("generated_at") or _now_iso()),
+    )
+
+
+@router.get(
+    "/projects/{project_id}/materials/depth_report.md",
+    tags=["项目管理"],
+    responses={**RESPONSES_404},
+)
+def download_material_depth_report_markdown(
+    project_id: str, locale: str = Depends(get_locale)
+) -> Response:
+    """下载项目资料深读体检 Markdown 文件。"""
+    result = get_material_depth_report_markdown(project_id=project_id, locale=locale)
+    markdown = str(result.markdown or "")
+    filename = f"material_depth_report_{project_id}.md"
+    return Response(
+        content=markdown,
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get(
     "/projects/{project_id}/anchors",
     response_model=list[ProjectAnchorRecord],
     tags=["项目管理"],
@@ -6540,6 +6613,7 @@ def _select_material_retrieval_chunks(
     rows.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
     available_types: List[str] = []
     candidates: List[Dict[str, object]] = []
+    backfill_candidates: List[Dict[str, object]] = []
     for row in rows:
         filename = str(row.get("filename") or "")
         mat_type = _normalize_material_type(row.get("material_type"), filename=filename)
@@ -6564,14 +6638,45 @@ def _select_material_retrieval_chunks(
             matched_numeric_terms = [
                 token for token in numeric_terms if token and token in chunk_numeric_set
             ][:8]
+            type_keyword_hits = [
+                kw.lower() for kw in MATERIAL_TYPE_KEYWORDS.get(mat_type, []) if kw.lower() in lower
+            ][:6]
             if not matched_terms:
                 # 兜底：若命中该类型关键词也纳入候选
-                matched_terms = [
-                    kw.lower()
-                    for kw in MATERIAL_TYPE_KEYWORDS.get(mat_type, [])
-                    if kw.lower() in lower
-                ][:6]
+                matched_terms = list(type_keyword_hits)
             if not matched_terms and not matched_numeric_terms:
+                # 二级兜底：即使没有直接命中查询词，也为每种资料类型保留“高信息密度”候选，
+                # 后续用于类型补全，避免某类资料长期无法进入评分证据链。
+                lexical_terms = _extract_terms(chunk, max_terms=20)
+                chunk_numeric_norm = [
+                    token
+                    for token in (
+                        _normalize_numeric_token(item)
+                        for item in _extract_numeric_terms(chunk, max_terms=18)
+                    )
+                    if token
+                ]
+                fallback_score = 0
+                fallback_score += min(4, len(lexical_terms))
+                fallback_score += min(4, len(chunk_numeric_norm))
+                fallback_score += min(3, len(type_keyword_hits))
+                if mat_type in {"boq", "drawing"}:
+                    fallback_score += 1
+                if fallback_score <= 0 or len(str(chunk).strip()) < 24:
+                    continue
+                backfill_candidates.append(
+                    {
+                        "material_type": mat_type,
+                        "filename": p.name,
+                        "chunk_id": f"{p.name}#c{idx:03d}",
+                        "dimension_id": _infer_chunk_dimension_id(mat_type, chunk),
+                        "score": fallback_score,
+                        "matched_terms": type_keyword_hits or lexical_terms[:6],
+                        "matched_numeric_terms": chunk_numeric_norm[:6],
+                        "chunk_preview": chunk[:220],
+                        "is_backfill": True,
+                    }
+                )
                 continue
             dimension_id = _infer_chunk_dimension_id(mat_type, chunk)
             score = len(matched_terms) + (2 if mat_type in {"boq", "drawing"} else 1)
@@ -6592,9 +6697,17 @@ def _select_material_retrieval_chunks(
                 }
             )
 
-    if not candidates:
+    if not candidates and not backfill_candidates:
         return []
     candidates.sort(
+        key=lambda x: (
+            -int(x.get("score", 0)),
+            str(x.get("material_type")),
+            str(x.get("filename")),
+            str(x.get("chunk_id")),
+        )
+    )
+    backfill_candidates.sort(
         key=lambda x: (
             -int(x.get("score", 0)),
             str(x.get("material_type")),
@@ -6639,12 +6752,36 @@ def _select_material_retrieval_chunks(
             if type_selected >= type_quota:
                 break
 
+    selected_types = {
+        str(item.get("material_type") or "").strip()
+        for item in selected
+        if str(item.get("material_type") or "").strip()
+    }
+    for mat_type in available_types:
+        if mat_type in selected_types:
+            continue
+        for candidate in backfill_candidates:
+            if str(candidate.get("material_type") or "") != mat_type:
+                continue
+            if not _try_pick(candidate, selected_via="type_backfill"):
+                continue
+            selected_types.add(mat_type)
+            if len(selected) >= target_k:
+                return selected
+            break
+
     # 再按全局相关性补齐 top_k。
     for candidate in candidates:
         if not _try_pick(candidate, selected_via="global_rank"):
             continue
         if len(selected) >= target_k:
             break
+    if len(selected) < target_k:
+        for candidate in backfill_candidates:
+            if not _try_pick(candidate, selected_via="global_backfill"):
+                continue
+            if len(selected) >= target_k:
+                break
     return selected
 
 
@@ -7136,6 +7273,201 @@ def _build_scoring_readiness(project_id: str, project: Dict[str, object]) -> Dic
         "retrieval_policy": _resolve_material_utilization_policy(project),
         "generated_at": _now_iso(),
     }
+
+
+def _build_material_depth_report(project_id: str, project: Dict[str, object]) -> Dict[str, object]:
+    readiness = _build_scoring_readiness(project_id, project)
+    quality = (
+        readiness.get("material_quality")
+        if isinstance(readiness.get("material_quality"), dict)
+        else {}
+    )
+    gate = (
+        readiness.get("material_gate") if isinstance(readiness.get("material_gate"), dict) else {}
+    )
+    depth_gate = (
+        readiness.get("material_depth_gate")
+        if isinstance(readiness.get("material_depth_gate"), dict)
+        else {}
+    )
+    counts_by_type = (
+        quality.get("counts_by_type") if isinstance(quality.get("counts_by_type"), dict) else {}
+    )
+    chars_by_type = (
+        quality.get("chars_by_type") if isinstance(quality.get("chars_by_type"), dict) else {}
+    )
+    chunks_by_type = (
+        quality.get("chunks_by_type") if isinstance(quality.get("chunks_by_type"), dict) else {}
+    )
+    numeric_terms_by_type = (
+        quality.get("numeric_terms_by_type")
+        if isinstance(quality.get("numeric_terms_by_type"), dict)
+        else {}
+    )
+    parsed_ok_by_type = (
+        quality.get("parsed_ok_by_type")
+        if isinstance(quality.get("parsed_ok_by_type"), dict)
+        else {}
+    )
+    parsed_fail_by_type = (
+        quality.get("parsed_fail_by_type")
+        if isinstance(quality.get("parsed_fail_by_type"), dict)
+        else {}
+    )
+    required_types = (
+        gate.get("required_types") if isinstance(gate.get("required_types"), list) else []
+    )
+    all_types: List[str] = []
+    for src in (required_types, list(counts_by_type.keys())):
+        for item in src:
+            key = _normalize_material_type(item)
+            if key and key not in all_types:
+                all_types.append(key)
+
+    per_type_rows: List[Dict[str, object]] = []
+    min_chars_by_type = (
+        gate.get("min_chars_by_type") if isinstance(gate.get("min_chars_by_type"), dict) else {}
+    )
+    min_chunks_by_type = (
+        depth_gate.get("min_chunks_by_type")
+        if isinstance(depth_gate.get("min_chunks_by_type"), dict)
+        else {}
+    )
+    min_numeric_terms_by_type = (
+        depth_gate.get("min_numeric_terms_by_type")
+        if isinstance(depth_gate.get("min_numeric_terms_by_type"), dict)
+        else {}
+    )
+    for mat_type in all_types:
+        files = int(_to_float_or_none(counts_by_type.get(mat_type)) or 0)
+        chars = int(_to_float_or_none(chars_by_type.get(mat_type)) or 0)
+        chunks = int(_to_float_or_none(chunks_by_type.get(mat_type)) or 0)
+        numeric_terms = int(_to_float_or_none(numeric_terms_by_type.get(mat_type)) or 0)
+        parsed_ok = int(_to_float_or_none(parsed_ok_by_type.get(mat_type)) or 0)
+        parsed_fail = int(_to_float_or_none(parsed_fail_by_type.get(mat_type)) or 0)
+        min_chars = int(_to_float_or_none(min_chars_by_type.get(mat_type)) or 0)
+        min_chunks = int(_to_float_or_none(min_chunks_by_type.get(mat_type)) or 0)
+        min_numeric_terms = int(_to_float_or_none(min_numeric_terms_by_type.get(mat_type)) or 0)
+        per_type_rows.append(
+            {
+                "material_type": mat_type,
+                "material_type_label": _material_type_label(mat_type),
+                "files": files,
+                "parsed_ok_files": parsed_ok,
+                "parsed_failed_files": parsed_fail,
+                "parsed_chars": chars,
+                "parsed_chunks": chunks,
+                "numeric_terms": numeric_terms,
+                "targets": {
+                    "min_chars": min_chars,
+                    "min_chunks": min_chunks,
+                    "min_numeric_terms": min_numeric_terms,
+                },
+                "meets_chars": chars >= min_chars,
+                "meets_chunks": chunks >= min_chunks,
+                "meets_numeric_terms": numeric_terms >= min_numeric_terms,
+            }
+        )
+
+    recommendations: List[str] = []
+    for issue in readiness.get("issues") or []:
+        text = str(issue).strip()
+        if text and text not in recommendations:
+            recommendations.append(text)
+    for warning in readiness.get("warnings") or []:
+        text = str(warning).strip()
+        if text and text not in recommendations:
+            recommendations.append(text)
+    for detail in (quality.get("parsed_fail_details") or [])[:8]:
+        if not isinstance(detail, dict):
+            continue
+        fn = str(detail.get("filename") or "").strip()
+        rs = str(detail.get("reason") or "").strip()
+        tip = f"解析失败文件：{fn or '未命名文件'}（{rs or '未知原因'}），建议重新上传可解析版本。"
+        if tip not in recommendations:
+            recommendations.append(tip)
+
+    quality_summary = {
+        "total_files": int(_to_float_or_none(quality.get("total_files")) or 0),
+        "parsed_ok_files": int(_to_float_or_none(quality.get("parsed_ok_files")) or 0),
+        "parsed_failed_files": int(_to_float_or_none(quality.get("parsed_failed_files")) or 0),
+        "total_parsed_chars": int(_to_float_or_none(quality.get("total_parsed_chars")) or 0),
+        "total_parsed_chunks": int(_to_float_or_none(quality.get("total_parsed_chunks")) or 0),
+        "total_numeric_terms": int(_to_float_or_none(quality.get("total_numeric_terms")) or 0),
+        "parse_fail_ratio": float(_to_float_or_none(quality.get("parse_fail_ratio")) or 0.0),
+    }
+
+    return {
+        "project_id": project_id,
+        "generated_at": _now_iso(),
+        "ready_to_score": bool(readiness.get("ready")),
+        "gate": gate,
+        "depth_gate": depth_gate,
+        "quality_summary": quality_summary,
+        "by_type": per_type_rows,
+        "recommendations": recommendations[:20],
+    }
+
+
+def _render_material_depth_report_markdown(payload: Dict[str, object]) -> str:
+    by_type = payload.get("by_type") if isinstance(payload.get("by_type"), list) else []
+    quality_summary = (
+        payload.get("quality_summary") if isinstance(payload.get("quality_summary"), dict) else {}
+    )
+    gate = payload.get("gate") if isinstance(payload.get("gate"), dict) else {}
+    depth_gate = payload.get("depth_gate") if isinstance(payload.get("depth_gate"), dict) else {}
+    recommendations = (
+        payload.get("recommendations") if isinstance(payload.get("recommendations"), list) else []
+    )
+    lines = [
+        "# 项目资料深读体检报告",
+        "",
+        f"- 项目ID：`{payload.get('project_id') or '-'}`",
+        f"- 生成时间：`{payload.get('generated_at') or '-'}`",
+        f"- 评分就绪：`{bool(payload.get('ready_to_score'))}`",
+        "",
+        "## 总览",
+        "",
+        f"- 资料总数：`{quality_summary.get('total_files', 0)}`",
+        f"- 解析成功：`{quality_summary.get('parsed_ok_files', 0)}`",
+        f"- 解析失败：`{quality_summary.get('parsed_failed_files', 0)}`",
+        f"- 解析字数：`{quality_summary.get('total_parsed_chars', 0)}`",
+        f"- 解析分块：`{quality_summary.get('total_parsed_chunks', 0)}`",
+        f"- 数字约束项：`{quality_summary.get('total_numeric_terms', 0)}`",
+        f"- 失败率：`{quality_summary.get('parse_fail_ratio', 0.0):.2%}`",
+        "",
+        "## 门禁状态",
+        "",
+        f"- 基础资料门禁：`{bool(gate.get('passed', True))}`（enforce={bool(gate.get('enforce', False))}）",
+        f"- 深读门禁：`{bool(depth_gate.get('passed', True))}`（enforce={bool(depth_gate.get('enforce', False))}）",
+        "",
+        "## 分类型体检",
+        "",
+        "| 资料类型 | 文件数 | 成功/失败 | 解析字数 | 分块数 | 数字约束项 | 目标(字数/分块/数字) |",
+        "|---|---:|---:|---:|---:|---:|---|",
+    ]
+    for row in by_type:
+        if not isinstance(row, dict):
+            continue
+        targets = row.get("targets") if isinstance(row.get("targets"), dict) else {}
+        lines.append(
+            f"| {row.get('material_type_label', row.get('material_type', '-'))} "
+            f"| {row.get('files', 0)} "
+            f"| {row.get('parsed_ok_files', 0)}/{row.get('parsed_failed_files', 0)} "
+            f"| {row.get('parsed_chars', 0)} "
+            f"| {row.get('parsed_chunks', 0)} "
+            f"| {row.get('numeric_terms', 0)} "
+            f"| {targets.get('min_chars', 0)}/{targets.get('min_chunks', 0)}/{targets.get('min_numeric_terms', 0)} |"
+        )
+    lines.extend(["", "## 建议动作", ""])
+    if recommendations:
+        for item in recommendations:
+            text = str(item or "").strip()
+            if text:
+                lines.append(f"- {text}")
+    else:
+        lines.append("- 当前资料深读质量满足要求，无需额外整改。")
+    return "\n".join(lines).strip()
 
 
 def _compute_multipliers_hash(multipliers: dict) -> str:
@@ -9981,6 +10313,38 @@ def compat_project_analysis_bundle_markdown_file(
 
 
 @compat_router.get(
+    "/projects/{project_id}/materials/depth_report",
+    response_model=MaterialDepthReportResponse,
+    tags=["项目管理"],
+)
+def compat_material_depth_report(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> MaterialDepthReportResponse:
+    return get_material_depth_report(project_id=project_id, locale=locale)
+
+
+@compat_router.get(
+    "/projects/{project_id}/materials/depth_report/markdown",
+    response_model=MaterialDepthReportMarkdownResponse,
+    tags=["项目管理"],
+)
+def compat_material_depth_report_markdown(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> MaterialDepthReportMarkdownResponse:
+    return get_material_depth_report_markdown(project_id=project_id, locale=locale)
+
+
+@compat_router.get("/projects/{project_id}/materials/depth_report.md", tags=["项目管理"])
+def compat_material_depth_report_markdown_file(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> Response:
+    return download_material_depth_report_markdown(project_id=project_id, locale=locale)
+
+
+@compat_router.get(
     "/projects/{project_id}/expert-profile",
     response_model=ProjectExpertProfileResponse,
     tags=["项目管理"],
@@ -10843,6 +11207,8 @@ def index(
           }
 
           const EARLY_ACTIONS = {
+            btnMaterialDepthReport: { resultId: 'materialDepthReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials/depth_report', loading: '资料深读体检生成中...' },
+            btnMaterialDepthReportDownload: { resultId: 'materialDepthReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials/depth_report.md', loading: '体检报告下载准备中...' },
             btnCompare: { resultId: 'compareResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare', loading: '对比排名加载中...' },
             btnCompareReport: { resultId: 'compareReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare_report', loading: '对比报告生成中...' },
             btnInsights: { resultId: 'insightsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/insights', loading: '洞察分析中...' },
@@ -10869,6 +11235,18 @@ def index(
               setResult(cfg.resultId, '请先在「2) 选择项目」中选择项目', true);
               setOutput('[' + actionId + '] 缺少项目ID');
               return false;
+            }
+            if (actionId === 'btnMaterialDepthReportDownload') {
+              const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/materials/depth_report.md';
+              const a = document.createElement('a');
+              a.href = dlUrl;
+              a.download = 'material_depth_report_' + projectId + '.md';
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              setResult(cfg.resultId, '资料深读体检报告下载已触发。', false);
+              setOutput('[' + actionId + '] download ' + dlUrl);
+              return true;
             }
             setResult(cfg.resultId, cfg.loading || '处理中...', false);
             let url = cfg.path(projectId);
@@ -10952,6 +11330,34 @@ def index(
               }
               return true;
             }
+            if (actionId === 'btnMaterialDepthReport') {
+              const byType = Array.isArray(data.by_type) ? data.by_type : [];
+              const quality = (data && typeof data.quality_summary === 'object') ? data.quality_summary : {};
+              const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
+              const html = ''
+                + '<strong>资料深读体检</strong>'
+                + '<p style="margin:6px 0">评分就绪：'
+                + (data && data.ready_to_score ? '<span class="success">是</span>' : '<span class="error">否</span>')
+                + '；总分块 ' + esc(quality.total_parsed_chunks || 0)
+                + '；数字约束项 ' + esc(quality.total_numeric_terms || 0)
+                + '</p>'
+                + '<table><tr><th>资料类型</th><th>文件数</th><th>解析字数</th><th>分块数</th><th>数字约束项</th></tr>'
+                + (byType.length
+                  ? byType.map((row) => '<tr>'
+                    + '<td>' + esc((row && row.material_type_label) || (row && row.material_type) || '-') + '</td>'
+                    + '<td>' + esc((row && row.files) || 0) + '</td>'
+                    + '<td>' + esc((row && row.parsed_chars) || 0) + '</td>'
+                    + '<td>' + esc((row && row.parsed_chunks) || 0) + '</td>'
+                    + '<td>' + esc((row && row.numeric_terms) || 0) + '</td>'
+                    + '</tr>').join('')
+                  : '<tr><td colspan="5">暂无资料体检数据</td></tr>')
+                + '</table>'
+                + (recs.length
+                  ? '<ul style="margin:6px 0 0 18px;color:#92400e">' + recs.slice(0, 6).map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>'
+                  : '');
+              setResultHtml(cfg.resultId, html);
+              return true;
+            }
             setResultHtml(cfg.resultId, '<pre>' + esc(text || '{}') + '</pre>');
             return true;
           }
@@ -11022,9 +11428,12 @@ def index(
         <div style="margin-bottom:10px">
           <strong>本项目资料列表</strong>
           <button type="button" id="btnRefreshMaterials" class="secondary" style="margin-left:8px">刷新</button>
+          <button type="button" id="btnMaterialDepthReport" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialDepthReport')">深读体检</button>
+          <button type="button" id="btnMaterialDepthReportDownload" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialDepthReportDownload')">下载体检报告(.md)</button>
         </div>
         <table id="materialsTable"><thead><tr><th>资料类型</th><th>文件名</th><th>上传时间</th><th>操作</th></tr></thead><tbody>__MATERIAL_ROWS__</tbody></table>
         <p id="materialsEmpty" style="font-size:13px;color:#64748b;margin:6px 0 0 0;display:__MATERIALS_EMPTY_DISPLAY__">暂无资料，请下方添加。</p>
+        <div id="materialDepthReportResult" class="result-block" style="display:none"></div>
         <div class="upload-box">
           <h3 class="upload-panel-title">文件上传区</h3>
           <div class="upload-zones">
@@ -11281,6 +11690,8 @@ def index(
             btnUploadBoq: { resultId: 'materialsActionStatusBoq', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/materials', loading: '清单上传中...' },
             btnUploadDrawing: { resultId: 'materialsActionStatusDrawing', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/materials', loading: '图纸上传中...' },
             btnUploadSitePhotos: { resultId: 'materialsActionStatusPhoto', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/materials', loading: '现场照片上传中...' },
+            btnMaterialDepthReport: { resultId: 'materialDepthReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials/depth_report', loading: '资料深读体检生成中...' },
+            btnMaterialDepthReportDownload: { resultId: 'materialDepthReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials/depth_report.md', loading: '体检报告下载准备中...' },
             btnUploadShigong: { resultId: 'shigongActionStatus', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/shigong', loading: '施组上传中...' },
             btnScoreShigong: { resultId: 'shigongActionStatus', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/rescore', loading: '施组评分中...' },
             btnCompare: { resultId: 'compareResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare', loading: '对比排名加载中...' },
@@ -11499,6 +11910,33 @@ def index(
             }
             if (aid === 'btnAdaptive' || aid === 'btnAdaptivePatch' || aid === 'btnAdaptiveValidate' || aid === 'btnAdaptiveApply') {
               fallbackSetResultHtml(resultId, '<strong>自适应结果</strong><pre>' + fallbackEscapeHtml(text || '{}') + '</pre>');
+              return true;
+            }
+            if (aid === 'btnMaterialDepthReport') {
+              const byType = Array.isArray(data.by_type) ? data.by_type : [];
+              const quality = (data && typeof data.quality_summary === 'object') ? data.quality_summary : {};
+              const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
+              const html = '<strong>资料深读体检</strong>'
+                + '<p style="margin:6px 0">评分就绪：'
+                + (data && data.ready_to_score ? '<span class="success">是</span>' : '<span class="error">否</span>')
+                + '；总分块 ' + fallbackEscapeHtml(quality.total_parsed_chunks || 0)
+                + '；数字约束项 ' + fallbackEscapeHtml(quality.total_numeric_terms || 0)
+                + '</p>'
+                + '<table><tr><th>资料类型</th><th>文件数</th><th>解析字数</th><th>分块数</th><th>数字约束项</th></tr>'
+                + (byType.length
+                  ? byType.map((row) => '<tr>'
+                    + '<td>' + fallbackEscapeHtml((row && row.material_type_label) || (row && row.material_type) || '-') + '</td>'
+                    + '<td>' + fallbackEscapeHtml((row && row.files) || 0) + '</td>'
+                    + '<td>' + fallbackEscapeHtml((row && row.parsed_chars) || 0) + '</td>'
+                    + '<td>' + fallbackEscapeHtml((row && row.parsed_chunks) || 0) + '</td>'
+                    + '<td>' + fallbackEscapeHtml((row && row.numeric_terms) || 0) + '</td>'
+                    + '</tr>').join('')
+                  : '<tr><td colspan="5">暂无资料体检数据</td></tr>')
+                + '</table>'
+                + (recs.length
+                  ? '<ul style="margin:6px 0 0 18px;color:#92400e">' + recs.slice(0, 6).map((x) => '<li>' + fallbackEscapeHtml(x) + '</li>').join('') + '</ul>'
+                  : '');
+              fallbackSetResultHtml(resultId, html);
               return true;
             }
             if (aid === 'btnScoreShigong') {
@@ -11961,6 +12399,18 @@ def index(
                 return false;
               }
             }
+            if (actionId === 'btnMaterialDepthReportDownload') {
+              const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/materials/depth_report.md';
+              const a = document.createElement('a');
+              a.href = dlUrl;
+              a.download = 'material_depth_report_' + projectId + '.md';
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              fallbackSetResult(cfg.resultId, '资料深读体检报告下载已触发。', false);
+              fallbackSetOutput('[' + actionId + '] download ' + dlUrl);
+              return true;
+            }
             if (actionId === 'btnScoreShigong') {
               const readiness = await fallbackFetchScoringReadiness(projectId);
               if (readiness && readiness.ready === false) {
@@ -12251,6 +12701,7 @@ def index(
         let scoringReadinessState = { project_id: '', ready: false, gate_passed: false, issues: [] };
         const PROJECT_REQUIRED_BUTTON_IDS = [
           'deleteCurrentProject', 'btnWeightsReset', 'btnWeightsSave', 'btnWeightsApply',
+          'btnMaterialDepthReport', 'btnMaterialDepthReportDownload',
           'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
           'btnEvolve', 'btnWritingGuidance', 'btnCompilationInstructions',
           'btnRebuildDelta', 'btnRebuildSamples', 'btnTrainCalibratorV2', 'btnApplyCalibPredict',
@@ -12258,7 +12709,7 @@ def index(
           'btnMinePatchV2', 'btnShadowPatchV2', 'btnDeployPatchV2', 'btnRollbackPatchV2',
         ];
         const NON_BLOCKING_ACTION_BUTTON_IDS = [
-          'btnUploadMaterials', 'btnUploadBoq', 'btnUploadDrawing', 'btnUploadSitePhotos', 'btnRefreshMaterials', 'btnUploadShigong', 'btnScoreShigong', 'btnRefreshSubmissions',
+          'btnUploadMaterials', 'btnUploadBoq', 'btnUploadDrawing', 'btnUploadSitePhotos', 'btnRefreshMaterials', 'btnMaterialDepthReport', 'btnMaterialDepthReportDownload', 'btnUploadShigong', 'btnScoreShigong', 'btnRefreshSubmissions',
           'btnCompare', 'btnCompareReport', 'btnInsights', 'btnLearning',
           'btnAdaptive', 'btnAdaptivePatch', 'btnAdaptiveValidate', 'btnAdaptiveApply',
           'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
@@ -12387,6 +12838,7 @@ def index(
           );
           [
             'scoringReadinessResult',
+            'materialDepthReportResult',
             'materialUtilizationResult',
             'compareResult', 'compareReportResult', 'insightsResult', 'learningResult',
             'adaptiveResult', 'adaptivePatchResult', 'adaptiveValidateResult', 'adaptiveApplyResult',
@@ -13778,6 +14230,43 @@ def index(
         if (btnRefSub) btnRefSub.onclick = refreshSubmissions;
         const btnRefMat = document.getElementById('btnRefreshMaterials');
         if (btnRefMat) btnRefMat.onclick = refreshMaterials;
+        safeClick('btnMaterialDepthReport', async () => {
+          if (!ensureProjectForAction('materialDepthReportResult')) return;
+          const id = pid();
+          setResultLoading('materialDepthReportResult', '资料深读体检生成中...');
+          let res;
+          let data = {};
+          try {
+            res = await fetch('/api/v1/projects/' + encodeURIComponent(id) + '/materials/depth_report', {
+              method: 'GET',
+              headers: apiHeaders(false),
+            });
+            data = await res.json().catch(() => ({}));
+          } catch (err) {
+            setResultError('materialDepthReportResult', '体检失败：' + String((err && err.message) || err || '网络异常'));
+            return;
+          }
+          if (!res.ok) {
+            const detail = (data && data.detail) ? String(data.detail) : ('HTTP ' + String(res.status || 0));
+            setResultError('materialDepthReportResult', '体检失败：' + detail);
+            return;
+          }
+          renderMaterialDepthReportPanel(data);
+          const out = document.getElementById('output');
+          if (out) out.textContent = JSON.stringify(data, null, 2);
+        });
+        safeClick('btnMaterialDepthReportDownload', async () => {
+          if (!ensureProjectForAction('materialDepthReportResult')) return;
+          const id = pid();
+          const url = '/api/v1/projects/' + encodeURIComponent(id) + '/materials/depth_report.md';
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'material_depth_report_' + id + '.md';
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          setResultSuccess('materialDepthReportResult', '资料深读体检报告下载已触发。');
+        });
 
         async function refreshFeedMaterials(expectedProjectId=null, switchSeq=null) {
           const id = expectedProjectId || pid();
@@ -13965,6 +14454,47 @@ def index(
           if (t === 'drawing') return '图纸';
           if (t === 'site_photo') return '现场照片';
           return t || '项目资料';
+        }
+        function renderMaterialDepthReportPanel(payload) {
+          const el = document.getElementById('materialDepthReportResult');
+          if (!el) return;
+          const data = (payload && typeof payload === 'object') ? payload : {};
+          const byType = Array.isArray(data.by_type) ? data.by_type : [];
+          const quality = (data.quality_summary && typeof data.quality_summary === 'object')
+            ? data.quality_summary
+            : {};
+          const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
+          const ready = !!data.ready_to_score;
+          let html = '<strong>资料深读体检（评分前）</strong>';
+          html += '<p style="margin:6px 0">评分就绪：'
+            + (ready ? '<span class="success">是</span>' : '<span class="error">否</span>')
+            + '；解析分块 ' + escapeHtmlText(quality.total_parsed_chunks || 0)
+            + '；数字约束项 ' + escapeHtmlText(quality.total_numeric_terms || 0)
+            + '；解析失败率 ' + escapeHtmlText(((Number(quality.parse_fail_ratio || 0) * 100).toFixed(1)) + '%')
+            + '</p>';
+          html += '<table><tr><th>资料类型</th><th>文件数</th><th>成功/失败</th><th>字数</th><th>分块</th><th>数字约束</th><th>目标(字数/分块/数字)</th></tr>';
+          html += byType.length
+            ? byType.map((row) => {
+              const targets = (row && typeof row.targets === 'object') ? row.targets : {};
+              return '<tr>'
+                + '<td>' + escapeHtmlText((row && row.material_type_label) || (row && row.material_type) || '-') + '</td>'
+                + '<td>' + escapeHtmlText((row && row.files) || 0) + '</td>'
+                + '<td>' + escapeHtmlText((row && row.parsed_ok_files) || 0) + '/' + escapeHtmlText((row && row.parsed_failed_files) || 0) + '</td>'
+                + '<td>' + escapeHtmlText((row && row.parsed_chars) || 0) + '</td>'
+                + '<td>' + escapeHtmlText((row && row.parsed_chunks) || 0) + '</td>'
+                + '<td>' + escapeHtmlText((row && row.numeric_terms) || 0) + '</td>'
+                + '<td>' + escapeHtmlText((targets.min_chars || 0) + '/' + (targets.min_chunks || 0) + '/' + (targets.min_numeric_terms || 0)) + '</td>'
+                + '</tr>';
+            }).join('')
+            : '<tr><td colspan="7">暂无资料体检数据</td></tr>';
+          html += '</table>';
+          if (recs.length) {
+            html += '<ul style="margin:6px 0 0 18px;color:#92400e">'
+              + recs.slice(0, 10).map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('')
+              + '</ul>';
+          }
+          el.style.display = 'block';
+          el.innerHTML = html;
         }
         function applyScoringReadiness(payload) {
           const data = (payload && typeof payload === 'object') ? payload : {};
