@@ -1574,6 +1574,63 @@ class TestMaterialAdvancedParsing:
             assert by_type["boq"] >= 2
             assert by_type["drawing"] >= 2
 
+    @patch("app.main.load_materials")
+    @patch("app.main._split_material_text_chunks")
+    @patch("app.main._read_uploaded_file_content")
+    def test_select_material_retrieval_chunks_respects_per_file_quota(
+        self, mock_read_uploaded_file_content, mock_split_chunks, mock_load_materials
+    ):
+        from app.main import _select_material_retrieval_chunks
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tender = Path(tmp) / "tender.txt"
+            boq = Path(tmp) / "boq.txt"
+            drawing = Path(tmp) / "drawing.txt"
+            tender.write_text("答疑 工期 节点 质量", encoding="utf-8")
+            boq.write_text("工程量 综合单价 措施费", encoding="utf-8")
+            drawing.write_text("图纸 节点 剖面 深化", encoding="utf-8")
+            mock_load_materials.return_value = [
+                {
+                    "project_id": "p1",
+                    "material_type": "tender_qa",
+                    "filename": "tender.txt",
+                    "path": str(tender),
+                    "created_at": "2026-02-26T00:00:01+00:00",
+                },
+                {
+                    "project_id": "p1",
+                    "material_type": "boq",
+                    "filename": "boq.txt",
+                    "path": str(boq),
+                    "created_at": "2026-02-26T00:00:02+00:00",
+                },
+                {
+                    "project_id": "p1",
+                    "material_type": "drawing",
+                    "filename": "drawing.txt",
+                    "path": str(drawing),
+                    "created_at": "2026-02-26T00:00:03+00:00",
+                },
+            ]
+            mock_read_uploaded_file_content.side_effect = lambda _content, filename: Path(
+                tmp, filename
+            ).read_text(encoding="utf-8")
+            mock_split_chunks.return_value = [
+                "工期 节点 工程量 质量 安全",
+                "BIM 节点 进度 工程量 清单",
+                "剖面 节点 深化 质量 施工",
+            ]
+            chunks = _select_material_retrieval_chunks(
+                "p1",
+                "工期 节点 工程量",
+                top_k=9,
+                per_type_quota=2,
+                per_file_quota=1,
+            )
+            by_filename = Counter(str(c.get("filename")) for c in chunks)
+            assert all(cnt <= 1 for cnt in by_filename.values())
+            assert len(by_filename) == 3
+
     def test_build_material_utilization_summary_reports_uncovered_types(self):
         from app.main import _build_material_utilization_summary
 
@@ -1583,6 +1640,8 @@ class TestMaterialAdvancedParsing:
                     "source_pack_id": "runtime_material_rag",
                     "material_type": "tender_qa",
                     "source_mode": "type_quota",
+                    "source_filename": "tender.txt",
+                    "chunk_id": "tender.txt#c001",
                     "hit": True,
                     "label": "资料检索证据：招标文件和答疑 / tender.txt / c1",
                 },
@@ -1597,10 +1656,14 @@ class TestMaterialAdvancedParsing:
         }
         runtime_meta = {
             "material_available_types": ["tender_qa", "boq", "drawing"],
+            "material_retrieval_selected_filenames": ["tender.txt", "boq.xlsx", "drawing.pdf"],
         }
         summary = _build_material_utilization_summary(report, runtime_meta)
         assert summary["retrieval_total"] == 1
         assert summary["retrieval_hit"] == 1
+        assert summary["retrieval_file_total"] == 3
+        assert summary["retrieval_file_hit"] == 1
+        assert summary["retrieval_file_coverage_rate"] == pytest.approx(0.3333, abs=1e-4)
         assert "boq" in (summary.get("uncovered_types") or [])
         assert "drawing" in (summary.get("uncovered_types") or [])
         assert summary["fallback_total"] == 1
@@ -1614,6 +1677,8 @@ class TestMaterialAdvancedParsing:
                 {
                     "retrieval_total": 2,
                     "retrieval_hit": 1,
+                    "retrieval_file_total": 2,
+                    "retrieval_file_hit": 1,
                     "consistency_total": 2,
                     "consistency_hit": 1,
                     "fallback_total": 1,
@@ -1642,6 +1707,8 @@ class TestMaterialAdvancedParsing:
                 {
                     "retrieval_total": 1,
                     "retrieval_hit": 1,
+                    "retrieval_file_total": 1,
+                    "retrieval_file_hit": 1,
                     "consistency_total": 1,
                     "consistency_hit": 1,
                     "fallback_total": 0,
@@ -1663,6 +1730,9 @@ class TestMaterialAdvancedParsing:
         )
         assert merged["retrieval_total"] == 3
         assert merged["retrieval_hit"] == 2
+        assert merged["retrieval_file_total"] == 3
+        assert merged["retrieval_file_hit"] == 2
+        assert merged["retrieval_file_coverage_rate"] == pytest.approx(0.6667, abs=1e-4)
         assert merged["consistency_total"] == 3
         assert merged["consistency_hit"] == 2
         assert merged["fallback_total"] == 1
@@ -1705,6 +1775,8 @@ class TestMaterialAdvancedParsing:
         summary = {
             "retrieval_total": 6,
             "retrieval_hit_rate": 0.1,
+            "retrieval_file_total": 4,
+            "retrieval_file_coverage_rate": 0.25,
             "consistency_total": 4,
             "consistency_hit_rate": 0.1,
             "available_types": ["tender_qa", "boq", "drawing"],
@@ -1714,6 +1786,7 @@ class TestMaterialAdvancedParsing:
             "enabled": True,
             "mode": "warn",
             "min_retrieval_hit_rate": 0.2,
+            "min_retrieval_file_coverage_rate": 0.6,
             "min_consistency_hit_rate": 0.2,
             "max_uncovered_required_types": 0,
             "min_required_type_coverage_rate": 0.6,
@@ -1726,6 +1799,38 @@ class TestMaterialAdvancedParsing:
         assert gate["warned"] is True
         assert gate["blocked"] is False
         assert gate["level"] == "warn"
+
+    def test_evaluate_material_utilization_gate_blocks_when_file_coverage_low(self):
+        from app.main import _evaluate_material_utilization_gate
+
+        summary = {
+            "retrieval_total": 9,
+            "retrieval_hit_rate": 0.8,
+            "retrieval_file_total": 5,
+            "retrieval_file_coverage_rate": 0.2,
+            "consistency_total": 5,
+            "consistency_hit_rate": 0.7,
+            "available_types": ["tender_qa", "boq", "drawing"],
+            "uncovered_types": [],
+        }
+        policy = {
+            "enabled": True,
+            "mode": "block",
+            "min_retrieval_total": 2,
+            "min_retrieval_hit_rate": 0.2,
+            "min_retrieval_file_coverage_rate": 0.6,
+            "min_consistency_hit_rate": 0.2,
+            "max_uncovered_required_types": 0,
+            "min_required_type_presence_rate": 0.6,
+            "min_required_type_coverage_rate": 0.6,
+        }
+        gate = _evaluate_material_utilization_gate(
+            summary,
+            policy=policy,
+            required_types=["tender_qa", "boq", "drawing"],
+        )
+        assert gate["blocked"] is True
+        assert any("文件覆盖率" in str(x) for x in (gate.get("reasons") or []))
 
     def test_evaluate_material_utilization_gate_blocks_when_required_upload_missing(self):
         from app.main import _evaluate_material_utilization_gate

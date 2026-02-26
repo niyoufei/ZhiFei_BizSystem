@@ -304,6 +304,8 @@ DEFAULT_MIN_REQUIRED_TYPE_PRESENCE_RATE = 0.0
 DEFAULT_MIN_REQUIRED_TYPE_COVERAGE_RATE = 0.67
 DEFAULT_MATERIAL_RETRIEVAL_TOP_K = 18
 DEFAULT_MATERIAL_RETRIEVAL_PER_TYPE_QUOTA = 2
+DEFAULT_MATERIAL_RETRIEVAL_PER_FILE_QUOTA = 3
+DEFAULT_MIN_MATERIAL_RETRIEVAL_FILE_COVERAGE_RATE = 0.0
 DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR = 200
 DEFAULT_PDF_OCR_MAX_PAGES = 30
 PROFILE_LOCKED_STATUSES = {"submitted_to_qingtian"}
@@ -468,6 +470,14 @@ def _ensure_project_v2_fields(
         changed = True
     if "material_retrieval_per_type_quota" not in meta:
         meta["material_retrieval_per_type_quota"] = int(DEFAULT_MATERIAL_RETRIEVAL_PER_TYPE_QUOTA)
+        changed = True
+    if "material_retrieval_per_file_quota" not in meta:
+        meta["material_retrieval_per_file_quota"] = int(DEFAULT_MATERIAL_RETRIEVAL_PER_FILE_QUOTA)
+        changed = True
+    if "min_material_retrieval_file_coverage_rate" not in meta:
+        meta["min_material_retrieval_file_coverage_rate"] = float(
+            DEFAULT_MIN_MATERIAL_RETRIEVAL_FILE_COVERAGE_RATE
+        )
         changed = True
     return changed
 
@@ -784,9 +794,16 @@ def _resolve_material_retrieval_config(project: Dict[str, object]) -> Dict[str, 
         lower=1,
         upper=6,
     )
+    per_file_quota = _resolve_int(
+        meta.get("material_retrieval_per_file_quota"),
+        DEFAULT_MATERIAL_RETRIEVAL_PER_FILE_QUOTA,
+        lower=1,
+        upper=8,
+    )
     return {
         "top_k": top_k,
         "per_type_quota": per_type_quota,
+        "per_file_quota": per_file_quota,
     }
 
 
@@ -898,10 +915,14 @@ def _build_runtime_custom_requirements(
     retrieval_cfg = _resolve_material_retrieval_config(project)
     material_rows = [m for m in load_materials() if str(m.get("project_id")) == project_id]
     available_material_types: List[str] = []
+    available_material_filenames: List[str] = []
     for row in material_rows:
         key = _normalize_material_type(row.get("material_type"), filename=row.get("filename"))
         if key not in available_material_types:
             available_material_types.append(key)
+        filename_text = str(row.get("filename") or "").strip()
+        if filename_text and filename_text not in available_material_filenames:
+            available_material_filenames.append(filename_text)
     retrieval_top_k = max(
         int(retrieval_cfg.get("top_k", DEFAULT_MATERIAL_RETRIEVAL_TOP_K)),
         len(available_material_types)
@@ -925,12 +946,30 @@ def _build_runtime_custom_requirements(
             ),
         ),
     )
+    retrieval_per_file_quota = max(
+        1,
+        min(
+            8,
+            int(
+                retrieval_cfg.get(
+                    "per_file_quota",
+                    DEFAULT_MATERIAL_RETRIEVAL_PER_FILE_QUOTA,
+                )
+            ),
+        ),
+    )
     retrieval_chunks = _select_material_retrieval_chunks(
         project_id,
         submission_text,
         top_k=retrieval_top_k,
         per_type_quota=retrieval_per_type_quota,
+        per_file_quota=retrieval_per_file_quota,
     )
+    retrieval_selected_filenames: List[str] = []
+    for chunk in retrieval_chunks:
+        filename_text = str(chunk.get("filename") or "").strip()
+        if filename_text and filename_text not in retrieval_selected_filenames:
+            retrieval_selected_filenames.append(filename_text)
     retrieval_types = sorted(
         {
             str(c.get("material_type") or "")
@@ -959,9 +998,12 @@ def _build_runtime_custom_requirements(
         "material_consistency_requirements": len(consistency_requirements),
         "material_retrieval_top_k": retrieval_top_k,
         "material_retrieval_per_type_quota": retrieval_per_type_quota,
+        "material_retrieval_per_file_quota": retrieval_per_file_quota,
         "material_available_files": len(material_rows),
+        "material_available_filenames": available_material_filenames[:120],
         "material_available_types": available_material_types,
         "material_retrieval_types": retrieval_types,
+        "material_retrieval_selected_filenames": retrieval_selected_filenames[:120],
         "material_retrieval_missing_types": [
             t for t in available_material_types if t not in retrieval_types
         ],
@@ -1078,6 +1120,8 @@ def _build_material_utilization_summary(
     consistency_hit = 0
     fallback_total = 0
     fallback_hit = 0
+    retrieval_file_total_set: set[str] = set()
+    retrieval_file_hit_set: set[str] = set()
 
     def _bucket(material_type: str) -> Dict[str, object]:
         if material_type not in by_type:
@@ -1092,6 +1136,13 @@ def _build_material_utilization_summary(
             }
         return by_type[material_type]
 
+    retrieval_files_raw = runtime_req_meta.get("material_retrieval_selected_filenames")
+    if isinstance(retrieval_files_raw, list):
+        for item in retrieval_files_raw:
+            filename_text = str(item or "").strip()
+            if filename_text:
+                retrieval_file_total_set.add(filename_text)
+
     for row in req_hits:
         if not isinstance(row, dict):
             continue
@@ -1102,13 +1153,22 @@ def _build_material_utilization_summary(
         hit = bool(row.get("hit"))
         source_mode = str(row.get("source_mode") or "").strip()
         bucket = _bucket(material_type)
+        source_filename = str(row.get("source_filename") or "").strip()
+        if not source_filename:
+            chunk_id = str(row.get("chunk_id") or "").strip()
+            if "#c" in chunk_id:
+                source_filename = chunk_id.split("#c", 1)[0].strip()
 
         if source_pack_id == "runtime_material_rag":
             retrieval_total += 1
             bucket["retrieval_total"] = int(bucket.get("retrieval_total", 0)) + 1
+            if source_filename:
+                retrieval_file_total_set.add(source_filename)
             if hit:
                 retrieval_hit += 1
                 bucket["retrieval_hit"] = int(bucket.get("retrieval_hit", 0)) + 1
+                if source_filename:
+                    retrieval_file_hit_set.add(source_filename)
         else:
             consistency_total += 1
             bucket["consistency_total"] = int(bucket.get("consistency_total", 0)) + 1
@@ -1155,6 +1215,14 @@ def _build_material_utilization_summary(
         "retrieval_total": retrieval_total,
         "retrieval_hit": retrieval_hit,
         "retrieval_hit_rate": _rate(retrieval_hit, retrieval_total),
+        "retrieval_file_total": len(retrieval_file_total_set),
+        "retrieval_file_hit": len(retrieval_file_hit_set),
+        "retrieval_file_coverage_rate": _rate(
+            len(retrieval_file_hit_set),
+            len(retrieval_file_total_set),
+        ),
+        "retrieval_selected_filenames": sorted(retrieval_file_total_set)[:120],
+        "retrieval_hit_filenames": sorted(retrieval_file_hit_set)[:120],
         "consistency_total": consistency_total,
         "consistency_hit": consistency_hit,
         "consistency_hit_rate": _rate(consistency_hit, consistency_total),
@@ -1180,6 +1248,8 @@ def _aggregate_material_utilization_summaries(
     consistency_hit = 0
     fallback_total = 0
     fallback_hit = 0
+    retrieval_file_total = 0
+    retrieval_file_hit = 0
 
     def _rate(hit_cnt: int, total_cnt: int) -> Optional[float]:
         if total_cnt <= 0:
@@ -1203,6 +1273,8 @@ def _aggregate_material_utilization_summaries(
             continue
         retrieval_total += int(_to_float_or_none(raw.get("retrieval_total")) or 0)
         retrieval_hit += int(_to_float_or_none(raw.get("retrieval_hit")) or 0)
+        retrieval_file_total += int(_to_float_or_none(raw.get("retrieval_file_total")) or 0)
+        retrieval_file_hit += int(_to_float_or_none(raw.get("retrieval_file_hit")) or 0)
         consistency_total += int(_to_float_or_none(raw.get("consistency_total")) or 0)
         consistency_hit += int(_to_float_or_none(raw.get("consistency_hit")) or 0)
 
@@ -1261,6 +1333,9 @@ def _aggregate_material_utilization_summaries(
         "retrieval_total": retrieval_total,
         "retrieval_hit": retrieval_hit,
         "retrieval_hit_rate": _rate(retrieval_hit, retrieval_total),
+        "retrieval_file_total": retrieval_file_total,
+        "retrieval_file_hit": retrieval_file_hit,
+        "retrieval_file_coverage_rate": _rate(retrieval_file_hit, retrieval_file_total),
         "consistency_total": consistency_total,
         "consistency_hit": consistency_hit,
         "consistency_hit_rate": _rate(consistency_hit, consistency_total),
@@ -1287,6 +1362,8 @@ def _build_material_utilization_alerts(
     consistency_hit_rate = _to_float_or_none(data.get("consistency_hit_rate"))
     fallback_total = int(_to_float_or_none(data.get("fallback_total")) or 0)
     fallback_hit = int(_to_float_or_none(data.get("fallback_hit")) or 0)
+    retrieval_file_total = int(_to_float_or_none(data.get("retrieval_file_total")) or 0)
+    retrieval_file_coverage_rate = _to_float_or_none(data.get("retrieval_file_coverage_rate"))
 
     if retrieval_total <= 0:
         alerts.append("评分未命中任何资料检索锚点，资料引用不足。")
@@ -1302,6 +1379,16 @@ def _build_material_utilization_alerts(
 
     if fallback_total > 0 and fallback_hit <= 0:
         alerts.append("仅触发了关键词兜底匹配且未命中，说明施组与项目资料耦合不足。")
+
+    if (
+        retrieval_file_total >= 3
+        and retrieval_file_coverage_rate is not None
+        and retrieval_file_coverage_rate < 0.4
+    ):
+        alerts.append(
+            "资料文件覆盖率偏低（"
+            + f"{retrieval_file_coverage_rate * 100:.1f}%），可能仅引用了少量文件。"
+        )
 
     uncovered_raw = data.get("uncovered_types")
     uncovered_types = uncovered_raw if isinstance(uncovered_raw, list) else []
@@ -1354,6 +1441,10 @@ def _resolve_material_utilization_policy(project: Dict[str, object]) -> Dict[str
             meta.get("min_material_retrieval_total"),
             DEFAULT_MIN_MATERIAL_RETRIEVAL_TOTAL,
         ),
+        "min_retrieval_file_coverage_rate": _to_rate(
+            meta.get("min_material_retrieval_file_coverage_rate"),
+            DEFAULT_MIN_MATERIAL_RETRIEVAL_FILE_COVERAGE_RATE,
+        ),
         "min_retrieval_hit_rate": _to_rate(
             meta.get("min_material_retrieval_hit_rate"),
             DEFAULT_MIN_MATERIAL_RETRIEVAL_HIT_RATE,
@@ -1391,6 +1482,8 @@ def _evaluate_material_utilization_gate(
 
     retrieval_total = int(_to_float_or_none(data.get("retrieval_total")) or 0)
     retrieval_hit_rate = _to_float_or_none(data.get("retrieval_hit_rate"))
+    retrieval_file_total = int(_to_float_or_none(data.get("retrieval_file_total")) or 0)
+    retrieval_file_coverage_rate = _to_float_or_none(data.get("retrieval_file_coverage_rate"))
     consistency_total = int(_to_float_or_none(data.get("consistency_total")) or 0)
     consistency_hit_rate = _to_float_or_none(data.get("consistency_hit_rate"))
 
@@ -1494,10 +1587,29 @@ def _evaluate_material_utilization_gate(
             ),
         ),
     )
+    min_retrieval_file_coverage = min(
+        1.0,
+        max(
+            0.0,
+            float(
+                _to_float_or_none(gate_policy.get("min_retrieval_file_coverage_rate"))
+                or DEFAULT_MIN_MATERIAL_RETRIEVAL_FILE_COVERAGE_RATE
+            ),
+        ),
+    )
 
     reasons: List[str] = []
     if retrieval_total < min_retrieval_total:
         reasons.append(f"资料检索证据数量 {retrieval_total} 低于阈值 {min_retrieval_total}")
+    if (
+        retrieval_file_total > 0
+        and retrieval_file_coverage_rate is not None
+        and retrieval_file_coverage_rate < min_retrieval_file_coverage
+    ):
+        reasons.append(
+            "资料检索文件覆盖率 "
+            + f"{retrieval_file_coverage_rate:.1%} 低于阈值 {min_retrieval_file_coverage:.1%}"
+        )
     if (
         retrieval_total > 0
         and retrieval_hit_rate is not None
@@ -1549,6 +1661,7 @@ def _evaluate_material_utilization_gate(
         "reasons": reasons,
         "thresholds": {
             "min_retrieval_total": min_retrieval_total,
+            "min_retrieval_file_coverage_rate": min_retrieval_file_coverage,
             "min_retrieval_hit_rate": min_retrieval,
             "min_consistency_hit_rate": min_consistency,
             "max_uncovered_required_types": max_uncovered,
@@ -1565,6 +1678,8 @@ def _evaluate_material_utilization_gate(
         "metrics": {
             "retrieval_total": retrieval_total,
             "retrieval_hit_rate": retrieval_hit_rate,
+            "retrieval_file_total": retrieval_file_total,
+            "retrieval_file_coverage_rate": retrieval_file_coverage_rate,
             "consistency_total": consistency_total,
             "consistency_hit_rate": consistency_hit_rate,
         },
@@ -6120,6 +6235,7 @@ def _select_material_retrieval_chunks(
     *,
     top_k: int = 12,
     per_type_quota: int = 1,
+    per_file_quota: int = 3,
 ) -> List[Dict[str, object]]:
     query_terms = set(_extract_terms(submission_text, max_terms=60))
     # 确保不同资料类型关键词也参与检索，避免“只用施组词命中”。
@@ -6185,21 +6301,34 @@ def _select_material_retrieval_chunks(
     target_k = max(1, int(top_k))
     selected: List[Dict[str, object]] = []
     seen_chunk_ids: set[str] = set()
+    selected_per_file: Dict[str, int] = {}
 
     type_quota = max(1, int(per_type_quota))
+    file_quota = max(1, int(per_file_quota))
+
+    def _try_pick(candidate: Dict[str, object], *, selected_via: str) -> bool:
+        chunk_id = str(candidate.get("chunk_id") or "")
+        if not chunk_id or chunk_id in seen_chunk_ids:
+            return False
+        filename_text = str(candidate.get("filename") or "").strip()
+        if filename_text and int(selected_per_file.get(filename_text, 0)) >= file_quota:
+            return False
+        row = dict(candidate)
+        row["selected_via"] = selected_via
+        selected.append(row)
+        seen_chunk_ids.add(chunk_id)
+        if filename_text:
+            selected_per_file[filename_text] = int(selected_per_file.get(filename_text, 0)) + 1
+        return True
+
     # 先保证“每个已上传资料类型至少取 N 个块”，避免单一资料类型垄断检索。
     for mat_type in available_types:
         type_selected = 0
         for candidate in candidates:
             if str(candidate.get("material_type") or "") != mat_type:
                 continue
-            chunk_id = str(candidate.get("chunk_id") or "")
-            if chunk_id in seen_chunk_ids:
+            if not _try_pick(candidate, selected_via="type_quota"):
                 continue
-            row = dict(candidate)
-            row["selected_via"] = "type_quota"
-            selected.append(row)
-            seen_chunk_ids.add(chunk_id)
             type_selected += 1
             if len(selected) >= target_k:
                 return selected
@@ -6208,13 +6337,8 @@ def _select_material_retrieval_chunks(
 
     # 再按全局相关性补齐 top_k。
     for candidate in candidates:
-        chunk_id = str(candidate.get("chunk_id") or "")
-        if chunk_id in seen_chunk_ids:
+        if not _try_pick(candidate, selected_via="global_rank"):
             continue
-        row = dict(candidate)
-        row["selected_via"] = "global_rank"
-        selected.append(row)
-        seen_chunk_ids.add(chunk_id)
         if len(selected) >= target_k:
             break
     return selected
@@ -6250,6 +6374,7 @@ def _build_material_retrieval_requirements(
                     "hints": hints,
                     "minimum_hint_hits": minimum_hint_hits,
                     "material_type": mat_type,
+                    "source_filename": filename,
                     "chunk_id": chunk_id,
                     "source_mode": str(chunk.get("selected_via") or "retrieval_chunks"),
                 },
@@ -13260,6 +13385,8 @@ def index(
           const consistencyHit = Number(summary.consistency_hit || 0);
           const fallbackTotal = Number(summary.fallback_total || 0);
           const fallbackHit = Number(summary.fallback_hit || 0);
+          const retrievalFileTotal = Number(summary.retrieval_file_total || 0);
+          const retrievalFileHit = Number(summary.retrieval_file_hit || 0);
           const byType = (summary.by_type && typeof summary.by_type === 'object') ? summary.by_type : {};
           const availableTypes = Array.isArray(summary.available_types) ? summary.available_types : [];
           const uncoveredTypes = Array.isArray(summary.uncovered_types) ? summary.uncovered_types : [];
@@ -13300,6 +13427,7 @@ def index(
               : '')
             + '<table><tr><th>维度</th><th>命中/总数</th><th>命中率</th></tr>'
             + '<tr><td>资料检索锚点</td><td>' + escapeHtmlText(retrievalHit) + ' / ' + escapeHtmlText(retrievalTotal) + '</td><td>' + escapeHtmlText(toPct(summary.retrieval_hit_rate)) + '</td></tr>'
+            + '<tr><td>检索文件覆盖</td><td>' + escapeHtmlText(retrievalFileHit) + ' / ' + escapeHtmlText(retrievalFileTotal) + '</td><td>' + escapeHtmlText(toPct(summary.retrieval_file_coverage_rate)) + '</td></tr>'
             + '<tr><td>跨资料一致性</td><td>' + escapeHtmlText(consistencyHit) + ' / ' + escapeHtmlText(consistencyTotal) + '</td><td>' + escapeHtmlText(toPct(summary.consistency_hit_rate)) + '</td></tr>'
             + '<tr><td>关键词兜底</td><td>' + escapeHtmlText(fallbackHit) + ' / ' + escapeHtmlText(fallbackTotal) + '</td><td>' + escapeHtmlText(toPct(summary.fallback_hit_rate)) + '</td></tr>'
             + '</table>';

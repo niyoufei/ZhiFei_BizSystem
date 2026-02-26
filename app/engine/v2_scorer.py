@@ -380,6 +380,7 @@ def _match_requirements(
                 "weight": req.get("weight"),
                 "material_type": patterns.get("material_type") or req.get("material_type"),
                 "source_mode": patterns.get("source_mode"),
+                "source_filename": patterns.get("source_filename"),
                 "chunk_id": patterns.get("chunk_id"),
             }
         )
