@@ -307,6 +307,9 @@ class RescoreResponse(BaseModel):
     reports_generated: int
     score_scale_max: int = 100
     score_scale_label: str = "100分制"
+    material_utilization: Dict[str, Any] = Field(default_factory=dict)
+    material_utilization_alerts: List[str] = Field(default_factory=list)
+    material_utilization_by_submission: List[Dict[str, Any]] = Field(default_factory=list)
     started_at: str
     finished_at: str
 

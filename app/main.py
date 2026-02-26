@@ -981,6 +981,8 @@ def _build_material_utilization_summary(
     retrieval_hit = 0
     consistency_total = 0
     consistency_hit = 0
+    fallback_total = 0
+    fallback_hit = 0
 
     def _bucket(material_type: str) -> Dict[str, object]:
         if material_type not in by_type:
@@ -1021,8 +1023,10 @@ def _build_material_utilization_summary(
 
         if source_mode == "fallback_keywords":
             bucket["fallback_total"] = int(bucket.get("fallback_total", 0)) + 1
+            fallback_total += 1
             if hit:
                 bucket["fallback_hit"] = int(bucket.get("fallback_hit", 0)) + 1
+                fallback_hit += 1
 
         label = str(row.get("label") or "").strip()
         if label:
@@ -1059,10 +1063,171 @@ def _build_material_utilization_summary(
         "consistency_total": consistency_total,
         "consistency_hit": consistency_hit,
         "consistency_hit_rate": _rate(consistency_hit, consistency_total),
+        "fallback_total": fallback_total,
+        "fallback_hit": fallback_hit,
+        "fallback_hit_rate": _rate(fallback_hit, fallback_total),
         "by_type": by_type,
         "available_types": available_types,
         "uncovered_types": uncovered_types,
     }
+
+
+def _aggregate_material_utilization_summaries(
+    summaries: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """聚合多份施组评分的资料利用统计，便于前端直接展示。"""
+    by_type: Dict[str, Dict[str, int]] = {}
+    available_types: List[str] = []
+    uncovered_types: List[str] = []
+    retrieval_total = 0
+    retrieval_hit = 0
+    consistency_total = 0
+    consistency_hit = 0
+    fallback_total = 0
+    fallback_hit = 0
+
+    def _rate(hit_cnt: int, total_cnt: int) -> Optional[float]:
+        if total_cnt <= 0:
+            return None
+        return round(float(hit_cnt) / float(total_cnt), 4)
+
+    def _ensure_bucket(material_type: str) -> Dict[str, int]:
+        if material_type not in by_type:
+            by_type[material_type] = {
+                "retrieval_total": 0,
+                "retrieval_hit": 0,
+                "consistency_total": 0,
+                "consistency_hit": 0,
+                "fallback_total": 0,
+                "fallback_hit": 0,
+            }
+        return by_type[material_type]
+
+    for raw in summaries:
+        if not isinstance(raw, dict):
+            continue
+        retrieval_total += int(_to_float_or_none(raw.get("retrieval_total")) or 0)
+        retrieval_hit += int(_to_float_or_none(raw.get("retrieval_hit")) or 0)
+        consistency_total += int(_to_float_or_none(raw.get("consistency_total")) or 0)
+        consistency_hit += int(_to_float_or_none(raw.get("consistency_hit")) or 0)
+
+        raw_types = raw.get("available_types")
+        if isinstance(raw_types, list):
+            for item in raw_types:
+                key = _normalize_material_type(item)
+                if key not in available_types:
+                    available_types.append(key)
+                    _ensure_bucket(key)
+
+        raw_uncovered = raw.get("uncovered_types")
+        if isinstance(raw_uncovered, list):
+            for item in raw_uncovered:
+                key = _normalize_material_type(item)
+                if key not in uncovered_types:
+                    uncovered_types.append(key)
+
+        raw_by_type = raw.get("by_type")
+        if not isinstance(raw_by_type, dict):
+            continue
+        for mat_type_raw, row in raw_by_type.items():
+            key = _normalize_material_type(mat_type_raw)
+            bucket = _ensure_bucket(key)
+            row_dict = row if isinstance(row, dict) else {}
+            rt = int(_to_float_or_none(row_dict.get("retrieval_total")) or 0)
+            rh = int(_to_float_or_none(row_dict.get("retrieval_hit")) or 0)
+            ct = int(_to_float_or_none(row_dict.get("consistency_total")) or 0)
+            ch = int(_to_float_or_none(row_dict.get("consistency_hit")) or 0)
+            ft = int(_to_float_or_none(row_dict.get("fallback_total")) or 0)
+            fh = int(_to_float_or_none(row_dict.get("fallback_hit")) or 0)
+            bucket["retrieval_total"] += rt
+            bucket["retrieval_hit"] += rh
+            bucket["consistency_total"] += ct
+            bucket["consistency_hit"] += ch
+            bucket["fallback_total"] += ft
+            bucket["fallback_hit"] += fh
+            fallback_total += ft
+            fallback_hit += fh
+
+    normalized_by_type: Dict[str, Dict[str, object]] = {}
+    for mat_type, row in by_type.items():
+        normalized_by_type[mat_type] = {
+            "retrieval_total": row["retrieval_total"],
+            "retrieval_hit": row["retrieval_hit"],
+            "retrieval_hit_rate": _rate(row["retrieval_hit"], row["retrieval_total"]),
+            "consistency_total": row["consistency_total"],
+            "consistency_hit": row["consistency_hit"],
+            "consistency_hit_rate": _rate(row["consistency_hit"], row["consistency_total"]),
+            "fallback_total": row["fallback_total"],
+            "fallback_hit": row["fallback_hit"],
+            "fallback_hit_rate": _rate(row["fallback_hit"], row["fallback_total"]),
+        }
+
+    return {
+        "retrieval_total": retrieval_total,
+        "retrieval_hit": retrieval_hit,
+        "retrieval_hit_rate": _rate(retrieval_hit, retrieval_total),
+        "consistency_total": consistency_total,
+        "consistency_hit": consistency_hit,
+        "consistency_hit_rate": _rate(consistency_hit, consistency_total),
+        "fallback_total": fallback_total,
+        "fallback_hit": fallback_hit,
+        "fallback_hit_rate": _rate(fallback_hit, fallback_total),
+        "by_type": normalized_by_type,
+        "available_types": available_types,
+        "uncovered_types": uncovered_types,
+    }
+
+
+def _build_material_utilization_alerts(
+    summary: Optional[Dict[str, object]],
+    material_gate: Optional[Dict[str, object]] = None,
+) -> List[str]:
+    """将资料利用统计转换为可读预警，提醒评分依据是否充分。"""
+    data = summary if isinstance(summary, dict) else {}
+    alerts: List[str] = []
+
+    retrieval_total = int(_to_float_or_none(data.get("retrieval_total")) or 0)
+    retrieval_hit_rate = _to_float_or_none(data.get("retrieval_hit_rate"))
+    consistency_total = int(_to_float_or_none(data.get("consistency_total")) or 0)
+    consistency_hit_rate = _to_float_or_none(data.get("consistency_hit_rate"))
+    fallback_total = int(_to_float_or_none(data.get("fallback_total")) or 0)
+    fallback_hit = int(_to_float_or_none(data.get("fallback_hit")) or 0)
+
+    if retrieval_total <= 0:
+        alerts.append("评分未命中任何资料检索锚点，资料引用不足。")
+    elif retrieval_hit_rate is not None and retrieval_total >= 4 and retrieval_hit_rate < 0.35:
+        alerts.append(
+            f"资料检索命中率偏低（{retrieval_hit_rate * 100:.1f}%），建议补充可检索的量化表述。"
+        )
+
+    if consistency_total > 0 and consistency_hit_rate is not None and consistency_hit_rate < 0.35:
+        alerts.append(
+            f"跨资料一致性命中率偏低（{consistency_hit_rate * 100:.1f}%），请核对工期/质量/危大工程等关键约束。"
+        )
+
+    if fallback_total > 0 and fallback_hit <= 0:
+        alerts.append("仅触发了关键词兜底匹配且未命中，说明施组与项目资料耦合不足。")
+
+    uncovered_raw = data.get("uncovered_types")
+    uncovered_types = uncovered_raw if isinstance(uncovered_raw, list) else []
+    if uncovered_types:
+        labels = [
+            _material_type_label(_normalize_material_type(item)) for item in uncovered_types[:4]
+        ]
+        alerts.append("以下资料类型未形成有效评分证据：" + "、".join(labels))
+
+    gate = material_gate if isinstance(material_gate, dict) else {}
+    if gate and not bool(gate.get("passed", True)):
+        issues = gate.get("issues") if isinstance(gate.get("issues"), list) else []
+        issue_text = "；".join(str(x) for x in issues[:2]) if issues else "资料门禁未通过"
+        alerts.append("资料门禁警告：" + issue_text)
+
+    deduped: List[str] = []
+    for item in alerts:
+        text = str(item or "").strip()
+        if text and text not in deduped:
+            deduped.append(text)
+    return deduped[:6]
 
 
 def _get_rubric_dim_cfg(rubric_dimensions: Dict[str, object], dim_id: str) -> Dict[str, object]:
@@ -2081,6 +2246,12 @@ def _score_submission_for_project(
         gate_obj = snapshot_for_meta.get("gate")
         if isinstance(gate_obj, dict):
             report_meta["material_gate"] = gate_obj
+        report_meta["material_utilization_alerts"] = _build_material_utilization_alerts(
+            report_meta.get("material_utilization")
+            if isinstance(report_meta.get("material_utilization"), dict)
+            else {},
+            gate_obj if isinstance(gate_obj, dict) else {},
+        )
         report["meta"] = report_meta
         _apply_deployed_patch_to_report(project_id, report)
         submission_like = {"id": submission_id, "project_id": project_id, "text": text}
@@ -3854,6 +4025,8 @@ def rescore_project_submissions(
     score_reports = load_score_reports()
     all_evidence_units = load_evidence_units()
     generated = 0
+    material_utilization_summaries: List[Dict[str, object]] = []
+    material_utilization_by_submission: List[Dict[str, object]] = []
     now = _now_iso()
     for submission in targets:
         text = submission.get("text") or ""
@@ -3884,6 +4057,18 @@ def rescore_project_submissions(
         report_meta["score_scale_max"] = score_scale_max
         report_meta["score_scale_label"] = _score_scale_label(score_scale_max)
         report["meta"] = report_meta
+        material_utilization = report_meta.get("material_utilization")
+        if isinstance(material_utilization, dict):
+            material_utilization_summaries.append(material_utilization)
+            detail_item: Dict[str, object] = {
+                "submission_id": str(submission.get("id") or ""),
+                "filename": str(submission.get("filename") or ""),
+                "summary": material_utilization,
+            }
+            alerts = report_meta.get("material_utilization_alerts")
+            if isinstance(alerts, list):
+                detail_item["alerts"] = [str(x) for x in alerts[:6] if str(x).strip()]
+            material_utilization_by_submission.append(detail_item)
 
         submission["report"] = report
         submission["total_score"] = float(
@@ -3928,6 +4113,17 @@ def rescore_project_submissions(
         _run_feedback_closed_loop(project_id, locale=locale, trigger="rescore")
     except Exception:
         pass
+    material_utilization = _aggregate_material_utilization_summaries(material_utilization_summaries)
+    material_gate = (
+        material_quality_snapshot.get("gate")
+        if isinstance(material_quality_snapshot, dict)
+        and isinstance(material_quality_snapshot.get("gate"), dict)
+        else {}
+    )
+    material_utilization_alerts = _build_material_utilization_alerts(
+        material_utilization,
+        material_gate if isinstance(material_gate, dict) else {},
+    )
 
     return RescoreResponse(
         ok=True,
@@ -3938,6 +4134,9 @@ def rescore_project_submissions(
         reports_generated=generated,
         score_scale_max=score_scale_max,
         score_scale_label=_score_scale_label(score_scale_max),
+        material_utilization=material_utilization,
+        material_utilization_alerts=material_utilization_alerts,
+        material_utilization_by_submission=material_utilization_by_submission[:20],
         started_at=started_at,
         finished_at=_now_iso(),
     )
@@ -9781,6 +9980,7 @@ def index(
             <span class="note">支持一次选择多个文件（Mac 按 Command，Windows 按 Ctrl）。</span>
           </form>
           <p id="shigongActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
+          <div id="materialUtilizationResult" class="result-block" style="display:none"></div>
         </div>
       </div>
 
@@ -10171,6 +10371,9 @@ def index(
               );
               const scaleLabel = (data && data.score_scale_label) ? String(data.score_scale_label) : selectedScoreScaleLabel();
               fallbackSetResult(resultId, '评分完成（' + scaleLabel + '）：已重算 ' + updated + ' 份。', false);
+              if (window.renderMaterialUtilizationPanel && typeof window.renderMaterialUtilizationPanel === 'function') {
+                window.renderMaterialUtilizationPanel(data || {});
+              }
               return true;
             }
             if (aid === 'btnUploadMaterials' || aid === 'btnUploadBoq' || aid === 'btnUploadDrawing' || aid === 'btnUploadSitePhotos' || aid === 'btnUploadShigong' || aid === 'btnScoreShigong' || aid === 'btnLearning' || aid === 'btnEvolve' || aid === 'btnRefreshGroundTruth' || aid === 'btnUploadFeed' || aid === 'btnAddGroundTruth' || aid === 'btnRefreshFeedMaterials' || aid === 'btnWritingGuidance' || aid === 'btnCompilationInstructions') {
@@ -10288,6 +10491,9 @@ def index(
                 emptyEl.textContent = '暂无施组，请下方添加。';
                 emptyEl.style.display = 'block';
               }
+              if (window.renderMaterialUtilizationPanel && typeof window.renderMaterialUtilizationPanel === 'function') {
+                window.renderMaterialUtilizationPanel(null);
+              }
               return;
             }
             if (emptyEl) emptyEl.style.display = 'none';
@@ -10321,6 +10527,23 @@ def index(
                 + '<td><button type="button" class="btn-danger js-delete-submission" data-submission-id="' + sid + '" data-filename="' + fn + '">删除</button></td>';
               if (tbody) tbody.appendChild(tr);
             });
+            if (window.renderMaterialUtilizationPanel && typeof window.renderMaterialUtilizationPanel === 'function') {
+              let utilPayload = null;
+              for (const s of rows) {
+                const rep = (s && typeof s === 'object') ? (s.report || {}) : {};
+                const meta = (rep && typeof rep.meta === 'object') ? rep.meta : {};
+                const util = (meta && typeof meta.material_utilization === 'object') ? meta.material_utilization : null;
+                if (!util) continue;
+                utilPayload = {
+                  material_utilization: util,
+                  material_utilization_alerts: Array.isArray(meta.material_utilization_alerts)
+                    ? meta.material_utilization_alerts
+                    : [],
+                };
+                break;
+              }
+              if (utilPayload) window.renderMaterialUtilizationPanel(utilPayload);
+            }
           }
           async function fallbackRefreshAfter(actionId) {
             const projectId = fallbackGetProjectId();
@@ -10943,6 +11166,7 @@ def index(
             hasProject ? '待机：正在加载当前项目真实评标记录…' : '暂无真实评标，请先选择项目。'
           );
           [
+            'materialUtilizationResult',
             'compareResult', 'compareReportResult', 'insightsResult', 'learningResult',
             'adaptiveResult', 'adaptivePatchResult', 'adaptiveValidateResult', 'adaptiveApplyResult',
             'evolveResult', 'guidanceResult', 'compilationInstructionsResult',
@@ -11217,6 +11441,9 @@ def index(
           );
           const out = document.getElementById('output');
           if (out) out.textContent = JSON.stringify(data, null, 2);
+          if (typeof renderMaterialUtilizationPanel === 'function') {
+            renderMaterialUtilizationPanel(data || {});
+          }
           if (typeof refreshSubmissions === 'function') await refreshSubmissions();
           if (typeof refreshMaterials === 'function') await refreshMaterials();
         }
@@ -11925,6 +12152,9 @@ def index(
             const doneScaleLabel = (data && data.score_scale_label) ? String(data.score_scale_label) : scaleLabel;
             if (o) o.textContent = '施组评分完成（' + doneScaleLabel + '）：已重算 ' + updated + ' 份。';
             setActionStatus('shigongActionStatus', '评分完成（' + doneScaleLabel + '）：已重算 ' + updated + ' 份。', false);
+            if (typeof renderMaterialUtilizationPanel === 'function') {
+              renderMaterialUtilizationPanel(data || {});
+            }
             await refreshSubmissions(projectId, projectSwitchSeq);
           } finally {
             scoreShigongInFlight = false;
@@ -12039,6 +12269,7 @@ def index(
               emptyEl.textContent = '暂无施组，请先选择项目。';
               emptyEl.style.display = 'block';
             }
+            if (typeof clearMaterialUtilizationPanel === 'function') clearMaterialUtilizationPanel();
             return;
           }
           let res;
@@ -12059,6 +12290,7 @@ def index(
               emptyEl.textContent = '施组列表加载失败（HTTP ' + String(res.status || 0) + '）';
               emptyEl.style.display = 'block';
             }
+            if (typeof clearMaterialUtilizationPanel === 'function') clearMaterialUtilizationPanel();
             return;
           }
           if (!Array.isArray(subs) || subs.length === 0) {
@@ -12066,6 +12298,7 @@ def index(
               emptyEl.textContent = '暂无施组，请下方添加。';
               emptyEl.style.display = 'block';
             }
+            if (typeof clearMaterialUtilizationPanel === 'function') clearMaterialUtilizationPanel();
             return;
           }
           if (emptyEl) emptyEl.style.display = 'none';
@@ -12096,6 +12329,24 @@ def index(
               '<td><button type="button" class="btn-danger js-delete-submission" data-submission-id="' + escapeHtmlText(String(s.id || '')) + '" data-filename="' + escapeHtmlText(String(s.filename || '')) + '">删除</button></td>';
             if (tbody) tbody.appendChild(tr);
           });
+          let utilPayload = null;
+          for (const s of subs) {
+            const rep = (s && typeof s === 'object') ? (s.report || {}) : {};
+            const meta = (rep && typeof rep.meta === 'object') ? rep.meta : {};
+            const util = (meta && typeof meta.material_utilization === 'object') ? meta.material_utilization : null;
+            if (!util) continue;
+            utilPayload = {
+              material_utilization: util,
+              material_utilization_alerts: Array.isArray(meta.material_utilization_alerts)
+                ? meta.material_utilization_alerts
+                : [],
+            };
+            break;
+          }
+          if (typeof renderMaterialUtilizationPanel === 'function') {
+            if (utilPayload) renderMaterialUtilizationPanel(utilPayload);
+            else clearMaterialUtilizationPanel();
+          }
           updateTableEmptyState('submissionsTable', 'submissionsEmpty');
           await refreshGroundTruthSubmissionOptions(id, switchSeq);
         }
@@ -12409,6 +12660,101 @@ def index(
             .replace(/\"/g, '&quot;')
             .replace(/'/g, '&#39;');
         }
+        function materialTypeDisplayName(materialType) {
+          const t = String(materialType || '').trim();
+          if (t === 'tender_qa') return '招标文件和答疑';
+          if (t === 'boq') return '清单';
+          if (t === 'drawing') return '图纸';
+          if (t === 'site_photo') return '现场照片';
+          return t || '项目资料';
+        }
+        function clearMaterialUtilizationPanel() {
+          const el = document.getElementById('materialUtilizationResult');
+          if (!el) return;
+          el.style.display = 'none';
+          el.innerHTML = '';
+        }
+        function renderMaterialUtilizationPanel(payload) {
+          const el = document.getElementById('materialUtilizationResult');
+          if (!el) return;
+          const source = (payload && typeof payload === 'object') ? payload : {};
+          const summary = (source.material_utilization && typeof source.material_utilization === 'object')
+            ? source.material_utilization
+            : (source.by_type ? source : null);
+          if (!summary) {
+            clearMaterialUtilizationPanel();
+            return;
+          }
+          const retrievalTotal = Number(summary.retrieval_total || 0);
+          const retrievalHit = Number(summary.retrieval_hit || 0);
+          const consistencyTotal = Number(summary.consistency_total || 0);
+          const consistencyHit = Number(summary.consistency_hit || 0);
+          const fallbackTotal = Number(summary.fallback_total || 0);
+          const fallbackHit = Number(summary.fallback_hit || 0);
+          const byType = (summary.by_type && typeof summary.by_type === 'object') ? summary.by_type : {};
+          const availableTypes = Array.isArray(summary.available_types) ? summary.available_types : [];
+          const uncoveredTypes = Array.isArray(summary.uncovered_types) ? summary.uncovered_types : [];
+          const alerts = Array.isArray(source.material_utilization_alerts)
+            ? source.material_utilization_alerts
+            : (Array.isArray(source.alerts) ? source.alerts : []);
+          const toPct = (v) => {
+            const n = Number(v);
+            return Number.isFinite(n) ? (n * 100).toFixed(1) + '%' : '-';
+          };
+
+          const orderedTypes = [];
+          availableTypes.forEach((t) => {
+            const key = String(t || '').trim();
+            if (key && !orderedTypes.includes(key)) orderedTypes.push(key);
+          });
+          Object.keys(byType).forEach((t) => {
+            const key = String(t || '').trim();
+            if (key && !orderedTypes.includes(key)) orderedTypes.push(key);
+          });
+
+          let html =
+            '<strong>资料利用审计（本次评分）</strong>'
+            + '<table><tr><th>维度</th><th>命中/总数</th><th>命中率</th></tr>'
+            + '<tr><td>资料检索锚点</td><td>' + escapeHtmlText(retrievalHit) + ' / ' + escapeHtmlText(retrievalTotal) + '</td><td>' + escapeHtmlText(toPct(summary.retrieval_hit_rate)) + '</td></tr>'
+            + '<tr><td>跨资料一致性</td><td>' + escapeHtmlText(consistencyHit) + ' / ' + escapeHtmlText(consistencyTotal) + '</td><td>' + escapeHtmlText(toPct(summary.consistency_hit_rate)) + '</td></tr>'
+            + '<tr><td>关键词兜底</td><td>' + escapeHtmlText(fallbackHit) + ' / ' + escapeHtmlText(fallbackTotal) + '</td><td>' + escapeHtmlText(toPct(summary.fallback_hit_rate)) + '</td></tr>'
+            + '</table>';
+
+          if (orderedTypes.length) {
+            html += '<details open style="margin-top:8px"><summary>按资料类型查看命中情况</summary>';
+            html += '<table><tr><th>资料类型</th><th>检索命中/总数</th><th>一致性命中/总数</th><th>兜底命中/总数</th></tr>';
+            html += orderedTypes.map((t) => {
+              const row = (byType[t] && typeof byType[t] === 'object') ? byType[t] : {};
+              const rt = Number(row.retrieval_total || 0);
+              const rh = Number(row.retrieval_hit || 0);
+              const ct = Number(row.consistency_total || 0);
+              const ch = Number(row.consistency_hit || 0);
+              const ft = Number(row.fallback_total || 0);
+              const fh = Number(row.fallback_hit || 0);
+              return '<tr>'
+                + '<td>' + escapeHtmlText(materialTypeDisplayName(t)) + '</td>'
+                + '<td>' + escapeHtmlText(rh) + ' / ' + escapeHtmlText(rt) + '</td>'
+                + '<td>' + escapeHtmlText(ch) + ' / ' + escapeHtmlText(ct) + '</td>'
+                + '<td>' + escapeHtmlText(fh) + ' / ' + escapeHtmlText(ft) + '</td>'
+                + '</tr>';
+            }).join('');
+            html += '</table></details>';
+          }
+
+          if (uncoveredTypes.length) {
+            html += '<p class="error" style="margin-top:8px">未形成有效评分证据的资料类型：'
+              + escapeHtmlText(uncoveredTypes.map(materialTypeDisplayName).join('、'))
+              + '</p>';
+          }
+          if (alerts.length) {
+            html += '<ul style="margin:6px 0 0 18px;color:#9f1239">'
+              + alerts.map((a) => '<li>' + escapeHtmlText(a) + '</li>').join('')
+              + '</ul>';
+          }
+          el.style.display = 'block';
+          el.innerHTML = html;
+        }
+        window.renderMaterialUtilizationPanel = renderMaterialUtilizationPanel;
         function setResultLoading(resultId, label) {
           const el = document.getElementById(resultId);
           if (!el) return;

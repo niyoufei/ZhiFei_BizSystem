@@ -833,6 +833,8 @@ class TestExpertProfileEndpoints:
         assert data["reports_generated"] == 1
         assert data["score_scale_max"] == 5
         assert data["score_scale_label"] == "5分制"
+        assert "material_utilization" in data
+        assert "material_utilization_alerts" in data
         mock_save_submissions.assert_called_once()
         mock_save_score_reports.assert_called_once()
         mock_record_history.assert_called_once()
@@ -1534,6 +1536,72 @@ class TestMaterialAdvancedParsing:
         assert summary["retrieval_hit"] == 1
         assert "boq" in (summary.get("uncovered_types") or [])
         assert "drawing" in (summary.get("uncovered_types") or [])
+        assert summary["fallback_total"] == 1
+        assert summary["fallback_hit"] == 0
+
+    def test_aggregate_material_utilization_summaries(self):
+        from app.main import _aggregate_material_utilization_summaries
+
+        merged = _aggregate_material_utilization_summaries(
+            [
+                {
+                    "retrieval_total": 2,
+                    "retrieval_hit": 1,
+                    "consistency_total": 2,
+                    "consistency_hit": 1,
+                    "fallback_total": 1,
+                    "fallback_hit": 0,
+                    "available_types": ["tender_qa", "boq"],
+                    "uncovered_types": ["boq"],
+                    "by_type": {
+                        "tender_qa": {
+                            "retrieval_total": 2,
+                            "retrieval_hit": 1,
+                            "consistency_total": 1,
+                            "consistency_hit": 1,
+                            "fallback_total": 0,
+                            "fallback_hit": 0,
+                        },
+                        "boq": {
+                            "retrieval_total": 0,
+                            "retrieval_hit": 0,
+                            "consistency_total": 1,
+                            "consistency_hit": 0,
+                            "fallback_total": 1,
+                            "fallback_hit": 0,
+                        },
+                    },
+                },
+                {
+                    "retrieval_total": 1,
+                    "retrieval_hit": 1,
+                    "consistency_total": 1,
+                    "consistency_hit": 1,
+                    "fallback_total": 0,
+                    "fallback_hit": 0,
+                    "available_types": ["drawing"],
+                    "uncovered_types": [],
+                    "by_type": {
+                        "drawing": {
+                            "retrieval_total": 1,
+                            "retrieval_hit": 1,
+                            "consistency_total": 1,
+                            "consistency_hit": 1,
+                            "fallback_total": 0,
+                            "fallback_hit": 0,
+                        }
+                    },
+                },
+            ]
+        )
+        assert merged["retrieval_total"] == 3
+        assert merged["retrieval_hit"] == 2
+        assert merged["consistency_total"] == 3
+        assert merged["consistency_hit"] == 2
+        assert merged["fallback_total"] == 1
+        assert merged["fallback_hit"] == 0
+        assert "boq" in (merged.get("uncovered_types") or [])
+        assert "drawing" in (merged.get("available_types") or [])
 
 
 class TestScoreForProjectEndpoint:
