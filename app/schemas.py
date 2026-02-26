@@ -315,6 +315,20 @@ class RescoreResponse(BaseModel):
     finished_at: str
 
 
+class ScoringReadinessResponse(BaseModel):
+    project_id: str
+    ready: bool = Field(..., description="是否满足评分前置条件")
+    score_button_enabled: bool = Field(..., description="前端是否应允许点击评分")
+    gate_passed: bool = Field(..., description="资料门禁是否通过")
+    issues: List[str] = Field(default_factory=list, description="阻断原因列表")
+    warnings: List[str] = Field(default_factory=list, description="提醒信息")
+    material_quality: Dict[str, Any] = Field(default_factory=dict)
+    material_gate: Dict[str, Any] = Field(default_factory=dict)
+    submissions: Dict[str, Any] = Field(default_factory=dict)
+    retrieval_policy: Dict[str, Any] = Field(default_factory=dict)
+    generated_at: str
+
+
 class QingTianResultCreate(BaseModel):
     qingtian_model_version: Optional[str] = Field(None, description="青天模型版本")
     qt_total_score: float = Field(..., description="青天总分(0..100)")

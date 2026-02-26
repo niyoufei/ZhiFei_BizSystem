@@ -1111,6 +1111,109 @@ class TestMaterialsEndpoint:
         assert data["gate"]["passed"] is True
         mock_material_gate.assert_called_once()
 
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_scoring_readiness_project_not_found(self, mock_ensure, mock_load_projects, client):
+        mock_load_projects.return_value = []
+        response = client.get("/api/v1/projects/nonexistent/scoring_readiness")
+        assert response.status_code == 404
+        assert "项目不存在" in response.json()["detail"]
+
+    @patch("app.main._now_iso", return_value="2026-02-26T00:00:00+00:00")
+    @patch("app.main._submission_is_scored")
+    @patch("app.main.load_submissions")
+    @patch("app.main._resolve_material_utilization_policy")
+    @patch("app.main._validate_material_gate_for_scoring")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_scoring_readiness_blocked_when_gate_failed(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_material_gate,
+        mock_resolve_policy,
+        mock_load_submissions,
+        mock_submission_is_scored,
+        mock_now_iso,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_material_gate.return_value = (
+            {
+                "project_id": "p1",
+                "total_files": 2,
+                "parsed_ok_files": 1,
+                "parse_fail_ratio": 0.5,
+                "gate": {"passed": False, "issues": ["缺少必需资料类型：图纸"]},
+            },
+            ["缺少必需资料类型：图纸"],
+        )
+        mock_resolve_policy.return_value = {"required_types": ["tender_qa", "drawing"]}
+        mock_load_submissions.return_value = [
+            {"id": "s1", "project_id": "p1", "text": "施组内容"},
+            {"id": "s2", "project_id": "p1", "text": ""},
+        ]
+        mock_submission_is_scored.side_effect = [False, False]
+
+        response = client.get("/api/v1/projects/p1/scoring_readiness")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["ready"] is False
+        assert data["score_button_enabled"] is False
+        assert data["gate_passed"] is False
+        assert data["issues"] == ["缺少必需资料类型：图纸"]
+        assert data["submissions"]["total"] == 2
+        assert data["submissions"]["non_empty"] == 1
+        assert data["submissions"]["scored"] == 0
+        assert data["generated_at"] == "2026-02-26T00:00:00+00:00"
+
+    @patch("app.main._now_iso", return_value="2026-02-26T00:00:00+00:00")
+    @patch("app.main._submission_is_scored")
+    @patch("app.main.load_submissions")
+    @patch("app.main._resolve_material_utilization_policy")
+    @patch("app.main._validate_material_gate_for_scoring")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_scoring_readiness_ready_when_gate_passed_and_submission_exists(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_material_gate,
+        mock_resolve_policy,
+        mock_load_submissions,
+        mock_submission_is_scored,
+        mock_now_iso,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_material_gate.return_value = (
+            {
+                "project_id": "p1",
+                "total_files": 4,
+                "parsed_ok_files": 4,
+                "parse_fail_ratio": 0.0,
+                "gate": {"passed": True, "issues": []},
+            },
+            [],
+        )
+        mock_resolve_policy.return_value = {"required_types": ["tender_qa", "boq", "drawing"]}
+        mock_load_submissions.return_value = [{"id": "s1", "project_id": "p1", "text": "施组内容"}]
+        mock_submission_is_scored.return_value = True
+
+        response = client.get("/api/v1/projects/p1/scoring_readiness")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["ready"] is True
+        assert data["score_button_enabled"] is True
+        assert data["gate_passed"] is True
+        assert data["issues"] == []
+        assert data["submissions"]["total"] == 1
+        assert data["submissions"]["non_empty"] == 1
+        assert data["submissions"]["scored"] == 1
+        assert data["generated_at"] == "2026-02-26T00:00:00+00:00"
+
     @patch("app.main.save_materials")
     @patch("app.main.load_materials")
     @patch("app.main.load_projects")

@@ -182,6 +182,7 @@ from app.schemas import (
     ScoreRequest,
     ScoringFactorsMarkdownResponse,
     ScoringFactorsResponse,
+    ScoringReadinessResponse,
     SelfCheckResponse,
     SubmissionRecord,
     TrendAnalysis,
@@ -1326,6 +1327,79 @@ def _build_material_utilization_summary(
         "by_type": by_type,
         "available_types": available_types,
         "uncovered_types": uncovered_types,
+    }
+
+
+def _build_evidence_trace_summary(report: Dict[str, object]) -> Dict[str, object]:
+    req_hits_raw = report.get("requirement_hits")
+    req_hits = req_hits_raw if isinstance(req_hits_raw, list) else []
+    total_requirements = 0
+    total_hits = 0
+    mandatory_total = 0
+    mandatory_hit = 0
+    runtime_hits = 0
+    source_pack_counter: Counter[str] = Counter()
+    source_file_hits: List[str] = []
+    preview_rows: List[Dict[str, object]] = []
+
+    for item in req_hits:
+        if not isinstance(item, dict):
+            continue
+        total_requirements += 1
+        mandatory = bool(item.get("mandatory"))
+        if mandatory:
+            mandatory_total += 1
+        if not bool(item.get("hit")):
+            continue
+        total_hits += 1
+        if mandatory:
+            mandatory_hit += 1
+
+        source_pack = str(item.get("source_pack_id") or "").strip() or "unknown"
+        source_pack_counter[source_pack] += 1
+        if source_pack in {"runtime_material_rag", "runtime_material_consistency"}:
+            runtime_hits += 1
+
+        source_filename = str(item.get("source_filename") or "").strip()
+        if not source_filename:
+            chunk_id = str(item.get("chunk_id") or "").strip()
+            if "#c" in chunk_id:
+                source_filename = chunk_id.split("#c", 1)[0].strip()
+        if source_filename and source_filename not in source_file_hits:
+            source_file_hits.append(source_filename)
+
+        if len(preview_rows) < 16:
+            preview_rows.append(
+                {
+                    "dimension_id": str(item.get("dimension_id") or ""),
+                    "label": str(item.get("label") or ""),
+                    "reason": str(item.get("reason") or ""),
+                    "mandatory": mandatory,
+                    "source_pack_id": source_pack,
+                    "material_type": str(item.get("material_type") or ""),
+                    "source_filename": source_filename,
+                    "chunk_id": str(item.get("chunk_id") or ""),
+                }
+            )
+
+    mandatory_hit_rate = (
+        round(float(mandatory_hit) / float(mandatory_total), 4) if mandatory_total > 0 else None
+    )
+    overall_hit_rate = (
+        round(float(total_hits) / float(total_requirements), 4) if total_requirements > 0 else None
+    )
+    return {
+        "total_requirements": total_requirements,
+        "total_hits": total_hits,
+        "overall_hit_rate": overall_hit_rate,
+        "mandatory_total": mandatory_total,
+        "mandatory_hit": mandatory_hit,
+        "mandatory_hit_rate": mandatory_hit_rate,
+        "runtime_material_hits": runtime_hits,
+        "source_files_hit": source_file_hits[:120],
+        "source_files_hit_count": len(source_file_hits),
+        "source_pack_hit_counts": dict(source_pack_counter),
+        "preview": preview_rows,
     }
 
 
@@ -2881,6 +2955,7 @@ def _score_submission_for_project(
             else {},
             gate_obj if isinstance(gate_obj, dict) else {},
         )
+        report_meta["evidence_trace"] = _build_evidence_trace_summary(report)
         if bool(utilization_gate.get("blocked")):
             report_meta["score_confidence_level"] = "low"
             report_meta["score_blocked_by_material_utilization"] = True
@@ -2934,6 +3009,7 @@ def _score_submission_for_project(
     if profile_snapshot:
         legacy["meta"]["expert_profile_snapshot"] = profile_snapshot
         legacy["meta"]["expert_profile_id"] = profile_snapshot.get("id")
+    legacy["meta"]["evidence_trace"] = _build_evidence_trace_summary(legacy)
     _apply_deployed_patch_to_report(project_id, legacy)
     _mark_report_scored(legacy, trigger="score_engine")
     return legacy, []
@@ -5439,6 +5515,26 @@ def get_materials_health(project_id: str, locale: str = Depends(get_locale)) -> 
 
 
 @router.get(
+    "/projects/{project_id}/scoring_readiness",
+    response_model=ScoringReadinessResponse,
+    tags=["项目管理"],
+    responses={**RESPONSES_404},
+)
+def get_scoring_readiness(
+    project_id: str, locale: str = Depends(get_locale)
+) -> ScoringReadinessResponse:
+    """评分前置检查：门禁 + 施组可评分状态。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    try:
+        project = _find_project(project_id, projects)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    payload = _build_scoring_readiness(project_id, project)
+    return ScoringReadinessResponse(**payload)
+
+
+@router.get(
     "/projects/{project_id}/anchors",
     response_model=list[ProjectAnchorRecord],
     tags=["项目管理"],
@@ -6819,6 +6915,53 @@ def _validate_material_gate_for_scoring(
         detail = "；".join(issues)
         raise HTTPException(status_code=422, detail=f"资料门禁未通过：{detail}")
     return snapshot, issues
+
+
+def _build_scoring_readiness(project_id: str, project: Dict[str, object]) -> Dict[str, object]:
+    snapshot, issues = _validate_material_gate_for_scoring(
+        project_id,
+        project,
+        raise_on_fail=False,
+    )
+    gate = snapshot.get("gate") if isinstance(snapshot.get("gate"), dict) else {}
+    gate_passed = bool(gate.get("passed", True))
+
+    submissions = [s for s in load_submissions() if str(s.get("project_id")) == project_id]
+    submission_count = len(submissions)
+    non_empty_submission_count = sum(1 for s in submissions if str(s.get("text") or "").strip())
+    scored_submission_count = sum(1 for s in submissions if _submission_is_scored(s))
+
+    warnings: List[str] = []
+    if non_empty_submission_count <= 0:
+        warnings.append("尚未上传施组文件，上传后才能执行评分。")
+    elif scored_submission_count <= 0:
+        warnings.append("当前施组尚未完成评分，可点击“评分施组”触发。")
+
+    parsed_ok_files = int(_to_float_or_none(snapshot.get("parsed_ok_files")) or 0)
+    total_files = int(_to_float_or_none(snapshot.get("total_files")) or 0)
+    if total_files > 0 and parsed_ok_files < total_files:
+        warnings.append(f"存在 {total_files - parsed_ok_files} 份资料解析失败，建议修复后再评分。")
+
+    ready = gate_passed and non_empty_submission_count > 0
+    issue_texts = [str(x).strip() for x in issues if str(x).strip()]
+
+    return {
+        "project_id": project_id,
+        "ready": ready,
+        "score_button_enabled": ready,
+        "gate_passed": gate_passed,
+        "issues": issue_texts,
+        "warnings": warnings[:8],
+        "material_quality": snapshot,
+        "material_gate": gate,
+        "submissions": {
+            "total": submission_count,
+            "non_empty": non_empty_submission_count,
+            "scored": scored_submission_count,
+        },
+        "retrieval_policy": _resolve_material_utilization_policy(project),
+        "generated_at": _now_iso(),
+    }
 
 
 def _compute_multipliers_hash(multipliers: dict) -> str:
@@ -10354,6 +10497,11 @@ def index(
                     else {}
                 )
                 util_blocked = bool(util_gate.get("blocked"))
+                evidence_trace = (
+                    report_meta.get("evidence_trace")
+                    if isinstance(report_meta.get("evidence_trace"), dict)
+                    else {}
+                )
                 primary_total = (
                     pred_total
                     if pred_total is not None
@@ -10375,6 +10523,18 @@ def index(
                 else:
                     score_cell = (
                         "-" if primary_total is None else html_lib.escape(str(primary_total))
+                    )
+                evidence_hits = int(_to_float_or_none(evidence_trace.get("total_hits")) or 0)
+                evidence_file_hits = int(
+                    _to_float_or_none(evidence_trace.get("source_files_hit_count")) or 0
+                )
+                if not is_pending and evidence_hits > 0:
+                    score_cell += (
+                        '<div class="note">证据命中: '
+                        + html_lib.escape(str(evidence_hits))
+                        + " 条 / 文件覆盖: "
+                        + html_lib.escape(str(evidence_file_hits))
+                        + " 份</div>"
                     )
                 if util_blocked:
                     score_cell += (
@@ -10781,6 +10941,7 @@ def index(
             <span class="note">支持一次选择多个文件（Mac 按 Command，Windows 按 Ctrl）。</span>
           </form>
           <p id="shigongActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
+          <div id="scoringReadinessResult" class="result-block" style="display:none"></div>
           <div id="materialUtilizationResult" class="result-block" style="display:none"></div>
         </div>
       </div>
@@ -11212,6 +11373,31 @@ def index(
             if (key) headers['X-API-Key'] = key;
             return headers;
           }
+          async function fallbackFetchScoringReadiness(projectId) {
+            const pid = String(projectId || '').trim();
+            if (!pid) return null;
+            let res;
+            let text = '';
+            let data = null;
+            try {
+              res = await fetch('/api/v1/projects/' + encodeURIComponent(pid) + '/scoring_readiness?t=' + Date.now(), {
+                method: 'GET',
+                headers: fallbackAuthHeaders(),
+                cache: 'no-store',
+              });
+              text = await res.text();
+              data = fallbackParseJson(text);
+            } catch (_) {
+              return null;
+            }
+            if (!res.ok || !data || typeof data !== 'object') {
+              return null;
+            }
+            if (window.renderScoringReadinessPanel && typeof window.renderScoringReadinessPanel === 'function') {
+              window.renderScoringReadinessPanel(data);
+            }
+            return data;
+          }
           async function fallbackRefreshMaterialsTable(projectId) {
             const pid = String(projectId || '').trim();
             if (!pid) return;
@@ -11296,6 +11482,7 @@ def index(
                 emptyEl.textContent = '施组列表加载失败（HTTP ' + String((res && res.status) || 0) + '）';
                 emptyEl.style.display = 'block';
               }
+              await fallbackFetchScoringReadiness(pid);
               return;
             }
             if (!rows.length) {
@@ -11306,6 +11493,7 @@ def index(
               if (window.renderMaterialUtilizationPanel && typeof window.renderMaterialUtilizationPanel === 'function') {
                 window.renderMaterialUtilizationPanel(null);
               }
+              await fallbackFetchScoringReadiness(pid);
               return;
             }
             if (emptyEl) emptyEl.style.display = 'none';
@@ -11325,6 +11513,9 @@ def index(
               const utilGate = (reportMeta && typeof reportMeta.material_utilization_gate === 'object')
                 ? reportMeta.material_utilization_gate
                 : {};
+              const evidenceTrace = (reportMeta && typeof reportMeta.evidence_trace === 'object')
+                ? reportMeta.evidence_trace
+                : {};
               const utilBlocked = !!(utilGate && utilGate.blocked);
               let scoreHtml = '-';
               if (isPending) {
@@ -11339,6 +11530,15 @@ def index(
                 if (notes.length) scoreHtml += '<div class="note">' + notes.join(' / ') + '</div>';
               } else if (s && s.total_score != null) {
                 scoreHtml = fallbackEscapeHtml(String(s.total_score));
+              }
+              const evidenceCount = Number(evidenceTrace.total_hits || 0);
+              const evidenceFileCount = Number(evidenceTrace.source_files_hit_count || 0);
+              if (!isPending && evidenceCount > 0) {
+                scoreHtml += '<div class="note">证据命中: '
+                  + fallbackEscapeHtml(String(evidenceCount))
+                  + ' 条 / 文件覆盖: '
+                  + fallbackEscapeHtml(String(evidenceFileCount))
+                  + ' 份</div>';
               }
               if (utilBlocked) {
                 scoreHtml += '<div class="error">资料利用门禁未达标（建议补齐资料后重评分）</div>';
@@ -11371,6 +11571,7 @@ def index(
               if (utilPayload) window.renderMaterialUtilizationPanel(utilPayload);
               else window.renderMaterialUtilizationPanel(null);
             }
+            await fallbackFetchScoringReadiness(pid);
           }
           async function fallbackRefreshAfter(actionId) {
             const projectId = fallbackGetProjectId();
@@ -11379,6 +11580,8 @@ def index(
               else await fallbackRefreshMaterialsTable(projectId);
               if (typeof refreshFeedMaterials === 'function') await Promise.resolve(refreshFeedMaterials(projectId));
               else await fallbackRefreshMaterialsTable(projectId);
+              if (typeof refreshScoringReadiness === 'function') await Promise.resolve(refreshScoringReadiness(projectId));
+              else await fallbackFetchScoringReadiness(projectId);
               return;
             }
             if (actionId === 'btnUploadShigong' || actionId === 'btnScoreShigong') {
@@ -11387,6 +11590,8 @@ def index(
               if (typeof refreshGroundTruthSubmissionOptions === 'function') {
                 await Promise.resolve(refreshGroundTruthSubmissionOptions(projectId));
               }
+              if (typeof refreshScoringReadiness === 'function') await Promise.resolve(refreshScoringReadiness(projectId));
+              else await fallbackFetchScoringReadiness(projectId);
               return;
             }
             if (actionId === 'btnUploadFeed') {
@@ -11582,6 +11787,17 @@ def index(
                 return false;
               }
             }
+            if (actionId === 'btnScoreShigong') {
+              const readiness = await fallbackFetchScoringReadiness(projectId);
+              if (readiness && readiness.ready === false) {
+                const issues = Array.isArray(readiness.issues) ? readiness.issues : [];
+                const reason = issues.length ? String(issues[0]) : '评分前置条件未满足';
+                const msg = '评分已阻止：' + reason;
+                fallbackSetResult(cfg.resultId, msg, true);
+                fallbackSetOutput('[' + actionId + '] ' + msg);
+                return false;
+              }
+            }
             const req = fallbackRenderPayloadForAction(actionId, projectId);
             let res;
             let text = '';
@@ -11671,6 +11887,8 @@ def index(
             } else if (kind === 'ground_truth' && typeof refreshGroundTruth === 'function') {
               refreshGroundTruth();
             }
+            if (typeof refreshScoringReadiness === 'function') refreshScoringReadiness(projectId);
+            else fallbackFetchScoringReadiness(projectId);
             return true;
           }
           window.__zhifeiFallbackClick = function (ev, actionId) {
@@ -11856,6 +12074,7 @@ def index(
         const DIM_IDS = Array.from({ length: 16 }, (_, i) => String(i + 1).padStart(2, '0'));
         let expertProfileLocked = false;
         let projectMetaById = {};
+        let scoringReadinessState = { project_id: '', ready: false, gate_passed: false, issues: [] };
         const PROJECT_REQUIRED_BUTTON_IDS = [
           'deleteCurrentProject', 'btnWeightsReset', 'btnWeightsSave', 'btnWeightsApply',
           'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
@@ -11993,6 +12212,7 @@ def index(
             hasProject ? '待机：正在加载当前项目真实评标记录…' : '暂无真实评标，请先选择项目。'
           );
           [
+            'scoringReadinessResult',
             'materialUtilizationResult',
             'compareResult', 'compareReportResult', 'insightsResult', 'learningResult',
             'adaptiveResult', 'adaptivePatchResult', 'adaptiveValidateResult', 'adaptiveApplyResult',
@@ -12571,6 +12791,7 @@ def index(
             (typeof loadExpertProfile === 'function') ? loadExpertProfile(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshSubmissions === 'function') ? refreshSubmissions(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshMaterials === 'function') ? refreshMaterials(selectedId, switchSeq) : Promise.resolve(),
+            (typeof refreshScoringReadiness === 'function') ? refreshScoringReadiness(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshFeedMaterials === 'function') ? refreshFeedMaterials(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshGroundTruth === 'function') ? refreshGroundTruth(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshGroundTruthSubmissionOptions === 'function') ? refreshGroundTruthSubmissionOptions(selectedId, switchSeq) : Promise.resolve(),
@@ -12954,6 +13175,23 @@ def index(
               setActionStatus('shigongActionStatus', '评分失败：请先选择项目。', true);
               return;
             }
+            if (typeof refreshScoringReadiness === 'function') {
+              await refreshScoringReadiness(projectId, projectSwitchSeq);
+            }
+            if (
+              scoringReadinessState
+              && String(scoringReadinessState.project_id || '') === String(projectId)
+              && !scoringReadinessState.ready
+            ) {
+              const firstIssue = Array.isArray(scoringReadinessState.issues) && scoringReadinessState.issues.length
+                ? String(scoringReadinessState.issues[0])
+                : '评分前置条件未满足';
+              const blockMsg = '评分已阻止：' + firstIssue;
+              const o = document.getElementById('output');
+              if (o) o.textContent = blockMsg;
+              setActionStatus('shigongActionStatus', blockMsg, true);
+              return;
+            }
             const o = document.getElementById('output');
             const scaleLabel = selectedScoreScaleLabel();
             if (o) o.textContent = '施组评分中（' + scaleLabel + '）...';
@@ -13004,6 +13242,9 @@ def index(
               renderMaterialUtilizationPanel(data || {});
             }
             await refreshSubmissions(projectId, projectSwitchSeq);
+            if (typeof refreshScoringReadiness === 'function') {
+              await refreshScoringReadiness(projectId, projectSwitchSeq);
+            }
           } finally {
             scoreShigongInFlight = false;
           }
@@ -13044,6 +13285,8 @@ def index(
           }
           if (rowEl) rowEl.remove();
           updateTableEmptyState('submissionsTable', 'submissionsEmpty');
+          if (typeof refreshScoringReadiness === 'function') refreshScoringReadiness();
+          if (typeof refreshGroundTruthSubmissionOptions === 'function') refreshGroundTruthSubmissionOptions();
           const out = document.getElementById('output');
           if (out) out.textContent = JSON.stringify({ ok: true, id: submissionId, filename: filename || '' }, null, 2);
         }
@@ -13073,6 +13316,7 @@ def index(
           if (rowEl) rowEl.remove();
           updateTableEmptyState('materialsTable', 'materialsEmpty');
           if (typeof refreshFeedMaterials === 'function') refreshFeedMaterials();
+          if (typeof refreshScoringReadiness === 'function') refreshScoringReadiness();
           const out = document.getElementById('output');
           if (out) out.textContent = JSON.stringify({ ok: true, id: materialId, filename: filename || '' }, null, 2);
         }
@@ -13118,6 +13362,7 @@ def index(
               emptyEl.style.display = 'block';
             }
             if (typeof clearMaterialUtilizationPanel === 'function') clearMaterialUtilizationPanel();
+            if (typeof clearScoringReadinessPanel === 'function') clearScoringReadinessPanel();
             return;
           }
           let res;
@@ -13139,6 +13384,7 @@ def index(
               emptyEl.style.display = 'block';
             }
             if (typeof clearMaterialUtilizationPanel === 'function') clearMaterialUtilizationPanel();
+            if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             return;
           }
           if (!Array.isArray(subs) || subs.length === 0) {
@@ -13147,6 +13393,7 @@ def index(
               emptyEl.style.display = 'block';
             }
             if (typeof clearMaterialUtilizationPanel === 'function') clearMaterialUtilizationPanel();
+            if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             return;
           }
           if (emptyEl) emptyEl.style.display = 'none';
@@ -13164,6 +13411,9 @@ def index(
               ? repMeta.material_utilization_gate
               : {};
             const utilBlocked = !!(utilGate && utilGate.blocked);
+            const evidenceTrace = (repMeta && typeof repMeta.evidence_trace === 'object')
+              ? repMeta.evidence_trace
+              : {};
             let scoreHtml = '-';
             if (isPending) {
               scoreHtml = '<span class="note">待评分</span>';
@@ -13177,6 +13427,11 @@ def index(
               if (notes.length) scoreHtml += '<div class="note">' + notes.join(' / ') + '</div>';
             } else if (s && s.total_score != null) {
               scoreHtml = escapeHtmlText(String(s.total_score));
+            }
+            const evidenceCount = Number(evidenceTrace.total_hits || 0);
+            const evidenceFileCount = Number(evidenceTrace.source_files_hit_count || 0);
+            if (!isPending && evidenceCount > 0) {
+              scoreHtml += '<div class="note">证据命中: ' + escapeHtmlText(evidenceCount) + ' 条 / 文件覆盖: ' + escapeHtmlText(evidenceFileCount) + ' 份</div>';
             }
             if (utilBlocked) {
               scoreHtml += '<div class="error">资料利用门禁未达标（建议补齐资料后重评分）</div>';
@@ -13210,6 +13465,7 @@ def index(
             else clearMaterialUtilizationPanel();
           }
           updateTableEmptyState('submissionsTable', 'submissionsEmpty');
+          if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
           await refreshGroundTruthSubmissionOptions(id, switchSeq);
         }
         async function refreshGroundTruthSubmissionOptions(expectedProjectId=null, switchSeq=null) {
@@ -13297,6 +13553,7 @@ def index(
               emptyEl.textContent = '暂无资料，请先选择项目。';
               emptyEl.style.display = 'block';
             }
+            if (typeof clearScoringReadinessPanel === 'function') clearScoringReadinessPanel();
             return;
           }
           let res;
@@ -13317,6 +13574,7 @@ def index(
               emptyEl.textContent = '资料列表加载失败（HTTP ' + String(res.status || 0) + '）';
               emptyEl.style.display = 'block';
             }
+            if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             return;
           }
           if (!Array.isArray(mats) || mats.length === 0) {
@@ -13324,6 +13582,7 @@ def index(
               emptyEl.textContent = '暂无资料，请下方添加。';
               emptyEl.style.display = 'block';
             }
+            if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             return;
           }
           if (emptyEl) emptyEl.style.display = 'none';
@@ -13338,6 +13597,7 @@ def index(
             if (tbody) tbody.appendChild(tr);
           });
           updateTableEmptyState('materialsTable', 'materialsEmpty');
+          if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
         }
         bindDeleteRowHandlers();
         const btnRefSub = document.getElementById('btnRefreshSubmissions');
@@ -13531,6 +13791,132 @@ def index(
           if (t === 'drawing') return '图纸';
           if (t === 'site_photo') return '现场照片';
           return t || '项目资料';
+        }
+        function applyScoringReadiness(payload) {
+          const data = (payload && typeof payload === 'object') ? payload : {};
+          const currentProjectId = pid();
+          const payloadProjectId = String(data.project_id || currentProjectId || '');
+          const ready = !!data.ready;
+          const gatePassed = !!data.gate_passed;
+          const issues = Array.isArray(data.issues) ? data.issues : [];
+          scoringReadinessState = {
+            project_id: payloadProjectId,
+            ready: ready,
+            gate_passed: gatePassed,
+            issues: issues,
+          };
+          const btn = document.getElementById('btnScoreShigong');
+          if (!btn) return;
+          const sameProject = payloadProjectId && currentProjectId && payloadProjectId === currentProjectId;
+          if (!sameProject) {
+            btn.disabled = !currentProjectId;
+            btn.title = currentProjectId ? '' : '请先选择项目';
+            return;
+          }
+          if (ready) {
+            btn.disabled = false;
+            btn.title = '';
+            return;
+          }
+          btn.disabled = true;
+          const reason = issues.length ? String(issues[0]) : '评分前置条件未满足';
+          btn.title = reason;
+        }
+        function clearScoringReadinessPanel() {
+          const el = document.getElementById('scoringReadinessResult');
+          if (!el) return;
+          el.style.display = 'none';
+          el.innerHTML = '';
+          applyScoringReadiness({ project_id: pid(), ready: false, gate_passed: false, issues: ['评分前置检查未完成'] });
+        }
+        function renderScoringReadinessPanel(payload) {
+          const el = document.getElementById('scoringReadinessResult');
+          if (!el) return;
+          const source = (payload && typeof payload === 'object') ? payload : {};
+          const issues = Array.isArray(source.issues) ? source.issues : [];
+          const warnings = Array.isArray(source.warnings) ? source.warnings : [];
+          const materialQuality = (source.material_quality && typeof source.material_quality === 'object')
+            ? source.material_quality
+            : {};
+          const gate = (source.material_gate && typeof source.material_gate === 'object')
+            ? source.material_gate
+            : {};
+          const submissions = (source.submissions && typeof source.submissions === 'object')
+            ? source.submissions
+            : {};
+          const toPct = (v) => {
+            const n = Number(v);
+            return Number.isFinite(n) ? (n * 100).toFixed(1) + '%' : '-';
+          };
+          let html = '<strong>评分前置检查</strong>';
+          if (source.ready) {
+            html += '<p class="success" style="margin:6px 0">已满足评分条件，可点击“评分施组”。</p>';
+          } else {
+            html += '<p class="error" style="margin:6px 0">暂不满足评分条件，请先补齐以下问题。</p>';
+          }
+          html += '<table><tr><th>检查项</th><th>状态</th><th>说明</th></tr>';
+          html += '<tr><td>资料门禁</td><td>' + (source.gate_passed ? '<span class="success">通过</span>' : '<span class="error">未通过</span>') + '</td><td>必需资料类型、解析字数、失败率</td></tr>';
+          html += '<tr><td>施组上传</td><td>' + (Number(submissions.non_empty || 0) > 0 ? '<span class="success">已上传</span>' : '<span class="error">缺失</span>') + '</td><td>已上传 ' + escapeHtmlText(submissions.non_empty || 0) + ' 份施组</td></tr>';
+          html += '<tr><td>资料解析质量</td><td>' + escapeHtmlText(materialQuality.parsed_ok_files || 0) + ' / ' + escapeHtmlText(materialQuality.total_files || 0) + '</td><td>失败率 ' + escapeHtmlText(toPct(materialQuality.parse_fail_ratio)) + '</td></tr>';
+          html += '</table>';
+          if (issues.length) {
+            html += '<ul style="margin:6px 0 0 18px;color:#9f1239">'
+              + issues.map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('')
+              + '</ul>';
+          }
+          if (warnings.length) {
+            html += '<ul style="margin:6px 0 0 18px;color:#92400e">'
+              + warnings.map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('')
+              + '</ul>';
+          }
+          if (gate && gate.required_types && Array.isArray(gate.required_types)) {
+            html += '<p style="margin-top:8px;font-size:12px;color:#334155">必需资料类型：'
+              + escapeHtmlText(gate.required_types.map(materialTypeDisplayName).join('、'))
+              + '</p>';
+          }
+          el.style.display = 'block';
+          el.innerHTML = html;
+          applyScoringReadiness(source);
+        }
+        async function refreshScoringReadiness(expectedProjectId=null, switchSeq=null) {
+          const id = expectedProjectId || pid();
+          if (!id) {
+            clearScoringReadinessPanel();
+            return;
+          }
+          let res;
+          try {
+            res = await fetch('/api/v1/projects/' + id + '/scoring_readiness?t=' + Date.now(), { cache: 'no-store' });
+          } catch (_) {
+            if (isStaleProjectResponse(id, switchSeq)) return;
+            renderScoringReadinessPanel({
+              project_id: id,
+              ready: false,
+              gate_passed: false,
+              issues: ['评分前置检查失败：无法连接服务'],
+              warnings: [],
+              material_quality: {},
+              material_gate: {},
+              submissions: {},
+            });
+            return;
+          }
+          if (isStaleProjectResponse(id, switchSeq)) return;
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || !data || typeof data !== 'object') {
+            renderScoringReadinessPanel({
+              project_id: id,
+              ready: false,
+              gate_passed: false,
+              issues: ['评分前置检查失败（HTTP ' + String((res && res.status) || 0) + '）'],
+              warnings: [],
+              material_quality: {},
+              material_gate: {},
+              submissions: {},
+            });
+            return;
+          }
+          renderScoringReadinessPanel(data);
         }
         function clearMaterialUtilizationPanel() {
           const el = document.getElementById('materialUtilizationResult');
