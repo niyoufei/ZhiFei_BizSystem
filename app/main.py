@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import csv
 import html as html_lib
 import io
 import json
 import os
+import re
 import shutil
+import subprocess
 import tempfile
 import unicodedata
+from collections import Counter
 from datetime import datetime, timezone
 
 # 加载 .env，使 SPARK_APIPASSWORD、OPENAI_API_KEY 等生效
@@ -723,6 +727,7 @@ def _build_runtime_custom_requirements(
     project_id: str,
     *,
     project: Dict[str, object],
+    submission_text: str = "",
 ) -> tuple[List[Dict[str, object]], Dict[str, object]]:
     evo = load_evolution_reports().get(project_id) or {}
     compilation = (
@@ -823,6 +828,14 @@ def _build_runtime_custom_requirements(
             kind="custom",
         )
 
+    retrieval_chunks = _select_material_retrieval_chunks(
+        project_id,
+        submission_text,
+        top_k=12,
+    )
+    retrieval_requirements = _build_material_retrieval_requirements(project_id, retrieval_chunks)
+    runtime_requirements.extend(retrieval_requirements)
+
     meta = {
         "required_sections": len(required_sections),
         "required_charts_images": len(required_charts),
@@ -830,6 +843,19 @@ def _build_runtime_custom_requirements(
         "custom_instruction_lines": len(custom_text_items),
         "runtime_custom_requirements": len(runtime_requirements),
         "project_context_chars": len(context_text),
+        "material_retrieval_chunks": len(retrieval_chunks),
+        "material_retrieval_requirements": len(retrieval_requirements),
+        "material_retrieval_preview": [
+            {
+                "material_type": c.get("material_type"),
+                "filename": c.get("filename"),
+                "chunk_id": c.get("chunk_id"),
+                "dimension_id": c.get("dimension_id"),
+                "score": c.get("score"),
+                "matched_terms": c.get("matched_terms"),
+            }
+            for c in retrieval_chunks[:8]
+        ],
     }
     return runtime_requirements, meta
 
@@ -1855,6 +1881,7 @@ def _score_submission_for_project(
         runtime_custom_requirements, runtime_req_meta = _build_runtime_custom_requirements(
             project_id,
             project=project,
+            submission_text=text,
         )
         effective_requirements = list(requirements) + list(runtime_custom_requirements)
         meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
@@ -1897,6 +1924,15 @@ def _score_submission_for_project(
             material_quality_snapshot=snapshot_for_meta,
         )
         report_meta["material_quality"] = snapshot_for_meta
+        report_meta["material_retrieval"] = {
+            "chunks": int(
+                _to_float_or_none(runtime_req_meta.get("material_retrieval_chunks")) or 0
+            ),
+            "requirements": int(
+                _to_float_or_none(runtime_req_meta.get("material_retrieval_requirements")) or 0
+            ),
+            "preview": runtime_req_meta.get("material_retrieval_preview") or [],
+        }
         gate_obj = snapshot_for_meta.get("gate")
         if isinstance(gate_obj, dict):
             report_meta["material_gate"] = gate_obj
@@ -4099,6 +4135,36 @@ MATERIAL_TYPE_ALLOWED_MIME_TOKENS: Dict[str, tuple[str, ...]] = {
 MATERIAL_ALLOWED_MIME_TOKENS = tuple(
     sorted({token for tokens in MATERIAL_TYPE_ALLOWED_MIME_TOKENS.values() for token in tokens})
 )
+MATERIAL_TYPE_DIMENSION_PRIORITY: Dict[str, List[str]] = {
+    "tender_qa": ["01", "08", "09", "07"],
+    "boq": ["13", "15", "11", "04"],
+    "drawing": ["14", "16", "07", "12"],
+    "site_photo": ["02", "03", "07", "08"],
+}
+MATERIAL_TYPE_KEYWORDS: Dict[str, List[str]] = {
+    "tender_qa": ["答疑", "澄清", "变更", "条款", "工期", "质量标准", "计价规则"],
+    "boq": ["清单", "工程量", "综合单价", "措施费", "暂估价", "设备", "甲供材"],
+    "drawing": ["图纸", "节点", "平面", "剖面", "BIM", "碰撞", "深化"],
+    "site_photo": ["现场", "照片", "临边", "扬尘", "消防", "高处", "塔吊"],
+}
+DIMENSION_RAG_KEYWORDS: Dict[str, List[str]] = {
+    "01": ["工程范围", "项目理解", "招标", "答疑", "澄清"],
+    "02": ["安全", "应急", "隐患", "临边", "高处", "消防"],
+    "03": ["文明施工", "扬尘", "噪声", "围挡", "环保"],
+    "04": ["材料", "部品", "进场", "验收", "周转"],
+    "05": ["新技术", "数字化", "智能建造", "BIM", "IoT"],
+    "06": ["关键工序", "工艺", "工法", "流程"],
+    "07": ["危大工程", "专项方案", "监测", "应急预案"],
+    "08": ["质量", "验收", "样板", "复检", "旁站"],
+    "09": ["进度", "工期", "里程碑", "关键线路", "节点"],
+    "10": ["专项施工", "模板", "吊装", "脚手架"],
+    "11": ["人力", "班组", "劳动力", "组织"],
+    "12": ["施工工艺", "总平面", "部署", "流水"],
+    "13": ["物资", "设备", "清单", "机械", "采购"],
+    "14": ["设计协调", "深化", "图纸", "碰撞", "会审"],
+    "15": ["配置计划", "资源计划", "工程量", "措施费"],
+    "16": ["技术措施", "可行性", "参数", "节点做法"],
+}
 
 
 def _normalize_uploaded_filename(filename: str) -> str:
@@ -4648,6 +4714,280 @@ def _extract_dxf_text(content: bytes) -> str:
     return "\n".join(summary_lines).strip()
 
 
+def _extract_dwg_text(content: bytes, filename: str) -> str:
+    """
+    DWG 预处理链：
+    1) 优先尝试系统级转换器将 DWG 转 DXF（若已安装）
+    2) 转换成功后复用 DXF 解析
+    3) 无转换器或转换失败时保留元信息并给出明确提示
+    """
+    converter_names = [
+        "dwg2dxf",
+        "ODAFileConverter",
+        "oda_file_converter",
+        "TeighaFileConverter",
+    ]
+    notes: List[str] = []
+    with tempfile.TemporaryDirectory(prefix="dwg_bridge_") as tmpdir:
+        tmp_root = Path(tmpdir)
+        input_dir = tmp_root / "in"
+        output_dir = tmp_root / "out"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        in_path = input_dir / _normalize_uploaded_filename(filename)
+        in_path.write_bytes(content)
+
+        for name in converter_names:
+            binary = shutil.which(name)
+            if not binary:
+                notes.append(f"{name}: not_found")
+                continue
+            try:
+                if name == "dwg2dxf":
+                    cmd = [binary, str(in_path), str(output_dir / f"{in_path.stem}.dxf")]
+                else:
+                    cmd = [
+                        binary,
+                        str(input_dir),
+                        str(output_dir),
+                        "ACAD2018",
+                        "DXF",
+                        "0",
+                        "1",
+                    ]
+                completed = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=40,
+                    check=False,
+                    text=True,
+                )
+                if completed.returncode != 0:
+                    err = (completed.stderr or completed.stdout or "").strip().splitlines()
+                    notes.append(f"{name}: rc={completed.returncode} {err[:1] if err else ''}")
+                    continue
+                dxf_candidates = sorted(output_dir.rglob("*.dxf"))
+                if not dxf_candidates:
+                    notes.append(f"{name}: no_dxf_output")
+                    continue
+                try:
+                    dxf_text = _extract_dxf_text(dxf_candidates[0].read_bytes())
+                except Exception as exc:  # noqa: BLE001 - converter output might be malformed
+                    notes.append(f"{name}: dxf_parse_failed {type(exc).__name__}: {exc}")
+                    continue
+                head = [
+                    f"[DWG预处理] 文件: {filename}",
+                    f"转换器: {Path(binary).name}",
+                    f"输出DXF: {dxf_candidates[0].name}",
+                ]
+                return "\n".join(head + ["", dxf_text]).strip()
+            except subprocess.TimeoutExpired:
+                notes.append(f"{name}: timeout")
+            except Exception as exc:  # noqa: BLE001 - continue next converter
+                notes.append(f"{name}: exception {type(exc).__name__}: {exc}")
+
+    notes_text = "；".join(notes[:6]) if notes else "未检测到可用转换器"
+    return (
+        f"[DWG图纸] 文件: {filename}，字节数: {len(content)}\n"
+        f"DWG预处理: {notes_text}\n"
+        "当前未完成结构化解析，建议同时上传 PDF 或 ASCII DXF 以提升评分准确性。"
+    )
+
+
+def _safe_float_from_cell(value: object) -> Optional[float]:
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except Exception:
+            return None
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    raw = raw.replace(",", "").replace("，", "")
+    if not re.fullmatch(r"[-+]?\d+(?:\.\d+)?", raw):
+        return None
+    try:
+        return float(raw)
+    except Exception:
+        return None
+
+
+def _extract_terms(text: str, *, max_terms: int = 40) -> List[str]:
+    tokens = re.findall(r"[A-Za-z]{3,}|[\u4e00-\u9fff]{2,8}", str(text or ""))
+    counter: Counter[str] = Counter()
+    stop_words = {"施工", "工程", "项目", "内容", "要求", "进行", "以及", "方案"}
+    for token in tokens:
+        key = token.strip().lower()
+        if not key:
+            continue
+        if key in stop_words:
+            continue
+        counter[key] += 1
+    return [k for k, _ in counter.most_common(max(1, int(max_terms)))]
+
+
+def _build_boq_structured_summary(
+    content: bytes,
+    filename: str,
+    *,
+    parsed_text: str = "",
+) -> Dict[str, object]:
+    summary: Dict[str, object] = {
+        "filename": filename,
+        "detected_format": Path(filename).suffix.lower().lstrip("."),
+    }
+    ext = Path(filename).suffix.lower()
+    header_alias = {
+        "code": ["项目编码", "清单编码", "编码", "子目号"],
+        "name": ["项目名称", "项目特征", "工程内容", "名称", "描述"],
+        "unit": ["单位"],
+        "quantity": ["工程量", "数量"],
+        "unit_price": ["综合单价", "单价"],
+        "amount": ["合价", "金额", "总价", "小计"],
+    }
+
+    def _find_col_map(header_row: List[str]) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        for idx, cell in enumerate(header_row):
+            s = str(cell or "").strip()
+            if not s:
+                continue
+            for field, aliases in header_alias.items():
+                if field in out:
+                    continue
+                if any(a in s for a in aliases):
+                    out[field] = idx
+        return out
+
+    def _sheet_struct_from_rows(rows: List[List[object]], sheet_name: str) -> Dict[str, object]:
+        header_idx = -1
+        col_map: Dict[str, int] = {}
+        for i, row in enumerate(rows[:40]):
+            str_row = [str(x or "").strip() for x in row]
+            maybe = _find_col_map(str_row)
+            if len(maybe) >= 2:
+                header_idx = i
+                col_map = maybe
+                break
+        if header_idx < 0:
+            return {
+                "sheet": sheet_name,
+                "parsed_items": 0,
+                "detected_columns": {},
+                "quantity_sum": 0.0,
+                "amount_sum": 0.0,
+                "top_items_by_amount": [],
+            }
+
+        parsed_items = 0
+        quantity_sum = 0.0
+        amount_sum = 0.0
+        unit_set: set[str] = set()
+        top_items: List[Dict[str, object]] = []
+        for row in rows[header_idx + 1 :]:
+            if not row:
+                continue
+
+            def _cell(name: str) -> object:
+                idx = col_map.get(name)
+                if idx is None or idx >= len(row):
+                    return ""
+                return row[idx]
+
+            code = str(_cell("code") or "").strip()
+            name = str(_cell("name") or "").strip()
+            if not code and not name:
+                continue
+            parsed_items += 1
+            unit = str(_cell("unit") or "").strip()
+            if unit:
+                unit_set.add(unit)
+            qty = _safe_float_from_cell(_cell("quantity"))
+            amt = _safe_float_from_cell(_cell("amount"))
+            if qty is not None:
+                quantity_sum += qty
+            if amt is not None:
+                amount_sum += amt
+            if name or code:
+                top_items.append(
+                    {
+                        "code": code,
+                        "name": name,
+                        "unit": unit,
+                        "quantity": round(float(qty), 4) if qty is not None else None,
+                        "amount": round(float(amt), 2) if amt is not None else None,
+                    }
+                )
+        top_items.sort(key=lambda x: float(x.get("amount") or 0.0), reverse=True)
+        return {
+            "sheet": sheet_name,
+            "parsed_items": parsed_items,
+            "detected_columns": col_map,
+            "quantity_sum": round(quantity_sum, 4),
+            "amount_sum": round(amount_sum, 2),
+            "units": sorted(unit_set)[:20],
+            "top_items_by_amount": top_items[:10],
+        }
+
+    if ext in {".xlsx", ".xls", ".xlsm"}:
+        try:
+            import openpyxl
+
+            wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+            sheet_summaries: List[Dict[str, object]] = []
+            total_items = 0
+            total_qty = 0.0
+            total_amt = 0.0
+            for sheet in wb.worksheets:
+                rows: List[List[object]] = []
+                for idx, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+                    rows.append(list(row))
+                    if idx >= 3000:
+                        break
+                sheet_summary = _sheet_struct_from_rows(rows, sheet.title)
+                sheet_summaries.append(sheet_summary)
+                total_items += int(sheet_summary.get("parsed_items", 0))
+                total_qty += float(sheet_summary.get("quantity_sum", 0.0))
+                total_amt += float(sheet_summary.get("amount_sum", 0.0))
+            wb.close()
+            summary["sheets"] = sheet_summaries
+            summary["total_parsed_items"] = total_items
+            summary["total_quantity"] = round(total_qty, 4)
+            summary["total_amount"] = round(total_amt, 2)
+            return summary
+        except Exception as exc:
+            summary["parse_error"] = f"excel_parse_failed: {type(exc).__name__}: {exc}"
+
+    if ext == ".csv":
+        try:
+            decoded = content.decode("utf-8", errors="ignore")
+            reader = csv.reader(io.StringIO(decoded))
+            rows = [list(r) for _, r in zip(range(3000), reader)]
+            csv_summary = _sheet_struct_from_rows(rows, "csv")
+            summary["sheets"] = [csv_summary]
+            summary["total_parsed_items"] = int(csv_summary.get("parsed_items", 0))
+            summary["total_quantity"] = float(csv_summary.get("quantity_sum", 0.0))
+            summary["total_amount"] = float(csv_summary.get("amount_sum", 0.0))
+            return summary
+        except Exception as exc:
+            summary["parse_error"] = f"csv_parse_failed: {type(exc).__name__}: {exc}"
+
+    # 兜底：从已解析文本里识别关键信号，至少提供结构化可见性。
+    text = str(parsed_text or "")
+    summary["keyword_hits"] = {
+        "工程量": len(re.findall(r"工程量|数量", text)),
+        "综合单价": len(re.findall(r"综合单价|单价", text)),
+        "合价金额": len(re.findall(r"合价|金额|总价|小计", text)),
+    }
+    summary["text_chars"] = len(text)
+    summary["signal_density"] = round(
+        (float(sum(summary["keyword_hits"].values())) / max(1.0, float(len(text) / 100.0))),
+        4,
+    )
+    return summary
+
+
 def _extract_binary_text_snippet(content: bytes, *, max_chars: int = 4000) -> str:
     decoded = content.decode("utf-8", errors="ignore")
     cleaned = "".join(ch if ch.isprintable() else " " for ch in decoded)
@@ -4761,7 +5101,7 @@ def _read_uploaded_file_content(content: bytes, filename: str) -> str:
         except Exception as e:
             raise ValueError(f"DXF 解析失败: {e}") from e
     if name.endswith(".dwg"):
-        return f"[DWG图纸] 文件: {filename}，字节数: {len(content)}（已纳入文件元信息，建议同步上传 PDF/DXF 便于文本解析）"
+        return _extract_dwg_text(content, filename)
     if name.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")):
         return _extract_image_content(content, filename)
     snippet = _extract_binary_text_snippet(content, max_chars=2000)
@@ -4810,7 +5150,19 @@ def _merge_materials_text(project_id: str) -> str:
                 content = p.read_bytes()
                 text = _read_uploaded_file_content(content, p.name).strip()
                 if text:
-                    section_lines.append(f"--- {p.name} ({created_at}) ---\n{text}")
+                    section_block = f"--- {p.name} ({created_at}) ---\n{text}"
+                    if mat_type == "boq":
+                        boq_struct = _build_boq_structured_summary(
+                            content,
+                            p.name,
+                            parsed_text=text,
+                        )
+                        section_block = (
+                            section_block
+                            + "\n\n[BOQ结构化摘要]\n"
+                            + json.dumps(boq_struct, ensure_ascii=False)
+                        )
+                    section_lines.append(section_block)
                 else:
                     section_lines.append(
                         f"--- {p.name} ({created_at}) ---\n[资料为空] 文件解析后为空内容。"
@@ -4821,6 +5173,152 @@ def _merge_materials_text(project_id: str) -> str:
                 )
         sections.append("\n\n".join(section_lines))
     return "\n\n".join(sections).strip()
+
+
+def _split_material_text_chunks(text: str, *, max_chars: int = 900) -> List[str]:
+    raw_parts = re.split(r"\n{2,}|[。！？]\s*", str(text or ""))
+    chunks: List[str] = []
+    buf: List[str] = []
+    size = 0
+    for part in raw_parts:
+        s = str(part or "").strip()
+        if not s:
+            continue
+        if len(s) > max_chars:
+            s = s[:max_chars]
+        if size + len(s) > max_chars and buf:
+            chunks.append("；".join(buf))
+            buf = [s]
+            size = len(s)
+            continue
+        buf.append(s)
+        size += len(s)
+    if buf:
+        chunks.append("；".join(buf))
+    return chunks[:80]
+
+
+def _infer_chunk_dimension_id(material_type: str, chunk_text: str) -> str:
+    candidates = MATERIAL_TYPE_DIMENSION_PRIORITY.get(material_type) or ["01"]
+    lower = str(chunk_text or "").lower()
+    best_dim = candidates[0]
+    best_score = -1
+    for dim_id in candidates:
+        score = 0
+        for kw in DIMENSION_RAG_KEYWORDS.get(dim_id, []):
+            if kw.lower() in lower:
+                score += 1
+        if score > best_score:
+            best_score = score
+            best_dim = dim_id
+    return best_dim
+
+
+def _select_material_retrieval_chunks(
+    project_id: str,
+    submission_text: str,
+    *,
+    top_k: int = 12,
+) -> List[Dict[str, object]]:
+    query_terms = set(_extract_terms(submission_text, max_terms=60))
+    # 确保不同资料类型关键词也参与检索，避免“只用施组词命中”。
+    for kws in MATERIAL_TYPE_KEYWORDS.values():
+        query_terms.update(k.lower() for k in kws)
+
+    rows = [m for m in load_materials() if str(m.get("project_id")) == project_id]
+    rows.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+    candidates: List[Dict[str, object]] = []
+    for row in rows:
+        filename = str(row.get("filename") or "")
+        mat_type = _normalize_material_type(row.get("material_type"), filename=filename)
+        path = str(row.get("path") or "").strip()
+        if not path:
+            continue
+        p = Path(path)
+        if not p.exists():
+            continue
+        try:
+            file_text = _read_uploaded_file_content(p.read_bytes(), p.name)
+        except Exception:
+            continue
+        chunks = _split_material_text_chunks(file_text, max_chars=900)
+        for idx, chunk in enumerate(chunks, start=1):
+            lower = chunk.lower()
+            matched_terms = [t for t in query_terms if t and t in lower][:8]
+            if not matched_terms:
+                # 兜底：若命中该类型关键词也纳入候选
+                matched_terms = [
+                    kw.lower()
+                    for kw in MATERIAL_TYPE_KEYWORDS.get(mat_type, [])
+                    if kw.lower() in lower
+                ][:6]
+            if not matched_terms:
+                continue
+            dimension_id = _infer_chunk_dimension_id(mat_type, chunk)
+            score = len(matched_terms) + (2 if mat_type in {"boq", "drawing"} else 1)
+            candidates.append(
+                {
+                    "material_type": mat_type,
+                    "filename": p.name,
+                    "chunk_id": f"{p.name}#c{idx:03d}",
+                    "dimension_id": dimension_id,
+                    "score": score,
+                    "matched_terms": matched_terms,
+                    "chunk_preview": chunk[:220],
+                }
+            )
+
+    if not candidates:
+        return []
+    candidates.sort(
+        key=lambda x: (
+            -int(x.get("score", 0)),
+            str(x.get("material_type")),
+            str(x.get("filename")),
+            str(x.get("chunk_id")),
+        )
+    )
+    return candidates[: max(1, int(top_k))]
+
+
+def _build_material_retrieval_requirements(
+    project_id: str,
+    retrieval_chunks: List[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    now = _now_iso()
+    reqs: List[Dict[str, object]] = []
+    for idx, chunk in enumerate(retrieval_chunks, start=1):
+        dim_id = str(chunk.get("dimension_id") or "01")
+        chunk_id = str(chunk.get("chunk_id") or f"chunk-{idx}")
+        mat_type = str(chunk.get("material_type") or MATERIAL_TYPE_DEFAULT)
+        filename = str(chunk.get("filename") or "")
+        hints = [str(x) for x in (chunk.get("matched_terms") or []) if str(x).strip()]
+        preview = str(chunk.get("chunk_preview") or "").strip()
+        if preview:
+            hints.append(preview[:120])
+        hints = _to_text_items(hints, max_items=8)
+        if not hints:
+            continue
+        reqs.append(
+            {
+                "id": f"runtime-rag-{project_id[:8]}-{idx}",
+                "project_id": project_id,
+                "dimension_id": dim_id,
+                "req_label": f"资料检索证据：{_material_type_label(mat_type)} / {filename} / {chunk_id}",
+                "req_type": "semantic",
+                "patterns": {"hints": hints},
+                "mandatory": False,
+                "weight": 0.7,
+                "source_anchor_id": None,
+                "source_pack_id": "runtime_material_rag",
+                "source_pack_version": "v2-rag-1",
+                "priority": 88.0,
+                "override_key": f"runtime::material_rag::{chunk_id}",
+                "lint": {},
+                "created_at": now,
+            }
+        )
+    return reqs
 
 
 def _build_material_quality_snapshot(project_id: str) -> Dict[str, object]:

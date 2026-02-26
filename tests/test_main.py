@@ -1380,6 +1380,34 @@ class TestDXFParser:
         assert "计划节点与验收" in text
 
 
+class TestMaterialAdvancedParsing:
+    def test_build_boq_structured_summary_from_csv(self):
+        from app.main import _build_boq_structured_summary
+
+        csv_content = (
+            "项目编码,项目名称,单位,工程量,综合单价,合价\n"
+            "010101001,土方开挖,m3,100,35.5,3550\n"
+            "010201001,钢筋制作,t,12.5,4300,53750\n"
+        ).encode("utf-8")
+        summary = _build_boq_structured_summary(csv_content, "boq.csv")
+        assert summary["detected_format"] == "csv"
+        assert summary["total_parsed_items"] == 2
+        assert summary["total_amount"] == 57300.0
+        first_sheet = summary["sheets"][0]
+        assert first_sheet["detected_columns"]["code"] == 0
+        assert first_sheet["detected_columns"]["amount"] == 5
+
+    @patch("app.main.shutil.which")
+    def test_read_uploaded_file_content_dwg_uses_preprocess_chain(self, mock_which):
+        from app.main import _read_uploaded_file_content
+
+        mock_which.return_value = None
+        text = _read_uploaded_file_content(b"DWGDATA", "sample.dwg")
+        assert "[DWG图纸]" in text
+        assert "DWG预处理" in text
+        assert "建议同时上传 PDF 或 ASCII DXF" in text
+
+
 class TestScoreForProjectEndpoint:
     """Tests for /projects/{project_id}/score endpoint."""
 
