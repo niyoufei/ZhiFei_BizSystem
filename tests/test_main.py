@@ -1913,6 +1913,20 @@ class TestMaterialAdvancedParsing:
         runtime_meta = {
             "material_available_types": ["tender_qa", "boq", "drawing"],
             "material_retrieval_selected_filenames": ["tender.txt", "boq.xlsx", "drawing.pdf"],
+            "material_retrieval_selected_via_counts": {
+                "type_quota": 1,
+                "type_backfill": 2,
+            },
+            "material_retrieval_top_k": 18,
+            "material_retrieval_per_type_quota": 2,
+            "material_retrieval_per_file_quota": 3,
+            "material_retrieval_base_top_k": 12,
+            "material_retrieval_base_per_type_quota": 1,
+            "material_retrieval_base_per_file_quota": 2,
+            "material_retrieval_budget_reasons": ["top_k:12->18", "per_type_quota:1->2"],
+            "material_total_size_mb": 12.5,
+            "material_type_count": 3,
+            "material_available_files": 3,
         }
         summary = _build_material_utilization_summary(report, runtime_meta)
         assert summary["retrieval_total"] == 1
@@ -1926,6 +1940,69 @@ class TestMaterialAdvancedParsing:
         assert "drawing" in (summary.get("uncovered_types") or [])
         assert summary["fallback_total"] == 1
         assert summary["fallback_hit"] == 0
+        assert summary["retrieval_selected_via_counts"] == {"type_quota": 1, "type_backfill": 2}
+        assert summary["retrieval_total_via_counts"]["type_quota"] == 1
+        assert summary["retrieval_hit_via_counts"]["type_quota"] == 1
+        assert summary["retrieval_top_k"] == 18
+        assert summary["retrieval_base_top_k"] == 12
+
+    def test_compute_dynamic_retrieval_budget_scales_with_material_volume(self):
+        from app.main import _compute_dynamic_retrieval_budget
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = []
+            material_types = ["tender_qa", "boq", "drawing", "site_photo"]
+            for idx in range(8):
+                p = Path(tmp) / f"m{idx}.txt"
+                p.write_text("x" * 200_000, encoding="utf-8")
+                rows.append(
+                    {
+                        "project_id": "p1",
+                        "material_type": material_types[idx % len(material_types)],
+                        "filename": p.name,
+                        "path": str(p),
+                        "created_at": "2026-02-26T00:00:00+00:00",
+                    }
+                )
+
+            budget = _compute_dynamic_retrieval_budget(
+                "p1",
+                {"top_k": 12, "per_type_quota": 1, "per_file_quota": 2},
+                rows,
+                available_material_types=material_types,
+            )
+            assert budget["top_k"] >= 12
+            assert budget["per_type_quota"] >= 2
+            assert budget["per_file_quota"] >= 3
+            assert budget["material_file_count"] == 8
+            assert budget["material_type_count"] == 4
+            assert budget["material_total_size_mb"] > 0
+
+    def test_compute_dynamic_retrieval_budget_keeps_base_for_small_inputs(self):
+        from app.main import _compute_dynamic_retrieval_budget
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "a.txt"
+            p.write_text("x" * 20, encoding="utf-8")
+            rows = [
+                {
+                    "project_id": "p1",
+                    "material_type": "tender_qa",
+                    "filename": "a.txt",
+                    "path": str(p),
+                    "created_at": "2026-02-26T00:00:00+00:00",
+                }
+            ]
+            budget = _compute_dynamic_retrieval_budget(
+                "p1",
+                {"top_k": 14, "per_type_quota": 2, "per_file_quota": 3},
+                rows,
+                available_material_types=["tender_qa"],
+            )
+            assert budget["top_k"] == 14
+            assert budget["per_type_quota"] == 2
+            assert budget["per_file_quota"] == 3
+            assert "base_budget_kept" in (budget.get("budget_reasons") or [])
 
     def test_aggregate_material_utilization_summaries(self):
         from app.main import _aggregate_material_utilization_summaries
@@ -1939,6 +2016,19 @@ class TestMaterialAdvancedParsing:
                     "retrieval_file_hit": 1,
                     "retrieval_selected_filenames": ["a.txt", "b.txt"],
                     "retrieval_hit_filenames": ["a.txt"],
+                    "retrieval_selected_via_counts": {"type_quota": 2, "global_backfill": 1},
+                    "retrieval_total_via_counts": {"type_quota": 2},
+                    "retrieval_hit_via_counts": {"type_quota": 1},
+                    "retrieval_top_k": 18,
+                    "retrieval_per_type_quota": 2,
+                    "retrieval_per_file_quota": 3,
+                    "retrieval_base_top_k": 12,
+                    "retrieval_base_per_type_quota": 1,
+                    "retrieval_base_per_file_quota": 2,
+                    "retrieval_budget_reasons": ["top_k:12->18"],
+                    "material_total_size_mb": 15.2,
+                    "material_type_count": 2,
+                    "material_file_count": 2,
                     "consistency_total": 2,
                     "consistency_hit": 1,
                     "fallback_total": 1,
@@ -1971,6 +2061,19 @@ class TestMaterialAdvancedParsing:
                     "retrieval_file_hit": 1,
                     "retrieval_selected_filenames": ["c.txt"],
                     "retrieval_hit_filenames": ["c.txt"],
+                    "retrieval_selected_via_counts": {"global_rank": 1},
+                    "retrieval_total_via_counts": {"global_rank": 1},
+                    "retrieval_hit_via_counts": {"global_rank": 1},
+                    "retrieval_top_k": 20,
+                    "retrieval_per_type_quota": 2,
+                    "retrieval_per_file_quota": 3,
+                    "retrieval_base_top_k": 12,
+                    "retrieval_base_per_type_quota": 1,
+                    "retrieval_base_per_file_quota": 2,
+                    "retrieval_budget_reasons": ["top_k:12->20"],
+                    "material_total_size_mb": 20.0,
+                    "material_type_count": 3,
+                    "material_file_count": 3,
                     "consistency_total": 1,
                     "consistency_hit": 1,
                     "fallback_total": 0,
@@ -2003,6 +2106,12 @@ class TestMaterialAdvancedParsing:
         assert merged["fallback_hit"] == 0
         assert "boq" in (merged.get("uncovered_types") or [])
         assert "drawing" in (merged.get("available_types") or [])
+        assert merged["retrieval_top_k"] == 20
+        assert merged["retrieval_base_top_k"] == 12
+        assert merged["retrieval_selected_via_counts"]["type_quota"] == 2
+        assert merged["retrieval_selected_via_counts"]["global_rank"] == 1
+        assert merged["retrieval_total_via_counts"]["type_quota"] == 2
+        assert merged["retrieval_hit_via_counts"]["global_rank"] == 1
 
     def test_evaluate_material_utilization_gate_blocks_when_required_types_uncovered(self):
         from app.main import _evaluate_material_utilization_gate

@@ -836,6 +836,121 @@ def _resolve_material_retrieval_config(project: Dict[str, object]) -> Dict[str, 
     }
 
 
+def _compute_dynamic_retrieval_budget(
+    project_id: str,
+    base_cfg: Dict[str, int],
+    material_rows: List[Dict[str, object]],
+    *,
+    available_material_types: Optional[List[str]] = None,
+) -> Dict[str, object]:
+    """
+    按资料体量动态放大检索预算，确保资料越多时检索“读得更深”。
+    - top_k：随文件数、文件总大小、资料类型数增长（封顶48）。
+    - per_type_quota：当类型丰富时，至少保证每类2条证据。
+    - per_file_quota：当文件较多时，允许单文件更深采样，降低偶然漏命中。
+    """
+    base_top_k = max(6, min(48, int(base_cfg.get("top_k") or DEFAULT_MATERIAL_RETRIEVAL_TOP_K)))
+    base_per_type = max(
+        1,
+        min(
+            6,
+            int(
+                base_cfg.get(
+                    "per_type_quota",
+                    DEFAULT_MATERIAL_RETRIEVAL_PER_TYPE_QUOTA,
+                )
+                or DEFAULT_MATERIAL_RETRIEVAL_PER_TYPE_QUOTA
+            ),
+        ),
+    )
+    base_per_file = max(
+        1,
+        min(
+            8,
+            int(
+                base_cfg.get(
+                    "per_file_quota",
+                    DEFAULT_MATERIAL_RETRIEVAL_PER_FILE_QUOTA,
+                )
+                or DEFAULT_MATERIAL_RETRIEVAL_PER_FILE_QUOTA
+            ),
+        ),
+    )
+
+    types: List[str] = []
+    if isinstance(available_material_types, list):
+        for item in available_material_types:
+            key = _normalize_material_type(item)
+            if key and key not in types:
+                types.append(key)
+    if not types:
+        for row in material_rows:
+            key = _normalize_material_type(row.get("material_type"), filename=row.get("filename"))
+            if key and key not in types:
+                types.append(key)
+
+    file_count = 0
+    total_size_bytes = 0
+    for row in material_rows:
+        if str(row.get("project_id") or "") != str(project_id):
+            continue
+        file_count += 1
+        path = str(row.get("path") or "").strip()
+        if not path:
+            continue
+        try:
+            total_size_bytes += max(0, int(Path(path).stat().st_size))
+        except Exception:
+            continue
+    total_size_mb = round(float(total_size_bytes) / (1024.0 * 1024.0), 3)
+
+    type_count = len(types)
+    # 类型覆盖底线：至少满足 “每类配额” 的总量。
+    type_floor = max(6, int(type_count) * int(base_per_type))
+    # 体量增强项：文件数和总体积越大，越需要更深检索。
+    file_boost = max(0, min(12, file_count - 3))
+    size_boost = max(0, min(12, int(total_size_mb // 20)))
+    diversity_boost = 2 if type_count >= 4 else (1 if type_count >= 3 else 0)
+    volume_boost = file_boost + size_boost + diversity_boost
+    top_k = max(base_top_k, type_floor, type_floor + min(12, volume_boost))
+    top_k = max(6, min(48, int(top_k)))
+
+    per_type_quota = base_per_type
+    if type_count >= 4:
+        per_type_quota = max(per_type_quota, 2)
+    per_type_quota = max(1, min(6, int(per_type_quota)))
+
+    per_file_quota = base_per_file
+    if file_count >= 12:
+        per_file_quota = max(per_file_quota, 4)
+    elif file_count >= 6:
+        per_file_quota = max(per_file_quota, 3)
+    per_file_quota = max(1, min(8, int(per_file_quota)))
+
+    reasons: List[str] = []
+    if top_k > base_top_k:
+        reasons.append(f"top_k:{base_top_k}->{top_k}")
+    if per_type_quota > base_per_type:
+        reasons.append(f"per_type_quota:{base_per_type}->{per_type_quota}")
+    if per_file_quota > base_per_file:
+        reasons.append(f"per_file_quota:{base_per_file}->{per_file_quota}")
+    if not reasons:
+        reasons.append("base_budget_kept")
+
+    return {
+        "top_k": top_k,
+        "per_type_quota": per_type_quota,
+        "per_file_quota": per_file_quota,
+        "base_top_k": base_top_k,
+        "base_per_type_quota": base_per_type,
+        "base_per_file_quota": base_per_file,
+        "material_file_count": file_count,
+        "material_type_count": type_count,
+        "material_total_size_mb": total_size_mb,
+        "budget_reasons": reasons,
+    }
+
+
 def _build_material_query_features(
     *,
     project_id: str,
@@ -1025,40 +1140,26 @@ def _build_runtime_custom_requirements(
         filename_text = str(row.get("filename") or "").strip()
         if filename_text and filename_text not in available_material_filenames:
             available_material_filenames.append(filename_text)
-    retrieval_top_k = max(
-        int(retrieval_cfg.get("top_k", DEFAULT_MATERIAL_RETRIEVAL_TOP_K)),
-        len(available_material_types)
-        * int(
-            retrieval_cfg.get(
-                "per_type_quota",
-                DEFAULT_MATERIAL_RETRIEVAL_PER_TYPE_QUOTA,
-            )
-        ),
+    retrieval_budget = _compute_dynamic_retrieval_budget(
+        project_id,
+        retrieval_cfg,
+        material_rows,
+        available_material_types=available_material_types,
     )
-    retrieval_top_k = max(6, min(48, int(retrieval_top_k)))
-    retrieval_per_type_quota = max(
-        1,
-        min(
-            6,
-            int(
-                retrieval_cfg.get(
-                    "per_type_quota",
-                    DEFAULT_MATERIAL_RETRIEVAL_PER_TYPE_QUOTA,
-                )
-            ),
-        ),
+    retrieval_top_k = int(
+        retrieval_budget.get("top_k")
+        or retrieval_cfg.get("top_k")
+        or DEFAULT_MATERIAL_RETRIEVAL_TOP_K
     )
-    retrieval_per_file_quota = max(
-        1,
-        min(
-            8,
-            int(
-                retrieval_cfg.get(
-                    "per_file_quota",
-                    DEFAULT_MATERIAL_RETRIEVAL_PER_FILE_QUOTA,
-                )
-            ),
-        ),
+    retrieval_per_type_quota = int(
+        retrieval_budget.get("per_type_quota")
+        or retrieval_cfg.get("per_type_quota")
+        or DEFAULT_MATERIAL_RETRIEVAL_PER_TYPE_QUOTA
+    )
+    retrieval_per_file_quota = int(
+        retrieval_budget.get("per_file_quota")
+        or retrieval_cfg.get("per_file_quota")
+        or DEFAULT_MATERIAL_RETRIEVAL_PER_FILE_QUOTA
     )
     retrieval_chunks = _select_material_retrieval_chunks(
         project_id,
@@ -1109,6 +1210,22 @@ def _build_runtime_custom_requirements(
         "material_retrieval_top_k": retrieval_top_k,
         "material_retrieval_per_type_quota": retrieval_per_type_quota,
         "material_retrieval_per_file_quota": retrieval_per_file_quota,
+        "material_retrieval_base_top_k": int(
+            retrieval_budget.get("base_top_k")
+            or retrieval_cfg.get("top_k")
+            or DEFAULT_MATERIAL_RETRIEVAL_TOP_K
+        ),
+        "material_retrieval_base_per_type_quota": int(
+            retrieval_budget.get("base_per_type_quota")
+            or retrieval_cfg.get("per_type_quota")
+            or DEFAULT_MATERIAL_RETRIEVAL_PER_TYPE_QUOTA
+        ),
+        "material_retrieval_base_per_file_quota": int(
+            retrieval_budget.get("base_per_file_quota")
+            or retrieval_cfg.get("per_file_quota")
+            or DEFAULT_MATERIAL_RETRIEVAL_PER_FILE_QUOTA
+        ),
+        "material_retrieval_budget_reasons": list(retrieval_budget.get("budget_reasons") or []),
         "material_query_seed_lines": int(query_features.get("seed_lines_count") or 0),
         "material_query_terms_count": len(query_features.get("query_terms") or []),
         "material_query_numeric_terms_count": len(query_features.get("query_numeric_terms") or []),
@@ -1123,6 +1240,8 @@ def _build_runtime_custom_requirements(
         "material_available_files": len(material_rows),
         "material_available_filenames": available_material_filenames[:120],
         "material_available_types": available_material_types,
+        "material_total_size_mb": float(retrieval_budget.get("material_total_size_mb") or 0.0),
+        "material_type_count": int(retrieval_budget.get("material_type_count") or 0),
         "material_retrieval_types": retrieval_types,
         "material_retrieval_selected_via_counts": retrieval_selected_via_counts,
         "material_retrieval_selected_filenames": retrieval_selected_filenames[:120],
@@ -1246,6 +1365,8 @@ def _build_material_utilization_summary(
     fallback_hit = 0
     retrieval_file_total_set: set[str] = set()
     retrieval_file_hit_set: set[str] = set()
+    retrieval_total_via_counts: Dict[str, int] = {}
+    retrieval_hit_via_counts: Dict[str, int] = {}
 
     def _bucket(material_type: str) -> Dict[str, object]:
         if material_type not in by_type:
@@ -1266,6 +1387,16 @@ def _build_material_utilization_summary(
             filename_text = str(item or "").strip()
             if filename_text:
                 retrieval_file_total_set.add(filename_text)
+    selected_via_raw = runtime_req_meta.get("material_retrieval_selected_via_counts")
+    retrieval_selected_via_counts: Dict[str, int] = {}
+    if isinstance(selected_via_raw, dict):
+        for key, value in selected_via_raw.items():
+            mode = str(key or "").strip() or "unknown"
+            count = int(_to_float_or_none(value) or 0)
+            if count > 0:
+                retrieval_selected_via_counts[mode] = (
+                    int(retrieval_selected_via_counts.get(mode, 0)) + count
+                )
 
     for row in req_hits:
         if not isinstance(row, dict):
@@ -1286,11 +1417,18 @@ def _build_material_utilization_summary(
         if source_pack_id == "runtime_material_rag":
             retrieval_total += 1
             bucket["retrieval_total"] = int(bucket.get("retrieval_total", 0)) + 1
+            via_key = source_mode or "unknown"
+            retrieval_total_via_counts[via_key] = (
+                int(retrieval_total_via_counts.get(via_key, 0)) + 1
+            )
             if source_filename:
                 retrieval_file_total_set.add(source_filename)
             if hit:
                 retrieval_hit += 1
                 bucket["retrieval_hit"] = int(bucket.get("retrieval_hit", 0)) + 1
+                retrieval_hit_via_counts[via_key] = (
+                    int(retrieval_hit_via_counts.get(via_key, 0)) + 1
+                )
                 if source_filename:
                     retrieval_file_hit_set.add(source_filename)
         else:
@@ -1351,6 +1489,41 @@ def _build_material_utilization_summary(
         "retrieval_hit_filenames": sorted(retrieval_file_hit_set)[:120],
         "retrieval_unhit_filenames": unhit_files[:120],
         "retrieval_unhit_file_count": len(unhit_files),
+        "retrieval_top_k": int(
+            _to_float_or_none(runtime_req_meta.get("material_retrieval_top_k")) or 0
+        ),
+        "retrieval_per_type_quota": int(
+            _to_float_or_none(runtime_req_meta.get("material_retrieval_per_type_quota")) or 0
+        ),
+        "retrieval_per_file_quota": int(
+            _to_float_or_none(runtime_req_meta.get("material_retrieval_per_file_quota")) or 0
+        ),
+        "retrieval_base_top_k": int(
+            _to_float_or_none(runtime_req_meta.get("material_retrieval_base_top_k")) or 0
+        ),
+        "retrieval_base_per_type_quota": int(
+            _to_float_or_none(runtime_req_meta.get("material_retrieval_base_per_type_quota")) or 0
+        ),
+        "retrieval_base_per_file_quota": int(
+            _to_float_or_none(runtime_req_meta.get("material_retrieval_base_per_file_quota")) or 0
+        ),
+        "retrieval_budget_reasons": list(
+            runtime_req_meta.get("material_retrieval_budget_reasons")
+            if isinstance(runtime_req_meta.get("material_retrieval_budget_reasons"), list)
+            else []
+        ),
+        "material_total_size_mb": float(
+            _to_float_or_none(runtime_req_meta.get("material_total_size_mb")) or 0.0
+        ),
+        "material_type_count": int(
+            _to_float_or_none(runtime_req_meta.get("material_type_count")) or 0
+        ),
+        "material_file_count": int(
+            _to_float_or_none(runtime_req_meta.get("material_available_files")) or 0
+        ),
+        "retrieval_selected_via_counts": retrieval_selected_via_counts,
+        "retrieval_total_via_counts": retrieval_total_via_counts,
+        "retrieval_hit_via_counts": retrieval_hit_via_counts,
         "consistency_total": consistency_total,
         "consistency_hit": consistency_hit,
         "consistency_hit_rate": _rate(consistency_hit, consistency_total),
@@ -1459,6 +1632,19 @@ def _aggregate_material_utilization_summaries(
     retrieval_file_hit = 0
     retrieval_selected_filenames: set[str] = set()
     retrieval_hit_filenames: set[str] = set()
+    retrieval_selected_via_counts: Dict[str, int] = {}
+    retrieval_total_via_counts: Dict[str, int] = {}
+    retrieval_hit_via_counts: Dict[str, int] = {}
+    retrieval_top_k = 0
+    retrieval_per_type_quota = 0
+    retrieval_per_file_quota = 0
+    retrieval_base_top_k = 0
+    retrieval_base_per_type_quota = 0
+    retrieval_base_per_file_quota = 0
+    material_total_size_mb = 0.0
+    material_type_count = 0
+    material_file_count = 0
+    retrieval_budget_reasons: List[str] = []
     query_terms_count = 0
     query_numeric_terms_count = 0
 
@@ -1498,6 +1684,69 @@ def _aggregate_material_utilization_summaries(
                 filename = str(item or "").strip()
                 if filename:
                     retrieval_hit_filenames.add(filename)
+        retrieval_top_k = max(
+            retrieval_top_k,
+            int(_to_float_or_none(raw.get("retrieval_top_k")) or 0),
+        )
+        retrieval_per_type_quota = max(
+            retrieval_per_type_quota,
+            int(_to_float_or_none(raw.get("retrieval_per_type_quota")) or 0),
+        )
+        retrieval_per_file_quota = max(
+            retrieval_per_file_quota,
+            int(_to_float_or_none(raw.get("retrieval_per_file_quota")) or 0),
+        )
+        retrieval_base_top_k = max(
+            retrieval_base_top_k,
+            int(_to_float_or_none(raw.get("retrieval_base_top_k")) or 0),
+        )
+        retrieval_base_per_type_quota = max(
+            retrieval_base_per_type_quota,
+            int(_to_float_or_none(raw.get("retrieval_base_per_type_quota")) or 0),
+        )
+        retrieval_base_per_file_quota = max(
+            retrieval_base_per_file_quota,
+            int(_to_float_or_none(raw.get("retrieval_base_per_file_quota")) or 0),
+        )
+        material_total_size_mb = max(
+            material_total_size_mb,
+            float(_to_float_or_none(raw.get("material_total_size_mb")) or 0.0),
+        )
+        material_type_count = max(
+            material_type_count,
+            int(_to_float_or_none(raw.get("material_type_count")) or 0),
+        )
+        material_file_count = max(
+            material_file_count,
+            int(_to_float_or_none(raw.get("material_file_count")) or 0),
+        )
+        reasons_raw = raw.get("retrieval_budget_reasons")
+        if isinstance(reasons_raw, list):
+            for item in reasons_raw:
+                text = str(item or "").strip()
+                if text and text not in retrieval_budget_reasons:
+                    retrieval_budget_reasons.append(text)
+        selected_via_raw = raw.get("retrieval_selected_via_counts")
+        if isinstance(selected_via_raw, dict):
+            for key, value in selected_via_raw.items():
+                mode = str(key or "").strip() or "unknown"
+                retrieval_selected_via_counts[mode] = int(
+                    retrieval_selected_via_counts.get(mode, 0)
+                ) + int(_to_float_or_none(value) or 0)
+        total_via_raw = raw.get("retrieval_total_via_counts")
+        if isinstance(total_via_raw, dict):
+            for key, value in total_via_raw.items():
+                mode = str(key or "").strip() or "unknown"
+                retrieval_total_via_counts[mode] = int(
+                    retrieval_total_via_counts.get(mode, 0)
+                ) + int(_to_float_or_none(value) or 0)
+        hit_via_raw = raw.get("retrieval_hit_via_counts")
+        if isinstance(hit_via_raw, dict):
+            for key, value in hit_via_raw.items():
+                mode = str(key or "").strip() or "unknown"
+                retrieval_hit_via_counts[mode] = int(retrieval_hit_via_counts.get(mode, 0)) + int(
+                    _to_float_or_none(value) or 0
+                )
         query_terms_count += int(_to_float_or_none(raw.get("query_terms_count")) or 0)
         query_numeric_terms_count += int(
             _to_float_or_none(raw.get("query_numeric_terms_count")) or 0
@@ -1569,6 +1818,19 @@ def _aggregate_material_utilization_summaries(
         "retrieval_hit_filenames": sorted(retrieval_hit_filenames)[:120],
         "retrieval_unhit_filenames": retrieval_unhit_filenames[:120],
         "retrieval_unhit_file_count": len(retrieval_unhit_filenames),
+        "retrieval_top_k": retrieval_top_k,
+        "retrieval_per_type_quota": retrieval_per_type_quota,
+        "retrieval_per_file_quota": retrieval_per_file_quota,
+        "retrieval_base_top_k": retrieval_base_top_k,
+        "retrieval_base_per_type_quota": retrieval_base_per_type_quota,
+        "retrieval_base_per_file_quota": retrieval_base_per_file_quota,
+        "retrieval_budget_reasons": retrieval_budget_reasons[:12],
+        "material_total_size_mb": round(material_total_size_mb, 3),
+        "material_type_count": material_type_count,
+        "material_file_count": material_file_count,
+        "retrieval_selected_via_counts": retrieval_selected_via_counts,
+        "retrieval_total_via_counts": retrieval_total_via_counts,
+        "retrieval_hit_via_counts": retrieval_hit_via_counts,
         "consistency_total": consistency_total,
         "consistency_hit": consistency_hit,
         "consistency_hit_rate": _rate(consistency_hit, consistency_total),
@@ -1600,6 +1862,11 @@ def _build_material_utilization_alerts(
     retrieval_file_total = int(_to_float_or_none(data.get("retrieval_file_total")) or 0)
     retrieval_file_coverage_rate = _to_float_or_none(data.get("retrieval_file_coverage_rate"))
     retrieval_unhit_count = int(_to_float_or_none(data.get("retrieval_unhit_file_count")) or 0)
+    selected_via_counts = (
+        data.get("retrieval_selected_via_counts")
+        if isinstance(data.get("retrieval_selected_via_counts"), dict)
+        else {}
+    )
 
     if retrieval_total <= 0:
         alerts.append("评分未命中任何资料检索锚点，资料引用不足。")
@@ -1615,6 +1882,19 @@ def _build_material_utilization_alerts(
 
     if fallback_total > 0 and fallback_hit <= 0:
         alerts.append("仅触发了关键词兜底匹配且未命中，说明施组与项目资料耦合不足。")
+    if selected_via_counts:
+        selected_total = sum(
+            max(0, int(_to_float_or_none(v) or 0)) for v in selected_via_counts.values()
+        )
+        if selected_total > 0:
+            backfill_count = int(
+                _to_float_or_none(selected_via_counts.get("type_backfill")) or 0
+            ) + int(_to_float_or_none(selected_via_counts.get("global_backfill")) or 0)
+            backfill_rate = float(backfill_count) / float(selected_total)
+            if backfill_rate >= 0.4:
+                alerts.append(
+                    "资料检索存在较高比例的回填命中，建议在施组中增加对清单/图纸/答疑的显式章节引用。"
+                )
 
     if (
         retrieval_file_total >= 3
@@ -14661,6 +14941,27 @@ def index(
           const retrievalUnhitFilenames = Array.isArray(summary.retrieval_unhit_filenames)
             ? summary.retrieval_unhit_filenames
             : [];
+          const retrievalTopK = Number(summary.retrieval_top_k || 0);
+          const retrievalPerTypeQuota = Number(summary.retrieval_per_type_quota || 0);
+          const retrievalPerFileQuota = Number(summary.retrieval_per_file_quota || 0);
+          const retrievalBaseTopK = Number(summary.retrieval_base_top_k || 0);
+          const retrievalBasePerTypeQuota = Number(summary.retrieval_base_per_type_quota || 0);
+          const retrievalBasePerFileQuota = Number(summary.retrieval_base_per_file_quota || 0);
+          const retrievalBudgetReasons = Array.isArray(summary.retrieval_budget_reasons)
+            ? summary.retrieval_budget_reasons
+            : [];
+          const materialTotalSizeMb = Number(summary.material_total_size_mb || 0);
+          const materialTypeCount = Number(summary.material_type_count || 0);
+          const materialFileCount = Number(summary.material_file_count || 0);
+          const selectedViaCounts = (summary.retrieval_selected_via_counts && typeof summary.retrieval_selected_via_counts === 'object')
+            ? summary.retrieval_selected_via_counts
+            : {};
+          const totalViaCounts = (summary.retrieval_total_via_counts && typeof summary.retrieval_total_via_counts === 'object')
+            ? summary.retrieval_total_via_counts
+            : {};
+          const hitViaCounts = (summary.retrieval_hit_via_counts && typeof summary.retrieval_hit_via_counts === 'object')
+            ? summary.retrieval_hit_via_counts
+            : {};
           const queryTermsCount = Number(summary.query_terms_count || 0);
           const queryNumericTermsCount = Number(summary.query_numeric_terms_count || 0);
           const byType = (summary.by_type && typeof summary.by_type === 'object') ? summary.by_type : {};
@@ -14719,6 +15020,53 @@ def index(
               + '，预警 ' + escapeHtmlText(warnCount)
               + '，阻断 ' + escapeHtmlText(blockedCount)
               + '</p>';
+          }
+          if (retrievalTopK > 0 || materialFileCount > 0) {
+            html += '<details style="margin-top:8px"><summary>检索预算与资料体量</summary>';
+            html += '<table><tr><th>项</th><th>当前</th><th>基线</th></tr>';
+            html += '<tr><td>top_k</td><td>' + escapeHtmlText(retrievalTopK || 0) + '</td><td>' + escapeHtmlText(retrievalBaseTopK || 0) + '</td></tr>';
+            html += '<tr><td>每类型配额</td><td>' + escapeHtmlText(retrievalPerTypeQuota || 0) + '</td><td>' + escapeHtmlText(retrievalBasePerTypeQuota || 0) + '</td></tr>';
+            html += '<tr><td>每文件配额</td><td>' + escapeHtmlText(retrievalPerFileQuota || 0) + '</td><td>' + escapeHtmlText(retrievalBasePerFileQuota || 0) + '</td></tr>';
+            html += '<tr><td>资料体量</td><td colspan="2">文件 ' + escapeHtmlText(materialFileCount || 0)
+              + '，类型 ' + escapeHtmlText(materialTypeCount || 0)
+              + '，总大小约 ' + escapeHtmlText((materialTotalSizeMb || 0).toFixed(2)) + ' MB</td></tr>';
+            html += '</table>';
+            if (retrievalBudgetReasons.length) {
+              html += '<p style="margin:6px 0 0 0;font-size:12px;color:#475569">预算调整：'
+                + escapeHtmlText(retrievalBudgetReasons.join('；'))
+                + '</p>';
+            }
+            html += '</details>';
+          }
+          const viaKeys = Object.keys(selectedViaCounts)
+            .concat(Object.keys(totalViaCounts))
+            .concat(Object.keys(hitViaCounts))
+            .filter((v, idx, arr) => v && arr.indexOf(v) === idx);
+          if (viaKeys.length) {
+            const viaLabel = (k) => {
+              const key = String(k || '').trim();
+              if (key === 'type_quota') return '类型配额命中';
+              if (key === 'type_backfill') return '类型回填命中';
+              if (key === 'global_rank') return '全局排序命中';
+              if (key === 'global_backfill') return '全局回填命中';
+              if (key === 'fallback_keywords') return '关键词兜底命中';
+              return key || 'unknown';
+            };
+            html += '<details style="margin-top:8px"><summary>检索策略命中分布</summary>';
+            html += '<table><tr><th>策略</th><th>选中块</th><th>有效锚点命中</th><th>命中率</th></tr>';
+            html += viaKeys.map((k) => {
+              const selectedCnt = Number(selectedViaCounts[k] || 0);
+              const totalCnt = Number(totalViaCounts[k] || 0);
+              const hitCnt = Number(hitViaCounts[k] || 0);
+              const rate = totalCnt > 0 ? ((hitCnt / totalCnt) * 100).toFixed(1) + '%' : '-';
+              return '<tr>'
+                + '<td>' + escapeHtmlText(viaLabel(k)) + '</td>'
+                + '<td>' + escapeHtmlText(selectedCnt) + '</td>'
+                + '<td>' + escapeHtmlText(hitCnt) + ' / ' + escapeHtmlText(totalCnt) + '</td>'
+                + '<td>' + escapeHtmlText(rate) + '</td>'
+                + '</tr>';
+            }).join('');
+            html += '</table></details>';
           }
 
           if (orderedTypes.length) {
