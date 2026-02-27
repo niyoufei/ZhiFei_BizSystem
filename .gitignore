@@ -90,6 +90,8 @@ MANIFEST
 data/materials/
 data/submissions/
 data/*.json
+data/*.lock
+data/*.json.lock
 
 # Generated report outputs (keep code, ignore generated artifacts)
 report_*.json

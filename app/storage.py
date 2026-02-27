@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -28,20 +32,105 @@ PATCH_PACKAGES_PATH = DATA_DIR / "patch_packages.json"
 PATCH_DEPLOYMENTS_PATH = DATA_DIR / "patch_deployments.json"
 HIGH_SCORE_FEATURES_PATH = DATA_DIR / "high_score_features.json"
 
+_PATH_LOCKS: Dict[str, threading.RLock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
 
 def ensure_data_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     MATERIALS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _get_path_lock(path: Path) -> threading.RLock:
+    key = str(path.resolve())
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PATH_LOCKS[key] = lock
+        return lock
+
+
+@contextlib.contextmanager
+def _exclusive_file_lock(path: Path):
+    lock_file = path.with_suffix(path.suffix + ".lock")
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    fp = lock_file.open("a+", encoding="utf-8")
+    try:
+        if os.name == "posix":
+            try:
+                import fcntl
+
+                fcntl.flock(fp.fileno(), fcntl.LOCK_EX)
+            except Exception:
+                pass
+        yield
+    finally:
+        if os.name == "posix":
+            try:
+                import fcntl
+
+                fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+        fp.close()
+
+
+def _fsync_parent_dir(path: Path) -> None:
+    if os.name != "posix":
+        return
+    dir_fd: int | None = None
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        os.fsync(dir_fd)
+    except Exception:
+        return
+    finally:
+        if dir_fd is not None:
+            try:
+                os.close(dir_fd)
+            except Exception:
+                pass
+
+
+def _atomic_write_text(path: Path, payload: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        _fsync_parent_dir(path)
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
 def load_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
-    return json.loads(path.read_text(encoding="utf-8"))
+    lock = _get_path_lock(path)
+    with lock:
+        with _exclusive_file_lock(path):
+            return json.loads(path.read_text(encoding="utf-8"))
 
 
 def save_json(path: Path, data: Any) -> None:
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    lock = _get_path_lock(path)
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    with lock:
+        with _exclusive_file_lock(path):
+            _atomic_write_text(path, payload)
 
 
 def load_projects() -> List[Dict[str, Any]]:
