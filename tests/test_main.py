@@ -55,6 +55,8 @@ class TestIndexEndpoint:
         assert 'id="deleteSelectedProjects"' in response.text
         assert 'id="scoreScaleSelect"' in response.text
         assert 'name="score_scale_max"' in response.text
+        assert 'id="btnMaterialKnowledgeProfile"' in response.text
+        assert 'id="btnMaterialKnowledgeProfileDownload"' in response.text
         assert 'id="groundTruthSubmissionSelect"' in response.text
         assert 'id="groundTruthFile"' not in response.text
         assert "/ground_truth/from_submission" in response.text
@@ -1425,6 +1427,149 @@ class TestMaterialsEndpoint:
         markdown = response.json()["markdown"]
         assert "## 解析能力" in markdown
         assert "DWG 转换器可用" in markdown
+
+    @patch("app.main._build_material_knowledge_profile")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_material_knowledge_profile_success(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_build_knowledge,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_build_knowledge.return_value = {
+            "project_id": "p1",
+            "generated_at": "2026-02-27T00:00:00+00:00",
+            "capabilities": {"ocr_available": True, "dwg_converter_available": True},
+            "summary": {
+                "total_files": 4,
+                "parsed_ok_files": 4,
+                "covered_dimensions": 12,
+                "dimension_coverage_rate": 0.75,
+            },
+            "by_type": [{"material_type": "tender_qa", "files": 1}],
+            "by_dimension": [
+                {
+                    "dimension_id": "01",
+                    "dimension_name": "工程项目整体理解",
+                    "coverage_score": 0.8,
+                    "coverage_level": "high",
+                }
+            ],
+            "recommendations": ["建议补充危大工程专项方案约束。"],
+        }
+
+        response = client.get("/api/v1/projects/p1/materials/knowledge_profile")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["summary"]["total_files"] == 4
+        assert data["by_dimension"][0]["dimension_id"] == "01"
+        assert data["recommendations"]
+
+    @patch("app.main._build_material_knowledge_profile")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_material_knowledge_profile_markdown_contains_sections(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_build_knowledge,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_build_knowledge.return_value = {
+            "project_id": "p1",
+            "generated_at": "2026-02-27T00:00:00+00:00",
+            "capabilities": {"ocr_available": False, "dwg_converter_available": False},
+            "summary": {
+                "total_files": 2,
+                "parsed_ok_files": 2,
+                "parsed_failed_files": 0,
+                "total_parsed_chars": 1000,
+                "total_parsed_chunks": 6,
+                "total_numeric_terms": 12,
+                "dimension_coverage_rate": 0.5,
+            },
+            "by_type": [
+                {
+                    "material_type_label": "招标文件和答疑",
+                    "files": 1,
+                    "parsed_chars": 600,
+                    "parsed_chunks": 3,
+                    "unique_terms": 18,
+                    "numeric_terms": 4,
+                },
+            ],
+            "by_dimension": [
+                {
+                    "dimension_id": "01",
+                    "dimension_name": "工程项目整体理解",
+                    "keyword_hits": 6,
+                    "source_types": ["tender_qa"],
+                    "coverage_score": 0.62,
+                    "coverage_level": "medium",
+                }
+            ],
+            "recommendations": ["建议补充图纸节点与危大工程量化指标。"],
+        }
+
+        response = client.get("/api/v1/projects/p1/materials/knowledge_profile/markdown")
+        assert response.status_code == 200
+        markdown = response.json()["markdown"]
+        assert "## 按资料类型" in markdown
+        assert "## 按评分维度" in markdown
+        assert "## 建议动作" in markdown
+
+    @patch("app.main._resolve_dwg_converter_binaries", return_value=["/usr/local/bin/dwg2dxf"])
+    @patch("app.main._now_iso", return_value="2026-02-27T00:00:00+00:00")
+    @patch("app.main.load_materials")
+    def test_build_material_knowledge_profile_extracts_dimension_coverage(
+        self,
+        mock_load_materials,
+        mock_now_iso,
+        mock_dwg_bins,
+        tmp_path,
+    ):
+        from app.main import _build_material_knowledge_profile
+
+        tender_path = tmp_path / "招标答疑.txt"
+        boq_path = tmp_path / "工程量清单.txt"
+        tender_path.write_text(
+            "招标答疑要求：工期节点、质量标准、危大工程专项方案、应急预案必须明确。",
+            encoding="utf-8",
+        )
+        boq_path.write_text(
+            "清单工程量 1200m3，综合单价 580 元，措施费 30 万，设备进场计划。",
+            encoding="utf-8",
+        )
+        mock_load_materials.return_value = [
+            {
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标答疑.txt",
+                "path": str(tender_path),
+                "created_at": "2026-02-26T00:00:00+00:00",
+            },
+            {
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.txt",
+                "path": str(boq_path),
+                "created_at": "2026-02-26T00:00:01+00:00",
+            },
+        ]
+
+        payload = _build_material_knowledge_profile("p1")
+        assert payload["project_id"] == "p1"
+        assert payload["summary"]["total_files"] == 2
+        assert payload["summary"]["parsed_ok_files"] == 2
+        assert payload["summary"]["covered_dimensions"] >= 1
+        assert len(payload["by_type"]) >= 2
+        dim_ids = {row["dimension_id"] for row in payload["by_dimension"]}
+        assert "01" in dim_ids
 
     @patch("app.main.save_materials")
     @patch("app.main.load_materials")

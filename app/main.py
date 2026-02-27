@@ -158,6 +158,8 @@ from app.schemas import (
     LLMBackendStatus,
     MaterialDepthReportMarkdownResponse,
     MaterialDepthReportResponse,
+    MaterialKnowledgeProfileMarkdownResponse,
+    MaterialKnowledgeProfileResponse,
     MaterialRecord,
     PatchDeploymentRecord,
     PatchDeployRequest,
@@ -5987,6 +5989,70 @@ def download_material_depth_report_markdown(
 
 
 @router.get(
+    "/projects/{project_id}/materials/knowledge_profile",
+    response_model=MaterialKnowledgeProfileResponse,
+    tags=["项目管理"],
+    responses={**RESPONSES_404},
+)
+def get_material_knowledge_profile(
+    project_id: str, locale: str = Depends(get_locale)
+) -> MaterialKnowledgeProfileResponse:
+    """项目资料知识画像（JSON），展示资料对16维评分的覆盖强度。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    try:
+        _find_project(project_id, projects)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    payload = _build_material_knowledge_profile(project_id)
+    return MaterialKnowledgeProfileResponse(**payload)
+
+
+@router.get(
+    "/projects/{project_id}/materials/knowledge_profile/markdown",
+    response_model=MaterialKnowledgeProfileMarkdownResponse,
+    tags=["项目管理"],
+    responses={**RESPONSES_404},
+)
+def get_material_knowledge_profile_markdown(
+    project_id: str, locale: str = Depends(get_locale)
+) -> MaterialKnowledgeProfileMarkdownResponse:
+    """项目资料知识画像（Markdown 文本）。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    try:
+        _find_project(project_id, projects)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    payload = _build_material_knowledge_profile(project_id)
+    markdown = _render_material_knowledge_profile_markdown(payload)
+    return MaterialKnowledgeProfileMarkdownResponse(
+        project_id=project_id,
+        markdown=markdown,
+        generated_at=str(payload.get("generated_at") or _now_iso()),
+    )
+
+
+@router.get(
+    "/projects/{project_id}/materials/knowledge_profile.md",
+    tags=["项目管理"],
+    responses={**RESPONSES_404},
+)
+def download_material_knowledge_profile_markdown(
+    project_id: str, locale: str = Depends(get_locale)
+) -> Response:
+    """下载项目资料知识画像 Markdown 文件。"""
+    result = get_material_knowledge_profile_markdown(project_id=project_id, locale=locale)
+    markdown = str(result.markdown or "")
+    filename = f"material_knowledge_profile_{project_id}.md"
+    return Response(
+        content=markdown,
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get(
     "/projects/{project_id}/anchors",
     response_model=list[ProjectAnchorRecord],
     tags=["项目管理"],
@@ -7843,6 +7909,361 @@ def _render_material_depth_report_markdown(payload: Dict[str, object]) -> str:
                 lines.append(f"- {text}")
     else:
         lines.append("- 当前资料深读质量满足要求，无需额外整改。")
+    return "\n".join(lines).strip()
+
+
+def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
+    """
+    构建项目资料知识画像：
+    - 按资料类型聚合：提取词项、数字约束、覆盖维度
+    - 按16维聚合：评估每个维度在资料中的证据覆盖强度
+    """
+    rows = [m for m in load_materials() if str(m.get("project_id")) == str(project_id)]
+    rows.sort(key=lambda x: str(x.get("created_at") or ""))
+
+    by_type_term_counter: Dict[str, Counter[str]] = {}
+    by_type_numeric_counter: Dict[str, Counter[str]] = {}
+    by_type_dim_counter: Dict[str, Counter[str]] = {}
+    by_type_file_count: Dict[str, int] = {}
+    by_type_ok_files: Dict[str, int] = {}
+    by_type_chars: Dict[str, int] = {}
+    by_type_chunks: Dict[str, int] = {}
+
+    by_dim_stats: Dict[str, Dict[str, object]] = {
+        dim_id: {
+            "keyword_hits": 0,
+            "numeric_signal_hits": 0,
+            "source_types": set(),
+            "source_files": set(),
+        }
+        for dim_id in DIMENSION_IDS
+    }
+
+    parsed_ok_files = 0
+    parsed_failed_files = 0
+    total_chars = 0
+    total_chunks = 0
+    total_numeric_terms = 0
+    parse_fail_details: List[Dict[str, str]] = []
+
+    for row in rows:
+        filename = str(row.get("filename") or "").strip()
+        mat_type = _normalize_material_type(row.get("material_type"), filename=filename)
+        by_type_file_count[mat_type] = int(by_type_file_count.get(mat_type, 0)) + 1
+        by_type_term_counter.setdefault(mat_type, Counter())
+        by_type_numeric_counter.setdefault(mat_type, Counter())
+        by_type_dim_counter.setdefault(mat_type, Counter())
+        by_type_ok_files.setdefault(mat_type, 0)
+        by_type_chars.setdefault(mat_type, 0)
+        by_type_chunks.setdefault(mat_type, 0)
+
+        path = str(row.get("path") or "").strip()
+        if not path:
+            parsed_failed_files += 1
+            parse_fail_details.append(
+                {"filename": filename, "material_type": mat_type, "reason": "missing_path"}
+            )
+            continue
+        p = Path(path)
+        if not p.exists():
+            parsed_failed_files += 1
+            parse_fail_details.append(
+                {"filename": filename, "material_type": mat_type, "reason": "path_not_exists"}
+            )
+            continue
+        try:
+            text = str(_read_uploaded_file_content(p.read_bytes(), p.name) or "").strip()
+        except Exception as exc:
+            parsed_failed_files += 1
+            parse_fail_details.append(
+                {
+                    "filename": filename,
+                    "material_type": mat_type,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            continue
+        if not text:
+            parsed_failed_files += 1
+            parse_fail_details.append(
+                {"filename": filename, "material_type": mat_type, "reason": "empty_text"}
+            )
+            continue
+
+        parsed_ok_files += 1
+        by_type_ok_files[mat_type] = int(by_type_ok_files.get(mat_type, 0)) + 1
+
+        chars = len(text)
+        chunks = len(_split_material_text_chunks(text, max_chars=900))
+        total_chars += chars
+        total_chunks += chunks
+        by_type_chars[mat_type] = int(by_type_chars.get(mat_type, 0)) + chars
+        by_type_chunks[mat_type] = int(by_type_chunks.get(mat_type, 0)) + chunks
+
+        lexical_terms = _extract_terms(text, max_terms=220)
+        by_type_term_counter[mat_type].update(lexical_terms)
+
+        numeric_terms = [
+            token
+            for token in (
+                _normalize_numeric_token(item)
+                for item in _extract_numeric_terms(text, max_terms=260)
+            )
+            if token
+        ]
+        total_numeric_terms += len(set(numeric_terms))
+        by_type_numeric_counter[mat_type].update(numeric_terms)
+
+        lower = text.lower()
+        file_numeric_strength = min(8, len(set(numeric_terms)))
+        file_name = p.name
+        for dim_id in DIMENSION_IDS:
+            hit_count = 0
+            for kw in DIMENSION_RAG_KEYWORDS.get(dim_id, [])[:10]:
+                token = str(kw or "").strip().lower()
+                if token:
+                    hit_count += lower.count(token)
+            if hit_count <= 0:
+                continue
+            dim_row = by_dim_stats[dim_id]
+            dim_row["keyword_hits"] = int(dim_row.get("keyword_hits", 0)) + int(hit_count)
+            dim_row["numeric_signal_hits"] = int(dim_row.get("numeric_signal_hits", 0)) + int(
+                file_numeric_strength
+            )
+            (dim_row.get("source_types") or set()).add(mat_type)
+            (dim_row.get("source_files") or set()).add(file_name)
+            by_type_dim_counter[mat_type][dim_id] += int(hit_count)
+
+    dwg_files = 0
+    site_photo_files = 0
+    for row in rows:
+        filename = str(row.get("filename") or "").strip()
+        ext = Path(filename).suffix.lower()
+        mat_type = _normalize_material_type(row.get("material_type"), filename=filename)
+        if ext == ".dwg" or (mat_type == "drawing" and ext == ".dwg"):
+            dwg_files += 1
+        if mat_type == "site_photo" and ext in {
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".webp",
+            ".bmp",
+            ".tif",
+            ".tiff",
+        }:
+            site_photo_files += 1
+
+    capabilities = {
+        "ocr_available": bool(pytesseract is not None and Image is not None),
+        "dwg_converter_available": bool(_resolve_dwg_converter_binaries()),
+        "dwg_file_count": dwg_files,
+        "site_photo_file_count": site_photo_files,
+    }
+
+    all_types: List[str] = []
+    for mat_type in ["tender_qa", "boq", "drawing", "site_photo"]:
+        if int(by_type_file_count.get(mat_type, 0)) > 0:
+            all_types.append(mat_type)
+    for mat_type in sorted(by_type_file_count.keys()):
+        if mat_type not in all_types:
+            all_types.append(mat_type)
+
+    by_type_rows: List[Dict[str, object]] = []
+    for mat_type in all_types:
+        dim_hits = by_type_dim_counter.get(mat_type, Counter())
+        top_dims = [
+            {
+                "dimension_id": dim_id,
+                "dimension_name": str((DIMENSIONS.get(dim_id) or {}).get("name") or dim_id),
+                "keyword_hits": int(score),
+            }
+            for dim_id, score in dim_hits.most_common(4)
+        ]
+        by_type_rows.append(
+            {
+                "material_type": mat_type,
+                "material_type_label": _material_type_label(mat_type),
+                "files": int(by_type_file_count.get(mat_type, 0)),
+                "parsed_ok_files": int(by_type_ok_files.get(mat_type, 0)),
+                "parsed_chars": int(by_type_chars.get(mat_type, 0)),
+                "parsed_chunks": int(by_type_chunks.get(mat_type, 0)),
+                "unique_terms": int(len(by_type_term_counter.get(mat_type, Counter()))),
+                "numeric_terms": int(
+                    sum(by_type_numeric_counter.get(mat_type, Counter()).values())
+                ),
+                "top_terms": [
+                    term
+                    for term, _ in by_type_term_counter.get(mat_type, Counter()).most_common(10)
+                ],
+                "top_numeric_terms": [
+                    term
+                    for term, _ in by_type_numeric_counter.get(mat_type, Counter()).most_common(8)
+                ],
+                "top_dimensions": top_dims,
+            }
+        )
+
+    by_dimension_rows: List[Dict[str, object]] = []
+    low_dims: List[Dict[str, object]] = []
+    for dim_id in DIMENSION_IDS:
+        row = by_dim_stats.get(dim_id) or {}
+        keyword_hits = int(row.get("keyword_hits", 0))
+        numeric_signal_hits = int(row.get("numeric_signal_hits", 0))
+        source_types = sorted(str(x) for x in (row.get("source_types") or set()) if str(x))
+        source_files = sorted(str(x) for x in (row.get("source_files") or set()) if str(x))
+        # 覆盖评分：关键词命中 + 跨类型覆盖共同决定（0..1）。
+        coverage_score = min(1.0, (keyword_hits / 8.0) + (len(source_types) * 0.18))
+        if numeric_signal_hits > 0:
+            coverage_score = min(1.0, coverage_score + 0.06)
+        coverage_level = (
+            "high" if coverage_score >= 0.75 else ("medium" if coverage_score >= 0.35 else "low")
+        )
+        dim_row = {
+            "dimension_id": dim_id,
+            "dimension_name": str((DIMENSIONS.get(dim_id) or {}).get("name") or dim_id),
+            "keyword_hits": keyword_hits,
+            "numeric_signal_hits": numeric_signal_hits,
+            "source_types": source_types,
+            "source_file_count": len(source_files),
+            "source_files_preview": source_files[:6],
+            "coverage_score": round(float(coverage_score), 4),
+            "coverage_level": coverage_level,
+            "suggested_keywords": list((DIMENSION_RAG_KEYWORDS.get(dim_id) or [])[:4]),
+        }
+        by_dimension_rows.append(dim_row)
+        if coverage_level == "low":
+            low_dims.append(dim_row)
+
+    covered_dimensions = sum(1 for item in by_dimension_rows if item.get("coverage_level") != "low")
+    coverage_rate = (
+        round(float(covered_dimensions) / float(len(DIMENSION_IDS)), 4) if DIMENSION_IDS else 0.0
+    )
+
+    recommendations: List[str] = []
+    if not rows:
+        recommendations.append("尚未上传任何项目资料，请先上传招答/清单/图纸/现场照片后再评分。")
+    if parsed_failed_files > 0:
+        recommendations.append(
+            f"存在 {parsed_failed_files} 份资料未解析成功，建议优先修复（见失败详情）。"
+        )
+    if capabilities["site_photo_file_count"] > 0 and not capabilities["ocr_available"]:
+        recommendations.append("已上传现场照片但 OCR 不可用，建议安装 OCR 组件后重评分。")
+    if capabilities["dwg_file_count"] > 0 and not capabilities["dwg_converter_available"]:
+        recommendations.append("已上传 DWG 图纸但转换器不可用，建议安装 DWG 转换器后重评分。")
+    for dim_row in low_dims[:6]:
+        dim_name = str(dim_row.get("dimension_name") or dim_row.get("dimension_id") or "")
+        kw = "、".join(str(x) for x in (dim_row.get("suggested_keywords") or [])[:3])
+        if kw:
+            recommendations.append(f"维度[{dim_name}]证据薄弱，建议在资料/施组中补充：{kw}。")
+        else:
+            recommendations.append(
+                f"维度[{dim_name}]证据薄弱，建议补充可量化的执行条款与验收口径。"
+            )
+    for item in parse_fail_details[:8]:
+        fn = str(item.get("filename") or "").strip() or "未命名文件"
+        rs = str(item.get("reason") or "").strip() or "未知原因"
+        recommendations.append(f"解析失败：{fn}（{rs}）。")
+
+    return {
+        "project_id": project_id,
+        "generated_at": _now_iso(),
+        "capabilities": capabilities,
+        "summary": {
+            "total_files": len(rows),
+            "parsed_ok_files": parsed_ok_files,
+            "parsed_failed_files": parsed_failed_files,
+            "total_parsed_chars": total_chars,
+            "total_parsed_chunks": total_chunks,
+            "total_numeric_terms": total_numeric_terms,
+            "covered_dimensions": covered_dimensions,
+            "dimension_coverage_rate": coverage_rate,
+            "low_coverage_dimensions": len(low_dims),
+        },
+        "by_type": by_type_rows,
+        "by_dimension": by_dimension_rows,
+        "recommendations": recommendations[:24],
+    }
+
+
+def _render_material_knowledge_profile_markdown(payload: Dict[str, object]) -> str:
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    by_type = payload.get("by_type") if isinstance(payload.get("by_type"), list) else []
+    by_dimension = (
+        payload.get("by_dimension") if isinstance(payload.get("by_dimension"), list) else []
+    )
+    recommendations = (
+        payload.get("recommendations") if isinstance(payload.get("recommendations"), list) else []
+    )
+    capabilities = (
+        payload.get("capabilities") if isinstance(payload.get("capabilities"), dict) else {}
+    )
+    lines = [
+        "# 项目资料知识画像报告",
+        "",
+        f"- 项目ID：`{payload.get('project_id') or '-'}`",
+        f"- 生成时间：`{payload.get('generated_at') or '-'}`",
+        "",
+        "## 总览",
+        "",
+        f"- 资料总数：`{summary.get('total_files', 0)}`",
+        f"- 解析成功/失败：`{summary.get('parsed_ok_files', 0)}/{summary.get('parsed_failed_files', 0)}`",
+        f"- 解析字数：`{summary.get('total_parsed_chars', 0)}`",
+        f"- 分块数：`{summary.get('total_parsed_chunks', 0)}`",
+        f"- 数字约束项：`{summary.get('total_numeric_terms', 0)}`",
+        f"- 维度覆盖率：`{summary.get('dimension_coverage_rate', 0.0):.2%}`",
+        "",
+        "## 解析能力",
+        "",
+        f"- OCR 可用：`{bool(capabilities.get('ocr_available'))}`",
+        f"- DWG 转换器可用：`{bool(capabilities.get('dwg_converter_available'))}`",
+        f"- 现场照片文件数：`{capabilities.get('site_photo_file_count', 0)}`",
+        f"- DWG 文件数：`{capabilities.get('dwg_file_count', 0)}`",
+        "",
+        "## 按资料类型",
+        "",
+        "| 资料类型 | 文件数 | 解析字数 | 分块数 | 词项数 | 数字约束项 |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for row in by_type:
+        if not isinstance(row, dict):
+            continue
+        lines.append(
+            f"| {row.get('material_type_label', row.get('material_type', '-'))} "
+            f"| {row.get('files', 0)} "
+            f"| {row.get('parsed_chars', 0)} "
+            f"| {row.get('parsed_chunks', 0)} "
+            f"| {row.get('unique_terms', 0)} "
+            f"| {row.get('numeric_terms', 0)} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## 按评分维度",
+            "",
+            "| 维度 | 关键词命中 | 来源类型数 | 覆盖评分 | 等级 |",
+            "|---|---:|---:|---:|---|",
+        ]
+    )
+    for row in by_dimension:
+        if not isinstance(row, dict):
+            continue
+        lines.append(
+            f"| {row.get('dimension_id', '-')} {row.get('dimension_name', '')} "
+            f"| {row.get('keyword_hits', 0)} "
+            f"| {len(row.get('source_types') or [])} "
+            f"| {row.get('coverage_score', 0)} "
+            f"| {row.get('coverage_level', '-')} |"
+        )
+
+    lines.extend(["", "## 建议动作", ""])
+    if recommendations:
+        for item in recommendations:
+            text = str(item or "").strip()
+            if text:
+                lines.append(f"- {text}")
+    else:
+        lines.append("- 当前知识覆盖正常，无需额外动作。")
     return "\n".join(lines).strip()
 
 
@@ -11647,6 +12068,8 @@ def index(
           const EARLY_ACTIONS = {
             btnMaterialDepthReport: { resultId: 'materialDepthReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials/depth_report', loading: '资料深读体检生成中...' },
             btnMaterialDepthReportDownload: { resultId: 'materialDepthReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials/depth_report.md', loading: '体检报告下载准备中...' },
+            btnMaterialKnowledgeProfile: { resultId: 'materialKnowledgeProfileResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials/knowledge_profile', loading: '资料知识画像生成中...' },
+            btnMaterialKnowledgeProfileDownload: { resultId: 'materialKnowledgeProfileResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials/knowledge_profile.md', loading: '知识画像下载准备中...' },
             btnCompare: { resultId: 'compareResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare', loading: '对比排名加载中...' },
             btnCompareReport: { resultId: 'compareReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare_report', loading: '对比报告生成中...' },
             btnInsights: { resultId: 'insightsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/insights', loading: '洞察分析中...' },
@@ -11683,6 +12106,18 @@ def index(
               a.click();
               a.remove();
               setResult(cfg.resultId, '资料深读体检报告下载已触发。', false);
+              setOutput('[' + actionId + '] download ' + dlUrl);
+              return true;
+            }
+            if (actionId === 'btnMaterialKnowledgeProfileDownload') {
+              const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/materials/knowledge_profile.md';
+              const a = document.createElement('a');
+              a.href = dlUrl;
+              a.download = 'material_knowledge_profile_' + projectId + '.md';
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              setResult(cfg.resultId, '资料知识画像报告下载已触发。', false);
               setOutput('[' + actionId + '] download ' + dlUrl);
               return true;
             }
@@ -11796,6 +12231,33 @@ def index(
               setResultHtml(cfg.resultId, html);
               return true;
             }
+            if (actionId === 'btnMaterialKnowledgeProfile') {
+              const summary = (data && typeof data.summary === 'object') ? data.summary : {};
+              const dims = Array.isArray(data.by_dimension) ? data.by_dimension : [];
+              const rows = dims.slice().sort((a, b) => Number((b && b.coverage_score) || 0) - Number((a && a.coverage_score) || 0)).slice(0, 8);
+              const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
+              const html = ''
+                + '<strong>资料知识画像</strong>'
+                + '<p style="margin:6px 0">维度覆盖率：' + esc(summary.dimension_coverage_rate || 0)
+                + '；低覆盖维度：' + esc(summary.low_coverage_dimensions || 0)
+                + '；总解析字数：' + esc(summary.total_parsed_chars || 0) + '</p>'
+                + '<table><tr><th>维度</th><th>关键词命中</th><th>来源类型数</th><th>覆盖评分</th><th>等级</th></tr>'
+                + (rows.length
+                  ? rows.map((row) => '<tr>'
+                    + '<td>' + esc((row && row.dimension_id) || '-') + ' ' + esc((row && row.dimension_name) || '') + '</td>'
+                    + '<td>' + esc((row && row.keyword_hits) || 0) + '</td>'
+                    + '<td>' + esc(((row && row.source_types) || []).length) + '</td>'
+                    + '<td>' + esc((row && row.coverage_score) || 0) + '</td>'
+                    + '<td>' + esc((row && row.coverage_level) || '-') + '</td>'
+                    + '</tr>').join('')
+                  : '<tr><td colspan="5">暂无知识画像数据</td></tr>')
+                + '</table>'
+                + (recs.length
+                  ? '<ul style="margin:6px 0 0 18px;color:#92400e">' + recs.slice(0, 6).map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>'
+                  : '');
+              setResultHtml(cfg.resultId, html);
+              return true;
+            }
             setResultHtml(cfg.resultId, '<pre>' + esc(text || '{}') + '</pre>');
             return true;
           }
@@ -11868,10 +12330,13 @@ def index(
           <button type="button" id="btnRefreshMaterials" class="secondary" style="margin-left:8px">刷新</button>
           <button type="button" id="btnMaterialDepthReport" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialDepthReport')">深读体检</button>
           <button type="button" id="btnMaterialDepthReportDownload" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialDepthReportDownload')">下载体检报告(.md)</button>
+          <button type="button" id="btnMaterialKnowledgeProfile" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialKnowledgeProfile')">知识画像</button>
+          <button type="button" id="btnMaterialKnowledgeProfileDownload" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialKnowledgeProfileDownload')">下载知识画像(.md)</button>
         </div>
         <table id="materialsTable"><thead><tr><th>资料类型</th><th>文件名</th><th>上传时间</th><th>操作</th></tr></thead><tbody>__MATERIAL_ROWS__</tbody></table>
         <p id="materialsEmpty" style="font-size:13px;color:#64748b;margin:6px 0 0 0;display:__MATERIALS_EMPTY_DISPLAY__">暂无资料，请下方添加。</p>
         <div id="materialDepthReportResult" class="result-block" style="display:none"></div>
+        <div id="materialKnowledgeProfileResult" class="result-block" style="display:none"></div>
         <div class="upload-box">
           <h3 class="upload-panel-title">文件上传区</h3>
           <div class="upload-zones">
@@ -12130,6 +12595,8 @@ def index(
             btnUploadSitePhotos: { resultId: 'materialsActionStatusPhoto', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/materials', loading: '现场照片上传中...' },
             btnMaterialDepthReport: { resultId: 'materialDepthReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials/depth_report', loading: '资料深读体检生成中...' },
             btnMaterialDepthReportDownload: { resultId: 'materialDepthReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials/depth_report.md', loading: '体检报告下载准备中...' },
+            btnMaterialKnowledgeProfile: { resultId: 'materialKnowledgeProfileResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials/knowledge_profile', loading: '资料知识画像生成中...' },
+            btnMaterialKnowledgeProfileDownload: { resultId: 'materialKnowledgeProfileResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials/knowledge_profile.md', loading: '知识画像下载准备中...' },
             btnUploadShigong: { resultId: 'shigongActionStatus', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/shigong', loading: '施组上传中...' },
             btnScoreShigong: { resultId: 'shigongActionStatus', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/rescore', loading: '施组评分中...' },
             btnCompare: { resultId: 'compareResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare', loading: '对比排名加载中...' },
@@ -12370,6 +12837,36 @@ def index(
                     + '<td>' + fallbackEscapeHtml((row && row.numeric_terms) || 0) + '</td>'
                     + '</tr>').join('')
                   : '<tr><td colspan="5">暂无资料体检数据</td></tr>')
+                + '</table>'
+                + (recs.length
+                  ? '<ul style="margin:6px 0 0 18px;color:#92400e">' + recs.slice(0, 6).map((x) => '<li>' + fallbackEscapeHtml(x) + '</li>').join('') + '</ul>'
+                  : '');
+              fallbackSetResultHtml(resultId, html);
+              return true;
+            }
+            if (aid === 'btnMaterialKnowledgeProfile') {
+              const summary = (data && typeof data.summary === 'object') ? data.summary : {};
+              const dims = Array.isArray(data.by_dimension) ? data.by_dimension : [];
+              const rows = dims.slice().sort((a, b) => Number((b && b.coverage_score) || 0) - Number((a && a.coverage_score) || 0)).slice(0, 8);
+              const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
+              const html = '<strong>资料知识画像</strong>'
+                + '<p style="margin:6px 0">维度覆盖率：'
+                + fallbackEscapeHtml(summary.dimension_coverage_rate || 0)
+                + '；低覆盖维度：'
+                + fallbackEscapeHtml(summary.low_coverage_dimensions || 0)
+                + '；总解析字数：'
+                + fallbackEscapeHtml(summary.total_parsed_chars || 0)
+                + '</p>'
+                + '<table><tr><th>维度</th><th>关键词命中</th><th>来源类型数</th><th>覆盖评分</th><th>等级</th></tr>'
+                + (rows.length
+                  ? rows.map((row) => '<tr>'
+                    + '<td>' + fallbackEscapeHtml((row && row.dimension_id) || '-') + ' ' + fallbackEscapeHtml((row && row.dimension_name) || '') + '</td>'
+                    + '<td>' + fallbackEscapeHtml((row && row.keyword_hits) || 0) + '</td>'
+                    + '<td>' + fallbackEscapeHtml(((row && row.source_types) || []).length) + '</td>'
+                    + '<td>' + fallbackEscapeHtml((row && row.coverage_score) || 0) + '</td>'
+                    + '<td>' + fallbackEscapeHtml((row && row.coverage_level) || '-') + '</td>'
+                    + '</tr>').join('')
+                  : '<tr><td colspan="5">暂无知识画像数据</td></tr>')
                 + '</table>'
                 + (recs.length
                   ? '<ul style="margin:6px 0 0 18px;color:#92400e">' + recs.slice(0, 6).map((x) => '<li>' + fallbackEscapeHtml(x) + '</li>').join('') + '</ul>'
@@ -12880,6 +13377,18 @@ def index(
               a.click();
               a.remove();
               fallbackSetResult(cfg.resultId, '资料深读体检报告下载已触发。', false);
+              fallbackSetOutput('[' + actionId + '] download ' + dlUrl);
+              return true;
+            }
+            if (actionId === 'btnMaterialKnowledgeProfileDownload') {
+              const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/materials/knowledge_profile.md';
+              const a = document.createElement('a');
+              a.href = dlUrl;
+              a.download = 'material_knowledge_profile_' + projectId + '.md';
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              fallbackSetResult(cfg.resultId, '资料知识画像报告下载已触发。', false);
               fallbackSetOutput('[' + actionId + '] download ' + dlUrl);
               return true;
             }

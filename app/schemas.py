@@ -461,6 +461,26 @@ class MaterialDepthReportMarkdownResponse(BaseModel):
     generated_at: str
 
 
+class MaterialKnowledgeProfileResponse(BaseModel):
+    """项目资料知识画像（按维度/资料类型聚合）"""
+
+    project_id: str
+    generated_at: str
+    capabilities: Dict[str, Any] = Field(default_factory=dict)
+    summary: Dict[str, Any] = Field(default_factory=dict)
+    by_type: List[Dict[str, Any]] = Field(default_factory=list)
+    by_dimension: List[Dict[str, Any]] = Field(default_factory=list)
+    recommendations: List[str] = Field(default_factory=list)
+
+
+class MaterialKnowledgeProfileMarkdownResponse(BaseModel):
+    """项目资料知识画像 Markdown 导出"""
+
+    project_id: str
+    markdown: str
+    generated_at: str
+
+
 class SelfCheckItem(BaseModel):
     name: str
     ok: bool
