@@ -59,6 +59,8 @@ class TestIndexEndpoint:
         assert 'id="btnMaterialKnowledgeProfileDownload"' in response.text
         assert 'id="btnEvolutionHealth"' in response.text
         assert 'id="btnEvidenceTrace"' in response.text
+        assert 'id="btnScoringBasis"' in response.text
+        assert 'id="scoringBasisResult"' in response.text
         assert 'id="groundTruthSubmissionSelect"' in response.text
         assert 'id="groundTruthFile"' not in response.text
         assert "/ground_truth/from_submission" in response.text
@@ -151,6 +153,7 @@ class TestIndexEndpoint:
             "btnInsights",
             "btnLearning",
             "btnEvidenceTrace",
+            "btnScoringBasis",
             "btnAdaptive",
             "btnAdaptivePatch",
             "btnAdaptiveValidate",
@@ -173,6 +176,7 @@ class TestIndexEndpoint:
             "insightsResult",
             "learningResult",
             "evidenceTraceResult",
+            "scoringBasisResult",
             "adaptiveResult",
             "adaptivePatchResult",
             "adaptiveValidateResult",
@@ -2639,6 +2643,42 @@ class TestMaterialAdvancedParsing:
         assert gate["blocked"] is True
         assert any("资料检索证据数量" in str(x) for x in (gate.get("reasons") or []))
 
+    def test_evaluate_material_utilization_gate_blocks_when_uploaded_type_uncovered(self):
+        from app.main import _evaluate_material_utilization_gate
+
+        summary = {
+            "retrieval_total": 10,
+            "retrieval_hit_rate": 0.8,
+            "retrieval_file_total": 6,
+            "retrieval_file_coverage_rate": 0.8,
+            "consistency_total": 6,
+            "consistency_hit_rate": 0.8,
+            "available_types": ["tender_qa", "boq", "drawing", "site_photo"],
+            "uncovered_types": ["site_photo"],
+        }
+        policy = {
+            "enabled": True,
+            "mode": "block",
+            "min_retrieval_total": 2,
+            "min_retrieval_hit_rate": 0.2,
+            "min_retrieval_file_coverage_rate": 0.2,
+            "min_consistency_hit_rate": 0.2,
+            "max_uncovered_required_types": 0,
+            "min_required_type_presence_rate": 0.6,
+            "min_required_type_coverage_rate": 0.6,
+            "enforce_uploaded_type_coverage": True,
+            "min_uploaded_type_coverage_rate": 1.0,
+        }
+        gate = _evaluate_material_utilization_gate(
+            summary,
+            policy=policy,
+            required_types=["tender_qa", "boq", "drawing"],
+        )
+        assert gate["blocked"] is True
+        assert gate["uploaded_type_coverage_rate"] == pytest.approx(0.75, abs=1e-4)
+        assert "site_photo" in (gate.get("uncovered_uploaded_types") or [])
+        assert any("已上传资料类型覆盖率" in str(x) for x in (gate.get("reasons") or []))
+
 
 class TestScoreForProjectEndpoint:
     """Tests for /projects/{project_id}/score endpoint."""
@@ -3180,6 +3220,70 @@ class TestEvidenceTraceEndpoints:
         data = response.json()
         assert data["submission_id"] == "s_old_scored"
         assert data["filename"] == "已评分施组.pdf"
+
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_latest_submission_scoring_basis_success(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_submissions,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "施工组织设计.pdf",
+                "text": "工期120天，关键节点分三段推进。",
+                "created_at": "2026-02-27T00:00:00+00:00",
+                "report": {
+                    "scoring_status": "scored",
+                    "requirement_hits": [],
+                    "meta": {
+                        "input_injection": {
+                            "mece_inputs": {
+                                "project_materials_extracted": True,
+                                "shigong_parsed": True,
+                                "bid_requirements_loaded": True,
+                                "attention_16d_weights_injected": True,
+                                "custom_instructions_injected": True,
+                                "materials_quality_gate_passed": True,
+                            }
+                        },
+                        "material_quality": {"total_files": 4, "total_parsed_chars": 22000},
+                        "material_retrieval": {"chunks": 18, "requirements": 16},
+                        "material_utilization": {
+                            "retrieval_hit_rate": 0.72,
+                            "retrieval_file_coverage_rate": 0.8,
+                        },
+                        "material_utilization_gate": {
+                            "passed": True,
+                            "blocked": False,
+                            "reasons": [],
+                        },
+                        "evidence_trace": {
+                            "total_requirements": 20,
+                            "total_hits": 14,
+                            "mandatory_hit_rate": 0.75,
+                            "source_files_hit_count": 3,
+                            "source_files_hit": ["招标文件.pdf", "工程量清单.xlsx", "图纸.dxf"],
+                        },
+                    },
+                },
+            }
+        ]
+
+        response = client.get("/api/v1/projects/p1/scoring_basis/latest")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["submission_id"] == "s1"
+        assert data["mece_inputs"]["materials_quality_gate_passed"] is True
+        assert data["material_utilization"]["retrieval_hit_rate"] == pytest.approx(0.72, abs=1e-6)
+        assert data["evidence_trace"]["source_files_hit_count"] == 3
 
     def test_build_material_conflict_summary_from_report(self):
         from app.main import _build_material_conflict_summary_from_report

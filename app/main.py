@@ -187,6 +187,7 @@ from app.schemas import (
     RescoreResponse,
     ScoreReport,
     ScoreRequest,
+    ScoringBasisResponse,
     ScoringFactorsMarkdownResponse,
     ScoringFactorsResponse,
     ScoringReadinessResponse,
@@ -328,6 +329,8 @@ DEFAULT_MATERIAL_RETRIEVAL_TOP_K = 18
 DEFAULT_MATERIAL_RETRIEVAL_PER_TYPE_QUOTA = 2
 DEFAULT_MATERIAL_RETRIEVAL_PER_FILE_QUOTA = 3
 DEFAULT_MIN_MATERIAL_RETRIEVAL_FILE_COVERAGE_RATE = 0.0
+DEFAULT_ENFORCE_UPLOADED_TYPE_COVERAGE = True
+DEFAULT_MIN_UPLOADED_TYPE_COVERAGE_RATE = 1.0
 DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR = 200
 DEFAULT_PDF_OCR_MAX_PAGES = 30
 PROFILE_LOCKED_STATUSES = {"submitted_to_qingtian"}
@@ -512,6 +515,12 @@ def _ensure_project_v2_fields(
         meta["min_material_retrieval_file_coverage_rate"] = float(
             DEFAULT_MIN_MATERIAL_RETRIEVAL_FILE_COVERAGE_RATE
         )
+        changed = True
+    if "enforce_uploaded_type_coverage" not in meta:
+        meta["enforce_uploaded_type_coverage"] = bool(DEFAULT_ENFORCE_UPLOADED_TYPE_COVERAGE)
+        changed = True
+    if "min_uploaded_type_coverage_rate" not in meta:
+        meta["min_uploaded_type_coverage_rate"] = float(DEFAULT_MIN_UPLOADED_TYPE_COVERAGE_RATE)
         changed = True
     return changed
 
@@ -2010,6 +2019,83 @@ def _build_submission_evidence_trace_report(
     }
 
 
+def _build_submission_scoring_basis_report(
+    *,
+    project_id: str,
+    submission: Dict[str, object],
+) -> Dict[str, object]:
+    """构建评分依据审计：展示评分时注入的输入与资料命中链路。"""
+    submission_id = str(submission.get("id") or "")
+    filename = str(submission.get("filename") or "")
+    report = submission.get("report") if isinstance(submission.get("report"), dict) else {}
+    meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+    input_injection = (
+        meta.get("input_injection") if isinstance(meta.get("input_injection"), dict) else {}
+    )
+    material_quality = (
+        meta.get("material_quality") if isinstance(meta.get("material_quality"), dict) else {}
+    )
+    if not material_quality:
+        material_quality = _build_material_quality_snapshot(project_id)
+    material_retrieval = (
+        meta.get("material_retrieval") if isinstance(meta.get("material_retrieval"), dict) else {}
+    )
+    material_utilization = (
+        meta.get("material_utilization")
+        if isinstance(meta.get("material_utilization"), dict)
+        else {}
+    )
+    material_utilization_gate = (
+        meta.get("material_utilization_gate")
+        if isinstance(meta.get("material_utilization_gate"), dict)
+        else {}
+    )
+    evidence_trace = (
+        meta.get("evidence_trace") if isinstance(meta.get("evidence_trace"), dict) else {}
+    )
+    if not evidence_trace:
+        evidence_trace = _build_evidence_trace_summary(report)
+
+    recommendations: List[str] = []
+    mece_inputs = (
+        input_injection.get("mece_inputs")
+        if isinstance(input_injection.get("mece_inputs"), dict)
+        else {}
+    )
+    if mece_inputs and not bool(mece_inputs.get("materials_quality_gate_passed", True)):
+        recommendations.append("资料门禁未通过：建议先完成“3) 项目资料”整改后再评分。")
+    if material_utilization_gate:
+        for reason in material_utilization_gate.get("reasons") or []:
+            reason_text = str(reason).strip()
+            if reason_text:
+                recommendations.append(reason_text)
+    if (_to_float_or_none(evidence_trace.get("total_requirements")) or 0) > 0 and (
+        _to_float_or_none(evidence_trace.get("total_hits")) or 0
+    ) <= 0:
+        recommendations.append("评分未命中任何资料证据：请补充与清单/图纸/答疑一致的量化约束。")
+
+    deduped_recommendations: List[str] = []
+    for item in recommendations:
+        text = str(item or "").strip()
+        if text and text not in deduped_recommendations:
+            deduped_recommendations.append(text)
+
+    return {
+        "project_id": project_id,
+        "submission_id": submission_id,
+        "filename": filename,
+        "generated_at": _now_iso(),
+        "scoring_status": str(report.get("scoring_status") or "unknown"),
+        "mece_inputs": mece_inputs,
+        "material_quality": material_quality,
+        "material_retrieval": material_retrieval,
+        "material_utilization": material_utilization,
+        "material_utilization_gate": material_utilization_gate,
+        "evidence_trace": evidence_trace,
+        "recommendations": deduped_recommendations[:16],
+    }
+
+
 def _render_evidence_trace_markdown(payload: Dict[str, object]) -> str:
     summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
     by_dimension = (
@@ -2437,6 +2523,9 @@ def _resolve_material_utilization_policy(project: Dict[str, object]) -> Dict[str
             meta.get("enforce_material_utilization_gate", DEFAULT_ENFORCE_MATERIAL_UTILIZATION_GATE)
         ),
         "mode": mode,
+        "enforce_uploaded_type_coverage": bool(
+            meta.get("enforce_uploaded_type_coverage", DEFAULT_ENFORCE_UPLOADED_TYPE_COVERAGE)
+        ),
         "min_retrieval_total": _to_nonneg_int(
             meta.get("min_material_retrieval_total"),
             DEFAULT_MIN_MATERIAL_RETRIEVAL_TOTAL,
@@ -2464,6 +2553,10 @@ def _resolve_material_utilization_policy(project: Dict[str, object]) -> Dict[str
         "min_required_type_coverage_rate": _to_rate(
             meta.get("min_required_type_coverage_rate"),
             DEFAULT_MIN_REQUIRED_TYPE_COVERAGE_RATE,
+        ),
+        "min_uploaded_type_coverage_rate": _to_rate(
+            meta.get("min_uploaded_type_coverage_rate"),
+            DEFAULT_MIN_UPLOADED_TYPE_COVERAGE_RATE,
         ),
     }
 
@@ -2521,6 +2614,13 @@ def _evaluate_material_utilization_gate(
     required_coverage_rate = (
         round(float(len(covered_required)) / float(len(required_present)), 4)
         if required_present
+        else None
+    )
+    uncovered_uploaded_types = [t for t in available_types if t in uncovered_types]
+    covered_uploaded_types = [t for t in available_types if t not in uncovered_uploaded_types]
+    uploaded_type_coverage_rate = (
+        round(float(len(covered_uploaded_types)) / float(len(available_types)), 4)
+        if available_types
         else None
     )
 
@@ -2597,6 +2697,19 @@ def _evaluate_material_utilization_gate(
             ),
         ),
     )
+    enforce_uploaded_type_coverage = bool(
+        gate_policy.get("enforce_uploaded_type_coverage", DEFAULT_ENFORCE_UPLOADED_TYPE_COVERAGE)
+    )
+    min_uploaded_type_coverage = min(
+        1.0,
+        max(
+            0.0,
+            float(
+                _to_float_or_none(gate_policy.get("min_uploaded_type_coverage_rate"))
+                or DEFAULT_MIN_UPLOADED_TYPE_COVERAGE_RATE
+            ),
+        ),
+    )
 
     reasons: List[str] = []
     if retrieval_total < min_retrieval_total:
@@ -2638,6 +2751,17 @@ def _evaluate_material_utilization_gate(
         reasons.append(
             f"关键资料覆盖率 {required_coverage_rate:.1%} 低于阈值 {min_required_coverage:.1%}"
         )
+    if (
+        enforce_uploaded_type_coverage
+        and uploaded_type_coverage_rate is not None
+        and uploaded_type_coverage_rate < min_uploaded_type_coverage
+    ):
+        labels = "、".join(_material_type_label(x) for x in uncovered_uploaded_types)
+        reasons.append(
+            "已上传资料类型覆盖率 "
+            + f"{uploaded_type_coverage_rate:.1%} 低于阈值 {min_uploaded_type_coverage:.1%}"
+            + (f"，未形成证据类型：{labels}" if labels else "")
+        )
 
     failed = bool(reasons)
     blocked = bool(enabled and failed and mode == "block")
@@ -2667,6 +2791,7 @@ def _evaluate_material_utilization_gate(
             "max_uncovered_required_types": max_uncovered,
             "min_required_type_presence_rate": min_required_presence,
             "min_required_type_coverage_rate": min_required_coverage,
+            "min_uploaded_type_coverage_rate": min_uploaded_type_coverage,
         },
         "required_types": normalized_required,
         "required_types_missing_upload": missing_required_upload,
@@ -2675,6 +2800,11 @@ def _evaluate_material_utilization_gate(
         "covered_required_types": covered_required,
         "uncovered_required_types": uncovered_required,
         "required_type_coverage_rate": required_coverage_rate,
+        "enforce_uploaded_type_coverage": enforce_uploaded_type_coverage,
+        "uploaded_types": available_types,
+        "covered_uploaded_types": covered_uploaded_types,
+        "uncovered_uploaded_types": uncovered_uploaded_types,
+        "uploaded_type_coverage_rate": uploaded_type_coverage_rate,
         "metrics": {
             "retrieval_total": retrieval_total,
             "retrieval_hit_rate": retrieval_hit_rate,
@@ -9734,6 +9864,63 @@ def get_latest_submission_evidence_trace(
     )
 
 
+@router.get(
+    "/projects/{project_id}/submissions/{submission_id}/scoring_basis",
+    response_model=ScoringBasisResponse,
+    tags=["施组提交"],
+    responses={**RESPONSES_404},
+)
+def get_submission_scoring_basis(
+    project_id: str,
+    submission_id: str,
+    locale: str = Depends(get_locale),
+) -> ScoringBasisResponse:
+    """获取单份施组评分依据审计（结构化 JSON）。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    _find_project(project_id, projects)
+    submissions = load_submissions()
+    submission = next(
+        (
+            s
+            for s in submissions
+            if str(s.get("id") or "") == submission_id
+            and str(s.get("project_id") or "") == project_id
+        ),
+        None,
+    )
+    if submission is None:
+        raise HTTPException(status_code=404, detail=t("api.no_submissions", locale=locale))
+    payload = _build_submission_scoring_basis_report(project_id=project_id, submission=submission)
+    return ScoringBasisResponse(**payload)
+
+
+@router.get(
+    "/projects/{project_id}/scoring_basis/latest",
+    response_model=ScoringBasisResponse,
+    tags=["施组提交"],
+    responses={**RESPONSES_404},
+)
+def get_latest_submission_scoring_basis(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> ScoringBasisResponse:
+    """获取本项目最新施组（优先已评分）的评分依据审计。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    _find_project(project_id, projects)
+    submissions = load_submissions()
+    latest = _latest_project_submission(project_id, submissions, prefer_scored=True)
+    if latest is None:
+        raise HTTPException(status_code=404, detail=t("api.no_submissions", locale=locale))
+    submission_id = str(latest.get("id") or "")
+    return get_submission_scoring_basis(
+        project_id=project_id,
+        submission_id=submission_id,
+        locale=locale,
+    )
+
+
 @router.post(
     "/submissions/{submission_id}/qingtian-results",
     response_model=QingTianResultRecord,
@@ -12209,6 +12396,35 @@ def compat_latest_submission_evidence_trace(
     return get_latest_submission_evidence_trace(project_id=project_id, locale=locale)
 
 
+@compat_router.get(
+    "/projects/{project_id}/submissions/{submission_id}/scoring_basis",
+    response_model=ScoringBasisResponse,
+    tags=["施组提交"],
+)
+def compat_get_submission_scoring_basis(
+    project_id: str,
+    submission_id: str,
+    locale: str = Depends(get_locale),
+) -> ScoringBasisResponse:
+    return get_submission_scoring_basis(
+        project_id=project_id,
+        submission_id=submission_id,
+        locale=locale,
+    )
+
+
+@compat_router.get(
+    "/projects/{project_id}/scoring_basis/latest",
+    response_model=ScoringBasisResponse,
+    tags=["施组提交"],
+)
+def compat_get_latest_submission_scoring_basis(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> ScoringBasisResponse:
+    return get_latest_submission_scoring_basis(project_id=project_id, locale=locale)
+
+
 @compat_router.post(
     "/submissions/{submission_id}/qingtian-results",
     response_model=QingTianResultRecord,
@@ -13075,6 +13291,7 @@ def index(
             btnInsights: { resultId: 'insightsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/insights', loading: '洞察分析中...' },
             btnLearning: { resultId: 'learningResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/learning', loading: '学习画像生成中...' },
             btnEvidenceTrace: { resultId: 'evidenceTraceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/evidence_trace/latest', loading: '证据追溯生成中...' },
+            btnScoringBasis: { resultId: 'scoringBasisResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/scoring_basis/latest', loading: '评分依据审计生成中...' },
             btnAdaptive: { resultId: 'adaptiveResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/adaptive', loading: '自适应建议生成中...' },
             btnAdaptivePatch: { resultId: 'adaptivePatchResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/adaptive_patch', loading: '补丁生成中...' },
             btnAdaptiveValidate: { resultId: 'adaptiveValidateResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/adaptive_validate', loading: '验证效果计算中...' },
@@ -13176,6 +13393,34 @@ def index(
                 + (recommendations.length
                   ? '<ul style="margin:6px 0 0 18px;color:#92400e">' + recommendations.slice(0, 6).map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>'
                   : '');
+              setResultHtml(cfg.resultId, html);
+              return true;
+            }
+            if (actionId === 'btnScoringBasis') {
+              const mece = (data && typeof data.mece_inputs === 'object') ? data.mece_inputs : {};
+              const util = (data && typeof data.material_utilization === 'object') ? data.material_utilization : {};
+              const gate = (data && typeof data.material_utilization_gate === 'object') ? data.material_utilization_gate : {};
+              const trace = (data && typeof data.evidence_trace === 'object') ? data.evidence_trace : {};
+              const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
+              let html = '<strong>评分依据审计（最新施组）</strong>'
+                + '<p style="margin:6px 0">文件：' + esc(data.filename || '-') + '；状态：' + esc(data.scoring_status || '-') + '</p>'
+                + '<table><tr><th>资料门禁</th><th>资料检索命中率</th><th>文件覆盖率</th><th>强制项命中率</th><th>命中文件数</th></tr>'
+                + '<tr><td>' + (mece.materials_quality_gate_passed ? '<span class="success">通过</span>' : '<span class="error">未通过</span>') + '</td>'
+                + '<td>' + esc(util.retrieval_hit_rate ?? '-') + '</td>'
+                + '<td>' + esc(util.retrieval_file_coverage_rate ?? '-') + '</td>'
+                + '<td>' + esc(trace.mandatory_hit_rate ?? '-') + '</td>'
+                + '<td>' + esc(trace.source_files_hit_count || 0) + '</td></tr></table>';
+              const hitFiles = Array.isArray(trace.source_files_hit) ? trace.source_files_hit : [];
+              if (hitFiles.length) {
+                html += '<p style="margin:6px 0">命中文件：' + esc(hitFiles.slice(0, 6).join('；')) + (hitFiles.length > 6 ? ' 等' : '') + '</p>';
+              }
+              const gateReasons = Array.isArray(gate.reasons) ? gate.reasons : [];
+              if (gateReasons.length) {
+                html += '<details style="margin-top:6px"><summary>门禁原因</summary><ul>' + gateReasons.slice(0, 8).map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul></details>';
+              }
+              if (recs.length) {
+                html += '<strong>建议动作</strong><ul>' + recs.slice(0, 8).map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>';
+              }
               setResultHtml(cfg.resultId, html);
               return true;
             }
@@ -13485,12 +13730,14 @@ def index(
           <button type="button" id="btnInsights" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnInsights')">洞察</button>
           <button type="button" id="btnLearning" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnLearning')">生成学习画像</button>
           <button type="button" id="btnEvidenceTrace" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnEvidenceTrace')">证据追溯（最新施组）</button>
+          <button type="button" id="btnScoringBasis" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnScoringBasis')">评分依据（最新施组）</button>
         </div>
         <div id="compareResult" class="result-block" style="display:none"></div>
         <div id="compareReportResult" class="result-block" style="display:none"></div>
         <div id="insightsResult" class="result-block" style="display:none"></div>
         <div id="learningResult" class="result-block" style="display:none"></div>
         <div id="evidenceTraceResult" class="result-block" style="display:none"></div>
+        <div id="scoringBasisResult" class="result-block" style="display:none"></div>
       </div>
 
       <div class="section card" id="section-adaptive" style="display:none">
@@ -13652,6 +13899,7 @@ def index(
             btnInsights: { resultId: 'insightsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/insights', loading: '洞察分析中...' },
             btnLearning: { resultId: 'learningResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/learning', loading: '学习画像生成中...' },
             btnEvidenceTrace: { resultId: 'evidenceTraceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/evidence_trace/latest', loading: '证据追溯生成中...' },
+            btnScoringBasis: { resultId: 'scoringBasisResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/scoring_basis/latest', loading: '评分依据审计生成中...' },
             btnAdaptive: { resultId: 'adaptiveResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/adaptive', loading: '自适应建议生成中...' },
             btnAdaptivePatch: { resultId: 'adaptivePatchResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/adaptive_patch', loading: '补丁生成中...' },
             btnAdaptiveValidate: { resultId: 'adaptiveValidateResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/adaptive_validate', loading: '验证效果计算中...' },
@@ -14766,7 +15014,7 @@ def index(
         const NON_BLOCKING_ACTION_BUTTON_IDS = [
           'btnUploadMaterials', 'btnUploadBoq', 'btnUploadDrawing', 'btnUploadSitePhotos', 'btnRefreshMaterials', 'btnMaterialDepthReport', 'btnMaterialDepthReportDownload', 'btnMaterialKnowledgeProfile', 'btnMaterialKnowledgeProfileDownload', 'btnUploadShigong', 'btnScoreShigong', 'btnRefreshSubmissions',
           'btnCompare', 'btnCompareReport', 'btnInsights', 'btnLearning',
-          'btnEvidenceTrace',
+          'btnEvidenceTrace', 'btnScoringBasis',
           'btnAdaptive', 'btnAdaptivePatch', 'btnAdaptiveValidate', 'btnAdaptiveApply',
           'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
           'btnEvolve', 'btnEvolutionHealth', 'btnWritingGuidance', 'btnCompilationInstructions',
@@ -14897,7 +15145,7 @@ def index(
             'materialDepthReportResult',
             'materialUtilizationResult',
             'compareResult', 'compareReportResult', 'insightsResult', 'learningResult',
-            'evidenceTraceResult',
+            'evidenceTraceResult', 'scoringBasisResult',
             'adaptiveResult', 'adaptivePatchResult', 'adaptiveValidateResult', 'adaptiveApplyResult',
             'evolveResult', 'guidanceResult', 'compilationInstructionsResult',
             'deltaResult', 'sampleResult', 'calibTrainResult', 'patchResult',
@@ -17453,6 +17701,44 @@ def index(
               a.remove();
             };
           }
+        });
+
+        safeClick('btnScoringBasis', async () => {
+          if (!ensureProjectForAction('scoringBasisResult')) return;
+          setResultLoading('scoringBasisResult', '评分依据审计生成中...');
+          const projectId = actionProjectId();
+          const res = await fetch('/api/v1/projects/' + projectId + '/scoring_basis/latest');
+          const data = await res.json().catch(() => ({}));
+          showJson('output', formatApiOutput(res, data));
+          const el = document.getElementById('scoringBasisResult');
+          el.style.display = 'block';
+          if (!res.ok) {
+            el.innerHTML = '<span class="error">' + (data.detail || '请求失败') + '</span>';
+            return;
+          }
+          const mece = (data.mece_inputs && typeof data.mece_inputs === 'object') ? data.mece_inputs : {};
+          const util = (data.material_utilization && typeof data.material_utilization === 'object') ? data.material_utilization : {};
+          const gate = (data.material_utilization_gate && typeof data.material_utilization_gate === 'object') ? data.material_utilization_gate : {};
+          const trace = (data.evidence_trace && typeof data.evidence_trace === 'object') ? data.evidence_trace : {};
+          const recommendations = Array.isArray(data.recommendations) ? data.recommendations : [];
+          let html = '<strong>评分依据审计（最新施组）</strong>';
+          html += '<p style="margin:6px 0">文件：' + escapeHtmlText(data.filename || '-') + '；评分状态：' + escapeHtmlText(data.scoring_status || '-') + '</p>';
+          html += '<table><tr><th>资料门禁</th><th>资料检索命中率</th><th>文件覆盖率</th><th>强制项命中率</th><th>命中文件数</th></tr>'
+            + '<tr><td>' + (mece.materials_quality_gate_passed ? '<span class="success">通过</span>' : '<span class="error">未通过</span>') + '</td><td>' + escapeHtmlText(util.retrieval_hit_rate ?? '-') + '</td><td>' + escapeHtmlText(util.retrieval_file_coverage_rate ?? '-') + '</td><td>' + escapeHtmlText(trace.mandatory_hit_rate ?? '-') + '</td><td>' + escapeHtmlText(trace.source_files_hit_count || 0) + '</td></tr></table>';
+          const hitFiles = Array.isArray(trace.source_files_hit) ? trace.source_files_hit : [];
+          if (hitFiles.length) {
+            html += '<p style="margin:6px 0">命中文件：' + escapeHtmlText(hitFiles.slice(0, 8).join('；')) + (hitFiles.length > 8 ? ' 等' : '') + '</p>';
+          } else {
+            html += '<p style="margin:6px 0;color:#92400e">尚未命中项目资料文件，请检查资料深读体检与一致性。</p>';
+          }
+          const gateReasons = Array.isArray(gate.reasons) ? gate.reasons : [];
+          if (gateReasons.length) {
+            html += '<details style="margin-top:6px"><summary>门禁原因</summary><ul>' + gateReasons.slice(0, 8).map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('') + '</ul></details>';
+          }
+          if (recommendations.length) {
+            html += '<strong>建议动作</strong><ul>' + recommendations.slice(0, 8).map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('') + '</ul>';
+          }
+          el.innerHTML = html;
         });
 
         safeClick('btnAdaptive', async () => {

@@ -618,6 +618,23 @@ class EvidenceTraceMarkdownResponse(BaseModel):
     generated_at: str
 
 
+class ScoringBasisResponse(BaseModel):
+    """单份施组评分依据审计报告"""
+
+    project_id: str
+    submission_id: str
+    filename: Optional[str] = None
+    generated_at: str
+    scoring_status: str = "unknown"
+    mece_inputs: Dict[str, Any] = Field(default_factory=dict)
+    material_quality: Dict[str, Any] = Field(default_factory=dict)
+    material_retrieval: Dict[str, Any] = Field(default_factory=dict)
+    material_utilization: Dict[str, Any] = Field(default_factory=dict)
+    material_utilization_gate: Dict[str, Any] = Field(default_factory=dict)
+    evidence_trace: Dict[str, Any] = Field(default_factory=dict)
+    recommendations: List[str] = Field(default_factory=list)
+
+
 class ProjectEvaluationResponse(BaseModel):
     project_id: str
     sample_count_qt: int
