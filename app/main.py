@@ -4456,6 +4456,36 @@ def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
     except Exception as e:
         add("rate_limit_status", False, str(e))
 
+    # parser/runtime capability checks
+    add(
+        "parser_pdf",
+        pymupdf is not None,
+        "PyMuPDF available" if pymupdf is not None else "PyMuPDF missing",
+    )
+    add(
+        "parser_docx",
+        Document is not None,
+        "python-docx available" if Document is not None else "python-docx missing",
+    )
+    ocr_available = bool(pytesseract is not None and Image is not None)
+    if ocr_available:
+        try:
+            version = str(pytesseract.get_tesseract_version()) if pytesseract is not None else ""
+            add("parser_ocr", True, f"tesseract={version}")
+        except Exception:
+            add("parser_ocr", True, "pytesseract available")
+    else:
+        add("parser_ocr", False, "pytesseract or PIL missing")
+    try:
+        dwg_bins = _resolve_dwg_converter_binaries()
+        add(
+            "parser_dwg_converter",
+            bool(dwg_bins),
+            f"found={','.join(Path(p).name for p in dwg_bins)}" if dwg_bins else "not_found",
+        )
+    except Exception as e:
+        add("parser_dwg_converter", False, str(e))
+
     # project-specific checks
     if project_id:
         try:
@@ -4479,6 +4509,20 @@ def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
                     add("project_submissions_listable", True, f"count={submissions_count}")
                 except Exception as e:
                     add("project_submissions_listable", False, str(e))
+                try:
+                    readiness = _build_scoring_readiness(project_id, target)
+                    ready = bool(readiness.get("ready"))
+                    issues = (
+                        readiness.get("issues") if isinstance(readiness.get("issues"), list) else []
+                    )
+                    issues_preview = "；".join(str(x) for x in issues[:2]) if issues else "-"
+                    add(
+                        "project_scoring_readiness",
+                        True,
+                        f"ready={ready}, issues={issues_preview}",
+                    )
+                except Exception as e:
+                    add("project_scoring_readiness", False, str(e))
         except Exception as e:
             add("project_exists", False, str(e))
 
@@ -6295,20 +6339,7 @@ def _dwg_converter_command_candidates(
     return candidates
 
 
-def _extract_dwg_text(content: bytes, filename: str) -> str:
-    """
-    DWG 预处理链：
-    1) 优先尝试系统级转换器将 DWG 转 DXF（若已安装）
-    2) 转换成功后复用 DXF 解析
-    3) 无转换器或转换失败时保留元信息并给出明确提示
-    """
-    if _looks_like_ascii_dxf(content):
-        try:
-            dxf_text = _extract_dxf_text(content)
-            return f"[DWG预处理] 文件: {filename}\n检测到ASCII DXF内容，按DXF解析。\n\n{dxf_text}"
-        except Exception:
-            pass
-
+def _resolve_dwg_converter_binaries() -> List[str]:
     converter_names: List[str] = []
     env_converters_raw = str(os.getenv("DWG_CONVERTER_BIN") or "").strip()
     if env_converters_raw:
@@ -6332,7 +6363,24 @@ def _extract_dwg_text(content: bytes, filename: str) -> str:
         resolved = name if Path(name).exists() else shutil.which(name)
         if resolved:
             binaries.append(str(resolved))
-    binaries = list(dict.fromkeys(binaries))
+    return list(dict.fromkeys(binaries))
+
+
+def _extract_dwg_text(content: bytes, filename: str) -> str:
+    """
+    DWG 预处理链：
+    1) 优先尝试系统级转换器将 DWG 转 DXF（若已安装）
+    2) 转换成功后复用 DXF 解析
+    3) 无转换器或转换失败时保留元信息并给出明确提示
+    """
+    if _looks_like_ascii_dxf(content):
+        try:
+            dxf_text = _extract_dxf_text(content)
+            return f"[DWG预处理] 文件: {filename}\n检测到ASCII DXF内容，按DXF解析。\n\n{dxf_text}"
+        except Exception:
+            pass
+
+    binaries = _resolve_dwg_converter_binaries()
 
     converter_display = ["dwg2dxf", "ODAFileConverter", "oda_file_converter", "TeighaFileConverter"]
     notes: List[str] = []
@@ -11354,6 +11402,68 @@ def index(
                         + html_lib.escape(str(evidence_file_hits))
                         + " 份</div>"
                     )
+                util_summary = (
+                    report_meta.get("material_utilization")
+                    if isinstance(report_meta.get("material_utilization"), dict)
+                    else {}
+                )
+                util_by_type = (
+                    util_summary.get("by_type")
+                    if isinstance(util_summary.get("by_type"), dict)
+                    else {}
+                )
+                util_available_types = (
+                    util_summary.get("available_types")
+                    if isinstance(util_summary.get("available_types"), list)
+                    else []
+                )
+
+                def _type_short(t: str) -> str:
+                    if t == "tender_qa":
+                        return "招答"
+                    if t == "boq":
+                        return "清单"
+                    if t == "drawing":
+                        return "图纸"
+                    if t == "site_photo":
+                        return "照片"
+                    return t or "-"
+
+                coverage_tokens: List[str] = []
+                for type_key in ["tender_qa", "boq", "drawing", "site_photo"]:
+                    in_scope = type_key in util_available_types
+                    if not in_scope:
+                        coverage_tokens.append(_type_short(type_key) + "·")
+                        continue
+                    row = util_by_type.get(type_key) if isinstance(util_by_type, dict) else {}
+                    row = row if isinstance(row, dict) else {}
+                    retrieval_hit = int(_to_float_or_none(row.get("retrieval_hit")) or 0)
+                    consistency_hit = int(_to_float_or_none(row.get("consistency_hit")) or 0)
+                    coverage_tokens.append(
+                        _type_short(type_key)
+                        + ("✓" if (retrieval_hit + consistency_hit) > 0 else "×")
+                    )
+                if not is_pending and coverage_tokens:
+                    score_cell += (
+                        '<div class="note">类型覆盖: '
+                        + html_lib.escape(" / ".join(coverage_tokens))
+                        + "</div>"
+                    )
+                evidence_files = (
+                    evidence_trace.get("source_files_hit")
+                    if isinstance(evidence_trace.get("source_files_hit"), list)
+                    else []
+                )
+                evidence_files = [str(x).strip() for x in evidence_files if str(x).strip()]
+                if not is_pending and evidence_files:
+                    preview = "；".join(evidence_files[:2])
+                    suffix = " 等" if len(evidence_files) > 2 else ""
+                    score_cell += (
+                        '<div class="note">命中文件: '
+                        + html_lib.escape(preview)
+                        + suffix
+                        + "</div>"
+                    )
                 if util_blocked:
                     score_cell += (
                         '<div class="error">资料利用门禁未达标（建议补齐资料后重评分）</div>'
@@ -12431,6 +12541,40 @@ def index(
                   + ' 条 / 文件覆盖: '
                   + fallbackEscapeHtml(String(evidenceFileCount))
                   + ' 份</div>';
+              }
+              const utilSummary = (reportMeta && typeof reportMeta.material_utilization === 'object')
+                ? reportMeta.material_utilization
+                : {};
+              const utilByType = (utilSummary && typeof utilSummary.by_type === 'object')
+                ? utilSummary.by_type
+                : {};
+              const utilAvailableTypes = Array.isArray(utilSummary.available_types) ? utilSummary.available_types : [];
+              const typeLabelShort = (t) => {
+                const key = String(t || '').trim();
+                if (key === 'tender_qa') return '招答';
+                if (key === 'boq') return '清单';
+                if (key === 'drawing') return '图纸';
+                if (key === 'site_photo') return '照片';
+                return key || '-';
+              };
+              const hasTypeEvidence = (t) => {
+                const row = (utilByType && typeof utilByType[t] === 'object') ? utilByType[t] : {};
+                const retrievalHit = Number((row && row.retrieval_hit) || 0);
+                const consistencyHit = Number((row && row.consistency_hit) || 0);
+                return (retrievalHit + consistencyHit) > 0;
+              };
+              const orderedTypes = ['tender_qa', 'boq', 'drawing', 'site_photo'];
+              const coverageTokens = orderedTypes.map((t) => {
+                const inScope = utilAvailableTypes.includes(t);
+                if (!inScope) return typeLabelShort(t) + '·';
+                return typeLabelShort(t) + (hasTypeEvidence(t) ? '✓' : '×');
+              });
+              if (!isPending && coverageTokens.length) {
+                scoreHtml += '<div class="note">类型覆盖: ' + fallbackEscapeHtml(coverageTokens.join(' / ')) + '</div>';
+              }
+              const evidenceFiles = Array.isArray(evidenceTrace.source_files_hit) ? evidenceTrace.source_files_hit : [];
+              if (!isPending && evidenceFiles.length) {
+                scoreHtml += '<div class="note">命中文件: ' + fallbackEscapeHtml(evidenceFiles.slice(0, 2).join('；')) + (evidenceFiles.length > 2 ? ' 等' : '') + '</div>';
               }
               if (utilBlocked) {
                 scoreHtml += '<div class="error">资料利用门禁未达标（建议补齐资料后重评分）</div>';
@@ -14338,6 +14482,40 @@ def index(
             const evidenceFileCount = Number(evidenceTrace.source_files_hit_count || 0);
             if (!isPending && evidenceCount > 0) {
               scoreHtml += '<div class="note">证据命中: ' + escapeHtmlText(evidenceCount) + ' 条 / 文件覆盖: ' + escapeHtmlText(evidenceFileCount) + ' 份</div>';
+            }
+            const utilSummary = (repMeta && typeof repMeta.material_utilization === 'object')
+              ? repMeta.material_utilization
+              : {};
+            const utilByType = (utilSummary && typeof utilSummary.by_type === 'object')
+              ? utilSummary.by_type
+              : {};
+            const utilAvailableTypes = Array.isArray(utilSummary.available_types) ? utilSummary.available_types : [];
+            const typeLabelShort = (t) => {
+              const key = String(t || '').trim();
+              if (key === 'tender_qa') return '招答';
+              if (key === 'boq') return '清单';
+              if (key === 'drawing') return '图纸';
+              if (key === 'site_photo') return '照片';
+              return key || '-';
+            };
+            const hasTypeEvidence = (t) => {
+              const row = (utilByType && typeof utilByType[t] === 'object') ? utilByType[t] : {};
+              const retrievalHit = Number((row && row.retrieval_hit) || 0);
+              const consistencyHit = Number((row && row.consistency_hit) || 0);
+              return (retrievalHit + consistencyHit) > 0;
+            };
+            const orderedTypes = ['tender_qa', 'boq', 'drawing', 'site_photo'];
+            const coverageTokens = orderedTypes.map((t) => {
+              const inScope = utilAvailableTypes.includes(t);
+              if (!inScope) return typeLabelShort(t) + '·';
+              return typeLabelShort(t) + (hasTypeEvidence(t) ? '✓' : '×');
+            });
+            if (!isPending && coverageTokens.length) {
+              scoreHtml += '<div class="note">类型覆盖: ' + escapeHtmlText(coverageTokens.join(' / ')) + '</div>';
+            }
+            const evidenceFiles = Array.isArray(evidenceTrace.source_files_hit) ? evidenceTrace.source_files_hit : [];
+            if (!isPending && evidenceFiles.length) {
+              scoreHtml += '<div class="note">命中文件: ' + escapeHtmlText(evidenceFiles.slice(0, 2).join('；')) + (evidenceFiles.length > 2 ? ' 等' : '') + '</div>';
             }
             if (utilBlocked) {
               scoreHtml += '<div class="error">资料利用门禁未达标（建议补齐资料后重评分）</div>';

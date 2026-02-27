@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import tempfile
 from collections import Counter
@@ -1612,6 +1613,23 @@ class TestMaterialAdvancedParsing:
         assert "[DWG图纸]" in text
         assert "DWG预处理" in text
         assert "建议同时上传 PDF 或 ASCII DXF" in text
+
+    @patch("app.main.shutil.which")
+    def test_resolve_dwg_converter_binaries_uses_env_and_defaults(self, mock_which):
+        from app.main import _resolve_dwg_converter_binaries
+
+        def _fake_which(name: str):
+            mapping = {
+                "my_dwg_converter": "/opt/tools/my_dwg_converter",
+                "dwg2dxf": "/usr/local/bin/dwg2dxf",
+            }
+            return mapping.get(name)
+
+        mock_which.side_effect = _fake_which
+        with patch.dict(os.environ, {"DWG_CONVERTER_BIN": "my_dwg_converter"}, clear=False):
+            bins = _resolve_dwg_converter_binaries()
+        assert "/opt/tools/my_dwg_converter" in bins
+        assert "/usr/local/bin/dwg2dxf" in bins
 
     def test_read_uploaded_file_content_dwg_detects_ascii_dxf_payload(self):
         from app.main import _read_uploaded_file_content
@@ -3677,6 +3695,31 @@ class TestProjectLevelCacheIntegration:
         assert call_args[0][0] == "测试文本"
         # config_hash 应该不是 None（因为有 multipliers）
         assert call_args[0][1] is not None
+
+
+class TestSystemSelfCheckCapabilities:
+    @patch("app.main._resolve_dwg_converter_binaries", return_value=["/usr/local/bin/dwg2dxf"])
+    @patch("app.main.get_rate_limit_status", return_value={"enabled": False})
+    @patch("app.main.get_auth_status", return_value={"enabled": False})
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.load_config")
+    def test_system_self_check_reports_parser_capabilities(
+        self,
+        mock_load_config,
+        mock_ensure_data_dirs,
+        mock_auth_status,
+        mock_rate_limit_status,
+        mock_dwg_bins,
+    ):
+        from app.main import _run_system_self_check
+
+        mock_load_config.return_value = MagicMock(rubric={}, lexicon={})
+        payload = _run_system_self_check(None)
+        names = {str(item.get("name")) for item in payload.get("items", [])}
+        assert "parser_pdf" in names
+        assert "parser_docx" in names
+        assert "parser_ocr" in names
+        assert "parser_dwg_converter" in names
 
 
 class TestComputeMultipliersHash:
