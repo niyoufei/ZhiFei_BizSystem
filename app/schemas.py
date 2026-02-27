@@ -311,6 +311,7 @@ class RescoreResponse(BaseModel):
     material_utilization_alerts: List[str] = Field(default_factory=list)
     material_utilization_gate: Dict[str, Any] = Field(default_factory=dict)
     material_utilization_by_submission: List[Dict[str, Any]] = Field(default_factory=list)
+    feedback_closed_loop: Dict[str, Any] = Field(default_factory=dict)
     started_at: str
     finished_at: str
 

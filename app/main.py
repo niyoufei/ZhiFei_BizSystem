@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import csv
+import hashlib
 import html as html_lib
 import io
 import json
@@ -9,6 +11,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import unicodedata
 from collections import Counter
 from datetime import datetime, timezone
@@ -317,6 +320,7 @@ DEFAULT_MIN_NUMERIC_TERMS_BY_TYPE = {
 }
 DEFAULT_MIN_TOTAL_PARSED_CHARS = 18000
 DEFAULT_MAX_MATERIAL_PARSE_FAIL_RATIO = 0.6
+DEFAULT_BLOCK_ON_ANY_MATERIAL_PARSE_FAILURE = True
 DEFAULT_ENFORCE_MATERIAL_UTILIZATION_GATE = True
 DEFAULT_MATERIAL_UTILIZATION_GATE_MODE = "block"
 DEFAULT_MIN_MATERIAL_RETRIEVAL_HIT_RATE = 0.25
@@ -333,6 +337,7 @@ DEFAULT_ENFORCE_UPLOADED_TYPE_COVERAGE = True
 DEFAULT_MIN_UPLOADED_TYPE_COVERAGE_RATE = 1.0
 DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR = 200
 DEFAULT_PDF_OCR_MAX_PAGES = 30
+DEFAULT_MATERIAL_INDEX_CACHE_SIZE = 12
 PROFILE_LOCKED_STATUSES = {"submitted_to_qingtian"}
 DEFAULT_CHAPTER_REQUIREMENTS = {
     "required_sections": [
@@ -357,6 +362,238 @@ DEFAULT_CHAPTER_REQUIREMENTS = {
         "措施类描述缺少参数/频次/责任/验收中至少两类",
     ],
 }
+
+_MATERIAL_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
+_MATERIAL_INDEX_CACHE_ORDER: List[str] = []
+_MATERIAL_INDEX_CACHE_LOCK = threading.RLock()
+
+
+def _material_row_cache_token(row: Dict[str, object]) -> Dict[str, object]:
+    path_text = str(row.get("path") or "").strip()
+    stat_size = -1
+    stat_mtime_ns = -1
+    if path_text:
+        p = Path(path_text)
+        if p.exists():
+            try:
+                st = p.stat()
+                stat_size = int(st.st_size)
+                stat_mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000)))
+            except Exception:
+                stat_size = -1
+                stat_mtime_ns = -1
+    return {
+        "id": str(row.get("id") or ""),
+        "material_type": _normalize_material_type(
+            row.get("material_type"), filename=row.get("filename")
+        ),
+        "filename": str(row.get("filename") or ""),
+        "path": path_text,
+        "created_at": str(row.get("created_at") or ""),
+        "updated_at": str(row.get("updated_at") or ""),
+        "size": stat_size,
+        "mtime_ns": stat_mtime_ns,
+    }
+
+
+def _compute_material_index_signature(project_id: str, rows: List[Dict[str, object]]) -> str:
+    payload = {
+        "project_id": project_id,
+        "rows": [_material_row_cache_token(row) for row in rows],
+    }
+    digest = hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _touch_material_index_cache(project_id: str) -> None:
+    if project_id in _MATERIAL_INDEX_CACHE_ORDER:
+        _MATERIAL_INDEX_CACHE_ORDER.remove(project_id)
+    _MATERIAL_INDEX_CACHE_ORDER.append(project_id)
+    while len(_MATERIAL_INDEX_CACHE_ORDER) > int(DEFAULT_MATERIAL_INDEX_CACHE_SIZE):
+        stale = _MATERIAL_INDEX_CACHE_ORDER.pop(0)
+        _MATERIAL_INDEX_CACHE.pop(stale, None)
+
+
+def _invalidate_material_index_cache(project_id: Optional[str] = None) -> None:
+    with _MATERIAL_INDEX_CACHE_LOCK:
+        if project_id is None:
+            _MATERIAL_INDEX_CACHE.clear()
+            _MATERIAL_INDEX_CACHE_ORDER.clear()
+            return
+        _MATERIAL_INDEX_CACHE.pop(project_id, None)
+        if project_id in _MATERIAL_INDEX_CACHE_ORDER:
+            _MATERIAL_INDEX_CACHE_ORDER.remove(project_id)
+
+
+def _build_project_material_index(project_id: str) -> Dict[str, object]:
+    rows = [m for m in load_materials() if str(m.get("project_id")) == str(project_id)]
+    rows.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+    signature = _compute_material_index_signature(project_id, rows)
+    with _MATERIAL_INDEX_CACHE_LOCK:
+        cached = _MATERIAL_INDEX_CACHE.get(project_id)
+        if cached and str(cached.get("signature") or "") == signature:
+            _touch_material_index_cache(project_id)
+            return cached
+
+    counts_by_type: Dict[str, int] = {}
+    parsed_ok_by_type: Dict[str, int] = {}
+    parsed_fail_by_type: Dict[str, int] = {}
+    chars_by_type: Dict[str, int] = {}
+    chunks_by_type: Dict[str, int] = {}
+    numeric_terms_by_type: Dict[str, int] = {}
+    lexical_terms_by_type: Dict[str, int] = {}
+    parsed_fail_details: List[Dict[str, str]] = []
+    parsed_ok_files = 0
+    parsed_failed_files = 0
+    total_parsed_chunks = 0
+    total_numeric_terms = 0
+    total_lexical_terms = 0
+    files: List[Dict[str, object]] = []
+    available_types: List[str] = []
+    available_filenames: List[str] = []
+
+    for row in rows:
+        filename = str(row.get("filename") or "").strip()
+        mat_type = _normalize_material_type(row.get("material_type"), filename=filename)
+        if mat_type and mat_type not in available_types:
+            available_types.append(mat_type)
+        if filename and filename not in available_filenames:
+            available_filenames.append(filename)
+        counts_by_type[mat_type] = counts_by_type.get(mat_type, 0) + 1
+
+        entry: Dict[str, object] = {
+            "id": str(row.get("id") or ""),
+            "project_id": project_id,
+            "material_type": mat_type,
+            "filename": filename,
+            "path": str(row.get("path") or "").strip(),
+            "created_at": str(row.get("created_at") or ""),
+            "row": dict(row),
+            "parsed_ok": False,
+            "chars": 0,
+            "chunks": [],
+            "numeric_terms_norm": [],
+            "lexical_terms": [],
+            "text": "",
+            "parse_error": "",
+        }
+
+        path = str(row.get("path") or "").strip()
+        if not path:
+            parsed_failed_files += 1
+            parsed_fail_by_type[mat_type] = parsed_fail_by_type.get(mat_type, 0) + 1
+            entry["parse_error"] = "missing_path"
+            parsed_fail_details.append(
+                {"filename": filename, "material_type": mat_type, "reason": "missing_path"}
+            )
+            files.append(entry)
+            continue
+
+        p = Path(path)
+        if not p.exists():
+            parsed_failed_files += 1
+            parsed_fail_by_type[mat_type] = parsed_fail_by_type.get(mat_type, 0) + 1
+            entry["parse_error"] = "path_not_exists"
+            parsed_fail_details.append(
+                {"filename": filename, "material_type": mat_type, "reason": "path_not_exists"}
+            )
+            files.append(entry)
+            continue
+
+        try:
+            content = p.read_bytes()
+            text = _read_uploaded_file_content(content, p.name)
+            text_value = str(text or "")
+            chars = len(text_value.strip())
+            chunks = _split_material_text_chunks(text_value, max_chars=900)
+            numeric_terms_norm = sorted(
+                {
+                    token
+                    for token in (
+                        _normalize_numeric_token(item)
+                        for item in _extract_numeric_terms(text_value, max_terms=260)
+                    )
+                    if token
+                }
+            )
+            lexical_terms = _extract_terms(text_value, max_terms=220)
+            entry.update(
+                {
+                    "parsed_ok": True,
+                    "text": text_value,
+                    "chars": chars,
+                    "chunks": chunks,
+                    "numeric_terms_norm": numeric_terms_norm,
+                    "lexical_terms": lexical_terms,
+                }
+            )
+            if mat_type == "boq":
+                entry["boq_structured_summary"] = _build_boq_structured_summary(
+                    content,
+                    p.name,
+                    parsed_text=text_value,
+                )
+            parsed_ok_files += 1
+            parsed_ok_by_type[mat_type] = parsed_ok_by_type.get(mat_type, 0) + 1
+            chars_by_type[mat_type] = chars_by_type.get(mat_type, 0) + chars
+            chunks_by_type[mat_type] = chunks_by_type.get(mat_type, 0) + len(chunks)
+            numeric_terms_by_type[mat_type] = numeric_terms_by_type.get(mat_type, 0) + len(
+                numeric_terms_norm
+            )
+            lexical_terms_by_type[mat_type] = lexical_terms_by_type.get(mat_type, 0) + len(
+                lexical_terms
+            )
+            total_parsed_chunks += len(chunks)
+            total_numeric_terms += len(numeric_terms_norm)
+            total_lexical_terms += len(lexical_terms)
+        except Exception as exc:
+            parsed_failed_files += 1
+            parsed_fail_by_type[mat_type] = parsed_fail_by_type.get(mat_type, 0) + 1
+            reason = f"{type(exc).__name__}: {exc}"
+            entry["parse_error"] = reason
+            parsed_fail_details.append(
+                {"filename": filename, "material_type": mat_type, "reason": reason}
+            )
+        files.append(entry)
+
+    total_files = len(rows)
+    total_chars = int(sum(chars_by_type.values()))
+    fail_ratio = (float(parsed_failed_files) / float(total_files)) if total_files > 0 else 0.0
+    quality_snapshot = {
+        "project_id": project_id,
+        "total_files": total_files,
+        "counts_by_type": counts_by_type,
+        "parsed_ok_files": parsed_ok_files,
+        "parsed_failed_files": parsed_failed_files,
+        "parsed_ok_by_type": parsed_ok_by_type,
+        "parsed_fail_by_type": parsed_fail_by_type,
+        "chars_by_type": chars_by_type,
+        "chunks_by_type": chunks_by_type,
+        "numeric_terms_by_type": numeric_terms_by_type,
+        "lexical_terms_by_type": lexical_terms_by_type,
+        "total_parsed_chars": total_chars,
+        "total_parsed_chunks": int(total_parsed_chunks),
+        "total_numeric_terms": int(total_numeric_terms),
+        "total_lexical_terms": int(total_lexical_terms),
+        "parse_fail_ratio": round(fail_ratio, 4),
+        "parsed_fail_details": parsed_fail_details[:20],
+        "available_types": available_types,
+        "available_filenames": available_filenames[:120],
+    }
+    index: Dict[str, object] = {
+        "project_id": project_id,
+        "signature": signature,
+        "rows": [dict(r) for r in rows],
+        "files": files,
+        "available_types": available_types,
+        "available_filenames": available_filenames,
+        "quality_snapshot": quality_snapshot,
+        "built_at": _now_iso(),
+    }
+    with _MATERIAL_INDEX_CACHE_LOCK:
+        _MATERIAL_INDEX_CACHE[project_id] = index
+        _touch_material_index_cache(project_id)
+        return index
 
 
 def _now_iso() -> str:
@@ -477,6 +714,11 @@ def _ensure_project_v2_fields(
         changed = True
     if "max_material_parse_fail_ratio" not in meta:
         meta["max_material_parse_fail_ratio"] = float(DEFAULT_MAX_MATERIAL_PARSE_FAIL_RATIO)
+        changed = True
+    if "block_on_any_material_parse_failure" not in meta:
+        meta["block_on_any_material_parse_failure"] = bool(
+            DEFAULT_BLOCK_ON_ANY_MATERIAL_PARSE_FAILURE
+        )
         changed = True
     if "enforce_material_utilization_gate" not in meta:
         meta["enforce_material_utilization_gate"] = bool(DEFAULT_ENFORCE_MATERIAL_UTILIZATION_GATE)
@@ -1161,16 +1403,14 @@ def _build_runtime_custom_requirements(
         custom_text_items=custom_text_items,
         context_text=context_text,
     )
-    material_rows = [m for m in load_materials() if str(m.get("project_id")) == project_id]
-    available_material_types: List[str] = []
-    available_material_filenames: List[str] = []
-    for row in material_rows:
-        key = _normalize_material_type(row.get("material_type"), filename=row.get("filename"))
-        if key not in available_material_types:
-            available_material_types.append(key)
-        filename_text = str(row.get("filename") or "").strip()
-        if filename_text and filename_text not in available_material_filenames:
-            available_material_filenames.append(filename_text)
+    material_index = _build_project_material_index(project_id)
+    material_rows = list(material_index.get("rows") or [])
+    available_material_types = [
+        str(x) for x in (material_index.get("available_types") or []) if str(x).strip()
+    ]
+    available_material_filenames = [
+        str(x) for x in (material_index.get("available_filenames") or []) if str(x).strip()
+    ]
     retrieval_budget = _compute_dynamic_retrieval_budget(
         project_id,
         retrieval_cfg,
@@ -1200,6 +1440,7 @@ def _build_runtime_custom_requirements(
         per_file_quota=retrieval_per_file_quota,
         query_terms_extra=query_features.get("query_terms"),
         query_numeric_terms=query_features.get("query_numeric_terms"),
+        material_index=material_index,
     )
     retrieval_selected_filenames: List[str] = []
     for chunk in retrieval_chunks:
@@ -5380,7 +5621,8 @@ def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
     # status providers
     try:
         s = get_auth_status()
-        add("auth_status", True, f"enabled={bool(s.get('enabled'))}")
+        enabled = bool(s.get("auth_enabled", s.get("enabled", False)))
+        add("auth_status", True, f"enabled={enabled}")
     except Exception as e:
         add("auth_status", False, str(e))
     try:
@@ -6174,11 +6416,30 @@ def rescore_project_submissions(
     save_evidence_units(all_evidence_units)
     project["updated_at"] = _now_iso()
     save_projects(projects)
-    # 重评分属于有效反馈信号：自动刷新样本并触发校准/调权重闭环（best-effort）。
+    # 重评分属于有效反馈信号：自动刷新样本并触发校准/调权重闭环。
+    feedback_closed_loop: Dict[str, object] = {
+        "ok": False,
+        "trigger": "rescore",
+        "error": "not_run",
+    }
     try:
-        _run_feedback_closed_loop(project_id, locale=locale, trigger="rescore")
-    except Exception:
-        pass
+        raw_closed_loop = _run_feedback_closed_loop(project_id, locale=locale, trigger="rescore")
+        if isinstance(raw_closed_loop, dict):
+            feedback_closed_loop = raw_closed_loop
+        elif hasattr(raw_closed_loop, "model_dump"):
+            feedback_closed_loop = dict(raw_closed_loop.model_dump())
+        else:
+            feedback_closed_loop = {
+                "ok": bool(getattr(raw_closed_loop, "ok", False)),
+                "trigger": "rescore",
+                "raw": str(raw_closed_loop),
+            }
+    except Exception as exc:
+        feedback_closed_loop = {
+            "ok": False,
+            "trigger": "rescore",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
     material_utilization = _aggregate_material_utilization_summaries(material_utilization_summaries)
     material_gate = (
         material_quality_snapshot.get("gate")
@@ -6206,6 +6467,7 @@ def rescore_project_submissions(
         material_utilization_alerts=material_utilization_alerts,
         material_utilization_gate=material_utilization_gate,
         material_utilization_by_submission=material_utilization_by_submission[:20],
+        feedback_closed_loop=feedback_closed_loop,
         started_at=started_at,
         finished_at=_now_iso(),
     )
@@ -6258,6 +6520,7 @@ def _delete_project_cascade(project_id: str, *, locale: str = "zh") -> Dict[str,
             except Exception:
                 pass
     save_materials([m for m in materials if m.get("project_id") != project_id])
+    _invalidate_material_index_cache(project_id)
 
     project_dir = MATERIALS_DIR / project_id
     if project_dir.exists():
@@ -6780,6 +7043,7 @@ def upload_material(
     }
     materials.append(record)
     save_materials(materials)
+    _invalidate_material_index_cache(project_id)
     # 材料更新后立即重建锚点/要求，避免后续评分继续使用旧约束。
     constraint_sync: Dict[str, object] = {"rebuilt": False}
     try:
@@ -7131,6 +7395,7 @@ def delete_material(
         path.unlink()
     materials = [m for m in materials if m.get("id") != material_id]
     save_materials(materials)
+    _invalidate_material_index_cache(project_id)
     return {"ok": True, "id": material_id}
 
 
@@ -7832,15 +8097,18 @@ def _read_uploaded_file_content(content: bytes, filename: str) -> str:
 
 def _merge_materials_text(project_id: str) -> str:
     """将本项目已上传资料按分类合并为文本，作为评分与学习进化的依据。"""
-    materials = [m for m in load_materials() if m.get("project_id") == project_id]
-    if not materials:
+    material_index = _build_project_material_index(project_id)
+    files = material_index.get("files") if isinstance(material_index.get("files"), list) else []
+    if not files:
         return ""
-    groups: Dict[str, List[dict]] = {}
-    for material in materials:
+    groups: Dict[str, List[Dict[str, object]]] = {}
+    for file_entry in files:
+        if not isinstance(file_entry, dict):
+            continue
         mat_type = _normalize_material_type(
-            material.get("material_type"), filename=material.get("filename")
+            file_entry.get("material_type"), filename=file_entry.get("filename")
         )
-        groups.setdefault(mat_type, []).append(material)
+        groups.setdefault(mat_type, []).append(file_entry)
     merge_order = ["tender_qa", "boq", "drawing", "site_photo"]
     for key in sorted(groups.keys()):
         if key not in merge_order:
@@ -7851,44 +8119,42 @@ def _merge_materials_text(project_id: str) -> str:
         rows = groups.get(mat_type) or []
         if not rows:
             continue
-        rows.sort(key=lambda x: str(x.get("created_at", "")))
+        rows.sort(key=lambda x: str(x.get("created_at") or ""))
         section_lines: List[str] = [f"=== {_material_type_label(mat_type)} ==="]
         for row in rows:
-            path = row.get("path")
             filename = str(row.get("filename") or "")
             created_at = str(row.get("created_at") or "")[:19]
-            if not path:
-                section_lines.append(f"--- {filename} ---\n[资料缺失] 未记录路径。")
-                continue
-            p = Path(path)
-            if not p.exists():
-                section_lines.append(f"--- {filename} ---\n[资料缺失] 文件已不存在：{path}")
-                continue
-            try:
-                content = p.read_bytes()
-                text = _read_uploaded_file_content(content, p.name).strip()
-                if text:
-                    section_block = f"--- {p.name} ({created_at}) ---\n{text}"
-                    if mat_type == "boq":
-                        boq_struct = _build_boq_structured_summary(
-                            content,
-                            p.name,
-                            parsed_text=text,
-                        )
-                        section_block = (
-                            section_block
-                            + "\n\n[BOQ结构化摘要]\n"
-                            + json.dumps(boq_struct, ensure_ascii=False)
-                        )
-                    section_lines.append(section_block)
+            if not bool(row.get("parsed_ok")):
+                reason = str(row.get("parse_error") or "解析失败")
+                if reason == "missing_path":
+                    section_lines.append(f"--- {filename} ---\n[资料缺失] 未记录路径。")
+                elif reason == "path_not_exists":
+                    section_lines.append(f"--- {filename} ---\n[资料缺失] 文件已不存在。")
                 else:
                     section_lines.append(
-                        f"--- {p.name} ({created_at}) ---\n[资料为空] 文件解析后为空内容。"
+                        f"--- {filename} ({created_at}) ---\n[资料解析失败] {reason}"
                     )
-            except Exception as exc:
+                continue
+            text = str(row.get("text") or "").strip()
+            if not text:
                 section_lines.append(
-                    f"--- {p.name} ({created_at}) ---\n[资料解析失败] {type(exc).__name__}: {exc}"
+                    f"--- {filename} ({created_at}) ---\n[资料为空] 文件解析后为空内容。"
                 )
+                continue
+            section_block = f"--- {filename} ({created_at}) ---\n{text}"
+            if mat_type == "boq":
+                boq_struct = (
+                    row.get("boq_structured_summary")
+                    if isinstance(row.get("boq_structured_summary"), dict)
+                    else {}
+                )
+                if boq_struct:
+                    section_block = (
+                        section_block
+                        + "\n\n[BOQ结构化摘要]\n"
+                        + json.dumps(boq_struct, ensure_ascii=False)
+                    )
+            section_lines.append(section_block)
         sections.append("\n\n".join(section_lines))
     return "\n\n".join(sections).strip()
 
@@ -7941,6 +8207,7 @@ def _select_material_retrieval_chunks(
     per_file_quota: int = 3,
     query_terms_extra: Optional[List[str]] = None,
     query_numeric_terms: Optional[List[str]] = None,
+    material_index: Optional[Dict[str, object]] = None,
 ) -> List[Dict[str, object]]:
     query_terms = set(_extract_terms(submission_text, max_terms=60))
     if isinstance(query_terms_extra, list):
@@ -7954,31 +8221,32 @@ def _select_material_retrieval_chunks(
             _normalize_numeric_token(x) for x in query_numeric_terms if _normalize_numeric_token(x)
         )
 
-    rows = [m for m in load_materials() if str(m.get("project_id")) == project_id]
-    rows.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
-    available_types: List[str] = []
+    index = (
+        material_index
+        if isinstance(material_index, dict)
+        else _build_project_material_index(project_id)
+    )
+    available_types = [str(x) for x in (index.get("available_types") or []) if str(x).strip()]
+    file_entries = index.get("files") if isinstance(index.get("files"), list) else []
     candidates: List[Dict[str, object]] = []
     backfill_candidates: List[Dict[str, object]] = []
-    for row in rows:
-        filename = str(row.get("filename") or "")
-        mat_type = _normalize_material_type(row.get("material_type"), filename=filename)
-        if mat_type not in available_types:
-            available_types.append(mat_type)
-        path = str(row.get("path") or "").strip()
-        if not path:
+    for file_entry in file_entries:
+        if not isinstance(file_entry, dict):
             continue
-        p = Path(path)
-        if not p.exists():
+        if not bool(file_entry.get("parsed_ok")):
             continue
-        try:
-            file_text = _read_uploaded_file_content(p.read_bytes(), p.name)
-        except Exception:
-            continue
-        chunks = _split_material_text_chunks(file_text, max_chars=900)
+        filename = str(file_entry.get("filename") or "").strip()
+        mat_type = str(file_entry.get("material_type") or "").strip()
+        chunks = file_entry.get("chunks") if isinstance(file_entry.get("chunks"), list) else []
+        if not chunks:
+            text_raw = str(file_entry.get("text") or "")
+            if text_raw:
+                chunks = _split_material_text_chunks(text_raw, max_chars=900)
         for idx, chunk in enumerate(chunks, start=1):
-            lower = chunk.lower()
+            chunk_text = str(chunk or "")
+            lower = chunk_text.lower()
             matched_terms = [t for t in query_terms if t and t in lower][:8]
-            chunk_numeric_terms = _extract_numeric_terms(chunk, max_terms=30)
+            chunk_numeric_terms = _extract_numeric_terms(chunk_text, max_terms=30)
             chunk_numeric_set = {str(x) for x in chunk_numeric_terms}
             matched_numeric_terms = [
                 token for token in numeric_terms if token and token in chunk_numeric_set
@@ -7992,12 +8260,12 @@ def _select_material_retrieval_chunks(
             if not matched_terms and not matched_numeric_terms:
                 # 二级兜底：即使没有直接命中查询词，也为每种资料类型保留“高信息密度”候选，
                 # 后续用于类型补全，避免某类资料长期无法进入评分证据链。
-                lexical_terms = _extract_terms(chunk, max_terms=20)
+                lexical_terms = _extract_terms(chunk_text, max_terms=20)
                 chunk_numeric_norm = [
                     token
                     for token in (
                         _normalize_numeric_token(item)
-                        for item in _extract_numeric_terms(chunk, max_terms=18)
+                        for item in _extract_numeric_terms(chunk_text, max_terms=18)
                     )
                     if token
                 ]
@@ -8007,18 +8275,18 @@ def _select_material_retrieval_chunks(
                 fallback_score += min(3, len(type_keyword_hits))
                 if mat_type in {"boq", "drawing"}:
                     fallback_score += 1
-                if fallback_score <= 0 or len(str(chunk).strip()) < 24:
+                if fallback_score <= 0 or len(chunk_text.strip()) < 24:
                     continue
                 backfill_candidates.append(
                     {
                         "material_type": mat_type,
-                        "filename": p.name,
-                        "chunk_id": f"{p.name}#c{idx:03d}",
+                        "filename": filename,
+                        "chunk_id": f"{filename}#c{idx:03d}",
                         "dimension_id": _infer_chunk_dimension_id(mat_type, chunk),
                         "score": fallback_score,
                         "matched_terms": type_keyword_hits or lexical_terms[:6],
                         "matched_numeric_terms": chunk_numeric_norm[:6],
-                        "chunk_preview": chunk[:220],
+                        "chunk_preview": chunk_text[:220],
                         "is_backfill": True,
                     }
                 )
@@ -8032,13 +8300,13 @@ def _select_material_retrieval_chunks(
             candidates.append(
                 {
                     "material_type": mat_type,
-                    "filename": p.name,
-                    "chunk_id": f"{p.name}#c{idx:03d}",
+                    "filename": filename,
+                    "chunk_id": f"{filename}#c{idx:03d}",
                     "dimension_id": dimension_id,
                     "score": score,
                     "matched_terms": matched_terms,
                     "matched_numeric_terms": matched_numeric_terms,
-                    "chunk_preview": chunk[:220],
+                    "chunk_preview": chunk_text[:220],
                 }
             )
 
@@ -8293,98 +8561,11 @@ def _build_material_consistency_requirements(
 
 
 def _build_material_quality_snapshot(project_id: str) -> Dict[str, object]:
-    rows = [m for m in load_materials() if str(m.get("project_id")) == project_id]
-    counts_by_type: Dict[str, int] = {}
-    parsed_ok_by_type: Dict[str, int] = {}
-    parsed_fail_by_type: Dict[str, int] = {}
-    chars_by_type: Dict[str, int] = {}
-    chunks_by_type: Dict[str, int] = {}
-    numeric_terms_by_type: Dict[str, int] = {}
-    lexical_terms_by_type: Dict[str, int] = {}
-    parsed_fail_details: List[Dict[str, str]] = []
-    parsed_ok_files = 0
-    parsed_failed_files = 0
-    total_parsed_chunks = 0
-    total_numeric_terms = 0
-    total_lexical_terms = 0
-    for row in rows:
-        filename = str(row.get("filename") or "")
-        mat_type = _normalize_material_type(row.get("material_type"), filename=filename)
-        counts_by_type[mat_type] = counts_by_type.get(mat_type, 0) + 1
-        path = str(row.get("path") or "").strip()
-        if not path:
-            parsed_failed_files += 1
-            parsed_fail_by_type[mat_type] = parsed_fail_by_type.get(mat_type, 0) + 1
-            parsed_fail_details.append(
-                {"filename": filename, "material_type": mat_type, "reason": "missing_path"}
-            )
-            continue
-        p = Path(path)
-        if not p.exists():
-            parsed_failed_files += 1
-            parsed_fail_by_type[mat_type] = parsed_fail_by_type.get(mat_type, 0) + 1
-            parsed_fail_details.append(
-                {"filename": filename, "material_type": mat_type, "reason": "path_not_exists"}
-            )
-            continue
-        try:
-            content = p.read_bytes()
-            text = _read_uploaded_file_content(content, p.name)
-            chars = len(str(text or "").strip())
-            chunks = _split_material_text_chunks(text, max_chars=900)
-            chunk_count = len(chunks)
-            numeric_terms = _extract_numeric_terms(text, max_terms=240)
-            numeric_terms_norm = {
-                token
-                for token in (_normalize_numeric_token(item) for item in numeric_terms)
-                if token
-            }
-            lexical_terms = _extract_terms(text, max_terms=200)
-            parsed_ok_files += 1
-            parsed_ok_by_type[mat_type] = parsed_ok_by_type.get(mat_type, 0) + 1
-            chars_by_type[mat_type] = chars_by_type.get(mat_type, 0) + chars
-            chunks_by_type[mat_type] = chunks_by_type.get(mat_type, 0) + chunk_count
-            numeric_terms_by_type[mat_type] = numeric_terms_by_type.get(mat_type, 0) + len(
-                numeric_terms_norm
-            )
-            lexical_terms_by_type[mat_type] = lexical_terms_by_type.get(mat_type, 0) + len(
-                lexical_terms
-            )
-            total_parsed_chunks += chunk_count
-            total_numeric_terms += len(numeric_terms_norm)
-            total_lexical_terms += len(lexical_terms)
-        except Exception as exc:
-            parsed_failed_files += 1
-            parsed_fail_by_type[mat_type] = parsed_fail_by_type.get(mat_type, 0) + 1
-            parsed_fail_details.append(
-                {
-                    "filename": filename,
-                    "material_type": mat_type,
-                    "reason": f"{type(exc).__name__}: {exc}",
-                }
-            )
-    total_files = len(rows)
-    total_chars = int(sum(chars_by_type.values()))
-    fail_ratio = (float(parsed_failed_files) / float(total_files)) if total_files > 0 else 0.0
-    return {
-        "project_id": project_id,
-        "total_files": total_files,
-        "counts_by_type": counts_by_type,
-        "parsed_ok_files": parsed_ok_files,
-        "parsed_failed_files": parsed_failed_files,
-        "parsed_ok_by_type": parsed_ok_by_type,
-        "parsed_fail_by_type": parsed_fail_by_type,
-        "chars_by_type": chars_by_type,
-        "chunks_by_type": chunks_by_type,
-        "numeric_terms_by_type": numeric_terms_by_type,
-        "lexical_terms_by_type": lexical_terms_by_type,
-        "total_parsed_chars": total_chars,
-        "total_parsed_chunks": int(total_parsed_chunks),
-        "total_numeric_terms": int(total_numeric_terms),
-        "total_lexical_terms": int(total_lexical_terms),
-        "parse_fail_ratio": round(fail_ratio, 4),
-        "parsed_fail_details": parsed_fail_details[:20],
-    }
+    index = _build_project_material_index(project_id)
+    snapshot = (
+        index.get("quality_snapshot") if isinstance(index.get("quality_snapshot"), dict) else {}
+    )
+    return copy.deepcopy(snapshot)
 
 
 def _resolve_material_gate_config(project: Dict[str, object]) -> Dict[str, object]:
@@ -8452,6 +8633,12 @@ def _resolve_material_gate_config(project: Dict[str, object]) -> Dict[str, objec
         if fail_ratio_raw is not None
         else float(DEFAULT_MAX_MATERIAL_PARSE_FAIL_RATIO)
     )
+    block_on_parse_failure = bool(
+        meta.get(
+            "block_on_any_material_parse_failure",
+            DEFAULT_BLOCK_ON_ANY_MATERIAL_PARSE_FAILURE,
+        )
+    )
     return {
         "enforce": enforce,
         "enforce_depth_gate": enforce_depth_gate,
@@ -8462,6 +8649,7 @@ def _resolve_material_gate_config(project: Dict[str, object]) -> Dict[str, objec
         "min_total_chunks": min_total_chunks,
         "min_total_chars": min_total_chars,
         "max_fail_ratio": max_fail_ratio,
+        "block_on_any_parse_failure": block_on_parse_failure,
     }
 
 
@@ -8524,7 +8712,27 @@ def _validate_material_gate_for_scoring(
         )
 
     parse_fail_ratio = _to_float_or_none(snapshot.get("parse_fail_ratio")) or 0.0
+    parsed_failed_files = int(_to_float_or_none(snapshot.get("parsed_failed_files")) or 0)
     max_fail_ratio = float(cfg.get("max_fail_ratio", DEFAULT_MAX_MATERIAL_PARSE_FAIL_RATIO))
+    block_on_parse_failure = bool(
+        cfg.get(
+            "block_on_any_parse_failure",
+            DEFAULT_BLOCK_ON_ANY_MATERIAL_PARSE_FAILURE,
+        )
+    )
+    if block_on_parse_failure and parsed_failed_files > 0:
+        parsed_fail_details = (
+            snapshot.get("parsed_fail_details")
+            if isinstance(snapshot.get("parsed_fail_details"), list)
+            else []
+        )
+        preview = "；".join(
+            str(item.get("filename") or "")
+            for item in parsed_fail_details[:3]
+            if isinstance(item, dict) and str(item.get("filename") or "").strip()
+        )
+        detail_suffix = f"（示例：{preview}）" if preview else ""
+        issues.append(f"存在 {parsed_failed_files} 份资料解析失败，硬闸门已阻断评分{detail_suffix}")
     if parse_fail_ratio > max_fail_ratio:
         issues.append(f"资料解析失败比例过高：{parse_fail_ratio:.1%}（阈值 {max_fail_ratio:.1%}）")
 
@@ -8534,6 +8742,7 @@ def _validate_material_gate_for_scoring(
         "min_chars_by_type": cfg.get("min_chars_by_type", {}),
         "min_total_chars": min_total_chars,
         "max_fail_ratio": max_fail_ratio,
+        "block_on_any_parse_failure": block_on_parse_failure,
         "issues": issues,
         "passed": len(issues) == 0,
     }
@@ -8869,8 +9078,12 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
     - 按资料类型聚合：提取词项、数字约束、覆盖维度
     - 按16维聚合：评估每个维度在资料中的证据覆盖强度
     """
-    rows = [m for m in load_materials() if str(m.get("project_id")) == str(project_id)]
-    rows.sort(key=lambda x: str(x.get("created_at") or ""))
+    material_index = _build_project_material_index(project_id)
+    rows = material_index.get("files") if isinstance(material_index.get("files"), list) else []
+    rows = sorted(
+        [r for r in rows if isinstance(r, dict)],
+        key=lambda x: str(x.get("created_at") or ""),
+    )
 
     by_type_term_counter: Dict[str, Counter[str]] = {}
     by_type_numeric_counter: Dict[str, Counter[str]] = {}
@@ -8908,32 +9121,17 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         by_type_chars.setdefault(mat_type, 0)
         by_type_chunks.setdefault(mat_type, 0)
 
-        path = str(row.get("path") or "").strip()
-        if not path:
-            parsed_failed_files += 1
-            parse_fail_details.append(
-                {"filename": filename, "material_type": mat_type, "reason": "missing_path"}
-            )
-            continue
-        p = Path(path)
-        if not p.exists():
-            parsed_failed_files += 1
-            parse_fail_details.append(
-                {"filename": filename, "material_type": mat_type, "reason": "path_not_exists"}
-            )
-            continue
-        try:
-            text = str(_read_uploaded_file_content(p.read_bytes(), p.name) or "").strip()
-        except Exception as exc:
+        if not bool(row.get("parsed_ok")):
             parsed_failed_files += 1
             parse_fail_details.append(
                 {
                     "filename": filename,
                     "material_type": mat_type,
-                    "reason": f"{type(exc).__name__}: {exc}",
+                    "reason": str(row.get("parse_error") or "parse_failed"),
                 }
             )
             continue
+        text = str(row.get("text") or "").strip()
         if not text:
             parsed_failed_files += 1
             parse_fail_details.append(
@@ -8945,29 +9143,39 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         by_type_ok_files[mat_type] = int(by_type_ok_files.get(mat_type, 0)) + 1
 
         chars = len(text)
-        chunks = len(_split_material_text_chunks(text, max_chars=900))
+        chunks = len(row.get("chunks") if isinstance(row.get("chunks"), list) else [])
+        if chunks <= 0:
+            chunks = len(_split_material_text_chunks(text, max_chars=900))
         total_chars += chars
         total_chunks += chunks
         by_type_chars[mat_type] = int(by_type_chars.get(mat_type, 0)) + chars
         by_type_chunks[mat_type] = int(by_type_chunks.get(mat_type, 0)) + chunks
 
-        lexical_terms = _extract_terms(text, max_terms=220)
+        lexical_terms = (
+            row.get("lexical_terms")
+            if isinstance(row.get("lexical_terms"), list)
+            else _extract_terms(text, max_terms=220)
+        )
         by_type_term_counter[mat_type].update(lexical_terms)
 
-        numeric_terms = [
-            token
-            for token in (
-                _normalize_numeric_token(item)
-                for item in _extract_numeric_terms(text, max_terms=260)
-            )
-            if token
-        ]
+        numeric_terms = (
+            row.get("numeric_terms_norm") if isinstance(row.get("numeric_terms_norm"), list) else []
+        )
+        if not numeric_terms:
+            numeric_terms = [
+                token
+                for token in (
+                    _normalize_numeric_token(item)
+                    for item in _extract_numeric_terms(text, max_terms=260)
+                )
+                if token
+            ]
         total_numeric_terms += len(set(numeric_terms))
         by_type_numeric_counter[mat_type].update(numeric_terms)
 
         lower = text.lower()
         file_numeric_strength = min(8, len(set(numeric_terms)))
-        file_name = p.name
+        file_name = filename
         for dim_id in DIMENSION_IDS:
             hit_count = 0
             for kw in DIMENSION_RAG_KEYWORDS.get(dim_id, [])[:10]:
@@ -13451,6 +13659,9 @@ def index(
               const gate = (data && typeof data.material_utilization_gate === 'object')
                 ? data.material_utilization_gate
                 : {};
+              const closedLoop = (data && typeof data.feedback_closed_loop === 'object')
+                ? data.feedback_closed_loop
+                : {};
               const blockedCount = Number((gate && gate.blocked_submissions) || 0);
               const warnCount = Number((gate && gate.warn_submissions) || 0);
               let msg = '评分完成（' + scaleLabel + '）：已重算 ' + updated + ' 份。';
@@ -13460,6 +13671,10 @@ def index(
                 msg += ' 资料门禁预警 ' + warnCount + ' 份。';
               } else if (gate && gate.enabled) {
                 msg += ' 资料门禁通过。';
+              }
+              if (Object.keys(closedLoop).length) {
+                if (closedLoop.ok === false) msg += ' 反馈闭环执行异常，请查看下方原始输出。';
+                else msg += ' 反馈闭环已执行。';
               }
               setResult(cfg.resultId, msg, blockedCount > 0);
               if (window.renderMaterialUtilizationPanel && typeof window.renderMaterialUtilizationPanel === 'function') {
@@ -16184,6 +16399,7 @@ def index(
             );
             const doneScaleLabel = (data && data.score_scale_label) ? String(data.score_scale_label) : scaleLabel;
             const gate = (data && typeof data.material_utilization_gate === 'object') ? data.material_utilization_gate : {};
+            const closedLoop = (data && typeof data.feedback_closed_loop === 'object') ? data.feedback_closed_loop : {};
             const blockedCount = Number((gate && gate.blocked_submissions) || 0);
             const warnCount = Number((gate && gate.warn_submissions) || 0);
             let doneMsg = '施组评分完成（' + doneScaleLabel + '）：已重算 ' + updated + ' 份。';
@@ -16193,6 +16409,10 @@ def index(
               doneMsg += ' 资料门禁预警 ' + warnCount + ' 份。';
             } else if (gate && gate.enabled) {
               doneMsg += ' 资料门禁通过。';
+            }
+            if (Object.keys(closedLoop).length) {
+              if (closedLoop.ok === false) doneMsg += ' 反馈闭环执行异常，请查看“原始输出”。';
+              else doneMsg += ' 反馈闭环已执行。';
             }
             if (o) o.textContent = doneMsg;
             setActionStatus('shigongActionStatus', doneMsg, blockedCount > 0);
