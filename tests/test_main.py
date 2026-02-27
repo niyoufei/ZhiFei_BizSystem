@@ -58,6 +58,7 @@ class TestIndexEndpoint:
         assert 'id="btnMaterialKnowledgeProfile"' in response.text
         assert 'id="btnMaterialKnowledgeProfileDownload"' in response.text
         assert 'id="btnEvolutionHealth"' in response.text
+        assert 'id="btnEvidenceTrace"' in response.text
         assert 'id="groundTruthSubmissionSelect"' in response.text
         assert 'id="groundTruthFile"' not in response.text
         assert "/ground_truth/from_submission" in response.text
@@ -149,6 +150,7 @@ class TestIndexEndpoint:
             "btnCompareReport",
             "btnInsights",
             "btnLearning",
+            "btnEvidenceTrace",
             "btnAdaptive",
             "btnAdaptivePatch",
             "btnAdaptiveValidate",
@@ -170,6 +172,7 @@ class TestIndexEndpoint:
             "compareReportResult",
             "insightsResult",
             "learningResult",
+            "evidenceTraceResult",
             "adaptiveResult",
             "adaptivePatchResult",
             "adaptiveValidateResult",
@@ -3001,6 +3004,286 @@ class TestCompareEndpoints:
         response = client.get("/api/v1/projects/p1/compare")
         assert response.status_code == 404
         assert "请先点击“评分施组”" in response.json()["detail"]
+
+
+class TestEvidenceTraceEndpoints:
+    """Tests for /projects/{project_id}/submissions/{submission_id}/evidence_trace endpoints."""
+
+    @patch("app.main.load_materials")
+    @patch("app.main.load_evidence_units")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_submission_evidence_trace_success(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_submissions,
+        mock_load_units,
+        mock_load_materials,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "施工组织设计.pdf",
+                "text": "工期120天，关键节点分三段推进。",
+                "created_at": "2026-02-27T00:00:00+00:00",
+                "report": {
+                    "requirement_hits": [
+                        {
+                            "dimension_id": "01",
+                            "label": "总工期约束",
+                            "hit": True,
+                            "mandatory": True,
+                            "reason": "命中 t2/2 n1/1",
+                            "source_pack_id": "runtime_material_rag",
+                            "material_type": "tender_qa",
+                            "source_filename": "招标文件.pdf",
+                            "chunk_id": "招标文件.pdf#c1",
+                        },
+                        {
+                            "dimension_id": "09",
+                            "label": "进度里程碑",
+                            "hit": False,
+                            "mandatory": True,
+                            "reason": "命中不足 t1/3 n0/1",
+                            "source_pack_id": "runtime_material_consistency",
+                            "material_type": "boq",
+                            "source_filename": "工程量清单.xlsx",
+                            "chunk_id": "工程量清单.xlsx#c2",
+                        },
+                    ],
+                    "material_consistency": {
+                        "by_material_type": {
+                            "boq": {
+                                "total": 1,
+                                "hit": 0,
+                                "mandatory_total": 1,
+                                "mandatory_hit": 0,
+                                "hit_rate": 0.0,
+                            }
+                        }
+                    },
+                    "meta": {},
+                },
+            }
+        ]
+        mock_load_units.return_value = [
+            {
+                "id": "u1",
+                "submission_id": "s1",
+                "dimension_id": "01",
+                "source_locator": "P12-L30",
+                "source_filename": "招标文件.pdf",
+                "confidence": 0.91,
+                "text_snippet": "项目总工期120天。",
+            }
+        ]
+        mock_load_materials.return_value = []
+
+        response = client.get("/api/v1/projects/p1/submissions/s1/evidence_trace")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["submission_id"] == "s1"
+        assert data["summary"]["total_requirements"] == 2
+        assert data["material_conflicts"]["has_conflicts"] is True
+        assert len(data["evidence_units"]) == 1
+
+    @patch("app.main.load_materials")
+    @patch("app.main.load_evidence_units")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_submission_evidence_trace_markdown_and_download(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_submissions,
+        mock_load_units,
+        mock_load_materials,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "施工组织设计.pdf",
+                "text": "工期120天。",
+                "created_at": "2026-02-27T00:00:00+00:00",
+                "report": {
+                    "requirement_hits": [],
+                    "material_consistency": {"by_material_type": {}},
+                    "meta": {},
+                },
+            }
+        ]
+        mock_load_units.return_value = []
+        mock_load_materials.return_value = []
+
+        md_resp = client.get("/api/v1/projects/p1/submissions/s1/evidence_trace/markdown")
+        assert md_resp.status_code == 200
+        markdown = md_resp.json()["markdown"]
+        assert "# 评分证据追溯报告" in markdown
+        assert "施组ID" in markdown
+
+        file_resp = client.get("/api/v1/projects/p1/submissions/s1/evidence_trace.md")
+        assert file_resp.status_code == 200
+        assert "text/markdown" in file_resp.headers.get("content-type", "")
+        assert "attachment; filename=" in file_resp.headers.get("content-disposition", "")
+
+    @patch("app.main.load_materials")
+    @patch("app.main.load_evidence_units")
+    @patch("app.main._submission_is_scored")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_latest_submission_evidence_trace_prefers_scored(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_submissions,
+        mock_submission_scored,
+        mock_load_units,
+        mock_load_materials,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s_new_pending",
+                "project_id": "p1",
+                "filename": "待评分施组.pdf",
+                "created_at": "2026-02-27T10:00:00+00:00",
+                "report": {"scoring_status": "pending"},
+                "text": "",
+            },
+            {
+                "id": "s_old_scored",
+                "project_id": "p1",
+                "filename": "已评分施组.pdf",
+                "created_at": "2026-02-27T09:00:00+00:00",
+                "report": {"scoring_status": "scored", "requirement_hits": [], "meta": {}},
+                "text": "施组文本",
+            },
+        ]
+        mock_submission_scored.side_effect = [False, True]
+        mock_load_units.return_value = []
+        mock_load_materials.return_value = []
+
+        response = client.get("/api/v1/projects/p1/evidence_trace/latest")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["submission_id"] == "s_old_scored"
+        assert data["filename"] == "已评分施组.pdf"
+
+    def test_build_material_conflict_summary_from_report(self):
+        from app.main import _build_material_conflict_summary_from_report
+
+        report = {
+            "requirement_hits": [
+                {
+                    "dimension_id": "09",
+                    "label": "工期里程碑",
+                    "hit": False,
+                    "mandatory": True,
+                    "reason": "命中不足 t1/3 n0/2",
+                    "source_pack_id": "runtime_material_consistency",
+                    "material_type": "boq",
+                    "source_filename": "工程量清单.xlsx",
+                    "chunk_id": "工程量清单.xlsx#c3",
+                    "source_mode": "consistency_check",
+                }
+            ],
+            "material_consistency": {
+                "by_material_type": {
+                    "boq": {
+                        "total": 1,
+                        "hit": 0,
+                        "mandatory_total": 1,
+                        "mandatory_hit": 0,
+                        "hit_rate": 0.0,
+                    }
+                }
+            },
+        }
+        payload = _build_material_conflict_summary_from_report(report)
+        assert payload["has_conflicts"] is True
+        assert payload["conflict_count"] == 1
+        assert payload["high_severity_count"] >= 1
+        assert payload["conflicts"][0]["conflict_kind"] in {
+            "numeric_mismatch",
+            "term_coverage_missing",
+            "material_consistency_missing",
+        }
+
+    @patch("app.main.save_patch_deployments")
+    @patch("app.main.load_patch_deployments")
+    @patch("app.main.save_patch_packages")
+    @patch("app.main.evaluate_patch_shadow")
+    @patch("app.main.load_patch_packages")
+    def test_auto_govern_deployed_patch_rolls_back_when_shadow_failed(
+        self,
+        mock_load_patch_packages,
+        mock_eval_shadow,
+        mock_save_patch_packages,
+        mock_load_patch_deployments,
+        mock_save_patch_deployments,
+    ):
+        from app.main import _auto_govern_deployed_patch
+
+        mock_load_patch_packages.return_value = [
+            {
+                "id": "patch_new",
+                "project_id": "p1",
+                "status": "deployed",
+                "rollback_pointer": "patch_old",
+                "patch_payload": {"penalty_multiplier": {"P-EMPTY-002": 1.1}},
+                "updated_at": "2026-02-27T10:00:00+00:00",
+            },
+            {
+                "id": "patch_old",
+                "project_id": "p1",
+                "status": "shadow_pass",
+                "patch_payload": {},
+                "updated_at": "2026-02-27T09:00:00+00:00",
+            },
+        ]
+        mock_eval_shadow.return_value = {
+            "ok": True,
+            "patch_id": "patch_new",
+            "gate_passed": False,
+            "metrics_before_after": {
+                "mae_before": 2.0,
+                "mae_after": 2.5,
+                "sample_count": 5,
+                "delta_mae": 0.5,
+            },
+        }
+        mock_load_patch_deployments.return_value = []
+
+        result = _auto_govern_deployed_patch(
+            project_id="p1",
+            delta_cases=[{"id": "d1"}, {"id": "d2"}, {"id": "d3"}, {"id": "d4"}, {"id": "d5"}],
+        )
+        assert result["checked"] is True
+        assert result["action"] == "rollback"
+        assert result["rolled_back"] is True
+        assert result["rollback_to_patch_id"] == "patch_old"
+
+        saved_packages = mock_save_patch_packages.call_args[0][0]
+        status_map = {str(p.get("id")): str(p.get("status")) for p in saved_packages}
+        assert status_map["patch_new"] == "rolled_back"
+        assert status_map["patch_old"] == "deployed"
+
+        saved_deploys = mock_save_patch_deployments.call_args[0][0]
+        actions = [str(d.get("action")) for d in saved_deploys]
+        assert "auto_rollback" in actions
+        assert "auto_promote_rollback_pointer" in actions
 
 
 class TestAdaptiveEndpoints:

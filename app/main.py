@@ -144,6 +144,8 @@ from app.schemas import (
     ConstraintPack,
     DeltaCaseRecord,
     EvaluationSummaryResponse,
+    EvidenceTraceMarkdownResponse,
+    EvidenceTraceResponse,
     EvolutionHealthResponse,
     EvolutionReport,
     ExpertProfileRecord,
@@ -670,6 +672,23 @@ def _find_submission(submission_id: str, submissions: List[Dict[str, object]]) -
         if str(s.get("id")) == submission_id:
             return s
     raise HTTPException(status_code=404, detail="施组提交记录不存在")
+
+
+def _latest_project_submission(
+    project_id: str,
+    submissions: List[Dict[str, object]],
+    *,
+    prefer_scored: bool = True,
+) -> Optional[Dict[str, object]]:
+    rows = [s for s in submissions if str(s.get("project_id") or "") == project_id]
+    if not rows:
+        return None
+    rows = sorted(rows, key=lambda x: str(x.get("created_at") or ""), reverse=True)
+    if prefer_scored:
+        for row in rows:
+            if _submission_is_scored(row):
+                return row
+    return rows[0]
 
 
 def _weights_norm_to_dimension_multipliers(weights_norm: Dict[str, float]) -> Dict[str, float]:
@@ -1616,6 +1635,464 @@ def _build_evidence_trace_summary(report: Dict[str, object]) -> Dict[str, object
         "source_pack_hit_counts": dict(source_pack_counter),
         "preview": preview_rows,
     }
+
+
+def _parse_reason_ratio(reason: str, marker: str) -> tuple[int, int]:
+    text = str(reason or "")
+    m = re.search(rf"{re.escape(marker)}(\d+)/(\d+)", text)
+    if not m:
+        return 0, 0
+    try:
+        left = int(m.group(1))
+        right = int(m.group(2))
+        return max(0, left), max(0, right)
+    except Exception:
+        return 0, 0
+
+
+def _build_material_conflict_summary_from_report(report: Dict[str, object]) -> Dict[str, object]:
+    req_hits = (
+        report.get("requirement_hits") if isinstance(report.get("requirement_hits"), list) else []
+    )
+    consistency = (
+        report.get("material_consistency")
+        if isinstance(report.get("material_consistency"), dict)
+        else {}
+    )
+    by_type_raw = (
+        consistency.get("by_material_type")
+        if isinstance(consistency.get("by_material_type"), dict)
+        else {}
+    )
+
+    by_type: Dict[str, Dict[str, object]] = {}
+    for key, row in by_type_raw.items():
+        mat_type = _normalize_material_type(key)
+        row_dict = row if isinstance(row, dict) else {}
+        by_type[mat_type] = {
+            "material_type": mat_type,
+            "material_type_label": _material_type_label(mat_type),
+            "total": int(_to_float_or_none(row_dict.get("total")) or 0),
+            "hit": int(_to_float_or_none(row_dict.get("hit")) or 0),
+            "mandatory_total": int(_to_float_or_none(row_dict.get("mandatory_total")) or 0),
+            "mandatory_hit": int(_to_float_or_none(row_dict.get("mandatory_hit")) or 0),
+            "hit_rate": _to_float_or_none(row_dict.get("hit_rate")),
+        }
+
+    conflicts: List[Dict[str, object]] = []
+    for item in req_hits:
+        if not isinstance(item, dict):
+            continue
+        if bool(item.get("hit")):
+            continue
+        source_pack = str(item.get("source_pack_id") or "")
+        if source_pack != "runtime_material_consistency":
+            continue
+        mat_type = _normalize_material_type(item.get("material_type"))
+        bucket = by_type.setdefault(
+            mat_type,
+            {
+                "material_type": mat_type,
+                "material_type_label": _material_type_label(mat_type),
+                "total": 0,
+                "hit": 0,
+                "mandatory_total": 0,
+                "mandatory_hit": 0,
+                "hit_rate": None,
+            },
+        )
+        bucket["total"] = int(bucket.get("total", 0)) + 1
+        mandatory = bool(item.get("mandatory"))
+        if mandatory:
+            bucket["mandatory_total"] = int(bucket.get("mandatory_total", 0)) + 1
+
+        reason = str(item.get("reason") or "")
+        term_hit, term_need = _parse_reason_ratio(reason, "t")
+        num_hit, num_need = _parse_reason_ratio(reason, "n")
+        numeric_conflict = num_need > 0 and num_hit < num_need
+        term_conflict = term_need > 0 and term_hit < term_need
+        severity = "high" if (mandatory or numeric_conflict) else "medium"
+        conflict_kind = (
+            "numeric_mismatch"
+            if numeric_conflict
+            else ("term_coverage_missing" if term_conflict else "material_consistency_missing")
+        )
+        conflicts.append(
+            {
+                "severity": severity,
+                "conflict_kind": conflict_kind,
+                "dimension_id": str(item.get("dimension_id") or ""),
+                "material_type": mat_type,
+                "material_type_label": _material_type_label(mat_type),
+                "label": str(item.get("label") or ""),
+                "reason": reason,
+                "mandatory": mandatory,
+                "source_filename": str(item.get("source_filename") or ""),
+                "chunk_id": str(item.get("chunk_id") or ""),
+                "source_mode": str(item.get("source_mode") or ""),
+                "term_hit": term_hit,
+                "term_need": term_need,
+                "num_hit": num_hit,
+                "num_need": num_need,
+            }
+        )
+
+    for row in by_type.values():
+        total = int(row.get("total", 0))
+        hit = int(row.get("hit", 0))
+        if total > 0 and row.get("hit_rate") is None:
+            row["hit_rate"] = round(float(hit) / float(total), 4)
+
+    high_cnt = sum(1 for x in conflicts if str(x.get("severity")) == "high")
+    medium_cnt = sum(1 for x in conflicts if str(x.get("severity")) == "medium")
+    recommendations: List[str] = []
+    if conflicts:
+        recommendations.append("施组与上传资料存在一致性缺口，建议按冲突项逐条补齐。")
+    for row in sorted(
+        by_type.values(),
+        key=lambda x: float(_to_float_or_none(x.get("hit_rate")) or 0.0),
+    ):
+        hit_rate = _to_float_or_none(row.get("hit_rate"))
+        total = int(row.get("total", 0))
+        if hit_rate is None or total <= 0:
+            continue
+        if hit_rate < 0.35:
+            recommendations.append(
+                f"{row.get('material_type_label')}一致性命中率偏低（{hit_rate * 100:.1f}%），建议补充明确的量化约束与章节引用。"
+            )
+
+    return {
+        "has_conflicts": bool(conflicts),
+        "conflict_count": len(conflicts),
+        "high_severity_count": high_cnt,
+        "medium_severity_count": medium_cnt,
+        "by_material_type": sorted(
+            list(by_type.values()),
+            key=lambda x: str(x.get("material_type") or ""),
+        ),
+        "conflicts": conflicts[:60],
+        "recommendations": recommendations[:10],
+    }
+
+
+def _build_submission_material_conflicts(
+    *,
+    project_id: str,
+    submission: Dict[str, object],
+) -> Dict[str, object]:
+    report = submission.get("report") if isinstance(submission.get("report"), dict) else {}
+    base = _build_material_conflict_summary_from_report(report)
+    submission_text = str(submission.get("text") or "")
+    submission_numbers = {
+        token
+        for token in (
+            _normalize_numeric_token(item)
+            for item in _extract_numeric_terms(submission_text, max_terms=320)
+        )
+        if token
+    }
+
+    material_retrieval = (
+        (report.get("meta") or {}).get("material_retrieval")
+        if isinstance((report.get("meta") or {}), dict)
+        else {}
+    )
+    consistency_preview = (
+        material_retrieval.get("consistency_preview")
+        if isinstance(material_retrieval, dict)
+        and isinstance(material_retrieval.get("consistency_preview"), list)
+        else []
+    )
+    key_material_numbers: List[str] = []
+    for row in consistency_preview:
+        if not isinstance(row, dict):
+            continue
+        for raw in row.get("numbers") or []:
+            token = _normalize_numeric_token(raw)
+            if token and token not in key_material_numbers:
+                key_material_numbers.append(token)
+
+    merged_material_text = _merge_materials_text(project_id)
+    material_numbers = {
+        token
+        for token in (
+            _normalize_numeric_token(item)
+            for item in _extract_numeric_terms(merged_material_text, max_terms=420)
+        )
+        if token
+    }
+    if not key_material_numbers:
+        key_material_numbers = sorted(list(material_numbers))[:40]
+    missing_key_numbers = [n for n in key_material_numbers if n not in submission_numbers][:30]
+
+    numeric_base = len(key_material_numbers)
+    numeric_hit = len([n for n in key_material_numbers if n in submission_numbers])
+    numeric_coverage_rate = (
+        round(float(numeric_hit) / float(numeric_base), 4) if numeric_base > 0 else None
+    )
+    numeric_conflict = numeric_base > 0 and numeric_hit < max(1, int(numeric_base * 0.25))
+    if numeric_conflict:
+        conflicts = base.get("conflicts") if isinstance(base.get("conflicts"), list) else []
+        conflicts.append(
+            {
+                "severity": "high",
+                "conflict_kind": "key_numeric_constraint_missing",
+                "dimension_id": "",
+                "material_type": "cross_material",
+                "material_type_label": "跨资料",
+                "label": "关键数字约束未在施组中体现",
+                "reason": f"关键数字命中 {numeric_hit}/{numeric_base}",
+                "mandatory": True,
+                "source_filename": "",
+                "chunk_id": "",
+                "source_mode": "numeric_cross_check",
+                "term_hit": 0,
+                "term_need": 0,
+                "num_hit": numeric_hit,
+                "num_need": numeric_base,
+                "missing_numbers": missing_key_numbers[:12],
+            }
+        )
+        base["conflicts"] = conflicts[:60]
+        base["conflict_count"] = len(base["conflicts"])
+        base["high_severity_count"] = int(base.get("high_severity_count", 0)) + 1
+
+    recommendations = (
+        base.get("recommendations") if isinstance(base.get("recommendations"), list) else []
+    )
+    if numeric_coverage_rate is not None and numeric_coverage_rate < 0.35:
+        recommendations.append(
+            f"关键数字约束覆盖率偏低（{numeric_coverage_rate * 100:.1f}%），建议在施组中补充工期/工程量/阈值等量化指标。"
+        )
+    base["recommendations"] = recommendations[:12]
+    base["numeric_cross_check"] = {
+        "key_numbers_total": numeric_base,
+        "key_numbers_hit": numeric_hit,
+        "key_numbers_coverage_rate": numeric_coverage_rate,
+        "missing_key_numbers": missing_key_numbers,
+        "submission_number_count": len(submission_numbers),
+        "material_number_count": len(material_numbers),
+    }
+    return base
+
+
+def _build_submission_evidence_trace_report(
+    *,
+    project_id: str,
+    submission: Dict[str, object],
+) -> Dict[str, object]:
+    submission_id = str(submission.get("id") or "")
+    filename = str(submission.get("filename") or "")
+    report = submission.get("report") if isinstance(submission.get("report"), dict) else {}
+    report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+    summary = (
+        report_meta.get("evidence_trace")
+        if isinstance(report_meta.get("evidence_trace"), dict)
+        else _build_evidence_trace_summary(report)
+    )
+    req_hits = (
+        report.get("requirement_hits") if isinstance(report.get("requirement_hits"), list) else []
+    )
+
+    by_dim_map: Dict[str, Dict[str, object]] = {}
+    requirement_rows: List[Dict[str, object]] = []
+    for item in req_hits:
+        if not isinstance(item, dict):
+            continue
+        dim_id = str(item.get("dimension_id") or "")
+        if dim_id:
+            bucket = by_dim_map.setdefault(
+                dim_id,
+                {
+                    "dimension_id": dim_id,
+                    "dimension_name": str((DIMENSIONS.get(dim_id) or {}).get("name") or dim_id),
+                    "total": 0,
+                    "hit": 0,
+                    "mandatory_total": 0,
+                    "mandatory_hit": 0,
+                },
+            )
+            bucket["total"] = int(bucket.get("total", 0)) + 1
+            if bool(item.get("hit")):
+                bucket["hit"] = int(bucket.get("hit", 0)) + 1
+            if bool(item.get("mandatory")):
+                bucket["mandatory_total"] = int(bucket.get("mandatory_total", 0)) + 1
+                if bool(item.get("hit")):
+                    bucket["mandatory_hit"] = int(bucket.get("mandatory_hit", 0)) + 1
+        requirement_rows.append(
+            {
+                "dimension_id": dim_id,
+                "dimension_name": str((DIMENSIONS.get(dim_id) or {}).get("name") or dim_id),
+                "label": str(item.get("label") or ""),
+                "hit": bool(item.get("hit")),
+                "mandatory": bool(item.get("mandatory")),
+                "reason": str(item.get("reason") or ""),
+                "source_pack_id": str(item.get("source_pack_id") or ""),
+                "material_type": str(item.get("material_type") or ""),
+                "source_filename": str(item.get("source_filename") or ""),
+                "chunk_id": str(item.get("chunk_id") or ""),
+                "source_mode": str(item.get("source_mode") or ""),
+            }
+        )
+
+    by_dimension_rows: List[Dict[str, object]] = []
+    for dim_id, row in by_dim_map.items():
+        total = int(row.get("total", 0))
+        hit = int(row.get("hit", 0))
+        mandatory_total = int(row.get("mandatory_total", 0))
+        mandatory_hit = int(row.get("mandatory_hit", 0))
+        by_dimension_rows.append(
+            {
+                **row,
+                "hit_rate": round(float(hit) / float(total), 4) if total > 0 else None,
+                "mandatory_hit_rate": round(float(mandatory_hit) / float(mandatory_total), 4)
+                if mandatory_total > 0
+                else None,
+            }
+        )
+    by_dimension_rows.sort(key=lambda x: str(x.get("dimension_id") or ""))
+
+    evidence_units_rows: List[Dict[str, object]] = []
+    for unit in load_evidence_units():
+        if str(unit.get("submission_id") or "") != submission_id:
+            continue
+        evidence_units_rows.append(
+            {
+                "id": str(unit.get("id") or ""),
+                "dimension_id": str(unit.get("dimension_id") or ""),
+                "dimension_name": str(
+                    (DIMENSIONS.get(str(unit.get("dimension_id") or "")) or {}).get("name")
+                    or str(unit.get("dimension_id") or "")
+                ),
+                "source_locator": str(
+                    unit.get("source_locator")
+                    or unit.get("locator")
+                    or unit.get("anchor_locator")
+                    or ""
+                ),
+                "source_filename": str(unit.get("source_filename") or ""),
+                "confidence": _to_float_or_none(unit.get("confidence")),
+                "text_snippet": str(
+                    unit.get("text_snippet") or unit.get("text") or unit.get("unit_text") or ""
+                )[:220],
+            }
+        )
+    evidence_units_rows.sort(
+        key=lambda x: float(_to_float_or_none(x.get("confidence")) or 0.0),
+        reverse=True,
+    )
+
+    material_conflicts = _build_submission_material_conflicts(
+        project_id=project_id,
+        submission=submission,
+    )
+    recommendations: List[str] = []
+    total_hits = int(_to_float_or_none(summary.get("total_hits")) or 0)
+    total_reqs = int(_to_float_or_none(summary.get("total_requirements")) or 0)
+    if total_reqs > 0 and total_hits <= 0:
+        recommendations.append("当前评分未命中有效证据锚点，建议补充与资料一致的可检索表述。")
+    if bool(material_conflicts.get("has_conflicts")):
+        recommendations.extend(
+            [str(x) for x in (material_conflicts.get("recommendations") or []) if str(x).strip()]
+        )
+
+    return {
+        "project_id": project_id,
+        "submission_id": submission_id,
+        "filename": filename,
+        "generated_at": _now_iso(),
+        "summary": summary,
+        "by_dimension": by_dimension_rows,
+        "requirement_hits": requirement_rows[:180],
+        "evidence_units": evidence_units_rows[:120],
+        "material_conflicts": material_conflicts,
+        "recommendations": recommendations[:16],
+    }
+
+
+def _render_evidence_trace_markdown(payload: Dict[str, object]) -> str:
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    by_dimension = (
+        payload.get("by_dimension") if isinstance(payload.get("by_dimension"), list) else []
+    )
+    requirement_hits = (
+        payload.get("requirement_hits") if isinstance(payload.get("requirement_hits"), list) else []
+    )
+    material_conflicts = (
+        payload.get("material_conflicts")
+        if isinstance(payload.get("material_conflicts"), dict)
+        else {}
+    )
+    recommendations = (
+        payload.get("recommendations") if isinstance(payload.get("recommendations"), list) else []
+    )
+    lines = [
+        "# 评分证据追溯报告",
+        "",
+        f"- 项目ID：`{payload.get('project_id') or '-'}`",
+        f"- 施组ID：`{payload.get('submission_id') or '-'}`",
+        f"- 文件名：`{payload.get('filename') or '-'}`",
+        f"- 生成时间：`{payload.get('generated_at') or '-'}`",
+        "",
+        "## 证据总览",
+        "",
+        f"- 要求总数：`{summary.get('total_requirements', 0)}`",
+        f"- 命中总数：`{summary.get('total_hits', 0)}`",
+        f"- 命中率：`{summary.get('overall_hit_rate')}`",
+        f"- 强制项命中率：`{summary.get('mandatory_hit_rate')}`",
+        f"- 命中文件数：`{summary.get('source_files_hit_count', 0)}`",
+        "",
+        "## 按维度命中",
+        "",
+        "| 维度 | total | hit | mandatory hit | hit_rate |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for row in by_dimension:
+        if not isinstance(row, dict):
+            continue
+        lines.append(
+            f"| {row.get('dimension_id', '-')} {row.get('dimension_name', '')} "
+            f"| {row.get('total', 0)} "
+            f"| {row.get('hit', 0)} "
+            f"| {row.get('mandatory_hit', 0)}/{row.get('mandatory_total', 0)} "
+            f"| {row.get('hit_rate', '-') if row.get('hit_rate') is not None else '-'} |"
+        )
+    lines.extend(["", "## 一致性冲突", ""])
+    lines.append(f"- 是否存在冲突：`{bool(material_conflicts.get('has_conflicts'))}`")
+    lines.append(f"- 冲突数量：`{material_conflicts.get('conflict_count', 0)}`")
+    numeric_cross_check = (
+        material_conflicts.get("numeric_cross_check")
+        if isinstance(material_conflicts.get("numeric_cross_check"), dict)
+        else {}
+    )
+    if numeric_cross_check:
+        lines.append(
+            "- 关键数字命中：`"
+            + f"{numeric_cross_check.get('key_numbers_hit', 0)}/{numeric_cross_check.get('key_numbers_total', 0)}"
+            + "`"
+        )
+
+    lines.extend(["", "## 未命中要求（Top30）", ""])
+    lines.append("| 维度 | 标签 | 原因 | 来源文件 |")
+    lines.append("|---|---|---|---|")
+    miss_rows = [x for x in requirement_hits if isinstance(x, dict) and not bool(x.get("hit"))][:30]
+    for row in miss_rows:
+        lines.append(
+            f"| {row.get('dimension_id', '-')} "
+            f"| {str(row.get('label') or '').replace('|', ' ')} "
+            f"| {str(row.get('reason') or '').replace('|', ' / ')} "
+            f"| {row.get('source_filename') or '-'} |"
+        )
+
+    lines.extend(["", "## 建议动作", ""])
+    if recommendations:
+        for item in recommendations:
+            text = str(item or "").strip()
+            if text:
+                lines.append(f"- {text}")
+    else:
+        lines.append("- 当前证据链条完整，无新增建议。")
+    return "\n".join(lines).strip()
 
 
 def _aggregate_material_utilization_summaries(
@@ -2829,6 +3306,136 @@ def _select_deployed_patch(project_id: str) -> Optional[Dict[str, object]]:
         return None
     packages.sort(key=lambda x: str(x.get("updated_at", "")), reverse=True)
     return packages[0]
+
+
+def _auto_govern_deployed_patch(
+    *,
+    project_id: str,
+    delta_cases: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """
+    对当前已部署补丁做自动治理：
+    - shadow 评估通过：保留部署
+    - shadow 评估失败且样本充分：自动回滚，并尝试回退到 rollback_pointer
+    """
+    result: Dict[str, object] = {
+        "checked": False,
+        "project_id": project_id,
+        "patch_id": None,
+        "gate_passed": None,
+        "sample_count": 0,
+        "action": "skip",
+        "reason": "no_deployed_patch",
+        "rolled_back": False,
+        "rollback_to_patch_id": None,
+        "metrics_before_after": {},
+        "deployment_record_ids": [],
+    }
+    if not delta_cases:
+        result["reason"] = "no_delta_cases"
+        return result
+
+    packages = load_patch_packages()
+    deployed = [
+        p
+        for p in packages
+        if str(p.get("project_id")) == project_id and str(p.get("status")) == "deployed"
+    ]
+    if not deployed:
+        return result
+
+    deployed = sorted(deployed, key=lambda x: str(x.get("updated_at", "")), reverse=True)
+    patch = deployed[0]
+    patch_id = str(patch.get("id") or "")
+    result["checked"] = True
+    result["patch_id"] = patch_id
+
+    shadow = evaluate_patch_shadow(patch=patch, delta_cases=delta_cases)
+    metrics = shadow.get("metrics_before_after") or {}
+    sample_count = int(_to_float_or_none(metrics.get("sample_count")) or len(delta_cases) or 0)
+    gate_passed = bool(shadow.get("gate_passed"))
+    result["sample_count"] = sample_count
+    result["gate_passed"] = gate_passed
+    result["metrics_before_after"] = metrics
+
+    # 样本不足时不做自动回滚，避免少量噪声导致频繁抖动。
+    min_rollback_samples = 3
+    if gate_passed:
+        result["action"] = "keep"
+        result["reason"] = "shadow_passed"
+        return result
+    if sample_count < min_rollback_samples:
+        result["action"] = "skip"
+        result["reason"] = "insufficient_samples_for_rollback"
+        return result
+
+    now_iso = _now_iso()
+    rollback_pointer = str(patch.get("rollback_pointer") or "").strip()
+    rollback_target = None
+    if rollback_pointer:
+        rollback_target = next(
+            (
+                p
+                for p in packages
+                if str(p.get("id") or "") == rollback_pointer
+                and str(p.get("project_id") or "") == project_id
+            ),
+            None,
+        )
+
+    for row in packages:
+        if str(row.get("project_id") or "") != project_id:
+            continue
+        if str(row.get("status") or "") == "deployed":
+            row["status"] = "shadow_pass"
+            row["updated_at"] = now_iso
+
+    patch["status"] = "rolled_back"
+    patch["updated_at"] = now_iso
+
+    rollback_to_patch_id: Optional[str] = None
+    if rollback_target is not None:
+        rollback_target["status"] = "deployed"
+        rollback_target["updated_at"] = now_iso
+        rollback_to_patch_id = str(rollback_target.get("id") or "")
+
+    save_patch_packages(packages)
+
+    deployment_record_ids: List[str] = []
+    deploys = load_patch_deployments()
+    rollback_record = {
+        "id": str(uuid4()),
+        "patch_id": patch_id,
+        "project_id": project_id,
+        "action": "auto_rollback",
+        "deployed": False,
+        "metrics_before_after": metrics,
+        "rollback_to_version": rollback_to_patch_id or rollback_pointer or None,
+        "created_at": now_iso,
+    }
+    deploys.append(rollback_record)
+    deployment_record_ids.append(str(rollback_record["id"]))
+    if rollback_to_patch_id:
+        promote_record = {
+            "id": str(uuid4()),
+            "patch_id": rollback_to_patch_id,
+            "project_id": project_id,
+            "action": "auto_promote_rollback_pointer",
+            "deployed": True,
+            "metrics_before_after": metrics,
+            "rollback_to_version": None,
+            "created_at": now_iso,
+        }
+        deploys.append(promote_record)
+        deployment_record_ids.append(str(promote_record["id"]))
+    save_patch_deployments(deploys)
+
+    result["action"] = "rollback"
+    result["reason"] = "shadow_failed"
+    result["rolled_back"] = True
+    result["rollback_to_patch_id"] = rollback_to_patch_id
+    result["deployment_record_ids"] = deployment_record_ids
+    return result
 
 
 def _apply_deployed_patch_to_report(project_id: str, report: Dict[str, object]) -> None:
@@ -9020,6 +9627,113 @@ def get_latest_submission_report(submission_id: str) -> LatestReportResponse:
     return LatestReportResponse(report=report_obj, ui_summary=ui_summary)
 
 
+@router.get(
+    "/projects/{project_id}/submissions/{submission_id}/evidence_trace",
+    response_model=EvidenceTraceResponse,
+    tags=["施组提交"],
+    responses={**RESPONSES_404},
+)
+def get_submission_evidence_trace(
+    project_id: str,
+    submission_id: str,
+    locale: str = Depends(get_locale),
+) -> EvidenceTraceResponse:
+    """获取单份施组的证据追溯报告（结构化 JSON）。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    _find_project(project_id, projects)
+    submissions = load_submissions()
+    submission = next(
+        (
+            s
+            for s in submissions
+            if str(s.get("id") or "") == submission_id
+            and str(s.get("project_id") or "") == project_id
+        ),
+        None,
+    )
+    if submission is None:
+        raise HTTPException(status_code=404, detail=t("api.no_submissions", locale=locale))
+    payload = _build_submission_evidence_trace_report(project_id=project_id, submission=submission)
+    return EvidenceTraceResponse(**payload)
+
+
+@router.get(
+    "/projects/{project_id}/submissions/{submission_id}/evidence_trace/markdown",
+    response_model=EvidenceTraceMarkdownResponse,
+    tags=["施组提交"],
+    responses={**RESPONSES_404},
+)
+def get_submission_evidence_trace_markdown(
+    project_id: str,
+    submission_id: str,
+    locale: str = Depends(get_locale),
+) -> EvidenceTraceMarkdownResponse:
+    """获取单份施组证据追溯的 Markdown 文本。"""
+    payload = get_submission_evidence_trace(
+        project_id=project_id,
+        submission_id=submission_id,
+        locale=locale,
+    ).model_dump()
+    markdown = _render_evidence_trace_markdown(payload)
+    return EvidenceTraceMarkdownResponse(
+        project_id=project_id,
+        submission_id=submission_id,
+        markdown=markdown,
+        generated_at=str(payload.get("generated_at") or _now_iso()),
+    )
+
+
+@router.get(
+    "/projects/{project_id}/submissions/{submission_id}/evidence_trace.md",
+    tags=["施组提交"],
+    responses={**RESPONSES_404},
+)
+def download_submission_evidence_trace_markdown(
+    project_id: str,
+    submission_id: str,
+    locale: str = Depends(get_locale),
+) -> Response:
+    """下载单份施组证据追溯 Markdown 文件。"""
+    payload = get_submission_evidence_trace_markdown(
+        project_id=project_id,
+        submission_id=submission_id,
+        locale=locale,
+    )
+    filename = f"evidence_trace_{project_id}_{submission_id}.md"
+    return Response(
+        content=payload.markdown.encode("utf-8"),
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get(
+    "/projects/{project_id}/evidence_trace/latest",
+    response_model=EvidenceTraceResponse,
+    tags=["施组提交"],
+    responses={**RESPONSES_404},
+)
+def get_latest_submission_evidence_trace(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> EvidenceTraceResponse:
+    """获取本项目最新施组（优先已评分）的证据追溯报告。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    _find_project(project_id, projects)
+    submissions = load_submissions()
+    latest = _latest_project_submission(project_id, submissions, prefer_scored=True)
+    if latest is None:
+        raise HTTPException(status_code=404, detail=t("api.no_submissions", locale=locale))
+    submission_id = str(latest.get("id") or "")
+    return get_submission_evidence_trace(
+        project_id=project_id,
+        submission_id=submission_id,
+        locale=locale,
+    )
+
+
 @router.post(
     "/submissions/{submission_id}/qingtian-results",
     response_model=QingTianResultRecord,
@@ -9857,7 +10571,16 @@ def auto_run_reflection_pipeline(
     patch_id = None
     patch_gate_passed = None
     patch_deployed = False
+    patch_auto_govern: Dict[str, object] = {
+        "checked": False,
+        "reason": "not_run",
+        "action": "skip",
+    }
     if delta_cases:
+        patch_auto_govern = _auto_govern_deployed_patch(
+            project_id=project_id,
+            delta_cases=delta_cases,
+        )
         packages = load_patch_packages()
         deployed = [
             p
@@ -9921,6 +10644,7 @@ def auto_run_reflection_pipeline(
         patch_id=patch_id,
         patch_gate_passed=patch_gate_passed,
         patch_deployed=patch_deployed,
+        patch_auto_govern=patch_auto_govern,
     )
 
 
@@ -11423,6 +12147,68 @@ def compat_latest_submission_report(submission_id: str) -> LatestReportResponse:
     return get_latest_submission_report(submission_id=submission_id)
 
 
+@compat_router.get(
+    "/projects/{project_id}/submissions/{submission_id}/evidence_trace",
+    response_model=EvidenceTraceResponse,
+    tags=["施组提交"],
+)
+def compat_submission_evidence_trace(
+    project_id: str,
+    submission_id: str,
+    locale: str = Depends(get_locale),
+) -> EvidenceTraceResponse:
+    return get_submission_evidence_trace(
+        project_id=project_id,
+        submission_id=submission_id,
+        locale=locale,
+    )
+
+
+@compat_router.get(
+    "/projects/{project_id}/submissions/{submission_id}/evidence_trace/markdown",
+    response_model=EvidenceTraceMarkdownResponse,
+    tags=["施组提交"],
+)
+def compat_submission_evidence_trace_markdown(
+    project_id: str,
+    submission_id: str,
+    locale: str = Depends(get_locale),
+) -> EvidenceTraceMarkdownResponse:
+    return get_submission_evidence_trace_markdown(
+        project_id=project_id,
+        submission_id=submission_id,
+        locale=locale,
+    )
+
+
+@compat_router.get(
+    "/projects/{project_id}/submissions/{submission_id}/evidence_trace.md",
+    tags=["施组提交"],
+)
+def compat_download_submission_evidence_trace_markdown(
+    project_id: str,
+    submission_id: str,
+    locale: str = Depends(get_locale),
+) -> Response:
+    return download_submission_evidence_trace_markdown(
+        project_id=project_id,
+        submission_id=submission_id,
+        locale=locale,
+    )
+
+
+@compat_router.get(
+    "/projects/{project_id}/evidence_trace/latest",
+    response_model=EvidenceTraceResponse,
+    tags=["施组提交"],
+)
+def compat_latest_submission_evidence_trace(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> EvidenceTraceResponse:
+    return get_latest_submission_evidence_trace(project_id=project_id, locale=locale)
+
+
 @compat_router.post(
     "/submissions/{submission_id}/qingtian-results",
     response_model=QingTianResultRecord,
@@ -12288,6 +13074,7 @@ def index(
             btnCompareReport: { resultId: 'compareReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare_report', loading: '对比报告生成中...' },
             btnInsights: { resultId: 'insightsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/insights', loading: '洞察分析中...' },
             btnLearning: { resultId: 'learningResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/learning', loading: '学习画像生成中...' },
+            btnEvidenceTrace: { resultId: 'evidenceTraceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/evidence_trace/latest', loading: '证据追溯生成中...' },
             btnAdaptive: { resultId: 'adaptiveResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/adaptive', loading: '自适应建议生成中...' },
             btnAdaptivePatch: { resultId: 'adaptivePatchResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/adaptive_patch', loading: '补丁生成中...' },
             btnAdaptiveValidate: { resultId: 'adaptiveValidateResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/adaptive_validate', loading: '验证效果计算中...' },
@@ -12372,6 +13159,23 @@ def index(
                   ? rows.map((r) => '<tr><td>' + esc(r.filename || '') + '</td><td>' + esc(r.total_score) + '</td><td>' + esc(r.created_at || '') + '</td></tr>').join('')
                   : '<tr><td colspan="3">暂无施组评分数据</td></tr>') +
                 '</table>';
+              setResultHtml(cfg.resultId, html);
+              return true;
+            }
+            if (actionId === 'btnEvidenceTrace') {
+              const summary = (data && typeof data.summary === 'object') ? data.summary : {};
+              const conflicts = (
+                data && data.material_conflicts && typeof data.material_conflicts === 'object'
+              ) ? data.material_conflicts : {};
+              const recommendations = Array.isArray(data.recommendations) ? data.recommendations : [];
+              const html = '<strong>证据追溯（最新施组）</strong>'
+                + '<p style="margin:6px 0">文件：' + esc(data.filename || '-') + '</p>'
+                + '<table><tr><th>要求总数</th><th>命中总数</th><th>整体命中率</th><th>强制项命中率</th><th>命中文件数</th></tr>'
+                + '<tr><td>' + esc(summary.total_requirements || 0) + '</td><td>' + esc(summary.total_hits || 0) + '</td><td>' + esc(summary.overall_hit_rate ?? '-') + '</td><td>' + esc(summary.mandatory_hit_rate ?? '-') + '</td><td>' + esc(summary.source_files_hit_count || 0) + '</td></tr></table>'
+                + '<p style="margin:6px 0">一致性冲突：' + esc(conflicts.conflict_count || 0) + '（高风险 ' + esc(conflicts.high_severity_count || 0) + '）</p>'
+                + (recommendations.length
+                  ? '<ul style="margin:6px 0 0 18px;color:#92400e">' + recommendations.slice(0, 6).map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>'
+                  : '');
               setResultHtml(cfg.resultId, html);
               return true;
             }
@@ -12680,11 +13484,13 @@ def index(
           <button type="button" id="btnCompareReport" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnCompareReport')">对比报告（叙述）</button>
           <button type="button" id="btnInsights" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnInsights')">洞察</button>
           <button type="button" id="btnLearning" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnLearning')">生成学习画像</button>
+          <button type="button" id="btnEvidenceTrace" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnEvidenceTrace')">证据追溯（最新施组）</button>
         </div>
         <div id="compareResult" class="result-block" style="display:none"></div>
         <div id="compareReportResult" class="result-block" style="display:none"></div>
         <div id="insightsResult" class="result-block" style="display:none"></div>
         <div id="learningResult" class="result-block" style="display:none"></div>
+        <div id="evidenceTraceResult" class="result-block" style="display:none"></div>
       </div>
 
       <div class="section card" id="section-adaptive" style="display:none">
@@ -12845,6 +13651,7 @@ def index(
             btnCompareReport: { resultId: 'compareReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare_report', loading: '对比报告生成中...' },
             btnInsights: { resultId: 'insightsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/insights', loading: '洞察分析中...' },
             btnLearning: { resultId: 'learningResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/learning', loading: '学习画像生成中...' },
+            btnEvidenceTrace: { resultId: 'evidenceTraceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/evidence_trace/latest', loading: '证据追溯生成中...' },
             btnAdaptive: { resultId: 'adaptiveResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/adaptive', loading: '自适应建议生成中...' },
             btnAdaptivePatch: { resultId: 'adaptivePatchResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/adaptive_patch', loading: '补丁生成中...' },
             btnAdaptiveValidate: { resultId: 'adaptiveValidateResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/adaptive_validate', loading: '验证效果计算中...' },
@@ -13959,6 +14766,7 @@ def index(
         const NON_BLOCKING_ACTION_BUTTON_IDS = [
           'btnUploadMaterials', 'btnUploadBoq', 'btnUploadDrawing', 'btnUploadSitePhotos', 'btnRefreshMaterials', 'btnMaterialDepthReport', 'btnMaterialDepthReportDownload', 'btnMaterialKnowledgeProfile', 'btnMaterialKnowledgeProfileDownload', 'btnUploadShigong', 'btnScoreShigong', 'btnRefreshSubmissions',
           'btnCompare', 'btnCompareReport', 'btnInsights', 'btnLearning',
+          'btnEvidenceTrace',
           'btnAdaptive', 'btnAdaptivePatch', 'btnAdaptiveValidate', 'btnAdaptiveApply',
           'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
           'btnEvolve', 'btnEvolutionHealth', 'btnWritingGuidance', 'btnCompilationInstructions',
@@ -14089,6 +14897,7 @@ def index(
             'materialDepthReportResult',
             'materialUtilizationResult',
             'compareResult', 'compareReportResult', 'insightsResult', 'learningResult',
+            'evidenceTraceResult',
             'adaptiveResult', 'adaptivePatchResult', 'adaptiveValidateResult', 'adaptiveApplyResult',
             'evolveResult', 'guidanceResult', 'compilationInstructionsResult',
             'deltaResult', 'sampleResult', 'calibTrainResult', 'patchResult',
@@ -16595,6 +17404,57 @@ def index(
           }
         });
 
+        safeClick('btnEvidenceTrace', async () => {
+          if (!ensureProjectForAction('evidenceTraceResult')) return;
+          setResultLoading('evidenceTraceResult', '证据追溯生成中...');
+          const projectId = actionProjectId();
+          const res = await fetch('/api/v1/projects/' + projectId + '/evidence_trace/latest');
+          const data = await res.json().catch(() => ({}));
+          showJson('output', formatApiOutput(res, data));
+          const el = document.getElementById('evidenceTraceResult');
+          el.style.display = 'block';
+          if (!res.ok) {
+            el.innerHTML = '<span class="error">' + (data.detail || '请求失败') + '</span>';
+            return;
+          }
+          const summary = (data.summary && typeof data.summary === 'object') ? data.summary : {};
+          const byDim = Array.isArray(data.by_dimension) ? data.by_dimension : [];
+          const conflicts = (data.material_conflicts && typeof data.material_conflicts === 'object')
+            ? data.material_conflicts
+            : {};
+          const recommendations = Array.isArray(data.recommendations) ? data.recommendations : [];
+          const rows = byDim.slice(0, 12);
+          let html = '<strong>证据追溯（最新施组）</strong>';
+          html += '<p style="margin:6px 0">文件：' + escapeHtmlText(data.filename || '-') + '</p>';
+          html += '<table><tr><th>要求总数</th><th>命中总数</th><th>整体命中率</th><th>强制项命中率</th><th>命中文件数</th></tr>'
+            + '<tr><td>' + escapeHtmlText(summary.total_requirements || 0) + '</td><td>' + escapeHtmlText(summary.total_hits || 0) + '</td><td>' + escapeHtmlText(summary.overall_hit_rate ?? '-') + '</td><td>' + escapeHtmlText(summary.mandatory_hit_rate ?? '-') + '</td><td>' + escapeHtmlText(summary.source_files_hit_count || 0) + '</td></tr></table>';
+          html += '<p style="margin:6px 0">一致性冲突：' + escapeHtmlText(conflicts.conflict_count || 0)
+            + '（高风险 ' + escapeHtmlText(conflicts.high_severity_count || 0) + '）</p>';
+          html += '<details style="margin-top:6px"><summary>按维度命中（Top12）</summary><table><tr><th>维度</th><th>total</th><th>hit</th><th>mandatory</th><th>hit_rate</th></tr>'
+            + (rows.length
+              ? rows.map((r) => '<tr><td>' + escapeHtmlText((r.dimension_id || '') + ' ' + (r.dimension_name || '')) + '</td><td>' + escapeHtmlText(r.total || 0) + '</td><td>' + escapeHtmlText(r.hit || 0) + '</td><td>' + escapeHtmlText((r.mandatory_hit || 0) + '/' + (r.mandatory_total || 0)) + '</td><td>' + escapeHtmlText(r.hit_rate ?? '-') + '</td></tr>').join('')
+              : '<tr><td colspan="5">暂无维度证据数据</td></tr>')
+            + '</table></details>';
+          if (recommendations.length) {
+            html += '<strong>建议动作</strong><ul>' + recommendations.slice(0, 8).map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('') + '</ul>';
+          }
+          html += '<div style="margin-top:8px"><button type="button" class="secondary" id="btnEvidenceTraceDownload">下载 Markdown</button></div>';
+          el.innerHTML = html;
+          const dlBtn = document.getElementById('btnEvidenceTraceDownload');
+          if (dlBtn) {
+            dlBtn.onclick = () => {
+              const sid = String(data.submission_id || '').trim();
+              if (!sid) return;
+              const a = document.createElement('a');
+              a.href = '/api/v1/projects/' + encodeURIComponent(projectId) + '/submissions/' + encodeURIComponent(sid) + '/evidence_trace.md';
+              a.download = 'evidence_trace_' + projectId + '_' + sid + '.md';
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+            };
+          }
+        });
+
         safeClick('btnAdaptive', async () => {
           if (!ensureProjectForAction('adaptiveResult')) return;
           setResultLoading('adaptiveResult', '自适应建议生成中...');
@@ -16940,6 +17800,21 @@ def index(
                 return '<tr><td style="padding:2px 8px;border:1px solid #dbe3ef">' + (c.model_type || '-') + '</td><td style="padding:2px 8px;border:1px solid #dbe3ef">' + gt + '</td><td style="padding:2px 8px;border:1px solid #dbe3ef">' + fmtMetric(c.cv_mae) + '</td><td style="padding:2px 8px;border:1px solid #dbe3ef">' + fmtMetric(c.cv_spearman) + '</td></tr>';
               }).join('');
               html += '<details style="margin:6px 0"><summary>候选模型对比（auto）</summary><table style="border-collapse:collapse;font-size:12px;margin-top:4px"><thead><tr><th style="padding:2px 8px;border:1px solid #dbe3ef">模型</th><th style="padding:2px 8px;border:1px solid #dbe3ef">闸门</th><th style="padding:2px 8px;border:1px solid #dbe3ef">CV MAE</th><th style="padding:2px 8px;border:1px solid #dbe3ef">CV Spearman</th></tr></thead><tbody>' + rows + '</tbody></table></details>';
+            }
+            const govern = (data.patch_auto_govern && typeof data.patch_auto_govern === 'object')
+              ? data.patch_auto_govern
+              : {};
+            if (Object.keys(govern).length) {
+              html += '<details style="margin:6px 0"><summary>补丁自动治理</summary>';
+              html += '<p style="margin:4px 0"><b>状态</b>：'
+                + (govern.checked ? '已检查' : '未检查')
+                + '；动作=' + String(govern.action || '-')
+                + '；原因=' + String(govern.reason || '-')
+                + '；闸门=' + String(govern.gate_passed === true ? '通过' : (govern.gate_passed === false ? '未通过' : '-'))
+                + '</p>';
+              html += '<p style="margin:4px 0"><b>样本</b>：' + String(govern.sample_count || 0)
+                + '；回滚目标=' + String(govern.rollback_to_patch_id || '-') + '</p>';
+              html += '</details>';
             }
           }
           html += '<pre style="margin:0">' + JSON.stringify(payload, null, 2) + '</pre>';

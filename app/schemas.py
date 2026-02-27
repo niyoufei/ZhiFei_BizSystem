@@ -591,6 +591,31 @@ class ReflectionAutoRunResponse(BaseModel):
     patch_id: Optional[str] = None
     patch_gate_passed: Optional[bool] = None
     patch_deployed: bool = False
+    patch_auto_govern: Dict[str, Any] = Field(default_factory=dict)
+
+
+class EvidenceTraceResponse(BaseModel):
+    """单份施组的证据追溯报告"""
+
+    project_id: str
+    submission_id: str
+    filename: Optional[str] = None
+    generated_at: str
+    summary: Dict[str, Any] = Field(default_factory=dict)
+    by_dimension: List[Dict[str, Any]] = Field(default_factory=list)
+    requirement_hits: List[Dict[str, Any]] = Field(default_factory=list)
+    evidence_units: List[Dict[str, Any]] = Field(default_factory=list)
+    material_conflicts: Dict[str, Any] = Field(default_factory=dict)
+    recommendations: List[str] = Field(default_factory=list)
+
+
+class EvidenceTraceMarkdownResponse(BaseModel):
+    """单份施组的证据追溯 Markdown 导出"""
+
+    project_id: str
+    submission_id: str
+    markdown: str
+    generated_at: str
 
 
 class ProjectEvaluationResponse(BaseModel):
