@@ -112,7 +112,7 @@ from app.engine.reflection import (
     mine_patch_package,
 )
 from app.engine.scorer import score_text
-from app.engine.surrogate_learning import calibrate_weights
+from app.engine.surrogate_learning import calibrate_weights, compute_time_decay_weight
 from app.engine.v2_scorer import compute_v2_rule_total, score_text_v2
 from app.i18n import DEFAULT_LOCALE, SUPPORTED_LOCALES, t
 from app.metrics import get_metrics, record_score, update_project_stats
@@ -144,6 +144,7 @@ from app.schemas import (
     ConstraintPack,
     DeltaCaseRecord,
     EvaluationSummaryResponse,
+    EvolutionHealthResponse,
     EvolutionReport,
     ExpertProfileRecord,
     ExpertProfileUpdate,
@@ -3895,6 +3896,199 @@ def _run_feedback_closed_loop(project_id: str, *, locale: str, trigger: str) -> 
     return result
 
 
+def _build_evolution_health_report(
+    project_id: str, project: Dict[str, object]
+) -> Dict[str, object]:
+    """
+    构建项目进化健康度报告：
+    - 统计系统预测分与真实分误差（全量/30天/90天）
+    - 用时间衰减评估样本新鲜度
+    - 给出概念漂移风险等级和建议动作
+    """
+    project_score_scale = _resolve_project_score_scale_max(project)
+    submissions = [s for s in load_submissions() if str(s.get("project_id")) == project_id]
+    submissions_by_id = {str(s.get("id") or ""): s for s in submissions if str(s.get("id") or "")}
+    ground_truth_rows = [r for r in load_ground_truth() if str(r.get("project_id")) == project_id]
+    now_utc = datetime.now(timezone.utc)
+
+    matched_rows: List[Dict[str, object]] = []
+    unmatched_ground_truth = 0
+    for row in ground_truth_rows:
+        if not isinstance(row, dict):
+            continue
+        normalized = _ground_truth_record_for_learning(
+            row,
+            default_score_scale_max=project_score_scale,
+        )
+        final_score = _to_float_or_none(normalized.get("final_score"))
+        if final_score is None:
+            continue
+
+        source_submission_id = str(row.get("source_submission_id") or "").strip()
+        submission = submissions_by_id.get(source_submission_id) if source_submission_id else None
+        if submission is None:
+            gt_text = str(row.get("shigong_text") or "").strip()
+            if gt_text:
+                submission = next(
+                    (s for s in submissions if str(s.get("text") or "").strip() == gt_text),
+                    None,
+                )
+        if submission is None:
+            unmatched_ground_truth += 1
+            continue
+
+        report = submission.get("report") if isinstance(submission.get("report"), dict) else {}
+        pred_score_raw = _to_float_or_none(report.get("pred_total_score"))
+        if pred_score_raw is None:
+            pred_score_raw = _to_float_or_none(report.get("rule_total_score"))
+        if pred_score_raw is None:
+            pred_score_raw = _to_float_or_none(report.get("total_score"))
+        if pred_score_raw is None:
+            pred_score_raw = _to_float_or_none(submission.get("total_score"))
+        if pred_score_raw is None:
+            unmatched_ground_truth += 1
+            continue
+
+        report_scale_max = _normalize_score_scale_max(
+            report.get("score_scale_max"),
+            default=project_score_scale,
+        )
+        pred_score_100 = _convert_score_to_100(pred_score_raw, report_scale_max)
+        if pred_score_100 is None:
+            unmatched_ground_truth += 1
+            continue
+
+        created_at_dt = _parse_iso_datetime_utc(row.get("created_at")) or now_utc
+        age_days = max(0.0, (now_utc - created_at_dt).total_seconds() / 86400.0)
+        abs_error = abs(float(pred_score_100) - float(final_score))
+        matched_rows.append(
+            {
+                "ground_truth_id": str(row.get("id") or ""),
+                "submission_id": str(submission.get("id") or ""),
+                "predicted_score": float(pred_score_100),
+                "actual_score": float(final_score),
+                "abs_error": float(abs_error),
+                "age_days": float(age_days),
+                "time_decay": float(
+                    compute_time_decay_weight(
+                        record_time=created_at_dt,
+                        now=now_utc,
+                        half_life_days=30.0,
+                    )
+                ),
+            }
+        )
+
+    def _window_metrics(
+        rows: List[Dict[str, object]],
+        *,
+        min_age_days: Optional[float] = None,
+        max_age_days: Optional[float] = None,
+    ) -> Dict[str, object]:
+        scoped: List[Dict[str, object]] = []
+        for item in rows:
+            age_days = float(_to_float_or_none(item.get("age_days")) or 0.0)
+            if min_age_days is not None and age_days < float(min_age_days):
+                continue
+            if max_age_days is not None and age_days > float(max_age_days):
+                continue
+            scoped.append(item)
+        count = len(scoped)
+        if count <= 0:
+            return {
+                "count": 0,
+                "mae": None,
+                "rmse": None,
+                "avg_time_decay": None,
+                "max_abs_error": None,
+            }
+        err_sq_sum = 0.0
+        err_abs_sum = 0.0
+        max_abs_error = 0.0
+        decay_sum = 0.0
+        for item in scoped:
+            abs_error = float(_to_float_or_none(item.get("abs_error")) or 0.0)
+            err_abs_sum += abs_error
+            err_sq_sum += abs_error * abs_error
+            max_abs_error = max(max_abs_error, abs_error)
+            decay_sum += float(_to_float_or_none(item.get("time_decay")) or 0.0)
+        return {
+            "count": count,
+            "mae": round(err_abs_sum / float(count), 4),
+            "rmse": round((err_sq_sum / float(count)) ** 0.5, 4),
+            "avg_time_decay": round(decay_sum / float(count), 6),
+            "max_abs_error": round(max_abs_error, 4),
+        }
+
+    metrics_all = _window_metrics(matched_rows)
+    metrics_recent_30 = _window_metrics(matched_rows, max_age_days=30.0)
+    metrics_recent_90 = _window_metrics(matched_rows, max_age_days=90.0)
+    metrics_prev_30_90 = _window_metrics(matched_rows, min_age_days=30.0, max_age_days=90.0)
+
+    recent_mae = _to_float_or_none(metrics_recent_30.get("mae"))
+    prev_mae = _to_float_or_none(metrics_prev_30_90.get("mae"))
+    mae_delta_recent_vs_prev = None
+    drift_level = "insufficient_data"
+    if recent_mae is not None and prev_mae is not None:
+        mae_delta_recent_vs_prev = round(float(recent_mae) - float(prev_mae), 4)
+        if mae_delta_recent_vs_prev >= 2.5:
+            drift_level = "high"
+        elif mae_delta_recent_vs_prev >= 1.0:
+            drift_level = "medium"
+        else:
+            drift_level = "low"
+    elif int(metrics_recent_30.get("count") or 0) >= 3:
+        drift_level = "watch"
+
+    multipliers, profile_snapshot, _ = _resolve_project_scoring_context(project_id)
+    evo = load_evolution_reports().get(project_id) or {}
+    scoring_evolution = evo.get("scoring_evolution") or {}
+    has_evolved_multipliers = bool(
+        isinstance(scoring_evolution, dict)
+        and isinstance(scoring_evolution.get("dimension_multipliers"), dict)
+        and scoring_evolution.get("dimension_multipliers")
+    )
+    recommendations: List[str] = []
+    if len(ground_truth_rows) < 3:
+        recommendations.append("真实评标样本不足，建议至少录入 3 条以上再观察进化稳定性。")
+    if int(metrics_recent_30.get("count") or 0) <= 0:
+        recommendations.append("近30天无真实反馈，建议补录最新项目评分以避免概念漂移。")
+    if drift_level in {"high", "medium"}:
+        recommendations.append("近期误差上升，建议立即执行「学习进化」并触发 V2 一键闭环。")
+    if int(unmatched_ground_truth) > 0:
+        recommendations.append(
+            f"有 {unmatched_ground_truth} 条真实评分未关联到施组预测记录，建议使用“从步骤4施组下拉选择”录入。"
+        )
+    if not has_evolved_multipliers:
+        recommendations.append("尚未形成进化维度权重，建议在录入真实评分后执行一次学习进化。")
+
+    return {
+        "project_id": project_id,
+        "generated_at": _now_iso(),
+        "summary": {
+            "ground_truth_count": len(ground_truth_rows),
+            "matched_prediction_count": len(matched_rows),
+            "unmatched_ground_truth_count": unmatched_ground_truth,
+            "current_weights_source": _infer_weights_source(project_id, profile_snapshot),
+            "current_multiplier_count": len(multipliers or {}),
+            "has_evolved_multipliers": has_evolved_multipliers,
+            "last_evolution_updated_at": str(evo.get("updated_at") or evo.get("created_at") or ""),
+        },
+        "windows": {
+            "all": metrics_all,
+            "recent_30d": metrics_recent_30,
+            "recent_90d": metrics_recent_90,
+            "prev_30_90d": metrics_prev_30_90,
+        },
+        "drift": {
+            "level": drift_level,
+            "mae_delta_recent_vs_prev_30_90": mae_delta_recent_vs_prev,
+            "half_life_days": 30.0,
+        },
+        "recommendations": recommendations[:12],
+    }
+
+
 def _collect_applied_feature_ids_from_report(
     report: Dict[str, object],
     *,
@@ -5922,6 +6116,26 @@ def get_scoring_readiness(
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
     payload = _build_scoring_readiness(project_id, project)
     return ScoringReadinessResponse(**payload)
+
+
+@router.get(
+    "/projects/{project_id}/evolution/health",
+    response_model=EvolutionHealthResponse,
+    tags=["自我学习与进化"],
+    responses={**RESPONSES_404},
+)
+def get_project_evolution_health(
+    project_id: str, locale: str = Depends(get_locale)
+) -> EvolutionHealthResponse:
+    """项目进化健康度：误差趋势、样本时效、概念漂移风险。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    try:
+        project = _find_project(project_id, projects)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    payload = _build_evolution_health_report(project_id, project)
+    return EvolutionHealthResponse(**payload)
 
 
 @router.get(
@@ -12081,6 +12295,7 @@ def index(
             btnRefreshGroundTruth: { resultId: 'evolveResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/ground_truth', loading: '真实评标列表刷新中...' },
             btnRefreshGroundTruthSubmissionOptions: { resultId: 'evolveResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/submissions', loading: '施组选项刷新中...' },
             btnEvolve: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/evolve', loading: '学习进化执行中...' },
+            btnEvolutionHealth: { resultId: 'evolutionHealthResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/evolution/health', loading: '进化健康度分析中...' },
             btnWritingGuidance: { resultId: 'guidanceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/writing_guidance', loading: '正在生成编制指导...' },
             btnCompilationInstructions: { resultId: 'compilationInstructionsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compilation_instructions', loading: '正在生成编制系统指令...' },
             btnScoreShigong: { resultId: 'shigongActionStatus', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/rescore', loading: '施组评分中...' },
@@ -12251,6 +12466,31 @@ def index(
                     + '<td>' + esc((row && row.coverage_level) || '-') + '</td>'
                     + '</tr>').join('')
                   : '<tr><td colspan="5">暂无知识画像数据</td></tr>')
+                + '</table>'
+                + (recs.length
+                  ? '<ul style="margin:6px 0 0 18px;color:#92400e">' + recs.slice(0, 6).map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>'
+                  : '');
+              setResultHtml(cfg.resultId, html);
+              return true;
+            }
+            if (actionId === 'btnEvolutionHealth') {
+              const summary = (data && typeof data.summary === 'object') ? data.summary : {};
+              const drift = (data && typeof data.drift === 'object') ? data.drift : {};
+              const w30 = (data && data.windows && typeof data.windows.recent_30d === 'object') ? data.windows.recent_30d : {};
+              const wall = (data && data.windows && typeof data.windows.all === 'object') ? data.windows.all : {};
+              const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
+              const html = ''
+                + '<strong>进化健康度</strong>'
+                + '<p style="margin:6px 0">漂移等级：'
+                + esc((drift && drift.level) || 'insufficient_data')
+                + '；近30天 MAE=' + esc((w30 && w30.mae) != null ? w30.mae : '-')
+                + '；全量 MAE=' + esc((wall && wall.mae) != null ? wall.mae : '-')
+                + '</p>'
+                + '<table><tr><th>指标</th><th>值</th></tr>'
+                + '<tr><td>真实评分样本</td><td>' + esc((summary && summary.ground_truth_count) || 0) + '</td></tr>'
+                + '<tr><td>已匹配预测</td><td>' + esc((summary && summary.matched_prediction_count) || 0) + '</td></tr>'
+                + '<tr><td>未匹配样本</td><td>' + esc((summary && summary.unmatched_ground_truth_count) || 0) + '</td></tr>'
+                + '<tr><td>当前权重来源</td><td>' + esc((summary && summary.current_weights_source) || '-') + '</td></tr>'
                 + '</table>'
                 + (recs.length
                   ? '<ul style="margin:6px 0 0 18px;color:#92400e">' + recs.slice(0, 6).map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>'
@@ -12530,6 +12770,7 @@ def index(
         </div>
         <div class="action-row" style="margin-bottom:10px">
           <button type="button" id="btnEvolve" onclick="return window.__zhifeiFallbackClick(event, 'btnEvolve')">学习进化（根据已录入真实评标生成高分逻辑与编制指导）</button>
+          <button type="button" id="btnEvolutionHealth" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnEvolutionHealth')">进化健康度</button>
           <button type="button" id="btnWritingGuidance" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnWritingGuidance')">查看编制指导</button>
           <button type="button" id="btnCompilationInstructions" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnCompilationInstructions')">编制系统指令（可导出为编制约束）</button>
         </div>
@@ -12563,6 +12804,7 @@ def index(
           </div>
         </details>
         <div id="evolveResult" class="result-block" style="display:none"></div>
+        <div id="evolutionHealthResult" class="result-block" style="display:none"></div>
         <div id="compilationInstructionsResult" class="result-block" style="display:none"></div>
         <div id="guidanceResult" class="result-block" style="display:none"></div>
         <div id="deltaResult" class="result-block" style="display:none"></div>
@@ -12613,6 +12855,7 @@ def index(
             btnUploadFeed: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/materials', loading: '投喂包上传中...' },
             btnAddGroundTruth: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/ground_truth/from_submission', loading: '真实评标录入中...' },
             btnEvolve: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/evolve', loading: '学习进化执行中...' },
+            btnEvolutionHealth: { resultId: 'evolutionHealthResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/evolution/health', loading: '进化健康度分析中...' },
             btnWritingGuidance: { resultId: 'guidanceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/writing_guidance', loading: '正在生成编制指导...' },
             btnCompilationInstructions: { resultId: 'compilationInstructionsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compilation_instructions', loading: '正在生成编制系统指令...' },
           });
@@ -12810,6 +13053,30 @@ def index(
               const html = '<strong>洞察结果</strong>'
                 + (weak.length ? ('<ul>' + weak.map((d) => '<li>' + fallbackEscapeHtml((d.dimension || d.dimension_id || '') + '：' + (d.avg_score || d.avg || '-')) + '</li>').join('') + '</ul>') : '<p>暂无弱项维度。</p>')
                 + (recs.length ? ('<strong>建议</strong><ul>' + recs.map((r) => '<li>' + fallbackEscapeHtml((r.reason || '') + ' — ' + (r.action || '')) + '</li>').join('') + '</ul>') : '');
+              fallbackSetResultHtml(resultId, html);
+              return true;
+            }
+            if (aid === 'btnEvolutionHealth') {
+              const summary = (data && typeof data.summary === 'object') ? data.summary : {};
+              const drift = (data && typeof data.drift === 'object') ? data.drift : {};
+              const w30 = (data && data.windows && typeof data.windows.recent_30d === 'object') ? data.windows.recent_30d : {};
+              const wall = (data && data.windows && typeof data.windows.all === 'object') ? data.windows.all : {};
+              const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
+              const html = '<strong>进化健康度</strong>'
+                + '<p style="margin:6px 0">漂移等级：'
+                + fallbackEscapeHtml((drift && drift.level) || 'insufficient_data')
+                + '；近30天 MAE=' + fallbackEscapeHtml((w30 && w30.mae) != null ? w30.mae : '-')
+                + '；全量 MAE=' + fallbackEscapeHtml((wall && wall.mae) != null ? wall.mae : '-')
+                + '</p>'
+                + '<table><tr><th>指标</th><th>值</th></tr>'
+                + '<tr><td>真实评分样本</td><td>' + fallbackEscapeHtml((summary && summary.ground_truth_count) || 0) + '</td></tr>'
+                + '<tr><td>已匹配预测</td><td>' + fallbackEscapeHtml((summary && summary.matched_prediction_count) || 0) + '</td></tr>'
+                + '<tr><td>未匹配样本</td><td>' + fallbackEscapeHtml((summary && summary.unmatched_ground_truth_count) || 0) + '</td></tr>'
+                + '<tr><td>当前权重来源</td><td>' + fallbackEscapeHtml((summary && summary.current_weights_source) || '-') + '</td></tr>'
+                + '</table>'
+                + (recs.length
+                  ? '<ul style="margin:6px 0 0 18px;color:#92400e">' + recs.slice(0, 6).map((x) => '<li>' + fallbackEscapeHtml(x) + '</li>').join('') + '</ul>'
+                  : '');
               fallbackSetResultHtml(resultId, html);
               return true;
             }
@@ -13682,19 +13949,19 @@ def index(
         let scoringReadinessState = { project_id: '', ready: false, gate_passed: false, issues: [] };
         const PROJECT_REQUIRED_BUTTON_IDS = [
           'deleteCurrentProject', 'btnWeightsReset', 'btnWeightsSave', 'btnWeightsApply',
-          'btnMaterialDepthReport', 'btnMaterialDepthReportDownload',
+          'btnMaterialDepthReport', 'btnMaterialDepthReportDownload', 'btnMaterialKnowledgeProfile', 'btnMaterialKnowledgeProfileDownload',
           'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
-          'btnEvolve', 'btnWritingGuidance', 'btnCompilationInstructions',
+          'btnEvolve', 'btnEvolutionHealth', 'btnWritingGuidance', 'btnCompilationInstructions',
           'btnRebuildDelta', 'btnRebuildSamples', 'btnTrainCalibratorV2', 'btnApplyCalibPredict',
           'btnAutoRunReflection', 'btnEvalMetricsV2', 'btnEvalSummaryV2',
           'btnMinePatchV2', 'btnShadowPatchV2', 'btnDeployPatchV2', 'btnRollbackPatchV2',
         ];
         const NON_BLOCKING_ACTION_BUTTON_IDS = [
-          'btnUploadMaterials', 'btnUploadBoq', 'btnUploadDrawing', 'btnUploadSitePhotos', 'btnRefreshMaterials', 'btnMaterialDepthReport', 'btnMaterialDepthReportDownload', 'btnUploadShigong', 'btnScoreShigong', 'btnRefreshSubmissions',
+          'btnUploadMaterials', 'btnUploadBoq', 'btnUploadDrawing', 'btnUploadSitePhotos', 'btnRefreshMaterials', 'btnMaterialDepthReport', 'btnMaterialDepthReportDownload', 'btnMaterialKnowledgeProfile', 'btnMaterialKnowledgeProfileDownload', 'btnUploadShigong', 'btnScoreShigong', 'btnRefreshSubmissions',
           'btnCompare', 'btnCompareReport', 'btnInsights', 'btnLearning',
           'btnAdaptive', 'btnAdaptivePatch', 'btnAdaptiveValidate', 'btnAdaptiveApply',
           'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
-          'btnEvolve', 'btnWritingGuidance', 'btnCompilationInstructions',
+          'btnEvolve', 'btnEvolutionHealth', 'btnWritingGuidance', 'btnCompilationInstructions',
           'btnRebuildDelta', 'btnRebuildSamples', 'btnTrainCalibratorV2', 'btnApplyCalibPredict',
           'btnAutoRunReflection', 'btnEvalMetricsV2', 'btnEvalSummaryV2',
           'btnMinePatchV2', 'btnShadowPatchV2', 'btnDeployPatchV2', 'btnRollbackPatchV2',
@@ -15309,6 +15576,43 @@ def index(
           a.remove();
           setResultSuccess('materialDepthReportResult', '资料深读体检报告下载已触发。');
         });
+        safeClick('btnMaterialKnowledgeProfile', async () => {
+          if (!ensureProjectForAction('materialKnowledgeProfileResult')) return;
+          const id = pid();
+          setResultLoading('materialKnowledgeProfileResult', '资料知识画像生成中...');
+          let res;
+          let data = {};
+          try {
+            res = await fetch('/api/v1/projects/' + encodeURIComponent(id) + '/materials/knowledge_profile', {
+              method: 'GET',
+              headers: apiHeaders(false),
+            });
+            data = await res.json().catch(() => ({}));
+          } catch (err) {
+            setResultError('materialKnowledgeProfileResult', '画像生成失败：' + String((err && err.message) || err || '网络异常'));
+            return;
+          }
+          if (!res.ok) {
+            const detail = (data && data.detail) ? String(data.detail) : ('HTTP ' + String(res.status || 0));
+            setResultError('materialKnowledgeProfileResult', '画像生成失败：' + detail);
+            return;
+          }
+          renderMaterialKnowledgeProfilePanel(data);
+          const out = document.getElementById('output');
+          if (out) out.textContent = JSON.stringify(data, null, 2);
+        });
+        safeClick('btnMaterialKnowledgeProfileDownload', async () => {
+          if (!ensureProjectForAction('materialKnowledgeProfileResult')) return;
+          const id = pid();
+          const url = '/api/v1/projects/' + encodeURIComponent(id) + '/materials/knowledge_profile.md';
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'material_knowledge_profile_' + id + '.md';
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          setResultSuccess('materialKnowledgeProfileResult', '资料知识画像报告下载已触发。');
+        });
 
         async function refreshFeedMaterials(expectedProjectId=null, switchSeq=null) {
           const id = expectedProjectId || pid();
@@ -15543,6 +15847,87 @@ def index(
           if (recs.length) {
             html += '<ul style="margin:6px 0 0 18px;color:#92400e">'
               + recs.slice(0, 10).map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('')
+              + '</ul>';
+          }
+          el.style.display = 'block';
+          el.innerHTML = html;
+        }
+        function renderMaterialKnowledgeProfilePanel(payload) {
+          const el = document.getElementById('materialKnowledgeProfileResult');
+          if (!el) return;
+          const data = (payload && typeof payload === 'object') ? payload : {};
+          const summary = (data.summary && typeof data.summary === 'object') ? data.summary : {};
+          const byDimension = Array.isArray(data.by_dimension) ? data.by_dimension : [];
+          const byType = Array.isArray(data.by_type) ? data.by_type : [];
+          const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
+          const topDims = byDimension
+            .slice()
+            .sort((a, b) => Number((b && b.coverage_score) || 0) - Number((a && a.coverage_score) || 0))
+            .slice(0, 8);
+          let html = '<strong>资料知识画像（按维度覆盖）</strong>';
+          html += '<p style="margin:6px 0">维度覆盖率 '
+            + escapeHtmlText(((Number(summary.dimension_coverage_rate || 0) * 100).toFixed(1)) + '%')
+            + '；低覆盖维度 ' + escapeHtmlText(summary.low_coverage_dimensions || 0)
+            + '；解析字数 ' + escapeHtmlText(summary.total_parsed_chars || 0)
+            + '</p>';
+          html += '<table><tr><th>维度</th><th>关键词命中</th><th>来源类型数</th><th>覆盖评分</th><th>等级</th></tr>';
+          html += topDims.length
+            ? topDims.map((row) => '<tr>'
+              + '<td>' + escapeHtmlText((row && row.dimension_id) || '-') + ' ' + escapeHtmlText((row && row.dimension_name) || '') + '</td>'
+              + '<td>' + escapeHtmlText((row && row.keyword_hits) || 0) + '</td>'
+              + '<td>' + escapeHtmlText(((row && row.source_types) || []).length) + '</td>'
+              + '<td>' + escapeHtmlText((row && row.coverage_score) || 0) + '</td>'
+              + '<td>' + escapeHtmlText((row && row.coverage_level) || '-') + '</td>'
+              + '</tr>').join('')
+            : '<tr><td colspan="5">暂无维度覆盖数据</td></tr>';
+          html += '</table>';
+          html += '<table style="margin-top:8px"><tr><th>资料类型</th><th>文件数</th><th>字数</th><th>分块</th><th>词项数</th></tr>';
+          html += byType.length
+            ? byType.slice(0, 6).map((row) => '<tr>'
+              + '<td>' + escapeHtmlText((row && row.material_type_label) || (row && row.material_type) || '-') + '</td>'
+              + '<td>' + escapeHtmlText((row && row.files) || 0) + '</td>'
+              + '<td>' + escapeHtmlText((row && row.parsed_chars) || 0) + '</td>'
+              + '<td>' + escapeHtmlText((row && row.parsed_chunks) || 0) + '</td>'
+              + '<td>' + escapeHtmlText((row && row.unique_terms) || 0) + '</td>'
+              + '</tr>').join('')
+            : '<tr><td colspan="5">暂无资料类型画像</td></tr>';
+          html += '</table>';
+          if (recs.length) {
+            html += '<ul style="margin:6px 0 0 18px;color:#92400e">'
+              + recs.slice(0, 8).map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('')
+              + '</ul>';
+          }
+          el.style.display = 'block';
+          el.innerHTML = html;
+        }
+        function renderEvolutionHealthPanel(payload) {
+          const el = document.getElementById('evolutionHealthResult');
+          if (!el) return;
+          const data = (payload && typeof payload === 'object') ? payload : {};
+          const summary = (data.summary && typeof data.summary === 'object') ? data.summary : {};
+          const windows = (data.windows && typeof data.windows === 'object') ? data.windows : {};
+          const wAll = (windows.all && typeof windows.all === 'object') ? windows.all : {};
+          const w30 = (windows.recent_30d && typeof windows.recent_30d === 'object') ? windows.recent_30d : {};
+          const w90 = (windows.recent_90d && typeof windows.recent_90d === 'object') ? windows.recent_90d : {};
+          const drift = (data.drift && typeof data.drift === 'object') ? data.drift : {};
+          const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
+          let html = '<strong>进化健康度（误差趋势 / 漂移）</strong>';
+          html += '<p style="margin:6px 0">漂移等级：'
+            + escapeHtmlText(drift.level || 'insufficient_data')
+            + '；近30天 MAE=' + escapeHtmlText((w30.mae != null) ? w30.mae : '-')
+            + '；近90天 MAE=' + escapeHtmlText((w90.mae != null) ? w90.mae : '-')
+            + '；全量 MAE=' + escapeHtmlText((wAll.mae != null) ? wAll.mae : '-')
+            + '</p>';
+          html += '<table><tr><th>指标</th><th>值</th></tr>';
+          html += '<tr><td>真实评分样本</td><td>' + escapeHtmlText(summary.ground_truth_count || 0) + '</td></tr>';
+          html += '<tr><td>已匹配预测</td><td>' + escapeHtmlText(summary.matched_prediction_count || 0) + '</td></tr>';
+          html += '<tr><td>未匹配样本</td><td>' + escapeHtmlText(summary.unmatched_ground_truth_count || 0) + '</td></tr>';
+          html += '<tr><td>当前权重来源</td><td>' + escapeHtmlText(summary.current_weights_source || '-') + '</td></tr>';
+          html += '<tr><td>进化权重状态</td><td>' + (summary.has_evolved_multipliers ? '<span class="success">已生效</span>' : '<span class="error">未生效</span>') + '</td></tr>';
+          html += '</table>';
+          if (recs.length) {
+            html += '<ul style="margin:6px 0 0 18px;color:#92400e">'
+              + recs.slice(0, 8).map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('')
               + '</ul>';
           }
           el.style.display = 'block';
@@ -16426,6 +16811,30 @@ def index(
             html += '<p style="font-size:12px;margin-top:8px">点击「编制系统指令」可查看/导出编制约束（必备章节、图表、禁止表述等）。</p>';
             el.innerHTML = html;
           } else { el.innerHTML = '<span class="error">' + (data.detail || '请求失败，若需认证请设置 API Key') + '</span>'; }
+        });
+        safeClick('btnEvolutionHealth', async () => {
+          if (!ensureProjectForAction('evolutionHealthResult')) return;
+          const projectId = actionProjectId();
+          setResultLoading('evolutionHealthResult', '进化健康度分析中...');
+          let res;
+          let data = {};
+          try {
+            res = await fetch('/api/v1/projects/' + encodeURIComponent(projectId) + '/evolution/health', {
+              method: 'GET',
+              headers: apiHeaders(false),
+            });
+            data = await res.json().catch(() => ({}));
+          } catch (err) {
+            setResultError('evolutionHealthResult', '分析失败：' + String((err && err.message) || err || '网络异常'));
+            return;
+          }
+          showJson('output', formatApiOutput(res, data));
+          if (!res.ok) {
+            const detail = (data && data.detail) ? String(data.detail) : ('HTTP ' + String(res.status || 0));
+            setResultError('evolutionHealthResult', '分析失败：' + detail);
+            return;
+          }
+          renderEvolutionHealthPanel(data);
         });
         safeClick('btnWritingGuidance', async () => {
           if (!ensureProjectForAction('guidanceResult')) return;

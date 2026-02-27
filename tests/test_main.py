@@ -57,6 +57,7 @@ class TestIndexEndpoint:
         assert 'name="score_scale_max"' in response.text
         assert 'id="btnMaterialKnowledgeProfile"' in response.text
         assert 'id="btnMaterialKnowledgeProfileDownload"' in response.text
+        assert 'id="btnEvolutionHealth"' in response.text
         assert 'id="groundTruthSubmissionSelect"' in response.text
         assert 'id="groundTruthFile"' not in response.text
         assert "/ground_truth/from_submission" in response.text
@@ -1313,6 +1314,98 @@ class TestMaterialsEndpoint:
         assert any("资料深读预警" in w for w in data["warnings"])
         assert data["material_depth_gate"]["enforce"] is False
         assert data["material_depth_gate"]["passed"] is False
+
+    @patch("app.main._build_evolution_health_report")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_project_evolution_health_success(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_build_health,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_build_health.return_value = {
+            "project_id": "p1",
+            "generated_at": "2026-02-27T00:00:00+00:00",
+            "summary": {
+                "ground_truth_count": 4,
+                "matched_prediction_count": 4,
+                "unmatched_ground_truth_count": 0,
+                "current_weights_source": "evolution",
+                "has_evolved_multipliers": True,
+            },
+            "windows": {
+                "all": {"count": 4, "mae": 2.1, "rmse": 2.8},
+                "recent_30d": {"count": 3, "mae": 1.9, "rmse": 2.4},
+                "recent_90d": {"count": 4, "mae": 2.1, "rmse": 2.8},
+                "prev_30_90d": {"count": 1, "mae": 2.7, "rmse": 2.7},
+            },
+            "drift": {"level": "low", "half_life_days": 30.0},
+            "recommendations": ["继续录入最新真实评分以保持时效。"],
+        }
+
+        response = client.get("/api/v1/projects/p1/evolution/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["summary"]["ground_truth_count"] == 4
+        assert data["drift"]["level"] == "low"
+
+    @patch("app.main._resolve_project_scoring_context")
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_submissions")
+    def test_build_evolution_health_report_computes_error_windows(
+        self,
+        mock_load_submissions,
+        mock_load_ground_truth,
+        mock_load_evo_reports,
+        mock_resolve_scoring_context,
+    ):
+        from app.main import _build_evolution_health_report
+
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "report": {"pred_total_score": 70.0, "score_scale_max": 100},
+            }
+        ]
+        mock_load_ground_truth.return_value = [
+            {
+                "id": "gt1",
+                "project_id": "p1",
+                "source_submission_id": "s1",
+                "judge_scores": [75, 76, 77, 78, 79],
+                "final_score": 78.0,
+                "score_scale_max": 100,
+                "created_at": "2026-02-26T00:00:00+00:00",
+            }
+        ]
+        mock_load_evo_reports.return_value = {
+            "p1": {
+                "updated_at": "2026-02-26T08:00:00+00:00",
+                "scoring_evolution": {"dimension_multipliers": {"01": 1.1}},
+            }
+        }
+        mock_resolve_scoring_context.return_value = (
+            {"01": 1.1, "02": 0.9},
+            None,
+            {"id": "p1", "meta": {"score_scale_max": 100}},
+        )
+
+        payload = _build_evolution_health_report(
+            "p1",
+            {"id": "p1", "meta": {"score_scale_max": 100}},
+        )
+        assert payload["project_id"] == "p1"
+        assert payload["summary"]["ground_truth_count"] == 1
+        assert payload["summary"]["matched_prediction_count"] == 1
+        assert payload["windows"]["all"]["mae"] == pytest.approx(8.0, abs=1e-4)
+        assert payload["windows"]["all"]["count"] == 1
+        assert payload["drift"]["level"] in {"insufficient_data", "watch", "low", "medium", "high"}
 
     @patch("app.main._resolve_dwg_converter_binaries", return_value=[])
     @patch("app.main.load_materials")

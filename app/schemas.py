@@ -330,6 +330,17 @@ class ScoringReadinessResponse(BaseModel):
     generated_at: str
 
 
+class EvolutionHealthResponse(BaseModel):
+    """项目进化健康度报告（误差趋势 / 漂移 / 样本时效）"""
+
+    project_id: str
+    generated_at: str
+    summary: Dict[str, Any] = Field(default_factory=dict)
+    windows: Dict[str, Any] = Field(default_factory=dict)
+    drift: Dict[str, Any] = Field(default_factory=dict)
+    recommendations: List[str] = Field(default_factory=list)
+
+
 class QingTianResultCreate(BaseModel):
     qingtian_model_version: Optional[str] = Field(None, description="青天模型版本")
     qt_total_score: float = Field(..., description="青天总分(0..100)")
