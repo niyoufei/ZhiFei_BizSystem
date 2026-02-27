@@ -13588,6 +13588,38 @@ def index(
           if (strong) strong.textContent = summary || '';
           if (pre) pre.textContent = details || '';
         }
+        function renderSelfCheckPanel(data) {
+          const el = document.getElementById('selfCheckResult');
+          if (!el) return;
+          const payload = (data && typeof data === 'object') ? data : {};
+          const items = Array.isArray(payload.items) ? payload.items : [];
+          const failed = items.filter((x) => !x || !x.ok).length;
+          const summary = failed === 0
+            ? '系统自检通过（全部正常）'
+            : ('系统自检完成：发现 ' + failed + ' 项异常');
+          el.style.display = 'block';
+          el.style.borderLeftColor = failed === 0 ? '#15803d' : '#b91c1c';
+          const capabilityNames = ['parser_pdf', 'parser_docx', 'parser_ocr', 'parser_dwg_converter'];
+          const capabilityRows = items.filter((x) => capabilityNames.includes(String((x && x.name) || '')));
+          const capabilitySummary = capabilityRows.length
+            ? capabilityRows.map((x) => (x && x.ok ? '✓' : '×') + String((x && x.name) || '')).join(' / ')
+            : '无';
+          let html = '<strong>' + escapeHtmlText(summary) + '</strong>';
+          html += '<p style="margin:6px 0 0 0;font-size:12px;color:#475569">解析能力：' + escapeHtmlText(capabilitySummary) + '</p>';
+          html += '<table style="margin-top:8px"><tr><th>检查项</th><th>状态</th><th>详情</th></tr>';
+          html += items.length
+            ? items.map((x) => {
+              const ok = !!(x && x.ok);
+              return '<tr>'
+                + '<td>' + escapeHtmlText(String((x && x.name) || '-')) + '</td>'
+                + '<td>' + (ok ? '<span class="success">OK</span>' : '<span class="error">FAIL</span>') + '</td>'
+                + '<td>' + escapeHtmlText(String((x && x.detail) || '-')) + '</td>'
+                + '</tr>';
+            }).join('')
+            : '<tr><td colspan="3">无自检数据</td></tr>';
+          html += '</table>';
+          el.innerHTML = html;
+        }
         function setScoringFactorsResult(summary, details, isError) {
           const el = document.getElementById('scoringFactorsResult');
           if (!el) return;
@@ -13631,12 +13663,7 @@ def index(
             return;
           }
           const data = r.data || {};
-          const items = data.items || [];
-          const failed = items.filter(x => !x.ok).length;
-          const lines = items.map(x => (x.ok ? '[ OK ] ' : '[FAIL] ') + x.name + (x.detail ? (' -> ' + x.detail) : ''));
-          const summary = failed === 0 ? '系统自检通过（全部正常）' : ('系统自检完成：发现 ' + failed + ' 项异常');
-          const details = lines.join(NL);
-          setSelfCheckResult(summary, details, failed > 0);
+          renderSelfCheckPanel(data);
           const out = document.getElementById('output');
           if (out) out.textContent = JSON.stringify(data, null, 2);
         }
