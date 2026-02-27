@@ -1312,6 +1312,120 @@ class TestMaterialsEndpoint:
         assert data["material_depth_gate"]["enforce"] is False
         assert data["material_depth_gate"]["passed"] is False
 
+    @patch("app.main._resolve_dwg_converter_binaries", return_value=[])
+    @patch("app.main.load_materials")
+    @patch("app.main._build_scoring_readiness")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.pytesseract", None)
+    @patch("app.main.Image", None)
+    def test_get_material_depth_report_includes_capability_warnings(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_build_readiness,
+        mock_load_materials,
+        mock_resolve_dwg_bins,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_build_readiness.return_value = {
+            "project_id": "p1",
+            "ready": False,
+            "material_quality": {
+                "total_files": 2,
+                "parsed_ok_files": 2,
+                "parsed_failed_files": 0,
+                "total_parsed_chars": 5000,
+                "total_parsed_chunks": 8,
+                "total_numeric_terms": 6,
+                "parse_fail_ratio": 0.0,
+                "counts_by_type": {"drawing": 1, "site_photo": 1},
+                "chars_by_type": {"drawing": 4000, "site_photo": 1000},
+                "chunks_by_type": {"drawing": 6, "site_photo": 2},
+                "numeric_terms_by_type": {"drawing": 5, "site_photo": 1},
+                "parsed_ok_by_type": {"drawing": 1, "site_photo": 1},
+                "parsed_fail_by_type": {"drawing": 0, "site_photo": 0},
+                "parsed_fail_details": [],
+            },
+            "material_gate": {"required_types": ["drawing", "site_photo"], "passed": True},
+            "material_depth_gate": {"passed": True},
+            "issues": [],
+            "warnings": [],
+        }
+        mock_load_materials.return_value = [
+            {
+                "project_id": "p1",
+                "material_type": "drawing",
+                "filename": "总图.dwg",
+            },
+            {
+                "project_id": "p1",
+                "material_type": "site_photo",
+                "filename": "现场照片1.jpg",
+            },
+        ]
+
+        response = client.get("/api/v1/projects/p1/materials/depth_report")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["capabilities"]["ocr_available"] is False
+        assert data["capabilities"]["dwg_converter_available"] is False
+        assert data["capabilities"]["dwg_file_count"] == 1
+        assert data["capabilities"]["site_photo_file_count"] == 1
+        rec_text = " ".join(data.get("recommendations") or [])
+        assert "OCR" in rec_text
+        assert "DWG" in rec_text
+
+    @patch("app.main._resolve_dwg_converter_binaries", return_value=["/usr/local/bin/dwg2dxf"])
+    @patch("app.main.load_materials")
+    @patch("app.main._build_scoring_readiness")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_material_depth_report_markdown_contains_capability_section(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_build_readiness,
+        mock_load_materials,
+        mock_resolve_dwg_bins,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_build_readiness.return_value = {
+            "project_id": "p1",
+            "ready": True,
+            "material_quality": {
+                "total_files": 1,
+                "parsed_ok_files": 1,
+                "parsed_failed_files": 0,
+                "total_parsed_chars": 3000,
+                "total_parsed_chunks": 5,
+                "total_numeric_terms": 3,
+                "parse_fail_ratio": 0.0,
+                "counts_by_type": {"drawing": 1},
+                "chars_by_type": {"drawing": 3000},
+                "chunks_by_type": {"drawing": 5},
+                "numeric_terms_by_type": {"drawing": 3},
+                "parsed_ok_by_type": {"drawing": 1},
+                "parsed_fail_by_type": {"drawing": 0},
+                "parsed_fail_details": [],
+            },
+            "material_gate": {"required_types": ["drawing"], "passed": True},
+            "material_depth_gate": {"passed": True},
+            "issues": [],
+            "warnings": [],
+        }
+        mock_load_materials.return_value = [
+            {"project_id": "p1", "material_type": "drawing", "filename": "总图.dwg"}
+        ]
+
+        response = client.get("/api/v1/projects/p1/materials/depth_report/markdown")
+        assert response.status_code == 200
+        markdown = response.json()["markdown"]
+        assert "## 解析能力" in markdown
+        assert "DWG 转换器可用" in markdown
+
     @patch("app.main.save_materials")
     @patch("app.main.load_materials")
     @patch("app.main.load_projects")

@@ -445,6 +445,7 @@ class MaterialDepthReportResponse(BaseModel):
     project_id: str
     generated_at: str
     ready_to_score: bool
+    capabilities: Dict[str, Any] = Field(default_factory=dict)
     gate: Dict[str, Any] = Field(default_factory=dict)
     depth_gate: Dict[str, Any] = Field(default_factory=dict)
     quality_summary: Dict[str, Any] = Field(default_factory=dict)

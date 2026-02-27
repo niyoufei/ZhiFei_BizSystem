@@ -7715,6 +7715,44 @@ def _build_material_depth_report(project_id: str, project: Dict[str, object]) ->
         if tip not in recommendations:
             recommendations.append(tip)
 
+    material_rows = [m for m in load_materials() if str(m.get("project_id")) == project_id]
+    dwg_files = 0
+    site_photo_files = 0
+    for row in material_rows:
+        filename = str(row.get("filename") or "").strip()
+        ext = Path(filename).suffix.lower()
+        material_type = _normalize_material_type(row.get("material_type"), filename=filename)
+        if ext == ".dwg" or (material_type == "drawing" and ext == ".dwg"):
+            dwg_files += 1
+        if material_type == "site_photo" and ext in {
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".webp",
+            ".bmp",
+            ".tif",
+            ".tiff",
+        }:
+            site_photo_files += 1
+    ocr_available = bool(pytesseract is not None and Image is not None)
+    dwg_converter_bins = _resolve_dwg_converter_binaries()
+    dwg_converter_available = bool(dwg_converter_bins)
+    capabilities = {
+        "ocr_available": ocr_available,
+        "dwg_converter_available": dwg_converter_available,
+        "dwg_converter_bins": [Path(p).name for p in dwg_converter_bins][:8],
+        "dwg_file_count": dwg_files,
+        "site_photo_file_count": site_photo_files,
+    }
+    if site_photo_files > 0 and not ocr_available:
+        tip = "已上传现场照片，但当前环境未启用 OCR（pytesseract/PIL），建议安装后重评分以提升图片信息利用率。"
+        if tip not in recommendations:
+            recommendations.append(tip)
+    if dwg_files > 0 and not dwg_converter_available:
+        tip = "已上传 DWG 图纸，但未检测到 DWG 转换器（如 dwg2dxf/ODAFileConverter），建议安装后重评分以提升图纸解析深度。"
+        if tip not in recommendations:
+            recommendations.append(tip)
+
     quality_summary = {
         "total_files": int(_to_float_or_none(quality.get("total_files")) or 0),
         "parsed_ok_files": int(_to_float_or_none(quality.get("parsed_ok_files")) or 0),
@@ -7729,6 +7767,7 @@ def _build_material_depth_report(project_id: str, project: Dict[str, object]) ->
         "project_id": project_id,
         "generated_at": _now_iso(),
         "ready_to_score": bool(readiness.get("ready")),
+        "capabilities": capabilities,
         "gate": gate,
         "depth_gate": depth_gate,
         "quality_summary": quality_summary,
@@ -7741,6 +7780,9 @@ def _render_material_depth_report_markdown(payload: Dict[str, object]) -> str:
     by_type = payload.get("by_type") if isinstance(payload.get("by_type"), list) else []
     quality_summary = (
         payload.get("quality_summary") if isinstance(payload.get("quality_summary"), dict) else {}
+    )
+    capabilities = (
+        payload.get("capabilities") if isinstance(payload.get("capabilities"), dict) else {}
     )
     gate = payload.get("gate") if isinstance(payload.get("gate"), dict) else {}
     depth_gate = payload.get("depth_gate") if isinstance(payload.get("depth_gate"), dict) else {}
@@ -7763,6 +7805,12 @@ def _render_material_depth_report_markdown(payload: Dict[str, object]) -> str:
         f"- 解析分块：`{quality_summary.get('total_parsed_chunks', 0)}`",
         f"- 数字约束项：`{quality_summary.get('total_numeric_terms', 0)}`",
         f"- 失败率：`{quality_summary.get('parse_fail_ratio', 0.0):.2%}`",
+        "",
+        "## 解析能力",
+        "",
+        f"- OCR 可用：`{bool(capabilities.get('ocr_available'))}`（现场照片文件数：`{capabilities.get('site_photo_file_count', 0)}`）",
+        f"- DWG 转换器可用：`{bool(capabilities.get('dwg_converter_available'))}`（DWG 文件数：`{capabilities.get('dwg_file_count', 0)}`）",
+        f"- 已检测转换器：`{', '.join(str(x) for x in (capabilities.get('dwg_converter_bins') or [])) or '-'}`",
         "",
         "## 门禁状态",
         "",
@@ -14948,6 +14996,9 @@ def index(
           const quality = (data.quality_summary && typeof data.quality_summary === 'object')
             ? data.quality_summary
             : {};
+          const capabilities = (data.capabilities && typeof data.capabilities === 'object')
+            ? data.capabilities
+            : {};
           const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
           const ready = !!data.ready_to_score;
           let html = '<strong>资料深读体检（评分前）</strong>';
@@ -14956,6 +15007,13 @@ def index(
             + '；解析分块 ' + escapeHtmlText(quality.total_parsed_chunks || 0)
             + '；数字约束项 ' + escapeHtmlText(quality.total_numeric_terms || 0)
             + '；解析失败率 ' + escapeHtmlText(((Number(quality.parse_fail_ratio || 0) * 100).toFixed(1)) + '%')
+            + '</p>';
+          html += '<p style="margin:4px 0 8px 0;font-size:12px;color:#334155">解析能力：OCR '
+            + (capabilities.ocr_available ? '<span class="success">可用</span>' : '<span class="error">不可用</span>')
+            + '（现场照片 ' + escapeHtmlText(capabilities.site_photo_file_count || 0) + '）'
+            + '；DWG转换器 '
+            + (capabilities.dwg_converter_available ? '<span class="success">可用</span>' : '<span class="error">不可用</span>')
+            + '（DWG ' + escapeHtmlText(capabilities.dwg_file_count || 0) + '）'
             + '</p>';
           html += '<table><tr><th>资料类型</th><th>文件数</th><th>成功/失败</th><th>字数</th><th>分块</th><th>数字约束</th><th>目标(字数/分块/数字)</th></tr>';
           html += byType.length
