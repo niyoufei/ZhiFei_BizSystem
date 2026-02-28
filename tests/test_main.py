@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -4519,3 +4520,130 @@ class TestEvolutionTotalScale:
         hash_value = _compute_multipliers_hash({})
         assert hash_value is not None
         assert len(hash_value) == 16  # 截断为 16 字符
+
+
+class TestScoringContextEvolutionGuard:
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.load_expert_profiles")
+    @patch("app.main.load_projects")
+    def test_resolve_project_scoring_context_skips_stale_evolution_weights(
+        self,
+        mock_load_projects,
+        mock_load_profiles,
+        mock_load_evolution,
+    ):
+        from app.main import _resolve_project_scoring_context
+
+        stale_at = (datetime.now(timezone.utc) - timedelta(days=120)).isoformat()
+        mock_load_projects.return_value = [
+            {
+                "id": "p1",
+                "meta": {
+                    "evolution_weight_min_samples": 3,
+                    "evolution_weight_max_age_days": 90,
+                },
+                "expert_profile_id": "ep1",
+            }
+        ]
+        mock_load_profiles.return_value = [
+            {
+                "id": "ep1",
+                "weights_norm": {"01": 0.9, "02": 0.1},
+            }
+        ]
+        mock_load_evolution.return_value = {
+            "p1": {
+                "sample_count": 20,
+                "updated_at": stale_at,
+                "scoring_evolution": {"dimension_multipliers": {"01": 9.99}},
+            }
+        }
+
+        multipliers, profile_snapshot, project = _resolve_project_scoring_context("p1")
+        assert project.get("id") == "p1"
+        assert isinstance(multipliers, dict)
+        assert multipliers.get("01") != 9.99
+        assert profile_snapshot is not None
+        assert profile_snapshot.get("id") == "ep1"
+
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.load_expert_profiles")
+    @patch("app.main.load_projects")
+    def test_resolve_project_scoring_context_uses_fresh_evolution_weights(
+        self,
+        mock_load_projects,
+        mock_load_profiles,
+        mock_load_evolution,
+    ):
+        from app.main import _resolve_project_scoring_context
+
+        fresh_at = datetime.now(timezone.utc).isoformat()
+        mock_load_projects.return_value = [
+            {
+                "id": "p1",
+                "meta": {
+                    "evolution_weight_min_samples": 3,
+                    "evolution_weight_max_age_days": 90,
+                },
+                "expert_profile_id": "ep1",
+            }
+        ]
+        mock_load_profiles.return_value = [
+            {
+                "id": "ep1",
+                "weights_norm": {"01": 0.5, "02": 0.5},
+            }
+        ]
+        mock_load_evolution.return_value = {
+            "p1": {
+                "sample_count": 3,
+                "updated_at": fresh_at,
+                "scoring_evolution": {"dimension_multipliers": {"01": 1.3}},
+            }
+        }
+
+        multipliers, profile_snapshot, _ = _resolve_project_scoring_context("p1")
+        assert profile_snapshot is None
+        assert multipliers.get("01") == pytest.approx(1.3, abs=1e-6)
+
+
+class TestFeedbackClosedLoopSafety:
+    @patch("app.main._run_feedback_closed_loop")
+    def test_run_feedback_closed_loop_safe_coerces_non_dict(self, mock_run):
+        from app.main import _run_feedback_closed_loop_safe
+
+        mock_run.return_value = MagicMock(ok=True)
+        payload = _run_feedback_closed_loop_safe("p1", locale="zh", trigger="rescore")
+        assert isinstance(payload, dict)
+        assert payload.get("project_id") == "p1"
+        assert payload.get("trigger") == "rescore"
+
+
+class TestDynamicBlendAdjustment:
+    def test_resolve_dynamic_blend_adjustment_no_signal_keeps_weights(self):
+        from app.main import _resolve_dynamic_blend_adjustment
+
+        scale, delta_scale, meta = _resolve_dynamic_blend_adjustment({"meta": {}})
+        assert scale == pytest.approx(1.0, abs=1e-6)
+        assert delta_scale == pytest.approx(1.0, abs=1e-6)
+        assert meta.get("signal_state") == "no_material_signal"
+        assert meta.get("reasons") == []
+
+    def test_resolve_dynamic_blend_adjustment_low_coverage_downweights_llm(self):
+        from app.main import _resolve_dynamic_blend_adjustment
+
+        report = {
+            "meta": {
+                "material_utilization": {
+                    "retrieval_file_coverage_rate": 0.2,
+                    "retrieval_hit_rate": 0.1,
+                },
+                "material_utilization_gate": {"warned": True},
+                "evidence_trace": {"mandatory_hit_rate": 0.2, "source_files_hit_count": 0},
+            }
+        }
+        scale, delta_scale, meta = _resolve_dynamic_blend_adjustment(report)
+        assert 0.0 < scale < 1.0
+        assert 0.0 < delta_scale <= 1.0
+        assert meta.get("signal_state") == "material_signal_detected"
+        assert any("material_gate_warned" == reason for reason in (meta.get("reasons") or []))

@@ -6,6 +6,7 @@ import hashlib
 import html as html_lib
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -242,6 +243,8 @@ from app.storage import (
     save_submissions,
 )
 
+logger = logging.getLogger(__name__)
+
 # OpenAPI 标签定义
 OPENAPI_TAGS = [
     {
@@ -295,6 +298,7 @@ DEFAULT_RULE_SCORE_WEIGHT = 0.7
 DEFAULT_LLM_SCORE_WEIGHT = 0.3
 DEFAULT_LLM_DELTA_CAP = 35.0
 DEFAULT_SCORE_SCALE_MAX = 100
+DEFAULT_ENFORCE_GB_REDLINE = False
 DEFAULT_NORM_RULE_VERSION = "v1_m=0.5+a/10_norm=sum"
 DEFAULT_ENFORCE_MATERIAL_GATE = True
 DEFAULT_REQUIRED_MATERIAL_TYPES = ["tender_qa", "boq", "drawing"]
@@ -338,6 +342,9 @@ DEFAULT_MIN_UPLOADED_TYPE_COVERAGE_RATE = 1.0
 DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR = 200
 DEFAULT_PDF_OCR_MAX_PAGES = 30
 DEFAULT_MATERIAL_INDEX_CACHE_SIZE = 12
+DEFAULT_CALIBRATION_MIN_SAMPLES = 20
+DEFAULT_CALIBRATION_FRESHNESS_DAYS = 90
+DEFAULT_CALIBRATION_MIN_RECENT_RATIO = 0.6
 PROFILE_LOCKED_STATUSES = {"submitted_to_qingtian"}
 DEFAULT_CHAPTER_REQUIREMENTS = {
     "required_sections": [
@@ -685,20 +692,56 @@ def _ensure_project_v2_fields(
         project["meta"] = {}
         meta = project["meta"]
         changed = True
+    strict_mode = bool(meta.get("strict_material_mode", True))
+
+    def _set_min_rate(key: str, value: float) -> None:
+        nonlocal changed
+        current = _to_float_or_none(meta.get(key))
+        if current is None or float(current) < float(value):
+            meta[key] = float(value)
+            changed = True
+
+    def _set_min_int(key: str, value: int) -> None:
+        nonlocal changed
+        current = _to_float_or_none(meta.get(key))
+        if current is None or int(round(float(current))) < int(value):
+            meta[key] = int(value)
+            changed = True
+
     if "score_scale_max" not in meta:
         meta["score_scale_max"] = DEFAULT_SCORE_SCALE_MAX
+        changed = True
+    if "enforce_gb_redline" not in meta:
+        meta["enforce_gb_redline"] = bool(DEFAULT_ENFORCE_GB_REDLINE)
         changed = True
     if "enforce_material_gate" not in meta:
         meta["enforce_material_gate"] = DEFAULT_ENFORCE_MATERIAL_GATE
         changed = True
-    if "required_material_types" not in meta:
+    required_material_types = meta.get("required_material_types")
+    if not isinstance(required_material_types, list):
         meta["required_material_types"] = list(DEFAULT_REQUIRED_MATERIAL_TYPES)
         changed = True
+    else:
+        normalized_required: List[str] = []
+        for item in required_material_types:
+            key = _normalize_material_type(item)
+            if key and key not in normalized_required:
+                normalized_required.append(key)
+        for required_key in DEFAULT_REQUIRED_MATERIAL_TYPES:
+            if required_key not in normalized_required:
+                normalized_required.append(required_key)
+                changed = True
+        if normalized_required != required_material_types:
+            meta["required_material_types"] = normalized_required
+            changed = True
     if "min_parsed_chars_by_type" not in meta:
         meta["min_parsed_chars_by_type"] = dict(DEFAULT_MIN_PARSED_CHARS_BY_TYPE)
         changed = True
     if "enforce_material_depth_gate" not in meta:
         meta["enforce_material_depth_gate"] = bool(DEFAULT_ENFORCE_MATERIAL_DEPTH_GATE)
+        changed = True
+    elif strict_mode and not bool(meta.get("enforce_material_depth_gate")):
+        meta["enforce_material_depth_gate"] = True
         changed = True
     if "min_parsed_chunks_by_type" not in meta:
         meta["min_parsed_chunks_by_type"] = dict(DEFAULT_MIN_PARSED_CHUNKS_BY_TYPE)
@@ -764,6 +807,19 @@ def _ensure_project_v2_fields(
     if "min_uploaded_type_coverage_rate" not in meta:
         meta["min_uploaded_type_coverage_rate"] = float(DEFAULT_MIN_UPLOADED_TYPE_COVERAGE_RATE)
         changed = True
+    if "evolution_weight_min_samples" not in meta:
+        meta["evolution_weight_min_samples"] = 3
+        changed = True
+    if "evolution_weight_max_age_days" not in meta:
+        meta["evolution_weight_max_age_days"] = DEFAULT_CALIBRATION_FRESHNESS_DAYS
+        changed = True
+    if strict_mode:
+        _set_min_int("min_material_retrieval_total", DEFAULT_MIN_MATERIAL_RETRIEVAL_TOTAL)
+        _set_min_rate(
+            "min_material_retrieval_file_coverage_rate",
+            DEFAULT_MIN_MATERIAL_RETRIEVAL_FILE_COVERAGE_RATE,
+        )
+        _set_min_rate("min_required_type_coverage_rate", DEFAULT_MIN_REQUIRED_TYPE_COVERAGE_RATE)
     return changed
 
 
@@ -966,13 +1022,47 @@ def _resolve_project_scoring_context(
                 profile = item
                 break
 
-    # 进化权重优先：用户执行学习进化后，使预评分贴近青天，优先采用进化产出的 dimension_multipliers
+    # 进化权重优先，但必须满足最小样本量与时效性，避免概念漂移导致误导评分。
     reports = load_evolution_reports()
     evo = reports.get(project_id) or {}
     se = evo.get("scoring_evolution") or {}
     mult = se.get("dimension_multipliers") or {}
     if mult:
-        return dict(mult), None, project
+        meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
+        min_samples = max(1, int(_to_float_or_none(meta.get("evolution_weight_min_samples")) or 3))
+        max_age_days = max(
+            1.0,
+            float(
+                _to_float_or_none(meta.get("evolution_weight_max_age_days"))
+                or DEFAULT_CALIBRATION_FRESHNESS_DAYS
+            ),
+        )
+        sample_count = int(_to_float_or_none(evo.get("sample_count")) or 0)
+        updated_at_dt = _parse_iso_datetime(evo.get("updated_at") or evo.get("created_at"))
+        age_days = None
+        if updated_at_dt is not None:
+            age_days = max(
+                0.0,
+                (
+                    datetime.now(timezone.utc) - updated_at_dt.astimezone(timezone.utc)
+                ).total_seconds()
+                / 86400.0,
+            )
+        evolved_usable = (
+            sample_count >= min_samples
+            and age_days is not None
+            and float(age_days) <= float(max_age_days)
+        )
+        if evolved_usable:
+            return dict(mult), None, project
+        logger.info(
+            "skip stale_or_thin_evolution_weights project_id=%s sample_count=%s min_samples=%s age_days=%s max_age_days=%s",
+            project_id,
+            sample_count,
+            min_samples,
+            round(float(age_days), 2) if age_days is not None else None,
+            max_age_days,
+        )
 
     if profile and isinstance(profile.get("weights_norm"), dict):
         multipliers = _weights_norm_to_dimension_multipliers(profile.get("weights_norm", {}))
@@ -3946,21 +4036,129 @@ def _resolve_score_blend_weights(project: Dict[str, object]) -> tuple[float, flo
     return rule_w, llm_w, delta_cap
 
 
+def _resolve_dynamic_blend_adjustment(
+    report: Dict[str, object],
+) -> tuple[float, float, Dict[str, object]]:
+    """
+    根据证据覆盖质量动态调整融合权重：
+    - 资料利用门禁 blocked/warn 时，显著降低 LLM 权重
+    - 资料文件覆盖率/强制项命中率低时，进一步降权
+    """
+    meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+    util = (
+        meta.get("material_utilization")
+        if isinstance(meta.get("material_utilization"), dict)
+        else {}
+    )
+    gate = (
+        meta.get("material_utilization_gate")
+        if isinstance(meta.get("material_utilization_gate"), dict)
+        else {}
+    )
+    trace = meta.get("evidence_trace") if isinstance(meta.get("evidence_trace"), dict) else {}
+    has_material_signal = bool(util) or bool(gate) or bool(trace)
+    if not has_material_signal:
+        return (
+            1.0,
+            1.0,
+            {
+                "coverage_scale": 1.0,
+                "delta_cap_scale": 1.0,
+                "reasons": [],
+                "retrieval_file_coverage_rate": None,
+                "retrieval_hit_rate": None,
+                "mandatory_hit_rate": None,
+                "source_files_hit_count": None,
+                "signal_state": "no_material_signal",
+            },
+        )
+
+    scale = 1.0
+    reasons: List[str] = []
+
+    if bool(gate.get("blocked")):
+        scale *= 0.1
+        reasons.append("material_gate_blocked")
+    elif bool(gate.get("warned")):
+        scale *= 0.45
+        reasons.append("material_gate_warned")
+
+    retrieval_file_cov = _to_float_or_none(util.get("retrieval_file_coverage_rate"))
+    if retrieval_file_cov is not None and retrieval_file_cov < 0.7:
+        ratio = max(0.2, float(retrieval_file_cov) / 0.7)
+        scale *= ratio
+        reasons.append(f"low_retrieval_file_coverage:{retrieval_file_cov:.3f}")
+
+    retrieval_hit_rate = _to_float_or_none(util.get("retrieval_hit_rate"))
+    if retrieval_hit_rate is not None and retrieval_hit_rate < 0.35:
+        ratio = max(0.3, float(retrieval_hit_rate) / 0.35)
+        scale *= ratio
+        reasons.append(f"low_retrieval_hit_rate:{retrieval_hit_rate:.3f}")
+
+    mandatory_hit_rate = _to_float_or_none(trace.get("mandatory_hit_rate"))
+    if mandatory_hit_rate is not None and mandatory_hit_rate < 0.45:
+        ratio = max(0.35, float(mandatory_hit_rate) / 0.45)
+        scale *= ratio
+        reasons.append(f"low_mandatory_hit_rate:{mandatory_hit_rate:.3f}")
+
+    source_files_hit_count_raw = (
+        _to_float_or_none(trace.get("source_files_hit_count"))
+        if isinstance(trace, dict) and "source_files_hit_count" in trace
+        else None
+    )
+    source_files_hit_count = (
+        int(source_files_hit_count_raw) if source_files_hit_count_raw is not None else None
+    )
+    if source_files_hit_count is not None and source_files_hit_count <= 0:
+        scale *= 0.25
+        reasons.append("no_material_source_files_hit")
+
+    scale = max(0.02, min(1.0, float(scale)))
+    delta_cap_scale = max(0.2, min(1.0, 0.2 + scale))
+    return (
+        scale,
+        delta_cap_scale,
+        {
+            "coverage_scale": round(scale, 4),
+            "delta_cap_scale": round(delta_cap_scale, 4),
+            "reasons": reasons,
+            "retrieval_file_coverage_rate": retrieval_file_cov,
+            "retrieval_hit_rate": retrieval_hit_rate,
+            "mandatory_hit_rate": mandatory_hit_rate,
+            "source_files_hit_count": source_files_hit_count,
+            "signal_state": "material_signal_detected",
+        },
+    )
+
+
 def _fuse_rule_and_llm_scores(
     *,
     rule_total: float,
     llm_total_raw: float,
     project: Dict[str, object],
-) -> tuple[float, float, Dict[str, float]]:
+    report: Optional[Dict[str, object]] = None,
+) -> tuple[float, float, Dict[str, object]]:
     rule = _clip_score(rule_total)
     llm_raw = _clip_score(llm_total_raw)
     rule_w, llm_w, delta_cap = _resolve_score_blend_weights(project)
+    coverage_meta: Dict[str, object] = {}
+    if isinstance(report, dict):
+        coverage_scale, delta_cap_scale, coverage_meta = _resolve_dynamic_blend_adjustment(report)
+        llm_w *= coverage_scale
+        total = rule_w + llm_w
+        if total > 1e-9:
+            rule_w /= total
+            llm_w /= total
+        else:
+            rule_w, llm_w = 1.0, 0.0
+        delta_cap *= delta_cap_scale
     llm_bounded = _clip_score(max(rule - delta_cap, min(rule + delta_cap, llm_raw)))
     fused = _clip_score(rule * rule_w + llm_bounded * llm_w)
     blend_info = {
         "rule_weight": round(rule_w, 4),
         "llm_weight": round(llm_w, 4),
         "llm_delta_cap": round(delta_cap, 2),
+        "dynamic_coverage": coverage_meta,
     }
     return round(fused, 2), round(llm_bounded, 2), blend_info
 
@@ -4020,13 +4218,21 @@ def _apply_prediction_to_report(
         rule_total=rule_total,
         llm_total_raw=float(pred),
         project=project,
+        report=report,
     )
+    sigma = float(_to_float_or_none(conf.get("sigma")) or 0.0)
+    ci95_delta = 1.96 * sigma if sigma > 0 else 0.0
+    ci95_lower = _clip_score(fused_total - ci95_delta)
+    ci95_upper = _clip_score(fused_total + ci95_delta)
     report["pred_total_score"] = fused_total
     report["llm_total_score"] = llm_total
     report["pred_confidence"] = {
         **conf,
         "raw_llm_score": float(pred),
         "bounded_llm_score": llm_total,
+        "fused_ci95_lower": round(ci95_lower, 2),
+        "fused_ci95_upper": round(ci95_upper, 2),
+        "fused_sigma": round(sigma, 2),
     }
     report["score_blend"] = blend_info
     report["pred_dim_scores"] = None
@@ -4197,7 +4403,7 @@ def _score_submission_for_project(
         )
         effective_requirements = list(requirements) + list(runtime_custom_requirements)
         meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
-        strict_pre_flight = bool(meta.get("enforce_gb_redline", False))
+        strict_pre_flight = bool(meta.get("enforce_gb_redline", DEFAULT_ENFORCE_GB_REDLINE))
         try:
             v2_result = score_text_v2(
                 submission_id=submission_id,
@@ -4872,6 +5078,60 @@ def _run_feedback_closed_loop(project_id: str, *, locale: str, trigger: str) -> 
     except Exception as exc:
         result["evolution_refresh"] = {"refreshed": False, "error": str(exc)}
     return result
+
+
+def _run_feedback_closed_loop_safe(
+    project_id: str,
+    *,
+    locale: str,
+    trigger: str,
+) -> Dict[str, object]:
+    """
+    闭环执行保护层：不抛错中断主流程，但必须显式返回失败信息并记录日志。
+    """
+    try:
+        raw_result = _run_feedback_closed_loop(project_id, locale=locale, trigger=trigger)
+        if isinstance(raw_result, dict):
+            result = dict(raw_result)
+        elif hasattr(raw_result, "model_dump"):
+            dumped = raw_result.model_dump()
+            if isinstance(dumped, dict):
+                result = dict(dumped)
+            else:
+                result = {
+                    "ok": bool(getattr(raw_result, "ok", False)),
+                    "project_id": project_id,
+                    "trigger": trigger,
+                    "raw": str(raw_result),
+                }
+        else:
+            result = {
+                "ok": bool(getattr(raw_result, "ok", False)),
+                "project_id": project_id,
+                "trigger": trigger,
+                "raw": str(raw_result),
+            }
+        if not bool(result.get("ok", True)):
+            logger.warning(
+                "feedback_closed_loop_non_ok project_id=%s trigger=%s result=%s",
+                project_id,
+                trigger,
+                result,
+            )
+        return result
+    except Exception as exc:
+        logger.exception(
+            "feedback_closed_loop_exception project_id=%s trigger=%s error=%s",
+            project_id,
+            trigger,
+            exc,
+        )
+        return {
+            "ok": False,
+            "project_id": project_id,
+            "trigger": trigger,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def _build_evolution_health_report(
@@ -6417,29 +6677,11 @@ def rescore_project_submissions(
     project["updated_at"] = _now_iso()
     save_projects(projects)
     # 重评分属于有效反馈信号：自动刷新样本并触发校准/调权重闭环。
-    feedback_closed_loop: Dict[str, object] = {
-        "ok": False,
-        "trigger": "rescore",
-        "error": "not_run",
-    }
-    try:
-        raw_closed_loop = _run_feedback_closed_loop(project_id, locale=locale, trigger="rescore")
-        if isinstance(raw_closed_loop, dict):
-            feedback_closed_loop = raw_closed_loop
-        elif hasattr(raw_closed_loop, "model_dump"):
-            feedback_closed_loop = dict(raw_closed_loop.model_dump())
-        else:
-            feedback_closed_loop = {
-                "ok": bool(getattr(raw_closed_loop, "ok", False)),
-                "trigger": "rescore",
-                "raw": str(raw_closed_loop),
-            }
-    except Exception as exc:
-        feedback_closed_loop = {
-            "ok": False,
-            "trigger": "rescore",
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+    feedback_closed_loop = _run_feedback_closed_loop_safe(
+        project_id,
+        locale=locale,
+        trigger="rescore",
+    )
     material_utilization = _aggregate_material_utilization_summaries(material_utilization_summaries)
     material_gate = (
         material_quality_snapshot.get("gate")
@@ -9852,11 +10094,8 @@ def _delete_submission_record(project_id: str, submission_id: str, locale: str) 
         s for s in calibration_samples if str(s.get("submission_id")) != submission_id
     ]
     save_calibration_samples(calibration_samples)
-    # 删除属于显式反馈信号：自动刷新样本并触发校准/调权重闭环（best-effort）。
-    try:
-        _run_feedback_closed_loop(project_id, locale=locale, trigger="delete_submission")
-    except Exception:
-        pass
+    # 删除属于显式反馈信号：自动刷新样本并触发校准/调权重闭环。
+    _run_feedback_closed_loop_safe(project_id, locale=locale, trigger="delete_submission")
 
 
 @router.delete(
@@ -11904,10 +12143,11 @@ def add_ground_truth(
     records.append(record)
     save_ground_truth(records)
     _sync_ground_truth_record_to_qingtian(project_id, record)
-    try:
-        _run_feedback_closed_loop(project_id, locale=locale, trigger="ground_truth_add")
-    except Exception:
-        pass
+    record["feedback_closed_loop"] = _run_feedback_closed_loop_safe(
+        project_id,
+        locale=locale,
+        trigger="ground_truth_add",
+    )
     return GroundTruthRecord(**record)
 
 
@@ -11966,10 +12206,11 @@ def add_ground_truth_from_submission(
     records.append(record)
     save_ground_truth(records)
     _sync_ground_truth_record_to_qingtian(project_id, record)
-    try:
-        _run_feedback_closed_loop(project_id, locale=locale, trigger="ground_truth_add")
-    except Exception:
-        pass
+    record["feedback_closed_loop"] = _run_feedback_closed_loop_safe(
+        project_id,
+        locale=locale,
+        trigger="ground_truth_add",
+    )
     return GroundTruthRecord(**record)
 
 
@@ -12021,10 +12262,11 @@ async def add_ground_truth_from_file(
     records.append(record)
     save_ground_truth(records)
     _sync_ground_truth_record_to_qingtian(project_id, record)
-    try:
-        _run_feedback_closed_loop(project_id, locale=locale, trigger="ground_truth_add")
-    except Exception:
-        pass
+    record["feedback_closed_loop"] = _run_feedback_closed_loop_safe(
+        project_id,
+        locale=locale,
+        trigger="ground_truth_add",
+    )
     return GroundTruthRecord(**record)
 
 
@@ -12104,10 +12346,14 @@ async def add_ground_truth_from_files(
                     _sync_ground_truth_record_to_qingtian(project_id, record)
                 except Exception as e:
                     item["detail"] = f"已保存，但同步青天失败：{e}"
-        try:
-            _run_feedback_closed_loop(project_id, locale=locale, trigger="ground_truth_batch_add")
-        except Exception:
-            pass
+        closed_loop_result = _run_feedback_closed_loop_safe(
+            project_id,
+            locale=locale,
+            trigger="ground_truth_batch_add",
+        )
+        for item in items:
+            if item.get("ok") and isinstance(item.get("record"), dict):
+                item["record"]["feedback_closed_loop"] = closed_loop_result
 
     success_count = sum(1 for item in items if item.get("ok"))
     failed_count = len(items) - success_count
