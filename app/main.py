@@ -35,6 +35,10 @@ try:
 except Exception:
     pymupdf = None
 try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
+try:
     from docx import Document
 except Exception:
     Document = None
@@ -5892,10 +5896,11 @@ def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
         add("rate_limit_status", False, str(e))
 
     # parser/runtime capability checks
+    pdf_backend = _pdf_backend_name()
     add(
         "parser_pdf",
-        pymupdf is not None,
-        "PyMuPDF available" if pymupdf is not None else "PyMuPDF missing",
+        pdf_backend != "none",
+        (f"backend={pdf_backend}" if pdf_backend != "none" else "PyMuPDF/pypdf missing"),
     )
     add(
         "parser_docx",
@@ -5961,7 +5966,18 @@ def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
         except Exception as e:
             add("project_exists", False, str(e))
 
-    all_ok = all(bool(x.get("ok")) for x in items)
+    # `parser_ocr` / `parser_dwg_converter` 属于增强能力，不应阻断系统基础可用性判断。
+    required_item_names = {
+        "health",
+        "config",
+        "data_dirs_writable",
+        "auth_status",
+        "rate_limit_status",
+        "parser_pdf",
+        "parser_docx",
+    }
+    required_items = [x for x in items if str(x.get("name")) in required_item_names]
+    all_ok = bool(required_items) and all(bool(x.get("ok")) for x in required_items)
     return {
         "ok": all_ok,
         "checked_at": _now_iso(),
@@ -7865,11 +7881,29 @@ def _dwg_converter_command_candidates(
 
 def _resolve_dwg_converter_binaries() -> List[str]:
     converter_names: List[str] = []
+    converter_paths: List[str] = []
     env_converters_raw = str(os.getenv("DWG_CONVERTER_BIN") or "").strip()
     if env_converters_raw:
         for item in re.split(r"[;,]", env_converters_raw):
             s = item.strip()
-            if s and s not in converter_names:
+            if not s:
+                continue
+            p = Path(s)
+            if p.exists() and p.is_file():
+                converter_paths.append(str(p))
+                continue
+            if p.exists() and p.is_dir():
+                for bin_name in (
+                    "dwg2dxf",
+                    "ODAFileConverter",
+                    "oda_file_converter",
+                    "TeighaFileConverter",
+                ):
+                    candidate = p / bin_name
+                    if candidate.exists() and candidate.is_file():
+                        converter_paths.append(str(candidate))
+                continue
+            if s not in converter_names:
                 converter_names.append(s)
     converter_names.extend(
         [
@@ -7877,10 +7911,23 @@ def _resolve_dwg_converter_binaries() -> List[str]:
             "ODAFileConverter",
             "oda_file_converter",
             "TeighaFileConverter",
+            "dwgread",
         ]
     )
     converter_names = list(dict.fromkeys(converter_names))
-    binaries: List[str] = []
+    binaries: List[str] = [p for p in converter_paths if p]
+    common_paths = [
+        "/Applications/ODAFileConverter.app/Contents/MacOS/ODAFileConverter",
+        "/Applications/Teigha File Converter.app/Contents/MacOS/TeighaFileConverter",
+        "/opt/homebrew/bin/dwg2dxf",
+        "/usr/local/bin/dwg2dxf",
+        "/opt/homebrew/bin/dwgread",
+        "/usr/local/bin/dwgread",
+    ]
+    for raw_path in common_paths:
+        p = Path(raw_path)
+        if p.exists() and p.is_file():
+            binaries.append(str(p))
     for name in converter_names:
         if not name:
             continue
@@ -7903,6 +7950,20 @@ def _extract_dwg_text(content: bytes, filename: str) -> str:
             return f"[DWG预处理] 文件: {filename}\n检测到ASCII DXF内容，按DXF解析。\n\n{dxf_text}"
         except Exception:
             pass
+    # 对明显异常的小体量 DWG 直接走标识兜底，避免调用外部转换器造成长时间阻塞。
+    if len(content) < 256:
+        markers = _extract_dwg_binary_markers(content, max_tokens=26)
+        versions = [str(x) for x in (markers.get("versions") or []) if str(x).strip()]
+        token_preview = [str(x) for x in (markers.get("tokens") or []) if str(x).strip()]
+        marker_text = "、".join(versions[:4]) if versions else "未识别"
+        tokens_text = "、".join(token_preview[:16]) if token_preview else "未提取到有效标识"
+        return (
+            f"[DWG图纸] 文件: {filename}，字节数: {len(content)}\n"
+            "DWG预处理: 文件体积过小，已跳过外部转换器尝试\n"
+            f"版本标记: {marker_text}\n"
+            f"二进制标识提取: {tokens_text}\n"
+            "当前未完成稳定结构化解析，建议同时上传 PDF 或 ASCII DXF 以提升评分准确性。"
+        )
 
     binaries = _resolve_dwg_converter_binaries()
 
@@ -8251,24 +8312,37 @@ def _extract_image_content(content: bytes, filename: str) -> str:
     return "\n".join(lines)
 
 
-def _read_uploaded_file_content(content: bytes, filename: str) -> str:
-    """根据文件名解析上传文件为文本，覆盖招标/清单/图纸/现场照片常见格式。"""
-    name = filename.lower()
-    if name.endswith(".txt") or name.endswith(".md") or name.endswith(".csv"):
-        return content.decode("utf-8", errors="ignore")
-    if name.endswith(".docx"):
-        if Document is None:
-            raise ValueError("DOCX 解析不可用：请安装与当前系统架构兼容的 python-docx/lxml。")
-        doc = Document(io.BytesIO(content))
-        return "\n".join(p.text for p in doc.paragraphs)
-    if name.endswith(".doc") or name.endswith(".docm"):
-        snippet = _extract_binary_text_snippet(content)
-        if snippet:
-            return snippet
-        return f"[DOC资料] 文件: {filename}（当前环境未启用结构化解析，已纳入文件元信息）"
-    if name.endswith(".pdf"):
-        if pymupdf is None:
-            raise ValueError("PDF 解析不可用：请安装与当前系统架构兼容的 PyMuPDF。")
+def _pdf_backend_name() -> str:
+    if pymupdf is not None:
+        return "pymupdf"
+    if PdfReader is not None:
+        return "pypdf"
+    return "none"
+
+
+def _extract_pdf_text_with_pypdf(content: bytes) -> str:
+    if PdfReader is None:
+        return ""
+    if not bytes(content or b"").lstrip().startswith(b"%PDF"):
+        return ""
+    try:
+        reader = PdfReader(io.BytesIO(content))
+    except Exception:
+        return ""
+    parts: List[str] = []
+    for idx, page in enumerate(getattr(reader, "pages", []) or [], start=1):
+        try:
+            page_text = str(page.extract_text() or "")
+        except Exception:
+            page_text = ""
+        page_text = page_text.strip()
+        if page_text:
+            parts.append(f"[PAGE:{idx}]\n{page_text}")
+    return "\n\n".join(parts).strip()
+
+
+def _extract_pdf_text(content: bytes, filename: str) -> str:
+    if pymupdf is not None:
         doc = pymupdf.open(stream=content, filetype="pdf")
         try:
             parts: List[str] = []
@@ -8298,11 +8372,39 @@ def _read_uploaded_file_content(content: bytes, filename: str) -> str:
                     merged_pdf_text = (
                         merged_pdf_text + "\n\n[PDF_OCR_FALLBACK]\n" + "\n\n".join(ocr_chunks)
                     ).strip()
-            if not merged_pdf_text:
-                return f"[PDF资料] 文件: {filename}（未提取到有效文本）"
-            return merged_pdf_text
+            if merged_pdf_text:
+                return f"[PDF_BACKEND:pymupdf]\n{merged_pdf_text}"
         finally:
             doc.close()
+
+    pypdf_text = _extract_pdf_text_with_pypdf(content)
+    if pypdf_text:
+        return f"[PDF_BACKEND:pypdf]\n{pypdf_text}"
+
+    if _pdf_backend_name() == "none":
+        raise ValueError(
+            "PDF 解析不可用：请安装与当前系统架构兼容的 PyMuPDF，或安装 pypdf 作为兼容解析后端。"
+        )
+    return f"[PDF资料] 文件: {filename}（未提取到有效文本）"
+
+
+def _read_uploaded_file_content(content: bytes, filename: str) -> str:
+    """根据文件名解析上传文件为文本，覆盖招标/清单/图纸/现场照片常见格式。"""
+    name = filename.lower()
+    if name.endswith(".txt") or name.endswith(".md") or name.endswith(".csv"):
+        return content.decode("utf-8", errors="ignore")
+    if name.endswith(".docx"):
+        if Document is None:
+            raise ValueError("DOCX 解析不可用：请安装与当前系统架构兼容的 python-docx/lxml。")
+        doc = Document(io.BytesIO(content))
+        return "\n".join(p.text for p in doc.paragraphs)
+    if name.endswith(".doc") or name.endswith(".docm"):
+        snippet = _extract_binary_text_snippet(content)
+        if snippet:
+            return snippet
+        return f"[DOC资料] 文件: {filename}（当前环境未启用结构化解析，已纳入文件元信息）"
+    if name.endswith(".pdf"):
+        return _extract_pdf_text(content, filename)
     if name.endswith(".json"):
         return content.decode("utf-8", errors="ignore")
     if name.endswith(".xlsx") or name.endswith(".xls") or name.endswith(".xlsm"):
@@ -9186,12 +9288,15 @@ def _build_material_depth_report(project_id: str, project: Dict[str, object]) ->
     material_rows = [m for m in load_materials() if str(m.get("project_id")) == project_id]
     dwg_files = 0
     site_photo_files = 0
+    pdf_files = 0
     for row in material_rows:
         filename = str(row.get("filename") or "").strip()
         ext = Path(filename).suffix.lower()
         material_type = _normalize_material_type(row.get("material_type"), filename=filename)
         if ext == ".dwg" or (material_type == "drawing" and ext == ".dwg"):
             dwg_files += 1
+        if ext == ".pdf":
+            pdf_files += 1
         if material_type == "site_photo" and ext in {
             ".png",
             ".jpg",
@@ -9205,7 +9310,12 @@ def _build_material_depth_report(project_id: str, project: Dict[str, object]) ->
     ocr_available = bool(pytesseract is not None and Image is not None)
     dwg_converter_bins = _resolve_dwg_converter_binaries()
     dwg_converter_available = bool(dwg_converter_bins)
+    pdf_backend = _pdf_backend_name()
+    pdf_parser_available = pdf_backend != "none"
     capabilities = {
+        "pdf_parser_available": pdf_parser_available,
+        "pdf_backend": pdf_backend,
+        "pdf_file_count": pdf_files,
         "ocr_available": ocr_available,
         "dwg_converter_available": dwg_converter_available,
         "dwg_converter_bins": [Path(p).name for p in dwg_converter_bins][:8],
@@ -9218,6 +9328,10 @@ def _build_material_depth_report(project_id: str, project: Dict[str, object]) ->
             recommendations.append(tip)
     if dwg_files > 0 and not dwg_converter_available:
         tip = "已上传 DWG 图纸，但未检测到 DWG 转换器（如 dwg2dxf/ODAFileConverter），建议安装后重评分以提升图纸解析深度。"
+        if tip not in recommendations:
+            recommendations.append(tip)
+    if pdf_files > 0 and not pdf_parser_available:
+        tip = "已上传 PDF 资料，但当前环境未启用 PDF 解析后端（PyMuPDF/pypdf），建议安装后重评分。"
         if tip not in recommendations:
             recommendations.append(tip)
 
@@ -9276,6 +9390,7 @@ def _render_material_depth_report_markdown(payload: Dict[str, object]) -> str:
         "",
         "## 解析能力",
         "",
+        f"- PDF 解析可用：`{bool(capabilities.get('pdf_parser_available'))}`（后端：`{capabilities.get('pdf_backend', '-')}`，PDF 文件数：`{capabilities.get('pdf_file_count', 0)}`）",
         f"- OCR 可用：`{bool(capabilities.get('ocr_available'))}`（现场照片文件数：`{capabilities.get('site_photo_file_count', 0)}`）",
         f"- DWG 转换器可用：`{bool(capabilities.get('dwg_converter_available'))}`（DWG 文件数：`{capabilities.get('dwg_file_count', 0)}`）",
         f"- 已检测转换器：`{', '.join(str(x) for x in (capabilities.get('dwg_converter_bins') or [])) or '-'}`",
@@ -9437,12 +9552,15 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
 
     dwg_files = 0
     site_photo_files = 0
+    pdf_files = 0
     for row in rows:
         filename = str(row.get("filename") or "").strip()
         ext = Path(filename).suffix.lower()
         mat_type = _normalize_material_type(row.get("material_type"), filename=filename)
         if ext == ".dwg" or (mat_type == "drawing" and ext == ".dwg"):
             dwg_files += 1
+        if ext == ".pdf":
+            pdf_files += 1
         if mat_type == "site_photo" and ext in {
             ".png",
             ".jpg",
@@ -9454,7 +9572,11 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         }:
             site_photo_files += 1
 
+    pdf_backend = _pdf_backend_name()
     capabilities = {
+        "pdf_parser_available": pdf_backend != "none",
+        "pdf_backend": pdf_backend,
+        "pdf_file_count": pdf_files,
         "ocr_available": bool(pytesseract is not None and Image is not None),
         "dwg_converter_available": bool(_resolve_dwg_converter_binaries()),
         "dwg_file_count": dwg_files,
@@ -9551,6 +9673,10 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         recommendations.append("已上传现场照片但 OCR 不可用，建议安装 OCR 组件后重评分。")
     if capabilities["dwg_file_count"] > 0 and not capabilities["dwg_converter_available"]:
         recommendations.append("已上传 DWG 图纸但转换器不可用，建议安装 DWG 转换器后重评分。")
+    if capabilities["pdf_file_count"] > 0 and not capabilities["pdf_parser_available"]:
+        recommendations.append(
+            "已上传 PDF 资料但 PDF 解析后端不可用，建议安装 PyMuPDF 或 pypdf 后重评分。"
+        )
     for dim_row in low_dims[:6]:
         dim_name = str(dim_row.get("dimension_name") or dim_row.get("dimension_id") or "")
         kw = "、".join(str(x) for x in (dim_row.get("suggested_keywords") or [])[:3])
@@ -9615,8 +9741,10 @@ def _render_material_knowledge_profile_markdown(payload: Dict[str, object]) -> s
         "",
         "## 解析能力",
         "",
+        f"- PDF 解析可用：`{bool(capabilities.get('pdf_parser_available'))}`（后端：`{capabilities.get('pdf_backend', '-')}`）",
         f"- OCR 可用：`{bool(capabilities.get('ocr_available'))}`",
         f"- DWG 转换器可用：`{bool(capabilities.get('dwg_converter_available'))}`",
+        f"- PDF 文件数：`{capabilities.get('pdf_file_count', 0)}`",
         f"- 现场照片文件数：`{capabilities.get('site_photo_file_count', 0)}`",
         f"- DWG 文件数：`{capabilities.get('dwg_file_count', 0)}`",
         "",

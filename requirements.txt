@@ -13,6 +13,7 @@ ruff
 black
 python-docx
 pymupdf
+pypdf
 openpyxl
 pillow
 pytesseract

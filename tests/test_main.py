@@ -4461,6 +4461,32 @@ class TestSystemSelfCheckCapabilities:
         assert "parser_ocr" in names
         assert "parser_dwg_converter" in names
 
+    @patch("app.main._resolve_dwg_converter_binaries", return_value=[])
+    @patch("app.main.get_rate_limit_status", return_value={"enabled": False})
+    @patch("app.main.get_auth_status", return_value={"enabled": False})
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.load_config")
+    @patch("app.main.pymupdf", None)
+    @patch("app.main.PdfReader", object())
+    def test_system_self_check_dwg_converter_optional_not_block_overall_ok(
+        self,
+        mock_load_config,
+        mock_ensure_data_dirs,
+        mock_auth_status,
+        mock_rate_limit_status,
+        mock_dwg_bins,
+    ):
+        from app.main import _run_system_self_check
+
+        mock_load_config.return_value = MagicMock(rubric={}, lexicon={})
+        payload = _run_system_self_check(None)
+        assert payload.get("ok") is True
+        items = payload.get("items") or []
+        dwg_item = next((x for x in items if x.get("name") == "parser_dwg_converter"), {})
+        assert dwg_item.get("ok") is False
+        pdf_item = next((x for x in items if x.get("name") == "parser_pdf"), {})
+        assert pdf_item.get("ok") is True
+
 
 class TestComputeMultipliersHash:
     """Tests for _compute_multipliers_hash helper function."""
@@ -4520,6 +4546,26 @@ class TestEvolutionTotalScale:
         hash_value = _compute_multipliers_hash({})
         assert hash_value is not None
         assert len(hash_value) == 16  # 截断为 16 字符
+
+
+class TestPdfFallbackParser:
+    @patch("app.main.pymupdf", None)
+    @patch("app.main.PdfReader")
+    def test_read_uploaded_file_content_pdf_uses_pypdf_fallback(self, mock_pdf_reader):
+        from app.main import _read_uploaded_file_content
+
+        class _FakePage:
+            def extract_text(self):
+                return "这是 PDF 提取文本"
+
+        class _FakeReader:
+            def __init__(self, _stream):
+                self.pages = [_FakePage()]
+
+        mock_pdf_reader.side_effect = _FakeReader
+        text = _read_uploaded_file_content(b"%PDF-fallback", "sample.pdf")
+        assert "[PDF_BACKEND:pypdf]" in text
+        assert "这是 PDF 提取文本" in text
 
 
 class TestScoringContextEvolutionGuard:
