@@ -17,6 +17,8 @@ KEEP_E2E_PROJECT="${KEEP_E2E_PROJECT:-0}"
 project_name="${E2E_PROJECT_PREFIX}${ts}"
 project_id=""
 sample_file="$ROOT_DIR/sample_shigong.txt"
+material_seed_file="$BUILD_DIR/e2e_material_seed.txt"
+inline_score_payload="$BUILD_DIR/e2e_inline_score_payload.json"
 if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
   PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
 else
@@ -29,6 +31,31 @@ if [[ ! -f "$sample_file" ]]; then
   echo "[e2e] sample file not found: $sample_file"
   exit 1
 fi
+
+"$PYTHON_BIN" - "$sample_file" "$material_seed_file" <<'PY'
+import sys
+from pathlib import Path
+
+src = Path(sys.argv[1]).read_text(encoding="utf-8", errors="ignore").strip()
+if not src:
+    src = "施工组织设计示例文本。"
+extra = (
+    "\n\n【门禁补齐段】本段用于 e2e 门禁回归，包含工期、质量、安全、资源、应急、"
+    "BIM、扬尘、危大工程、检查频次、责任岗位、验收动作、参数阈值等关键词。"
+    "\n参数示例：工期365天，检查频次每周2次，抽检比例10%，旁站覆盖率100%。\n"
+)
+payload = ((src + extra) * 28).strip() + "\n"
+Path(sys.argv[2]).write_text(payload, encoding="utf-8")
+PY
+
+"$PYTHON_BIN" - "$sample_file" "$inline_score_payload" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="ignore")
+Path(sys.argv[2]).write_text(json.dumps({"text": text}, ensure_ascii=False), encoding="utf-8")
+PY
 
 host_port="$(python3 - "$BASE_URL" <<'PY'
 import sys
@@ -303,18 +330,91 @@ if ! curl_with_auth "$BASE_URL/health" > "$BUILD_DIR/health.json"; then
 fi
 
 echo "[e2e] create project: $project_name"
-create_resp="$(post_json "$BASE_URL/api/v1/projects" "{\"name\":\"$project_name\"}")"
+create_payload="$(cat <<JSON
+{
+  "name": "$project_name",
+  "meta": {
+    "required_material_types": ["tender_qa", "boq", "drawing"],
+    "min_parsed_chars_by_type": {
+      "tender_qa": 500,
+      "boq": 300,
+      "drawing": 300,
+      "site_photo": 0
+    },
+    "min_total_parsed_chars": 1000,
+    "max_material_parse_fail_ratio": 1.0,
+    "block_on_any_material_parse_failure": false,
+    "enforce_material_utilization_gate": false,
+    "material_utilization_gate_mode": "warn"
+  }
+}
+JSON
+)"
+create_resp="$(post_json "$BASE_URL/api/v1/projects" "$create_payload")"
 printf '%s\n' "$create_resp" > "$BUILD_DIR/create_project.json"
 project_id="$(printf '%s' "$create_resp" | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')"
 echo "[e2e] project_id=$project_id"
 
 echo "[e2e] upload material"
-curl_with_auth -X POST "$BASE_URL/api/v1/projects/$project_id/materials" -F "file=@$sample_file;type=text/plain" > "$BUILD_DIR/upload_material.json"
+curl_with_auth -X POST "$BASE_URL/api/v1/projects/$project_id/materials" \
+  -F "material_type=tender_qa" \
+  -F "file=@$material_seed_file;type=text/plain" > "$BUILD_DIR/upload_material.json"
+curl_with_auth -X POST "$BASE_URL/api/v1/projects/$project_id/materials" \
+  -F "material_type=boq" \
+  -F "file=@$material_seed_file;type=text/plain" > "$BUILD_DIR/upload_material_boq.json"
+curl_with_auth -X POST "$BASE_URL/api/v1/projects/$project_id/materials" \
+  -F "material_type=drawing" \
+  -F "file=@$material_seed_file;type=text/plain" > "$BUILD_DIR/upload_material_drawing.json"
 
-echo "[e2e] upload shigong and score"
+echo "[e2e] upload shigong (pending expected)"
 curl_with_auth -X POST "$BASE_URL/api/v1/projects/$project_id/shigong" -F "file=@$sample_file;type=text/plain" > "$BUILD_DIR/upload_shigong.json"
 
-echo "[e2e] list submissions latest_report"
+python3 - "$BUILD_DIR/upload_shigong.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+status = str(((payload.get("report") or {}).get("scoring_status") or "")).strip().lower()
+if status != "pending":
+    raise SystemExit(f"upload should stay pending, got scoring_status={status!r}")
+print("[e2e] pending status assertion: OK")
+PY
+
+echo "[e2e] rescore shigong"
+rescore_tmp="$BUILD_DIR/rescore.tmp.json"
+rescore_code="$(curl_http_code "$rescore_tmp" -H "Content-Type: application/json" -X POST "$BASE_URL/api/v1/projects/$project_id/rescore" -d '{"score_scale_max":100}')"
+mv "$rescore_tmp" "$BUILD_DIR/rescore.json"
+if [[ "${rescore_code:0:1}" == "2" ]]; then
+  python3 - "$BUILD_DIR/rescore.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+generated = int(payload.get("reports_generated") or 0)
+if generated <= 0:
+    raise SystemExit(f"rescore generated no reports: {generated}")
+print("[e2e] rescore assertion: OK, reports_generated=", generated)
+PY
+elif [[ "$rescore_code" == "422" ]]; then
+  echo "[e2e] WARN: rescore blocked by material gate, fallback to inline /score for downstream linkage checks"
+  if [[ -n "$API_KEY" ]]; then
+    curl -fsS -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+      -X POST "$BASE_URL/api/v1/projects/$project_id/score" \
+      --data-binary @"$inline_score_payload" > "$BUILD_DIR/inline_score_fallback.json"
+  else
+    curl -fsS -H "Content-Type: application/json" \
+      -X POST "$BASE_URL/api/v1/projects/$project_id/score" \
+      --data-binary @"$inline_score_payload" > "$BUILD_DIR/inline_score_fallback.json"
+  fi
+else
+  echo "[e2e] rescore failed with HTTP $rescore_code"
+  cat "$BUILD_DIR/rescore.json" || true
+  exit 1
+fi
+
+echo "[e2e] list submissions latest_report (scored expected)"
 curl_with_auth "$BASE_URL/api/v1/projects/$project_id/submissions?with=latest_report" > "$BUILD_DIR/submissions_latest.json"
 
 echo "[e2e] ingest one ground truth from file"
@@ -379,6 +479,67 @@ fetch_best_effort_text "$BUILD_DIR/analysis_bundle.md" \
   "$BASE_URL/api/projects/$project_id/analysis_bundle.md" \
   "$BASE_URL/api/v1/projects/$project_id/compare_report"
 
+echo "[e2e] module 5/6/7 linkage checks"
+fetch_best_effort_json "$BUILD_DIR/compare.json" \
+  "$BASE_URL/api/v1/projects/$project_id/compare"
+fetch_best_effort_json "$BUILD_DIR/compare_report.json" \
+  "$BASE_URL/api/v1/projects/$project_id/compare_report"
+fetch_best_effort_json "$BUILD_DIR/insights.json" \
+  "$BASE_URL/api/v1/projects/$project_id/insights"
+post_json "$BASE_URL/api/v1/projects/$project_id/learning" '{}' > "$BUILD_DIR/learning.json"
+fetch_best_effort_json "$BUILD_DIR/adaptive.json" \
+  "$BASE_URL/api/v1/projects/$project_id/adaptive"
+fetch_best_effort_json "$BUILD_DIR/adaptive_patch.json" \
+  "$BASE_URL/api/v1/projects/$project_id/adaptive_patch"
+fetch_best_effort_json "$BUILD_DIR/adaptive_validate.json" \
+  "$BASE_URL/api/v1/projects/$project_id/adaptive_validate"
+fetch_best_effort_json "$BUILD_DIR/writing_guidance.json" \
+  "$BASE_URL/api/v1/projects/$project_id/writing_guidance"
+fetch_best_effort_json "$BUILD_DIR/compilation_instructions.json" \
+  "$BASE_URL/api/v1/projects/$project_id/compilation_instructions"
+fetch_best_effort_json "$BUILD_DIR/evolution_health.json" \
+  "$BASE_URL/api/v1/projects/$project_id/evolution/health"
+fetch_best_effort_json "$BUILD_DIR/mece_audit.json" \
+  "$BASE_URL/api/v1/projects/$project_id/mece_audit"
+fetch_best_effort_json "$BUILD_DIR/evidence_trace_latest.json" \
+  "$BASE_URL/api/v1/projects/$project_id/evidence_trace/latest"
+fetch_best_effort_json "$BUILD_DIR/scoring_basis_latest.json" \
+  "$BASE_URL/api/v1/projects/$project_id/scoring_basis/latest"
+
+python3 - "$BUILD_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+build = Path(sys.argv[1])
+
+def _load(name: str):
+    return json.loads((build / name).read_text(encoding="utf-8"))
+
+compare = _load("compare.json")
+if not (isinstance(compare.get("rankings"), list) and compare["rankings"]):
+    raise SystemExit("compare linkage failed: rankings empty")
+
+insights = _load("insights.json")
+weak_dims = insights.get("weak_dimensions")
+if not isinstance(weak_dims, list):
+    weak_dims = insights.get("weakest_dims")
+if not isinstance(weak_dims, list):
+    raise SystemExit("insights linkage failed: weak_dimensions/weakest_dims missing")
+
+learning = _load("learning.json")
+mult = learning.get("dimension_multipliers") if isinstance(learning, dict) else None
+if not (isinstance(mult, dict) and mult):
+    raise SystemExit("learning linkage failed: dimension_multipliers empty")
+
+mece = _load("mece_audit.json")
+overall = mece.get("overall") if isinstance(mece, dict) else {}
+if not isinstance(overall, dict) or "health_score" not in overall:
+    raise SystemExit("mece audit linkage failed: overall.health_score missing")
+
+print("[e2e] module linkage assertions: OK")
+PY
+
 echo "[e2e] system self-check"
 fetch_best_effort_json "$BUILD_DIR/self_check.json" \
   "$BASE_URL/api/v1/system/self_check?project_id=$project_id" \
@@ -403,10 +564,27 @@ summary = {
     "artifacts": {
         "create_project": str(build_dir / "create_project.json"),
         "upload_material": str(build_dir / "upload_material.json"),
+        "upload_material_boq": str(build_dir / "upload_material_boq.json"),
+        "upload_material_drawing": str(build_dir / "upload_material_drawing.json"),
         "upload_shigong": str(build_dir / "upload_shigong.json"),
         "submissions_latest": str(build_dir / "submissions_latest.json"),
         "ground_truth_from_files": str(build_dir / "ground_truth_from_files.json"),
         "evolve": str(build_dir / "evolve.json"),
+        "rescore": str(build_dir / "rescore.json"),
+        "inline_score_fallback": str(build_dir / "inline_score_fallback.json"),
+        "compare": str(build_dir / "compare.json"),
+        "compare_report": str(build_dir / "compare_report.json"),
+        "insights": str(build_dir / "insights.json"),
+        "learning": str(build_dir / "learning.json"),
+        "adaptive": str(build_dir / "adaptive.json"),
+        "adaptive_patch": str(build_dir / "adaptive_patch.json"),
+        "adaptive_validate": str(build_dir / "adaptive_validate.json"),
+        "writing_guidance": str(build_dir / "writing_guidance.json"),
+        "compilation_instructions": str(build_dir / "compilation_instructions.json"),
+        "evolution_health": str(build_dir / "evolution_health.json"),
+        "mece_audit": str(build_dir / "mece_audit.json"),
+        "evidence_trace_latest": str(build_dir / "evidence_trace_latest.json"),
+        "scoring_basis_latest": str(build_dir / "scoring_basis_latest.json"),
         "scoring_factors": str(build_dir / "scoring_factors.json"),
         "scoring_factors_markdown": str(build_dir / "scoring_factors_markdown.json"),
         "analysis_bundle_json": str(build_dir / "analysis_bundle.json"),

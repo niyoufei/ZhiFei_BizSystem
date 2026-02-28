@@ -71,6 +71,7 @@ if openapi_payload="$(curl_with_auth "$OPENAPI_URL" 2>/dev/null)"; then
     "/api/v1/projects/{project_id}/ground_truth/from_files"
     "/api/v1/projects/{project_id}/expert-profile"
     "/api/v1/projects/{project_id}/rescore"
+    "/api/v1/projects/{project_id}/mece_audit"
     "/api/v1/scoring/factors"
     "/api/v1/system/self_check"
   )

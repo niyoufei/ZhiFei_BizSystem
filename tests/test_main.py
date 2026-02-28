@@ -1323,6 +1323,105 @@ class TestMaterialsEndpoint:
         assert data["material_depth_gate"]["enforce"] is False
         assert data["material_depth_gate"]["passed"] is False
 
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_project_mece_audit_project_not_found(
+        self, mock_ensure, mock_load_projects, client
+    ):
+        mock_load_projects.return_value = []
+        response = client.get("/api/v1/projects/nonexistent/mece_audit")
+        assert response.status_code == 404
+        assert "项目不存在" in response.json()["detail"]
+
+    @patch("app.main._build_submission_scoring_basis_report")
+    @patch("app.main._resolve_submission_score_fields")
+    @patch("app.main._submission_is_scored")
+    @patch("app.main.load_submissions")
+    @patch("app.main._run_system_self_check")
+    @patch("app.main._build_evolution_health_report")
+    @patch("app.main._build_material_depth_report")
+    @patch("app.main._build_scoring_readiness")
+    @patch("app.main._now_iso", return_value="2026-02-28T00:00:00+00:00")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_project_mece_audit_success(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_now_iso,
+        mock_build_readiness,
+        mock_build_depth,
+        mock_build_evo_health,
+        mock_self_check,
+        mock_load_submissions,
+        mock_submission_is_scored,
+        mock_resolve_score_fields,
+        mock_scoring_basis,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_build_readiness.return_value = {
+            "project_id": "p1",
+            "ready": True,
+            "gate_passed": True,
+            "issues": [],
+            "warnings": [],
+            "material_quality": {"total_parsed_chars": 8600},
+            "material_gate": {"required_types": ["tender_qa", "boq", "drawing"]},
+        }
+        mock_build_depth.return_value = {
+            "quality_summary": {"total_files": 4},
+        }
+        mock_build_evo_health.return_value = {
+            "summary": {
+                "ground_truth_count": 4,
+                "matched_prediction_count": 3,
+                "has_evolved_multipliers": True,
+                "current_weights_source": "evolution",
+            },
+            "drift": {"level": "low"},
+        }
+        mock_self_check.return_value = {
+            "ok": True,
+            "items": [{"name": "health", "ok": True}],
+        }
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "created_at": "2026-02-27T00:00:00+00:00",
+                "updated_at": "2026-02-27T00:00:00+00:00",
+                "report": {"scoring_status": "done"},
+            }
+        ]
+        mock_submission_is_scored.return_value = True
+        mock_resolve_score_fields.return_value = {"total_score": 78.6}
+        mock_scoring_basis.return_value = {
+            "mece_inputs": {
+                "project_materials_extracted": True,
+                "shigong_parsed": True,
+                "bid_requirements_loaded": True,
+                "attention_16d_weights_injected": True,
+                "custom_instructions_injected": True,
+            },
+            "evidence_trace": {"total_requirements": 10, "total_hits": 8},
+        }
+
+        response = client.get("/api/v1/projects/p1/mece_audit")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["overall"]["level"] == "good"
+        assert data["overall"]["health_score"] >= 90
+        assert data["summary"]["submission_scored"] == 1
+        assert data["summary"]["ground_truth_count"] == 4
+        assert isinstance(data["dimensions"], list) and len(data["dimensions"]) >= 4
+        keys = {row["key"] for row in data["dimensions"]}
+        assert "input_chain" in keys
+        assert "scoring_validity" in keys
+        assert "self_evolution_loop" in keys
+        assert "runtime_stability" in keys
+
     @patch("app.main._build_evolution_health_report")
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")

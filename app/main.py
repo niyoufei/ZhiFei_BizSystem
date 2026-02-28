@@ -183,6 +183,7 @@ from app.schemas import (
     ProjectCreate,
     ProjectEvaluationResponse,
     ProjectExpertProfileResponse,
+    ProjectMeceAuditResponse,
     ProjectPreScoreListResponse,
     ProjectRecord,
     ProjectRequirementRecord,
@@ -7378,6 +7379,26 @@ def get_scoring_readiness(
 
 
 @router.get(
+    "/projects/{project_id}/mece_audit",
+    response_model=ProjectMeceAuditResponse,
+    tags=["系统诊断"],
+    responses={**RESPONSES_404},
+)
+def get_project_mece_audit(
+    project_id: str, locale: str = Depends(get_locale)
+) -> ProjectMeceAuditResponse:
+    """项目级 MECE 审计：输入链路、评分有效性、进化闭环、运行稳定性。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    try:
+        project = _find_project(project_id, projects)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    payload = _build_project_mece_audit(project_id, project)
+    return ProjectMeceAuditResponse(**payload)
+
+
+@router.get(
     "/projects/{project_id}/evolution/health",
     response_model=EvolutionHealthResponse,
     tags=["自我学习与进化"],
@@ -9170,6 +9191,241 @@ def _build_scoring_readiness(project_id: str, project: Dict[str, object]) -> Dic
         },
         "retrieval_policy": _resolve_material_utilization_policy(project),
         "generated_at": _now_iso(),
+    }
+
+
+def _build_project_mece_audit(project_id: str, project: Dict[str, object]) -> Dict[str, object]:
+    """
+    项目级 MECE 审计（Mutually Exclusive, Collectively Exhaustive）。
+
+    目标：对“资料输入 -> 评分输出 -> 进化闭环 -> 运行稳定性”给出可执行诊断，
+    用于自动化验收与持续回归。
+    """
+    readiness = _build_scoring_readiness(project_id, project)
+    depth = _build_material_depth_report(project_id, project)
+    evo_health = _build_evolution_health_report(project_id, project)
+    self_check = _run_system_self_check(project_id)
+
+    submissions_all = [s for s in load_submissions() if str(s.get("project_id")) == project_id]
+    scored_submissions = [s for s in submissions_all if _submission_is_scored(s)]
+    scored_totals: List[float] = []
+    for row in scored_submissions:
+        score_fields = _resolve_submission_score_fields(
+            row,
+            allow_pred_score=True,
+            score_scale_max=100,
+        )
+        scored_totals.append(float(_to_float_or_none(score_fields.get("total_score")) or 0.0))
+    scored_totals = [max(0.0, min(100.0, x)) for x in scored_totals]
+    if scored_totals:
+        mean_score = sum(scored_totals) / len(scored_totals)
+        variance = sum((x - mean_score) ** 2 for x in scored_totals) / len(scored_totals)
+        std_score = variance**0.5
+    else:
+        std_score = 0.0
+        mean_score = 0.0
+
+    latest_scored: Optional[Dict[str, object]] = None
+    if scored_submissions:
+        latest_scored = max(
+            scored_submissions,
+            key=lambda x: str(x.get("updated_at") or x.get("created_at") or ""),
+        )
+    scoring_basis_ok = False
+    evidence_trace_ok = False
+    if isinstance(latest_scored, dict):
+        try:
+            basis_payload = _build_submission_scoring_basis_report(
+                project_id=project_id,
+                submission=latest_scored,
+            )
+            mece_inputs = (
+                basis_payload.get("mece_inputs")
+                if isinstance(basis_payload.get("mece_inputs"), dict)
+                else {}
+            )
+            required_keys = (
+                "project_materials_extracted",
+                "shigong_parsed",
+                "bid_requirements_loaded",
+                "attention_16d_weights_injected",
+                "custom_instructions_injected",
+            )
+            scoring_basis_ok = all(bool(mece_inputs.get(k)) for k in required_keys)
+            evidence_trace = (
+                basis_payload.get("evidence_trace")
+                if isinstance(basis_payload.get("evidence_trace"), dict)
+                else {}
+            )
+            total_req = int(_to_float_or_none(evidence_trace.get("total_requirements")) or 0)
+            hit_req = int(_to_float_or_none(evidence_trace.get("total_hits")) or 0)
+            evidence_trace_ok = total_req > 0 and hit_req > 0
+        except Exception:
+            scoring_basis_ok = False
+            evidence_trace_ok = False
+
+    dim_rows: List[Dict[str, object]] = []
+
+    def _append_dim(
+        *,
+        key: str,
+        title: str,
+        checks: Dict[str, object],
+        pass_condition: bool,
+        warnings: Optional[List[str]] = None,
+        fail_reasons: Optional[List[str]] = None,
+    ) -> None:
+        warn_rows = [str(x).strip() for x in (warnings or []) if str(x).strip()]
+        fail_rows = [str(x).strip() for x in (fail_reasons or []) if str(x).strip()]
+        status = "pass" if pass_condition else ("warn" if warn_rows else "fail")
+        if fail_rows:
+            status = "fail"
+        dim_rows.append(
+            {
+                "key": key,
+                "title": title,
+                "status": status,
+                "checks": checks,
+                "warnings": warn_rows,
+                "issues": fail_rows,
+            }
+        )
+
+    _append_dim(
+        key="input_chain",
+        title="输入链路完整性",
+        checks={
+            "gate_passed": bool(readiness.get("gate_passed")),
+            "ready": bool(readiness.get("ready")),
+            "material_files": int(
+                _to_float_or_none(((depth.get("quality_summary") or {}).get("total_files"))) or 0
+            ),
+            "materials_total_parsed_chars": int(
+                _to_float_or_none(
+                    ((readiness.get("material_quality") or {}).get("total_parsed_chars"))
+                )
+                or 0
+            ),
+            "required_types": list(
+                ((readiness.get("material_gate") or {}).get("required_types")) or []
+            ),
+        },
+        pass_condition=bool(readiness.get("gate_passed")) and bool(readiness.get("ready")),
+        warnings=[str(x) for x in (readiness.get("warnings") or [])],
+        fail_reasons=[str(x) for x in (readiness.get("issues") or [])],
+    )
+
+    score_variance_warn = []
+    if len(scored_totals) >= 3 and std_score < 1.0:
+        score_variance_warn.append(
+            f"已评分样本 {len(scored_totals)} 份，但总分标准差仅 {std_score:.2f}，建议检查区分度。"
+        )
+    _append_dim(
+        key="scoring_validity",
+        title="评分有效性与可解释性",
+        checks={
+            "scored_submissions": len(scored_submissions),
+            "mean_total_score": round(mean_score, 2),
+            "std_total_score": round(std_score, 4),
+            "scoring_basis_ok": bool(scoring_basis_ok),
+            "evidence_trace_ok": bool(evidence_trace_ok),
+        },
+        pass_condition=len(scored_submissions) > 0 and scoring_basis_ok and evidence_trace_ok,
+        warnings=score_variance_warn,
+        fail_reasons=[],
+    )
+
+    gt_summary = evo_health.get("summary") if isinstance(evo_health.get("summary"), dict) else {}
+    gt_count = int(_to_float_or_none(gt_summary.get("ground_truth_count")) or 0)
+    matched_pred_count = int(_to_float_or_none(gt_summary.get("matched_prediction_count")) or 0)
+    has_evolved_multipliers = bool(gt_summary.get("has_evolved_multipliers"))
+    evo_fail_reasons: List[str] = []
+    evo_warnings: List[str] = []
+    if gt_count <= 0:
+        evo_fail_reasons.append("未录入真实评标，进化闭环未激活。")
+    elif gt_count < 3:
+        evo_warnings.append(f"真实评标样本仅 {gt_count} 条，建议至少 3 条以上。")
+    if gt_count > 0 and matched_pred_count <= 0:
+        evo_fail_reasons.append("真实评标与系统预测未形成有效匹配，闭环训练不可用。")
+    if gt_count >= 3 and not has_evolved_multipliers:
+        evo_warnings.append("已具备样本但尚未产出进化权重，建议执行“学习进化”。")
+    _append_dim(
+        key="self_evolution_loop",
+        title="自我进化闭环",
+        checks={
+            "ground_truth_count": gt_count,
+            "matched_prediction_count": matched_pred_count,
+            "has_evolved_multipliers": has_evolved_multipliers,
+            "weights_source": str(gt_summary.get("current_weights_source") or "-"),
+            "drift_level": str((evo_health.get("drift") or {}).get("level") or "unknown"),
+        },
+        pass_condition=gt_count >= 1 and matched_pred_count >= 1,
+        warnings=evo_warnings,
+        fail_reasons=evo_fail_reasons,
+    )
+
+    self_check_items = self_check.get("items") if isinstance(self_check.get("items"), list) else []
+    failed_items = [str(x.get("name") or "") for x in self_check_items if not bool(x.get("ok"))]
+    _append_dim(
+        key="runtime_stability",
+        title="运行稳定性",
+        checks={
+            "self_check_ok": bool(self_check.get("ok")),
+            "failed_items": failed_items,
+            "service_health": bool(
+                next(
+                    (bool(i.get("ok")) for i in self_check_items if str(i.get("name")) == "health"),
+                    False,
+                )
+            ),
+        },
+        pass_condition=bool(self_check.get("ok")),
+        warnings=[],
+        fail_reasons=[],
+    )
+
+    pass_count = sum(1 for row in dim_rows if row.get("status") == "pass")
+    warn_count = sum(1 for row in dim_rows if row.get("status") == "warn")
+    fail_count = sum(1 for row in dim_rows if row.get("status") == "fail")
+    total_dims = max(1, len(dim_rows))
+    pass_rate = round(pass_count / total_dims, 4)
+    health_score = round((pass_count + 0.5 * warn_count) / total_dims * 100, 2)
+    level = "good"
+    if fail_count > 0:
+        level = "critical" if fail_count >= 2 else "watch"
+    elif warn_count > 0:
+        level = "watch"
+
+    recommendations: List[str] = []
+    for row in dim_rows:
+        for text in (row.get("issues") or []) + (row.get("warnings") or []):
+            s = str(text).strip()
+            if s and s not in recommendations:
+                recommendations.append(s)
+
+    return {
+        "project_id": project_id,
+        "generated_at": _now_iso(),
+        "overall": {
+            "health_score": health_score,
+            "level": level,
+            "pass_rate": pass_rate,
+            "pass_count": pass_count,
+            "warn_count": warn_count,
+            "fail_count": fail_count,
+            "total_dimensions": total_dims,
+        },
+        "dimensions": dim_rows,
+        "summary": {
+            "submission_total": len(submissions_all),
+            "submission_scored": len(scored_submissions),
+            "score_mean_100": round(mean_score, 2),
+            "score_std_100": round(std_score, 4),
+            "ground_truth_count": gt_count,
+            "matched_prediction_count": matched_pred_count,
+            "self_check_ok": bool(self_check.get("ok")),
+        },
+        "recommendations": recommendations[:20],
     }
 
 

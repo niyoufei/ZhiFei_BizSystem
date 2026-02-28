@@ -331,6 +331,17 @@ class ScoringReadinessResponse(BaseModel):
     generated_at: str
 
 
+class ProjectMeceAuditResponse(BaseModel):
+    """项目级 MECE 审计（输入完整性 / 评分有效性 / 进化闭环 / 运行稳定性）"""
+
+    project_id: str
+    generated_at: str
+    overall: Dict[str, Any] = Field(default_factory=dict)
+    dimensions: List[Dict[str, Any]] = Field(default_factory=list)
+    summary: Dict[str, Any] = Field(default_factory=dict)
+    recommendations: List[str] = Field(default_factory=list)
+
+
 class EvolutionHealthResponse(BaseModel):
     """项目进化健康度报告（误差趋势 / 漂移 / 样本时效）"""
 

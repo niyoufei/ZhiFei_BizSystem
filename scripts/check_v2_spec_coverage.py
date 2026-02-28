@@ -23,6 +23,7 @@ REQUIRED_FILES = [
     "scripts/build_golden_dataset.py",
     "scripts/evaluate_golden_dataset.py",
     "scripts/e2e_api_flow.sh",
+    "scripts/mece_audit.sh",
     "scripts/doctor.sh",
 ]
 
@@ -32,6 +33,7 @@ REQUIRED_PATHS_METHODS = [
     ("/api/v1/projects/{project_id}/rescore", "POST"),
     ("/api/v1/projects/{project_id}/ground_truth/from_files", "POST"),
     ("/api/v1/projects/{project_id}/analysis_bundle", "GET"),
+    ("/api/v1/projects/{project_id}/mece_audit", "GET"),
     ("/api/v1/scoring/factors", "GET"),
     ("/api/v1/scoring/factors/markdown", "GET"),
     ("/api/v1/system/self_check", "GET"),
