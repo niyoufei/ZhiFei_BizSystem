@@ -25,6 +25,10 @@ REQUIRED_FILES = [
     "scripts/e2e_api_flow.sh",
     "scripts/mece_audit.sh",
     "scripts/data_hygiene.sh",
+    "scripts/ops_agents.py",
+    "scripts/start_ops_agents.sh",
+    "scripts/stop_ops_agents.sh",
+    "scripts/ops_agents_status.sh",
     "scripts/doctor.sh",
 ]
 
@@ -39,6 +43,7 @@ REQUIRED_PATHS_METHODS = [
     ("/api/v1/scoring/factors/markdown", "GET"),
     ("/api/v1/system/self_check", "GET"),
     ("/api/v1/system/data_hygiene", "GET"),
+    ("/api/v1/system/data_hygiene/repair", "POST"),
 ]
 
 

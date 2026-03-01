@@ -101,8 +101,8 @@ echo "[acceptance] step 3/6: mece audit"
 STRICT=1 API_KEY="$API_KEY" BASE_URL="http://127.0.0.1:${PORT}" ./scripts/mece_audit.sh
 step_mece=1
 
-echo "[acceptance] step 4/6: data hygiene"
-STRICT=1 FAIL_ON_ORPHAN=0 API_KEY="$API_KEY" BASE_URL="http://127.0.0.1:${PORT}" ./scripts/data_hygiene.sh
+echo "[acceptance] step 4/6: data hygiene (auto-repair)"
+APPLY=1 STRICT=1 FAIL_ON_ORPHAN=0 API_KEY="$API_KEY" BASE_URL="http://127.0.0.1:${PORT}" ./scripts/data_hygiene.sh
 step_hygiene=1
 
 echo "[acceptance] step 5/6: v2 spec coverage"

@@ -1,7 +1,7 @@
 # 施工组织设计评标评分系统 Makefile
 # 提供一键操作命令
 
-.PHONY: install test smoke score docx batch clean help coverage lint-fix pre-commit web run api restart stop status daemon-start daemon-stop daemon-status analysis-bundle analysis-bundle-all doctor e2e-flow mece-audit data-hygiene spec-coverage acceptance acceptance-fast
+.PHONY: install test smoke score docx batch clean help coverage lint-fix pre-commit web run api restart stop status daemon-start daemon-stop daemon-status analysis-bundle analysis-bundle-all doctor e2e-flow mece-audit data-hygiene ops-agents-run ops-agents-start ops-agents-stop ops-agents-status spec-coverage acceptance acceptance-fast
 
 PYTHON ?= $(shell if [ -x .venv/bin/python ]; then echo .venv/bin/python; else echo python3; fi)
 
@@ -23,6 +23,10 @@ help:
 	@echo "  make acceptance-fast - 快速严格验收（跳过pytest）"
 	@echo "  make mece-audit - 生成项目级 MECE 诊断汇总（build/mece_audit_latest.*）"
 	@echo "  make data-hygiene - 生成数据卫生巡检（build/data_hygiene_latest.*）"
+	@echo "  make ops-agents-run - 运行一轮4智能体协同巡检（SRE/数据卫生/评分质量/进化）"
+	@echo "  make ops-agents-start - 后台启动4智能体协同守护（默认60秒一轮）"
+	@echo "  make ops-agents-status - 查看协同守护状态"
+	@echo "  make ops-agents-stop - 停止协同守护"
 	@echo "  make spec-coverage - 检查V2重构关键文件/API覆盖度"
 	@echo "  make analysis-bundle PROJECT_ID=<id> - 导出项目分析包 Markdown"
 	@echo "  make analysis-bundle-all - 导出全部项目分析包 Markdown"
@@ -157,6 +161,20 @@ mece-audit:
 # 数据卫生巡检（孤儿记录检查）
 data-hygiene:
 	./scripts/data_hygiene.sh
+
+# 4智能体协同巡检（单轮）
+ops-agents-run:
+	$(PYTHON) scripts/ops_agents.py --interval-seconds 0 --max-cycles 1
+
+# 4智能体协同守护（后台）
+ops-agents-start:
+	./scripts/start_ops_agents.sh
+
+ops-agents-stop:
+	./scripts/stop_ops_agents.sh
+
+ops-agents-status:
+	./scripts/ops_agents_status.sh
 
 # V2 规格覆盖度检查（关键文件 + API）
 spec-coverage:
