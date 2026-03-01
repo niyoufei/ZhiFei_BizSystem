@@ -84,3 +84,44 @@ def test_run_ops_agents_cycle_warn_from_sub_agents(monkeypatch):
     assert result["overall"]["warn_count"] == 1
     assert result["overall"]["fail_count"] == 0
     assert "quality watch" in result["recommendations"]
+
+
+def test_scoring_quality_treats_preparation_critical_as_non_failure():
+    def fake_requester(**kwargs):
+        url = str(kwargs.get("url") or "")
+        if url.endswith("/api/v1/projects"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": [
+                    {
+                        "id": "p1",
+                        "name": "项目1",
+                        "status": "scoring_preparation",
+                    }
+                ],
+                "error": None,
+            }
+        if url.endswith("/api/v1/projects/p1/mece_audit"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "overall": {"level": "critical"},
+                    "summary": {"submission_total": 0, "submission_scored": 0},
+                },
+                "error": None,
+            }
+        raise AssertionError(f"unexpected url: {url}")
+
+    result = oa._run_scoring_quality_agent(
+        base_url="http://127.0.0.1:8000",
+        api_key=None,
+        timeout=5.0,
+        requester=fake_requester,
+    )
+    assert result["status"] == "pass"
+    assert result["metrics"]["critical_count"] == 0
+    assert result["metrics"]["preparation_critical_count"] == 1

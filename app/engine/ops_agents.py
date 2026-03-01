@@ -294,12 +294,14 @@ def _run_scoring_quality_agent(
 
     audits: List[Dict[str, Any]] = []
     critical = 0
+    preparation_critical = 0
     watch = 0
     good = 0
     for project in projects:
         pid = str(project.get("id") or "").strip()
         if not pid:
             continue
+        project_status = str(project.get("status") or "").strip().lower()
         resp = requester(
             method="GET",
             url=f"{base_url}/api/v1/projects/{pid}/mece_audit",
@@ -310,9 +312,20 @@ def _run_scoring_quality_agent(
         if int(resp.get("status_code") or 0) != 200:
             critical += 1
             continue
-        level = str(((resp.get("json") or {}).get("overall") or {}).get("level") or "").lower()
+        payload = resp.get("json") or {}
+        level = str((payload.get("overall") or {}).get("level") or "").lower()
+        summary = payload.get("summary") or {}
+        submission_total = _to_int(summary.get("submission_total"))
+        submission_scored = _to_int(summary.get("submission_scored"))
+        # 处于准备阶段（未上传施组/未评分）的项目，不应把运维状态打成 fail。
+        in_preparation = project_status in {"scoring_preparation", "draft", "created"} and (
+            submission_total == 0 and submission_scored == 0
+        )
         if level == "critical":
-            critical += 1
+            if in_preparation:
+                preparation_critical += 1
+            else:
+                critical += 1
         elif level == "watch":
             watch += 1
         else:
@@ -325,6 +338,10 @@ def _run_scoring_quality_agent(
         recommendations.append(f"存在 {critical} 个项目处于 critical，请优先补齐资料与评分门禁。")
     elif watch > 0:
         recommendations.append(f"存在 {watch} 个项目处于 watch，建议补充样本与进化训练。")
+    elif preparation_critical > 0:
+        recommendations.append(
+            f"有 {preparation_critical} 个项目处于准备阶段（未上传施组/未评分），不计入故障。"
+        )
     else:
         recommendations.append("所有项目评分质量状态良好。")
 
@@ -338,6 +355,7 @@ def _run_scoring_quality_agent(
             "good_count": good,
             "watch_count": watch,
             "critical_count": critical,
+            "preparation_critical_count": preparation_critical,
         },
         "recommendations": recommendations,
     }
