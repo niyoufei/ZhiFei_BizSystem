@@ -516,6 +516,24 @@ class SelfCheckResponse(BaseModel):
     items: List[SelfCheckItem] = Field(default_factory=list)
 
 
+class DataHygieneDataset(BaseModel):
+    name: str
+    total: int
+    orphan_count: int
+    cleaned_count: int = 0
+    mode: str = "project_id"
+
+
+class DataHygieneResponse(BaseModel):
+    generated_at: str
+    apply_mode: bool
+    valid_project_count: int
+    orphan_records_total: int
+    cleaned_records_total: int
+    datasets: List[DataHygieneDataset] = Field(default_factory=list)
+    recommendations: List[str] = Field(default_factory=list)
+
+
 class DeltaCaseRecord(BaseModel):
     id: str
     project_id: str

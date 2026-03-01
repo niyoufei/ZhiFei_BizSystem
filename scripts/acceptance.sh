@@ -13,6 +13,7 @@ started_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 step_doctor=0
 step_e2e=0
 step_mece=0
+step_hygiene=0
 step_coverage=0
 step_tests=0
 tests_skipped=0
@@ -43,7 +44,7 @@ write_summary() {
   else
     status="FAIL"
   fi
-  python3 - "$SUMMARY_FILE" "$status" "$rc" "$started_at" "$ended_at" "$step_doctor" "$step_e2e" "$step_mece" "$step_coverage" "$step_tests" "$RUN_TESTS" "$tests_skipped" "$git_is_repo" "$git_ref" "$git_head" "$git_has_commit" "$workspace_dirty" <<'PY'
+  python3 - "$SUMMARY_FILE" "$status" "$rc" "$started_at" "$ended_at" "$step_doctor" "$step_e2e" "$step_mece" "$step_hygiene" "$step_coverage" "$step_tests" "$RUN_TESTS" "$tests_skipped" "$git_is_repo" "$git_ref" "$git_head" "$git_has_commit" "$workspace_dirty" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -58,22 +59,25 @@ summary = {
         "doctor_strict_ok": bool(int(sys.argv[6])),
         "e2e_strict_ok": bool(int(sys.argv[7])),
         "mece_audit_ok": bool(int(sys.argv[8])),
-        "spec_coverage_ok": bool(int(sys.argv[9])),
-        "tests_ok": (None if bool(int(sys.argv[12])) else bool(int(sys.argv[10]))),
+        "data_hygiene_ok": bool(int(sys.argv[9])),
+        "spec_coverage_ok": bool(int(sys.argv[10])),
+        "tests_ok": (None if bool(int(sys.argv[13])) else bool(int(sys.argv[11]))),
     },
-    "tests_skipped": bool(int(sys.argv[12])),
-    "run_tests": bool(int(sys.argv[11])),
+    "tests_skipped": bool(int(sys.argv[13])),
+    "run_tests": bool(int(sys.argv[12])),
     "git": {
-        "is_repo": bool(int(sys.argv[13])),
-        "ref": sys.argv[14],
-        "head": (None if sys.argv[15] == "null" else sys.argv[15]),
-        "has_commit": bool(int(sys.argv[16])),
-        "workspace_dirty": bool(int(sys.argv[17])),
+        "is_repo": bool(int(sys.argv[14])),
+        "ref": sys.argv[15],
+        "head": (None if sys.argv[16] == "null" else sys.argv[16]),
+        "has_commit": bool(int(sys.argv[17])),
+        "workspace_dirty": bool(int(sys.argv[18])),
     },
     "artifacts": {
         "e2e_summary": "/Users/youfeini/Desktop/ZhiFei_BizSystem/build/e2e_flow/summary.json",
         "mece_audit_json": "/Users/youfeini/Desktop/ZhiFei_BizSystem/build/mece_audit_latest.json",
         "mece_audit_md": "/Users/youfeini/Desktop/ZhiFei_BizSystem/build/mece_audit_latest.md",
+        "data_hygiene_json": "/Users/youfeini/Desktop/ZhiFei_BizSystem/build/data_hygiene_latest.json",
+        "data_hygiene_md": "/Users/youfeini/Desktop/ZhiFei_BizSystem/build/data_hygiene_latest.md",
         "v2_spec_coverage_md": "/Users/youfeini/Desktop/ZhiFei_BizSystem/build/v2_spec_coverage.md",
     },
 }
@@ -85,19 +89,23 @@ PY
 
 trap 'write_summary "$?"' EXIT
 
-echo "[acceptance] step 1/5: strict doctor"
+echo "[acceptance] step 1/6: strict doctor"
 STRICT=1 API_KEY="$API_KEY" PORT="$PORT" ./scripts/doctor.sh
 step_doctor=1
 
-echo "[acceptance] step 2/5: strict e2e flow"
+echo "[acceptance] step 2/6: strict e2e flow"
 STRICT=1 API_KEY="$API_KEY" BASE_URL="http://127.0.0.1:${PORT}" ./scripts/e2e_api_flow.sh
 step_e2e=1
 
-echo "[acceptance] step 3/5: mece audit"
+echo "[acceptance] step 3/6: mece audit"
 STRICT=1 API_KEY="$API_KEY" BASE_URL="http://127.0.0.1:${PORT}" ./scripts/mece_audit.sh
 step_mece=1
 
-echo "[acceptance] step 4/5: v2 spec coverage"
+echo "[acceptance] step 4/6: data hygiene"
+STRICT=1 FAIL_ON_ORPHAN=0 API_KEY="$API_KEY" BASE_URL="http://127.0.0.1:${PORT}" ./scripts/data_hygiene.sh
+step_hygiene=1
+
+echo "[acceptance] step 5/6: v2 spec coverage"
 if [[ -x ".venv/bin/python" ]]; then
   .venv/bin/python scripts/check_v2_spec_coverage.py --strict
 else
@@ -106,7 +114,7 @@ fi
 step_coverage=1
 
 if [[ "$RUN_TESTS" == "1" ]]; then
-  echo "[acceptance] step 5/5: pytest"
+  echo "[acceptance] step 6/6: pytest"
   if [[ -x ".venv/bin/pytest" ]]; then
     .venv/bin/pytest -q
   else
@@ -114,7 +122,7 @@ if [[ "$RUN_TESTS" == "1" ]]; then
   fi
   step_tests=1
 else
-  echo "[acceptance] step 5/5: skipped tests (RUN_TESTS=$RUN_TESTS)"
+  echo "[acceptance] step 6/6: skipped tests (RUN_TESTS=$RUN_TESTS)"
   tests_skipped=1
 fi
 
@@ -122,4 +130,5 @@ echo "[acceptance] PASS"
 echo "[acceptance] artifacts:"
 echo "  - /Users/youfeini/Desktop/ZhiFei_BizSystem/build/e2e_flow/summary.json"
 echo "  - /Users/youfeini/Desktop/ZhiFei_BizSystem/build/mece_audit_latest.md"
+echo "  - /Users/youfeini/Desktop/ZhiFei_BizSystem/build/data_hygiene_latest.md"
 echo "  - /Users/youfeini/Desktop/ZhiFei_BizSystem/build/v2_spec_coverage.md"

@@ -150,6 +150,7 @@ from app.schemas import (
     ConfigReloadResponse,
     ConfigStatusResponse,
     ConstraintPack,
+    DataHygieneResponse,
     DeltaCaseRecord,
     EvaluationSummaryResponse,
     EvidenceTraceMarkdownResponse,
@@ -5856,6 +5857,266 @@ def get_locale(
     return parse_accept_language(accept_language)
 
 
+def _build_data_hygiene_report(*, apply: bool) -> Dict[str, object]:
+    """
+    数据卫生巡检/修复：
+    - 清理 project_id 不存在的孤儿记录
+    - 清理 submission_id 不存在的孤儿记录
+    - 清理 project_id 维度的 dict 型映射残留键
+    """
+    ensure_data_dirs()
+    projects = load_projects()
+    valid_project_ids = {str(p.get("id") or "").strip() for p in projects if str(p.get("id") or "")}
+    datasets: List[Dict[str, object]] = []
+    orphan_records_total = 0
+    cleaned_records_total = 0
+
+    def _append_dataset(
+        *,
+        name: str,
+        total: int,
+        orphan_count: int,
+        cleaned_count: int = 0,
+        mode: str = "project_id",
+    ) -> None:
+        nonlocal orphan_records_total, cleaned_records_total
+        orphan_records_total += int(orphan_count)
+        cleaned_records_total += int(cleaned_count)
+        datasets.append(
+            {
+                "name": name,
+                "total": int(total),
+                "orphan_count": int(orphan_count),
+                "cleaned_count": int(cleaned_count),
+                "mode": mode,
+            }
+        )
+
+    def _scan_project_scoped_rows(
+        *,
+        name: str,
+        rows: List[Dict[str, object]],
+        save_fn,
+    ) -> List[Dict[str, object]]:
+        kept: List[Dict[str, object]] = []
+        orphan_count = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                kept.append(row)
+                continue
+            pid = str(row.get("project_id") or "").strip()
+            if pid and pid not in valid_project_ids:
+                orphan_count += 1
+                continue
+            kept.append(row)
+        cleaned_count = orphan_count if apply else 0
+        if apply and orphan_count > 0:
+            save_fn(kept)
+        _append_dataset(
+            name=name,
+            total=len(rows),
+            orphan_count=orphan_count,
+            cleaned_count=cleaned_count,
+            mode="project_id",
+        )
+        return kept
+
+    submissions_rows = load_submissions()
+    submissions_kept = _scan_project_scoped_rows(
+        name="submissions",
+        rows=submissions_rows,
+        save_fn=save_submissions,
+    )
+    valid_submission_ids = {
+        str(row.get("id") or "").strip()
+        for row in submissions_kept
+        if isinstance(row, dict) and str(row.get("id") or "").strip()
+    }
+
+    def _scan_submission_linked_rows(
+        *,
+        name: str,
+        rows: List[Dict[str, object]],
+        save_fn,
+        submission_key: str = "submission_id",
+    ) -> None:
+        kept: List[Dict[str, object]] = []
+        orphan_count = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                kept.append(row)
+                continue
+            pid = str(row.get("project_id") or "").strip()
+            sid = str(row.get(submission_key) or "").strip()
+            orphan_by_project = bool(pid) and pid not in valid_project_ids
+            orphan_by_submission = bool(sid) and sid not in valid_submission_ids
+            if orphan_by_project or orphan_by_submission:
+                orphan_count += 1
+                continue
+            kept.append(row)
+        cleaned_count = orphan_count if apply else 0
+        if apply and orphan_count > 0:
+            save_fn(kept)
+        _append_dataset(
+            name=name,
+            total=len(rows),
+            orphan_count=orphan_count,
+            cleaned_count=cleaned_count,
+            mode=f"project_id|{submission_key}",
+        )
+
+    _scan_project_scoped_rows(
+        name="materials",
+        rows=load_materials(),
+        save_fn=save_materials,
+    )
+    _scan_project_scoped_rows(
+        name="learning_profiles",
+        rows=load_learning_profiles(),
+        save_fn=save_learning_profiles,
+    )
+    _scan_project_scoped_rows(
+        name="score_history",
+        rows=load_score_history(),
+        save_fn=save_score_history,
+    )
+    _scan_project_scoped_rows(
+        name="ground_truth_scores",
+        rows=load_ground_truth(),
+        save_fn=save_ground_truth,
+    )
+    _scan_project_scoped_rows(
+        name="project_anchors",
+        rows=load_project_anchors(),
+        save_fn=save_project_anchors,
+    )
+    _scan_project_scoped_rows(
+        name="project_requirements",
+        rows=load_project_requirements(),
+        save_fn=save_project_requirements,
+    )
+    _scan_project_scoped_rows(
+        name="delta_cases",
+        rows=load_delta_cases(),
+        save_fn=save_delta_cases,
+    )
+    _scan_project_scoped_rows(
+        name="calibration_samples",
+        rows=load_calibration_samples(),
+        save_fn=save_calibration_samples,
+    )
+
+    patch_packages_rows = _scan_project_scoped_rows(
+        name="patch_packages",
+        rows=load_patch_packages(),
+        save_fn=save_patch_packages,
+    )
+    valid_patch_ids = {
+        str(p.get("id") or "").strip()
+        for p in patch_packages_rows
+        if isinstance(p, dict) and str(p.get("id") or "").strip()
+    }
+
+    # patch_deployments 额外校验 patch_id
+    patch_deployments_rows = load_patch_deployments()
+    patch_deployments_kept: List[Dict[str, object]] = []
+    patch_deployments_orphan = 0
+    for row in patch_deployments_rows:
+        if not isinstance(row, dict):
+            patch_deployments_kept.append(row)
+            continue
+        pid = str(row.get("project_id") or "").strip()
+        patch_id = str(row.get("patch_id") or "").strip()
+        orphan_by_project = bool(pid) and pid not in valid_project_ids
+        orphan_by_patch = bool(patch_id) and patch_id not in valid_patch_ids
+        if orphan_by_project or orphan_by_patch:
+            patch_deployments_orphan += 1
+            continue
+        patch_deployments_kept.append(row)
+    if apply and patch_deployments_orphan > 0:
+        save_patch_deployments(patch_deployments_kept)
+    _append_dataset(
+        name="patch_deployments",
+        total=len(patch_deployments_rows),
+        orphan_count=patch_deployments_orphan,
+        cleaned_count=(patch_deployments_orphan if apply else 0),
+        mode="project_id|patch_id",
+    )
+
+    _scan_submission_linked_rows(
+        name="score_reports",
+        rows=load_score_reports(),
+        save_fn=save_score_reports,
+        submission_key="submission_id",
+    )
+    _scan_submission_linked_rows(
+        name="evidence_units",
+        rows=load_evidence_units(),
+        save_fn=save_evidence_units,
+        submission_key="submission_id",
+    )
+    _scan_submission_linked_rows(
+        name="qingtian_results",
+        rows=load_qingtian_results(),
+        save_fn=save_qingtian_results,
+        submission_key="submission_id",
+    )
+
+    def _scan_project_map(*, name: str, data: Dict[str, object], save_fn) -> None:
+        if not isinstance(data, dict):
+            _append_dataset(name=name, total=0, orphan_count=0, cleaned_count=0, mode="project_map")
+            return
+        orphan_keys = [str(k) for k in data.keys() if str(k) not in valid_project_ids]
+        cleaned_count = len(orphan_keys) if apply else 0
+        if apply and orphan_keys:
+            new_data = {k: v for k, v in data.items() if str(k) in valid_project_ids}
+            save_fn(new_data)
+        _append_dataset(
+            name=name,
+            total=len(data),
+            orphan_count=len(orphan_keys),
+            cleaned_count=cleaned_count,
+            mode="project_map",
+        )
+
+    _scan_project_map(
+        name="project_context",
+        data=load_project_context(),
+        save_fn=save_project_context,
+    )
+    _scan_project_map(
+        name="evolution_reports",
+        data=load_evolution_reports(),
+        save_fn=save_evolution_reports,
+    )
+
+    recommendations: List[str] = []
+    if orphan_records_total <= 0:
+        recommendations.append("数据卫生良好：未发现跨项目孤儿记录。")
+    elif apply:
+        recommendations.append(
+            f"已清理孤儿记录 {cleaned_records_total} 条，建议执行一次 doctor/acceptance 回归。"
+        )
+    else:
+        recommendations.append(
+            f"发现孤儿记录 {orphan_records_total} 条，建议调用 /api/v1/system/data_hygiene/repair 进行修复。"
+        )
+    if orphan_records_total > 0:
+        recommendations.append(
+            "建议在批量删除项目后执行数据卫生巡检，避免历史孤儿记录影响统计与审计。"
+        )
+
+    return {
+        "generated_at": _now_iso(),
+        "apply_mode": bool(apply),
+        "valid_project_count": len(valid_project_ids),
+        "orphan_records_total": int(orphan_records_total),
+        "cleaned_records_total": int(cleaned_records_total),
+        "datasets": datasets,
+        "recommendations": recommendations,
+    }
+
+
 def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
     items: List[Dict[str, object]] = []
 
@@ -5926,6 +6187,23 @@ def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
         )
     except Exception as e:
         add("parser_dwg_converter", False, str(e))
+
+    # data hygiene (non-blocking): 用于识别孤儿项目数据，避免统计/审计偏差
+    try:
+        hygiene = _build_data_hygiene_report(apply=False)
+        orphan_count = int(_to_float_or_none(hygiene.get("orphan_records_total")) or 0)
+        impacted = sum(
+            1
+            for row in (hygiene.get("datasets") or [])
+            if int(_to_float_or_none((row or {}).get("orphan_count")) or 0) > 0
+        )
+        add(
+            "data_hygiene",
+            orphan_count == 0,
+            f"orphan_records={orphan_count}, impacted_datasets={impacted}",
+        )
+    except Exception as e:
+        add("data_hygiene", False, str(e))
 
     # project-specific checks
     if project_id:
@@ -6326,6 +6604,41 @@ def system_self_check(
     """运行系统自检并返回结构化结果。"""
     ensure_data_dirs()
     return SelfCheckResponse(**_run_system_self_check(project_id))
+
+
+@router.get(
+    "/system/data_hygiene",
+    response_model=DataHygieneResponse,
+    tags=["系统状态"],
+)
+def system_data_hygiene() -> DataHygieneResponse:
+    """
+    数据卫生巡检（只读）。
+
+    用于检查项目删除/迁移后是否残留孤儿记录，避免影响评分统计与审计结论。
+    """
+    ensure_data_dirs()
+    payload = _build_data_hygiene_report(apply=False)
+    return DataHygieneResponse(**payload)
+
+
+@router.post(
+    "/system/data_hygiene/repair",
+    response_model=DataHygieneResponse,
+    tags=["系统状态"],
+    responses={**RESPONSES_401},
+)
+def repair_system_data_hygiene(
+    api_key: Optional[str] = Depends(verify_api_key),
+) -> DataHygieneResponse:
+    """
+    数据卫生修复（写操作）。
+
+    清理 project_id / submission_id / patch_id 失联导致的孤儿记录。
+    """
+    ensure_data_dirs()
+    payload = _build_data_hygiene_report(apply=True)
+    return DataHygieneResponse(**payload)
 
 
 @router.post(
@@ -13050,6 +13363,23 @@ def compat_system_self_check(
     project_id: Optional[str] = Query(None),
 ) -> SelfCheckResponse:
     return system_self_check(project_id=project_id)
+
+
+@compat_router.get("/system/data_hygiene", response_model=DataHygieneResponse, tags=["系统状态"])
+def compat_system_data_hygiene() -> DataHygieneResponse:
+    return system_data_hygiene()
+
+
+@compat_router.post(
+    "/system/data_hygiene/repair",
+    response_model=DataHygieneResponse,
+    tags=["系统状态"],
+    responses={**RESPONSES_401},
+)
+def compat_repair_system_data_hygiene(
+    api_key: Optional[str] = Depends(verify_api_key),
+) -> DataHygieneResponse:
+    return repair_system_data_hygiene(api_key=api_key)
 
 
 @compat_router.get(

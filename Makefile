@@ -1,7 +1,7 @@
 # 施工组织设计评标评分系统 Makefile
 # 提供一键操作命令
 
-.PHONY: install test smoke score docx batch clean help coverage lint-fix pre-commit web run api restart stop status daemon-start daemon-stop daemon-status analysis-bundle analysis-bundle-all doctor e2e-flow mece-audit spec-coverage acceptance acceptance-fast
+.PHONY: install test smoke score docx batch clean help coverage lint-fix pre-commit web run api restart stop status daemon-start daemon-stop daemon-status analysis-bundle analysis-bundle-all doctor e2e-flow mece-audit data-hygiene spec-coverage acceptance acceptance-fast
 
 PYTHON ?= $(shell if [ -x .venv/bin/python ]; then echo .venv/bin/python; else echo python3; fi)
 
@@ -22,6 +22,7 @@ help:
 	@echo "  make acceptance - 严格验收（doctor + e2e + spec-coverage + pytest）"
 	@echo "  make acceptance-fast - 快速严格验收（跳过pytest）"
 	@echo "  make mece-audit - 生成项目级 MECE 诊断汇总（build/mece_audit_latest.*）"
+	@echo "  make data-hygiene - 生成数据卫生巡检（build/data_hygiene_latest.*）"
 	@echo "  make spec-coverage - 检查V2重构关键文件/API覆盖度"
 	@echo "  make analysis-bundle PROJECT_ID=<id> - 导出项目分析包 Markdown"
 	@echo "  make analysis-bundle-all - 导出全部项目分析包 Markdown"
@@ -152,6 +153,10 @@ e2e-flow:
 # 项目级 MECE 审计汇总
 mece-audit:
 	./scripts/mece_audit.sh
+
+# 数据卫生巡检（孤儿记录检查）
+data-hygiene:
+	./scripts/data_hygiene.sh
 
 # V2 规格覆盖度检查（关键文件 + API）
 spec-coverage:

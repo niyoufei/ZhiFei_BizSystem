@@ -138,6 +138,7 @@ check_endpoint_coverage() {
     "/api/v1/projects/{project_id}/rescore"
     "/api/v1/scoring/factors"
     "/api/v1/system/self_check"
+    "/api/v1/system/data_hygiene"
   )
   local missing=()
   local p

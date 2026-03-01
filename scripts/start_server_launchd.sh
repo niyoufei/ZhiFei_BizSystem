@@ -48,7 +48,33 @@ if [[ "$FORCE_LAUNCHD" != "1" ]]; then
   esac
 fi
 
-APP_DIR="$ROOT_DIR" PORT="$PORT" PY_BIN="$PY_BIN" launchctl submit -l "$LABEL" -- /bin/sh "$RUNNER"
+submit_err_file="$(mktemp "${TMPDIR:-/tmp}/zhifei_launchd_submit.XXXXXX")"
+set +e
+APP_DIR="$ROOT_DIR" PORT="$PORT" PY_BIN="$PY_BIN" launchctl submit -l "$LABEL" -- /bin/sh "$RUNNER" 2>"$submit_err_file"
+submit_status=$?
+set -e
+if [[ "$submit_status" -ne 0 ]]; then
+  echo "launchctl submit failed (status=$submit_status)."
+  sed -n '1,40p' "$submit_err_file" || true
+  rm -f "$submit_err_file"
+  case "$ROOT_DIR" in
+    */Desktop/*|*/Desktop)
+      echo "fallback: using regular background restart (launchctl submit failed)."
+      launchctl remove "$LABEL" >/dev/null 2>&1 || true
+      PORT="$PORT" ./scripts/restart_server.sh
+      {
+        echo "mode=fallback"
+        echo "label=$LABEL"
+        echo "port=$PORT"
+        echo "updated_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+        echo "reason=launchctl_submit_failed"
+      } > "$MODE_FILE"
+      exit 0
+      ;;
+  esac
+  exit 1
+fi
+rm -f "$submit_err_file"
 
 for _ in $(seq 1 30); do
   if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then

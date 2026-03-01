@@ -74,6 +74,7 @@ if openapi_payload="$(curl_with_auth "$OPENAPI_URL" 2>/dev/null)"; then
     "/api/v1/projects/{project_id}/mece_audit"
     "/api/v1/scoring/factors"
     "/api/v1/system/self_check"
+    "/api/v1/system/data_hygiene"
   )
   missing=()
   for p in "${required_paths[@]}"; do

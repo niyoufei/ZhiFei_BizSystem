@@ -24,6 +24,7 @@ REQUIRED_FILES = [
     "scripts/evaluate_golden_dataset.py",
     "scripts/e2e_api_flow.sh",
     "scripts/mece_audit.sh",
+    "scripts/data_hygiene.sh",
     "scripts/doctor.sh",
 ]
 
@@ -37,6 +38,7 @@ REQUIRED_PATHS_METHODS = [
     ("/api/v1/scoring/factors", "GET"),
     ("/api/v1/scoring/factors/markdown", "GET"),
     ("/api/v1/system/self_check", "GET"),
+    ("/api/v1/system/data_hygiene", "GET"),
 ]
 
 

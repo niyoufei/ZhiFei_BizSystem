@@ -4537,6 +4537,10 @@ class TestProjectLevelCacheIntegration:
 
 
 class TestSystemSelfCheckCapabilities:
+    @patch(
+        "app.main._build_data_hygiene_report",
+        return_value={"orphan_records_total": 0, "datasets": []},
+    )
     @patch("app.main._resolve_dwg_converter_binaries", return_value=["/usr/local/bin/dwg2dxf"])
     @patch("app.main.get_rate_limit_status", return_value={"enabled": False})
     @patch("app.main.get_auth_status", return_value={"enabled": False})
@@ -4549,6 +4553,7 @@ class TestSystemSelfCheckCapabilities:
         mock_auth_status,
         mock_rate_limit_status,
         mock_dwg_bins,
+        mock_data_hygiene,
     ):
         from app.main import _run_system_self_check
 
@@ -4559,7 +4564,12 @@ class TestSystemSelfCheckCapabilities:
         assert "parser_docx" in names
         assert "parser_ocr" in names
         assert "parser_dwg_converter" in names
+        assert "data_hygiene" in names
 
+    @patch(
+        "app.main._build_data_hygiene_report",
+        return_value={"orphan_records_total": 0, "datasets": []},
+    )
     @patch("app.main._resolve_dwg_converter_binaries", return_value=[])
     @patch("app.main.get_rate_limit_status", return_value={"enabled": False})
     @patch("app.main.get_auth_status", return_value={"enabled": False})
@@ -4574,6 +4584,7 @@ class TestSystemSelfCheckCapabilities:
         mock_auth_status,
         mock_rate_limit_status,
         mock_dwg_bins,
+        mock_data_hygiene,
     ):
         from app.main import _run_system_self_check
 
@@ -4585,6 +4596,61 @@ class TestSystemSelfCheckCapabilities:
         assert dwg_item.get("ok") is False
         pdf_item = next((x for x in items if x.get("name") == "parser_pdf"), {})
         assert pdf_item.get("ok") is True
+
+
+class TestDataHygieneEndpoints:
+    @patch("app.main._build_data_hygiene_report")
+    def test_system_data_hygiene_audit(self, mock_hygiene, client):
+        mock_hygiene.return_value = {
+            "generated_at": "2026-03-01T00:00:00+00:00",
+            "apply_mode": False,
+            "valid_project_count": 2,
+            "orphan_records_total": 3,
+            "cleaned_records_total": 0,
+            "datasets": [
+                {
+                    "name": "materials",
+                    "total": 10,
+                    "orphan_count": 3,
+                    "cleaned_count": 0,
+                    "mode": "project_id",
+                }
+            ],
+            "recommendations": ["发现孤儿记录 3 条，建议修复。"],
+        }
+        response = client.get("/api/v1/system/data_hygiene")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["apply_mode"] is False
+        assert data["orphan_records_total"] == 3
+        assert len(data["datasets"]) == 1
+        mock_hygiene.assert_called_once_with(apply=False)
+
+    @patch("app.main._build_data_hygiene_report")
+    def test_system_data_hygiene_repair(self, mock_hygiene, client):
+        mock_hygiene.return_value = {
+            "generated_at": "2026-03-01T00:00:00+00:00",
+            "apply_mode": True,
+            "valid_project_count": 2,
+            "orphan_records_total": 3,
+            "cleaned_records_total": 3,
+            "datasets": [
+                {
+                    "name": "materials",
+                    "total": 10,
+                    "orphan_count": 3,
+                    "cleaned_count": 3,
+                    "mode": "project_id",
+                }
+            ],
+            "recommendations": ["已清理孤儿记录 3 条。"],
+        }
+        response = client.post("/api/v1/system/data_hygiene/repair")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["apply_mode"] is True
+        assert data["cleaned_records_total"] == 3
+        mock_hygiene.assert_called_once_with(apply=True)
 
 
 class TestComputeMultipliersHash:
