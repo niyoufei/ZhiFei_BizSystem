@@ -34,7 +34,10 @@ if command -v screen >/dev/null 2>&1; then
     LOG_FILE="$LOG_FILE" \
     /bin/zsh -lc 'cd "$ROOT_DIR" && "$PYTHON_BIN" scripts/ops_agents.py --base-url "$BASE_URL" --api-key "$API_KEY" --auto-repair 1 --auto-evolve 1 --interval-seconds "$INTERVAL_SECONDS" --max-cycles "$MAX_CYCLES" >>"$LOG_FILE" 2>&1'
   sleep 1
-  screen_pid="$(screen -ls | awk '/\.'"$SCREEN_SESSION"'[[:space:]]/{split($1,a,"."); print a[1]; exit}')"
+  screen_pid="$(
+    (screen -ls 2>/dev/null || true) \
+      | awk '/\.'"$SCREEN_SESSION"'[[:space:]]/{split($1,a,"."); print a[1]; found=1} END{if (!found) print ""}'
+  )"
   if [[ -n "${screen_pid:-}" ]]; then
     printf '%s\n' "$screen_pid" > "$PID_FILE"
   fi
