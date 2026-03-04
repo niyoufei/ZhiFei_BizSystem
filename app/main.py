@@ -14179,7 +14179,7 @@ def index(
                     + f"<td>{created_at}</td>"
                     + (
                         "<td>"
-                        + f'<button type="button" class="btn-danger js-delete-material" data-material-id="{material_id}" data-filename="{html_lib.escape(filename_raw)}" onclick="return window.__zhifeiFallbackDelete(event, \'material\', this.getAttribute(\'data-material-id\'), this.getAttribute(\'data-filename\'))">删除</button>'
+                        + f'<button type="button" class="btn-danger js-delete-material" data-material-id="{material_id}" data-project-id="{html_lib.escape(str(m.get("project_id") or ""))}" data-filename="{html_lib.escape(filename_raw)}" onclick="return window.__zhifeiFallbackDelete(event, \'material\', this.getAttribute(\'data-material-id\'), this.getAttribute(\'data-filename\'), this.getAttribute(\'data-project-id\'))">删除</button>'
                         + "</td>"
                     )
                     + "</tr>"
@@ -14329,7 +14329,7 @@ def index(
                     + f"<td>{created_at}</td>"
                     + (
                         "<td>"
-                        + f'<button type="button" class="btn-danger js-delete-submission" data-submission-id="{submission_id}" data-filename="{html_lib.escape(filename_raw)}" onclick="return window.__zhifeiFallbackDelete(event, \'submission\', this.getAttribute(\'data-submission-id\'), this.getAttribute(\'data-filename\'))">删除</button>'
+                        + f'<button type="button" class="btn-danger js-delete-submission" data-submission-id="{submission_id}" data-project-id="{html_lib.escape(str(s.get("project_id") or ""))}" data-filename="{html_lib.escape(filename_raw)}" onclick="return window.__zhifeiFallbackDelete(event, \'submission\', this.getAttribute(\'data-submission-id\'), this.getAttribute(\'data-filename\'), this.getAttribute(\'data-project-id\'))">删除</button>'
                         + "</td>"
                     )
                     + "</tr>"
@@ -15131,6 +15131,29 @@ def index(
             const sel = document.getElementById('projectSelect');
             return (sel && sel.value) ? sel.value : '';
           }
+          function fallbackResolveProjectId(projectIdOverride='') {
+            const explicit = String(projectIdOverride || '').trim();
+            if (explicit) return explicit;
+            const fromSelect = fallbackGetProjectId();
+            if (fromSelect) return fromSelect;
+            const hiddenIds = [
+              'uploadShigongProjectId',
+              'uploadMaterialProjectId',
+              'uploadMaterialBoqProjectId',
+              'uploadMaterialDrawingProjectId',
+              'uploadMaterialPhotoProjectId',
+            ];
+            for (const hid of hiddenIds) {
+              const el = document.getElementById(hid);
+              const v = String((el && el.value) || '').trim();
+              if (v) return v;
+            }
+            try {
+              const qid = new URL(window.location.href).searchParams.get('project_id') || '';
+              if (String(qid).trim()) return String(qid).trim();
+            } catch (_) {}
+            return '';
+          }
           function fallbackApiKey() {
             try { return localStorage.getItem('api_key') || ''; } catch (_) { return ''; }
           }
@@ -15492,7 +15515,7 @@ def index(
                 '<td>' + mt + '</td>'
                 + '<td>' + fn + '</td>'
                 + '<td>' + createdAt + '</td>'
-                + '<td><button type="button" class="btn-danger js-delete-material" data-material-id="' + mid + '" data-filename="' + fn + '">删除</button></td>';
+                + '<td><button type="button" class="btn-danger js-delete-material" data-material-id="' + mid + '" data-project-id="' + fallbackEscapeHtml(pid) + '" data-filename="' + fn + '">删除</button></td>';
               if (tbody) tbody.appendChild(tr);
             });
           }
@@ -15625,7 +15648,7 @@ def index(
                 '<td>' + fn + '</td>'
                 + '<td>' + scoreHtml + '</td>'
                 + '<td>' + createdAt + '</td>'
-                + '<td><button type="button" class="btn-danger js-delete-submission" data-submission-id="' + sid + '" data-filename="' + fn + '">删除</button></td>';
+                + '<td><button type="button" class="btn-danger js-delete-submission" data-submission-id="' + sid + '" data-project-id="' + fallbackEscapeHtml(pid) + '" data-filename="' + fn + '">删除</button></td>';
               if (tbody) tbody.appendChild(tr);
             });
             if (window.renderMaterialUtilizationPanel && typeof window.renderMaterialUtilizationPanel === 'function') {
@@ -15950,8 +15973,8 @@ def index(
             }
             return !!res.ok;
           }
-          async function fallbackDelete(kind, fileId, filename, rowEl) {
-            const projectId = fallbackGetProjectId();
+          async function fallbackDelete(kind, fileId, filename, rowEl, projectIdOverride='') {
+            const projectId = fallbackResolveProjectId(projectIdOverride);
             if (!projectId) { alert('请先选择项目'); return false; }
             if (!fileId) { alert('删除失败：记录ID为空'); return false; }
             if (!confirm('确认删除该文件？')) return false;
@@ -15998,10 +16021,10 @@ def index(
             fallbackRunAction(actionId);
             return false;
           };
-          window.__zhifeiFallbackDelete = function (ev, kind, fileId, filename) {
+          window.__zhifeiFallbackDelete = function (ev, kind, fileId, filename, projectIdOverride='') {
             const rowEl = ev && ev.target && ev.target.closest ? ev.target.closest('tr') : null;
             fallbackStopEvent(ev);
-            fallbackDelete(kind, fileId, filename, rowEl);
+            fallbackDelete(kind, fileId, filename, rowEl, projectIdOverride);
             return false;
           };
           document.addEventListener('click', function (ev) {
@@ -16017,7 +16040,8 @@ def index(
             else if (kind === 'ground_truth') fileId = btn.getAttribute('data-gt-id') || '';
             else fileId = btn.getAttribute('data-material-id') || '';
             const filename = btn.getAttribute('data-filename') || '';
-            window.__zhifeiFallbackDelete(ev, kind, fileId, filename);
+            const projectIdOverride = btn.getAttribute('data-project-id') || '';
+            window.__zhifeiFallbackDelete(ev, kind, fileId, filename, projectIdOverride);
           }, true);
         })();
       </script>
@@ -16103,6 +16127,29 @@ def index(
         function pid() {
           const sel = document.getElementById('projectSelect');
           return pickProjectFromSelect(sel);
+        }
+        function resolveProjectId(projectIdOverride='') {
+          const explicit = String(projectIdOverride || '').trim();
+          if (explicit) return explicit;
+          const fromSelect = pid();
+          if (fromSelect) return fromSelect;
+          const hiddenIds = [
+            'uploadShigongProjectId',
+            'uploadMaterialProjectId',
+            'uploadMaterialBoqProjectId',
+            'uploadMaterialDrawingProjectId',
+            'uploadMaterialPhotoProjectId',
+          ];
+          for (const hid of hiddenIds) {
+            const el = document.getElementById(hid);
+            const v = String((el && el.value) || '').trim();
+            if (v) return v;
+          }
+          try {
+            const qid = new URL(window.location.href).searchParams.get('project_id') || '';
+            if (String(qid).trim()) return String(qid).trim();
+          } catch (_) {}
+          return '';
         }
         function selectedScoreScaleMax() {
           const el = document.getElementById('scoreScaleSelect');
@@ -17398,8 +17445,8 @@ def index(
           const detail = (data && data.detail) ? String(data.detail) : String(text || '').trim();
           return '删除失败：HTTP ' + String(status || 0) + (detail ? (' ' + detail) : '');
         }
-        async function deleteSubmissionRow(submissionId, rowEl, filename) {
-          const id = pid();
+        async function deleteSubmissionRow(submissionId, rowEl, filename, projectIdOverride='') {
+          const id = resolveProjectId(projectIdOverride);
           if (!id) { alert('删除失败：请先选择项目'); return; }
           if (!submissionId) { alert('删除失败：记录ID为空'); return; }
           const ok = confirm('确认删除该文件？');
@@ -17428,8 +17475,8 @@ def index(
           const out = document.getElementById('output');
           if (out) out.textContent = JSON.stringify({ ok: true, id: submissionId, filename: filename || '' }, null, 2);
         }
-        async function deleteMaterialRow(materialId, rowEl, filename) {
-          const id = pid();
+        async function deleteMaterialRow(materialId, rowEl, filename, projectIdOverride='') {
+          const id = resolveProjectId(projectIdOverride);
           if (!id) { alert('删除失败：请先选择项目'); return; }
           if (!materialId) { alert('删除失败：记录ID为空'); return; }
           const ok = confirm('确认删除该文件？');
@@ -17469,7 +17516,8 @@ def index(
               deleteSubmissionRow(
                 btn.getAttribute('data-submission-id') || '',
                 btn.closest('tr'),
-                btn.getAttribute('data-filename') || ''
+                btn.getAttribute('data-filename') || '',
+                btn.getAttribute('data-project-id') || ''
               );
             });
           }
@@ -17483,7 +17531,8 @@ def index(
               deleteMaterialRow(
                 btn.getAttribute('data-material-id') || '',
                 btn.closest('tr'),
-                btn.getAttribute('data-filename') || ''
+                btn.getAttribute('data-filename') || '',
+                btn.getAttribute('data-project-id') || ''
               );
             });
           }
@@ -17612,7 +17661,7 @@ def index(
               '<td>' + escapeHtmlText(s.filename || '') + '</td>' +
               '<td>' + scoreHtml + '</td>' +
               '<td>' + escapeHtmlText((s.created_at || '').slice(0,19)) + '</td>' +
-              '<td><button type="button" class="btn-danger js-delete-submission" data-submission-id="' + escapeHtmlText(String(s.id || '')) + '" data-filename="' + escapeHtmlText(String(s.filename || '')) + '">删除</button></td>';
+              '<td><button type="button" class="btn-danger js-delete-submission" data-submission-id="' + escapeHtmlText(String(s.id || '')) + '" data-project-id="' + escapeHtmlText(String(id || '')) + '" data-filename="' + escapeHtmlText(String(s.filename || '')) + '">删除</button></td>';
             if (tbody) tbody.appendChild(tr);
           });
           let utilPayload = null;
@@ -17765,7 +17814,7 @@ def index(
               '<td>' + escapeHtmlText(typeLabel) + '</td>' +
               '<td>' + escapeHtmlText(m.filename || '') + '</td>' +
               '<td>' + escapeHtmlText((m.created_at || '').slice(0,19)) + '</td>' +
-              '<td><button type="button" class="btn-danger js-delete-material" data-material-id="' + escapeHtmlText(String(m.id || '')) + '" data-filename="' + escapeHtmlText(String(m.filename || '')) + '">删除</button></td>';
+              '<td><button type="button" class="btn-danger js-delete-material" data-material-id="' + escapeHtmlText(String(m.id || '')) + '" data-project-id="' + escapeHtmlText(String(id || '')) + '" data-filename="' + escapeHtmlText(String(m.filename || '')) + '">删除</button></td>';
             if (tbody) tbody.appendChild(tr);
           });
           updateTableEmptyState('materialsTable', 'materialsEmpty');
@@ -17894,7 +17943,7 @@ def index(
           if (emptyEl) emptyEl.style.display = 'none';
           mats.forEach(m => {
             const tr = document.createElement('tr');
-            tr.innerHTML = '<td>' + m.filename + '</td><td>' + (m.created_at || '').slice(0,19) + '</td><td><button type="button" class="btn-danger js-delete-material" data-material-id="' + String(m.id || '') + '" data-filename="' + String(m.filename || '').replace(/"/g, '&quot;') + '">删除</button></td>';
+            tr.innerHTML = '<td>' + m.filename + '</td><td>' + (m.created_at || '').slice(0,19) + '</td><td><button type="button" class="btn-danger js-delete-material" data-material-id="' + String(m.id || '') + '" data-project-id="' + String(id || '') + '" data-filename="' + String(m.filename || '').replace(/"/g, '&quot;') + '">删除</button></td>';
             const btn = tr.querySelector('button');
             if (btn) btn.onclick = async () => {
               const r = await fetch('/api/v1/projects/' + id + '/materials/' + m.id, { method: 'DELETE', headers: apiHeaders() });
