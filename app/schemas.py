@@ -508,6 +508,8 @@ class SelfCheckItem(BaseModel):
     name: str
     ok: bool
     detail: Optional[str] = None
+    category: Optional[str] = None
+    required: bool = False
 
 
 class SelfCheckResponse(BaseModel):
@@ -517,6 +519,8 @@ class SelfCheckResponse(BaseModel):
     failed_required_count: int = 0
     failed_optional_count: int = 0
     checked_at: str
+    checks: Dict[str, bool] = Field(default_factory=dict)
+    summary: Dict[str, Any] = Field(default_factory=dict)
     items: List[SelfCheckItem] = Field(default_factory=list)
 
 

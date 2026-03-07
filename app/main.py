@@ -7499,18 +7499,56 @@ def _build_data_hygiene_report(*, apply: bool) -> Dict[str, object]:
 def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
     items: List[Dict[str, object]] = []
 
-    def add(name: str, ok: bool, detail: str = "") -> None:
-        items.append({"name": name, "ok": bool(ok), "detail": detail or None})
+    def add(
+        name: str,
+        ok: bool,
+        detail: str = "",
+        *,
+        category: str = "runtime",
+        required: Optional[bool] = None,
+    ) -> None:
+        is_required = (
+            bool(required)
+            if required is not None
+            else str(name) in SYSTEM_SELF_CHECK_REQUIRED_ITEM_NAMES
+        )
+        items.append(
+            {
+                "name": name,
+                "ok": bool(ok),
+                "detail": detail or None,
+                "category": category,
+                "required": is_required,
+            }
+        )
+
+    auth_enabled: Optional[bool] = None
+    rate_limit_enabled: Optional[bool] = None
+    pdf_backend = "none"
+    ocr_available = False
+    dwg_converter_found = False
+    data_hygiene_orphan_count = 0
+    data_hygiene_impacted = 0
+    project_name: Optional[str] = None
+    project_material_count: Optional[int] = None
+    project_submission_count: Optional[int] = None
+    project_ready: Optional[bool] = None
+    project_gate_passed: Optional[bool] = None
+    project_issue_count: Optional[int] = None
+    project_warning_count: Optional[int] = None
+    project_missing_required_types: List[str] = []
+    project_issues_preview = "-"
+    project_warnings_preview = "-"
 
     # health (always true if request reaches server)
-    add("health", True, "service reachable")
+    add("health", True, "service reachable", category="service")
 
     # config
     try:
         load_config()
-        add("config", True, "rubric/lexicon loaded")
+        add("config", True, "rubric/lexicon loaded", category="config")
     except Exception as e:
-        add("config", False, str(e))
+        add("config", False, str(e), category="config")
 
     # data dirs + writable test
     try:
@@ -7519,22 +7557,29 @@ def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
             prefix="selfcheck_", suffix=".tmp", dir="data", delete=True
         ) as _:
             pass
-        add("data_dirs_writable", True, "data directory writable")
+        add("data_dirs_writable", True, "data directory writable", category="storage")
     except Exception as e:
-        add("data_dirs_writable", False, str(e))
+        add("data_dirs_writable", False, str(e), category="storage")
 
     # status providers
     try:
         s = get_auth_status()
-        enabled = bool(s.get("auth_enabled", s.get("enabled", False)))
-        add("auth_status", True, f"enabled={enabled}")
+        auth_enabled = bool(s.get("auth_enabled", s.get("enabled", False)))
+        add("auth_status", True, f"enabled={auth_enabled}", category="security", required=False)
     except Exception as e:
-        add("auth_status", False, str(e))
+        add("auth_status", False, str(e), category="security", required=False)
     try:
         s = get_rate_limit_status()
-        add("rate_limit_status", True, f"enabled={bool(s.get('enabled'))}")
+        rate_limit_enabled = bool(s.get("enabled"))
+        add(
+            "rate_limit_status",
+            True,
+            f"enabled={rate_limit_enabled}",
+            category="security",
+            required=False,
+        )
     except Exception as e:
-        add("rate_limit_status", False, str(e))
+        add("rate_limit_status", False, str(e), category="security", required=False)
 
     # parser/runtime capability checks
     pdf_backend = _pdf_backend_name()
@@ -7542,47 +7587,59 @@ def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
         "parser_pdf",
         pdf_backend != "none",
         (f"backend={pdf_backend}" if pdf_backend != "none" else "PyMuPDF/pypdf missing"),
+        category="parser",
+        required=False,
     )
     add(
         "parser_docx",
         Document is not None,
         "python-docx available" if Document is not None else "python-docx missing",
+        category="parser",
+        required=False,
     )
     ocr_available = bool(pytesseract is not None and Image is not None)
     if ocr_available:
         try:
             version = str(pytesseract.get_tesseract_version()) if pytesseract is not None else ""
-            add("parser_ocr", True, f"tesseract={version}")
+            add("parser_ocr", True, f"tesseract={version}", category="parser", required=False)
         except Exception:
-            add("parser_ocr", True, "pytesseract available")
+            add("parser_ocr", True, "pytesseract available", category="parser", required=False)
     else:
-        add("parser_ocr", False, "pytesseract or PIL missing")
+        add("parser_ocr", False, "pytesseract or PIL missing", category="parser", required=False)
     try:
         dwg_bins = _resolve_dwg_converter_binaries()
+        dwg_converter_found = bool(dwg_bins)
         add(
             "parser_dwg_converter",
-            bool(dwg_bins),
+            dwg_converter_found,
             f"found={','.join(Path(p).name for p in dwg_bins)}" if dwg_bins else "not_found",
+            category="parser",
+            required=False,
         )
     except Exception as e:
-        add("parser_dwg_converter", False, str(e))
+        add("parser_dwg_converter", False, str(e), category="parser", required=False)
 
     # data hygiene (non-blocking): 用于识别孤儿项目数据，避免统计/审计偏差
     try:
         hygiene = _build_data_hygiene_report(apply=False)
-        orphan_count = int(_to_float_or_none(hygiene.get("orphan_records_total")) or 0)
-        impacted = sum(
+        data_hygiene_orphan_count = int(_to_float_or_none(hygiene.get("orphan_records_total")) or 0)
+        data_hygiene_impacted = sum(
             1
             for row in (hygiene.get("datasets") or [])
             if int(_to_float_or_none((row or {}).get("orphan_count")) or 0) > 0
         )
         add(
             "data_hygiene",
-            orphan_count == 0,
-            f"orphan_records={orphan_count}, impacted_datasets={impacted}",
+            data_hygiene_orphan_count == 0,
+            (
+                f"orphan_records={data_hygiene_orphan_count}, "
+                f"impacted_datasets={data_hygiene_impacted}"
+            ),
+            category="data",
+            required=False,
         )
     except Exception as e:
-        add("data_hygiene", False, str(e))
+        add("data_hygiene", False, str(e), category="data", required=False)
 
     # project-specific checks
     if project_id:
@@ -7590,39 +7647,82 @@ def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
             projects = load_projects()
             target = next((p for p in projects if str(p.get("id")) == project_id), None)
             if target is None:
-                add("project_exists", False, f"project not found: {project_id}")
+                add(
+                    "project_exists",
+                    False,
+                    f"project not found: {project_id}",
+                    category="project",
+                )
             else:
-                add("project_exists", True, str(target.get("name") or project_id))
+                project_name = str(target.get("name") or project_id)
+                add("project_exists", True, project_name, category="project")
                 try:
-                    materials_count = len(
+                    project_material_count = len(
                         [m for m in load_materials() if str(m.get("project_id")) == project_id]
                     )
-                    add("project_materials_listable", True, f"count={materials_count}")
+                    add(
+                        "project_materials_listable",
+                        True,
+                        f"count={project_material_count}",
+                        category="project",
+                    )
                 except Exception as e:
-                    add("project_materials_listable", False, str(e))
+                    add("project_materials_listable", False, str(e), category="project")
                 try:
-                    submissions_count = len(
+                    project_submission_count = len(
                         [s for s in load_submissions() if str(s.get("project_id")) == project_id]
                     )
-                    add("project_submissions_listable", True, f"count={submissions_count}")
+                    add(
+                        "project_submissions_listable",
+                        True,
+                        f"count={project_submission_count}",
+                        category="project",
+                    )
                 except Exception as e:
-                    add("project_submissions_listable", False, str(e))
+                    add("project_submissions_listable", False, str(e), category="project")
                 try:
                     readiness = _build_scoring_readiness(project_id, target)
-                    ready = bool(readiness.get("ready"))
+                    project_ready = bool(readiness.get("ready"))
+                    project_gate_passed = bool(readiness.get("gate_passed"))
                     issues = (
                         readiness.get("issues") if isinstance(readiness.get("issues"), list) else []
                     )
-                    issues_preview = "；".join(str(x) for x in issues[:2]) if issues else "-"
+                    warnings = (
+                        readiness.get("warnings")
+                        if isinstance(readiness.get("warnings"), list)
+                        else []
+                    )
+                    material_gate = (
+                        readiness.get("material_gate")
+                        if isinstance(readiness.get("material_gate"), dict)
+                        else {}
+                    )
+                    project_issue_count = len(issues)
+                    project_warning_count = len(warnings)
+                    project_missing_required_types = [
+                        str(x)
+                        for x in (material_gate.get("missing_required_types") or [])
+                        if str(x).strip()
+                    ]
+                    project_issues_preview = (
+                        "；".join(str(x) for x in issues[:2]) if issues else "-"
+                    )
+                    project_warnings_preview = (
+                        "；".join(str(x) for x in warnings[:2]) if warnings else "-"
+                    )
                     add(
                         "project_scoring_readiness",
                         True,
-                        f"ready={ready}, issues={issues_preview}",
+                        (
+                            f"ready={project_ready}, gate_passed={project_gate_passed}, "
+                            f"issues={project_issues_preview}"
+                        ),
+                        category="project",
                     )
                 except Exception as e:
-                    add("project_scoring_readiness", False, str(e))
+                    add("project_scoring_readiness", False, str(e), category="project")
         except Exception as e:
-            add("project_exists", False, str(e))
+            add("project_exists", False, str(e), category="project")
 
     # `parser_ocr` / `parser_dwg_converter` 属于增强能力，不应阻断系统基础可用性判断。
     required_items = [
@@ -7635,6 +7735,50 @@ def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
         if str(x.get("name")) not in SYSTEM_SELF_CHECK_REQUIRED_ITEM_NAMES and not bool(x.get("ok"))
     ]
     all_ok = bool(required_items) and not required_failures
+    checks = {str(x.get("name")): bool(x.get("ok")) for x in items if str(x.get("name")).strip()}
+    parser_checks = {
+        name: bool(checks.get(name))
+        for name in ("parser_pdf", "parser_docx", "parser_ocr", "parser_dwg_converter")
+    }
+    passed_count = sum(1 for row in items if bool(row.get("ok")))
+    missing_required_labels = [
+        _material_type_label(row) for row in project_missing_required_types if str(row).strip()
+    ]
+    summary = {
+        "total_items": len(items),
+        "passed_items": passed_count,
+        "failed_items": len(items) - passed_count,
+        "required_items": len(required_items),
+        "optional_items": max(0, len(items) - len(required_items)),
+        "failed_required_items": [
+            str(x.get("name")) for x in required_failures if str(x.get("name")).strip()
+        ],
+        "failed_optional_items": [
+            str(x.get("name")) for x in optional_failures if str(x.get("name")).strip()
+        ],
+        "parser_capabilities": parser_checks,
+        "parser_capability_count": sum(1 for ok in parser_checks.values() if ok),
+        "parser_capability_total": len(parser_checks),
+        "auth_enabled": auth_enabled,
+        "rate_limit_enabled": rate_limit_enabled,
+        "pdf_backend": pdf_backend,
+        "ocr_available": ocr_available,
+        "dwg_converter_found": dwg_converter_found,
+        "data_hygiene_orphan_records": data_hygiene_orphan_count,
+        "data_hygiene_impacted_datasets": data_hygiene_impacted,
+        "project_id": project_id,
+        "project_name": project_name,
+        "project_material_count": project_material_count,
+        "project_submission_count": project_submission_count,
+        "project_ready": project_ready,
+        "project_gate_passed": project_gate_passed,
+        "project_issue_count": project_issue_count,
+        "project_warning_count": project_warning_count,
+        "project_missing_required_types": project_missing_required_types,
+        "project_missing_required_labels": missing_required_labels,
+        "project_issues_preview": project_issues_preview,
+        "project_warnings_preview": project_warnings_preview,
+    }
     return {
         "ok": all_ok,
         "required_ok": all_ok,
@@ -7642,6 +7786,8 @@ def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
         "failed_required_count": len(required_failures),
         "failed_optional_count": len(optional_failures),
         "checked_at": _now_iso(),
+        "checks": checks,
+        "summary": summary,
         "items": items,
     }
 
@@ -18434,6 +18580,8 @@ def index(
           if (!el) return;
           const payload = (data && typeof data === 'object') ? data : {};
           const items = Array.isArray(payload.items) ? payload.items : [];
+          const checks = (payload.checks && typeof payload.checks === 'object') ? payload.checks : {};
+          const meta = (payload.summary && typeof payload.summary === 'object') ? payload.summary : {};
           const failedRequired = Number(payload.failed_required_count || 0);
           const failedOptional = Number(payload.failed_optional_count || 0);
           const degraded = !!payload.degraded;
@@ -18449,14 +18597,43 @@ def index(
           }
           el.style.display = 'block';
           el.style.borderLeftColor = accent;
+          const parserCapabilities = (meta.parser_capabilities && typeof meta.parser_capabilities === 'object')
+            ? meta.parser_capabilities
+            : {};
           const capabilityNames = ['parser_pdf', 'parser_docx', 'parser_ocr', 'parser_dwg_converter'];
-          const capabilityRows = items.filter((x) => capabilityNames.includes(String((x && x.name) || '')));
-          const capabilitySummary = capabilityRows.length
-            ? capabilityRows.map((x) => (x && x.ok ? '✓' : '×') + String((x && x.name) || '')).join(' / ')
-            : '无';
+          const capabilitySummary = capabilityNames
+            .filter((name) => Object.prototype.hasOwnProperty.call(parserCapabilities, name) || Object.prototype.hasOwnProperty.call(checks, name))
+            .map((name) => ((parserCapabilities[name] ?? checks[name]) ? '✓' : '×') + name)
+            .join(' / ') || '无';
+          const projectMissing = Array.isArray(meta.project_missing_required_labels) ? meta.project_missing_required_labels : [];
+          const projectLine = meta.project_id
+            ? ('<p style="margin:4px 0 0 0;font-size:12px;color:#475569">项目：'
+              + escapeHtmlText(String(meta.project_name || meta.project_id))
+              + '；评分就绪：'
+              + escapeHtmlText(meta.project_ready == null ? '-' : (meta.project_ready ? '是' : '否'))
+              + '；资料门禁：'
+              + escapeHtmlText(meta.project_gate_passed == null ? '-' : (meta.project_gate_passed ? '通过' : '未通过'))
+              + '</p>')
+            : '';
           let html = '<strong>' + escapeHtmlText(summary) + '</strong>';
           html += '<p style="margin:6px 0 0 0;font-size:12px;color:#475569">解析能力：' + escapeHtmlText(capabilitySummary) + '</p>';
           html += '<p style="margin:4px 0 0 0;font-size:12px;color:#475569">核心异常：' + escapeHtmlText(String(failedRequired)) + '，降级告警：' + escapeHtmlText(String(failedOptional)) + '</p>';
+          html += projectLine;
+          html += '<table style="margin-top:8px"><tr><th>汇总项</th><th>值</th><th>说明</th></tr>'
+            + '<tr><td>检查总数</td><td>' + escapeHtmlText(String(meta.total_items || items.length || 0)) + '</td><td>通过 '
+            + escapeHtmlText(String(meta.passed_items || (items.length - failed) || 0)) + ' / 失败 '
+            + escapeHtmlText(String(meta.failed_items || failed || 0)) + '</td></tr>'
+            + '<tr><td>解析能力</td><td>' + escapeHtmlText(String(meta.parser_capability_count || 0)) + ' / '
+            + escapeHtmlText(String(meta.parser_capability_total || 0)) + '</td><td>PDF后端 '
+            + escapeHtmlText(String(meta.pdf_backend || '-')) + '</td></tr>'
+            + '<tr><td>数据卫生</td><td>' + escapeHtmlText(String(meta.data_hygiene_orphan_records || 0)) + ' 个孤儿记录</td><td>影响数据集 '
+            + escapeHtmlText(String(meta.data_hygiene_impacted_datasets || 0)) + ' 个</td></tr>'
+            + '<tr><td>安全状态</td><td>鉴权 '
+            + escapeHtmlText(meta.auth_enabled == null ? '-' : (meta.auth_enabled ? '开' : '关'))
+            + '；限流 '
+            + escapeHtmlText(meta.rate_limit_enabled == null ? '-' : (meta.rate_limit_enabled ? '开' : '关'))
+            + '</td><td>' + escapeHtmlText(projectMissing.length ? ('缺少资料：' + projectMissing.join('、')) : (meta.project_issues_preview || meta.project_warnings_preview || '-')) + '</td></tr>'
+            + '</table>';
           html += '<table style="margin-top:8px"><tr><th>检查项</th><th>状态</th><th>详情</th></tr>';
           html += items.length
             ? items.map((x) => {

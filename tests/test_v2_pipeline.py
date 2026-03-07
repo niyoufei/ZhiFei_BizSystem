@@ -1456,13 +1456,17 @@ class TestSystemSelfCheckEndpoint:
         assert "ok" in data
         assert "required_ok" in data
         assert "degraded" in data
+        assert isinstance(data.get("checks"), dict)
+        assert isinstance(data.get("summary"), dict)
         assert isinstance(data.get("items"), list)
+        assert data["checks"]["health"] is True
         assert any(item.get("name") == "health" for item in data.get("items", []))
 
     def test_system_self_check_project_missing(self):
         resp = _client().get("/api/v1/system/self_check?project_id=missing_project_id")
         assert resp.status_code == 200
         data = resp.json()
+        assert data["summary"]["project_id"] == "missing_project_id"
         items = data.get("items", [])
         target = next((x for x in items if x.get("name") == "project_exists"), None)
         assert target is not None

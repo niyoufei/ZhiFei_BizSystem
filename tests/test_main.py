@@ -5309,6 +5309,10 @@ class TestSystemSelfCheckCapabilities:
         assert "degraded" in payload
         assert "failed_required_count" in payload
         assert "failed_optional_count" in payload
+        assert payload["checks"]["health"] is True
+        assert payload["checks"]["parser_pdf"] is True
+        assert payload["summary"]["parser_capability_total"] == 4
+        assert payload["summary"]["data_hygiene_orphan_records"] == 0
 
     @patch(
         "app.main._build_data_hygiene_report",
@@ -5339,6 +5343,8 @@ class TestSystemSelfCheckCapabilities:
         assert payload.get("degraded") is True
         assert payload.get("failed_required_count") == 0
         assert payload.get("failed_optional_count") == 1
+        assert payload["checks"]["parser_dwg_converter"] is False
+        assert "parser_dwg_converter" in payload["summary"]["failed_optional_items"]
         items = payload.get("items") or []
         dwg_item = next((x for x in items if x.get("name") == "parser_dwg_converter"), {})
         assert dwg_item.get("ok") is False
