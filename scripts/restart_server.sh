@@ -6,6 +6,8 @@ cd "$ROOT_DIR"
 
 PORT="${PORT:-8000}"
 STRICT="${STRICT:-0}"
+AUTO_REPAIR_DATA_HYGIENE="${AUTO_REPAIR_DATA_HYGIENE:-1}"
+API_KEY="${API_KEY:-}"
 PID_FILE="build/server.pid"
 LOG_FILE="build/server.log"
 LOCK_DIR="build/.restart.lock"
@@ -126,6 +128,36 @@ wait_until_ready() {
   return 1
 }
 
+curl_with_auth() {
+  if [[ -n "$API_KEY" ]]; then
+    curl -fsS -H "X-API-Key: $API_KEY" "$@"
+  else
+    curl -fsS "$@"
+  fi
+}
+
+post_start_data_hygiene_repair() {
+  if [[ "$AUTO_REPAIR_DATA_HYGIENE" != "1" ]]; then
+    return 0
+  fi
+  local repair_url="http://127.0.0.1:${PORT}/api/v1/system/data_hygiene/repair"
+  local audit_url="http://127.0.0.1:${PORT}/api/v1/system/data_hygiene"
+  local audit_payload=""
+  if curl_with_auth -X POST "$repair_url" >/dev/null 2>&1; then
+    echo "Post-start hygiene repair: OK"
+  else
+    echo "Warning: post-start hygiene repair skipped or failed."
+    return 0
+  fi
+  audit_payload="$(curl_with_auth "$audit_url" 2>/dev/null || true)"
+  if [[ -n "$audit_payload" ]]; then
+    local orphan_count
+    orphan_count="$(printf '%s' "$audit_payload" | grep -o '"orphan_records_total":[[:space:]]*[0-9]*' | head -n 1 | tr -cd '0-9' || true)"
+    echo "Post-start hygiene audit: orphan_records_total=${orphan_count:-unknown}"
+  fi
+  return 0
+}
+
 check_endpoint_coverage() {
   local openapi
   if ! openapi="$(curl -fsS "http://127.0.0.1:${PORT}/openapi.json" 2>/dev/null)"; then
@@ -182,6 +214,7 @@ if wait_until_ready; then
   echo "Start mode: $START_MODE"
   echo "URL: http://127.0.0.1:${PORT}/"
   echo "Log: $ROOT_DIR/$LOG_FILE"
+  post_start_data_hygiene_repair
   check_endpoint_coverage
   exit 0
 fi

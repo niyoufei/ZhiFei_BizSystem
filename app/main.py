@@ -189,6 +189,7 @@ from app.schemas import (
     ProjectRecord,
     ProjectRequirementRecord,
     ProjectScoreHistory,
+    ProjectScoringDiagnosticResponse,
     QingTianResultCreate,
     QingTianResultRecord,
     ReadyResponse,
@@ -342,7 +343,7 @@ DEFAULT_MIN_REQUIRED_TYPE_COVERAGE_RATE = 0.67
 DEFAULT_MATERIAL_RETRIEVAL_TOP_K = 18
 DEFAULT_MATERIAL_RETRIEVAL_PER_TYPE_QUOTA = 2
 DEFAULT_MATERIAL_RETRIEVAL_PER_FILE_QUOTA = 3
-DEFAULT_MIN_MATERIAL_RETRIEVAL_FILE_COVERAGE_RATE = 0.0
+DEFAULT_MIN_MATERIAL_RETRIEVAL_FILE_COVERAGE_RATE = 0.35
 DEFAULT_ENFORCE_UPLOADED_TYPE_COVERAGE = True
 DEFAULT_MIN_UPLOADED_TYPE_COVERAGE_RATE = 1.0
 DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR = 200
@@ -352,27 +353,47 @@ DEFAULT_CALIBRATION_MIN_SAMPLES = 20
 DEFAULT_CALIBRATION_FRESHNESS_DAYS = 90
 DEFAULT_CALIBRATION_MIN_RECENT_RATIO = 0.6
 PROFILE_LOCKED_STATUSES = {"submitted_to_qingtian"}
+SYSTEM_SELF_CHECK_REQUIRED_ITEM_NAMES = {
+    "health",
+    "config",
+    "data_dirs_writable",
+    "auth_status",
+    "rate_limit_status",
+    "parser_pdf",
+    "parser_docx",
+}
 DEFAULT_CHAPTER_REQUIREMENTS = {
     "required_sections": [
-        "重难点及危大工程（对应维度07）",
-        "进度保障措施（对应维度09）",
-        "安全生产与文明施工（对应维度02/03）",
-        "质量保障体系（对应维度08）",
+        "总体部署与信息化管理（对应维度01，必须出现“信息化管理”完整标题）",
+        "文明施工与绿色工地（对应维度03，必须出现“绿色工地”完整标题）",
+        "危大工程闭环管理（对应维度07）",
+        "质量管理体系与ITP简表（对应维度08）",
+        "进度计划体系与纠偏阈值（对应维度09）",
     ],
     "required_charts_images": [
-        "进度计划或横道图",
-        "危大工程或重难点分析示意图（如适用）",
-        "组织架构或责任分工表",
+        "总表A：项目总控参数表",
+        "总表D：风险控制总表",
+        "关键工序控制点表（06章固定表头）",
     ],
     "mandatory_elements": [
         "控制参数或阈值",
-        "执行频次（如日报/周检）",
+        "执行频次",
         "责任岗位或责任人",
         "验收或检查动作（报验/旁站/签认等）",
+        "记录表/台账/影像/检验批/隐蔽验收单",
     ],
     "forbidden_patterns": [
-        "仅使用「保证」「严格落实」「确保」等空泛承诺而无量化或动作",
-        "措施类描述缺少参数/频次/责任/验收中至少两类",
+        "按照",
+        "符合",
+        "确保",
+        "保障",
+        "严格落实",
+        "加强管理",
+        "有效措施",
+        "合理安排",
+        "现场实际情况",
+        "相关规范",
+        "有关规定",
     ],
 }
 
@@ -1013,6 +1034,75 @@ def _weights_norm_to_dimension_multipliers(weights_norm: Dict[str, float]) -> Di
     }
 
 
+def _evaluate_evolution_weight_status(
+    project_id: str,
+    *,
+    project: Optional[Dict[str, object]] = None,
+    evo: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    current_project = project
+    if not isinstance(current_project, dict):
+        current_project = _find_project(project_id, load_projects())
+    _ensure_project_v2_fields(current_project, include_engine_defaults=False)
+
+    current_evo = evo if isinstance(evo, dict) else (load_evolution_reports().get(project_id) or {})
+    scoring_evolution = (
+        current_evo.get("scoring_evolution")
+        if isinstance(current_evo.get("scoring_evolution"), dict)
+        else {}
+    )
+    dimension_multipliers = (
+        scoring_evolution.get("dimension_multipliers")
+        if isinstance(scoring_evolution.get("dimension_multipliers"), dict)
+        else {}
+    )
+    stored = bool(dimension_multipliers)
+    meta = current_project.get("meta") if isinstance(current_project.get("meta"), dict) else {}
+    min_samples = max(1, int(_to_float_or_none(meta.get("evolution_weight_min_samples")) or 3))
+    max_age_days = max(
+        1.0,
+        float(
+            _to_float_or_none(meta.get("evolution_weight_max_age_days"))
+            or DEFAULT_CALIBRATION_FRESHNESS_DAYS
+        ),
+    )
+    sample_count = int(_to_float_or_none(current_evo.get("sample_count")) or 0)
+    updated_at_dt = _parse_iso_datetime(
+        current_evo.get("updated_at") or current_evo.get("created_at")
+    )
+    age_days = None
+    if updated_at_dt is not None:
+        age_days = max(
+            0.0,
+            (datetime.now(timezone.utc) - updated_at_dt.astimezone(timezone.utc)).total_seconds()
+            / 86400.0,
+        )
+    thin = stored and sample_count < min_samples
+    stale = stored and age_days is not None and float(age_days) > float(max_age_days)
+    missing_timestamp = stored and age_days is None
+    usable = stored and not thin and not stale and not missing_timestamp
+    inactive_reason = None
+    if stored and not usable:
+        if thin:
+            inactive_reason = "sample_count_below_min"
+        elif stale:
+            inactive_reason = "stale"
+        elif missing_timestamp:
+            inactive_reason = "missing_timestamp"
+        else:
+            inactive_reason = "inactive"
+    return {
+        "stored": stored,
+        "usable": usable,
+        "inactive_reason": inactive_reason,
+        "sample_count": sample_count,
+        "min_samples": min_samples,
+        "age_days": age_days,
+        "max_age_days": max_age_days,
+        "dimension_multipliers": dimension_multipliers,
+    }
+
+
 def _resolve_project_scoring_context(
     project_id: str,
 ) -> tuple[Dict[str, float], Optional[Dict[str, object]], Dict[str, object]]:
@@ -1029,45 +1119,18 @@ def _resolve_project_scoring_context(
                 break
 
     # 进化权重优先，但必须满足最小样本量与时效性，避免概念漂移导致误导评分。
-    reports = load_evolution_reports()
-    evo = reports.get(project_id) or {}
-    se = evo.get("scoring_evolution") or {}
-    mult = se.get("dimension_multipliers") or {}
-    if mult:
-        meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
-        min_samples = max(1, int(_to_float_or_none(meta.get("evolution_weight_min_samples")) or 3))
-        max_age_days = max(
-            1.0,
-            float(
-                _to_float_or_none(meta.get("evolution_weight_max_age_days"))
-                or DEFAULT_CALIBRATION_FRESHNESS_DAYS
-            ),
-        )
-        sample_count = int(_to_float_or_none(evo.get("sample_count")) or 0)
-        updated_at_dt = _parse_iso_datetime(evo.get("updated_at") or evo.get("created_at"))
-        age_days = None
-        if updated_at_dt is not None:
-            age_days = max(
-                0.0,
-                (
-                    datetime.now(timezone.utc) - updated_at_dt.astimezone(timezone.utc)
-                ).total_seconds()
-                / 86400.0,
-            )
-        evolved_usable = (
-            sample_count >= min_samples
-            and age_days is not None
-            and float(age_days) <= float(max_age_days)
-        )
-        if evolved_usable:
-            return dict(mult), None, project
+    evo_status = _evaluate_evolution_weight_status(project_id, project=project)
+    if bool(evo_status.get("usable")):
+        return dict(evo_status.get("dimension_multipliers") or {}), None, project
+    if bool(evo_status.get("stored")):
+        age_days = _to_float_or_none(evo_status.get("age_days"))
         logger.info(
             "skip stale_or_thin_evolution_weights project_id=%s sample_count=%s min_samples=%s age_days=%s max_age_days=%s",
             project_id,
-            sample_count,
-            min_samples,
+            int(_to_float_or_none(evo_status.get("sample_count")) or 0),
+            int(_to_float_or_none(evo_status.get("min_samples")) or 0),
             round(float(age_days), 2) if age_days is not None else None,
-            max_age_days,
+            float(_to_float_or_none(evo_status.get("max_age_days")) or 0.0),
         )
 
     if profile and isinstance(profile.get("weights_norm"), dict):
@@ -1643,13 +1706,29 @@ def _build_runtime_custom_requirements(
     return runtime_requirements, meta
 
 
-def _infer_weights_source(project_id: str, profile_snapshot: Optional[Dict[str, object]]) -> str:
+def _infer_weights_source(
+    project_id: str,
+    profile_snapshot: Optional[Dict[str, object]],
+    project: Optional[Dict[str, object]] = None,
+) -> str:
+    status: Dict[str, object] = {"usable": False, "stored": False}
+    try:
+        current_project = project
+        if not isinstance(current_project, dict):
+            current_project = next(
+                (p for p in load_projects() if str(p.get("id") or "") == project_id),
+                None,
+            )
+        if isinstance(current_project, dict):
+            status = _evaluate_evolution_weight_status(project_id, project=current_project)
+    except Exception:
+        status = {"usable": False, "stored": False}
+    if bool(status.get("usable")):
+        return "evolution"
     if profile_snapshot:
         return "expert_profile"
-    evo = load_evolution_reports().get(project_id) or {}
-    evo_mult = (evo.get("scoring_evolution") or {}).get("dimension_multipliers") or {}
-    if isinstance(evo_mult, dict) and evo_mult:
-        return "evolution"
+    if bool(status.get("stored")):
+        return "evolution_stored_inactive"
     if any(str(p.get("project_id")) == project_id for p in load_learning_profiles()):
         return "learning_profile"
     return "default_uniform"
@@ -2430,6 +2509,559 @@ def _build_submission_scoring_basis_report(
         "material_utilization_gate": material_utilization_gate,
         "evidence_trace": evidence_trace,
         "recommendations": deduped_recommendations[:16],
+    }
+
+
+def _build_project_scoring_diagnostic(
+    project_id: str,
+    project: Dict[str, object],
+) -> Dict[str, object]:
+    """聚合“评分前置 + 资料深读 + 最新施组证据链 + 评分依据”的项目级诊断。"""
+    readiness = _build_scoring_readiness(project_id, project)
+    material_depth = _build_material_depth_report(project_id, project)
+    material_knowledge = _build_material_knowledge_profile(project_id)
+    material_rows = [m for m in load_materials() if str(m.get("project_id") or "") == project_id]
+
+    submissions = load_submissions()
+    latest = _latest_project_submission(project_id, submissions, prefer_scored=True)
+    latest_submission: Dict[str, object] = {
+        "exists": False,
+        "submission_id": None,
+        "filename": None,
+        "created_at": None,
+        "scoring_status": None,
+        "is_scored": False,
+    }
+    evidence_trace: Optional[Dict[str, object]] = None
+    scoring_basis: Optional[Dict[str, object]] = None
+
+    if isinstance(latest, dict):
+        report = latest.get("report") if isinstance(latest.get("report"), dict) else {}
+        scoring_status = str(report.get("scoring_status") or "unknown")
+        latest_submission = {
+            "exists": True,
+            "submission_id": str(latest.get("id") or ""),
+            "filename": str(latest.get("filename") or ""),
+            "created_at": str(latest.get("created_at") or ""),
+            "scoring_status": scoring_status,
+            "is_scored": scoring_status not in {"pending", "blocked", "unknown"},
+        }
+        evidence_trace = _build_submission_evidence_trace_report(
+            project_id=project_id,
+            submission=latest,
+        )
+        scoring_basis = _build_submission_scoring_basis_report(
+            project_id=project_id,
+            submission=latest,
+        )
+
+    trace_summary = evidence_trace.get("summary") if isinstance(evidence_trace, dict) else {}
+    basis_util = (
+        scoring_basis.get("material_utilization") if isinstance(scoring_basis, dict) else {}
+    )
+    basis_retrieval = (
+        scoring_basis.get("material_retrieval") if isinstance(scoring_basis, dict) else {}
+    )
+    basis_gate = (
+        scoring_basis.get("material_utilization_gate") if isinstance(scoring_basis, dict) else {}
+    )
+    conflict_summary = (
+        evidence_trace.get("material_conflicts") if isinstance(evidence_trace, dict) else {}
+    )
+    quality_summary = (
+        material_depth.get("quality_summary")
+        if isinstance(material_depth.get("quality_summary"), dict)
+        else {}
+    )
+    knowledge_summary = (
+        material_knowledge.get("summary")
+        if isinstance(material_knowledge.get("summary"), dict)
+        else {}
+    )
+    knowledge_by_dimension = (
+        material_knowledge.get("by_dimension")
+        if isinstance(material_knowledge.get("by_dimension"), list)
+        else []
+    )
+    depth_gate = (
+        material_depth.get("depth_gate")
+        if isinstance(material_depth.get("depth_gate"), dict)
+        else {}
+    )
+    material_gate = (
+        readiness.get("material_gate") if isinstance(readiness.get("material_gate"), dict) else {}
+    )
+    depth_rows = (
+        material_depth.get("by_type") if isinstance(material_depth.get("by_type"), list) else []
+    )
+    depth_by_type: Dict[str, Dict[str, object]] = {}
+    for row in depth_rows:
+        if not isinstance(row, dict):
+            continue
+        mat_type = _normalize_material_type(row.get("material_type"))
+        if mat_type:
+            depth_by_type[mat_type] = row
+    knowledge_rows = (
+        material_knowledge.get("by_type")
+        if isinstance(material_knowledge.get("by_type"), list)
+        else []
+    )
+    knowledge_numeric_terms_by_type: Dict[str, List[str]] = {}
+    knowledge_numeric_summary_by_type: Dict[str, List[str]] = {}
+    for row in knowledge_rows:
+        if not isinstance(row, dict):
+            continue
+        mat_type = _normalize_material_type(row.get("material_type"))
+        if not mat_type:
+            continue
+        top_numeric_terms = [
+            _normalize_numeric_token(item)
+            for item in (row.get("top_numeric_terms") or [])
+            if _normalize_numeric_token(item)
+        ]
+        knowledge_numeric_terms_by_type[mat_type] = top_numeric_terms[:12]
+        category_buckets: Dict[str, List[str]] = {}
+        top_terms = row.get("top_terms") if isinstance(row.get("top_terms"), list) else []
+        top_dimensions = (
+            row.get("top_dimensions") if isinstance(row.get("top_dimensions"), list) else []
+        )
+        first_dim = ""
+        if top_dimensions and isinstance(top_dimensions[0], dict):
+            first_dim = str(top_dimensions[0].get("dimension_id") or "")
+        for token in top_numeric_terms:
+            category = _classify_numeric_anchor_category(
+                terms=top_terms[:8],
+                material_type=mat_type,
+                dimension_id=first_dim,
+                label=row.get("material_type_label"),
+            )
+            _append_numeric_anchor_bucket(category_buckets, category, token)
+        knowledge_numeric_summary_by_type[mat_type] = _build_numeric_anchor_category_summary(
+            category_buckets
+        )
+    util_by_type = basis_util.get("by_type") if isinstance(basis_util.get("by_type"), dict) else {}
+    requirement_hits = (
+        evidence_trace.get("requirement_hits") if isinstance(evidence_trace, dict) else []
+    )
+    required_types = (
+        material_gate.get("required_types")
+        if isinstance(material_gate.get("required_types"), list)
+        else []
+    )
+    available_types = (
+        basis_util.get("available_types")
+        if isinstance(basis_util.get("available_types"), list)
+        else []
+    )
+    all_types: List[str] = []
+    for src in (
+        ["tender_qa", "boq", "drawing", "site_photo"],
+        required_types,
+        available_types,
+        list(depth_by_type.keys()),
+        list(util_by_type.keys()),
+    ):
+        for item in src:
+            key = _normalize_material_type(item)
+            if key and key not in all_types:
+                all_types.append(key)
+
+    uploaded_filenames_by_type: Dict[str, List[str]] = {}
+    for row in material_rows:
+        mat_type = _normalize_material_type(row.get("material_type"), filename=row.get("filename"))
+        filename = str(row.get("filename") or "").strip()
+        if not mat_type or not filename:
+            continue
+        bucket = uploaded_filenames_by_type.setdefault(mat_type, [])
+        if filename not in bucket:
+            bucket.append(filename)
+
+    hit_filenames_by_type: Dict[str, List[str]] = {}
+    hit_requirement_labels_by_type: Dict[str, List[str]] = {}
+    miss_requirement_labels_by_type: Dict[str, List[str]] = {}
+    hit_evidence_preview_by_type: Dict[str, List[Dict[str, str]]] = {}
+    miss_evidence_preview_by_type: Dict[str, List[Dict[str, str]]] = {}
+    if isinstance(requirement_hits, list):
+        for item in requirement_hits:
+            if not isinstance(item, dict):
+                continue
+            mat_type = _normalize_material_type(item.get("material_type"))
+            label = str(item.get("label") or "").strip()
+            source_filename = str(item.get("source_filename") or "").strip()
+            if not source_filename:
+                chunk_id = str(item.get("chunk_id") or "").strip()
+                if "#c" in chunk_id:
+                    source_filename = chunk_id.split("#c", 1)[0].strip()
+            preview_row = {
+                "label": label,
+                "source_filename": source_filename,
+                "source_mode": str(item.get("source_mode") or "").strip(),
+                "reason": str(item.get("reason") or "").strip()[:120],
+            }
+            if mat_type and label:
+                label_bucket = (
+                    hit_requirement_labels_by_type.setdefault(mat_type, [])
+                    if bool(item.get("hit"))
+                    else miss_requirement_labels_by_type.setdefault(mat_type, [])
+                )
+                if label not in label_bucket:
+                    label_bucket.append(label)
+                preview_bucket = (
+                    hit_evidence_preview_by_type.setdefault(mat_type, [])
+                    if bool(item.get("hit"))
+                    else miss_evidence_preview_by_type.setdefault(mat_type, [])
+                )
+                if preview_row not in preview_bucket:
+                    preview_bucket.append(preview_row)
+            if not bool(item.get("hit")):
+                continue
+            filename = source_filename
+            if not mat_type or not filename:
+                continue
+            bucket = hit_filenames_by_type.setdefault(mat_type, [])
+            if filename not in bucket:
+                bucket.append(filename)
+
+    retrieval_preview = (
+        basis_retrieval.get("preview") if isinstance(basis_retrieval.get("preview"), list) else []
+    )
+    consistency_preview = (
+        basis_retrieval.get("consistency_preview")
+        if isinstance(basis_retrieval.get("consistency_preview"), list)
+        else []
+    )
+    hit_numeric_terms_by_type: Dict[str, List[str]] = {}
+    expected_numeric_terms_by_type: Dict[str, List[str]] = {}
+    hit_numeric_categories_by_type: Dict[str, Dict[str, List[str]]] = {}
+    expected_numeric_categories_by_type: Dict[str, Dict[str, List[str]]] = {}
+    for row in retrieval_preview:
+        if not isinstance(row, dict):
+            continue
+        mat_type = _normalize_material_type(row.get("material_type"))
+        if not mat_type:
+            continue
+        bucket = hit_numeric_terms_by_type.setdefault(mat_type, [])
+        category = _classify_numeric_anchor_category(
+            terms=row.get("matched_terms") if isinstance(row.get("matched_terms"), list) else [],
+            material_type=mat_type,
+            dimension_id=row.get("dimension_id"),
+            label=row.get("filename"),
+        )
+        for raw in row.get("matched_numeric_terms") or []:
+            token = _normalize_numeric_token(raw)
+            if token and token not in bucket:
+                bucket.append(token)
+            _append_numeric_anchor_bucket(
+                hit_numeric_categories_by_type.setdefault(mat_type, {}),
+                category,
+                token,
+            )
+    for row in consistency_preview:
+        if not isinstance(row, dict):
+            continue
+        mat_type = _normalize_material_type(row.get("material_type"))
+        if not mat_type:
+            continue
+        bucket = expected_numeric_terms_by_type.setdefault(mat_type, [])
+        category = _classify_numeric_anchor_category(
+            terms=row.get("terms") if isinstance(row.get("terms"), list) else [],
+            material_type=mat_type,
+            dimension_id=row.get("dimension_id"),
+            label=row.get("label"),
+        )
+        for raw in row.get("numbers") or []:
+            token = _normalize_numeric_token(raw)
+            if token and token not in bucket:
+                bucket.append(token)
+            _append_numeric_anchor_bucket(
+                expected_numeric_categories_by_type.setdefault(mat_type, {}),
+                category,
+                token,
+            )
+
+    conflict_labels_by_type: Dict[str, List[str]] = {}
+    conflict_rows = (
+        conflict_summary.get("conflicts")
+        if isinstance(conflict_summary.get("conflicts"), list)
+        else []
+    )
+    for row in conflict_rows:
+        if not isinstance(row, dict):
+            continue
+        mat_type = _normalize_material_type(row.get("material_type"))
+        label = str(row.get("label") or row.get("conflict_kind") or "").strip()
+        if not mat_type or not label:
+            continue
+        bucket = conflict_labels_by_type.setdefault(mat_type, [])
+        if label not in bucket:
+            bucket.append(label)
+
+    dimension_support_cards: List[Dict[str, object]] = []
+    for row in knowledge_by_dimension:
+        if not isinstance(row, dict):
+            continue
+        dimension_support_cards.append(
+            {
+                "dimension_id": str(row.get("dimension_id") or ""),
+                "dimension_name": str(row.get("dimension_name") or ""),
+                "coverage_score": _to_float_or_none(row.get("coverage_score")) or 0.0,
+                "coverage_level": str(row.get("coverage_level") or "low"),
+                "keyword_hits": int(_to_float_or_none(row.get("keyword_hits")) or 0),
+                "numeric_signal_hits": int(_to_float_or_none(row.get("numeric_signal_hits")) or 0),
+                "source_types": [
+                    _normalize_material_type(item) or str(item or "").strip()
+                    for item in (row.get("source_types") or [])
+                    if str(item or "").strip()
+                ][:6],
+                "source_file_count": int(_to_float_or_none(row.get("source_file_count")) or 0),
+                "source_files_preview": [
+                    str(item or "").strip()
+                    for item in (row.get("source_files_preview") or [])
+                    if str(item or "").strip()
+                ][:6],
+                "suggested_keywords": [
+                    str(item or "").strip()
+                    for item in (row.get("suggested_keywords") or [])
+                    if str(item or "").strip()
+                ][:4],
+            }
+        )
+    dimension_support_cards.sort(
+        key=lambda item: (
+            -float(_to_float_or_none(item.get("coverage_score")) or 0.0),
+            str(item.get("dimension_id") or ""),
+        )
+    )
+
+    material_type_cards: List[Dict[str, object]] = []
+    for mat_type in all_types:
+        depth_row = (
+            depth_by_type.get(mat_type) if isinstance(depth_by_type.get(mat_type), dict) else {}
+        )
+        util_row = (
+            util_by_type.get(mat_type) if isinstance(util_by_type.get(mat_type), dict) else {}
+        )
+        files = int(_to_float_or_none(depth_row.get("files")) or 0)
+        parsed_chars = int(_to_float_or_none(depth_row.get("parsed_chars")) or 0)
+        parsed_chunks = int(_to_float_or_none(depth_row.get("parsed_chunks")) or 0)
+        numeric_terms = int(_to_float_or_none(depth_row.get("numeric_terms")) or 0)
+        retrieval_total = int(_to_float_or_none(util_row.get("retrieval_total")) or 0)
+        retrieval_hit = int(_to_float_or_none(util_row.get("retrieval_hit")) or 0)
+        consistency_total = int(_to_float_or_none(util_row.get("consistency_total")) or 0)
+        consistency_hit = int(_to_float_or_none(util_row.get("consistency_hit")) or 0)
+        fallback_total = int(_to_float_or_none(util_row.get("fallback_total")) or 0)
+        fallback_hit = int(_to_float_or_none(util_row.get("fallback_hit")) or 0)
+        has_evidence = (retrieval_hit + consistency_hit + fallback_hit) > 0
+        required = mat_type in [_normalize_material_type(x) for x in required_types]
+        in_scope = (
+            mat_type in [_normalize_material_type(x) for x in available_types]
+            or files > 0
+            or required
+        )
+        uploaded_filenames = list(uploaded_filenames_by_type.get(mat_type) or [])
+        hit_filenames = list(hit_filenames_by_type.get(mat_type) or [])
+        hit_requirement_labels = list(hit_requirement_labels_by_type.get(mat_type) or [])
+        miss_requirement_labels = list(miss_requirement_labels_by_type.get(mat_type) or [])
+        hit_evidence_preview = list(hit_evidence_preview_by_type.get(mat_type) or [])
+        miss_evidence_preview = list(miss_evidence_preview_by_type.get(mat_type) or [])
+        conflict_labels = list(conflict_labels_by_type.get(mat_type) or [])
+        project_numeric_terms = list(knowledge_numeric_terms_by_type.get(mat_type) or [])
+        project_numeric_category_summary = list(
+            knowledge_numeric_summary_by_type.get(mat_type) or []
+        )
+        hit_numeric_terms = list(hit_numeric_terms_by_type.get(mat_type) or [])
+        expected_numeric_terms = list(expected_numeric_terms_by_type.get(mat_type) or [])
+        missing_numeric_terms = [
+            token for token in expected_numeric_terms if token not in hit_numeric_terms
+        ]
+        hit_numeric_categories = {
+            key: list(value)
+            for key, value in (hit_numeric_categories_by_type.get(mat_type) or {}).items()
+        }
+        expected_numeric_categories = {
+            key: list(value)
+            for key, value in (expected_numeric_categories_by_type.get(mat_type) or {}).items()
+        }
+        missing_numeric_categories: Dict[str, List[str]] = {}
+        for category, tokens in expected_numeric_categories.items():
+            hit_tokens = set(hit_numeric_categories.get(category) or [])
+            for token in tokens:
+                if token not in hit_tokens:
+                    _append_numeric_anchor_bucket(missing_numeric_categories, category, token)
+        meets_chars = bool(depth_row.get("meets_chars")) if depth_row else False
+        meets_chunks = bool(depth_row.get("meets_chunks")) if depth_row else False
+        meets_numeric_terms = bool(depth_row.get("meets_numeric_terms")) if depth_row else False
+
+        guidance: List[str] = []
+        if files <= 0 and required:
+            status = "missing"
+            status_label = "缺失"
+            guidance.append(f"缺少{_material_type_label(mat_type)}，当前不能形成完整评分依据。")
+        elif files <= 0:
+            status = "idle"
+            status_label = "未上传"
+            guidance.append(f"{_material_type_label(mat_type)}未上传，当前按可选资料处理。")
+        elif parsed_chunks <= 0 or parsed_chars <= 0:
+            status = "uploaded_unparsed"
+            status_label = "已上传未解析"
+            guidance.append(f"{_material_type_label(mat_type)}已上传，但尚未形成可检索文本。")
+        elif has_evidence:
+            status = "active"
+            status_label = "已参与评分"
+            guidance.append(f"{_material_type_label(mat_type)}已进入评分证据链。")
+        else:
+            status = "parsed_not_used"
+            status_label = "已解析未命中"
+            guidance.append(
+                f"{_material_type_label(mat_type)}已解析，但本次评分尚未命中到有效证据。"
+            )
+
+        if files > 0 and not meets_chars and required:
+            guidance.append(
+                f"{_material_type_label(mat_type)}解析字数不足，建议补齐关键章节或提升可解析版本。"
+            )
+        if files > 0 and not meets_chunks and bool(depth_gate.get("enforce")):
+            guidance.append(
+                f"{_material_type_label(mat_type)}分块不足，建议补充更多结构化约束内容。"
+            )
+        if files > 0 and not meets_numeric_terms and mat_type in {"tender_qa", "boq", "drawing"}:
+            guidance.append(
+                f"{_material_type_label(mat_type)}中的数值约束不足，建议补充工期、规格、阈值、清单量等硬参数。"
+            )
+
+        material_type_cards.append(
+            {
+                "material_type": mat_type,
+                "material_type_label": _material_type_label(mat_type),
+                "required": required,
+                "in_scope": in_scope,
+                "status": status,
+                "status_label": status_label,
+                "files": files,
+                "uploaded_filenames": uploaded_filenames[:20],
+                "uploaded_filename_count": len(uploaded_filenames),
+                "parsed_chars": parsed_chars,
+                "parsed_chunks": parsed_chunks,
+                "numeric_terms": numeric_terms,
+                "hit_requirement_labels": hit_requirement_labels[:12],
+                "hit_requirement_count": len(hit_requirement_labels),
+                "miss_requirement_labels": miss_requirement_labels[:12],
+                "miss_requirement_count": len(miss_requirement_labels),
+                "hit_evidence_preview": hit_evidence_preview[:6],
+                "miss_evidence_preview": miss_evidence_preview[:6],
+                "conflict_labels": conflict_labels[:12],
+                "conflict_label_count": len(conflict_labels),
+                "project_numeric_terms": project_numeric_terms[:12],
+                "project_numeric_term_count": len(project_numeric_terms),
+                "project_numeric_category_summary": project_numeric_category_summary[:8],
+                "hit_numeric_terms": hit_numeric_terms[:12],
+                "hit_numeric_term_count": len(hit_numeric_terms),
+                "expected_numeric_terms": expected_numeric_terms[:12],
+                "expected_numeric_term_count": len(expected_numeric_terms),
+                "missing_numeric_terms": missing_numeric_terms[:12],
+                "missing_numeric_term_count": len(missing_numeric_terms),
+                "hit_numeric_category_summary": _build_numeric_anchor_category_summary(
+                    hit_numeric_categories
+                ),
+                "expected_numeric_category_summary": _build_numeric_anchor_category_summary(
+                    expected_numeric_categories
+                ),
+                "missing_numeric_category_summary": _build_numeric_anchor_category_summary(
+                    missing_numeric_categories
+                ),
+                "meets_chars": meets_chars,
+                "meets_chunks": meets_chunks,
+                "meets_numeric_terms": meets_numeric_terms,
+                "retrieval_hit": retrieval_hit,
+                "retrieval_total": retrieval_total,
+                "consistency_hit": consistency_hit,
+                "consistency_total": consistency_total,
+                "fallback_hit": fallback_hit,
+                "fallback_total": fallback_total,
+                "has_evidence": has_evidence,
+                "hit_filenames": hit_filenames[:20],
+                "hit_filename_count": len(hit_filenames),
+                "guidance": guidance[:3],
+            }
+        )
+
+    recommendations: List[str] = []
+    for bucket in (
+        readiness.get("issues") or [],
+        readiness.get("warnings") or [],
+        material_depth.get("recommendations") or [],
+        (evidence_trace or {}).get("recommendations") or [],
+        (scoring_basis or {}).get("recommendations") or [],
+    ):
+        if not isinstance(bucket, list):
+            continue
+        for item in bucket:
+            text = str(item or "").strip()
+            if text and text not in recommendations:
+                recommendations.append(text)
+
+    if not bool(latest_submission.get("exists")):
+        recommendations.insert(0, "暂无施组评分证据链，请先上传并评分至少 1 份施组。")
+
+    return {
+        "project_id": project_id,
+        "generated_at": _now_iso(),
+        "readiness": readiness,
+        "material_depth": material_depth,
+        "latest_submission": latest_submission,
+        "evidence_trace": evidence_trace,
+        "scoring_basis": scoring_basis,
+        "material_type_cards": material_type_cards,
+        "dimension_support_cards": dimension_support_cards,
+        "summary": {
+            "ready_to_score": bool(readiness.get("ready")),
+            "material_gate_passed": bool(readiness.get("gate_passed")),
+            "material_files": int(_to_float_or_none(quality_summary.get("total_files")) or 0),
+            "material_parsed_chars": int(
+                _to_float_or_none(quality_summary.get("total_parsed_chars")) or 0
+            ),
+            "material_parsed_chunks": int(
+                _to_float_or_none(quality_summary.get("total_parsed_chunks")) or 0
+            ),
+            "latest_submission_exists": bool(latest_submission.get("exists")),
+            "latest_submission_scored": bool(latest_submission.get("is_scored")),
+            "evidence_total_requirements": int(
+                _to_float_or_none(trace_summary.get("total_requirements")) or 0
+            ),
+            "evidence_total_hits": int(_to_float_or_none(trace_summary.get("total_hits")) or 0),
+            "evidence_mandatory_hit_rate": _to_float_or_none(
+                trace_summary.get("mandatory_hit_rate")
+            ),
+            "evidence_source_files_hit_count": int(
+                _to_float_or_none(trace_summary.get("source_files_hit_count")) or 0
+            ),
+            "retrieval_hit_rate": _to_float_or_none(basis_util.get("retrieval_hit_rate")),
+            "retrieval_file_coverage_rate": _to_float_or_none(
+                basis_util.get("retrieval_file_coverage_rate")
+            ),
+            "material_utilization_gate_blocked": bool(basis_gate.get("blocked")),
+            "material_conflict_count": int(
+                _to_float_or_none(conflict_summary.get("conflict_count")) or 0
+            ),
+            "material_conflict_high_severity_count": int(
+                _to_float_or_none(conflict_summary.get("high_severity_count")) or 0
+            ),
+            "material_dimension_coverage_rate": _to_float_or_none(
+                knowledge_summary.get("dimension_coverage_rate")
+            ),
+            "material_low_coverage_dimensions": int(
+                _to_float_or_none(knowledge_summary.get("low_coverage_dimensions")) or 0
+            ),
+            "material_covered_dimensions": int(
+                _to_float_or_none(knowledge_summary.get("covered_dimensions")) or 0
+            ),
+            "material_numeric_category_summary": [
+                str(item or "").strip()
+                for item in (knowledge_summary.get("numeric_category_summary") or [])
+                if str(item or "").strip()
+            ][:8],
+        },
+        "recommendations": recommendations[:20],
     }
 
 
@@ -5286,12 +5918,9 @@ def _build_evolution_health_report(
 
     multipliers, profile_snapshot, _ = _resolve_project_scoring_context(project_id)
     evo = load_evolution_reports().get(project_id) or {}
-    scoring_evolution = evo.get("scoring_evolution") or {}
-    has_evolved_multipliers = bool(
-        isinstance(scoring_evolution, dict)
-        and isinstance(scoring_evolution.get("dimension_multipliers"), dict)
-        and scoring_evolution.get("dimension_multipliers")
-    )
+    evo_status = _evaluate_evolution_weight_status(project_id, project=project, evo=evo)
+    has_evolved_multipliers = bool(evo_status.get("usable"))
+    stored_evolved_multipliers = bool(evo_status.get("stored"))
     recommendations: List[str] = []
     if len(ground_truth_rows) < 3:
         recommendations.append("真实评标样本不足，建议至少录入 3 条以上再观察进化稳定性。")
@@ -5303,7 +5932,19 @@ def _build_evolution_health_report(
         recommendations.append(
             f"有 {unmatched_ground_truth} 条真实评分未关联到施组预测记录，建议使用“从步骤4施组下拉选择”录入。"
         )
-    if not has_evolved_multipliers:
+    inactive_reason = str(evo_status.get("inactive_reason") or "").strip()
+    if stored_evolved_multipliers and not has_evolved_multipliers:
+        if inactive_reason == "sample_count_below_min":
+            recommendations.append(
+                "已产出进化权重，但样本量未达到生效阈值，当前评分仍不会使用该权重。"
+            )
+        elif inactive_reason == "stale":
+            recommendations.append(
+                "已产出进化权重，但已超过时效窗口，当前评分已回退到专家权重或默认权重。"
+            )
+        elif inactive_reason == "missing_timestamp":
+            recommendations.append("已存在进化权重，但缺少更新时间，当前不会直接启用。")
+    elif not has_evolved_multipliers:
         recommendations.append("尚未形成进化维度权重，建议在录入真实评分后执行一次学习进化。")
 
     return {
@@ -5313,9 +5954,30 @@ def _build_evolution_health_report(
             "ground_truth_count": len(ground_truth_rows),
             "matched_prediction_count": len(matched_rows),
             "unmatched_ground_truth_count": unmatched_ground_truth,
-            "current_weights_source": _infer_weights_source(project_id, profile_snapshot),
+            "current_weights_source": _infer_weights_source(
+                project_id,
+                profile_snapshot,
+                project,
+            ),
             "current_multiplier_count": len(multipliers or {}),
             "has_evolved_multipliers": has_evolved_multipliers,
+            "stored_evolved_multipliers": stored_evolved_multipliers,
+            "evolution_weights_usable": has_evolved_multipliers,
+            "evolution_weights_inactive_reason": inactive_reason or None,
+            "evolution_weight_sample_count": int(
+                _to_float_or_none(evo_status.get("sample_count")) or 0
+            ),
+            "evolution_weight_min_samples": int(
+                _to_float_or_none(evo_status.get("min_samples")) or 0
+            ),
+            "evolution_weight_age_days": (
+                round(float(_to_float_or_none(evo_status.get("age_days")) or 0.0), 2)
+                if _to_float_or_none(evo_status.get("age_days")) is not None
+                else None
+            ),
+            "evolution_weight_max_age_days": float(
+                _to_float_or_none(evo_status.get("max_age_days")) or 0.0
+            ),
             "last_evolution_updated_at": str(evo.get("updated_at") or evo.get("created_at") or ""),
         },
         "windows": {
@@ -6246,19 +6908,22 @@ def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
             add("project_exists", False, str(e))
 
     # `parser_ocr` / `parser_dwg_converter` 属于增强能力，不应阻断系统基础可用性判断。
-    required_item_names = {
-        "health",
-        "config",
-        "data_dirs_writable",
-        "auth_status",
-        "rate_limit_status",
-        "parser_pdf",
-        "parser_docx",
-    }
-    required_items = [x for x in items if str(x.get("name")) in required_item_names]
-    all_ok = bool(required_items) and all(bool(x.get("ok")) for x in required_items)
+    required_items = [
+        x for x in items if str(x.get("name")) in SYSTEM_SELF_CHECK_REQUIRED_ITEM_NAMES
+    ]
+    required_failures = [x for x in required_items if not bool(x.get("ok"))]
+    optional_failures = [
+        x
+        for x in items
+        if str(x.get("name")) not in SYSTEM_SELF_CHECK_REQUIRED_ITEM_NAMES and not bool(x.get("ok"))
+    ]
+    all_ok = bool(required_items) and not required_failures
     return {
         "ok": all_ok,
+        "required_ok": all_ok,
+        "degraded": bool(optional_failures),
+        "failed_required_count": len(required_failures),
+        "failed_optional_count": len(optional_failures),
         "checked_at": _now_iso(),
         "items": items,
     }
@@ -8447,6 +9112,116 @@ def _extract_numeric_terms(text: str, *, max_terms: int = 24) -> List[str]:
     return [k for k, _ in counter.most_common(max(1, int(max_terms)))]
 
 
+NUMERIC_ANCHOR_CATEGORY_HINTS: Dict[str, List[str]] = {
+    "duration": ["工期", "进度", "节点", "里程碑", "日历天", "工序", "天", "周", "月"],
+    "quantity": ["工程量", "数量", "台", "套", "人", "班组", "设备", "材料", "清单", "投入"],
+    "specification": [
+        "规格",
+        "型号",
+        "尺寸",
+        "厚度",
+        "强度",
+        "直径",
+        "标高",
+        "间距",
+        "宽度",
+        "长度",
+        "容量",
+        "功率",
+        "等级",
+        "管径",
+        "电缆",
+        "风管",
+        "试压",
+    ],
+    "threshold": ["阈值", "偏差", "预警", "报警", "限值", "合格", "控制", "频次", "抽检", "覆盖率"],
+}
+
+NUMERIC_ANCHOR_CATEGORY_LABELS: Dict[str, str] = {
+    "duration": "工期/节点",
+    "quantity": "数量/工程量",
+    "specification": "规格/参数",
+    "threshold": "阈值/偏差",
+}
+
+
+def _classify_numeric_anchor_category(
+    *,
+    terms: Optional[List[object]] = None,
+    material_type: object = "",
+    dimension_id: object = "",
+    label: object = "",
+) -> str:
+    corpus_parts: List[str] = []
+    for item in terms or []:
+        text = str(item or "").strip().lower()
+        if text:
+            corpus_parts.append(text)
+    label_text = str(label or "").strip().lower()
+    if label_text:
+        corpus_parts.append(label_text)
+    material_key = _normalize_material_type(material_type)
+    dim_key = str(dimension_id or "").strip()
+    corpus = " ".join(corpus_parts)
+    scores: Dict[str, int] = {key: 0 for key in NUMERIC_ANCHOR_CATEGORY_HINTS}
+    for category, hints in NUMERIC_ANCHOR_CATEGORY_HINTS.items():
+        for hint in hints:
+            if hint and hint.lower() in corpus:
+                scores[category] += 1
+
+    if dim_key == "09":
+        scores["duration"] += 2
+    if dim_key in {"06", "13", "14"}:
+        scores["specification"] += 1
+    if material_key == "boq":
+        scores["quantity"] += 2
+    elif material_key == "drawing":
+        scores["specification"] += 2
+    elif material_key == "site_photo":
+        scores["threshold"] += 1
+
+    top_category, top_score = sorted(scores.items(), key=lambda item: (-item[1], item[0]))[0]
+    if top_score > 0:
+        return top_category
+    if dim_key == "09":
+        return "duration"
+    if material_key == "boq":
+        return "quantity"
+    if material_key == "drawing":
+        return "specification"
+    return "threshold"
+
+
+def _append_numeric_anchor_bucket(
+    buckets: Dict[str, List[str]],
+    category: str,
+    token: object,
+) -> None:
+    clean_category = str(category or "").strip()
+    clean_token = _normalize_numeric_token(token)
+    if not clean_category or not clean_token:
+        return
+    bucket = buckets.setdefault(clean_category, [])
+    if clean_token not in bucket:
+        bucket.append(clean_token)
+
+
+def _build_numeric_anchor_category_summary(
+    buckets: Dict[str, List[str]],
+) -> List[str]:
+    summary: List[str] = []
+    for category in ("duration", "quantity", "specification", "threshold"):
+        tokens = [str(x) for x in (buckets.get(category) or []) if str(x).strip()]
+        if not tokens:
+            continue
+        label = NUMERIC_ANCHOR_CATEGORY_LABELS.get(category, category)
+        preview = "、".join(tokens[:4])
+        if len(tokens) > 4:
+            preview += " 等"
+        summary.append(f"{label}：{preview}")
+    return summary[:8]
+
+
 def _build_boq_structured_summary(
     content: bytes,
     filename: str,
@@ -9353,10 +10128,13 @@ def _validate_material_gate_for_scoring(
     depth_issues: List[str] = []
     required_types = cfg.get("required_types") if isinstance(cfg, dict) else []
     required_types = required_types if isinstance(required_types, list) else []
+    missing_required_types: List[str] = []
     for tpe in required_types:
         label = _material_type_label(tpe)
         count = int(counts_by_type.get(tpe, 0))
         if count <= 0:
+            if tpe not in missing_required_types:
+                missing_required_types.append(str(tpe))
             issues.append(f"缺少必需资料类型：{label}")
             continue
         min_chars = int((cfg.get("min_chars_by_type") or {}).get(tpe, 0))
@@ -9417,6 +10195,7 @@ def _validate_material_gate_for_scoring(
     snapshot["gate"] = {
         "enforce": bool(cfg.get("enforce", False)),
         "required_types": required_types,
+        "missing_required_types": missing_required_types,
         "min_chars_by_type": cfg.get("min_chars_by_type", {}),
         "min_total_chars": min_total_chars,
         "max_fail_ratio": max_fail_ratio,
@@ -9652,6 +10431,7 @@ def _build_project_mece_audit(project_id: str, project: Dict[str, object]) -> Di
     gt_count = int(_to_float_or_none(gt_summary.get("ground_truth_count")) or 0)
     matched_pred_count = int(_to_float_or_none(gt_summary.get("matched_prediction_count")) or 0)
     has_evolved_multipliers = bool(gt_summary.get("has_evolved_multipliers"))
+    stored_evolved_multipliers = bool(gt_summary.get("stored_evolved_multipliers"))
     evo_fail_reasons: List[str] = []
     evo_warnings: List[str] = []
     if gt_count <= 0:
@@ -9662,6 +10442,8 @@ def _build_project_mece_audit(project_id: str, project: Dict[str, object]) -> Di
         evo_fail_reasons.append("真实评标与系统预测未形成有效匹配，闭环训练不可用。")
     if gt_count >= 3 and not has_evolved_multipliers:
         evo_warnings.append("已具备样本但尚未产出进化权重，建议执行“学习进化”。")
+    if stored_evolved_multipliers and not has_evolved_multipliers:
+        evo_warnings.append("系统内已有进化权重，但当前未达到生效条件，评分仍未使用该权重。")
     _append_dim(
         key="self_evolution_loop",
         title="自我进化闭环",
@@ -9669,6 +10451,7 @@ def _build_project_mece_audit(project_id: str, project: Dict[str, object]) -> Di
             "ground_truth_count": gt_count,
             "matched_prediction_count": matched_pred_count,
             "has_evolved_multipliers": has_evolved_multipliers,
+            "stored_evolved_multipliers": stored_evolved_multipliers,
             "weights_source": str(gt_summary.get("current_weights_source") or "-"),
             "drift_level": str((evo_health.get("drift") or {}).get("level") or "unknown"),
         },
@@ -9678,7 +10461,18 @@ def _build_project_mece_audit(project_id: str, project: Dict[str, object]) -> Di
     )
 
     self_check_items = self_check.get("items") if isinstance(self_check.get("items"), list) else []
-    failed_items = [str(x.get("name") or "") for x in self_check_items if not bool(x.get("ok"))]
+    failed_rows = [x for x in self_check_items if not bool(x.get("ok"))]
+    failed_items = [str(x.get("name") or "") for x in failed_rows]
+    blocking_runtime_failures = [
+        f"{str(x.get('name') or '')}: {str(x.get('detail') or '').strip() or 'failed'}"
+        for x in failed_rows
+        if str(x.get("name") or "") in SYSTEM_SELF_CHECK_REQUIRED_ITEM_NAMES
+    ]
+    optional_runtime_warnings = [
+        f"{str(x.get('name') or '')}: {str(x.get('detail') or '').strip() or 'failed'}"
+        for x in failed_rows
+        if str(x.get("name") or "") not in SYSTEM_SELF_CHECK_REQUIRED_ITEM_NAMES
+    ]
     _append_dim(
         key="runtime_stability",
         title="运行稳定性",
@@ -9692,9 +10486,9 @@ def _build_project_mece_audit(project_id: str, project: Dict[str, object]) -> Di
                 )
             ),
         },
-        pass_condition=bool(self_check.get("ok")),
-        warnings=[],
-        fail_reasons=[],
+        pass_condition=bool(self_check.get("ok")) and not optional_runtime_warnings,
+        warnings=optional_runtime_warnings,
+        fail_reasons=blocking_runtime_failures,
     )
 
     pass_count = sum(1 for row in dim_rows if row.get("status") == "pass")
@@ -10014,10 +10808,12 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
     by_type_term_counter: Dict[str, Counter[str]] = {}
     by_type_numeric_counter: Dict[str, Counter[str]] = {}
     by_type_dim_counter: Dict[str, Counter[str]] = {}
+    by_type_numeric_categories: Dict[str, Dict[str, List[str]]] = {}
     by_type_file_count: Dict[str, int] = {}
     by_type_ok_files: Dict[str, int] = {}
     by_type_chars: Dict[str, int] = {}
     by_type_chunks: Dict[str, int] = {}
+    total_numeric_categories: Dict[str, List[str]] = {}
 
     by_dim_stats: Dict[str, Dict[str, object]] = {
         dim_id: {
@@ -10043,6 +10839,7 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         by_type_term_counter.setdefault(mat_type, Counter())
         by_type_numeric_counter.setdefault(mat_type, Counter())
         by_type_dim_counter.setdefault(mat_type, Counter())
+        by_type_numeric_categories.setdefault(mat_type, {})
         by_type_ok_files.setdefault(mat_type, 0)
         by_type_chars.setdefault(mat_type, 0)
         by_type_chunks.setdefault(mat_type, 0)
@@ -10119,6 +10916,20 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
             (dim_row.get("source_files") or set()).add(file_name)
             by_type_dim_counter[mat_type][dim_id] += int(hit_count)
 
+        dominant_dim = by_type_dim_counter[mat_type].most_common(1)
+        dominant_dim_id = str(dominant_dim[0][0]) if dominant_dim else ""
+        numeric_category = _classify_numeric_anchor_category(
+            terms=lexical_terms[:12],
+            material_type=mat_type,
+            dimension_id=dominant_dim_id,
+            label=filename,
+        )
+        for token in sorted(set(numeric_terms)):
+            _append_numeric_anchor_bucket(
+                by_type_numeric_categories[mat_type], numeric_category, token
+            )
+            _append_numeric_anchor_bucket(total_numeric_categories, numeric_category, token)
+
     dwg_files = 0
     site_photo_files = 0
     pdf_files = 0
@@ -10191,6 +11002,9 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
                     term
                     for term, _ in by_type_numeric_counter.get(mat_type, Counter()).most_common(8)
                 ],
+                "numeric_category_summary": _build_numeric_anchor_category_summary(
+                    by_type_numeric_categories.get(mat_type) or {}
+                ),
                 "top_dimensions": top_dims,
             }
         )
@@ -10271,6 +11085,9 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
             "total_parsed_chars": total_chars,
             "total_parsed_chunks": total_chunks,
             "total_numeric_terms": total_numeric_terms,
+            "numeric_category_summary": _build_numeric_anchor_category_summary(
+                total_numeric_categories
+            ),
             "covered_dimensions": covered_dimensions,
             "dimension_coverage_rate": coverage_rate,
             "low_coverage_dimensions": len(low_dims),
@@ -10306,6 +11123,7 @@ def _render_material_knowledge_profile_markdown(payload: Dict[str, object]) -> s
         f"- 解析字数：`{summary.get('total_parsed_chars', 0)}`",
         f"- 分块数：`{summary.get('total_parsed_chunks', 0)}`",
         f"- 数字约束项：`{summary.get('total_numeric_terms', 0)}`",
+        f"- 数值约束簇：`{'；'.join(str(x) for x in (summary.get('numeric_category_summary') or [])) or '-'}`",
         f"- 维度覆盖率：`{summary.get('dimension_coverage_rate', 0.0):.2%}`",
         "",
         "## 解析能力",
@@ -10319,8 +11137,8 @@ def _render_material_knowledge_profile_markdown(payload: Dict[str, object]) -> s
         "",
         "## 按资料类型",
         "",
-        "| 资料类型 | 文件数 | 解析字数 | 分块数 | 词项数 | 数字约束项 |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| 资料类型 | 文件数 | 解析字数 | 分块数 | 词项数 | 数字约束项 | 数值约束簇 |",
+        "|---|---:|---:|---:|---:|---:|---|",
     ]
     for row in by_type:
         if not isinstance(row, dict):
@@ -10332,6 +11150,7 @@ def _render_material_knowledge_profile_markdown(payload: Dict[str, object]) -> s
             f"| {row.get('parsed_chunks', 0)} "
             f"| {row.get('unique_terms', 0)} "
             f"| {row.get('numeric_terms', 0)} |"
+            f" {'；'.join(str(x) for x in (row.get('numeric_category_summary') or [])) or '-'} |"
         )
 
     lines.extend(
@@ -10980,6 +11799,27 @@ def download_submission_evidence_trace_markdown(
         media_type="text/markdown; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.get(
+    "/projects/{project_id}/scoring_diagnostic/latest",
+    response_model=ProjectScoringDiagnosticResponse,
+    tags=["施组提交"],
+    responses={**RESPONSES_404},
+)
+def get_latest_project_scoring_diagnostic(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> ProjectScoringDiagnosticResponse:
+    """获取项目级评分证据链诊断：前置条件、资料深读、最新施组证据追溯与评分依据。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    try:
+        project = _find_project(project_id, projects)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    payload = _build_project_scoring_diagnostic(project_id, project)
+    return ProjectScoringDiagnosticResponse(**payload)
 
 
 @router.get(
@@ -13553,6 +14393,18 @@ def compat_download_submission_evidence_trace_markdown(
 
 
 @compat_router.get(
+    "/projects/{project_id}/scoring_diagnostic/latest",
+    response_model=ProjectScoringDiagnosticResponse,
+    tags=["施组提交"],
+)
+def compat_latest_project_scoring_diagnostic(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> ProjectScoringDiagnosticResponse:
+    return get_latest_project_scoring_diagnostic(project_id=project_id, locale=locale)
+
+
+@compat_router.get(
     "/projects/{project_id}/evidence_trace/latest",
     response_model=EvidenceTraceResponse,
     tags=["施组提交"],
@@ -14061,22 +14913,22 @@ def index(
         )
 
     ui_dimension_labels = {
-        "01": "01 工程项目整体理解与实施路径",
-        "02": "02 安全生产管理体系与控制措施",
-        "03": "03 文明施工管理体系与实施措施",
-        "04": "04 材料与部品采购及管理机制",
-        "05": "05 四新技术的应用与实施方案",
-        "06": "06 工程关键工序识别与控制措施",
-        "07": "07 工程重难点及危险性较大工程管控",
-        "08": "08 工程质量管理体系与保证措施",
-        "09": "09 工期目标保障与进度控制措施",
-        "10": "10 专项施工工艺与技术方案",
-        "11": "11 人力资源配置与管理方案",
-        "12": "12 总体施工工艺流程与组织逻辑",
-        "13": "13 物资与施工设备配置方案",
-        "14": "14 设计协调与深化实施能力",
-        "15": "15 总体资源配置与实施计划",
-        "16": "16 技术措施的可行性与落地性",
+        "01": "01 总体部署与信息化管理",
+        "02": "02 安全管理与劳保用品配置",
+        "03": "03 文明施工与绿色工地",
+        "04": "04 材料采购、进场验收与特殊材料闭环",
+        "05": "05 四新技术应用",
+        "06": "06 关键工序控制点",
+        "07": "07 危大工程闭环管理",
+        "08": "08 质量管理体系与ITP简表",
+        "09": "09 进度计划体系与纠偏阈值",
+        "10": "10 专项方案管理与审批验收节点",
+        "11": "11 人力配置与培训",
+        "12": "12 施工流程、专业穿插与移交条件",
+        "13": "13 机械设备配置、验收与维保",
+        "14": "14 图纸会审、深化设计与变更闭环",
+        "15": "15 资源总控与动态调配",
+        "16": "16 可行性验证、样板先行与落地清单",
     }
     initial_weights_raw: Dict[str, int] = _default_weights_raw()
     initial_weights_norm: Dict[str, float] = _normalize_weights(initial_weights_raw)
@@ -14367,7 +15219,11 @@ def index(
         .upload-panel-title { margin:0 0 8px 0; font-size:22px; font-weight:700; color:#1e293b; }
         .upload-zones { display:grid; grid-template-columns: 1fr; gap:12px; margin-top:12px; }
         .upload-zone { border:1px solid var(--border); border-radius:12px; background:#f8fafc; padding:12px; }
+        .upload-zone[data-health="missing"], .upload-zone[data-health="uploaded_unparsed"] { border-color:#dc2626; background:#fef2f2; box-shadow:0 0 0 1px rgba(220,38,38,0.08); }
+        .upload-zone[data-health="parsed_not_used"] { border-color:#d97706; background:#fff7ed; box-shadow:0 0 0 1px rgba(217,119,6,0.08); }
+        .upload-zone[data-health="active"] { border-color:#16a34a; background:#f0fdf4; box-shadow:0 0 0 1px rgba(22,163,74,0.08); }
         .upload-zone h4 { margin:0 0 8px 0; font-size:18px; color:#1e293b; }
+        .upload-zone-state { margin:8px 0 0 0; font-size:12px; color:#64748b; min-height:1.2em; line-height:1.5; }
         .upload-zone .inline-form { width:100%; }
         .upload-zone input[type="file"] { flex:1 1 360px; min-width:260px; }
         .upload-zone .note { display:block; width:100%; }
@@ -14454,6 +15310,7 @@ def index(
             btnMaterialDepthReportDownload: { resultId: 'materialDepthReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials/depth_report.md', loading: '体检报告下载准备中...' },
             btnMaterialKnowledgeProfile: { resultId: 'materialKnowledgeProfileResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials/knowledge_profile', loading: '资料知识画像生成中...' },
             btnMaterialKnowledgeProfileDownload: { resultId: 'materialKnowledgeProfileResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials/knowledge_profile.md', loading: '知识画像下载准备中...' },
+            btnScoringDiagnostic: { resultId: 'scoringDiagnosticResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/scoring_diagnostic/latest', loading: '评分证据链诊断生成中...' },
             btnCompare: { resultId: 'compareResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare', loading: '对比排名加载中...' },
             btnCompareReport: { resultId: 'compareReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare_report', loading: '对比报告生成中...' },
             btnInsights: { resultId: 'insightsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/insights', loading: '洞察分析中...' },
@@ -14592,6 +15449,14 @@ def index(
               setResultHtml(cfg.resultId, html);
               return true;
             }
+            if (actionId === 'btnScoringDiagnostic') {
+              if (window.renderScoringDiagnosticPanel && typeof window.renderScoringDiagnosticPanel === 'function') {
+                window.renderScoringDiagnosticPanel(data || {});
+              } else {
+                setResultHtml(cfg.resultId, '<strong>评分证据链诊断</strong><pre>' + esc(JSON.stringify(data || {}, null, 2)) + '</pre>');
+              }
+              return true;
+            }
             if (actionId === 'btnRefreshGroundTruthSubmissionOptions') {
               const sel = document.getElementById('groundTruthSubmissionSelect');
               const subs = Array.isArray(data) ? data : [];
@@ -14703,6 +15568,14 @@ def index(
               const w30 = (data && data.windows && typeof data.windows.recent_30d === 'object') ? data.windows.recent_30d : {};
               const wall = (data && data.windows && typeof data.windows.all === 'object') ? data.windows.all : {};
               const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
+              const evoStored = !!(summary && summary.stored_evolved_multipliers);
+              const evoActive = !!(summary && summary.has_evolved_multipliers);
+              const evoAge = (summary && summary.evolution_weight_age_days != null) ? summary.evolution_weight_age_days : '-';
+              const evoSamples = (summary && summary.evolution_weight_sample_count != null) ? summary.evolution_weight_sample_count : 0;
+              const evoMinSamples = (summary && summary.evolution_weight_min_samples != null) ? summary.evolution_weight_min_samples : '-';
+              const evoStatus = evoActive
+                ? '<span class="success">已生效</span>'
+                : (evoStored ? '<span class="warn">已存储未生效</span>' : '<span class="error">未产出</span>');
               const html = ''
                 + '<strong>进化健康度</strong>'
                 + '<p style="margin:6px 0">漂移等级：'
@@ -14715,6 +15588,9 @@ def index(
                 + '<tr><td>已匹配预测</td><td>' + esc((summary && summary.matched_prediction_count) || 0) + '</td></tr>'
                 + '<tr><td>未匹配样本</td><td>' + esc((summary && summary.unmatched_ground_truth_count) || 0) + '</td></tr>'
                 + '<tr><td>当前权重来源</td><td>' + esc((summary && summary.current_weights_source) || '-') + '</td></tr>'
+                + '<tr><td>进化权重状态</td><td>' + evoStatus + '</td></tr>'
+                + '<tr><td>进化权重样本/阈值</td><td>' + esc(evoSamples) + ' / ' + esc(evoMinSamples) + '</td></tr>'
+                + '<tr><td>进化权重时效(天)</td><td>' + esc(evoAge) + '</td></tr>'
                 + '</table>'
                 + (recs.length
                   ? '<ul style="margin:6px 0 0 18px;color:#92400e">' + recs.slice(0, 6).map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>'
@@ -14804,7 +15680,7 @@ def index(
         <div class="upload-box">
           <h3 class="upload-panel-title">文件上传区</h3>
           <div class="upload-zones">
-            <div class="upload-zone">
+            <div class="upload-zone" id="uploadZoneTenderQa" data-material-type="tender_qa" data-health="idle">
               <h4>招标文件和答疑（可多选）</h4>
               <form id="uploadMaterial" method="post" action="/web/upload_materials" enctype="multipart/form-data" class="inline-form">
                 <input type="hidden" name="project_id" id="uploadMaterialProjectId" value="__SELECTED_PROJECT_ID__" />
@@ -14814,8 +15690,9 @@ def index(
                 <span class="note">支持：TXT/MD/PDF/DOC/DOCX/DOCM/JSON，支持一次选择多个文件。</span>
               </form>
               <p id="materialsActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
+              <p id="uploadZoneStateTenderQa" class="upload-zone-state">当前状态：未上传。</p>
             </div>
-            <div class="upload-zone">
+            <div class="upload-zone" id="uploadZoneBoq" data-material-type="boq" data-health="idle">
               <h4>清单（可多选）</h4>
               <form id="uploadMaterialBoq" method="post" action="/web/upload_materials" enctype="multipart/form-data" class="inline-form">
                 <input type="hidden" name="project_id" id="uploadMaterialBoqProjectId" value="__SELECTED_PROJECT_ID__" />
@@ -14825,8 +15702,9 @@ def index(
                 <span class="note">支持：XLSX/XLS/XLSM/CSV/PDF/DOC/DOCX/TXT/JSON，支持一次选择多个文件。</span>
               </form>
               <p id="materialsActionStatusBoq" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
+              <p id="uploadZoneStateBoq" class="upload-zone-state">当前状态：未上传。</p>
             </div>
-            <div class="upload-zone">
+            <div class="upload-zone" id="uploadZoneDrawing" data-material-type="drawing" data-health="idle">
               <h4>图纸（可多选，支持 DXF ASCII）</h4>
               <form id="uploadMaterialDrawing" method="post" action="/web/upload_materials" enctype="multipart/form-data" class="inline-form">
                 <input type="hidden" name="project_id" id="uploadMaterialDrawingProjectId" value="__SELECTED_PROJECT_ID__" />
@@ -14836,8 +15714,9 @@ def index(
                 <span class="note">支持：PDF/DOC/DOCX/XLSX/XLS/DXF/DWG/图片/JSON/TXT，支持一次选择多个文件。</span>
               </form>
               <p id="materialsActionStatusDrawing" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
+              <p id="uploadZoneStateDrawing" class="upload-zone-state">当前状态：未上传。</p>
             </div>
-            <div class="upload-zone">
+            <div class="upload-zone" id="uploadZoneSitePhoto" data-material-type="site_photo" data-health="idle">
               <h4>现场照片（可多选）</h4>
               <form id="uploadMaterialPhoto" method="post" action="/web/upload_materials" enctype="multipart/form-data" class="inline-form">
                 <input type="hidden" name="project_id" id="uploadMaterialPhotoProjectId" value="__SELECTED_PROJECT_ID__" />
@@ -14847,6 +15726,7 @@ def index(
                 <span class="note">支持：PNG/JPG/JPEG/WEBP/BMP/TIF/TIFF，支持一次选择多个文件。</span>
               </form>
               <p id="materialsActionStatusPhoto" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
+              <p id="uploadZoneStateSitePhoto" class="upload-zone-state">当前状态：未上传。</p>
             </div>
           </div>
         </div>
@@ -14888,10 +15768,13 @@ def index(
               <option value="100">100分制</option>
               <option value="5">5分制</option>
             </select>
+            <button type="button" id="btnScoringDiagnostic" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnScoringDiagnostic')">评分证据链诊断</button>
             <span class="note">支持一次选择多个文件（Mac 按 Command，Windows 按 Ctrl）。</span>
           </form>
+          <p id="shigongGateSummary" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
           <p id="shigongActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
           <div id="scoringReadinessResult" class="result-block" style="display:none"></div>
+          <div id="scoringDiagnosticResult" class="result-block" style="display:none"></div>
           <div id="materialUtilizationResult" class="result-block" style="display:none"></div>
         </div>
       </div>
@@ -15069,6 +15952,7 @@ def index(
             btnMaterialKnowledgeProfileDownload: { resultId: 'materialKnowledgeProfileResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials/knowledge_profile.md', loading: '知识画像下载准备中...' },
             btnUploadShigong: { resultId: 'shigongActionStatus', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/shigong', loading: '施组上传中...' },
             btnScoreShigong: { resultId: 'shigongActionStatus', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/rescore', loading: '施组评分中...' },
+            btnScoringDiagnostic: { resultId: 'scoringDiagnosticResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/scoring_diagnostic/latest', loading: '评分证据链诊断生成中...' },
             btnCompare: { resultId: 'compareResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare', loading: '对比排名加载中...' },
             btnCompareReport: { resultId: 'compareReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare_report', loading: '对比报告生成中...' },
             btnInsights: { resultId: 'insightsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/insights', loading: '洞察分析中...' },
@@ -15315,6 +16199,14 @@ def index(
               const w30 = (data && data.windows && typeof data.windows.recent_30d === 'object') ? data.windows.recent_30d : {};
               const wall = (data && data.windows && typeof data.windows.all === 'object') ? data.windows.all : {};
               const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
+              const evoStored = !!(summary && summary.stored_evolved_multipliers);
+              const evoActive = !!(summary && summary.has_evolved_multipliers);
+              const evoAge = (summary && summary.evolution_weight_age_days != null) ? summary.evolution_weight_age_days : '-';
+              const evoSamples = (summary && summary.evolution_weight_sample_count != null) ? summary.evolution_weight_sample_count : 0;
+              const evoMinSamples = (summary && summary.evolution_weight_min_samples != null) ? summary.evolution_weight_min_samples : '-';
+              const evoStatus = evoActive
+                ? '<span class="success">已生效</span>'
+                : (evoStored ? '<span class="warn">已存储未生效</span>' : '<span class="error">未产出</span>');
               const html = '<strong>进化健康度</strong>'
                 + '<p style="margin:6px 0">漂移等级：'
                 + fallbackEscapeHtml((drift && drift.level) || 'insufficient_data')
@@ -15326,11 +16218,22 @@ def index(
                 + '<tr><td>已匹配预测</td><td>' + fallbackEscapeHtml((summary && summary.matched_prediction_count) || 0) + '</td></tr>'
                 + '<tr><td>未匹配样本</td><td>' + fallbackEscapeHtml((summary && summary.unmatched_ground_truth_count) || 0) + '</td></tr>'
                 + '<tr><td>当前权重来源</td><td>' + fallbackEscapeHtml((summary && summary.current_weights_source) || '-') + '</td></tr>'
+                + '<tr><td>进化权重状态</td><td>' + evoStatus + '</td></tr>'
+                + '<tr><td>进化权重样本/阈值</td><td>' + fallbackEscapeHtml(evoSamples) + ' / ' + fallbackEscapeHtml(evoMinSamples) + '</td></tr>'
+                + '<tr><td>进化权重时效(天)</td><td>' + fallbackEscapeHtml(evoAge) + '</td></tr>'
                 + '</table>'
                 + (recs.length
                   ? '<ul style="margin:6px 0 0 18px;color:#92400e">' + recs.slice(0, 6).map((x) => '<li>' + fallbackEscapeHtml(x) + '</li>').join('') + '</ul>'
                   : '');
               fallbackSetResultHtml(resultId, html);
+              return true;
+            }
+            if (aid === 'btnScoringDiagnostic') {
+              if (window.renderScoringDiagnosticPanel && typeof window.renderScoringDiagnosticPanel === 'function') {
+                window.renderScoringDiagnosticPanel(data || {});
+              } else {
+                fallbackSetResultHtml(resultId, '<strong>评分证据链诊断</strong><pre>' + fallbackEscapeHtml(text || '{}') + '</pre>');
+              }
               return true;
             }
             if (aid === 'btnAdaptive' || aid === 'btnAdaptivePatch' || aid === 'btnAdaptiveValidate' || aid === 'btnAdaptiveApply') {
@@ -15683,6 +16586,7 @@ def index(
               else await fallbackRefreshMaterialsTable(projectId);
               if (typeof refreshScoringReadiness === 'function') await Promise.resolve(refreshScoringReadiness(projectId));
               else await fallbackFetchScoringReadiness(projectId);
+              if (typeof refreshScoringDiagnostic === 'function') await Promise.resolve(refreshScoringDiagnostic(projectId));
               return;
             }
             if (actionId === 'btnUploadShigong' || actionId === 'btnScoreShigong') {
@@ -15693,6 +16597,7 @@ def index(
               }
               if (typeof refreshScoringReadiness === 'function') await Promise.resolve(refreshScoringReadiness(projectId));
               else await fallbackFetchScoringReadiness(projectId);
+              if (typeof refreshScoringDiagnostic === 'function') await Promise.resolve(refreshScoringDiagnostic(projectId));
               return;
             }
             if (actionId === 'btnUploadFeed') {
@@ -15700,6 +16605,7 @@ def index(
               else await fallbackRefreshMaterialsTable(projectId);
               if (typeof refreshFeedMaterials === 'function') await Promise.resolve(refreshFeedMaterials(projectId));
               else await fallbackRefreshMaterialsTable(projectId);
+              if (typeof refreshScoringDiagnostic === 'function') await Promise.resolve(refreshScoringDiagnostic(projectId));
               return;
             }
             if (actionId === 'btnRefreshFeedMaterials') {
@@ -16203,22 +17109,22 @@ def index(
         }
         const NL = String.fromCharCode(10);
         const DIMENSION_LABELS = {
-          "01": "01 工程项目整体理解与实施路径",
-          "02": "02 安全生产管理体系与控制措施",
-          "03": "03 文明施工管理体系与实施措施",
-          "04": "04 材料与部品采购及管理机制",
-          "05": "05 四新技术的应用与实施方案",
-          "06": "06 工程关键工序识别与控制措施",
-          "07": "07 工程重难点及危险性较大工程管控",
-          "08": "08 工程质量管理体系与保证措施",
-          "09": "09 工期目标保障与进度控制措施",
-          "10": "10 专项施工工艺与技术方案",
-          "11": "11 人力资源配置与管理方案",
-          "12": "12 总体施工工艺流程与组织逻辑",
-          "13": "13 物资与施工设备配置方案",
-          "14": "14 设计协调与深化实施能力",
-          "15": "15 总体资源配置与实施计划",
-          "16": "16 技术措施的可行性与落地性"
+          "01": "01 总体部署与信息化管理",
+          "02": "02 安全管理与劳保用品配置",
+          "03": "03 文明施工与绿色工地",
+          "04": "04 材料采购、进场验收与特殊材料闭环",
+          "05": "05 四新技术应用",
+          "06": "06 关键工序控制点",
+          "07": "07 危大工程闭环管理",
+          "08": "08 质量管理体系与ITP简表",
+          "09": "09 进度计划体系与纠偏阈值",
+          "10": "10 专项方案管理与审批验收节点",
+          "11": "11 人力配置与培训",
+          "12": "12 施工流程、专业穿插与移交条件",
+          "13": "13 机械设备配置、验收与维保",
+          "14": "14 图纸会审、深化设计与变更闭环",
+          "15": "15 资源总控与动态调配",
+          "16": "16 可行性验证、样板先行与落地清单"
         };
         const DIM_IDS = Array.from({ length: 16 }, (_, i) => String(i + 1).padStart(2, '0'));
         let expertProfileLocked = false;
@@ -16227,6 +17133,7 @@ def index(
         const PROJECT_REQUIRED_BUTTON_IDS = [
           'deleteCurrentProject', 'btnWeightsReset', 'btnWeightsSave', 'btnWeightsApply',
           'btnMaterialDepthReport', 'btnMaterialDepthReportDownload', 'btnMaterialKnowledgeProfile', 'btnMaterialKnowledgeProfileDownload',
+          'btnScoringDiagnostic',
           'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
           'btnEvolve', 'btnEvolutionHealth', 'btnWritingGuidance', 'btnCompilationInstructions',
           'btnRebuildDelta', 'btnRebuildSamples', 'btnTrainCalibratorV2', 'btnApplyCalibPredict',
@@ -16234,7 +17141,7 @@ def index(
           'btnMinePatchV2', 'btnShadowPatchV2', 'btnDeployPatchV2', 'btnRollbackPatchV2',
         ];
         const NON_BLOCKING_ACTION_BUTTON_IDS = [
-          'btnUploadMaterials', 'btnUploadBoq', 'btnUploadDrawing', 'btnUploadSitePhotos', 'btnRefreshMaterials', 'btnMaterialDepthReport', 'btnMaterialDepthReportDownload', 'btnMaterialKnowledgeProfile', 'btnMaterialKnowledgeProfileDownload', 'btnUploadShigong', 'btnScoreShigong', 'btnRefreshSubmissions',
+          'btnUploadMaterials', 'btnUploadBoq', 'btnUploadDrawing', 'btnUploadSitePhotos', 'btnRefreshMaterials', 'btnMaterialDepthReport', 'btnMaterialDepthReportDownload', 'btnMaterialKnowledgeProfile', 'btnMaterialKnowledgeProfileDownload', 'btnUploadShigong', 'btnScoreShigong', 'btnScoringDiagnostic', 'btnRefreshSubmissions',
           'btnCompare', 'btnCompareReport', 'btnInsights', 'btnLearning',
           'btnEvidenceTrace', 'btnScoringBasis',
           'btnAdaptive', 'btnAdaptivePatch', 'btnAdaptiveValidate', 'btnAdaptiveApply',
@@ -16364,6 +17271,7 @@ def index(
           );
           [
             'scoringReadinessResult',
+            'scoringDiagnosticResult',
             'materialDepthReportResult',
             'materialUtilizationResult',
             'compareResult', 'compareReportResult', 'insightsResult', 'learningResult',
@@ -16696,12 +17604,21 @@ def index(
           if (!el) return;
           const payload = (data && typeof data === 'object') ? data : {};
           const items = Array.isArray(payload.items) ? payload.items : [];
+          const failedRequired = Number(payload.failed_required_count || 0);
+          const failedOptional = Number(payload.failed_optional_count || 0);
+          const degraded = !!payload.degraded;
           const failed = items.filter((x) => !x || !x.ok).length;
-          const summary = failed === 0
-            ? '系统自检通过（全部正常）'
-            : ('系统自检完成：发现 ' + failed + ' 项异常');
+          let summary = '系统自检通过（全部正常）';
+          let accent = '#15803d';
+          if (failedRequired > 0) {
+            summary = '系统自检失败：发现 ' + failedRequired + ' 项核心异常';
+            accent = '#b91c1c';
+          } else if (degraded || failedOptional > 0) {
+            summary = '系统自检通过，但存在 ' + (failedOptional || failed) + ' 项降级告警';
+            accent = '#b45309';
+          }
           el.style.display = 'block';
-          el.style.borderLeftColor = failed === 0 ? '#15803d' : '#b91c1c';
+          el.style.borderLeftColor = accent;
           const capabilityNames = ['parser_pdf', 'parser_docx', 'parser_ocr', 'parser_dwg_converter'];
           const capabilityRows = items.filter((x) => capabilityNames.includes(String((x && x.name) || '')));
           const capabilitySummary = capabilityRows.length
@@ -16709,6 +17626,7 @@ def index(
             : '无';
           let html = '<strong>' + escapeHtmlText(summary) + '</strong>';
           html += '<p style="margin:6px 0 0 0;font-size:12px;color:#475569">解析能力：' + escapeHtmlText(capabilitySummary) + '</p>';
+          html += '<p style="margin:4px 0 0 0;font-size:12px;color:#475569">核心异常：' + escapeHtmlText(String(failedRequired)) + '，降级告警：' + escapeHtmlText(String(failedOptional)) + '</p>';
           html += '<table style="margin-top:8px"><tr><th>检查项</th><th>状态</th><th>详情</th></tr>';
           html += items.length
             ? items.map((x) => {
@@ -16972,6 +17890,7 @@ def index(
             (typeof refreshSubmissions === 'function') ? refreshSubmissions(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshMaterials === 'function') ? refreshMaterials(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshScoringReadiness === 'function') ? refreshScoringReadiness(selectedId, switchSeq) : Promise.resolve(),
+            (typeof refreshScoringDiagnostic === 'function') ? refreshScoringDiagnostic(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshFeedMaterials === 'function') ? refreshFeedMaterials(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshGroundTruth === 'function') ? refreshGroundTruth(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshGroundTruthSubmissionOptions === 'function') ? refreshGroundTruthSubmissionOptions(selectedId, switchSeq) : Promise.resolve(),
@@ -17242,6 +18161,7 @@ def index(
             if (okCount > 0) {
               await refreshMaterials(projectId, projectSwitchSeq);
               if (typeof refreshFeedMaterials === 'function') await refreshFeedMaterials(projectId, projectSwitchSeq);
+              if (typeof refreshScoringDiagnostic === 'function') await refreshScoringDiagnostic(projectId, projectSwitchSeq);
             }
             if (fileInput && failCount === 0) fileInput.value = '';
           } finally {
@@ -17335,7 +18255,10 @@ def index(
               '上传完成：成功 ' + okCount + '，失败 ' + failCount + '。成功文件待评分。',
               failCount > 0
             );
-            if (okCount > 0) await refreshSubmissions(projectId, projectSwitchSeq);
+            if (okCount > 0) {
+              await refreshSubmissions(projectId, projectSwitchSeq);
+              if (typeof refreshScoringDiagnostic === 'function') await refreshScoringDiagnostic(projectId, projectSwitchSeq);
+            }
             if (fileInput && failCount === 0) fileInput.value = '';
           } finally {
             uploadShigongInFlight = false;
@@ -17430,6 +18353,9 @@ def index(
             if (typeof refreshScoringReadiness === 'function') {
               await refreshScoringReadiness(projectId, projectSwitchSeq);
             }
+            if (typeof refreshScoringDiagnostic === 'function') {
+              await refreshScoringDiagnostic(projectId, projectSwitchSeq);
+            }
           } finally {
             scoreShigongInFlight = false;
           }
@@ -17472,6 +18398,7 @@ def index(
           updateTableEmptyState('submissionsTable', 'submissionsEmpty');
           if (typeof refreshScoringReadiness === 'function') refreshScoringReadiness();
           if (typeof refreshGroundTruthSubmissionOptions === 'function') refreshGroundTruthSubmissionOptions();
+          if (typeof refreshScoringDiagnostic === 'function') refreshScoringDiagnostic();
           const out = document.getElementById('output');
           if (out) out.textContent = JSON.stringify({ ok: true, id: submissionId, filename: filename || '' }, null, 2);
         }
@@ -17502,6 +18429,7 @@ def index(
           updateTableEmptyState('materialsTable', 'materialsEmpty');
           if (typeof refreshFeedMaterials === 'function') refreshFeedMaterials();
           if (typeof refreshScoringReadiness === 'function') refreshScoringReadiness();
+          if (typeof refreshScoringDiagnostic === 'function') refreshScoringDiagnostic();
           const out = document.getElementById('output');
           if (out) out.textContent = JSON.stringify({ ok: true, id: materialId, filename: filename || '' }, null, 2);
         }
@@ -17550,6 +18478,7 @@ def index(
             }
             if (typeof clearMaterialUtilizationPanel === 'function') clearMaterialUtilizationPanel();
             if (typeof clearScoringReadinessPanel === 'function') clearScoringReadinessPanel();
+            if (typeof clearScoringDiagnosticPanel === 'function') clearScoringDiagnosticPanel();
             return;
           }
           let res;
@@ -17775,6 +18704,7 @@ def index(
               emptyEl.style.display = 'block';
             }
             if (typeof clearScoringReadinessPanel === 'function') clearScoringReadinessPanel();
+            if (typeof clearScoringDiagnosticPanel === 'function') clearScoringDiagnosticPanel();
             return;
           }
           let res;
@@ -17822,9 +18752,15 @@ def index(
         }
         bindDeleteRowHandlers();
         const btnRefSub = document.getElementById('btnRefreshSubmissions');
-        if (btnRefSub) btnRefSub.onclick = refreshSubmissions;
+        if (btnRefSub) btnRefSub.onclick = async () => {
+          await refreshSubmissions();
+          if (typeof refreshScoringDiagnostic === 'function') await refreshScoringDiagnostic();
+        };
         const btnRefMat = document.getElementById('btnRefreshMaterials');
-        if (btnRefMat) btnRefMat.onclick = refreshMaterials;
+        if (btnRefMat) btnRefMat.onclick = async () => {
+          await refreshMaterials();
+          if (typeof refreshScoringDiagnostic === 'function') await refreshScoringDiagnostic();
+        };
         safeClick('btnMaterialDepthReport', async () => {
           if (!ensureProjectForAction('materialDepthReportResult')) return;
           const id = pid();
@@ -18146,6 +19082,7 @@ def index(
           const byDimension = Array.isArray(data.by_dimension) ? data.by_dimension : [];
           const byType = Array.isArray(data.by_type) ? data.by_type : [];
           const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
+          const numericCategorySummary = Array.isArray(summary.numeric_category_summary) ? summary.numeric_category_summary : [];
           const topDims = byDimension
             .slice()
             .sort((a, b) => Number((b && b.coverage_score) || 0) - Number((a && a.coverage_score) || 0))
@@ -18156,6 +19093,11 @@ def index(
             + '；低覆盖维度 ' + escapeHtmlText(summary.low_coverage_dimensions || 0)
             + '；解析字数 ' + escapeHtmlText(summary.total_parsed_chars || 0)
             + '</p>';
+          if (numericCategorySummary.length) {
+            html += '<p style="margin:4px 0 8px 0;color:#334155"><strong>资料约束簇：</strong>'
+              + escapeHtmlText(numericCategorySummary.join('；'))
+              + '</p>';
+          }
           html += '<table><tr><th>维度</th><th>关键词命中</th><th>来源类型数</th><th>覆盖评分</th><th>等级</th></tr>';
           html += topDims.length
             ? topDims.map((row) => '<tr>'
@@ -18167,7 +19109,7 @@ def index(
               + '</tr>').join('')
             : '<tr><td colspan="5">暂无维度覆盖数据</td></tr>';
           html += '</table>';
-          html += '<table style="margin-top:8px"><tr><th>资料类型</th><th>文件数</th><th>字数</th><th>分块</th><th>词项数</th></tr>';
+          html += '<table style="margin-top:8px"><tr><th>资料类型</th><th>文件数</th><th>字数</th><th>分块</th><th>词项数</th><th>数值约束簇</th></tr>';
           html += byType.length
             ? byType.slice(0, 6).map((row) => '<tr>'
               + '<td>' + escapeHtmlText((row && row.material_type_label) || (row && row.material_type) || '-') + '</td>'
@@ -18175,8 +19117,9 @@ def index(
               + '<td>' + escapeHtmlText((row && row.parsed_chars) || 0) + '</td>'
               + '<td>' + escapeHtmlText((row && row.parsed_chunks) || 0) + '</td>'
               + '<td>' + escapeHtmlText((row && row.unique_terms) || 0) + '</td>'
+              + '<td>' + escapeHtmlText((((row && row.numeric_category_summary) || []).join('；')) || '-') + '</td>'
               + '</tr>').join('')
-            : '<tr><td colspan="5">暂无资料类型画像</td></tr>';
+            : '<tr><td colspan="6">暂无资料类型画像</td></tr>';
           html += '</table>';
           if (recs.length) {
             html += '<ul style="margin:6px 0 0 18px;color:#92400e">'
@@ -18197,6 +19140,14 @@ def index(
           const w90 = (windows.recent_90d && typeof windows.recent_90d === 'object') ? windows.recent_90d : {};
           const drift = (data.drift && typeof data.drift === 'object') ? data.drift : {};
           const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
+          const evoStored = !!summary.stored_evolved_multipliers;
+          const evoActive = !!summary.has_evolved_multipliers;
+          const evoAge = (summary.evolution_weight_age_days != null) ? summary.evolution_weight_age_days : '-';
+          const evoSamples = (summary.evolution_weight_sample_count != null) ? summary.evolution_weight_sample_count : 0;
+          const evoMinSamples = (summary.evolution_weight_min_samples != null) ? summary.evolution_weight_min_samples : '-';
+          const evoStatus = evoActive
+            ? '<span class="success">已生效</span>'
+            : (evoStored ? '<span class="warn">已存储未生效</span>' : '<span class="error">未产出</span>');
           let html = '<strong>进化健康度（误差趋势 / 漂移）</strong>';
           html += '<p style="margin:6px 0">漂移等级：'
             + escapeHtmlText(drift.level || 'insufficient_data')
@@ -18209,7 +19160,9 @@ def index(
           html += '<tr><td>已匹配预测</td><td>' + escapeHtmlText(summary.matched_prediction_count || 0) + '</td></tr>';
           html += '<tr><td>未匹配样本</td><td>' + escapeHtmlText(summary.unmatched_ground_truth_count || 0) + '</td></tr>';
           html += '<tr><td>当前权重来源</td><td>' + escapeHtmlText(summary.current_weights_source || '-') + '</td></tr>';
-          html += '<tr><td>进化权重状态</td><td>' + (summary.has_evolved_multipliers ? '<span class="success">已生效</span>' : '<span class="error">未生效</span>') + '</td></tr>';
+          html += '<tr><td>进化权重状态</td><td>' + evoStatus + '</td></tr>';
+          html += '<tr><td>进化权重样本/阈值</td><td>' + escapeHtmlText(evoSamples) + ' / ' + escapeHtmlText(evoMinSamples) + '</td></tr>';
+          html += '<tr><td>进化权重时效(天)</td><td>' + escapeHtmlText(evoAge) + '</td></tr>';
           html += '</table>';
           if (recs.length) {
             html += '<ul style="margin:6px 0 0 18px;color:#92400e">'
@@ -18254,7 +19207,156 @@ def index(
           if (!el) return;
           el.style.display = 'none';
           el.innerHTML = '';
+          updateShigongGateSummary({ project_id: pid(), ready: false, gate_passed: false, issues: ['评分前置检查未完成'] });
           applyScoringReadiness({ project_id: pid(), ready: false, gate_passed: false, issues: ['评分前置检查未完成'] });
+        }
+        function materialTypeUploadAnchor(materialType) {
+          const mt = String(materialType || '').trim();
+          if (mt === 'tender_qa') return '#uploadMaterial';
+          if (mt === 'boq') return '#uploadMaterialBoq';
+          if (mt === 'drawing') return '#uploadMaterialDrawing';
+          if (mt === 'site_photo') return '#uploadMaterialPhoto';
+          return '#section-materials';
+        }
+        function materialTypeUploadZoneId(materialType) {
+          const mt = String(materialType || '').trim();
+          if (mt === 'tender_qa') return 'uploadZoneTenderQa';
+          if (mt === 'boq') return 'uploadZoneBoq';
+          if (mt === 'drawing') return 'uploadZoneDrawing';
+          if (mt === 'site_photo') return 'uploadZoneSitePhoto';
+          return '';
+        }
+        function materialTypeUploadZoneStateId(materialType) {
+          const mt = String(materialType || '').trim();
+          if (mt === 'tender_qa') return 'uploadZoneStateTenderQa';
+          if (mt === 'boq') return 'uploadZoneStateBoq';
+          if (mt === 'drawing') return 'uploadZoneStateDrawing';
+          if (mt === 'site_photo') return 'uploadZoneStateSitePhoto';
+          return '';
+        }
+        function clearMaterialUploadZoneHighlights() {
+          ['tender_qa', 'boq', 'drawing', 'site_photo'].forEach((materialType) => {
+            const zoneId = materialTypeUploadZoneId(materialType);
+            const stateId = materialTypeUploadZoneStateId(materialType);
+            const zoneEl = zoneId ? document.getElementById(zoneId) : null;
+            const stateEl = stateId ? document.getElementById(stateId) : null;
+            if (zoneEl) zoneEl.dataset.health = 'idle';
+            if (stateEl) {
+              stateEl.style.color = '#64748b';
+              stateEl.textContent = '当前状态：未上传。';
+            }
+          });
+        }
+        function applyMaterialUploadZoneHighlights(typeCards) {
+          clearMaterialUploadZoneHighlights();
+          const cards = Array.isArray(typeCards) ? typeCards : [];
+          cards.forEach((card) => {
+            if (!card || typeof card !== 'object') return;
+            const materialType = String(card.material_type || '').trim();
+            const zoneId = materialTypeUploadZoneId(materialType);
+            const stateId = materialTypeUploadZoneStateId(materialType);
+            const zoneEl = zoneId ? document.getElementById(zoneId) : null;
+            const stateEl = stateId ? document.getElementById(stateId) : null;
+            if (!zoneEl || !stateEl) return;
+            const status = String(card.status || 'idle');
+            zoneEl.dataset.health = status || 'idle';
+            const hitRequirementCount = Number(card.hit_requirement_count || 0);
+            const hitFileCount = Number(card.hit_filename_count || 0);
+            const missingNumericCount = Number(card.missing_numeric_term_count || 0);
+            const missingNumericCategorySummary = Array.isArray(card.missing_numeric_category_summary)
+              ? card.missing_numeric_category_summary
+              : [];
+            const projectNumericCategorySummary = Array.isArray(card.project_numeric_category_summary)
+              ? card.project_numeric_category_summary
+              : [];
+            const statusLabel = String(card.status_label || '未上传');
+            let text = '当前状态：' + statusLabel;
+            if (status === 'active') {
+              text += '；已命中文件 ' + String(hitFileCount) + ' 份';
+              if (hitRequirementCount > 0) text += '；已命中约束 ' + String(hitRequirementCount) + ' 条';
+              if (missingNumericCount > 0) text += '；仍缺数值锚点 ' + String(missingNumericCount) + ' 项';
+              if (missingNumericCategorySummary.length) text += '；重点缺口 ' + String(missingNumericCategorySummary[0] || '');
+              stateEl.style.color = '#166534';
+            } else if (status === 'parsed_not_used') {
+              text += '；已解析但尚未进入评分证据链';
+              if (missingNumericCount > 0) text += '；建议补充数值锚点 ' + String(missingNumericCount) + ' 项';
+              if (projectNumericCategorySummary.length) text += '；已提取 ' + String(projectNumericCategorySummary[0] || '');
+              if (missingNumericCategorySummary.length) text += '；重点缺口 ' + String(missingNumericCategorySummary[0] || '');
+              stateEl.style.color = '#9a3412';
+            } else if (status === 'uploaded_unparsed') {
+              text += '；建议更换可解析版本或补传文本/PDF';
+              stateEl.style.color = '#991b1b';
+            } else if (status === 'missing') {
+              text += '；当前阻断评分';
+              stateEl.style.color = '#991b1b';
+            } else {
+              stateEl.style.color = '#64748b';
+            }
+            stateEl.textContent = text;
+          });
+        }
+        function updateShigongGateSummary(payload) {
+          const el = document.getElementById('shigongGateSummary');
+          if (!el) return;
+          const source = (payload && typeof payload === 'object') ? payload : {};
+          if (!pid()) {
+            el.style.color = '#475569';
+            el.textContent = '当前未选择项目。';
+            return;
+          }
+          const issues = Array.isArray(source.issues) ? source.issues.filter((item) => String(item || '').trim()) : [];
+          const warnings = Array.isArray(source.warnings) ? source.warnings.filter((item) => String(item || '').trim()) : [];
+          const gate = (source.material_gate && typeof source.material_gate === 'object') ? source.material_gate : {};
+          const typeCards = Array.isArray(source.material_type_cards) ? source.material_type_cards : [];
+          const missingTypes = Array.isArray(gate.missing_required_types)
+            ? gate.missing_required_types.map((item) => materialTypeDisplayName(item)).filter((item) => !!item)
+            : [];
+          if (source.ready) {
+            el.style.color = '#166534';
+            el.innerHTML = '评分前置已满足，可直接点击“评分施组”。';
+            return;
+          }
+          const parts = [];
+          const missingTypeLinks = Array.isArray(gate.missing_required_types)
+            ? gate.missing_required_types
+                .map((item) => {
+                  const key = String(item || '').trim();
+                  if (!key) return '';
+                  return '<a href="' + materialTypeUploadAnchor(key) + '">' + escapeHtmlText(materialTypeDisplayName(key)) + '</a>';
+                })
+                .filter((item) => !!item)
+            : [];
+          if (missingTypeLinks.length) {
+            parts.push('缺少资料：' + missingTypeLinks.join('、'));
+          } else if (missingTypes.length) {
+            parts.push('缺少资料：' + missingTypes.map((item) => escapeHtmlText(item)).join('、'));
+          }
+          const attentionCards = typeCards.filter((card) => {
+            const status = String((card && card.status) || '');
+            return status === 'uploaded_unparsed' || status === 'parsed_not_used';
+          });
+          if (attentionCards.length) {
+            const tokens = attentionCards.slice(0, 2).map((card) => {
+              const mt = String((card && card.material_type) || '').trim();
+              const label = escapeHtmlText(card.material_type_label || materialTypeDisplayName(mt) || mt || '资料');
+              const statusLabel = escapeHtmlText(card.status_label || '待处理');
+              return '<a href="' + materialTypeUploadAnchor(mt) + '">' + label + '</a>' + '（' + statusLabel + '）';
+            });
+            if (tokens.length) {
+              parts.push('待处理：' + tokens.join('、'));
+            }
+          }
+          issues.slice(0, 2).forEach((item) => {
+            const text = String(item);
+            if (!parts.includes(text)) parts.push(escapeHtmlText(text));
+          });
+          if (!parts.length && warnings.length) {
+            warnings.slice(0, 2).forEach((item) => parts.push(escapeHtmlText(String(item))));
+          }
+          el.style.color = '#9f1239';
+          el.innerHTML = parts.length
+            ? ('当前不可评分：' + parts.join('；'))
+            : '当前不可评分，请先补齐资料并完成评分前置检查。';
         }
         function renderScoringReadinessPanel(payload) {
           const el = document.getElementById('scoringReadinessResult');
@@ -18313,6 +19415,7 @@ def index(
           }
           el.style.display = 'block';
           el.innerHTML = html;
+          updateShigongGateSummary(source);
           applyScoringReadiness(source);
         }
         async function refreshScoringReadiness(expectedProjectId=null, switchSeq=null) {
@@ -18573,6 +19676,340 @@ def index(
           el.innerHTML = html;
         }
         window.renderMaterialUtilizationPanel = renderMaterialUtilizationPanel;
+        function clearScoringDiagnosticPanel() {
+          const el = document.getElementById('scoringDiagnosticResult');
+          if (!el) return;
+          el.style.display = 'none';
+          el.innerHTML = '';
+          clearMaterialUploadZoneHighlights();
+        }
+        function renderScoringDiagnosticPanel(payload) {
+          const el = document.getElementById('scoringDiagnosticResult');
+          if (!el) return;
+          const data = (payload && typeof payload === 'object') ? payload : {};
+          const readiness = (data.readiness && typeof data.readiness === 'object') ? data.readiness : {};
+          const depth = (data.material_depth && typeof data.material_depth === 'object') ? data.material_depth : {};
+          const latest = (data.latest_submission && typeof data.latest_submission === 'object') ? data.latest_submission : {};
+          const trace = (data.evidence_trace && typeof data.evidence_trace === 'object') ? data.evidence_trace : {};
+          const traceSummary = (trace.summary && typeof trace.summary === 'object') ? trace.summary : {};
+          const basis = (data.scoring_basis && typeof data.scoring_basis === 'object') ? data.scoring_basis : {};
+          const util = (basis.material_utilization && typeof basis.material_utilization === 'object') ? basis.material_utilization : {};
+          const utilGate = (basis.material_utilization_gate && typeof basis.material_utilization_gate === 'object')
+            ? basis.material_utilization_gate
+            : {};
+          const summary = (data.summary && typeof data.summary === 'object') ? data.summary : {};
+          const recommendations = Array.isArray(data.recommendations) ? data.recommendations : [];
+          const dimensionSupportCards = Array.isArray(data.dimension_support_cards) ? data.dimension_support_cards : [];
+          const issues = Array.isArray(readiness.issues) ? readiness.issues : [];
+          const warnings = Array.isArray(readiness.warnings) ? readiness.warnings : [];
+          const hitFiles = Array.isArray(traceSummary.source_files_hit)
+            ? traceSummary.source_files_hit
+            : (Array.isArray(trace.source_files_hit) ? trace.source_files_hit : []);
+          const gateReasons = Array.isArray(utilGate.reasons) ? utilGate.reasons : [];
+          const byTypeDepth = Array.isArray(depth.by_type) ? depth.by_type : [];
+          const utilByType = (util.by_type && typeof util.by_type === 'object') ? util.by_type : {};
+          const utilAvailableTypes = Array.isArray(util.available_types) ? util.available_types : [];
+          const typeCards = Array.isArray(data.material_type_cards) ? data.material_type_cards : [];
+          const statusRaw = String((latest.scoring_status || '')).toLowerCase();
+          const statusLabel = statusRaw === 'scored'
+            ? '<span class="success">已评分</span>'
+            : (statusRaw === 'pending'
+              ? '<span style="color:#92400e">待评分</span>'
+              : (statusRaw === 'blocked'
+                ? '<span class="error">已阻断</span>'
+                : escapeHtmlText(latest.scoring_status || '未生成')));
+          const toPct = (v) => {
+            const n = Number(v);
+            return Number.isFinite(n) ? ((n * 100).toFixed(1) + '%') : '-';
+          };
+          const typeLabels = {
+            tender_qa: '招标文件和答疑',
+            boq: '清单',
+            drawing: '图纸',
+            site_photo: '现场照片',
+          };
+          const orderedTypes = [];
+          byTypeDepth.forEach((row) => {
+            const key = String((row && row.material_type) || '').trim();
+            if (key && !orderedTypes.includes(key)) orderedTypes.push(key);
+          });
+          utilAvailableTypes.forEach((key) => {
+            const clean = String(key || '').trim();
+            if (clean && !orderedTypes.includes(clean)) orderedTypes.push(clean);
+          });
+          Object.keys(utilByType).forEach((key) => {
+            const clean = String(key || '').trim();
+            if (clean && !orderedTypes.includes(clean)) orderedTypes.push(clean);
+          });
+
+          let html = '<strong>评分证据链诊断（项目级）</strong>';
+          html += '<p style="margin:6px 0">最新施组：'
+            + (latest.exists ? escapeHtmlText(latest.filename || '-') : '<span style="color:#64748b">暂无施组</span>')
+            + '；状态：' + statusLabel
+            + '；生成时间：' + escapeHtmlText(String(data.generated_at || '').slice(0, 19) || '-')
+            + '</p>';
+          if (dimensionSupportCards.length) {
+            const strongDims = dimensionSupportCards
+              .filter((row) => String((row && row.coverage_level) || '') !== 'low')
+              .slice(0, 6);
+            const weakDims = dimensionSupportCards
+              .filter((row) => String((row && row.coverage_level) || '') === 'low')
+              .slice(0, 6);
+            const numericClusterSummary = Array.isArray(summary.material_numeric_category_summary)
+              ? summary.material_numeric_category_summary
+              : [];
+            html += '<div style="border:1px solid #cbd5e1;background:#f8fafc;border-radius:10px;padding:10px;margin:8px 0 12px 0">';
+            html += '<div style="font-weight:700;color:#0f172a;margin-bottom:6px">资料支撑维度总览</div>';
+            html += '<p style="margin:4px 0;color:#334155">'
+              + '覆盖率 ' + escapeHtmlText(toPct(summary.material_dimension_coverage_rate))
+              + '；已覆盖维度 ' + escapeHtmlText(summary.material_covered_dimensions || 0)
+              + '；低覆盖维度 ' + escapeHtmlText(summary.material_low_coverage_dimensions || 0)
+              + '</p>';
+            if (numericClusterSummary.length) {
+              html += '<p style="margin:4px 0;color:#334155"><strong>资料约束簇：</strong>'
+                + escapeHtmlText(numericClusterSummary.join('；'))
+                + '</p>';
+            }
+            html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px;margin-top:8px">';
+            html += '<div><div style="font-weight:600;color:#166534;margin-bottom:4px">支撑较强维度</div>';
+            html += '<table><tr><th>维度</th><th>覆盖</th><th>来源</th></tr>';
+            html += strongDims.length
+              ? strongDims.map((row) => '<tr>'
+                + '<td>' + escapeHtmlText((row.dimension_id || '-') + ' ' + (row.dimension_name || '')) + '</td>'
+                + '<td>' + escapeHtmlText(((Number(row.coverage_score || 0) * 100).toFixed(1)) + '%') + '</td>'
+                + '<td>' + escapeHtmlText(((row.source_types || []).map(materialTypeDisplayName).join('、')) || '-') + '</td>'
+                + '</tr>').join('')
+              : '<tr><td colspan="3">暂无明显强支撑维度</td></tr>';
+            html += '</table></div>';
+            html += '<div><div style="font-weight:600;color:#9a3412;margin-bottom:4px">证据薄弱维度</div>';
+            html += '<table><tr><th>维度</th><th>缺口提示</th><th>建议补充</th></tr>';
+            html += weakDims.length
+              ? weakDims.map((row) => '<tr>'
+                + '<td>' + escapeHtmlText((row.dimension_id || '-') + ' ' + (row.dimension_name || '')) + '</td>'
+                + '<td>' + escapeHtmlText(((row.source_types || []).map(materialTypeDisplayName).join('、')) || '暂无资料支撑') + '</td>'
+                + '<td>' + escapeHtmlText(((row.suggested_keywords || []).join('、')) || '-') + '</td>'
+                + '</tr>').join('')
+              : '<tr><td colspan="3">暂无明显薄弱维度</td></tr>';
+            html += '</table></div>';
+            html += '</div></div>';
+            html += '<details style="margin:8px 0 12px 0"><summary>维度支撑明细（16维）</summary>';
+            html += '<table><tr><th>维度</th><th>覆盖</th><th>关键词</th><th>数值信号</th><th>资料类型</th><th>来源文件</th><th>建议补充</th></tr>';
+            html += dimensionSupportCards.map((row) => '<tr>'
+              + '<td>' + escapeHtmlText((row.dimension_id || '-') + ' ' + (row.dimension_name || '')) + '</td>'
+              + '<td>' + escapeHtmlText(((Number(row.coverage_score || 0) * 100).toFixed(1)) + '%') + ' / ' + escapeHtmlText(row.coverage_level || '-') + '</td>'
+              + '<td>' + escapeHtmlText(row.keyword_hits || 0) + '</td>'
+              + '<td>' + escapeHtmlText(row.numeric_signal_hits || 0) + '</td>'
+              + '<td>' + escapeHtmlText(((row.source_types || []).map(materialTypeDisplayName).join('、')) || '-') + '</td>'
+              + '<td>' + escapeHtmlText(((row.source_files_preview || []).join('；')) || '-') + '</td>'
+              + '<td>' + escapeHtmlText(((row.suggested_keywords || []).join('、')) || '-') + '</td>'
+              + '</tr>').join('');
+            html += '</table></details>';
+          }
+          if (typeCards.length) {
+            const typeTone = (status) => {
+              const s = String(status || '');
+              if (s === 'active') return { border: '#16a34a', bg: '#f0fdf4', title: '#166534' };
+              if (s === 'parsed_not_used') return { border: '#d97706', bg: '#fff7ed', title: '#9a3412' };
+              if (s === 'uploaded_unparsed') return { border: '#dc2626', bg: '#fef2f2', title: '#991b1b' };
+              if (s === 'missing') return { border: '#dc2626', bg: '#fef2f2', title: '#991b1b' };
+              return { border: '#94a3b8', bg: '#f8fafc', title: '#334155' };
+            };
+            html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin:10px 0 12px 0;">';
+            html += typeCards.map((card) => {
+              const tone = typeTone(card.status);
+              const guidance = Array.isArray(card.guidance) ? card.guidance : [];
+              const uploadedFiles = Array.isArray(card.uploaded_filenames) ? card.uploaded_filenames : [];
+              const hitFilesByType = Array.isArray(card.hit_filenames) ? card.hit_filenames : [];
+              const hitLabels = Array.isArray(card.hit_requirement_labels) ? card.hit_requirement_labels : [];
+              const missLabels = Array.isArray(card.miss_requirement_labels) ? card.miss_requirement_labels : [];
+              const hitEvidencePreview = Array.isArray(card.hit_evidence_preview) ? card.hit_evidence_preview : [];
+              const missEvidencePreview = Array.isArray(card.miss_evidence_preview) ? card.miss_evidence_preview : [];
+              const conflictLabels = Array.isArray(card.conflict_labels) ? card.conflict_labels : [];
+              const projectNumericTerms = Array.isArray(card.project_numeric_terms) ? card.project_numeric_terms : [];
+              const projectNumericCategorySummary = Array.isArray(card.project_numeric_category_summary) ? card.project_numeric_category_summary : [];
+              const hitNumericTerms = Array.isArray(card.hit_numeric_terms) ? card.hit_numeric_terms : [];
+              const missingNumericTerms = Array.isArray(card.missing_numeric_terms) ? card.missing_numeric_terms : [];
+              const hitNumericCategorySummary = Array.isArray(card.hit_numeric_category_summary) ? card.hit_numeric_category_summary : [];
+              const missingNumericCategorySummary = Array.isArray(card.missing_numeric_category_summary) ? card.missing_numeric_category_summary : [];
+              const uploadedPreview = uploadedFiles.slice(0, 3).join('；');
+              const hitPreview = hitFilesByType.slice(0, 3).join('；');
+              const hitLabelPreview = hitLabels.slice(0, 3).join('；');
+              const missLabelPreview = missLabels.slice(0, 3).join('；');
+              const hitEvidencePreviewText = hitEvidencePreview.slice(0, 2).map((row) => {
+                if (!row || typeof row !== 'object') return '';
+                const label = String(row.label || '').trim();
+                const filename = String(row.source_filename || '').trim();
+                return label && filename ? (label + ' @ ' + filename) : (label || filename);
+              }).filter((item) => !!item).join('；');
+              const missEvidencePreviewText = missEvidencePreview.slice(0, 2).map((row) => {
+                if (!row || typeof row !== 'object') return '';
+                const label = String(row.label || '').trim();
+                const filename = String(row.source_filename || '').trim();
+                return label && filename ? (label + ' @ ' + filename) : (label || filename);
+              }).filter((item) => !!item).join('；');
+              const conflictLabelPreview = conflictLabels.slice(0, 3).join('；');
+              const projectNumericPreview = projectNumericTerms.slice(0, 4).join('、');
+              const projectNumericCategoryPreview = projectNumericCategorySummary.slice(0, 2).join('；');
+              const hitNumericPreview = hitNumericTerms.slice(0, 4).join('、');
+              const missNumericPreview = missingNumericTerms.slice(0, 4).join('、');
+              const hitNumericCategoryPreview = hitNumericCategorySummary.slice(0, 2).join('；');
+              const missNumericCategoryPreview = missingNumericCategorySummary.slice(0, 2).join('；');
+              const evidenceText = Number(card.retrieval_total || 0) > 0 || Number(card.consistency_total || 0) > 0 || Number(card.fallback_total || 0) > 0
+                ? (
+                    '检索 ' + escapeHtmlText(card.retrieval_hit || 0) + '/' + escapeHtmlText(card.retrieval_total || 0)
+                    + '；一致性 ' + escapeHtmlText(card.consistency_hit || 0) + '/' + escapeHtmlText(card.consistency_total || 0)
+                    + '；兜底 ' + escapeHtmlText(card.fallback_hit || 0) + '/' + escapeHtmlText(card.fallback_total || 0)
+                  )
+                : '尚未形成评分证据';
+              return ''
+                + '<div style="border:1px solid ' + tone.border + ';background:' + tone.bg + ';border-radius:10px;padding:10px;">'
+                + '<div style="display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:6px;">'
+                + '<strong style="color:' + tone.title + '">' + escapeHtmlText(card.material_type_label || '-') + '</strong>'
+                + '<span style="font-size:12px;color:' + tone.title + '">' + escapeHtmlText(card.status_label || '-') + '</span>'
+                + '</div>'
+                + '<div style="font-size:12px;color:#334155;line-height:1.6">'
+                + '<div>文件 ' + escapeHtmlText(card.files || 0) + '；字数 ' + escapeHtmlText(card.parsed_chars || 0) + '</div>'
+                + '<div>分块 ' + escapeHtmlText(card.parsed_chunks || 0) + '；数值项 ' + escapeHtmlText(card.numeric_terms || 0) + '</div>'
+                + '<div>' + evidenceText + '</div>'
+                + '<div>已上传：' + (uploadedFiles.length ? (escapeHtmlText(uploadedPreview) + (uploadedFiles.length > 3 ? ' 等' : '')) : '<span style="color:#64748b">无</span>') + '</div>'
+                + '<div>已命中：' + (hitFilesByType.length ? (escapeHtmlText(hitPreview) + (hitFilesByType.length > 3 ? ' 等' : '')) : '<span style="color:#64748b">暂无命中</span>') + '</div>'
+                + '<div>命中约束：' + (hitLabels.length ? (escapeHtmlText(hitLabelPreview) + (hitLabels.length > 3 ? ' 等' : '')) : '<span style="color:#64748b">暂无</span>') + '</div>'
+                + '<div>命中证据：' + (hitEvidencePreviewText ? escapeHtmlText(hitEvidencePreviewText) : '<span style="color:#64748b">暂无</span>') + '</div>'
+                + '<div>未命中重点：' + (conflictLabels.length
+                    ? (escapeHtmlText(conflictLabelPreview) + (conflictLabels.length > 3 ? ' 等' : ''))
+                    : (missLabels.length ? (escapeHtmlText(missLabelPreview) + (missLabels.length > 3 ? ' 等' : '')) : '<span style="color:#64748b">暂无</span>')) + '</div>'
+                + '<div>缺口证据：' + (missEvidencePreviewText ? escapeHtmlText(missEvidencePreviewText) : '<span style="color:#64748b">暂无</span>') + '</div>'
+                + '<div>资料提取锚点：' + (projectNumericTerms.length ? (escapeHtmlText(projectNumericPreview) + (projectNumericTerms.length > 4 ? ' 等' : '')) : '<span style="color:#64748b">暂无</span>') + '</div>'
+                + '<div>资料锚点类别：' + (projectNumericCategorySummary.length ? escapeHtmlText(projectNumericCategoryPreview) : '<span style="color:#64748b">暂无</span>') + '</div>'
+                + '<div>命中数值锚点：' + (hitNumericTerms.length ? (escapeHtmlText(hitNumericPreview) + (hitNumericTerms.length > 4 ? ' 等' : '')) : '<span style="color:#64748b">暂无</span>') + '</div>'
+                + '<div>待补数值锚点：' + (missingNumericTerms.length ? (escapeHtmlText(missNumericPreview) + (missingNumericTerms.length > 4 ? ' 等' : '')) : '<span style="color:#64748b">暂无</span>') + '</div>'
+                + '<div>命中类别：' + (hitNumericCategorySummary.length ? escapeHtmlText(hitNumericCategoryPreview) : '<span style="color:#64748b">暂无</span>') + '</div>'
+                + '<div>待补类别：' + (missingNumericCategorySummary.length ? escapeHtmlText(missNumericCategoryPreview) : '<span style="color:#64748b">暂无</span>') + '</div>'
+                + '<div>角色：' + (card.required ? '必需资料' : '补充资料') + '</div>'
+                + '</div>'
+                + (guidance.length
+                  ? '<ul style="margin:8px 0 0 18px;font-size:12px;color:#475569">' + guidance.slice(0, 2).map((item) => '<li>' + escapeHtmlText(item) + '</li>').join('') + '</ul>'
+                  : '')
+                + '</div>';
+            }).join('');
+            html += '</div>';
+          }
+          html += '<table><tr><th>检查项</th><th>当前值</th><th>状态</th></tr>';
+          html += '<tr><td>评分前置</td><td>' + (readiness.ready ? '已满足' : '未满足') + '</td><td>'
+            + (readiness.ready ? '<span class="success">可评分</span>' : '<span class="error">需补齐</span>') + '</td></tr>';
+          html += '<tr><td>资料门禁</td><td>' + (summary.material_gate_passed ? '通过' : '未通过') + '</td><td>'
+            + (summary.material_gate_passed ? '<span class="success">通过</span>' : '<span class="error">阻断/预警</span>') + '</td></tr>';
+          html += '<tr><td>资料深读</td><td>文件 ' + escapeHtmlText(summary.material_files || 0)
+            + '；字数 ' + escapeHtmlText(summary.material_parsed_chars || 0)
+            + '；分块 ' + escapeHtmlText(summary.material_parsed_chunks || 0)
+            + '</td><td>' + (summary.material_parsed_chunks > 0 ? '<span class="success">已解析</span>' : '<span class="error">未解析</span>') + '</td></tr>';
+          html += '<tr><td>证据命中</td><td>' + escapeHtmlText(summary.evidence_total_hits || 0)
+            + ' / ' + escapeHtmlText(summary.evidence_total_requirements || 0)
+            + '</td><td>强制项 ' + escapeHtmlText(toPct(summary.evidence_mandatory_hit_rate)) + '</td></tr>';
+          html += '<tr><td>文件覆盖</td><td>' + escapeHtmlText(summary.evidence_source_files_hit_count || 0)
+            + ' 份命中文件</td><td>检索命中率 ' + escapeHtmlText(toPct(summary.retrieval_hit_rate)) + '</td></tr>';
+          html += '<tr><td>检索覆盖率</td><td>' + escapeHtmlText(toPct(summary.retrieval_file_coverage_rate))
+            + '</td><td>' + (summary.material_utilization_gate_blocked ? '<span class="error">资料利用门禁阻断</span>' : '<span class="success">资料利用可接受</span>') + '</td></tr>';
+          html += '<tr><td>资料冲突</td><td>' + escapeHtmlText(summary.material_conflict_count || 0)
+            + ' 个</td><td>高风险 ' + escapeHtmlText(summary.material_conflict_high_severity_count || 0) + ' 个</td></tr>';
+          html += '</table>';
+
+          if (orderedTypes.length) {
+            html += '<details open style="margin-top:8px"><summary>按资料类型查看参与评分情况</summary>';
+            html += '<table><tr><th>资料类型</th><th>文件数</th><th>解析字数</th><th>分块</th><th>检索命中</th><th>一致性命中</th><th>兜底命中</th></tr>';
+            html += orderedTypes.map((typeKey) => {
+              const depthRow = byTypeDepth.find((row) => String((row && row.material_type) || '') === typeKey) || {};
+              const utilRow = (utilByType[typeKey] && typeof utilByType[typeKey] === 'object') ? utilByType[typeKey] : {};
+              const retrievalTotal = Number(utilRow.retrieval_total || 0);
+              const retrievalHit = Number(utilRow.retrieval_hit || 0);
+              const consistencyTotal = Number(utilRow.consistency_total || 0);
+              const consistencyHit = Number(utilRow.consistency_hit || 0);
+              const fallbackTotal = Number(utilRow.fallback_total || 0);
+              const fallbackHit = Number(utilRow.fallback_hit || 0);
+              return '<tr>'
+                + '<td>' + escapeHtmlText(typeLabels[typeKey] || typeKey || '-') + '</td>'
+                + '<td>' + escapeHtmlText(depthRow.files || 0) + '</td>'
+                + '<td>' + escapeHtmlText(depthRow.parsed_chars || 0) + '</td>'
+                + '<td>' + escapeHtmlText(depthRow.parsed_chunks || 0) + '</td>'
+                + '<td>' + escapeHtmlText(retrievalHit) + ' / ' + escapeHtmlText(retrievalTotal) + '</td>'
+                + '<td>' + escapeHtmlText(consistencyHit) + ' / ' + escapeHtmlText(consistencyTotal) + '</td>'
+                + '<td>' + escapeHtmlText(fallbackHit) + ' / ' + escapeHtmlText(fallbackTotal) + '</td>'
+                + '</tr>';
+            }).join('');
+            html += '</table></details>';
+          }
+
+          if (hitFiles.length) {
+            html += '<p style="margin:8px 0 0 0"><strong>评分命中文件：</strong>'
+              + escapeHtmlText(hitFiles.slice(0, 10).join('；'))
+              + (hitFiles.length > 10 ? ' 等' : '')
+              + '</p>';
+          }
+          if (issues.length) {
+            html += '<ul style="margin:8px 0 0 18px;color:#9f1239">'
+              + issues.slice(0, 8).map((item) => '<li>' + escapeHtmlText(item) + '</li>').join('')
+              + '</ul>';
+          }
+          if (warnings.length || gateReasons.length || recommendations.length) {
+            html += '<details style="margin-top:8px"><summary>诊断建议与门禁原因</summary>';
+            if (warnings.length) {
+              html += '<p style="margin:6px 0 0 0;color:#92400e"><strong>预警</strong></p><ul style="margin:4px 0 0 18px;color:#92400e">'
+                + warnings.slice(0, 8).map((item) => '<li>' + escapeHtmlText(item) + '</li>').join('')
+                + '</ul>';
+            }
+            if (gateReasons.length) {
+              html += '<p style="margin:6px 0 0 0;color:#9f1239"><strong>门禁原因</strong></p><ul style="margin:4px 0 0 18px;color:#9f1239">'
+                + gateReasons.slice(0, 8).map((item) => '<li>' + escapeHtmlText(item) + '</li>').join('')
+                + '</ul>';
+            }
+            if (recommendations.length) {
+              html += '<p style="margin:6px 0 0 0;color:#334155"><strong>建议动作</strong></p><ul style="margin:4px 0 0 18px;color:#334155">'
+                + recommendations.slice(0, 12).map((item) => '<li>' + escapeHtmlText(item) + '</li>').join('')
+                + '</ul>';
+            }
+            html += '</details>';
+          }
+          el.style.display = 'block';
+          el.innerHTML = html;
+          applyMaterialUploadZoneHighlights(typeCards);
+          updateShigongGateSummary({
+            project_id: data.project_id || pid(),
+            ready: !!readiness.ready,
+            issues: issues,
+            warnings: warnings,
+            material_gate: readiness.material_gate || {},
+            material_type_cards: typeCards,
+          });
+        }
+        window.renderScoringDiagnosticPanel = renderScoringDiagnosticPanel;
+        async function refreshScoringDiagnostic(expectedProjectId=null, switchSeq=null) {
+          const id = expectedProjectId || pid();
+          if (!id) {
+            clearScoringDiagnosticPanel();
+            return;
+          }
+          let res;
+          let data = {};
+          try {
+            res = await fetch('/api/v1/projects/' + encodeURIComponent(id) + '/scoring_diagnostic/latest?t=' + Date.now(), {
+              method: 'GET',
+              headers: apiHeaders(false),
+              cache: 'no-store',
+            });
+            data = await res.json().catch(() => ({}));
+          } catch (_) {
+            if (isStaleProjectResponse(id, switchSeq)) return;
+            setResultError('scoringDiagnosticResult', '评分证据链诊断失败：无法连接服务');
+            return;
+          }
+          if (isStaleProjectResponse(id, switchSeq)) return;
+          if (!res.ok) {
+            const detail = (data && data.detail) ? String(data.detail) : ('HTTP ' + String(res.status || 0));
+            setResultError('scoringDiagnosticResult', '评分证据链诊断失败：' + detail);
+            return;
+          }
+          renderScoringDiagnosticPanel(data);
+        }
         function setResultLoading(resultId, label) {
           const el = document.getElementById(resultId);
           if (!el) return;
@@ -18879,6 +20316,14 @@ def index(
           } catch (_) {
             el.innerHTML = '<pre>' + text + '</pre>';
           }
+        });
+
+        safeClick('btnScoringDiagnostic', async () => {
+          if (!ensureProjectForAction('scoringDiagnosticResult')) return;
+          setResultLoading('scoringDiagnosticResult', '评分证据链诊断生成中...');
+          await refreshScoringDiagnostic(actionProjectId(), projectSwitchSeq);
+          const out = document.getElementById('output');
+          if (out) out.textContent = '评分证据链诊断已刷新。';
         });
 
         safeClick('btnEvidenceTrace', async () => {

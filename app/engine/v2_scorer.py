@@ -234,6 +234,7 @@ def _match_requirements(
         dim_units = units_by_dim.get(dim_id, [])
         dim_text = _joined_unit_text(dim_units)
         scope_text = dim_text if dim_text else text
+        scope_lower = scope_text.lower()
         hit = True
         reason = ""
         evaluated = False
@@ -247,7 +248,7 @@ def _match_requirements(
         elif req_type in {"presence", "keyword"}:
             kws = patterns.get("keywords") or []
             if kws:
-                hit = any(str(k).lower() in lower for k in kws if k)
+                hit = any(str(k).lower() in scope_lower for k in kws if k)
                 reason = "keywords"
                 evaluated = True
         elif req_type == "semantic":
@@ -335,11 +336,25 @@ def _match_requirements(
 
         must_have_terms = patterns.get("must_have_terms")
         if isinstance(must_have_terms, list) and must_have_terms:
-            must_ok = all(
-                str(t).strip() and str(t).lower() in scope_text.lower() for t in must_have_terms
-            )
+            must_ok = all(str(t).strip() and str(t).lower() in scope_lower for t in must_have_terms)
             hit = hit and must_ok
             reason = f"{reason}|must_have_terms" if reason else "must_have_terms"
+            evaluated = True
+
+        must_not_have_terms = patterns.get("must_not_have_terms")
+        if isinstance(must_not_have_terms, list) and must_not_have_terms:
+            forbidden_hits = [
+                str(t).strip()
+                for t in must_not_have_terms
+                if str(t).strip() and str(t).lower() in scope_lower
+            ]
+            must_not_ok = len(forbidden_hits) == 0
+            hit = hit and must_not_ok
+            reason = (
+                f"{reason}|must_not_have_terms:{len(forbidden_hits)}"
+                if reason
+                else f"must_not_have_terms:{len(forbidden_hits)}"
+            )
             evaluated = True
 
         should_any2 = patterns.get("should_have_terms_any2") or {}

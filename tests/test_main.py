@@ -51,6 +51,14 @@ class TestIndexEndpoint:
         assert "uploadMaterialBoq" in response.text
         assert "uploadMaterialDrawing" in response.text
         assert "uploadMaterialPhoto" in response.text
+        assert 'id="uploadZoneTenderQa"' in response.text
+        assert 'id="uploadZoneBoq"' in response.text
+        assert 'id="uploadZoneDrawing"' in response.text
+        assert 'id="uploadZoneSitePhoto"' in response.text
+        assert 'id="uploadZoneStateTenderQa"' in response.text
+        assert 'id="uploadZoneStateBoq"' in response.text
+        assert 'id="uploadZoneStateDrawing"' in response.text
+        assert 'id="uploadZoneStateSitePhoto"' in response.text
         assert "uploadShigong" in response.text
         assert 'id="projectDeleteSelect"' in response.text
         assert 'id="deleteSelectedProjects"' in response.text
@@ -61,7 +69,10 @@ class TestIndexEndpoint:
         assert 'id="btnEvolutionHealth"' in response.text
         assert 'id="btnEvidenceTrace"' in response.text
         assert 'id="btnScoringBasis"' in response.text
+        assert 'id="btnScoringDiagnostic"' in response.text
+        assert 'id="shigongGateSummary"' in response.text
         assert 'id="scoringBasisResult"' in response.text
+        assert 'id="scoringDiagnosticResult"' in response.text
         assert 'id="groundTruthSubmissionSelect"' in response.text
         assert 'id="groundTruthFile"' not in response.text
         assert "/ground_truth/from_submission" in response.text
@@ -134,6 +145,21 @@ class TestIndexEndpoint:
         assert "function ensureProjectForAction" in page
         assert "setResultLoading('compareResult'" in page
         assert "setResultLoading('adaptiveResult'" in page
+        assert "setResultLoading('scoringDiagnosticResult'" in page
+        assert "function updateShigongGateSummary" in page
+        assert "function materialTypeUploadAnchor" in page
+        assert "function applyMaterialUploadZoneHighlights" in page
+        assert "function clearMaterialUploadZoneHighlights" in page
+        assert "资料提取锚点：" in page
+        assert "资料锚点类别：" in page
+        assert "命中证据：" in page
+        assert "缺口证据：" in page
+        assert "命中类别：" in page
+        assert "待补类别：" in page
+        assert "资料支撑维度总览" in page
+        assert "支撑较强维度" in page
+        assert "证据薄弱维度" in page
+        assert "维度支撑明细（16维）" in page
 
     def test_index_frontend_has_no_broken_multiline_regex_literal(self, client):
         """Rendered JS should not contain regex literals split by line breaks (would break entire script)."""
@@ -153,6 +179,7 @@ class TestIndexEndpoint:
             "btnCompareReport",
             "btnInsights",
             "btnLearning",
+            "btnScoringDiagnostic",
             "btnEvidenceTrace",
             "btnScoringBasis",
             "btnAdaptive",
@@ -176,6 +203,7 @@ class TestIndexEndpoint:
             "compareReportResult",
             "insightsResult",
             "learningResult",
+            "scoringDiagnosticResult",
             "evidenceTraceResult",
             "scoringBasisResult",
             "adaptiveResult",
@@ -1422,6 +1450,88 @@ class TestMaterialsEndpoint:
         assert "self_evolution_loop" in keys
         assert "runtime_stability" in keys
 
+    @patch("app.main._build_submission_scoring_basis_report")
+    @patch("app.main._resolve_submission_score_fields")
+    @patch("app.main._submission_is_scored")
+    @patch("app.main.load_submissions")
+    @patch("app.main._run_system_self_check")
+    @patch("app.main._build_evolution_health_report")
+    @patch("app.main._build_material_depth_report")
+    @patch("app.main._build_scoring_readiness")
+    @patch("app.main._now_iso", return_value="2026-02-28T00:00:00+00:00")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_project_mece_audit_marks_runtime_warn_for_optional_failures(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_now_iso,
+        mock_build_readiness,
+        mock_build_depth,
+        mock_build_evo_health,
+        mock_self_check,
+        mock_load_submissions,
+        mock_submission_is_scored,
+        mock_resolve_score_fields,
+        mock_scoring_basis,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_build_readiness.return_value = {
+            "project_id": "p1",
+            "ready": True,
+            "gate_passed": True,
+            "issues": [],
+            "warnings": [],
+            "material_quality": {"total_parsed_chars": 8600},
+            "material_gate": {"required_types": ["tender_qa", "boq", "drawing"]},
+        }
+        mock_build_depth.return_value = {"quality_summary": {"total_files": 4}}
+        mock_build_evo_health.return_value = {
+            "summary": {
+                "ground_truth_count": 4,
+                "matched_prediction_count": 3,
+                "has_evolved_multipliers": True,
+                "stored_evolved_multipliers": True,
+                "current_weights_source": "evolution",
+            },
+            "drift": {"level": "low"},
+        }
+        mock_self_check.return_value = {
+            "ok": True,
+            "items": [
+                {"name": "health", "ok": True},
+                {"name": "data_hygiene", "ok": False, "detail": "orphan_records=2"},
+            ],
+        }
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "created_at": "2026-02-27T00:00:00+00:00",
+                "updated_at": "2026-02-27T00:00:00+00:00",
+                "report": {"scoring_status": "done"},
+            }
+        ]
+        mock_submission_is_scored.return_value = True
+        mock_resolve_score_fields.return_value = {"total_score": 78.6}
+        mock_scoring_basis.return_value = {
+            "mece_inputs": {
+                "project_materials_extracted": True,
+                "shigong_parsed": True,
+                "bid_requirements_loaded": True,
+                "attention_16d_weights_injected": True,
+                "custom_instructions_injected": True,
+            },
+            "evidence_trace": {"total_requirements": 10, "total_hits": 8},
+        }
+
+        response = client.get("/api/v1/projects/p1/mece_audit")
+        assert response.status_code == 200
+        rows = {row["key"]: row for row in response.json()["dimensions"]}
+        assert rows["runtime_stability"]["status"] == "warn"
+        assert any("data_hygiene" in str(x) for x in rows["runtime_stability"]["warnings"])
+
     @patch("app.main._build_evolution_health_report")
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
@@ -1513,6 +1623,57 @@ class TestMaterialsEndpoint:
         assert payload["windows"]["all"]["mae"] == pytest.approx(8.0, abs=1e-4)
         assert payload["windows"]["all"]["count"] == 1
         assert payload["drift"]["level"] in {"insufficient_data", "watch", "low", "medium", "high"}
+
+    @patch("app.main.load_projects")
+    @patch("app.main._resolve_project_scoring_context")
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_submissions")
+    def test_build_evolution_health_report_distinguishes_stored_vs_active_weights(
+        self,
+        mock_load_submissions,
+        mock_load_ground_truth,
+        mock_load_evo_reports,
+        mock_resolve_scoring_context,
+        mock_load_projects,
+    ):
+        from app.main import _build_evolution_health_report
+
+        mock_load_projects.return_value = [
+            {
+                "id": "p1",
+                "meta": {
+                    "score_scale_max": 100,
+                    "evolution_weight_min_samples": 3,
+                    "evolution_weight_max_age_days": 90,
+                },
+            }
+        ]
+        mock_load_submissions.return_value = []
+        mock_load_ground_truth.return_value = []
+        mock_load_evo_reports.return_value = {
+            "p1": {
+                "sample_count": 1,
+                "updated_at": "2026-03-01T00:00:00+00:00",
+                "scoring_evolution": {"dimension_multipliers": {"01": 1.2}},
+            }
+        }
+        mock_resolve_scoring_context.return_value = (
+            {"01": 1.0},
+            {"id": "ep1", "weights_norm": {"01": 1.0}},
+            {"id": "p1", "meta": {"score_scale_max": 100}},
+        )
+
+        payload = _build_evolution_health_report(
+            "p1",
+            {"id": "p1", "meta": {"score_scale_max": 100, "evolution_weight_min_samples": 3}},
+        )
+        summary = payload["summary"]
+        assert summary["stored_evolved_multipliers"] is True
+        assert summary["has_evolved_multipliers"] is False
+        assert summary["current_weights_source"] == "expert_profile"
+        assert summary["evolution_weights_inactive_reason"] == "sample_count_below_min"
+        assert any("样本量未达到生效阈值" in str(x) for x in payload["recommendations"])
 
     @patch("app.main._resolve_dwg_converter_binaries", return_value=[])
     @patch("app.main.load_materials")
@@ -1646,10 +1807,17 @@ class TestMaterialsEndpoint:
             "summary": {
                 "total_files": 4,
                 "parsed_ok_files": 4,
+                "numeric_category_summary": ["工期/节点：90", "数量/工程量：1200"],
                 "covered_dimensions": 12,
                 "dimension_coverage_rate": 0.75,
             },
-            "by_type": [{"material_type": "tender_qa", "files": 1}],
+            "by_type": [
+                {
+                    "material_type": "tender_qa",
+                    "files": 1,
+                    "numeric_category_summary": ["工期/节点：90"],
+                }
+            ],
             "by_dimension": [
                 {
                     "dimension_id": "01",
@@ -1666,6 +1834,7 @@ class TestMaterialsEndpoint:
         data = response.json()
         assert data["project_id"] == "p1"
         assert data["summary"]["total_files"] == 4
+        assert data["summary"]["numeric_category_summary"] == ["工期/节点：90", "数量/工程量：1200"]
         assert data["by_dimension"][0]["dimension_id"] == "01"
         assert data["recommendations"]
 
@@ -1691,6 +1860,7 @@ class TestMaterialsEndpoint:
                 "total_parsed_chars": 1000,
                 "total_parsed_chunks": 6,
                 "total_numeric_terms": 12,
+                "numeric_category_summary": ["工期/节点：90", "规格/参数：1200", "阈值/偏差：48"],
                 "dimension_coverage_rate": 0.5,
             },
             "by_type": [
@@ -1701,6 +1871,7 @@ class TestMaterialsEndpoint:
                     "parsed_chunks": 3,
                     "unique_terms": 18,
                     "numeric_terms": 4,
+                    "numeric_category_summary": ["工期/节点：90", "阈值/偏差：48"],
                 },
             ],
             "by_dimension": [
@@ -1722,6 +1893,7 @@ class TestMaterialsEndpoint:
         assert "## 按资料类型" in markdown
         assert "## 按评分维度" in markdown
         assert "## 建议动作" in markdown
+        assert "数值约束簇" in markdown
 
     @patch("app.main._resolve_dwg_converter_binaries", return_value=["/usr/local/bin/dwg2dxf"])
     @patch("app.main._now_iso", return_value="2026-02-27T00:00:00+00:00")
@@ -1767,7 +1939,9 @@ class TestMaterialsEndpoint:
         assert payload["summary"]["total_files"] == 2
         assert payload["summary"]["parsed_ok_files"] == 2
         assert payload["summary"]["covered_dimensions"] >= 1
+        assert payload["summary"]["numeric_category_summary"]
         assert len(payload["by_type"]) >= 2
+        assert any(row.get("numeric_category_summary") for row in payload["by_type"])
         dim_ids = {row["dimension_id"] for row in payload["by_dimension"]}
         assert "01" in dim_ids
 
@@ -2779,6 +2953,12 @@ class TestMaterialAdvancedParsing:
         assert "site_photo" in (gate.get("uncovered_uploaded_types") or [])
         assert any("已上传资料类型覆盖率" in str(x) for x in (gate.get("reasons") or []))
 
+    def test_resolve_material_utilization_policy_defaults_to_nonzero_file_coverage(self):
+        from app.main import _resolve_material_utilization_policy
+
+        policy = _resolve_material_utilization_policy({"id": "p1", "meta": {}})
+        assert policy["min_retrieval_file_coverage_rate"] == pytest.approx(0.35, abs=1e-6)
+
 
 class TestScoreForProjectEndpoint:
     """Tests for /projects/{project_id}/score endpoint."""
@@ -3384,6 +3564,310 @@ class TestEvidenceTraceEndpoints:
         assert data["mece_inputs"]["materials_quality_gate_passed"] is True
         assert data["material_utilization"]["retrieval_hit_rate"] == pytest.approx(0.72, abs=1e-6)
         assert data["evidence_trace"]["source_files_hit_count"] == 3
+
+    @patch("app.main._build_project_scoring_diagnostic")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_latest_project_scoring_diagnostic_success(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_build_diagnostic,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_build_diagnostic.return_value = {
+            "project_id": "p1",
+            "generated_at": "2026-03-07T10:00:00+08:00",
+            "readiness": {
+                "project_id": "p1",
+                "ready": True,
+                "score_button_enabled": True,
+                "gate_passed": True,
+                "issues": [],
+                "warnings": [],
+                "material_quality": {"total_files": 4},
+                "material_gate": {"required_types": ["tender_qa", "boq", "drawing"]},
+                "material_depth_gate": {"passed": True, "enforce": True},
+                "submissions": {"non_empty": 1},
+                "retrieval_policy": {},
+                "generated_at": "2026-03-07T10:00:00+08:00",
+            },
+            "material_depth": {
+                "project_id": "p1",
+                "generated_at": "2026-03-07T10:00:00+08:00",
+                "ready_to_score": True,
+                "capabilities": {"ocr_available": True},
+                "gate": {"passed": True},
+                "depth_gate": {"passed": True, "enforce": True},
+                "quality_summary": {"total_files": 4, "total_parsed_chars": 28000},
+                "by_type": [],
+                "recommendations": [],
+            },
+            "latest_submission": {
+                "exists": True,
+                "submission_id": "s1",
+                "filename": "施工组织设计.pdf",
+                "created_at": "2026-03-07T09:00:00+08:00",
+                "scoring_status": "scored",
+                "is_scored": True,
+            },
+            "evidence_trace": {
+                "project_id": "p1",
+                "submission_id": "s1",
+                "filename": "施工组织设计.pdf",
+                "generated_at": "2026-03-07T10:00:00+08:00",
+                "summary": {
+                    "total_requirements": 18,
+                    "total_hits": 12,
+                    "mandatory_hit_rate": 0.8,
+                    "source_files_hit_count": 3,
+                    "source_files_hit": ["招标文件.pdf", "清单.xlsx", "图纸.dxf"],
+                },
+                "by_dimension": [],
+                "requirement_hits": [],
+                "evidence_units": [],
+                "material_conflicts": {"conflict_count": 1, "high_severity_count": 0},
+                "recommendations": [],
+            },
+            "scoring_basis": {
+                "project_id": "p1",
+                "submission_id": "s1",
+                "filename": "施工组织设计.pdf",
+                "generated_at": "2026-03-07T10:00:00+08:00",
+                "scoring_status": "scored",
+                "mece_inputs": {"materials_quality_gate_passed": True},
+                "material_quality": {"total_files": 4},
+                "material_retrieval": {"chunks": 20},
+                "material_utilization": {"retrieval_hit_rate": 0.75},
+                "material_utilization_gate": {"blocked": False, "reasons": []},
+                "evidence_trace": {"mandatory_hit_rate": 0.8},
+                "recommendations": [],
+            },
+            "material_type_cards": [
+                {
+                    "material_type": "tender_qa",
+                    "material_type_label": "招标文件和答疑",
+                    "required": True,
+                    "in_scope": True,
+                    "status": "active",
+                    "status_label": "已参与评分",
+                    "files": 1,
+                    "parsed_chars": 12000,
+                    "parsed_chunks": 12,
+                    "numeric_terms": 8,
+                    "meets_chars": True,
+                    "meets_chunks": True,
+                    "meets_numeric_terms": True,
+                    "retrieval_hit": 4,
+                    "retrieval_total": 6,
+                    "consistency_hit": 2,
+                    "consistency_total": 3,
+                    "fallback_hit": 0,
+                    "fallback_total": 0,
+                    "has_evidence": True,
+                    "uploaded_filenames": ["招标文件.pdf", "答疑纪要.docx"],
+                    "uploaded_filename_count": 2,
+                    "hit_filenames": ["招标文件.pdf"],
+                    "hit_filename_count": 1,
+                    "hit_requirement_labels": ["工期节点", "质量目标"],
+                    "hit_requirement_count": 2,
+                    "miss_requirement_labels": ["危大工程清单"],
+                    "miss_requirement_count": 1,
+                    "hit_evidence_preview": [
+                        {
+                            "label": "工期节点",
+                            "source_filename": "招标文件.pdf",
+                            "source_mode": "retrieval",
+                            "reason": "keywords",
+                        },
+                        {
+                            "label": "质量目标",
+                            "source_filename": "答疑纪要.docx",
+                            "source_mode": "retrieval",
+                            "reason": "keywords",
+                        },
+                    ],
+                    "miss_evidence_preview": [
+                        {
+                            "label": "危大工程清单",
+                            "source_filename": "招标文件.pdf",
+                            "source_mode": "material_consistency",
+                            "reason": "material_consistency:t1/2;n0/1",
+                        },
+                    ],
+                    "conflict_labels": ["危大工程清单"],
+                    "conflict_label_count": 1,
+                    "project_numeric_terms": ["90", "1200", "48"],
+                    "project_numeric_term_count": 3,
+                    "project_numeric_category_summary": [
+                        "工期/节点：90",
+                        "规格/参数：1200",
+                        "阈值/偏差：48",
+                    ],
+                    "hit_numeric_terms": ["90", "1200", "7"],
+                    "hit_numeric_term_count": 3,
+                    "expected_numeric_terms": ["90", "1200", "7", "48"],
+                    "expected_numeric_term_count": 4,
+                    "missing_numeric_terms": ["48"],
+                    "missing_numeric_term_count": 1,
+                    "hit_numeric_category_summary": ["工期/节点：90", "规格/参数：1200、7"],
+                    "expected_numeric_category_summary": [
+                        "工期/节点：90",
+                        "规格/参数：1200、7",
+                        "阈值/偏差：48",
+                    ],
+                    "missing_numeric_category_summary": ["阈值/偏差：48"],
+                    "guidance": ["招标文件和答疑已进入评分证据链。"],
+                }
+            ],
+            "dimension_support_cards": [
+                {
+                    "dimension_id": "01",
+                    "dimension_name": "总体部署与信息化管理",
+                    "coverage_score": 0.82,
+                    "coverage_level": "high",
+                    "keyword_hits": 10,
+                    "numeric_signal_hits": 2,
+                    "source_types": ["tender_qa", "drawing"],
+                    "source_file_count": 2,
+                    "source_files_preview": ["招标文件.pdf", "总图.dxf"],
+                    "suggested_keywords": ["工程范围", "项目理解"],
+                },
+                {
+                    "dimension_id": "07",
+                    "dimension_name": "危大工程闭环管理",
+                    "coverage_score": 0.21,
+                    "coverage_level": "low",
+                    "keyword_hits": 1,
+                    "numeric_signal_hits": 0,
+                    "source_types": [],
+                    "source_file_count": 0,
+                    "source_files_preview": [],
+                    "suggested_keywords": ["危大工程", "专项方案", "监测"],
+                },
+            ],
+            "summary": {
+                "latest_submission_exists": True,
+                "latest_submission_scored": True,
+                "evidence_total_hits": 12,
+                "retrieval_hit_rate": 0.75,
+                "material_dimension_coverage_rate": 0.625,
+                "material_low_coverage_dimensions": 6,
+                "material_covered_dimensions": 10,
+                "material_numeric_category_summary": ["工期/节点：90", "规格/参数：1200"],
+            },
+            "recommendations": ["补充图纸中的设备型号锚点。"],
+        }
+
+        response = client.get("/api/v1/projects/p1/scoring_diagnostic/latest")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["latest_submission"]["filename"] == "施工组织设计.pdf"
+        assert data["summary"]["evidence_total_hits"] == 12
+        assert data["summary"]["retrieval_hit_rate"] == pytest.approx(0.75, abs=1e-6)
+        assert data["evidence_trace"]["summary"]["source_files_hit_count"] == 3
+        assert data["scoring_basis"]["material_utilization"]["retrieval_hit_rate"] == pytest.approx(
+            0.75, abs=1e-6
+        )
+        assert len(data["material_type_cards"]) == 1
+        assert data["material_type_cards"][0]["status"] == "active"
+        assert data["material_type_cards"][0]["uploaded_filenames"] == [
+            "招标文件.pdf",
+            "答疑纪要.docx",
+        ]
+        assert data["material_type_cards"][0]["hit_filenames"] == ["招标文件.pdf"]
+        assert data["material_type_cards"][0]["hit_requirement_labels"] == ["工期节点", "质量目标"]
+        assert data["material_type_cards"][0]["hit_evidence_preview"][0]["label"] == "工期节点"
+        assert data["material_type_cards"][0]["miss_evidence_preview"][0]["label"] == "危大工程清单"
+        assert data["material_type_cards"][0]["conflict_labels"] == ["危大工程清单"]
+        assert data["material_type_cards"][0]["project_numeric_terms"] == ["90", "1200", "48"]
+        assert data["material_type_cards"][0]["project_numeric_category_summary"] == [
+            "工期/节点：90",
+            "规格/参数：1200",
+            "阈值/偏差：48",
+        ]
+        assert data["material_type_cards"][0]["hit_numeric_terms"] == ["90", "1200", "7"]
+        assert data["material_type_cards"][0]["missing_numeric_terms"] == ["48"]
+        assert data["material_type_cards"][0]["hit_numeric_category_summary"] == [
+            "工期/节点：90",
+            "规格/参数：1200、7",
+        ]
+        assert data["material_type_cards"][0]["missing_numeric_category_summary"] == [
+            "阈值/偏差：48"
+        ]
+        assert data["dimension_support_cards"][0]["dimension_id"] == "01"
+        assert data["dimension_support_cards"][1]["coverage_level"] == "low"
+        assert data["summary"]["material_dimension_coverage_rate"] == pytest.approx(0.625, abs=1e-6)
+        assert data["summary"]["material_low_coverage_dimensions"] == 6
+
+    @patch("app.main._build_project_scoring_diagnostic")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_latest_project_scoring_diagnostic_without_submission(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_build_diagnostic,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_build_diagnostic.return_value = {
+            "project_id": "p1",
+            "generated_at": "2026-03-07T10:00:00+08:00",
+            "readiness": {
+                "project_id": "p1",
+                "ready": False,
+                "score_button_enabled": False,
+                "gate_passed": False,
+                "issues": ["缺少施组文件"],
+                "warnings": [],
+                "material_quality": {},
+                "material_gate": {},
+                "material_depth_gate": {},
+                "submissions": {"non_empty": 0},
+                "retrieval_policy": {},
+                "generated_at": "2026-03-07T10:00:00+08:00",
+            },
+            "material_depth": {
+                "project_id": "p1",
+                "generated_at": "2026-03-07T10:00:00+08:00",
+                "ready_to_score": False,
+                "capabilities": {},
+                "gate": {},
+                "depth_gate": {},
+                "quality_summary": {"total_files": 0},
+                "by_type": [],
+                "recommendations": ["请先上传项目资料。"],
+            },
+            "latest_submission": {
+                "exists": False,
+                "submission_id": None,
+                "filename": None,
+                "created_at": None,
+                "scoring_status": None,
+                "is_scored": False,
+            },
+            "evidence_trace": None,
+            "scoring_basis": None,
+            "material_type_cards": [],
+            "summary": {
+                "latest_submission_exists": False,
+                "latest_submission_scored": False,
+                "evidence_total_hits": 0,
+                "retrieval_hit_rate": None,
+            },
+            "recommendations": ["暂无施组评分证据链，请先上传并评分至少 1 份施组。"],
+        }
+
+        response = client.get("/api/v1/projects/p1/scoring_diagnostic/latest")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["latest_submission"]["exists"] is False
+        assert data["evidence_trace"] is None
+        assert data["scoring_basis"] is None
+        assert data["summary"]["latest_submission_exists"] is False
 
     def test_build_material_conflict_summary_from_report(self):
         from app.main import _build_material_conflict_summary_from_report
@@ -4565,6 +5049,10 @@ class TestSystemSelfCheckCapabilities:
         assert "parser_ocr" in names
         assert "parser_dwg_converter" in names
         assert "data_hygiene" in names
+        assert "required_ok" in payload
+        assert "degraded" in payload
+        assert "failed_required_count" in payload
+        assert "failed_optional_count" in payload
 
     @patch(
         "app.main._build_data_hygiene_report",
@@ -4591,6 +5079,10 @@ class TestSystemSelfCheckCapabilities:
         mock_load_config.return_value = MagicMock(rubric={}, lexicon={})
         payload = _run_system_self_check(None)
         assert payload.get("ok") is True
+        assert payload.get("required_ok") is True
+        assert payload.get("degraded") is True
+        assert payload.get("failed_required_count") == 0
+        assert payload.get("failed_optional_count") == 1
         items = payload.get("items") or []
         dwg_item = next((x for x in items if x.get("name") == "parser_dwg_converter"), {})
         assert dwg_item.get("ok") is False

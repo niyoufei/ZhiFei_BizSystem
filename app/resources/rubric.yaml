@@ -1,249 +1,194 @@
-adaptive_hints:
-- 若高优维度长期偏低，可提高其权重或下调阈值。
+version: v2_qingtian_hefei_exec
+
 dimensions:
-  '01':
+  "01":
     max_score: 10
     per_hit: 2.5
-    suggested_gain: 1.5
-    suggestion: 补充工程概况、施工范围与目标指标，明确项目理解。
-    suggestion_threshold: 6
     weight: 5
-  '02':
-    max_score: 10
-    per_hit: 2.5
-    suggested_gain: 1.5
-    suggestion: 增加安全管理组织架构与安全检查频次。
     suggestion_threshold: 6
-    weight: 5
-  '03':
+    suggested_gain: 1.5
+    suggestion: 补齐“总体部署与信息化管理”闭环：模块、采集项、更新频次、预警阈值、责任岗位、处置时限、记录载体。
+  "02":
     max_score: 10
     per_hit: 2.5
+    weight: 5
+    suggestion_threshold: 6
+    suggested_gain: 1.5
+    suggestion: 建立劳保用品配置矩阵（岗位/用品/标准/频次/处置/记录），并写清班前交底与巡查闭环。
+  "03":
+    max_score: 10
+    per_hit: 2.5
+    weight: 5
+    suggestion_threshold: 6
+    suggested_gain: 1.3
+    suggestion: 以“绿色工地”完整标题展开至少3类环保主题（扬尘/噪声/污水/固废/节能节水），并补齐验收与台账。
+  "04":
+    max_score: 10
+    per_hit: 2.5
+    weight: 5
+    suggestion_threshold: 6
     suggested_gain: 1.2
-    suggestion: 完善文明施工措施与现场围挡、扬尘控制。
-    suggestion_threshold: 6
-    weight: 5
-  '04':
+    suggestion: 完整描述材料闭环链条：计划提报、采购审查、进场验收、见证取样、复验判定、不合格隔离退场、批次追溯。
+  "05":
     max_score: 10
     per_hit: 2.5
+    weight: 5
+    suggestion_threshold: 6
     suggested_gain: 1.2
-    suggestion: 补充材料验收、样板与进场检验流程。
-    suggestion_threshold: 6
-    weight: 5
-  '05':
+    suggestion: 四新应用需写成落地清单：类别、适用部位、实施参数、预期效果、验证方式、管控要点。
+  "06":
     max_score: 10
     per_hit: 2.5
-    suggested_gain: 1.0
-    suggestion: 描述新工艺/新技术的应用场景和优势。
-    suggestion_threshold: 6
     weight: 5
-  '06':
-    max_score: 10
-    per_hit: 2.5
+    suggestion_threshold: 6
     suggested_gain: 1.5
-    suggestion: 明确关键工序的控制点和验收标准。
-    suggestion_threshold: 6
-    weight: 5
-  '07':
+    suggestion: 关键工序必须使用固定结构（工序内容/重点难点/措施/验收），并在措施中体现参数、频次、责任、记录。
+  "07":
     max_score: 10
     per_hit: 2.5
+    weight: 5
+    suggestion_threshold: 6
+    suggested_gain: 1.5
+    suggestion: 完善危大工程闭环：清单、专项方案、监测与阈值、停复工条件、签认闭环。
     sub_items:
-    - id: 07-1
-      keywords:
-      - 危大工程
-      - 重难点
-      - 重点难点
-      - 专项方案
-      - 论证
-      name: 危大工程/重点难点识别完整
-      weight: 2
-    - id: 07-2
-      keywords:
-      - 风险
-      - 隐患
-      - 难点
-      - 易导致
-      - 影响
-      - 不利因素
-      - 可能
-      name: 风险点分析到位
-      regex:
-      - 易\s*导致
-      - 可能\s*发生
-      - 存在\s*(?:较大|一定|突出)?\s*(?:风险|隐患|难点|问题)
-      weight: 2
-    - id: 07-3
-      keywords:
-      - 控制在
-      - 不大于
-      - 不小于
-      - 频次
-      - 责任人
-      - 验收
-      - 旁站
-      name: 措施参数化落地
-      regex:
-      - (?:控制在|不大于|不小于|≤|≥|<|>)\s*\d+(?:\.\d+)?
-      - (?:每日|每周|每月|每班|每次|每\d+天|每\d+小时|\d+次/天|\d+次/周)
-      - (?:项目经理|技术负责人|施工员|质检员|安全员|资料员|材料员|班组长)\S{0,10}(?:负责|牵头|组织|落实)
-      - (?:报验|签认|验收|旁站|自检|互检|交接检|隐蔽验收)
-      weight: 2
-    - id: 07-4
-      keywords:
-      - 监测
-      - 旁站
-      - 报验
-      - 签认
-      - 隐蔽验收
-      - 销项
-      name: 监测与验收闭环
-      weight: 2
-    - id: 07-5
-      keywords:
-      - 应急预案
-      - 处置
-      - 停工
-      - 复工条件
-      - 整改
-      name: 应急与纠偏
-      weight: 2
-    suggested_gain: 1.5
-    suggestion: 识别重难点与危大工程并提出专项控制。
-    suggestion_threshold: 6
-    weight: 5
-  08:
+      - id: 07-1
+        name: 危大工程/重点难点识别完整
+        weight: 2
+        keywords: ["危大工程", "重难点", "重点难点", "专项方案", "论证"]
+      - id: 07-2
+        name: 风险点分析到位
+        weight: 2
+        keywords: ["风险", "隐患", "难点", "易导致", "影响", "不利因素", "可能"]
+        regex:
+          - 易\s*导致
+          - 可能\s*发生
+          - 存在\s*(?:较大|一定|突出)?\s*(?:风险|隐患|难点|问题)
+      - id: 07-3
+        name: 措施参数化落地
+        weight: 2
+        keywords: ["控制在", "不大于", "不小于", "频次", "责任人", "验收", "旁站"]
+        regex:
+          - (?:控制在|不大于|不小于|≤|≥|<|>)\s*\d+(?:\.\d+)?
+          - (?:每日|每周|每月|每班|每次|每\d+天|每\d+小时|\d+次/天|\d+次/周)
+          - (?:项目经理|项目总工|生产经理|施工员|质检员|安全员|资料员|材料员|机管员|班组长)\S{0,10}(?:负责|牵头|组织|落实)
+          - (?:报验|签认|验收|旁站|自检|互检|交接检|隐蔽验收)
+      - id: 07-4
+        name: 监测与验收闭环
+        weight: 2
+        keywords: ["监测", "旁站", "报验", "签认", "隐蔽验收", "销项"]
+      - id: 07-5
+        name: 应急与纠偏
+        weight: 2
+        keywords: ["应急预案", "处置", "停工", "复工条件", "整改"]
+  "08":
     max_score: 10
     per_hit: 2.5
-    suggested_gain: 1.5
-    suggestion: 完善质量保障体系与质量责任制。
-    suggestion_threshold: 6
     weight: 5
-  09:
+    suggestion_threshold: 6
+    suggested_gain: 1.5
+    suggestion: 以ITP为核心补齐质量控制链：见证点、停检点、旁站点、检验批、隐蔽验收、整改销项。
+  "09":
     max_score: 10
     per_hit: 2.5
+    weight: 5
+    suggestion_threshold: 6
+    suggested_gain: 1.5
+    suggestion: 建立一级/二级/三级计划联动，设置偏差阈值、触发条件、纠偏动作、完成时限与记录。
     sub_items:
-    - id: 09-1
-      keywords:
-      - 总控计划
-      - 月计划
-      - 周计划
-      - 日计划
-      name: 计划体系
-      weight: 2
-    - id: 09-2
-      keywords:
-      - 节点
-      - 关键线路
-      - 里程碑
-      - 倒排
-      - 穿插
-      name: 节点与关键线路
-      weight: 2
-    - id: 09-3
-      keywords:
-      - 劳动力
-      - 机械
-      - 材料保障
-      - 冗余
-      - 调配
-      name: 资源与人机保障
-      weight: 2
-    - id: 09-4
-      keywords:
-      - 纠偏
-      - 赶工
-      - 调整
-      - 追赶
-      - 索赔工期
-      - 顺延条件
-      name: 纠偏机制
-      weight: 2
-    - id: 09-5
-      keywords:
-      - 每日
-      - 每周
-      - 例会
-      - 调度会
-      - '17:00'
-      - 日报
-      - 周报
-      name: 例会与跟踪频次
-      weight: 2
-    suggested_gain: 1.5
-    suggestion: 补充进度计划、关键里程碑与纠偏措施。
-    suggestion_threshold: 6
-    weight: 5
-  '10':
+      - id: 09-1
+        name: 计划体系
+        weight: 2
+        keywords: ["一级计划", "二级计划", "三级计划", "总控计划", "月计划", "周计划", "日计划"]
+      - id: 09-2
+        name: 节点与关键线路
+        weight: 2
+        keywords: ["节点", "关键线路", "里程碑", "倒排", "穿插"]
+      - id: 09-3
+        name: 资源与人机保障
+        weight: 2
+        keywords: ["劳动力", "机械", "材料保障", "冗余", "调配"]
+      - id: 09-4
+        name: 纠偏机制
+        weight: 2
+        keywords: ["纠偏", "赶工", "调整", "追赶", "索赔工期", "顺延条件"]
+      - id: 09-5
+        name: 例会与跟踪频次
+        weight: 2
+        keywords: ["每日", "每周", "例会", "调度会", "日报", "周报"]
+  "10":
     max_score: 10
     per_hit: 2.5
+    weight: 5
+    suggestion_threshold: 6
     suggested_gain: 1.2
-    suggestion: 增加专项施工工艺流程与参数。
-    suggestion_threshold: 6
-    weight: 5
-  '11':
+    suggestion: 专项方案管理按时间节点写清：编制、审批、交底、验收、销项资料。
+  "11":
     max_score: 10
     per_hit: 2.5
+    weight: 5
+    suggestion_threshold: 6
     suggested_gain: 1.2
-    suggestion: 明确岗位配置、班组规模与技能要求。
-    suggestion_threshold: 6
-    weight: 5
-  '12':
+    suggestion: 写清分阶段人力投入、高峰配置、特种作业、培训与不合格复训闭环。
+  "12":
     max_score: 10
     per_hit: 2.5
+    weight: 5
+    suggestion_threshold: 6
     suggested_gain: 1.2
-    suggestion: 补充总体施工工艺流程与工序衔接。
-    suggestion_threshold: 6
-    weight: 5
-  '13':
+    suggestion: 使用流程衔接表明确前置条件、可穿插工序、禁止交叉情形、移交条件与记录。
+  "13":
     max_score: 10
     per_hit: 2.5
+    weight: 5
+    suggestion_threshold: 6
     suggested_gain: 1.2
-    suggestion: 补充设备清单、使用频次与保障措施。
-    suggestion_threshold: 6
-    weight: 5
-  '14':
+    suggestion: 设备配置需落到型号规格、数量、进场阶段、验收内容、维保频次、替补方案。
+  "14":
     max_score: 10
     per_hit: 2.5
+    weight: 5
+    suggestion_threshold: 6
     suggested_gain: 1.2
-    suggestion: 增加设计协调、图纸会审与深化流程。
-    suggestion_threshold: 6
-    weight: 5
-  '15':
+    suggestion: 用问题单闭环描述图纸会审与深化变更：提出时限、责任专业、关闭条件、复核签认。
+  "15":
     max_score: 10
     per_hit: 2.5
+    weight: 5
+    suggestion_threshold: 6
     suggested_gain: 1.0
-    suggestion: 补充总体配置计划与资源平衡安排。
-    suggestion_threshold: 6
-    weight: 5
-  '16':
+    suggestion: 资源总控采用触发式调配：监控指标、触发条件、调配动作、批准人、完成时限。
+  "16":
     max_score: 10
     per_hit: 2.5
-    suggested_gain: 1.2
-    suggestion: 说明技术措施可行性与验证依据。
-    suggestion_threshold: 6
     weight: 5
+    suggestion_threshold: 6
+    suggested_gain: 1.2
+    suggestion: 补齐可行性验证闭环：样板段计划、首件验收、试验验证、通过标准、推广范围、落地清单。
+
+logic_lock:
+  max_step_score: 5
+  max_bonus: 20
+  break_penalty: 5
+
+penalties:
+  empty_promises:
+    deduct: 0.8
+    max_deduct: 6.0
+    window: 40
+  action_missing:
+    deduct_per: 0.8
+    max_deduct: 8.0
+    window: 60
+
+adaptive_hints:
+  - 若高优维度长期偏低，可提高其权重或下调阈值。
+
 llm_merge_policy:
   base_rules_weight: 0.6
   llm_weight: 0.4
   max_adjustment: 10.0
+
 llm_weight_profile:
-  high_priority_dims:
-  - '07'
-  - 09
-  - '02'
-  - '03'
+  high_priority_dims: ["01", "03", "07", "08", "09", "14"]
   high_priority_multiplier: 1.4
   normal_multiplier: 1.0
-logic_lock:
-  break_penalty: 5
-  max_bonus: 20
-  max_step_score: 5
-penalties:
-  action_missing:
-    deduct_per: 0.5
-    max_deduct: 5.0
-    window: 60
-  empty_promises:
-    deduct: 0.5
-    max_deduct: 3.0
-    window: 40
-version: v1

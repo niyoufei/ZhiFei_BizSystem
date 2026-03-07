@@ -126,6 +126,9 @@ else
   tests_skipped=1
 fi
 
+echo "[acceptance] final cleanup: data hygiene repair"
+APPLY=1 STRICT=1 FAIL_ON_ORPHAN=0 API_KEY="$API_KEY" BASE_URL="http://127.0.0.1:${PORT}" ./scripts/data_hygiene.sh >/dev/null
+
 echo "[acceptance] PASS"
 echo "[acceptance] artifacts:"
 echo "  - /Users/youfeini/Desktop/ZhiFei_BizSystem/build/e2e_flow/summary.json"

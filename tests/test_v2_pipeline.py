@@ -1454,6 +1454,8 @@ class TestSystemSelfCheckEndpoint:
         assert resp.status_code == 200
         data = resp.json()
         assert "ok" in data
+        assert "required_ok" in data
+        assert "degraded" in data
         assert isinstance(data.get("items"), list)
         assert any(item.get("name") == "health" for item in data.get("items", []))
 

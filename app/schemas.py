@@ -512,6 +512,10 @@ class SelfCheckItem(BaseModel):
 
 class SelfCheckResponse(BaseModel):
     ok: bool
+    required_ok: bool = True
+    degraded: bool = False
+    failed_required_count: int = 0
+    failed_optional_count: int = 0
     checked_at: str
     items: List[SelfCheckItem] = Field(default_factory=list)
 
@@ -662,6 +666,22 @@ class ScoringBasisResponse(BaseModel):
     material_utilization: Dict[str, Any] = Field(default_factory=dict)
     material_utilization_gate: Dict[str, Any] = Field(default_factory=dict)
     evidence_trace: Dict[str, Any] = Field(default_factory=dict)
+    recommendations: List[str] = Field(default_factory=list)
+
+
+class ProjectScoringDiagnosticResponse(BaseModel):
+    """项目级评分证据链诊断（聚合资料体检/证据追溯/评分依据）"""
+
+    project_id: str
+    generated_at: str
+    readiness: ScoringReadinessResponse
+    material_depth: MaterialDepthReportResponse
+    latest_submission: Dict[str, Any] = Field(default_factory=dict)
+    evidence_trace: Optional[EvidenceTraceResponse] = None
+    scoring_basis: Optional[ScoringBasisResponse] = None
+    material_type_cards: List[Dict[str, Any]] = Field(default_factory=list)
+    dimension_support_cards: List[Dict[str, Any]] = Field(default_factory=list)
+    summary: Dict[str, Any] = Field(default_factory=dict)
     recommendations: List[str] = Field(default_factory=list)
 
 

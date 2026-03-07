@@ -1,6 +1,6 @@
 {
   "pack_id": "qingtian_hefei_chapter_factors_v1",
-  "version": "qthf_chapter_factors_v1_2026-02-11",
+  "version": "qthf_chapter_factors_v1_2026-03-06",
   "enable_scope": {
     "region": "合肥",
     "scoring_engine_min": "v2"
@@ -8,60 +8,14 @@
   "requirements": [
     {
       "id": "REQ-ALL-RISK-001",
-      "dimension_ids": [
-        "01",
-        "02",
-        "03",
-        "04",
-        "05",
-        "06",
-        "07",
-        "08",
-        "09",
-        "10",
-        "11",
-        "12",
-        "13",
-        "14",
-        "15",
-        "16"
-      ],
+      "dimension_ids": ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16"],
       "req_label": "本章必须体现重点难点/风险点及对应措施",
       "req_type": "semantic",
       "mandatory": true,
       "weight": 2.0,
       "patterns": {
-        "risk_terms": [
-          "重点难点",
-          "风险点",
-          "主要风险",
-          "难点分析",
-          "风险分析",
-          "风险识别",
-          "风险源",
-          "不利因素",
-          "隐患",
-          "瓶颈",
-          "可能导致",
-          "易导致"
-        ],
-        "measure_terms": [
-          "措施",
-          "对策",
-          "管控",
-          "落实",
-          "执行",
-          "实施",
-          "设置",
-          "配置",
-          "增设",
-          "旁站",
-          "巡检",
-          "复核",
-          "报验",
-          "验收",
-          "交底"
-        ],
+        "risk_terms": ["重点难点", "风险点", "主要风险", "难点分析", "风险分析", "风险识别", "风险源", "不利因素", "隐患", "瓶颈", "可能导致", "易导致"],
+        "measure_terms": ["措施", "对策", "管控", "执行", "实施", "设置", "配置", "增设", "旁站", "巡检", "复核", "报验", "验收", "交底"],
         "linkage_rule": {
           "same_dimension_scope": true,
           "within_same_heading_or_neighbor_units": 2
@@ -71,7 +25,48 @@
         "issue_code": "MissingRequirement",
         "severity": "high",
         "why_it_matters": "本章缺少重点难点/风险点及对应措施，现场不可执行且易被青天扣分。",
-        "fix_template": "【重点难点/风险点】{风险描述}\\n【措施】采取{措施}，控制要点为{参数/阈值}；{执行频次}由{责任岗位}实施。\\n【验收】完成后进行{验收动作}并形成{记录表/台账}。"
+        "fix_template": "【重点难点/风险点】{风险描述}\\n【措施】{执行动作}（参数/阈值、频次、责任岗位）\\n【验收】{验收动作}并形成{记录表/台账/影像}。"
+      }
+    },
+    {
+      "id": "REQ-ALL-CLOSURE-001",
+      "dimension_ids": ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16"],
+      "req_label": "措施类内容必须形成“参数+频次+责任+验收+记录”闭环",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.8,
+      "patterns": {
+        "must_include_measure_and_acceptance": {
+          "measure_terms": ["措施", "执行", "实施", "配置", "控制", "交底", "巡检"],
+          "acceptance_terms": ["验收", "检查", "报验", "签认", "复核", "旁站"]
+        },
+        "should_have_terms_any2": {
+          "terms": ["参数", "阈值", "频次", "每日", "每周", "责任岗位", "责任人", "记录表", "台账", "影像", "检验批", "隐蔽验收"],
+          "minimum": 3
+        }
+      },
+      "lint": {
+        "issue_code": "ClosureGap",
+        "severity": "high",
+        "why_it_matters": "缺少参数/频次/责任/验收/记录闭环，难以被青天稳定抽取并形成高分证据。",
+        "fix_template": "按“控制对象→工序/场景→参数阈值→执行动作→检查人→频次→合格标准→记录载体”重写本章措施。"
+      }
+    },
+    {
+      "id": "REQ-ALL-BANNED-001",
+      "dimension_ids": ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16"],
+      "req_label": "禁语控制：禁止空泛口号化表达",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.4,
+      "patterns": {
+        "must_not_have_terms": ["按照", "符合", "确保", "保障", "严格落实", "加强管理", "有效措施", "合理安排", "现场实际情况", "相关规范", "有关规定"]
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "medium",
+        "why_it_matters": "命中禁语会降低可执行性与可验收性，影响青天抽取稳定度。",
+        "fix_template": "删除空泛术语，改写为“量化参数+检查频次+责任岗位+验收动作+记录载体”。"
       }
     },
     {
@@ -84,42 +79,37 @@
       "patterns": {
         "heading_exact": "信息化管理",
         "content_terms_any2": {
-          "modules": [
-            "实名制",
-            "门禁",
-            "视频",
-            "视频巡检",
-            "环境监测",
-            "扬尘监测",
-            "设备管理",
-            "质量巡检",
-            "安全隐患",
-            "闭环",
-            "进度填报",
-            "日报",
-            "周报",
-            "预警"
-          ],
-          "ops": [
-            "频次",
-            "每日",
-            "每周",
-            "阈值",
-            "超限",
-            "处置",
-            "整改",
-            "复核",
-            "留痕",
-            "导出",
-            "权限"
-          ]
+          "modules": ["实名制", "门禁", "视频", "环境监测", "设备管理", "质量巡检", "安全隐患", "进度填报", "预警"],
+          "ops": ["频次", "每日", "每周", "阈值", "超限", "处置", "整改", "复核", "留痕", "时限"]
         }
       },
       "lint": {
         "issue_code": "MissingRequirement",
         "severity": "high",
-        "why_it_matters": "缺少“信息化管理”完整章节/内容，无法体现项目数字化管控闭环。",
-        "fix_template": "【信息化管理】\\n模块：{人员/视频/环境/设备/质量/安全/进度}\\n采集：{数据项}，频次：{每日/每周/实时}\\n阈值：{触发条件}\\n处置：{责任岗位}在{时限}内{整改/复核}并形成{记录/报表}。"
+        "why_it_matters": "缺少“信息化管理”完整章节/内容，无法体现项目数字化总控闭环。",
+        "fix_template": "【信息化管理】模块/数据项/更新频次/预警阈值/责任岗位/闭环时限/记录载体。"
+      }
+    },
+    {
+      "id": "REQ-02-LAOBAO-001",
+      "dimension_id": "02",
+      "req_label": "维度02必须体现劳保用品配置矩阵，且不得使用PPE替代",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.8,
+      "patterns": {
+        "must_have_terms": ["劳保用品", "配置"],
+        "must_not_have_terms": ["PPE"],
+        "should_have_terms_any2": {
+          "terms": ["作业岗位", "配置标准", "检查频次", "不合格处置", "发放", "领用", "更换频次", "台账", "验收"],
+          "minimum": 3
+        }
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "high",
+        "why_it_matters": "未形成劳保用品岗位匹配与配置闭环，现场难以检查。",
+        "fix_template": "【劳保用品配置矩阵】作业岗位/工序—劳保用品—配置标准—检查频次—不合格处置—记录表。"
       }
     },
     {
@@ -132,87 +122,60 @@
       "patterns": {
         "heading_exact": "绿色工地",
         "topic_terms_at_least3": {
-          "topics": [
-            "扬尘",
-            "噪声",
-            "污水",
-            "固废",
-            "节能",
-            "节水",
-            "节材",
-            "绿色施工",
-            "围挡",
-            "硬化",
-            "冲洗",
-            "喷淋",
-            "雾炮",
-            "沉淀池",
-            "垃圾分类"
-          ],
+          "topics": ["扬尘", "噪声", "污水", "固废", "节能", "节水", "节材", "四节一环保", "垃圾分类"],
           "minimum": 3
         },
         "must_include_measure_and_acceptance": {
-          "measure_terms": [
-            "设置",
-            "配置",
-            "启停",
-            "覆盖",
-            "冲洗",
-            "喷淋",
-            "洒水",
-            "清运",
-            "分类"
-          ],
-          "acceptance_terms": [
-            "检查",
-            "验收",
-            "巡检",
-            "记录",
-            "台账",
-            "整改闭环"
-          ]
+          "measure_terms": ["覆盖", "喷淋", "洒水", "冲洗", "雾化", "分类", "清运"],
+          "acceptance_terms": ["检查", "验收", "巡检", "记录", "台账", "整改闭环"]
         }
       },
       "lint": {
         "issue_code": "MissingRequirement",
         "severity": "high",
         "why_it_matters": "缺少“绿色工地”完整章节/内容，文明施工与环保控制缺乏可执行标准。",
-        "fix_template": "【绿色工地】\\n对象：{扬尘/噪声/污水/固废/节能节水}\\n措施：{设施/启停条件/频次}由{责任岗位}实施\\n验收：{巡检/记录/整改闭环}，形成{台账/检查表}。"
+        "fix_template": "【绿色工地】类别/控制点/参数频次责任/验收动作/记录表。"
       }
     },
     {
-      "id": "REQ-02-LAOBAO-001",
-      "dimension_id": "02",
-      "req_label": "维度02必须体现劳保用品配置矩阵",
+      "id": "REQ-04-MATERIAL-CLOSED-001",
+      "dimension_id": "04",
+      "req_label": "维度04需覆盖材料闭环链条（采购至追溯）",
       "req_type": "presence",
       "mandatory": true,
       "weight": 1.6,
       "patterns": {
-        "must_have_terms": [
-          "劳保用品",
-          "配置"
-        ],
+        "must_have_terms": ["进场验收"],
         "should_have_terms_any2": {
-          "terms": [
-            "数量",
-            "质量要求",
-            "标准",
-            "发放",
-            "领用",
-            "存储",
-            "台账",
-            "岗位匹配",
-            "更换频次",
-            "验收"
-          ],
-          "minimum": 2
+          "terms": ["计划提报", "采购审查", "见证取样", "复验", "不合格品隔离退场", "批次追溯", "特殊材料", "危化"],
+          "minimum": 4
         }
       },
       "lint": {
         "issue_code": "MissingRequirement",
         "severity": "medium",
-        "why_it_matters": "未形成劳保用品岗位匹配与配置闭环，现场难以检查。",
-        "fix_template": "【劳保用品配置矩阵】岗位/工种—用品—数量/标准—发放/更换频次—领用签字—存储要求—检查/验收记录。"
+        "why_it_matters": "材料闭环链条缺失会导致采购与验收脱节，影响一致性评分。",
+        "fix_template": "按“计划提报→采购审查→进场验收→见证取样→复验判定→不合格隔离退场→批次追溯”补齐。"
+      }
+    },
+    {
+      "id": "REQ-05-FOURNEW-001",
+      "dimension_id": "05",
+      "req_label": "维度05必须为四新落地清单而非概念展示",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.6,
+      "patterns": {
+        "should_have_terms_any2": {
+          "terms": ["类别", "采用内容", "适用部位", "实施参数", "预期效果", "验证方式", "管控要点"],
+          "minimum": 4
+        }
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "medium",
+        "why_it_matters": "四新章节未落到可验证清单，无法形成可评分证据。",
+        "fix_template": "每项四新需写：类别/采用内容/适用部位/实施参数/预期效果/验证方式/管控要点。"
       }
     },
     {
@@ -223,25 +186,222 @@
       "mandatory": true,
       "weight": 2.0,
       "patterns": {
-        "table_header_terms_all": [
-          "工序内容",
-          "重点难点",
-          "措施",
-          "验收"
-        ],
-        "fallback_line_terms_all": [
-          "工序内容",
-          "重点难点",
-          "措施",
-          "验收"
-        ],
-        "within_dimension_scope": true
+        "table_header_terms_all": ["工序内容", "重点难点", "措施", "验收"],
+        "fallback_line_terms_all": ["工序内容", "重点难点", "措施", "验收"],
+        "within_dimension_scope": true,
+        "should_have_terms_any2": {
+          "terms": ["参数", "频次", "责任岗位", "验收动作", "记录表"],
+          "minimum": 3
+        }
       },
       "lint": {
         "issue_code": "MissingRequirement",
         "severity": "high",
-        "why_it_matters": "缺少关键工序控制点表（工序内容/重点难点/措施/验收），不符合现场可执行的工序管控表达。",
-        "fix_template": "【关键工序控制点表】\\n工序内容：{工序}\\n重点难点：{难点/风险}\\n措施：{措施}（写入参数/频次/责任岗位）\\n验收：{验收动作}（写入记录表编号/签认要求）"
+        "why_it_matters": "缺少关键工序控制点表，不符合工序级可执行管控表达。",
+        "fix_template": "【关键工序控制点表】工序内容/重点难点/措施/验收；每格写入参数+频次+责任岗位+验收动作+记录表。"
+      }
+    },
+    {
+      "id": "REQ-07-DANGER-CLOSED-001",
+      "dimension_id": "07",
+      "req_label": "维度07需体现危大工程停复工与监测闭环",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.8,
+      "patterns": {
+        "must_have_terms": ["危大工程"],
+        "should_have_terms_any2": {
+          "terms": ["专项方案", "监测项目", "预警阈值", "停工条件", "复工条件", "签认闭环"],
+          "minimum": 4
+        }
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "high",
+        "why_it_matters": "危大工程未形成停复工与监测闭环，属于重大风险缺项。",
+        "fix_template": "补齐“危大清单—专项方案—监测阈值—停工条件—复工条件—签认闭环”。"
+      }
+    },
+    {
+      "id": "REQ-08-ITP-001",
+      "dimension_id": "08",
+      "req_label": "维度08必须以ITP简表体现检验与试验计划",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.8,
+      "patterns": {
+        "must_have_terms": ["ITP"],
+        "should_have_terms_any2": {
+          "terms": ["见证点", "停检点", "旁站点", "检验批", "隐蔽验收", "整改销项", "合格标准"],
+          "minimum": 4
+        }
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "high",
+        "why_it_matters": "质量章节缺少ITP核心要素，验收链不完整。",
+        "fix_template": "按“分项工程/控制点/检查方法/频次/责任人/合格标准/记录表”输出ITP简表。"
+      }
+    },
+    {
+      "id": "REQ-09-SCHEDULE-001",
+      "dimension_id": "09",
+      "req_label": "维度09需体现三级计划衔接与纠偏阈值",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.8,
+      "patterns": {
+        "should_have_terms_any2": {
+          "terms": ["一级计划", "二级计划", "三级计划", "偏差阈值", "触发条件", "纠偏动作", "完成时限"],
+          "minimum": 4
+        }
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "high",
+        "why_it_matters": "进度章节未形成“阈值触发-纠偏闭环”，难以落地执行。",
+        "fix_template": "补齐“节点/控制目标/偏差阈值/纠偏动作/责任岗位/完成时限/记录表”。"
+      }
+    },
+    {
+      "id": "REQ-10-SPECIAL-CHAIN-001",
+      "dimension_id": "10",
+      "req_label": "维度10需覆盖专项方案全链条节点",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.4,
+      "patterns": {
+        "should_have_terms_any2": {
+          "terms": ["编制时点", "审批节点", "交底时点", "验收时点", "销项资料"],
+          "minimum": 4
+        }
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "medium",
+        "why_it_matters": "专项方案节点缺失，审批与验收链路不完整。",
+        "fix_template": "按“专项名称/编制时点/审批节点/交底对象/验收节点/形成资料”补齐。"
+      }
+    },
+    {
+      "id": "REQ-11-HR-TRAIN-001",
+      "dimension_id": "11",
+      "req_label": "维度11需体现人力投入与培训复训规则",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.4,
+      "patterns": {
+        "should_have_terms_any2": {
+          "terms": ["分阶段", "高峰期", "特种作业人员", "培训计划", "考核", "复训"],
+          "minimum": 4
+        }
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "medium",
+        "why_it_matters": "人力与培训缺失会削弱可执行性和风险控制能力。",
+        "fix_template": "补齐“阶段/岗位配置/人数/培训内容/检查频次/责任人/记录表”。"
+      }
+    },
+    {
+      "id": "REQ-12-FLOW-HANDOVER-001",
+      "dimension_id": "12",
+      "req_label": "维度12需写清流程穿插与移交条件",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.4,
+      "patterns": {
+        "should_have_terms_any2": {
+          "terms": ["前置条件", "可穿插工序", "禁止交叉情形", "移交条件", "记录表"],
+          "minimum": 4
+        }
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "medium",
+        "why_it_matters": "流程衔接条件不清晰会引发交叉作业冲突。",
+        "fix_template": "按“区域系统/前置条件/可穿插工序/禁止交叉情形/移交条件/记录表”补齐。"
+      }
+    },
+    {
+      "id": "REQ-13-EQUIP-MAINTAIN-001",
+      "dimension_id": "13",
+      "req_label": "维度13需体现设备配置验收维保与替补",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.4,
+      "patterns": {
+        "should_have_terms_any2": {
+          "terms": ["设备名称", "型号规格", "数量", "进场阶段", "验收内容", "维保频次", "停机替补方案"],
+          "minimum": 5
+        }
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "medium",
+        "why_it_matters": "设备管理不完整会导致执行保障不足。",
+        "fix_template": "按“设备名称/型号规格/数量/进场阶段/验收内容/维保频次/责任人/记录表”补齐。"
+      }
+    },
+    {
+      "id": "REQ-14-DESIGN-CHANGE-001",
+      "dimension_id": "14",
+      "req_label": "维度14需体现图纸问题单闭环",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.6,
+      "patterns": {
+        "should_have_terms_any2": {
+          "terms": ["问题发现", "会审提出", "责任分配", "深化处理", "变更确认", "关闭条件", "复核签认"],
+          "minimum": 5
+        }
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "medium",
+        "why_it_matters": "图纸会审与变更缺少闭环会削弱可追溯性。",
+        "fix_template": "按“问题来源/问题类型/提出时限/责任专业/关闭条件/复核人/台账”补齐。"
+      }
+    },
+    {
+      "id": "REQ-15-RESOURCE-TRIGGER-001",
+      "dimension_id": "15",
+      "req_label": "维度15需采用触发式动态调配",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.6,
+      "patterns": {
+        "must_have_terms": ["触发条件", "调配动作"],
+        "should_have_terms_any2": {
+          "terms": ["人员缺口触发", "材料延误触发", "设备故障触发", "夜间施工触发", "高峰抢工触发", "完成时限", "批准人"],
+          "minimum": 3
+        }
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "high",
+        "why_it_matters": "资源章节未触发式表达时，无法形成动态调配执行闭环。",
+        "fix_template": "按“资源类别/监控指标/触发条件/调配动作/批准人/完成时限/记录表”补齐。"
+      }
+    },
+    {
+      "id": "REQ-16-SAMPLE-VERIFY-001",
+      "dimension_id": "16",
+      "req_label": "维度16需体现样板先行与可行性验证闭环",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.6,
+      "patterns": {
+        "should_have_terms_any2": {
+          "terms": ["样板段计划", "首件验收", "试验验证", "通过标准", "推广条件", "落地清单"],
+          "minimum": 4
+        }
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "high",
+        "why_it_matters": "缺少样板先行与验证闭环会降低措施可行性与落地性。",
+        "fix_template": "按“验证项目/试验样板部位/验证内容/通过标准/验收人/记录表/推广范围”补齐。"
       }
     }
   ]

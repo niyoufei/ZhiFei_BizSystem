@@ -111,6 +111,7 @@ def test_dim02_ppe_without_laobao_is_missing_requirement() -> None:
     )
     req_hit = _find_req_hit(report, "REQ-02-LAOBAO-001")
     assert req_hit and req_hit.get("hit") is False
+    assert "must_not_have_terms" in str(req_hit.get("reason") or "")
 
 
 def test_dim06_missing_key_process_headers_triggers_requirement() -> None:
@@ -139,3 +140,17 @@ def test_any_dimension_missing_risk_or_measure_triggers_req_all_risk() -> None:
     assert req_hit and req_hit.get("hit") is False
     lint_texts = [str(x.get("why_it_matters") or "") for x in report.get("lint_findings") or []]
     assert any("重点难点/风险点" in t for t in lint_texts)
+
+
+def test_global_banned_words_requirement_triggers_on_forbidden_terms() -> None:
+    text = "本章按照相关规范开展，严格落实现场实际情况下的一般安排。"
+    report = score_text_v2(
+        submission_id="s-banned-words",
+        text=text,
+        lexicon=_minimal_lexicon(),
+        anchors=[],
+        requirements=_pack_requirements(),
+    )
+    req_hit = _find_req_hit(report, "REQ-ALL-BANNED-001-01")
+    assert req_hit and req_hit.get("hit") is False
+    assert "must_not_have_terms" in str(req_hit.get("reason") or "")
