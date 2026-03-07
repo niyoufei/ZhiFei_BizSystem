@@ -15,7 +15,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from app.main import app, create_app
+from app.main import _build_score_self_awareness, app, create_app
 
 
 @pytest.fixture
@@ -31,6 +31,80 @@ class TestCreateApp:
         """create_app should return the FastAPI app instance."""
         result = create_app()
         assert result is app
+
+
+class TestScoreSelfAwareness:
+    def test_build_score_self_awareness_high_when_evidence_and_dimension_support_are_strong(
+        self,
+    ):
+        report = {
+            "pred_confidence": {
+                "fused_sigma": 1.2,
+                "fused_ci95_lower": 84.0,
+                "fused_ci95_upper": 88.0,
+            },
+            "meta": {
+                "material_utilization": {
+                    "retrieval_file_coverage_rate": 0.88,
+                    "retrieval_hit_rate": 0.76,
+                },
+                "material_utilization_gate": {"blocked": False, "warned": False},
+                "evidence_trace": {
+                    "mandatory_hit_rate": 0.82,
+                    "source_files_hit_count": 3,
+                },
+            },
+        }
+        material_knowledge_snapshot = {
+            "summary": {
+                "dimension_coverage_rate": 0.81,
+                "numeric_category_summary": [
+                    "工期/节点：90",
+                    "规格/参数：1200",
+                    "阈值/偏差：48",
+                ],
+            }
+        }
+
+        out = _build_score_self_awareness(
+            report,
+            material_knowledge_snapshot=material_knowledge_snapshot,
+        )
+
+        assert out["level"] == "high"
+        assert out["score_0_1"] >= 0.72
+        assert out["dimension_coverage_rate"] == pytest.approx(0.81, abs=1e-6)
+        assert out["source_files_hit_count"] == 3
+
+    def test_build_score_self_awareness_forces_low_when_material_gate_blocked(self):
+        report = {
+            "meta": {
+                "material_utilization": {
+                    "retrieval_file_coverage_rate": 0.92,
+                    "retrieval_hit_rate": 0.8,
+                },
+                "material_utilization_gate": {"blocked": True, "warned": False},
+                "evidence_trace": {
+                    "mandatory_hit_rate": 0.9,
+                    "source_files_hit_count": 4,
+                },
+            }
+        }
+        material_knowledge_snapshot = {
+            "summary": {
+                "dimension_coverage_rate": 0.9,
+                "numeric_category_summary": ["工期/节点：90", "规格/参数：1200"],
+            }
+        }
+
+        out = _build_score_self_awareness(
+            report,
+            material_knowledge_snapshot=material_knowledge_snapshot,
+        )
+
+        assert out["level"] == "low"
+        assert out["score_0_1"] <= 0.18
+        assert "资料利用门禁阻断" in out["reasons"]
 
 
 class TestIndexEndpoint:
@@ -160,6 +234,7 @@ class TestIndexEndpoint:
         assert "支撑较强维度" in page
         assert "证据薄弱维度" in page
         assert "维度支撑明细（16维）" in page
+        assert "评分置信度" in page
 
     def test_index_frontend_has_no_broken_multiline_regex_literal(self, client):
         """Rendered JS should not contain regex literals split by line breaks (would break entire script)."""
@@ -3190,6 +3265,10 @@ class TestCompareEndpoints:
                 "report": {
                     "rule_total_score": 70.0,
                     "pred_total_score": 65.0,
+                    "meta": {
+                        "score_confidence_level": "low",
+                        "score_self_awareness": {"level": "low", "score_0_100": 21.0},
+                    },
                     "dimension_scores": {},
                     "penalties": [],
                 },
@@ -3203,6 +3282,10 @@ class TestCompareEndpoints:
                 "report": {
                     "rule_total_score": 75.0,
                     "pred_total_score": 90.0,
+                    "meta": {
+                        "score_confidence_level": "high",
+                        "score_self_awareness": {"level": "high", "score_0_100": 82.0},
+                    },
                     "dimension_scores": {},
                     "penalties": [],
                 },
@@ -3216,6 +3299,8 @@ class TestCompareEndpoints:
         assert data["rankings"][0]["total_score"] == 90.0
         assert data["rankings"][0]["rule_total_score"] == 75.0
         assert data["rankings"][0]["score_source"] == "pred"
+        assert data["rankings"][0]["score_confidence_level"] == "high"
+        assert data["rankings"][0]["score_self_awareness"]["score_0_100"] == 82.0
 
     @patch("app.main.build_compare_narrative")
     @patch("app.main.load_submissions")
@@ -3271,14 +3356,28 @@ class TestCompareEndpoints:
                 "project_id": "p1",
                 "filename": "f1.txt",
                 "total_score": 91.0,
-                "report": {"rule_total_score": 70.0, "pred_total_score": 65.0},
+                "report": {
+                    "rule_total_score": 70.0,
+                    "pred_total_score": 65.0,
+                    "meta": {
+                        "score_confidence_level": "low",
+                        "score_self_awareness": {"level": "low", "score_0_100": 28.0},
+                    },
+                },
             },
             {
                 "id": "s2",
                 "project_id": "p1",
                 "filename": "f2.txt",
                 "total_score": 82.0,
-                "report": {"rule_total_score": 80.0, "pred_total_score": 90.0},
+                "report": {
+                    "rule_total_score": 80.0,
+                    "pred_total_score": 90.0,
+                    "meta": {
+                        "score_confidence_level": "high",
+                        "score_self_awareness": {"level": "high", "score_0_100": 84.0},
+                    },
+                },
             },
         ]
 
@@ -3300,6 +3399,8 @@ class TestCompareEndpoints:
         assert data["top_submission"]["pred_total_score"] == 90.0
         assert data["top_submission"]["rule_total_score"] == 80.0
         assert data["top_submission"]["score_source"] == "pred"
+        assert data["top_submission"]["score_confidence_level"] == "high"
+        assert data["top_submission"]["score_self_awareness"]["score_0_100"] == 84.0
 
     @patch("app.main.load_submissions")
     @patch("app.main.ensure_data_dirs")

@@ -214,6 +214,53 @@ def test_compare_submission_cards_with_page_hint():
     assert len(low_scorecard.get("deduction_items") or []) >= 1
 
 
+def test_compare_narrative_carries_score_confidence_metadata():
+    submissions = [
+        {
+            "id": "s-low",
+            "filename": "低置信稿.pdf",
+            "total_score": 76.0,
+            "report": {
+                "meta": {
+                    "score_confidence_level": "low",
+                    "score_self_awareness": {
+                        "level": "low",
+                        "score_0_100": 22.0,
+                        "reasons": ["资料覆盖不足"],
+                    },
+                },
+                "dimension_scores": {"07": {"score": 3.0}, "09": {"score": 4.0}},
+                "penalties": [],
+            },
+        },
+        {
+            "id": "s-high",
+            "filename": "高置信稿.pdf",
+            "total_score": 88.0,
+            "report": {
+                "meta": {
+                    "score_confidence_level": "high",
+                    "score_self_awareness": {
+                        "level": "high",
+                        "score_0_100": 81.0,
+                        "reasons": ["资料覆盖较完整"],
+                    },
+                },
+                "dimension_scores": {"07": {"score": 8.0}, "09": {"score": 8.5}},
+                "penalties": [],
+            },
+        },
+    ]
+    result = build_compare_narrative(submissions)
+    assert result["top_submission"]["score_confidence_level"] == "high"
+    assert result["bottom_submission"]["score_confidence_level"] == "low"
+    assert result["score_overview"]["low_confidence_submission_count"] == 1
+    scorecards = result.get("submission_scorecards") or []
+    low_card = next((c for c in scorecards if c.get("submission_id") == "s-low"), {})
+    assert low_card.get("score_confidence_level") == "low"
+    assert low_card.get("score_confidence_score") == 22.0
+
+
 def test_compare_submission_cards_use_full_score_gap_not_top_gap():
     """Dimension optimization should target full score, not only current project top."""
     submissions = [

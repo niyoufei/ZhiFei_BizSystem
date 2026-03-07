@@ -57,6 +57,22 @@ def _dim_module(dim_id: str) -> str:
     return str(d.get("module") or "")
 
 
+def _score_awareness_meta(submission: Dict[str, Any]) -> Dict[str, Any]:
+    report = submission.get("report") or {}
+    meta = report.get("meta") if isinstance(report, dict) else {}
+    meta = meta if isinstance(meta, dict) else {}
+    awareness = meta.get("score_self_awareness")
+    awareness = awareness if isinstance(awareness, dict) else {}
+    reasons = awareness.get("reasons") if isinstance(awareness.get("reasons"), list) else []
+    return {
+        "score_confidence_level": _safe_str(
+            meta.get("score_confidence_level") or awareness.get("level") or ""
+        ),
+        "score_confidence_score": round(_safe_float(awareness.get("score_0_100")), 2),
+        "score_confidence_reason": _safe_str(reasons[0]) if reasons else "",
+    }
+
+
 def _build_page_markers(text: str) -> List[Tuple[int, int]]:
     markers: List[Tuple[int, int]] = []
     for m in _PAGE_MARK_RE.finditer(text or ""):
@@ -991,6 +1007,7 @@ def _build_submission_scorecards(
         filename = _safe_str(s.get("filename"))
         total_score = round(_safe_float(s.get("total_score")), 2)
         report = s.get("report") or {}
+        awareness = _score_awareness_meta(s)
         own_dims = report.get("dimension_scores", {}) or {}
         text = _safe_str(s.get("text"))
         markers = _build_page_markers(text)
@@ -1085,6 +1102,9 @@ def _build_submission_scorecards(
                 "filename": filename,
                 "rank_desc": rank_desc,
                 "total_score": total_score,
+                "score_confidence_level": awareness.get("score_confidence_level") or "",
+                "score_confidence_score": awareness.get("score_confidence_score"),
+                "score_confidence_reason": awareness.get("score_confidence_reason") or "",
                 "target_full_score": FULL_TARGET_TOTAL_SCORE,
                 "gap_to_full_total": round(max(0.0, FULL_TARGET_TOTAL_SCORE - total_score), 2),
                 "total_deduction_points": round(total_deduction_points, 2),
@@ -1300,6 +1320,7 @@ def build_compare_narrative(submissions: List[Dict[str, Any]]) -> Dict[str, Any]
     for rank, s in enumerate(
         sorted(rankings, key=lambda x: _safe_float(x.get("total_score"))), start=1
     ):
+        awareness = _score_awareness_meta(s)
         dim_rows = (s.get("report") or {}).get("dimension_scores", {}) or {}
         dim_rank = sorted(
             [
@@ -1327,6 +1348,9 @@ def build_compare_narrative(submissions: List[Dict[str, Any]]) -> Dict[str, Any]
                 "filename": _safe_str(s.get("filename")),
                 "rank_ascending": rank,
                 "total_score": round(_safe_float(s.get("total_score")), 2),
+                "score_confidence_level": awareness.get("score_confidence_level") or "",
+                "score_confidence_score": awareness.get("score_confidence_score"),
+                "score_confidence_reason": awareness.get("score_confidence_reason") or "",
                 "weakest_dimensions": weakest,
                 "strongest_dimensions": strongest,
                 "major_penalties": major_penalties,
@@ -1367,13 +1391,23 @@ def build_compare_narrative(submissions: List[Dict[str, Any]]) -> Dict[str, Any]
     submission_optimization_cards = _build_submission_optimization_cards(rankings, top, all_dim_ids)
     submission_scorecards = _build_submission_scorecards(rankings, top, all_dim_ids)
     gap = round(_safe_float(top.get("total_score")) - _safe_float(bottom.get("total_score")), 2)
+    low_confidence_files = [
+        _safe_str(s.get("filename"))
+        for s in rankings
+        if _safe_str(_score_awareness_meta(s).get("score_confidence_level")) == "low"
+    ]
     summary = (
         f"最高分为{top.get('filename')}（{top.get('total_score')}分），"
         f"最低分为{bottom.get('filename')}（{bottom.get('total_score')}分），"
         f"分差 {gap} 分。"
         f"当前建议优先处理维度：{'、'.join([str(x.get('dimension')) for x in key_diffs[:3]]) or '无'}，"
         f"并优先消减扣分项：{'、'.join([str(x.get('code')) for x in penalty_diagnostics[:2]]) or '无'}。"
-        "报告已给出逐文件、逐页定位的优化动作，可直接用于编制迭代。"
+        + (
+            f"当前有 {len(low_confidence_files)} 份施组处于低置信度评分，排序解读需结合资料完备度。"
+            if low_confidence_files
+            else "当前评分置信度未见明显低位异常。"
+        )
+        + "报告已给出逐文件、逐页定位的优化动作，可直接用于编制迭代。"
     )
 
     return {
@@ -1382,11 +1416,13 @@ def build_compare_narrative(submissions: List[Dict[str, Any]]) -> Dict[str, Any]
             "id": top.get("id"),
             "filename": top.get("filename"),
             "total_score": top.get("total_score"),
+            **_score_awareness_meta(top),
         },
         "bottom_submission": {
             "id": bottom.get("id"),
             "filename": bottom.get("filename"),
             "total_score": bottom.get("total_score"),
+            **_score_awareness_meta(bottom),
         },
         "key_diffs": key_diffs,
         "score_overview": {
@@ -1396,6 +1432,8 @@ def build_compare_narrative(submissions: List[Dict[str, Any]]) -> Dict[str, Any]
             "score_gap": gap,
             "project_avg_score": round(mean(scores), 2),
             "project_std_score": round(pstdev(scores), 2) if len(scores) > 1 else 0.0,
+            "low_confidence_submission_count": len(low_confidence_files),
+            "low_confidence_filenames": low_confidence_files[:8],
         },
         "dimension_diagnostics": diffs[:8],
         "penalty_diagnostics": penalty_diagnostics[:8],

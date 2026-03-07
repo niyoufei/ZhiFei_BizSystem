@@ -2537,7 +2537,13 @@ def _build_project_scoring_diagnostic(
 
     if isinstance(latest, dict):
         report = latest.get("report") if isinstance(latest.get("report"), dict) else {}
+        _ensure_report_score_self_awareness(
+            report,
+            project_id=project_id,
+            material_knowledge_snapshot=material_knowledge,
+        )
         scoring_status = str(report.get("scoring_status") or "unknown")
+        report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
         latest_submission = {
             "exists": True,
             "submission_id": str(latest.get("id") or ""),
@@ -2545,6 +2551,12 @@ def _build_project_scoring_diagnostic(
             "created_at": str(latest.get("created_at") or ""),
             "scoring_status": scoring_status,
             "is_scored": scoring_status not in {"pending", "blocked", "unknown"},
+            "score_self_awareness": (
+                report_meta.get("score_self_awareness")
+                if isinstance(report_meta.get("score_self_awareness"), dict)
+                else {}
+            ),
+            "score_confidence_level": str(report_meta.get("score_confidence_level") or ""),
         }
         evidence_trace = _build_submission_evidence_trace_report(
             project_id=project_id,
@@ -3060,6 +3072,14 @@ def _build_project_scoring_diagnostic(
                 for item in (knowledge_summary.get("numeric_category_summary") or [])
                 if str(item or "").strip()
             ][:8],
+            "latest_score_self_awareness": (
+                latest_submission.get("score_self_awareness")
+                if isinstance(latest_submission.get("score_self_awareness"), dict)
+                else {}
+            ),
+            "latest_score_confidence_level": str(
+                latest_submission.get("score_confidence_level") or ""
+            ),
         },
         "recommendations": recommendations[:20],
     }
@@ -4157,6 +4177,11 @@ def _build_score_report_snapshot(
         "pred_total_score": report.get("pred_total_score"),
         "llm_total_score": report.get("llm_total_score"),
         "pred_confidence": report.get("pred_confidence"),
+        "score_self_awareness": (
+            report.get("meta", {}).get("score_self_awareness")
+            if isinstance(report.get("meta"), dict)
+            else {}
+        ),
         "score_blend": report.get("score_blend"),
         "penalties": report.get("penalties", []),
         "lint_findings": report.get("lint_findings", []),
@@ -4769,6 +4794,193 @@ def _resolve_dynamic_blend_adjustment(
     )
 
 
+def _build_score_self_awareness(
+    report: Dict[str, object],
+    *,
+    material_knowledge_snapshot: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    """
+    为评分结果生成统一的“自我意识/置信度”指标。
+
+    目标不是表达统计学严格置信区间，而是让系统显式回答：
+    - 当前分数是否建立在足够的资料证据之上；
+    - 当前分数是否覆盖到足够多的评分维度；
+    - 若启用了预测校准器，其波动范围是否可接受。
+    """
+
+    meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+    util = (
+        meta.get("material_utilization")
+        if isinstance(meta.get("material_utilization"), dict)
+        else {}
+    )
+    gate = (
+        meta.get("material_utilization_gate")
+        if isinstance(meta.get("material_utilization_gate"), dict)
+        else {}
+    )
+    trace = meta.get("evidence_trace") if isinstance(meta.get("evidence_trace"), dict) else {}
+    knowledge_summary = (
+        material_knowledge_snapshot.get("summary")
+        if isinstance(material_knowledge_snapshot, dict)
+        and isinstance(material_knowledge_snapshot.get("summary"), dict)
+        else {}
+    )
+    pred_confidence = (
+        report.get("pred_confidence") if isinstance(report.get("pred_confidence"), dict) else {}
+    )
+
+    def _clip01(value: object) -> Optional[float]:
+        numeric = _to_float_or_none(value)
+        if numeric is None:
+            return None
+        return max(0.0, min(1.0, float(numeric)))
+
+    retrieval_file_coverage_rate = _clip01(util.get("retrieval_file_coverage_rate"))
+    retrieval_hit_rate = _clip01(util.get("retrieval_hit_rate"))
+    mandatory_hit_rate = _clip01(trace.get("mandatory_hit_rate"))
+    dimension_coverage_rate = _clip01(knowledge_summary.get("dimension_coverage_rate"))
+    source_files_hit_count = int(_to_float_or_none(trace.get("source_files_hit_count")) or 0)
+    numeric_category_count = len(
+        [
+            item
+            for item in (knowledge_summary.get("numeric_category_summary") or [])
+            if str(item or "").strip()
+        ]
+    )
+
+    source_file_signal = min(1.0, float(source_files_hit_count) / 3.0)
+    numeric_cluster_signal = min(1.0, float(numeric_category_count) / 4.0)
+
+    weighted_metrics: List[tuple[float, Optional[float], str]] = [
+        (0.24, retrieval_file_coverage_rate, "资料文件覆盖率"),
+        (0.18, retrieval_hit_rate, "资料检索命中率"),
+        (0.22, mandatory_hit_rate, "强制项命中率"),
+        (0.24, dimension_coverage_rate, "维度覆盖率"),
+        (0.07, source_file_signal, "命中文件广度"),
+        (0.05, numeric_cluster_signal, "数值约束簇"),
+    ]
+    available_weight = sum(weight for weight, value, _ in weighted_metrics if value is not None)
+    if available_weight > 1e-9:
+        data_score = (
+            sum(weight * float(value or 0.0) for weight, value, _ in weighted_metrics)
+            / available_weight
+        )
+    else:
+        data_score = 0.25
+
+    sigma = _to_float_or_none(pred_confidence.get("fused_sigma"))
+    if sigma is None:
+        sigma = _to_float_or_none(pred_confidence.get("sigma"))
+    ci_lower = _to_float_or_none(pred_confidence.get("fused_ci95_lower"))
+    ci_upper = _to_float_or_none(pred_confidence.get("fused_ci95_upper"))
+    ci_width = None
+    if ci_lower is not None and ci_upper is not None:
+        ci_width = max(0.0, float(ci_upper) - float(ci_lower))
+
+    model_signals: List[float] = []
+    if sigma is not None:
+        model_signals.append(max(0.0, min(1.0, 1.0 - float(sigma) / 12.0)))
+    if ci_width is not None:
+        model_signals.append(max(0.0, min(1.0, 1.0 - float(ci_width) / 30.0)))
+    model_score = (
+        round(sum(model_signals) / float(len(model_signals)), 4) if model_signals else None
+    )
+
+    overall_score = data_score if model_score is None else (data_score * 0.82 + model_score * 0.18)
+    reasons: List[str] = []
+
+    if bool(gate.get("blocked")):
+        overall_score = min(overall_score, 0.18)
+        reasons.append("资料利用门禁阻断")
+    elif bool(gate.get("warned")):
+        overall_score *= 0.78
+        reasons.append("资料利用门禁预警")
+
+    if retrieval_file_coverage_rate is not None and retrieval_file_coverage_rate < 0.35:
+        reasons.append(f"资料文件覆盖率偏低（{retrieval_file_coverage_rate * 100:.1f}%）")
+    if retrieval_hit_rate is not None and retrieval_hit_rate < 0.25:
+        reasons.append(f"资料检索命中率偏低（{retrieval_hit_rate * 100:.1f}%）")
+    if mandatory_hit_rate is not None and mandatory_hit_rate < 0.45:
+        reasons.append(f"强制项命中率偏低（{mandatory_hit_rate * 100:.1f}%）")
+    if dimension_coverage_rate is not None and dimension_coverage_rate < 0.45:
+        reasons.append(f"资料支撑维度覆盖率偏低（{dimension_coverage_rate * 100:.1f}%）")
+    if source_files_hit_count <= 0:
+        reasons.append("尚未形成有效命中文件")
+    if numeric_category_count <= 0:
+        reasons.append("资料中的数值约束簇不足")
+    if sigma is not None and sigma > 6:
+        reasons.append(f"预测波动偏大（sigma={sigma:.2f}）")
+    if ci_width is not None and ci_width > 18:
+        reasons.append(f"预测区间过宽（95%区间宽度={ci_width:.2f}）")
+
+    overall_score = max(0.0, min(1.0, float(overall_score)))
+    if overall_score >= 0.72:
+        level = "high"
+    elif overall_score >= 0.45:
+        level = "medium"
+    else:
+        level = "low"
+    if not reasons and level == "high":
+        reasons.append("资料证据、维度覆盖与模型波动均处于可接受范围")
+
+    return {
+        "level": level,
+        "score_0_1": round(overall_score, 4),
+        "score_0_100": round(overall_score * 100.0, 1),
+        "data_score_0_1": round(float(data_score), 4),
+        "model_score_0_1": round(float(model_score), 4) if model_score is not None else None,
+        "retrieval_file_coverage_rate": retrieval_file_coverage_rate,
+        "retrieval_hit_rate": retrieval_hit_rate,
+        "mandatory_hit_rate": mandatory_hit_rate,
+        "dimension_coverage_rate": dimension_coverage_rate,
+        "source_files_hit_count": source_files_hit_count,
+        "numeric_category_count": numeric_category_count,
+        "calibrator_sigma": round(float(sigma), 4) if sigma is not None else None,
+        "confidence_interval_width": round(float(ci_width), 4) if ci_width is not None else None,
+        "state": (
+            "blocked"
+            if bool(gate.get("blocked"))
+            else ("warned" if bool(gate.get("warned")) else "normal")
+        ),
+        "reasons": reasons[:8],
+    }
+
+
+def _ensure_report_score_self_awareness(
+    report: Optional[Dict[str, object]],
+    *,
+    project_id: Optional[str] = None,
+    material_knowledge_snapshot: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    if not isinstance(report, dict):
+        return {}
+    meta = report.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+        report["meta"] = meta
+    awareness = meta.get("score_self_awareness")
+    if isinstance(awareness, dict) and awareness:
+        if not meta.get("score_confidence_level"):
+            meta["score_confidence_level"] = str(awareness.get("level") or "low")
+        return awareness
+    knowledge_snapshot = material_knowledge_snapshot
+    if knowledge_snapshot is None and project_id:
+        try:
+            knowledge_snapshot = _build_material_knowledge_profile(project_id)
+        except Exception:
+            knowledge_snapshot = None
+    awareness = _build_score_self_awareness(
+        report,
+        material_knowledge_snapshot=knowledge_snapshot,
+    )
+    meta["score_self_awareness"] = awareness
+    meta["score_confidence_level"] = str(
+        awareness.get("level") or meta.get("score_confidence_level") or "low"
+    )
+    return awareness
+
+
 def _fuse_rule_and_llm_scores(
     *,
     rule_total: float,
@@ -5004,6 +5216,7 @@ def _score_submission_for_project(
     anchors: Optional[List[Dict[str, object]]] = None,
     requirements: Optional[List[Dict[str, object]]] = None,
     material_quality_snapshot: Optional[Dict[str, object]] = None,
+    material_knowledge_snapshot: Optional[Dict[str, object]] = None,
 ) -> tuple[Dict[str, object], List[Dict[str, object]]]:
     engine_version = _determine_engine_version(project, scoring_engine_version)
     if engine_version == "v2":
@@ -5060,6 +5273,11 @@ def _score_submission_for_project(
             project=project,
             profile_snapshot=profile_snapshot,
             scoring_engine_version=scoring_engine_version,
+        )
+        knowledge_snapshot = (
+            dict(material_knowledge_snapshot)
+            if isinstance(material_knowledge_snapshot, dict)
+            else _build_material_knowledge_profile(project_id)
         )
         snapshot_for_meta = (
             dict(material_quality_snapshot)
@@ -5148,10 +5366,30 @@ def _score_submission_for_project(
         report["meta"] = report_meta
         _apply_deployed_patch_to_report(project_id, report)
         if _report_is_blocked(report):
+            report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+            report_meta = dict(report_meta or {})
+            awareness = _build_score_self_awareness(
+                report,
+                material_knowledge_snapshot=knowledge_snapshot,
+            )
+            report_meta["score_self_awareness"] = awareness
+            report_meta["score_confidence_level"] = str(awareness.get("level") or "low")
+            report["meta"] = report_meta
             return report, list(v2_result.get("evidence_units") or [])
         submission_like = {"id": submission_id, "project_id": project_id, "text": text}
         _apply_prediction_to_report(report, submission_like=submission_like, project=project)
         _mark_report_scored(report, trigger="score_engine")
+        report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+        report_meta = dict(report_meta or {})
+        awareness = _build_score_self_awareness(
+            report,
+            material_knowledge_snapshot=knowledge_snapshot,
+        )
+        report_meta["score_self_awareness"] = awareness
+        report_meta["score_confidence_level"] = str(
+            awareness.get("level") or report_meta.get("score_confidence_level") or "medium"
+        )
+        report["meta"] = report_meta
         return report, list(v2_result.get("evidence_units") or [])
 
     legacy = score_text(
@@ -5181,6 +5419,12 @@ def _score_submission_for_project(
     legacy["meta"]["evidence_trace"] = _build_evidence_trace_summary(legacy)
     _apply_deployed_patch_to_report(project_id, legacy)
     _mark_report_scored(legacy, trigger="score_engine")
+    awareness = _build_score_self_awareness(
+        legacy,
+        material_knowledge_snapshot=material_knowledge_snapshot,
+    )
+    legacy["meta"]["score_self_awareness"] = awareness
+    legacy["meta"]["score_confidence_level"] = str(awareness.get("level") or "low")
     return legacy, []
 
 
@@ -6116,6 +6360,7 @@ def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, 
     submission_changed = False
     evidence_units_new: List[Dict[str, object]] = []
     now_iso = _now_iso()
+    material_knowledge_snapshot: Optional[Dict[str, object]] = None
     if matched_submission is None:
         matched_submission = {
             "id": str(uuid4()),
@@ -6144,6 +6389,8 @@ def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, 
         submission_changed = True
 
     if not _submission_is_scored(matched_submission):
+        if material_knowledge_snapshot is None:
+            material_knowledge_snapshot = _build_material_knowledge_profile(project_id)
         report, evidence_units_new = _score_submission_for_project(
             submission_id=str(matched_submission.get("id")),
             text=gt_text,
@@ -6153,6 +6400,7 @@ def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, 
             multipliers=multipliers,
             profile_snapshot=profile_snapshot,
             scoring_engine_version=scoring_engine_version,
+            material_knowledge_snapshot=material_knowledge_snapshot,
         )
         if not _report_is_blocked(report):
             _mark_report_scored(report, trigger="ground_truth_sync")
@@ -7568,6 +7816,7 @@ def rescore_project_submissions(
         project,
         raise_on_fail=True,
     )
+    material_knowledge_snapshot = _build_material_knowledge_profile(project_id)
 
     score_reports = load_score_reports()
     all_evidence_units = load_evidence_units()
@@ -7593,6 +7842,7 @@ def rescore_project_submissions(
             anchors=anchors,
             requirements=requirements,
             material_quality_snapshot=material_quality_snapshot,
+            material_knowledge_snapshot=material_knowledge_snapshot,
         )
         _apply_evolution_total_scale(project_id, report)
         all_evidence_units = _replace_submission_evidence_units(
@@ -11341,6 +11591,7 @@ def score_text_for_project(
     submission_id = str(uuid4())
     scoring_engine_version = str(project.get("scoring_engine_version_locked") or "v1")
     engine_version = _determine_engine_version(project, scoring_engine_version)
+    material_knowledge_snapshot = _build_material_knowledge_profile(project_id)
 
     if engine_version == "v1":
         config_hash = _compute_multipliers_hash(multipliers) if multipliers else None
@@ -11357,6 +11608,7 @@ def score_text_for_project(
                 multipliers=multipliers,
                 profile_snapshot=profile_snapshot,
                 scoring_engine_version=scoring_engine_version,
+                material_knowledge_snapshot=material_knowledge_snapshot,
             )
             # 缓存仅存“未缩放原始分”，避免后续读取时重复应用 total_score_scale。
             cache_score_result(payload.text, raw_report, config_hash)
@@ -11373,6 +11625,7 @@ def score_text_for_project(
             multipliers=multipliers,
             profile_snapshot=profile_snapshot,
             scoring_engine_version=scoring_engine_version,
+            material_knowledge_snapshot=material_knowledge_snapshot,
         )
         _apply_evolution_total_scale(project_id, report)
 
@@ -11449,6 +11702,7 @@ def list_submissions(
     score_scale_max = _resolve_project_score_scale_max(project)
 
     submissions = [s for s in load_submissions() if s["project_id"] == project_id]
+    material_knowledge_snapshot = _build_material_knowledge_profile(project_id)
 
     def _view_submission(item: Dict[str, object]) -> Dict[str, object]:
         view = dict(item)
@@ -11459,6 +11713,11 @@ def list_submissions(
                 view["total_score"] = total_display
             return view
         report = dict(report_obj)
+        _ensure_report_score_self_awareness(
+            report,
+            project_id=project_id,
+            material_knowledge_snapshot=material_knowledge_snapshot,
+        )
         rule_total = _to_float_or_none(report.get("rule_total_score"))
         if rule_total is None:
             rule_total = _to_float_or_none(report.get("total_score"))
@@ -12948,8 +13207,15 @@ def compare_submissions(
     submissions = [s for s in submissions_all if _submission_is_scored(s)]
     if not submissions:
         raise HTTPException(status_code=404, detail="暂无已评分施组，请先点击“评分施组”。")
+    material_knowledge_snapshot = _build_material_knowledge_profile(project_id)
     rankings = []
     for s in submissions:
+        report_for_awareness = s.get("report") if isinstance(s.get("report"), dict) else None
+        awareness = _ensure_report_score_self_awareness(
+            report_for_awareness,
+            project_id=project_id,
+            material_knowledge_snapshot=material_knowledge_snapshot,
+        )
         score_fields = _resolve_submission_score_fields(
             s,
             allow_pred_score=allow_pred_score,
@@ -12963,6 +13229,11 @@ def compare_submissions(
                 "pred_total_score": score_fields["pred_total_score"],
                 "rule_total_score": score_fields["rule_total_score"],
                 "score_source": score_fields["score_source"],
+                "score_confidence_level": str(
+                    ((report_for_awareness or {}).get("meta") or {}).get("score_confidence_level")
+                    or ""
+                ),
+                "score_self_awareness": awareness if isinstance(awareness, dict) else {},
                 "created_at": s["created_at"],
             }
         )
@@ -13023,6 +13294,7 @@ def compare_report(
     submissions = [s for s in submissions_all if _submission_is_scored(s)]
     if not submissions:
         raise HTTPException(status_code=404, detail="暂无已评分施组，请先点击“评分施组”。")
+    material_knowledge_snapshot = _build_material_knowledge_profile(project_id)
     submissions_for_compare = []
     by_id: Dict[str, Dict[str, object]] = {}
     for s in submissions:
@@ -13040,6 +13312,11 @@ def compare_report(
         item["total_score"] = float(score_fields_raw["total_score"])
         report = item.get("report")
         report = dict(report) if isinstance(report, dict) else {}
+        _ensure_report_score_self_awareness(
+            report,
+            project_id=project_id,
+            material_knowledge_snapshot=material_knowledge_snapshot,
+        )
         report["pred_total_score"] = score_fields_raw["pred_total_score"]
         report["rule_total_score"] = score_fields_raw["rule_total_score"]
         item["report"] = report
@@ -13061,9 +13338,33 @@ def compare_report(
             allow_pred_score=allow_pred_score,
             score_scale_max=score_scale_max,
         )
+        awareness = (
+            (
+                ((source_submission.get("report") or {}).get("meta") or {}).get(
+                    "score_self_awareness"
+                )
+            )
+            if isinstance(
+                (
+                    ((source_submission.get("report") or {}).get("meta") or {}).get(
+                        "score_self_awareness"
+                    )
+                ),
+                dict,
+            )
+            else {}
+        )
         row["pred_total_score"] = score_fields["pred_total_score"]
         row["rule_total_score"] = score_fields["rule_total_score"]
         row["score_source"] = score_fields["score_source"]
+        row["score_confidence_level"] = str(
+            ((source_submission.get("report") or {}).get("meta") or {}).get(
+                "score_confidence_level"
+            )
+            or (awareness.get("level") if isinstance(awareness, dict) else "")
+            or ""
+        )
+        row["score_self_awareness"] = awareness if isinstance(awareness, dict) else {}
     return CompareNarrative(project_id=project_id, **narrative)
 
 
@@ -15009,6 +15310,9 @@ def index(
     )
     initial_material_rows: List[str] = []
     initial_submission_rows: List[str] = []
+    initial_material_knowledge = (
+        _build_material_knowledge_profile(selected_project_id) if selected_project_id else {}
+    )
     if selected_project_id:
         try:
             materials_all = load_materials()
@@ -15050,6 +15354,11 @@ def index(
                 filename = html_lib.escape(filename_raw)
                 report_obj = s.get("report")
                 report = report_obj if isinstance(report_obj, dict) else {}
+                _ensure_report_score_self_awareness(
+                    report,
+                    project_id=selected_project_id,
+                    material_knowledge_snapshot=initial_material_knowledge,
+                )
                 pred_total_raw = report.get("pred_total_score")
                 rule_total_raw = report.get("rule_total_score")
                 if not allow_pred_initial:
@@ -15071,6 +15380,11 @@ def index(
                 evidence_trace = (
                     report_meta.get("evidence_trace")
                     if isinstance(report_meta.get("evidence_trace"), dict)
+                    else {}
+                )
+                score_self_awareness = (
+                    report_meta.get("score_self_awareness")
+                    if isinstance(report_meta.get("score_self_awareness"), dict)
                     else {}
                 )
                 primary_total = (
@@ -15167,6 +15481,33 @@ def index(
                         '<div class="note">命中文件: '
                         + html_lib.escape(preview)
                         + suffix
+                        + "</div>"
+                    )
+                awareness_score = _to_float_or_none(score_self_awareness.get("score_0_100"))
+                awareness_level = str(score_self_awareness.get("level") or "").strip()
+                awareness_reasons = (
+                    score_self_awareness.get("reasons")
+                    if isinstance(score_self_awareness.get("reasons"), list)
+                    else []
+                )
+                if not is_pending and awareness_level:
+                    awareness_label = (
+                        "高"
+                        if awareness_level == "high"
+                        else ("中" if awareness_level == "medium" else "低")
+                    )
+                    reason_preview = "；".join(
+                        str(x).strip() for x in awareness_reasons[:1] if str(x).strip()
+                    )
+                    score_cell += (
+                        '<div class="note">评分置信度: '
+                        + html_lib.escape(awareness_label)
+                        + (
+                            ""
+                            if awareness_score is None
+                            else "（" + html_lib.escape(f"{awareness_score:.1f}") + "）"
+                        )
+                        + ("" if not reason_preview else " / " + html_lib.escape(reason_preview))
                         + "</div>"
                     )
                 if util_blocked:
@@ -15396,10 +15737,15 @@ def index(
             }
             if (actionId === 'btnCompare') {
               const rows = Array.isArray(data.rankings) ? data.rankings : [];
-              const html = '<strong>排名</strong><table><tr><th>文件名</th><th>总分</th><th>时间</th></tr>' +
+              const html = '<strong>排名</strong><table><tr><th>文件名</th><th>总分</th><th>置信度</th><th>时间</th></tr>' +
                 (rows.length
-                  ? rows.map((r) => '<tr><td>' + esc(r.filename || '') + '</td><td>' + esc(r.total_score) + '</td><td>' + esc(r.created_at || '') + '</td></tr>').join('')
-                  : '<tr><td colspan="3">暂无施组评分数据</td></tr>') +
+                  ? rows.map((r) => {
+                      const awareness = (r && typeof r.score_self_awareness === 'object') ? r.score_self_awareness : {};
+                      const level = esc((r && r.score_confidence_level) || awareness.level || '-');
+                      const score = awareness && awareness.score_0_100 != null ? '（' + esc(awareness.score_0_100) + '）' : '';
+                      return '<tr><td>' + esc(r.filename || '') + '</td><td>' + esc(r.total_score) + '</td><td>' + level + score + '</td><td>' + esc(r.created_at || '') + '</td></tr>';
+                    }).join('')
+                  : '<tr><td colspan="4">暂无施组评分数据</td></tr>') +
                 '</table>';
               setResultHtml(cfg.resultId, html);
               return true;
@@ -16126,10 +16472,15 @@ def index(
             const data = fallbackParseJson(text);
             if (aid === 'btnCompare') {
               const rows = Array.isArray(data.rankings) ? data.rankings : [];
-              const html = '<strong>排名</strong><table><tr><th>文件名</th><th>总分</th><th>时间</th></tr>' +
+              const html = '<strong>排名</strong><table><tr><th>文件名</th><th>总分</th><th>置信度</th><th>时间</th></tr>' +
                 (rows.length
-                  ? rows.map((r) => '<tr><td>' + fallbackEscapeHtml(r.filename || '') + '</td><td>' + fallbackEscapeHtml(r.total_score) + '</td><td>' + fallbackEscapeHtml(r.created_at || '') + '</td></tr>').join('')
-                  : '<tr><td colspan="3">暂无施组评分数据</td></tr>') +
+                  ? rows.map((r) => {
+                      const awareness = (r && typeof r.score_self_awareness === 'object') ? r.score_self_awareness : {};
+                      const level = fallbackEscapeHtml((r && r.score_confidence_level) || awareness.level || '-');
+                      const score = awareness && awareness.score_0_100 != null ? '（' + fallbackEscapeHtml(awareness.score_0_100) + '）' : '';
+                      return '<tr><td>' + fallbackEscapeHtml(r.filename || '') + '</td><td>' + fallbackEscapeHtml(r.total_score) + '</td><td>' + level + score + '</td><td>' + fallbackEscapeHtml(r.created_at || '') + '</td></tr>';
+                    }).join('')
+                  : '<tr><td colspan="4">暂无施组评分数据</td></tr>') +
                 '</table>';
               fallbackSetResultHtml(resultId, html);
               return true;
@@ -16138,6 +16489,14 @@ def index(
               const summary = fallbackEscapeHtml(data.summary || '');
               const top = data.top_submission || {};
               const bottom = data.bottom_submission || {};
+              const confidenceText = (row) => {
+                if (!row || typeof row !== 'object') return '置信度 -';
+                const awareness = row.score_self_awareness && typeof row.score_self_awareness === 'object' ? row.score_self_awareness : {};
+                const level = row.score_confidence_level || awareness.level || '-';
+                const score = awareness.score_0_100 == null ? '' : (' / ' + fallbackEscapeHtml(awareness.score_0_100) + '分');
+                const reason = Array.isArray(awareness.reasons) && awareness.reasons.length ? ('；' + fallbackEscapeHtml(awareness.reasons[0])) : '';
+                return '置信度 ' + fallbackEscapeHtml(level) + score + reason;
+              };
               const keyDiffs = (Array.isArray(data.key_diffs) ? data.key_diffs : []).slice(0, 5);
               const rankings = Array.isArray(data.rankings) ? data.rankings : [];
               const sourceCards = Array.isArray(data.submission_optimization_cards) ? data.submission_optimization_cards : [];
@@ -16173,7 +16532,9 @@ def index(
               const html = ''
                 + '<p><strong>摘要</strong>：' + (summary || '无') + '</p>'
                 + '<p><strong>最高分</strong>：' + fallbackEscapeHtml(top.filename || '-') + '（' + fallbackEscapeHtml(top.total_score) + '）'
-                + '，<strong>最低分</strong>：' + fallbackEscapeHtml(bottom.filename || '-') + '（' + fallbackEscapeHtml(bottom.total_score) + '）</p>'
+                + '，' + confidenceText(top)
+                + '；<strong>最低分</strong>：' + fallbackEscapeHtml(bottom.filename || '-') + '（' + fallbackEscapeHtml(bottom.total_score) + '）'
+                + '，' + confidenceText(bottom) + '</p>'
                 + (keyDiffs.length
                   ? '<strong>关键差距维度（Top5）</strong><table><tr><th>维度</th><th>分差</th></tr>'
                     + keyDiffs.map((d) => '<tr><td>' + fallbackEscapeHtml((d.dimension || d.dim_id || '-') + ' ' + (d.dimension_name || '')) + '</td><td>' + fallbackEscapeHtml(d.delta) + '</td></tr>').join('')
@@ -18530,6 +18891,9 @@ def index(
             const evidenceTrace = (repMeta && typeof repMeta.evidence_trace === 'object')
               ? repMeta.evidence_trace
               : {};
+            const scoreSelfAwareness = (repMeta && typeof repMeta.score_self_awareness === 'object')
+              ? repMeta.score_self_awareness
+              : {};
             let scoreHtml = '-';
             if (isPending) {
               scoreHtml = '<span class="note">待评分</span>';
@@ -18582,6 +18946,23 @@ def index(
             const evidenceFiles = Array.isArray(evidenceTrace.source_files_hit) ? evidenceTrace.source_files_hit : [];
             if (!isPending && evidenceFiles.length) {
               scoreHtml += '<div class="note">命中文件: ' + escapeHtmlText(evidenceFiles.slice(0, 2).join('；')) + (evidenceFiles.length > 2 ? ' 等' : '') + '</div>';
+            }
+            const awarenessScore = Number(scoreSelfAwareness.score_0_100);
+            const awarenessLevel = String(scoreSelfAwareness.level || '').trim();
+            const awarenessReasons = Array.isArray(scoreSelfAwareness.reasons) ? scoreSelfAwareness.reasons : [];
+            if (!isPending && awarenessLevel) {
+              const awarenessLabel = awarenessLevel === 'high'
+                ? '高'
+                : (awarenessLevel === 'medium' ? '中' : '低');
+              const awarenessText = Number.isFinite(awarenessScore)
+                ? '（' + awarenessScore.toFixed(1) + '）'
+                : '';
+              const reasonPreview = awarenessReasons
+                .map((item) => String(item || '').trim())
+                .filter((item) => !!item)
+                .slice(0, 1)
+                .join('；');
+              scoreHtml += '<div class="note">评分置信度: ' + escapeHtmlText(awarenessLabel + awarenessText + (reasonPreview ? ' / ' + reasonPreview : '')) + '</div>';
             }
             if (utilBlocked) {
               scoreHtml += '<div class="error">资料利用门禁未达标（建议补齐资料后重评分）</div>';
@@ -19710,6 +20091,11 @@ def index(
           const utilByType = (util.by_type && typeof util.by_type === 'object') ? util.by_type : {};
           const utilAvailableTypes = Array.isArray(util.available_types) ? util.available_types : [];
           const typeCards = Array.isArray(data.material_type_cards) ? data.material_type_cards : [];
+          const latestSelfAwareness = (latest.score_self_awareness && typeof latest.score_self_awareness === 'object')
+            ? latest.score_self_awareness
+            : ((summary.latest_score_self_awareness && typeof summary.latest_score_self_awareness === 'object')
+              ? summary.latest_score_self_awareness
+              : {});
           const statusRaw = String((latest.scoring_status || '')).toLowerCase();
           const statusLabel = statusRaw === 'scored'
             ? '<span class="success">已评分</span>'
@@ -19903,6 +20289,19 @@ def index(
             + '；字数 ' + escapeHtmlText(summary.material_parsed_chars || 0)
             + '；分块 ' + escapeHtmlText(summary.material_parsed_chunks || 0)
             + '</td><td>' + (summary.material_parsed_chunks > 0 ? '<span class="success">已解析</span>' : '<span class="error">未解析</span>') + '</td></tr>';
+          html += '<tr><td>评分置信度</td><td>'
+            + (latestSelfAwareness.level
+              ? (escapeHtmlText(String(latestSelfAwareness.level === 'high' ? '高' : (latestSelfAwareness.level === 'medium' ? '中' : '低')))
+                  + ' / '
+                  + escapeHtmlText((latestSelfAwareness.score_0_100 != null) ? (Number(latestSelfAwareness.score_0_100).toFixed(1) + '/100') : '-'))
+              : '-')
+            + '</td><td>'
+            + escapeHtmlText(
+              Array.isArray(latestSelfAwareness.reasons)
+                ? (latestSelfAwareness.reasons[0] || '暂无说明')
+                : '暂无说明'
+            )
+            + '</td></tr>';
           html += '<tr><td>证据命中</td><td>' + escapeHtmlText(summary.evidence_total_hits || 0)
             + ' / ' + escapeHtmlText(summary.evidence_total_requirements || 0)
             + '</td><td>强制项 ' + escapeHtmlText(toPct(summary.evidence_mandatory_hit_rate)) + '</td></tr>';
@@ -20065,8 +20464,14 @@ def index(
           el.style.display = 'block';
           if (res.ok && data.rankings) {
             const scoreSource = (s) => (s === 'pred' ? '预测' : '规则');
-            el.innerHTML = '<strong>排名</strong><table><tr><th>文件名</th><th>总分(优先预测)</th><th>规则分(追溯)</th><th>来源</th><th>时间</th></tr>' +
-              data.rankings.map(r => '<tr><td>' + r.filename + '</td><td>' + r.total_score + '</td><td>' + (r.rule_total_score ?? '-') + '</td><td>' + scoreSource(r.score_source) + '</td><td>' + r.created_at + '</td></tr>').join('') + '</table>';
+            const awarenessText = (row) => {
+              const awareness = (row && typeof row.score_self_awareness === 'object') ? row.score_self_awareness : {};
+              const level = row && row.score_confidence_level ? row.score_confidence_level : (awareness.level || '-');
+              const score = awareness && awareness.score_0_100 != null ? '（' + awareness.score_0_100 + '）' : '';
+              return String(level || '-') + score;
+            };
+            el.innerHTML = '<strong>排名</strong><table><tr><th>文件名</th><th>总分(优先预测)</th><th>规则分(追溯)</th><th>来源</th><th>评分置信度</th><th>时间</th></tr>' +
+              data.rankings.map(r => '<tr><td>' + r.filename + '</td><td>' + r.total_score + '</td><td>' + (r.rule_total_score ?? '-') + '</td><td>' + scoreSource(r.score_source) + '</td><td>' + awarenessText(r) + '</td><td>' + r.created_at + '</td></tr>').join('') + '</table>';
           } else {
             el.innerHTML = '<span class="error">' + (data.detail || '请求失败') + '</span>';
           }
@@ -20097,11 +20502,19 @@ def index(
               const rule = row.rule_total_score == null ? '-' : row.rule_total_score;
               return esc(row.total_score) + ' 分（规则 ' + esc(rule) + '，来源 ' + source + '）';
             };
+            const confidenceText = (row) => {
+              if (!row || typeof row !== 'object') return '置信度 -';
+              const awareness = row.score_self_awareness && typeof row.score_self_awareness === 'object' ? row.score_self_awareness : {};
+              const level = row.score_confidence_level || awareness.level || '-';
+              const score = awareness.score_0_100 == null ? '' : (' / ' + awareness.score_0_100 + '分');
+              const reason = Array.isArray(awareness.reasons) && awareness.reasons.length ? ('；' + awareness.reasons[0]) : '';
+              return '置信度 ' + esc(level) + score + reason;
+            };
             let html = '<p><strong>摘要</strong>: ' + (data.summary || '') + '</p>';
             if (data.top_submission && data.top_submission.filename)
-              html += '<p>最高: ' + data.top_submission.filename + ' — ' + scoreText(data.top_submission) + '</p>';
+              html += '<p>最高: ' + data.top_submission.filename + ' — ' + scoreText(data.top_submission) + '；' + confidenceText(data.top_submission) + '</p>';
             if (data.bottom_submission && data.bottom_submission.filename)
-              html += '<p>最低: ' + data.bottom_submission.filename + ' — ' + scoreText(data.bottom_submission) + '</p>';
+              html += '<p>最低: ' + data.bottom_submission.filename + ' — ' + scoreText(data.bottom_submission) + '；' + confidenceText(data.bottom_submission) + '</p>';
             if (data.submission_scorecards && data.submission_scorecards.length) {
               html += '<strong>逐份施组得分项/失分项（按文件）</strong>' +
                 data.submission_scorecards.map((card, idx) => {
@@ -20112,6 +20525,7 @@ def index(
                   const title = esc(card.filename || '') +
                     '（排名 ' + esc(card.rank_desc || '-') +
                     '，总分 ' + esc(card.total_score) +
+                    '，置信度 ' + esc(card.score_confidence_level || '-') + '/' + esc(card.score_confidence_score ?? '-') +
                     '，距满分 ' + esc(card.gap_to_full_total) +
                     '，累计扣分 ' + esc(card.total_deduction_points) + '）';
 
