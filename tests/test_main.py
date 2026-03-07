@@ -106,6 +106,32 @@ class TestScoreSelfAwareness:
         assert out["score_0_1"] <= 0.18
         assert "资料利用门禁阻断" in out["reasons"]
 
+    def test_build_score_self_awareness_backfills_material_usage_metadata(self):
+        report = {
+            "requirement_hits": [
+                {
+                    "source_pack_id": "runtime_material_dimension",
+                    "dimension_id": "09",
+                    "label": "资料维度约束：进度计划",
+                    "hit": True,
+                    "source_types": ["tender_qa"],
+                }
+            ],
+            "meta": {
+                "material_retrieval": {},
+                "material_utilization_gate": {"blocked": False, "warned": False},
+                "evidence_trace": {
+                    "mandatory_hit_rate": 0.6,
+                    "source_files_hit_count": 1,
+                },
+            },
+        }
+
+        out = _build_score_self_awareness(report, material_knowledge_snapshot={"summary": {}})
+
+        assert out["material_dimension_hit_rate"] == pytest.approx(1.0, abs=1e-6)
+        assert report["meta"]["material_utilization"]["material_dimension_total"] == 1
+
 
 class TestIndexEndpoint:
     """Tests for GET / index endpoint."""
@@ -2296,6 +2322,135 @@ class TestDXFParser:
 
 
 class TestMaterialAdvancedParsing:
+    @patch("app.main.load_project_requirements", return_value=[])
+    @patch("app.main.load_project_anchors", return_value=[])
+    def test_build_material_query_features_includes_material_profile_boosts(
+        self,
+        mock_load_anchors,
+        mock_load_requirements,
+    ):
+        from app.main import _build_material_query_features
+
+        profile = {
+            "by_type": [
+                {
+                    "material_type": "boq",
+                    "top_terms": ["工程量", "综合单价", "措施费", "项目"],
+                    "top_numeric_terms": ["120", "30", "580"],
+                }
+            ],
+            "by_dimension": [
+                {
+                    "dimension_id": "15",
+                    "coverage_score": 0.76,
+                    "source_file_count": 2,
+                    "source_types": ["boq"],
+                }
+            ],
+        }
+
+        out = _build_material_query_features(
+            project_id="p1",
+            submission_text="计划调配与资源组织。",
+            required_sections=[],
+            required_charts=[],
+            mandatory_elements=[],
+            custom_text_items=[],
+            context_text="",
+            material_knowledge_profile=profile,
+        )
+
+        assert out["material_profile_query_terms_count"] >= 2
+        assert out["material_profile_query_numeric_terms_count"] >= 1
+        assert "15" in out["material_profile_focus_dimensions"]
+        assert "工程量" in out["query_terms"]
+        assert "120" in out["query_numeric_terms"]
+
+    def test_build_material_dimension_requirements_from_knowledge_profile(self):
+        from app.main import _build_material_dimension_requirements
+
+        profile = {
+            "by_type": [
+                {
+                    "material_type": "tender_qa",
+                    "top_terms": ["工期", "质量标准", "危大工程", "项目"],
+                    "top_numeric_terms": ["120", "30"],
+                },
+                {
+                    "material_type": "drawing",
+                    "top_terms": ["节点", "剖面", "深化", "图纸"],
+                    "top_numeric_terms": ["3.5", "600"],
+                },
+            ],
+            "by_dimension": [
+                {
+                    "dimension_id": "09",
+                    "dimension_name": "进度计划体系与纠偏阈值",
+                    "coverage_score": 0.81,
+                    "source_file_count": 2,
+                    "source_types": ["tender_qa"],
+                },
+                {
+                    "dimension_id": "14",
+                    "dimension_name": "图纸会审、深化设计与变更闭环",
+                    "coverage_score": 0.72,
+                    "source_file_count": 1,
+                    "source_types": ["drawing"],
+                },
+            ],
+        }
+
+        reqs = _build_material_dimension_requirements(
+            "p1",
+            profile,
+            available_material_types=["tender_qa", "drawing"],
+        )
+
+        assert len(reqs) == 2
+        dim09 = next(r for r in reqs if r.get("dimension_id") == "09")
+        patterns = dim09.get("patterns") or {}
+        assert dim09.get("source_pack_id") == "runtime_material_dimension"
+        assert patterns.get("source_mode") == "material_knowledge_profile"
+        assert "tender_qa" in (patterns.get("source_types") or [])
+        assert "120" in (patterns.get("hints") or [])
+
+    def test_build_material_utilization_summary_tracks_dimension_requirements(self):
+        from app.main import _build_material_utilization_summary
+
+        report = {
+            "requirement_hits": [
+                {
+                    "source_pack_id": "runtime_material_dimension",
+                    "dimension_id": "09",
+                    "label": "资料维度约束：进度计划",
+                    "hit": True,
+                    "source_types": ["tender_qa", "boq"],
+                },
+                {
+                    "source_pack_id": "runtime_material_dimension",
+                    "dimension_id": "14",
+                    "label": "资料维度约束：图纸深化",
+                    "hit": False,
+                    "source_types": ["drawing"],
+                },
+            ]
+        }
+        runtime_req_meta = {
+            "material_profile_query_terms_count": 6,
+            "material_profile_query_numeric_terms_count": 3,
+            "material_profile_focus_dimensions": ["09", "14"],
+        }
+
+        summary = _build_material_utilization_summary(report, runtime_req_meta)
+
+        assert summary["material_dimension_total"] == 2
+        assert summary["material_dimension_hit"] == 1
+        assert summary["material_dimension_hit_rate"] == pytest.approx(0.5, abs=1e-6)
+        assert summary["material_profile_query_terms_count"] == 6
+        assert summary["material_profile_focus_dimensions"] == ["09", "14"]
+        first_dim = summary["material_dimension_by_dimension"][0]
+        assert first_dim["dimension_id"] in {"09", "14"}
+
     def test_build_boq_structured_summary_from_csv(self):
         from app.main import _build_boq_structured_summary
 

@@ -470,6 +470,9 @@ def _match_requirements(
                 "source_mode": patterns.get("source_mode"),
                 "source_filename": patterns.get("source_filename"),
                 "chunk_id": patterns.get("chunk_id"),
+                "source_types": patterns.get("source_types"),
+                "source_coverage_score": patterns.get("source_coverage_score"),
+                "source_file_count": patterns.get("source_file_count"),
             }
         )
 

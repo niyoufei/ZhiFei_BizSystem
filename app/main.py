@@ -1392,7 +1392,51 @@ def _build_material_query_features(
     mandatory_elements: List[str],
     custom_text_items: List[str],
     context_text: str,
+    material_knowledge_profile: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
+    def _append_unique(items: List[str], target: List[str], *, limit: int) -> None:
+        seen = {str(x).strip().lower() for x in target if str(x).strip()}
+        for item in items:
+            text_value = str(item or "").strip()
+            if not text_value:
+                continue
+            key = text_value.lower()
+            if key in seen:
+                continue
+            target.append(text_value)
+            seen.add(key)
+            if len(target) >= limit:
+                return
+
+    def _filter_profile_terms(raw_terms: object, *, limit: int = 8) -> List[str]:
+        generic_terms = {
+            "工程",
+            "施工",
+            "项目",
+            "资料",
+            "要求",
+            "内容",
+            "现场",
+            "部位",
+            "方案",
+            "措施",
+            "管理",
+            "控制",
+        }
+        items: List[str] = []
+        seen: set[str] = set()
+        for item in raw_terms if isinstance(raw_terms, list) else []:
+            token = str(item or "").strip().lower()
+            if not token or len(token) < 2 or token in generic_terms:
+                continue
+            if token in seen:
+                continue
+            items.append(token)
+            seen.add(token)
+            if len(items) >= limit:
+                break
+        return items
+
     seed_lines: List[str] = []
     seed_lines.extend(required_sections)
     seed_lines.extend(required_charts)
@@ -1433,6 +1477,78 @@ def _build_material_query_features(
     seed_text = "\n".join(seed_lines)
     text_terms = _extract_terms(seed_text, max_terms=100)
     numeric_terms = _extract_numeric_terms(seed_text, max_terms=40)
+
+    material_profile_query_terms: List[str] = []
+    material_profile_query_numeric_terms: List[str] = []
+    material_profile_focus_dimensions: List[str] = []
+    by_type_rows = (
+        material_knowledge_profile.get("by_type")
+        if isinstance(material_knowledge_profile, dict)
+        and isinstance(material_knowledge_profile.get("by_type"), list)
+        else []
+    )
+    by_dimension_rows = (
+        material_knowledge_profile.get("by_dimension")
+        if isinstance(material_knowledge_profile, dict)
+        and isinstance(material_knowledge_profile.get("by_dimension"), list)
+        else []
+    )
+    by_type_map = {
+        _normalize_material_type(row.get("material_type")): row
+        for row in by_type_rows
+        if isinstance(row, dict)
+    }
+    ordered_dimensions = sorted(
+        [row for row in by_dimension_rows if isinstance(row, dict)],
+        key=lambda x: (
+            -float(_to_float_or_none(x.get("coverage_score")) or 0.0),
+            -int(_to_float_or_none(x.get("source_file_count")) or 0),
+            str(x.get("dimension_id") or ""),
+        ),
+    )
+    for dim_row in ordered_dimensions[:8]:
+        coverage_score = float(_to_float_or_none(dim_row.get("coverage_score")) or 0.0)
+        source_file_count = int(_to_float_or_none(dim_row.get("source_file_count")) or 0)
+        if coverage_score < 0.22 or source_file_count <= 0:
+            continue
+        dim_id = str(dim_row.get("dimension_id") or "").strip()
+        if not dim_id:
+            continue
+        material_profile_focus_dimensions.append(dim_id)
+        _append_unique(
+            [str(x) for x in (DIMENSION_RAG_KEYWORDS.get(dim_id) or [])[:4]],
+            material_profile_query_terms,
+            limit=36,
+        )
+        for mat_type in dim_row.get("source_types") or []:
+            row = by_type_map.get(_normalize_material_type(mat_type))
+            if not isinstance(row, dict):
+                continue
+            _append_unique(
+                _filter_profile_terms(row.get("top_terms"), limit=4),
+                material_profile_query_terms,
+                limit=36,
+            )
+            _append_unique(
+                [
+                    token
+                    for token in (
+                        _normalize_numeric_token(item)
+                        for item in (row.get("top_numeric_terms") or [])[:4]
+                    )
+                    if token
+                ],
+                material_profile_query_numeric_terms,
+                limit=18,
+            )
+        if (
+            len(material_profile_query_terms) >= 36
+            and len(material_profile_query_numeric_terms) >= 18
+        ):
+            break
+
+    _append_unique(material_profile_query_terms, text_terms, limit=100)
+    _append_unique(material_profile_query_numeric_terms, numeric_terms, limit=60)
     submission_numeric_terms = _extract_numeric_terms(submission_text, max_terms=24)
     for token in submission_numeric_terms:
         if token not in numeric_terms:
@@ -1444,7 +1560,167 @@ def _build_material_query_features(
         "seed_lines_count": len(seed_lines),
         "project_anchor_count": len(project_anchors),
         "project_requirement_count": len(project_requirements),
+        "material_profile_query_terms_count": len(material_profile_query_terms),
+        "material_profile_query_numeric_terms_count": len(material_profile_query_numeric_terms),
+        "material_profile_focus_dimensions": material_profile_focus_dimensions[:8],
+        "material_profile_query_terms_preview": material_profile_query_terms[:16],
+        "material_profile_query_numeric_terms_preview": material_profile_query_numeric_terms[:12],
     }
+
+
+def _build_material_dimension_requirements(
+    project_id: str,
+    material_knowledge_profile: Optional[Dict[str, object]],
+    *,
+    available_material_types: Optional[List[str]] = None,
+) -> List[Dict[str, object]]:
+    if not isinstance(material_knowledge_profile, dict):
+        return []
+
+    by_type_rows = (
+        material_knowledge_profile.get("by_type")
+        if isinstance(material_knowledge_profile.get("by_type"), list)
+        else []
+    )
+    by_dimension_rows = (
+        material_knowledge_profile.get("by_dimension")
+        if isinstance(material_knowledge_profile.get("by_dimension"), list)
+        else []
+    )
+    if not by_type_rows or not by_dimension_rows:
+        return []
+
+    generic_terms = {
+        "工程",
+        "施工",
+        "项目",
+        "资料",
+        "要求",
+        "内容",
+        "现场",
+        "部位",
+        "方案",
+        "措施",
+        "管理",
+        "控制",
+    }
+
+    def _collect_terms(raw_terms: object, *, limit: int = 8) -> List[str]:
+        out: List[str] = []
+        seen: set[str] = set()
+        for item in raw_terms if isinstance(raw_terms, list) else []:
+            token = str(item or "").strip().lower()
+            if not token or len(token) < 2 or token in generic_terms:
+                continue
+            if token in seen:
+                continue
+            out.append(token)
+            seen.add(token)
+            if len(out) >= limit:
+                break
+        return out
+
+    allowed_types = {
+        _normalize_material_type(item)
+        for item in (available_material_types or [])
+        if str(item or "").strip()
+    }
+    by_type_map = {
+        _normalize_material_type(row.get("material_type")): row
+        for row in by_type_rows
+        if isinstance(row, dict)
+    }
+    ordered_dimensions = sorted(
+        [row for row in by_dimension_rows if isinstance(row, dict)],
+        key=lambda x: (
+            -float(_to_float_or_none(x.get("coverage_score")) or 0.0),
+            -int(_to_float_or_none(x.get("source_file_count")) or 0),
+            str(x.get("dimension_id") or ""),
+        ),
+    )
+    reqs: List[Dict[str, object]] = []
+    now = _now_iso()
+    req_index = 0
+    for dim_row in ordered_dimensions:
+        coverage_score = float(_to_float_or_none(dim_row.get("coverage_score")) or 0.0)
+        source_file_count = int(_to_float_or_none(dim_row.get("source_file_count")) or 0)
+        if coverage_score < 0.28 or source_file_count <= 0:
+            continue
+        dim_id = str(dim_row.get("dimension_id") or "").strip()
+        if not dim_id:
+            continue
+        source_types = [
+            _normalize_material_type(item)
+            for item in (dim_row.get("source_types") or [])
+            if str(item or "").strip()
+        ]
+        if allowed_types:
+            source_types = [item for item in source_types if item in allowed_types]
+        if not source_types:
+            continue
+
+        hints: List[str] = []
+        for token in DIMENSION_RAG_KEYWORDS.get(dim_id, [])[:4]:
+            text_value = str(token or "").strip().lower()
+            if text_value and text_value not in hints:
+                hints.append(text_value)
+        numeric_terms: List[str] = []
+        for mat_type in source_types[:3]:
+            row = by_type_map.get(mat_type)
+            if not isinstance(row, dict):
+                continue
+            for term in _collect_terms(row.get("top_terms"), limit=5):
+                if term not in hints:
+                    hints.append(term)
+                if len(hints) >= 8:
+                    break
+            for raw_num in (row.get("top_numeric_terms") or [])[:4]:
+                token = _normalize_numeric_token(raw_num)
+                if token and token not in numeric_terms:
+                    numeric_terms.append(token)
+                if len(numeric_terms) >= 4:
+                    break
+        merged_hints = _to_text_items(hints + numeric_terms, max_items=10)
+        if len(merged_hints) < 3:
+            continue
+
+        minimum_hint_hits = 2 if (coverage_score >= 0.58 or len(source_types) >= 2) else 1
+        weight = round(
+            min(1.0, 0.58 + coverage_score * 0.28 + min(0.08, len(source_types) * 0.03)),
+            2,
+        )
+        req_index += 1
+        reqs.append(
+            {
+                "id": f"runtime-material-dim-{project_id[:8]}-{req_index}",
+                "project_id": project_id,
+                "dimension_id": dim_id,
+                "req_label": (
+                    f"资料维度约束：{str(dim_row.get('dimension_name') or dim_id)}"
+                    "需体现项目资料关键锚点"
+                ),
+                "req_type": "semantic",
+                "patterns": {
+                    "hints": merged_hints,
+                    "minimum_hint_hits": minimum_hint_hits,
+                    "source_types": source_types,
+                    "source_mode": "material_knowledge_profile",
+                    "source_coverage_score": round(coverage_score, 4),
+                    "source_file_count": source_file_count,
+                    "top_numeric_terms": numeric_terms[:4],
+                },
+                "mandatory": False,
+                "weight": weight,
+                "source_anchor_id": None,
+                "source_pack_id": "runtime_material_dimension",
+                "source_pack_version": "v2-material-dimension-1",
+                "priority": 89.0,
+                "override_key": f"runtime::material_dimension::{dim_id}",
+                "lint": {},
+                "created_at": now,
+            }
+        )
+    return reqs
 
 
 def _build_runtime_custom_requirements(
@@ -1552,6 +1828,15 @@ def _build_runtime_custom_requirements(
             kind="custom",
         )
 
+    material_index = _build_project_material_index(project_id)
+    material_rows = list(material_index.get("rows") or [])
+    available_material_types = [
+        str(x) for x in (material_index.get("available_types") or []) if str(x).strip()
+    ]
+    available_material_filenames = [
+        str(x) for x in (material_index.get("available_filenames") or []) if str(x).strip()
+    ]
+    material_knowledge_profile = _build_material_knowledge_profile(project_id)
     retrieval_cfg = _resolve_material_retrieval_config(project)
     query_features = _build_material_query_features(
         project_id=project_id,
@@ -1561,15 +1846,8 @@ def _build_runtime_custom_requirements(
         mandatory_elements=mandatory_elements,
         custom_text_items=custom_text_items,
         context_text=context_text,
+        material_knowledge_profile=material_knowledge_profile,
     )
-    material_index = _build_project_material_index(project_id)
-    material_rows = list(material_index.get("rows") or [])
-    available_material_types = [
-        str(x) for x in (material_index.get("available_types") or []) if str(x).strip()
-    ]
-    available_material_filenames = [
-        str(x) for x in (material_index.get("available_filenames") or []) if str(x).strip()
-    ]
     retrieval_budget = _compute_dynamic_retrieval_budget(
         project_id,
         retrieval_cfg,
@@ -1625,8 +1903,14 @@ def _build_runtime_custom_requirements(
         retrieval_chunks,
         available_material_types=available_material_types,
     )
+    material_dimension_requirements = _build_material_dimension_requirements(
+        project_id,
+        material_knowledge_profile,
+        available_material_types=available_material_types,
+    )
     runtime_requirements.extend(retrieval_requirements)
     runtime_requirements.extend(consistency_requirements)
+    runtime_requirements.extend(material_dimension_requirements)
 
     meta = {
         "required_sections": len(required_sections),
@@ -1638,6 +1922,7 @@ def _build_runtime_custom_requirements(
         "material_retrieval_chunks": len(retrieval_chunks),
         "material_retrieval_requirements": len(retrieval_requirements),
         "material_consistency_requirements": len(consistency_requirements),
+        "material_dimension_requirements": len(material_dimension_requirements),
         "material_retrieval_top_k": retrieval_top_k,
         "material_retrieval_per_type_quota": retrieval_per_type_quota,
         "material_retrieval_per_file_quota": retrieval_per_file_quota,
@@ -1664,9 +1949,32 @@ def _build_runtime_custom_requirements(
         "material_query_numeric_terms_preview": list(
             (query_features.get("query_numeric_terms") or [])[:12]
         ),
+        "material_profile_query_terms_count": int(
+            query_features.get("material_profile_query_terms_count") or 0
+        ),
+        "material_profile_query_numeric_terms_count": int(
+            query_features.get("material_profile_query_numeric_terms_count") or 0
+        ),
+        "material_profile_focus_dimensions": list(
+            (query_features.get("material_profile_focus_dimensions") or [])[:8]
+        ),
+        "material_profile_query_terms_preview": list(
+            (query_features.get("material_profile_query_terms_preview") or [])[:12]
+        ),
+        "material_profile_query_numeric_terms_preview": list(
+            (query_features.get("material_profile_query_numeric_terms_preview") or [])[:12]
+        ),
         "material_query_anchor_count": int(query_features.get("project_anchor_count") or 0),
         "material_query_requirement_count": int(
             query_features.get("project_requirement_count") or 0
+        ),
+        "material_profile_dimension_coverage_rate": float(
+            _to_float_or_none(
+                ((material_knowledge_profile.get("summary") or {}).get("dimension_coverage_rate"))
+                if isinstance(material_knowledge_profile, dict)
+                else None
+            )
+            or 0.0
         ),
         "material_available_files": len(material_rows),
         "material_available_filenames": available_material_filenames[:120],
@@ -1701,6 +2009,17 @@ def _build_runtime_custom_requirements(
                 "numbers": ((req.get("patterns") or {}).get("must_hit_numbers") or [])[:4],
             }
             for req in consistency_requirements[:6]
+        ],
+        "material_dimension_preview": [
+            {
+                "dimension_id": req.get("dimension_id"),
+                "label": req.get("req_label"),
+                "hints": (((req.get("patterns") or {}).get("hints")) or [])[:6],
+                "source_types": (((req.get("patterns") or {}).get("source_types")) or [])[:4],
+                "coverage_score": (req.get("patterns") or {}).get("source_coverage_score"),
+                "source_file_count": (req.get("patterns") or {}).get("source_file_count"),
+            }
+            for req in material_dimension_requirements[:8]
         ],
     }
     return runtime_requirements, meta
@@ -1810,10 +2129,13 @@ def _build_material_utilization_summary(
     consistency_hit = 0
     fallback_total = 0
     fallback_hit = 0
+    dimension_total = 0
+    dimension_hit = 0
     retrieval_file_total_set: set[str] = set()
     retrieval_file_hit_set: set[str] = set()
     retrieval_total_via_counts: Dict[str, int] = {}
     retrieval_hit_via_counts: Dict[str, int] = {}
+    dimension_by_dim: Dict[str, Dict[str, object]] = {}
 
     def _bucket(material_type: str) -> Dict[str, object]:
         if material_type not in by_type:
@@ -1827,6 +2149,18 @@ def _build_material_utilization_summary(
                 "sample_labels": [],
             }
         return by_type[material_type]
+
+    def _dimension_bucket(dim_id: str) -> Dict[str, object]:
+        if dim_id not in dimension_by_dim:
+            dimension_by_dim[dim_id] = {
+                "dimension_id": dim_id,
+                "dimension_name": str((DIMENSIONS.get(dim_id) or {}).get("name") or dim_id),
+                "total": 0,
+                "hit": 0,
+                "source_types": [],
+                "sample_labels": [],
+            }
+        return dimension_by_dim[dim_id]
 
     retrieval_files_raw = runtime_req_meta.get("material_retrieval_selected_filenames")
     if isinstance(retrieval_files_raw, list):
@@ -1849,12 +2183,14 @@ def _build_material_utilization_summary(
         if not isinstance(row, dict):
             continue
         source_pack_id = str(row.get("source_pack_id") or "")
-        if source_pack_id not in {"runtime_material_rag", "runtime_material_consistency"}:
+        if source_pack_id not in {
+            "runtime_material_rag",
+            "runtime_material_consistency",
+            "runtime_material_dimension",
+        }:
             continue
-        material_type = _normalize_material_type(row.get("material_type"))
         hit = bool(row.get("hit"))
         source_mode = str(row.get("source_mode") or "").strip()
-        bucket = _bucket(material_type)
         source_filename = str(row.get("source_filename") or "").strip()
         if not source_filename:
             chunk_id = str(row.get("chunk_id") or "").strip()
@@ -1862,6 +2198,8 @@ def _build_material_utilization_summary(
                 source_filename = chunk_id.split("#c", 1)[0].strip()
 
         if source_pack_id == "runtime_material_rag":
+            material_type = _normalize_material_type(row.get("material_type"))
+            bucket = _bucket(material_type)
             retrieval_total += 1
             bucket["retrieval_total"] = int(bucket.get("retrieval_total", 0)) + 1
             via_key = source_mode or "unknown"
@@ -1878,14 +2216,30 @@ def _build_material_utilization_summary(
                 )
                 if source_filename:
                     retrieval_file_hit_set.add(source_filename)
-        else:
+        elif source_pack_id == "runtime_material_consistency":
+            material_type = _normalize_material_type(row.get("material_type"))
+            bucket = _bucket(material_type)
             consistency_total += 1
             bucket["consistency_total"] = int(bucket.get("consistency_total", 0)) + 1
             if hit:
                 consistency_hit += 1
                 bucket["consistency_hit"] = int(bucket.get("consistency_hit", 0)) + 1
+        else:
+            dim_id = str(row.get("dimension_id") or "").strip() or "01"
+            dim_bucket = _dimension_bucket(dim_id)
+            dim_bucket["total"] = int(dim_bucket.get("total", 0)) + 1
+            dimension_total += 1
+            for item in row.get("source_types") or []:
+                type_key = _normalize_material_type(item)
+                if type_key and type_key not in dim_bucket["source_types"]:
+                    dim_bucket["source_types"].append(type_key)
+            if hit:
+                dim_bucket["hit"] = int(dim_bucket.get("hit", 0)) + 1
+                dimension_hit += 1
 
         if source_mode == "fallback_keywords":
+            material_type = _normalize_material_type(row.get("material_type"))
+            bucket = _bucket(material_type)
             bucket["fallback_total"] = int(bucket.get("fallback_total", 0)) + 1
             fallback_total += 1
             if hit:
@@ -1894,13 +2248,24 @@ def _build_material_utilization_summary(
 
         label = str(row.get("label") or "").strip()
         if label:
-            sample_labels = bucket.get("sample_labels")
-            if (
-                isinstance(sample_labels, list)
-                and label not in sample_labels
-                and len(sample_labels) < 3
-            ):
-                sample_labels.append(label)
+            if source_pack_id == "runtime_material_dimension":
+                dim_id = str(row.get("dimension_id") or "").strip() or "01"
+                sample_labels = _dimension_bucket(dim_id).get("sample_labels")
+                if (
+                    isinstance(sample_labels, list)
+                    and label not in sample_labels
+                    and len(sample_labels) < 3
+                ):
+                    sample_labels.append(label)
+            else:
+                material_type = _normalize_material_type(row.get("material_type"))
+                sample_labels = _bucket(material_type).get("sample_labels")
+                if (
+                    isinstance(sample_labels, list)
+                    and label not in sample_labels
+                    and len(sample_labels) < 3
+                ):
+                    sample_labels.append(label)
 
     available_types_raw = runtime_req_meta.get("material_available_types")
     available_types = (
@@ -1977,16 +2342,94 @@ def _build_material_utilization_summary(
         "fallback_total": fallback_total,
         "fallback_hit": fallback_hit,
         "fallback_hit_rate": _rate(fallback_hit, fallback_total),
+        "material_dimension_total": dimension_total,
+        "material_dimension_hit": dimension_hit,
+        "material_dimension_hit_rate": _rate(dimension_hit, dimension_total),
+        "material_dimension_by_dimension": sorted(
+            [
+                {
+                    **row,
+                    "hit_rate": _rate(int(row.get("hit", 0)), int(row.get("total", 0))),
+                }
+                for row in dimension_by_dim.values()
+            ],
+            key=lambda x: (
+                -float(_to_float_or_none(x.get("hit_rate")) or 0.0),
+                -int(_to_float_or_none(x.get("hit")) or 0),
+                str(x.get("dimension_id") or ""),
+            ),
+        ),
         "query_terms_count": int(
             _to_float_or_none(runtime_req_meta.get("material_query_terms_count")) or 0
         ),
         "query_numeric_terms_count": int(
             _to_float_or_none(runtime_req_meta.get("material_query_numeric_terms_count")) or 0
         ),
+        "material_profile_query_terms_count": int(
+            _to_float_or_none(runtime_req_meta.get("material_profile_query_terms_count")) or 0
+        ),
+        "material_profile_query_numeric_terms_count": int(
+            _to_float_or_none(runtime_req_meta.get("material_profile_query_numeric_terms_count"))
+            or 0
+        ),
+        "material_profile_focus_dimensions": list(
+            runtime_req_meta.get("material_profile_focus_dimensions")
+            if isinstance(runtime_req_meta.get("material_profile_focus_dimensions"), list)
+            else []
+        ),
         "by_type": by_type,
         "available_types": available_types,
         "uncovered_types": uncovered_types,
     }
+
+
+def _normalize_material_retrieval_meta(raw: object) -> Dict[str, object]:
+    meta = copy.deepcopy(raw) if isinstance(raw, dict) else {}
+    if not isinstance(meta.get("material_retrieval_preview"), list):
+        meta["material_retrieval_preview"] = []
+    if not isinstance(meta.get("material_consistency_preview"), list):
+        meta["material_consistency_preview"] = []
+    if not isinstance(meta.get("material_dimension_preview"), list):
+        meta["material_dimension_preview"] = []
+    if not isinstance(meta.get("material_profile_focus_dimensions"), list):
+        meta["material_profile_focus_dimensions"] = []
+    for key in (
+        "material_dimension_requirements",
+        "material_profile_query_terms_count",
+        "material_profile_query_numeric_terms_count",
+    ):
+        numeric = _to_float_or_none(meta.get(key))
+        meta[key] = int(numeric or 0)
+    return meta
+
+
+def _ensure_report_material_usage_metadata(
+    report: Optional[Dict[str, object]],
+) -> tuple[Dict[str, object], Dict[str, object]]:
+    if not isinstance(report, dict):
+        return {}, {}
+    meta = report.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+        report["meta"] = meta
+    retrieval_meta = _normalize_material_retrieval_meta(meta.get("material_retrieval"))
+    meta["material_retrieval"] = retrieval_meta
+    computed_utilization = _build_material_utilization_summary(report, retrieval_meta)
+    existing_utilization = (
+        copy.deepcopy(meta.get("material_utilization"))
+        if isinstance(meta.get("material_utilization"), dict)
+        else {}
+    )
+    merged_utilization = existing_utilization if isinstance(existing_utilization, dict) else {}
+    computed_only_prefixes = ("material_dimension_", "material_profile_")
+    for key, value in computed_utilization.items():
+        if key not in merged_utilization:
+            merged_utilization[key] = value
+            continue
+        if any(str(key).startswith(prefix) for prefix in computed_only_prefixes):
+            merged_utilization[key] = value
+    meta["material_utilization"] = merged_utilization
+    return retrieval_meta, merged_utilization
 
 
 def _build_evidence_trace_summary(report: Dict[str, object]) -> Dict[str, object]:
@@ -2016,7 +2459,11 @@ def _build_evidence_trace_summary(report: Dict[str, object]) -> Dict[str, object
 
         source_pack = str(item.get("source_pack_id") or "").strip() or "unknown"
         source_pack_counter[source_pack] += 1
-        if source_pack in {"runtime_material_rag", "runtime_material_consistency"}:
+        if source_pack in {
+            "runtime_material_rag",
+            "runtime_material_consistency",
+            "runtime_material_dimension",
+        }:
             runtime_hits += 1
 
         source_filename = str(item.get("source_filename") or "").strip()
@@ -2444,6 +2891,7 @@ def _build_submission_scoring_basis_report(
     submission_id = str(submission.get("id") or "")
     filename = str(submission.get("filename") or "")
     report = submission.get("report") if isinstance(submission.get("report"), dict) else {}
+    _ensure_report_material_usage_metadata(report)
     meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
     input_injection = (
         meta.get("input_injection") if isinstance(meta.get("input_injection"), dict) else {}
@@ -2453,9 +2901,7 @@ def _build_submission_scoring_basis_report(
     )
     if not material_quality:
         material_quality = _build_material_quality_snapshot(project_id)
-    material_retrieval = (
-        meta.get("material_retrieval") if isinstance(meta.get("material_retrieval"), dict) else {}
-    )
+    material_retrieval = _normalize_material_retrieval_meta(meta.get("material_retrieval"))
     material_utilization = (
         meta.get("material_utilization")
         if isinstance(meta.get("material_utilization"), dict)
@@ -2537,6 +2983,7 @@ def _build_project_scoring_diagnostic(
 
     if isinstance(latest, dict):
         report = latest.get("report") if isinstance(latest.get("report"), dict) else {}
+        _ensure_report_material_usage_metadata(report)
         _ensure_report_score_self_awareness(
             report,
             project_id=project_id,
@@ -3051,6 +3498,26 @@ def _build_project_scoring_diagnostic(
             "retrieval_file_coverage_rate": _to_float_or_none(
                 basis_util.get("retrieval_file_coverage_rate")
             ),
+            "material_dimension_hit_rate": _to_float_or_none(
+                basis_util.get("material_dimension_hit_rate")
+            ),
+            "material_dimension_hit": int(
+                _to_float_or_none(basis_util.get("material_dimension_hit")) or 0
+            ),
+            "material_dimension_total": int(
+                _to_float_or_none(basis_util.get("material_dimension_total")) or 0
+            ),
+            "material_profile_query_terms_count": int(
+                _to_float_or_none(basis_util.get("material_profile_query_terms_count")) or 0
+            ),
+            "material_profile_query_numeric_terms_count": int(
+                _to_float_or_none(basis_util.get("material_profile_query_numeric_terms_count")) or 0
+            ),
+            "material_profile_focus_dimensions": [
+                str(item or "").strip()
+                for item in (basis_util.get("material_profile_focus_dimensions") or [])
+                if str(item or "").strip()
+            ][:8],
             "material_utilization_gate_blocked": bool(basis_gate.get("blocked")),
             "material_conflict_count": int(
                 _to_float_or_none(conflict_summary.get("conflict_count")) or 0
@@ -4808,12 +5275,8 @@ def _build_score_self_awareness(
     - 若启用了预测校准器，其波动范围是否可接受。
     """
 
+    _retrieval_meta, util = _ensure_report_material_usage_metadata(report)
     meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
-    util = (
-        meta.get("material_utilization")
-        if isinstance(meta.get("material_utilization"), dict)
-        else {}
-    )
     gate = (
         meta.get("material_utilization_gate")
         if isinstance(meta.get("material_utilization_gate"), dict)
@@ -4838,6 +5301,7 @@ def _build_score_self_awareness(
 
     retrieval_file_coverage_rate = _clip01(util.get("retrieval_file_coverage_rate"))
     retrieval_hit_rate = _clip01(util.get("retrieval_hit_rate"))
+    material_dimension_hit_rate = _clip01(util.get("material_dimension_hit_rate"))
     mandatory_hit_rate = _clip01(trace.get("mandatory_hit_rate"))
     dimension_coverage_rate = _clip01(knowledge_summary.get("dimension_coverage_rate"))
     source_files_hit_count = int(_to_float_or_none(trace.get("source_files_hit_count")) or 0)
@@ -4853,12 +5317,13 @@ def _build_score_self_awareness(
     numeric_cluster_signal = min(1.0, float(numeric_category_count) / 4.0)
 
     weighted_metrics: List[tuple[float, Optional[float], str]] = [
-        (0.24, retrieval_file_coverage_rate, "资料文件覆盖率"),
-        (0.18, retrieval_hit_rate, "资料检索命中率"),
-        (0.22, mandatory_hit_rate, "强制项命中率"),
-        (0.24, dimension_coverage_rate, "维度覆盖率"),
-        (0.07, source_file_signal, "命中文件广度"),
-        (0.05, numeric_cluster_signal, "数值约束簇"),
+        (0.22, retrieval_file_coverage_rate, "资料文件覆盖率"),
+        (0.16, retrieval_hit_rate, "资料检索命中率"),
+        (0.12, material_dimension_hit_rate, "资料维度约束命中率"),
+        (0.20, mandatory_hit_rate, "强制项命中率"),
+        (0.20, dimension_coverage_rate, "维度覆盖率"),
+        (0.06, source_file_signal, "命中文件广度"),
+        (0.04, numeric_cluster_signal, "数值约束簇"),
     ]
     available_weight = sum(weight for weight, value, _ in weighted_metrics if value is not None)
     if available_weight > 1e-9:
@@ -4901,6 +5366,8 @@ def _build_score_self_awareness(
         reasons.append(f"资料文件覆盖率偏低（{retrieval_file_coverage_rate * 100:.1f}%）")
     if retrieval_hit_rate is not None and retrieval_hit_rate < 0.25:
         reasons.append(f"资料检索命中率偏低（{retrieval_hit_rate * 100:.1f}%）")
+    if material_dimension_hit_rate is not None and material_dimension_hit_rate < 0.35:
+        reasons.append(f"资料维度约束命中率偏低（{material_dimension_hit_rate * 100:.1f}%）")
     if mandatory_hit_rate is not None and mandatory_hit_rate < 0.45:
         reasons.append(f"强制项命中率偏低（{mandatory_hit_rate * 100:.1f}%）")
     if dimension_coverage_rate is not None and dimension_coverage_rate < 0.45:
@@ -4932,6 +5399,7 @@ def _build_score_self_awareness(
         "model_score_0_1": round(float(model_score), 4) if model_score is not None else None,
         "retrieval_file_coverage_rate": retrieval_file_coverage_rate,
         "retrieval_hit_rate": retrieval_hit_rate,
+        "material_dimension_hit_rate": material_dimension_hit_rate,
         "mandatory_hit_rate": mandatory_hit_rate,
         "dimension_coverage_rate": dimension_coverage_rate,
         "source_files_hit_count": source_files_hit_count,
@@ -4959,6 +5427,7 @@ def _ensure_report_score_self_awareness(
     if not isinstance(meta, dict):
         meta = {}
         report["meta"] = meta
+    _ensure_report_material_usage_metadata(report)
     awareness = meta.get("score_self_awareness")
     if isinstance(awareness, dict) and awareness:
         if not meta.get("score_confidence_level"):
@@ -19891,6 +20360,16 @@ def index(
             : {};
           const queryTermsCount = Number(summary.query_terms_count || 0);
           const queryNumericTermsCount = Number(summary.query_numeric_terms_count || 0);
+          const materialProfileQueryTermsCount = Number(summary.material_profile_query_terms_count || 0);
+          const materialProfileQueryNumericTermsCount = Number(summary.material_profile_query_numeric_terms_count || 0);
+          const materialDimensionTotal = Number(summary.material_dimension_total || 0);
+          const materialDimensionHit = Number(summary.material_dimension_hit || 0);
+          const materialProfileFocusDimensions = Array.isArray(summary.material_profile_focus_dimensions)
+            ? summary.material_profile_focus_dimensions
+            : [];
+          const materialDimensionByDimension = Array.isArray(summary.material_dimension_by_dimension)
+            ? summary.material_dimension_by_dimension
+            : [];
           const byType = (summary.by_type && typeof summary.by_type === 'object') ? summary.by_type : {};
           const availableTypes = Array.isArray(summary.available_types) ? summary.available_types : [];
           const uncoveredTypes = Array.isArray(summary.uncovered_types) ? summary.uncovered_types : [];
@@ -19934,8 +20413,10 @@ def index(
             + '<tr><td>检索文件覆盖</td><td>' + escapeHtmlText(retrievalFileHit) + ' / ' + escapeHtmlText(retrievalFileTotal) + '</td><td>' + escapeHtmlText(toPct(summary.retrieval_file_coverage_rate)) + '</td></tr>'
             + '<tr><td>未命中资料文件</td><td>' + escapeHtmlText(retrievalUnhitFileCount) + ' / ' + escapeHtmlText(retrievalFileTotal) + '</td><td>建议优先补齐这些文件的章节引用</td></tr>'
             + '<tr><td>跨资料一致性</td><td>' + escapeHtmlText(consistencyHit) + ' / ' + escapeHtmlText(consistencyTotal) + '</td><td>' + escapeHtmlText(toPct(summary.consistency_hit_rate)) + '</td></tr>'
+            + '<tr><td>资料维度约束</td><td>' + escapeHtmlText(materialDimensionHit) + ' / ' + escapeHtmlText(materialDimensionTotal) + '</td><td>' + escapeHtmlText(toPct(summary.material_dimension_hit_rate)) + '</td></tr>'
             + '<tr><td>关键词兜底</td><td>' + escapeHtmlText(fallbackHit) + ' / ' + escapeHtmlText(fallbackTotal) + '</td><td>' + escapeHtmlText(toPct(summary.fallback_hit_rate)) + '</td></tr>'
             + '<tr><td>查询特征规模</td><td>' + escapeHtmlText(queryTermsCount) + ' + ' + escapeHtmlText(queryNumericTermsCount) + '</td><td>文本词 + 数字约束</td></tr>'
+            + '<tr><td>资料画像增强</td><td>' + escapeHtmlText(materialProfileQueryTermsCount) + ' + ' + escapeHtmlText(materialProfileQueryNumericTermsCount) + '</td><td>画像词 + 画像数字锚点</td></tr>'
             + '</table>';
 
           if (gate && gate.enabled) {
@@ -20014,6 +20495,25 @@ def index(
                 + '<td>' + escapeHtmlText(fh) + ' / ' + escapeHtmlText(ft) + '</td>'
                 + '</tr>';
             }).join('');
+            html += '</table></details>';
+          }
+
+          if (materialDimensionByDimension.length || materialProfileFocusDimensions.length) {
+            html += '<details style="margin-top:8px"><summary>资料画像驱动的维度增强</summary>';
+            if (materialProfileFocusDimensions.length) {
+              html += '<p style="margin:6px 0 8px 0;color:#334155">重点维度：'
+                + escapeHtmlText(materialProfileFocusDimensions.join('、'))
+                + '</p>';
+            }
+            html += '<table><tr><th>维度</th><th>命中/总数</th><th>命中率</th><th>来源资料类型</th></tr>';
+            html += materialDimensionByDimension.length
+              ? materialDimensionByDimension.slice(0, 12).map((row) => '<tr>'
+                + '<td>' + escapeHtmlText((row.dimension_id || '-') + ' ' + (row.dimension_name || '')) + '</td>'
+                + '<td>' + escapeHtmlText(row.hit || 0) + ' / ' + escapeHtmlText(row.total || 0) + '</td>'
+                + '<td>' + escapeHtmlText(toPct(row.hit_rate)) + '</td>'
+                + '<td>' + escapeHtmlText(((row.source_types || []).map(materialTypeDisplayName).join('、')) || '-') + '</td>'
+                + '</tr>').join('')
+              : '<tr><td colspan="4">当前尚未形成资料画像驱动的维度命中</td></tr>';
             html += '</table></details>';
           }
 
@@ -20307,6 +20807,12 @@ def index(
             + '</td><td>强制项 ' + escapeHtmlText(toPct(summary.evidence_mandatory_hit_rate)) + '</td></tr>';
           html += '<tr><td>文件覆盖</td><td>' + escapeHtmlText(summary.evidence_source_files_hit_count || 0)
             + ' 份命中文件</td><td>检索命中率 ' + escapeHtmlText(toPct(summary.retrieval_hit_rate)) + '</td></tr>';
+          html += '<tr><td>资料维度约束</td><td>' + escapeHtmlText(summary.material_dimension_hit || 0)
+            + ' / ' + escapeHtmlText(summary.material_dimension_total || 0)
+            + '</td><td>命中率 ' + escapeHtmlText(toPct(summary.material_dimension_hit_rate)) + '</td></tr>';
+          html += '<tr><td>资料画像增强</td><td>' + escapeHtmlText(summary.material_profile_query_terms_count || 0)
+            + ' + ' + escapeHtmlText(summary.material_profile_query_numeric_terms_count || 0)
+            + '</td><td>' + escapeHtmlText(((summary.material_profile_focus_dimensions || []).join('、')) || '暂无') + '</td></tr>';
           html += '<tr><td>检索覆盖率</td><td>' + escapeHtmlText(toPct(summary.retrieval_file_coverage_rate))
             + '</td><td>' + (summary.material_utilization_gate_blocked ? '<span class="error">资料利用门禁阻断</span>' : '<span class="success">资料利用可接受</span>') + '</td></tr>';
           html += '<tr><td>资料冲突</td><td>' + escapeHtmlText(summary.material_conflict_count || 0)
