@@ -67,8 +67,9 @@ class LLMBackendStatus(BaseModel):
     """进化 LLM 后端配置状态（不暴露密钥）"""
 
     evolution_backend: str = Field(..., description="当前进化后端：rules | spark | openai | gemini")
-    spark_configured: bool = Field(..., description="是否已配置 SPARK_APIPASSWORD")
+    spark_configured: bool = Field(..., description="是否仍保留历史 SPARK_APIPASSWORD 配置")
     openai_configured: bool = Field(..., description="是否已配置 OPENAI_API_KEY")
+    openai_model: Optional[str] = Field(None, description="当前 OpenAI 模型")
     gemini_configured: bool = Field(..., description="是否已配置 GEMINI_API_KEY")
 
 
@@ -1244,7 +1245,7 @@ class ScoreReport(BaseModel):
     meta: Dict[str, Any] = Field(default_factory=dict, description="评分元数据")
     judge_mode: Optional[str] = Field(None, description="评判模式")
     judge_source: Optional[str] = Field(None, description="评判来源")
-    spark_called: Optional[bool] = Field(None, description="是否调用Spark")
+    spark_called: Optional[bool] = Field(None, description="是否调用外部LLM（兼容旧字段名）")
     fallback_reason: Optional[str] = Field(None, description="回退原因")
 
     model_config = {

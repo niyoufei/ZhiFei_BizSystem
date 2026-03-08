@@ -7980,6 +7980,7 @@ def llm_status() -> LLMBackendStatus:
         evolution_backend=s["evolution_backend"],
         spark_configured=s["spark_configured"],
         openai_configured=s["openai_configured"],
+        openai_model=s.get("openai_model"),
         gemini_configured=s["gemini_configured"],
     )
 

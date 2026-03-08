@@ -7,13 +7,20 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List, Optional
 
+from app.engine.openai_compat import get_openai_model
+
 # 支持的后端: rules | spark | openai | gemini
 EVOLUTION_LLM_BACKEND_ENV = "EVOLUTION_LLM_BACKEND"
 
 
 def get_evolution_llm_backend() -> str:
-    """从环境变量读取进化 LLM 后端，默认 rules（仅规则，不调 API）。"""
-    return (os.environ.get(EVOLUTION_LLM_BACKEND_ENV) or "rules").strip().lower()
+    """从环境变量读取进化 LLM 后端；未显式指定时优先使用已配置的 OpenAI。"""
+    raw = (os.environ.get(EVOLUTION_LLM_BACKEND_ENV) or "").strip().lower()
+    if raw:
+        return raw
+    if (os.getenv("OPENAI_API_KEY") or "").strip():
+        return "openai"
+    return "rules"
 
 
 def get_llm_backend_status() -> Dict[str, Any]:
@@ -26,6 +33,7 @@ def get_llm_backend_status() -> Dict[str, Any]:
         "evolution_backend": backend,
         "spark_configured": spark_configured,
         "openai_configured": openai_configured,
+        "openai_model": get_openai_model() if openai_configured else None,
         "gemini_configured": gemini_configured,
     }
 

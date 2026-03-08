@@ -6,7 +6,7 @@ report:
   title: 《青天视角评分报告》
   title_word: 《青天评标官终版报告》
   section_a: "A. 评分结论（总分、判分来源）"
-  section_a_word: "A. 评分结论（总分/置信度/判分来源spark_api）"
+  section_a_word: "A. 评分结论（总分/置信度/判分来源openai_api）"
   section_b: "B. 高优维度诊断（定义要点→缺陷→改进→证据）"
   section_b_word: "B. 高优维度诊断（定义要点/缺陷/改进/证据）"
   section_c: "C. 扣分清单（Top 10，按扣分值排序）"
@@ -19,7 +19,7 @@ scoring:
   confidence: "置信度（0-1）"
   judge_mode: judge_mode
   judge_source: judge_source
-  spark_called: spark_called
+  spark_called: llm_called
   high_priority_strategy: 高优维度权重策略
   expected_gain: 预计加分
 
@@ -65,7 +65,7 @@ templates:
 # 附录说明
 appendix:
   evidence_note: start_index/end_index/snippet 表示原文区间与片段引用。
-  spark_hint: 如配置 Spark 凭证即可获得"青天Spark Judge 真评"并替换高优维度诊断内容。
+  spark_hint: 如配置 OpenAI 凭证与 `gpt-5.4`，即可获得“青天 ChatGPT Judge 真评”并替换高优维度诊断内容。
 
 # API 响应消息
 api:

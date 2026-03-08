@@ -7,21 +7,29 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from app.engine.dimensions import DIMENSIONS
+from app.engine.openai_compat import call_openai_json, get_openai_api_key, get_openai_model
 from app.schemas import ScoreReport
 
-# 讯飞星火 HTTP 接口（OpenAI 兼容）
-SPARK_HTTP_URL = "https://spark-api-open.xf-yun.com/v1/chat/completions"
-SPARK_DEFAULT_MODEL = "4.0Ultra"
+# 兼容保留：历史文件名/函数名不变，但实际 provider 已切到 OpenAI GPT-5.4。
+SPARK_DEFAULT_MODEL = "gpt-5.4"
 
 
 def _get_spark_model() -> str:
-    """进化/评标用模型，默认最高端 4.0Ultra；可通过 SPARK_MODEL 覆盖（如 generalv3.5）。"""
-    return (os.getenv("SPARK_MODEL") or "").strip() or SPARK_DEFAULT_MODEL
+    """
+    历史兼容入口。
+    优先读取 OPENAI_MODEL；若用户仍设置 SPARK_MODEL，则将其视为别名并透传到 OpenAI 模型解析器。
+    默认切到 gpt-5.4。
+    """
+    return (
+        get_openai_model()
+        if os.getenv("OPENAI_MODEL")
+        else ((os.getenv("SPARK_MODEL") or "").strip() or SPARK_DEFAULT_MODEL)
+    )
 
 
 def _get_spark_bearer_token() -> str | None:
-    """获取 HTTP Bearer 鉴权令牌。仅 SPARK_APIPASSWORD 会触发真实 HTTP 调用（讯飞控制台 HTTP 接口的 APIPassword）。"""
-    return os.getenv("SPARK_APIPASSWORD") or None
+    """历史兼容入口，实际读取 OpenAI API Key。"""
+    return get_openai_api_key()
 
 
 def load_prompt(prompt_name: str) -> str:
@@ -190,8 +198,8 @@ def _build_from_rules(report: ScoreReport, rubric: Dict[str, Any]) -> Dict[str, 
         breaks.append({"type": t, "evidence": _placeholder_evidence()})
 
     payload = {
-        "judge_mode": "spark",
-        "model": "spark",
+        "judge_mode": "openai",
+        "model": _get_spark_model(),
         "prompt_version": "qingtian_v1",
         "weights": {
             "high_priority_dims": list(high_dims),
@@ -257,53 +265,16 @@ def _call_spark_http(
     max_tokens: int = 8192,
 ) -> Tuple[bool, Dict[str, Any] | None, str]:
     """
-    调用讯飞星火 HTTP 接口，非流式。
+    历史兼容入口：实际调用 OpenAI GPT-5.4 HTTP 接口，非流式。
     返回 (成功, 解析后的 JSON 或 None, 错误信息)。
     """
-    token = _get_spark_bearer_token()
-    if not token:
-        return False, None, "missing_credentials"
-    if model is None:
-        model = _get_spark_model()
-
-    try:
-        import urllib.request
-
-        body = json.dumps(
-            {
-                "model": model,
-                "messages": [{"role": "user", "content": user_message}],
-                "stream": False,
-                "max_tokens": max_tokens,
-                "temperature": 0.3,
-            },
-            ensure_ascii=False,
-        ).encode("utf-8")
-        req = urllib.request.Request(
-            SPARK_HTTP_URL,
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {token}",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        return False, None, str(e)
-
-    choices = data.get("choices")
-    if not choices or not isinstance(choices, list):
-        return False, None, "invalid_response_no_choices"
-    msg = choices[0].get("message") if choices else {}
-    content = (msg.get("content") or "").strip()
-    if not content:
-        return False, None, "empty_content"
-    parsed = _extract_json_from_content(content)
-    if parsed is None:
-        return False, None, "json_parse_failed"
-    return True, parsed, ""
+    return call_openai_json(
+        user_message,
+        model=model or _get_spark_model(),
+        max_tokens=max_tokens,
+        timeout=120,
+        temperature=0.3,
+    )
 
 
 def run_spark_judge(
@@ -313,9 +284,9 @@ def run_spark_judge(
     rules_report: ScoreReport,
 ) -> Dict[str, Any]:
     """
-    执行星火评标：若配置了 SPARK_APIPASSWORD 或 SPARK_API_KEY，则调用讯飞星火 HTTP 接口；
-    否则若配置了 SPARK_APP_ID + SPARK_API_KEY + SPARK_API_SECRET，则仅用规则结果（兼容旧行为）；
-    否则返回 missing_credentials。
+    历史兼容入口：现已改为调用 OpenAI GPT-5.4。
+    为避免打断旧 CLI/测试，保留函数名和 called_spark_api 标志位；
+    但 judge_mode / model / judge_source 会写入 OpenAI 语义。
     """
     token = _get_spark_bearer_token()
     required_env = ["SPARK_APP_ID", "SPARK_API_KEY", "SPARK_API_SECRET"]
@@ -337,12 +308,16 @@ def run_spark_judge(
             valid, err = validate_llm_judge_json(payload)
             if valid:
                 payload["called_spark_api"] = True
-                payload.setdefault("judge_mode", "spark")
+                payload["called_openai_api"] = True
+                payload.setdefault("judge_mode", "openai")
+                payload.setdefault("model", _get_spark_model())
+                payload.setdefault("judge_source", "openai_api")
                 return payload
         # API 失败或校验不通过：回退到规则结果
         payload = _build_from_rules(rules_report, rubric)
         payload = post_process_llm_output(payload, rubric)
         payload["called_spark_api"] = False
+        payload["called_openai_api"] = False
         payload["reason"] = "api_error" if ok else "request_failed"
         if err_msg:
             payload["fallback_reason"] = err_msg
@@ -355,8 +330,13 @@ def run_spark_judge(
     if not ok:
         return {
             "called_spark_api": False,
+            "called_openai_api": False,
             "reason": "api_error",
             "error": err,
         }
     payload["called_spark_api"] = True
+    payload["called_openai_api"] = True
+    payload["judge_mode"] = "openai"
+    payload["model"] = _get_spark_model()
+    payload["judge_source"] = "openai_api"
     return payload

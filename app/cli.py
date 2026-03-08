@@ -77,8 +77,8 @@ def score_command(
     input: str = typer.Option(..., "--input", "-i", help="施组文本路径（支持 .txt 和 .docx）"),
     project_type: Optional[str] = None,
     out: Optional[str] = typer.Option(None, "--out", "-o", help="输出 JSON 文件"),
-    mode: str = typer.Option("rules", "--mode", help="评分模式：rules/spark/hybrid"),
-    prompt: str = typer.Option("spark_judge_qingtian_v1", "--prompt", help="Spark Prompt 名称"),
+    mode: str = typer.Option("rules", "--mode", help="评分模式：rules/openai/hybrid"),
+    prompt: str = typer.Option("openai_judge_qingtian_v1", "--prompt", help="LLM Prompt 名称"),
     summary: bool = typer.Option(False, "--summary", help="输出评分报告正文"),
     summary_out: Optional[str] = typer.Option(None, "--summary-out", help="输出评分报告到文件"),
     docx_out: Optional[str] = typer.Option(None, "--docx-out", help="输出 DOCX 报告文件路径"),
@@ -95,20 +95,24 @@ def score_command(
         )
     set_locale(effective_locale)
 
+    normalized_mode = (mode or "").strip().lower()
+    if normalized_mode == "spark":
+        normalized_mode = "openai"
+
     path = Path(input)
     text = read_input_file(path)
     config = load_config()
     rules_report = score_text(text, config.rubric, config.lexicon)
-    if mode == "rules":
+    if normalized_mode == "rules":
         rules_report.judge_mode = "rules"
         rules_report.judge_source = "rules_engine"
         rules_report.spark_called = False
         output = json.dumps(rules_report.model_dump(), ensure_ascii=False, indent=2)
-    elif mode == "spark":
+    elif normalized_mode == "openai":
         llm_payload = run_spark_judge(text, config.rubric, prompt, rules_report)
         if llm_payload.get("called_spark_api"):
-            llm_payload["judge_mode"] = "spark"
-            llm_payload["judge_source"] = "spark_api"
+            llm_payload["judge_mode"] = "openai"
+            llm_payload["judge_source"] = "openai_api"
             output = json.dumps(llm_payload, ensure_ascii=False, indent=2)
         else:
             reason = llm_payload.get("reason", "unknown")
@@ -117,7 +121,7 @@ def score_command(
             rules_report.spark_called = False
             rules_report.fallback_reason = f"{reason}; prompt={prompt}"
             output = json.dumps(rules_report.model_dump(), ensure_ascii=False, indent=2)
-    elif mode == "hybrid":
+    elif normalized_mode == "hybrid":
         llm_payload = run_spark_judge(text, config.rubric, prompt, rules_report)
         if llm_payload.get("called_spark_api"):
             base_score = rules_report.total_score
@@ -129,7 +133,7 @@ def score_command(
             output = json.dumps(
                 {
                     "judge_mode": "hybrid",
-                    "judge_source": "spark_api",
+                    "judge_source": "openai_api",
                     "spark_called": True,
                     "base_rules_score": base_score,
                     "llm_adjustment": adjustment,
@@ -155,7 +159,7 @@ def score_command(
                 indent=2,
             )
     else:
-        raise typer.BadParameter("mode 仅支持 rules/spark/hybrid")
+        raise typer.BadParameter("mode 仅支持 rules/openai/hybrid（spark 作为兼容别名仍可用）")
     if out:
         Path(out).write_text(output, encoding="utf-8")
     print(output)
@@ -190,16 +194,20 @@ def _process_single_file(
     text = read_input_file(input_path)
     rules_report = score_text(text, config.rubric, config.lexicon)
 
-    if mode == "rules":
+    normalized_mode = (mode or "").strip().lower()
+    if normalized_mode == "spark":
+        normalized_mode = "openai"
+
+    if normalized_mode == "rules":
         rules_report.judge_mode = "rules"
         rules_report.judge_source = "rules_engine"
         rules_report.spark_called = False
         report_data = rules_report.model_dump()
-    elif mode == "spark":
+    elif normalized_mode == "openai":
         llm_payload = run_spark_judge(text, config.rubric, prompt, rules_report)
         if llm_payload.get("called_spark_api"):
-            llm_payload["judge_mode"] = "spark"
-            llm_payload["judge_source"] = "spark_api"
+            llm_payload["judge_mode"] = "openai"
+            llm_payload["judge_source"] = "openai_api"
             report_data = llm_payload
         else:
             reason = llm_payload.get("reason", "unknown")
@@ -240,8 +248,8 @@ def batch_command(
         ..., "--input", "-i", help="输入文件路径（可多次指定）或目录路径，支持 .txt 和 .docx"
     ),
     output_dir: str = typer.Option("build/batch_output", "--out-dir", "-o", help="输出目录"),
-    mode: str = typer.Option("rules", "--mode", help="评分模式：rules/spark"),
-    prompt: str = typer.Option("spark_judge_qingtian_v1", "--prompt", help="Spark Prompt 名称"),
+    mode: str = typer.Option("rules", "--mode", help="评分模式：rules/openai"),
+    prompt: str = typer.Option("openai_judge_qingtian_v1", "--prompt", help="LLM Prompt 名称"),
     docx: bool = typer.Option(False, "--docx", help="同时生成 DOCX 报告"),
     pattern: str = typer.Option(
         "*.txt", "--pattern", help="目录模式下的文件匹配模式（如 *.txt 或 *.docx）"

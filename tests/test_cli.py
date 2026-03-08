@@ -223,8 +223,8 @@ class TestScoreSparkMode:
         result = runner.invoke(app, ["score", "-i", sample_shigong_path, "--mode", "spark"])
         assert result.exit_code == 0
         output = json.loads(result.stdout)
-        assert output.get("judge_mode") == "spark"
-        assert output.get("judge_source") == "spark_api"
+        assert output.get("judge_mode") == "openai"
+        assert output.get("judge_source") == "openai_api"
 
     @patch("app.cli.run_spark_judge")
     def test_spark_mode_fallback_to_rules(self, mock_spark, sample_shigong_path):
@@ -260,7 +260,7 @@ class TestScoreHybridMode:
         assert result.exit_code == 0
         output = json.loads(result.stdout)
         assert output.get("judge_mode") == "hybrid"
-        assert output.get("judge_source") == "spark_api"
+        assert output.get("judge_source") == "openai_api"
         assert output.get("spark_called") is True
         assert "base_rules_score" in output
         assert "llm_adjustment" in output

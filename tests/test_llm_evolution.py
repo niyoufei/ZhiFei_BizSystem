@@ -10,14 +10,17 @@ from app.engine.llm_evolution import (
     enhance_evolution_report_with_llm,
     get_evolution_llm_backend,
 )
+from app.engine.openai_compat import resolve_openai_model
 
 
 class TestGetEvolutionLlmBackend:
     def test_default_is_rules(self):
-        with patch.dict(os.environ, {}, clear=False):
-            if EVOLUTION_LLM_BACKEND_ENV in os.environ:
-                del os.environ[EVOLUTION_LLM_BACKEND_ENV]
+        with patch.dict(os.environ, {}, clear=True):
             assert get_evolution_llm_backend() == "rules"
+
+    def test_default_is_openai_when_key_present(self):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True):
+            assert get_evolution_llm_backend() == "openai"
 
     def test_env_spark(self):
         with patch.dict(os.environ, {EVOLUTION_LLM_BACKEND_ENV: "spark"}):
@@ -28,6 +31,13 @@ class TestGetEvolutionLlmBackend:
             assert get_evolution_llm_backend() == "openai"
         with patch.dict(os.environ, {EVOLUTION_LLM_BACKEND_ENV: "gemini"}):
             assert get_evolution_llm_backend() == "gemini"
+
+
+class TestOpenAIModelAliases:
+    def test_chatgpt_alias_maps_to_gpt_54(self):
+        assert resolve_openai_model("ChatGPT5.4") == "gpt-5.4"
+        assert resolve_openai_model("chatgpt-5") == "gpt-5.4"
+        assert resolve_openai_model("gpt-5") == "gpt-5.4"
 
 
 class TestEnhanceEvolutionReportWithLlm:
