@@ -10551,6 +10551,14 @@ SITE_PHOTO_PROGRESS_HINTS: Dict[str, List[str]] = {
     "资源调配": ["材料进场", "机械进场", "吊装", "堆场", "班组", "车辆"],
 }
 
+BOQ_STRUCTURE_HINTS: Dict[str, List[str]] = {
+    "安全文明/绿色措施": ["安全文明", "文明施工", "绿色施工", "围挡", "扬尘", "临时设施"],
+    "人工与班组投入": ["人工", "工日", "班组", "安装工", "焊工", "木工", "电工"],
+    "机械机具投入": ["机械", "机具", "塔吊", "施工电梯", "汽车吊", "吊篮", "泵车"],
+    "主材与设备": ["钢筋", "混凝土", "电缆", "风管", "管材", "设备", "阀门", "桥架"],
+    "措施项目/抢工": ["措施项目", "脚手架", "模板", "垂直运输", "二次搬运", "夜间施工", "抢工"],
+}
+
 
 def _limit_unique_texts(raw_items: List[object], *, limit: int = 12) -> List[str]:
     out: List[str] = []
@@ -10785,11 +10793,32 @@ def _finalize_boq_structured_summary(
     ).items():
         if int(_to_float_or_none(count) or 0) > 0:
             structured_terms.append(label)
+    boq_corpus_parts: List[str] = [str(parsed_text or ""), str(summary.get("filename") or "")]
+    for sheet in summary.get("sheets") if isinstance(summary.get("sheets"), list) else []:
+        if not isinstance(sheet, dict):
+            continue
+        boq_corpus_parts.append(str(sheet.get("sheet") or ""))
+        for item in (sheet.get("top_items_by_amount") or [])[:8]:
+            if not isinstance(item, dict):
+                continue
+            boq_corpus_parts.append(str(item.get("name") or ""))
+            boq_corpus_parts.append(str(item.get("code") or ""))
+    boq_corpus = "\n".join(part for part in boq_corpus_parts if part)
+    cost_structure_tags = _collect_keyword_labels(boq_corpus, BOQ_STRUCTURE_HINTS, limit=6)
     structured_terms.extend(_extract_terms(parsed_text, max_terms=14))
+    structured_terms.extend(cost_structure_tags)
     numeric_terms.extend(_extract_numeric_terms(parsed_text, max_terms=12))
     summary["structured_terms"] = _filter_structured_signal_terms(structured_terms, limit=18)
     summary["top_numeric_terms"] = _limit_unique_numeric_tokens(numeric_terms, limit=10)
-    summary["focused_dimensions"] = ["04", "13", "15"]
+    focused_dimensions = ["04", "13", "15"]
+    if "安全文明/绿色措施" in cost_structure_tags:
+        focused_dimensions.extend(["02", "03"])
+    if "人工与班组投入" in cost_structure_tags:
+        focused_dimensions.append("11")
+    if "措施项目/抢工" in cost_structure_tags:
+        focused_dimensions.extend(["09", "15"])
+    summary["cost_structure_tags"] = cost_structure_tags
+    summary["focused_dimensions"] = _limit_unique_texts(focused_dimensions, limit=6)
     return summary
 
 

@@ -2679,7 +2679,11 @@ class TestMaterialAdvancedParsing:
             "010101001,土方开挖,m3,100,35.5,3550\n"
             "010201001,钢筋制作,t,12.5,4300,53750\n"
         ).encode("utf-8")
-        summary = _build_boq_structured_summary(csv_content, "boq.csv")
+        summary = _build_boq_structured_summary(
+            csv_content,
+            "boq.csv",
+            parsed_text="安全文明措施 人工 工日 机械 措施项目 夜间施工",
+        )
         assert summary["detected_format"] == "csv"
         assert summary["total_parsed_items"] == 2
         assert summary["total_amount"] == 57300.0
@@ -2687,7 +2691,11 @@ class TestMaterialAdvancedParsing:
         assert first_sheet["detected_columns"]["code"] == 0
         assert first_sheet["detected_columns"]["amount"] == 5
         assert "工程量" in (summary.get("structured_terms") or [])
+        assert "安全文明/绿色措施" in (summary.get("cost_structure_tags") or [])
+        assert "人工与班组投入" in (summary.get("cost_structure_tags") or [])
+        assert "措施项目/抢工" in (summary.get("cost_structure_tags") or [])
         assert "13" in (summary.get("focused_dimensions") or [])
+        assert "11" in (summary.get("focused_dimensions") or [])
 
     def test_build_drawing_structured_summary_extracts_structured_signals(self):
         from app.main import _build_drawing_structured_summary
