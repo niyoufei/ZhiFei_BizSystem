@@ -2467,6 +2467,81 @@ def _build_runtime_custom_requirements(
     return runtime_requirements, meta
 
 
+def _build_current_runtime_constraint_snapshot(
+    project_id: str,
+    *,
+    submission_text: str = "",
+) -> Dict[str, object]:
+    snapshot: Dict[str, object] = {
+        "generated_at": _now_iso(),
+        "weights_source": "unknown",
+        "effective_multipliers_preview": [],
+        "material_dimension_requirements": 0,
+        "feedback_evolution_requirements": 0,
+        "feature_confidence_requirements": 0,
+        "material_dimension_preview": [],
+        "feedback_evolution_preview": [],
+        "feature_confidence_preview": [],
+    }
+    try:
+        multipliers, profile_snapshot, project = _resolve_project_scoring_context(project_id)
+    except HTTPException:
+        return snapshot
+    weights_norm = (
+        dict(profile_snapshot.get("weights_norm") or {})
+        if isinstance(profile_snapshot, dict)
+        else _weights_from_multipliers(multipliers)
+    )
+    _, runtime_meta = _build_runtime_custom_requirements(
+        project_id,
+        project=project,
+        submission_text=submission_text,
+        weights_norm=weights_norm,
+    )
+    multiplier_rows = sorted(
+        [
+            {
+                "dimension_id": dim_id,
+                "dimension_name": str((DIMENSIONS.get(dim_id) or {}).get("name") or dim_id),
+                "multiplier": round(float(multipliers.get(dim_id, 1.0)), 4),
+            }
+            for dim_id in DIMENSION_IDS
+        ],
+        key=lambda item: (
+            -float(item.get("multiplier") or 1.0),
+            str(item.get("dimension_id") or ""),
+        ),
+    )
+    snapshot.update(
+        {
+            "weights_source": _infer_weights_source(project_id, profile_snapshot, project=project),
+            "effective_multipliers_preview": multiplier_rows[:8],
+            "expert_profile_id": (
+                str(profile_snapshot.get("id") or "") if isinstance(profile_snapshot, dict) else ""
+            ),
+            "material_dimension_requirements": int(
+                _to_float_or_none(runtime_meta.get("material_dimension_requirements")) or 0
+            ),
+            "feedback_evolution_requirements": int(
+                _to_float_or_none(runtime_meta.get("feedback_evolution_requirements")) or 0
+            ),
+            "feature_confidence_requirements": int(
+                _to_float_or_none(runtime_meta.get("feature_confidence_requirements")) or 0
+            ),
+            "material_dimension_preview": list(
+                runtime_meta.get("material_dimension_preview") or []
+            ),
+            "feedback_evolution_preview": list(
+                runtime_meta.get("feedback_evolution_preview") or []
+            ),
+            "feature_confidence_preview": list(
+                runtime_meta.get("feature_confidence_preview") or []
+            ),
+        }
+    )
+    return snapshot
+
+
 def _infer_weights_source(
     project_id: str,
     profile_snapshot: Optional[Dict[str, object]],
@@ -3365,6 +3440,10 @@ def _build_submission_scoring_basis_report(
     )
     if not evidence_trace:
         evidence_trace = _build_evidence_trace_summary(report)
+    current_runtime_constraints = _build_current_runtime_constraint_snapshot(
+        project_id,
+        submission_text=str(submission.get("text") or ""),
+    )
 
     recommendations: List[str] = []
     mece_inputs = (
@@ -3402,6 +3481,7 @@ def _build_submission_scoring_basis_report(
         "material_utilization": material_utilization,
         "material_utilization_gate": material_utilization_gate,
         "evidence_trace": evidence_trace,
+        "current_runtime_constraints": current_runtime_constraints,
         "recommendations": deduped_recommendations[:16],
     }
 
@@ -3465,6 +3545,9 @@ def _build_project_scoring_diagnostic(
     trace_summary = evidence_trace.get("summary") if isinstance(evidence_trace, dict) else {}
     basis_util = (
         scoring_basis.get("material_utilization") if isinstance(scoring_basis, dict) else {}
+    )
+    basis_runtime_constraints = (
+        scoring_basis.get("current_runtime_constraints") if isinstance(scoring_basis, dict) else {}
     )
     basis_retrieval = (
         scoring_basis.get("material_retrieval") if isinstance(scoring_basis, dict) else {}
@@ -3987,6 +4070,24 @@ def _build_project_scoring_diagnostic(
                 for item in (knowledge_summary.get("numeric_category_summary") or [])
                 if str(item or "").strip()
             ][:8],
+            "current_weights_source": str(
+                (basis_runtime_constraints or {}).get("weights_source") or "-"
+            ),
+            "current_effective_multipliers_preview": list(
+                ((basis_runtime_constraints or {}).get("effective_multipliers_preview") or [])[:6]
+            ),
+            "current_feedback_evolution_requirements": int(
+                _to_float_or_none(
+                    (basis_runtime_constraints or {}).get("feedback_evolution_requirements")
+                )
+                or 0
+            ),
+            "current_feature_confidence_requirements": int(
+                _to_float_or_none(
+                    (basis_runtime_constraints or {}).get("feature_confidence_requirements")
+                )
+                or 0
+            ),
             "latest_score_self_awareness": (
                 latest_submission.get("score_self_awareness")
                 if isinstance(latest_submission.get("score_self_awareness"), dict)
@@ -21765,6 +21866,9 @@ def index(
           const basisRetrieval = (basis.material_retrieval && typeof basis.material_retrieval === 'object')
             ? basis.material_retrieval
             : {};
+          const basisRuntime = (basis.current_runtime_constraints && typeof basis.current_runtime_constraints === 'object')
+            ? basis.current_runtime_constraints
+            : {};
           const summary = (data.summary && typeof data.summary === 'object') ? data.summary : {};
           const recommendations = Array.isArray(data.recommendations) ? data.recommendations : [];
           const dimensionSupportCards = Array.isArray(data.dimension_support_cards) ? data.dimension_support_cards : [];
@@ -21782,6 +21886,9 @@ def index(
             : [];
           const feedbackEvolutionCount = Number(basisRetrieval.feedback_evolution_requirements || 0);
           const featureConfidenceCount = Number(basisRetrieval.feature_confidence_requirements || 0);
+          const currentMultipliersPreview = Array.isArray(basisRuntime.effective_multipliers_preview)
+            ? basisRuntime.effective_multipliers_preview
+            : [];
           const byTypeDepth = Array.isArray(depth.by_type) ? depth.by_type : [];
           const utilByType = (util.by_type && typeof util.by_type === 'object') ? util.by_type : {};
           const utilAvailableTypes = Array.isArray(util.available_types) ? util.available_types : [];
@@ -21829,6 +21936,23 @@ def index(
             + '；状态：' + statusLabel
             + '；生成时间：' + escapeHtmlText(String(data.generated_at || '').slice(0, 19) || '-')
             + '</p>';
+          if (basisRuntime && Object.keys(basisRuntime).length) {
+            html += '<p style="margin:4px 0;color:#334155">当前有效权重来源：'
+              + escapeHtmlText(basisRuntime.weights_source || '-')
+              + '；反馈进化约束 '
+              + escapeHtmlText(Number(basisRuntime.feedback_evolution_requirements || 0))
+              + ' 条；高置信骨架约束 '
+              + escapeHtmlText(Number(basisRuntime.feature_confidence_requirements || 0))
+              + ' 条。</p>';
+            if (currentMultipliersPreview.length) {
+              html += '<details style="margin:6px 0"><summary>当前有效权重（Top）</summary><table><tr><th>维度</th><th>倍率</th></tr>'
+                + currentMultipliersPreview.slice(0, 6).map((row) => '<tr>'
+                  + '<td>' + escapeHtmlText((row.dimension_id || '-') + ' ' + (row.dimension_name || '')) + '</td>'
+                  + '<td>' + escapeHtmlText(row.multiplier != null ? String(row.multiplier) : '-') + '</td>'
+                  + '</tr>').join('')
+                + '</table></details>';
+            }
+          }
           if (dimensionSupportCards.length) {
             const strongDims = dimensionSupportCards
               .filter((row) => String((row && row.coverage_level) || '') !== 'low')
@@ -22540,6 +22664,7 @@ def index(
           const util = (data.material_utilization && typeof data.material_utilization === 'object') ? data.material_utilization : {};
           const gate = (data.material_utilization_gate && typeof data.material_utilization_gate === 'object') ? data.material_utilization_gate : {};
           const trace = (data.evidence_trace && typeof data.evidence_trace === 'object') ? data.evidence_trace : {};
+          const runtime = (data.current_runtime_constraints && typeof data.current_runtime_constraints === 'object') ? data.current_runtime_constraints : {};
           const recommendations = Array.isArray(data.recommendations) ? data.recommendations : [];
           const feedbackEvolutionPreview = Array.isArray(retrieval.feedback_evolution_preview)
             ? retrieval.feedback_evolution_preview
@@ -22547,8 +22672,28 @@ def index(
           const featureConfidencePreview = Array.isArray(retrieval.feature_confidence_preview)
             ? retrieval.feature_confidence_preview
             : [];
+          const currentMultipliersPreview = Array.isArray(runtime.effective_multipliers_preview)
+            ? runtime.effective_multipliers_preview
+            : [];
           let html = '<strong>评分依据审计（最新施组）</strong>';
           html += '<p style="margin:6px 0">文件：' + escapeHtmlText(data.filename || '-') + '；评分状态：' + escapeHtmlText(data.scoring_status || '-') + '</p>';
+          if (runtime && Object.keys(runtime).length) {
+            html += '<p style="margin:6px 0;color:#334155">当前有效权重来源：'
+              + escapeHtmlText(runtime.weights_source || '-')
+              + '；反馈进化约束 '
+              + escapeHtmlText(Number(runtime.feedback_evolution_requirements || 0))
+              + ' 条；高置信骨架约束 '
+              + escapeHtmlText(Number(runtime.feature_confidence_requirements || 0))
+              + ' 条。</p>';
+            if (currentMultipliersPreview.length) {
+              html += '<details style="margin-top:6px"><summary>当前有效权重（Top）</summary><table><tr><th>维度</th><th>倍率</th></tr>'
+                + currentMultipliersPreview.slice(0, 6).map((row) => '<tr>'
+                  + '<td>' + escapeHtmlText((row.dimension_id || '-') + ' ' + (row.dimension_name || '')) + '</td>'
+                  + '<td>' + escapeHtmlText(row.multiplier != null ? String(row.multiplier) : '-') + '</td>'
+                  + '</tr>').join('')
+                + '</table></details>';
+            }
+          }
           html += '<table><tr><th>资料门禁</th><th>资料检索命中率</th><th>文件覆盖率</th><th>强制项命中率</th><th>命中文件数</th></tr>'
             + '<tr><td>' + (mece.materials_quality_gate_passed ? '<span class="success">通过</span>' : '<span class="error">未通过</span>') + '</td><td>' + escapeHtmlText(util.retrieval_hit_rate ?? '-') + '</td><td>' + escapeHtmlText(util.retrieval_file_coverage_rate ?? '-') + '</td><td>' + escapeHtmlText(trace.mandatory_hit_rate ?? '-') + '</td><td>' + escapeHtmlText(trace.source_files_hit_count || 0) + '</td></tr></table>';
           const hitFiles = Array.isArray(trace.source_files_hit) ? trace.source_files_hit : [];

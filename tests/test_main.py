@@ -264,6 +264,7 @@ class TestIndexEndpoint:
         assert "评分进化约束总览" in page
         assert "进化反馈约束" in page
         assert "高置信逻辑骨架约束" in page
+        assert "当前有效权重（Top）" in page
 
     def test_index_frontend_has_no_broken_multiline_regex_literal(self, client):
         """Rendered JS should not contain regex literals split by line breaks (would break entire script)."""
@@ -4096,6 +4097,10 @@ class TestEvidenceTraceEndpoints:
         assert data["material_retrieval"]["feature_confidence_requirements"] == 0
         assert data["material_retrieval"]["feedback_evolution_preview"] == []
         assert data["material_retrieval"]["feature_confidence_preview"] == []
+        assert isinstance(data["current_runtime_constraints"]["weights_source"], str)
+        assert isinstance(
+            data["current_runtime_constraints"]["effective_multipliers_preview"], list
+        )
 
     @patch("app.main._build_project_scoring_diagnostic")
     @patch("app.main.load_projects")
@@ -4196,6 +4201,18 @@ class TestEvidenceTraceEndpoints:
                 "material_utilization": {"retrieval_hit_rate": 0.75},
                 "material_utilization_gate": {"blocked": False, "reasons": []},
                 "evidence_trace": {"mandatory_hit_rate": 0.8},
+                "current_runtime_constraints": {
+                    "weights_source": "evolution",
+                    "effective_multipliers_preview": [
+                        {
+                            "dimension_id": "09",
+                            "dimension_name": "进度计划体系与纠偏阈值",
+                            "multiplier": 1.16,
+                        }
+                    ],
+                    "feedback_evolution_requirements": 1,
+                    "feature_confidence_requirements": 1,
+                },
                 "recommendations": [],
             },
             "material_type_cards": [
@@ -4310,6 +4327,9 @@ class TestEvidenceTraceEndpoints:
                 "material_low_coverage_dimensions": 6,
                 "material_covered_dimensions": 10,
                 "material_numeric_category_summary": ["工期/节点：90", "规格/参数：1200"],
+                "current_weights_source": "evolution",
+                "current_feedback_evolution_requirements": 1,
+                "current_feature_confidence_requirements": 1,
             },
             "recommendations": ["补充图纸中的设备型号锚点。"],
         }
@@ -4336,6 +4356,8 @@ class TestEvidenceTraceEndpoints:
             ]
             == "14"
         )
+        assert data["scoring_basis"]["current_runtime_constraints"]["weights_source"] == "evolution"
+        assert data["summary"]["current_weights_source"] == "evolution"
         assert data["scoring_basis"]["material_utilization"]["retrieval_hit_rate"] == pytest.approx(
             0.75, abs=1e-6
         )
