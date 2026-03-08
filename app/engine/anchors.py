@@ -418,6 +418,15 @@ def build_project_requirements_from_anchors(
             )
         elif key == "boq_cost_control_points":
             add_req(
+                "04",
+                "主材、设备与特殊材料闭环需映射清单关键项",
+                "semantic",
+                {"hints": a.get("anchor_value")},
+                mandatory=False,
+                weight=1.4,
+                source_anchor_id=aid,
+            )
+            add_req(
                 "13",
                 "物资设备配置应与清单计价口径一致",
                 "semantic",
@@ -454,6 +463,24 @@ def build_project_requirements_from_anchors(
                 weight=1.6,
                 source_anchor_id=aid,
             )
+            add_req(
+                "06",
+                "关键工序控制点需体现图纸节点与净高/碰撞控制",
+                "semantic",
+                {"hints": a.get("anchor_value")},
+                mandatory=False,
+                weight=1.45,
+                source_anchor_id=aid,
+            )
+            add_req(
+                "12",
+                "专业穿插与移交条件需覆盖图纸接口和预留预埋",
+                "presence",
+                {"keywords": ["预留", "预埋", "接口", "穿插", "移交", "净高"]},
+                mandatory=False,
+                weight=1.35,
+                source_anchor_id=aid,
+            )
         elif key == "site_photo_risk_points":
             add_req(
                 "07",
@@ -471,6 +498,15 @@ def build_project_requirements_from_anchors(
                 {"keywords": ["临边", "高处", "深基坑", "塔吊", "脚手架", "消防"]},
                 mandatory=True,
                 weight=1.6,
+                source_anchor_id=aid,
+            )
+            add_req(
+                "03",
+                "文明施工与绿色工地措施应对应现场照片中的扬尘/围挡/道路等实况",
+                "presence",
+                {"keywords": ["扬尘", "围挡", "道路", "冲洗", "材料堆放", "污水"]},
+                mandatory=False,
+                weight=1.3,
                 source_anchor_id=aid,
             )
 

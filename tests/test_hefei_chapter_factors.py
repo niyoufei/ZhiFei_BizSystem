@@ -154,3 +154,31 @@ def test_global_banned_words_requirement_triggers_on_forbidden_terms() -> None:
     req_hit = _find_req_hit(report, "REQ-ALL-BANNED-001-01")
     assert req_hit and req_hit.get("hit") is False
     assert "must_not_have_terms" in str(req_hit.get("reason") or "")
+
+
+def test_material_anchors_expand_to_more_runtime_dimensions() -> None:
+    anchors = [
+        {
+            "id": "a-boq",
+            "anchor_key": "boq_cost_control_points",
+            "anchor_value": ["工程量", "综合单价", "设备"],
+        },
+        {
+            "id": "a-drawing",
+            "anchor_key": "drawing_coordination_points",
+            "anchor_value": ["节点深化", "预留预埋", "碰撞"],
+        },
+        {
+            "id": "a-photo",
+            "anchor_key": "site_photo_risk_points",
+            "anchor_value": ["临边", "扬尘", "脚手架"],
+        },
+    ]
+    reqs = build_project_requirements_from_anchors(
+        "p1",
+        anchors,
+        region="合肥",
+        scoring_engine_version="v2.0.0",
+    )
+    dims = {str(row.get("dimension_id")) for row in reqs}
+    assert {"04", "06", "12", "03"}.issubset(dims)

@@ -2046,6 +2046,59 @@ class TestMaterialsEndpoint:
         dim_ids = {row["dimension_id"] for row in payload["by_dimension"]}
         assert "01" in dim_ids
 
+    @patch("app.main._resolve_dwg_converter_binaries", return_value=["/usr/local/bin/dwg2dxf"])
+    @patch("app.main._now_iso", return_value="2026-02-27T00:00:00+00:00")
+    @patch("app.main.load_materials")
+    def test_build_material_knowledge_profile_includes_structured_material_signals(
+        self,
+        mock_load_materials,
+        mock_now_iso,
+        mock_dwg_bins,
+        tmp_path,
+    ):
+        from app.main import _build_material_knowledge_profile
+
+        drawing_path = tmp_path / "总图.dxf"
+        site_photo_path = tmp_path / "现场照片.txt"
+        drawing_path.write_text(
+            "0\nSECTION\n2\nENTITIES\n"
+            "0\nTEXT\n8\nM-EQPM\n1\n节点深化 BIM 综合管线 碰撞 净高 预留预埋 600 3.5\n"
+            "0\nINSERT\n8\nP-PIPE\n2\nPUMP_TAG\n"
+            "0\nENDSEC\n0\nEOF\n",
+            encoding="utf-8",
+        )
+        site_photo_path.write_text(
+            "[图像资料] 文件: 现场.jpg\n" "[OCR文本提取]\n" "临边防护 扬尘治理 围挡 样板 实测 48",
+            encoding="utf-8",
+        )
+        mock_load_materials.return_value = [
+            {
+                "project_id": "p1",
+                "material_type": "drawing",
+                "filename": "总图.dxf",
+                "path": str(drawing_path),
+                "created_at": "2026-02-26T00:00:01+00:00",
+            },
+            {
+                "project_id": "p1",
+                "material_type": "site_photo",
+                "filename": "现场照片.txt",
+                "path": str(site_photo_path),
+                "created_at": "2026-02-26T00:00:02+00:00",
+            },
+        ]
+
+        payload = _build_material_knowledge_profile("p1")
+        by_type = {row["material_type"]: row for row in payload["by_type"]}
+        assert by_type["drawing"]["structured_signal_count"] > 0
+        assert "机电综合" in (by_type["drawing"]["structured_terms_preview"] or [])
+        assert "14" in (by_type["drawing"]["focused_dimensions"] or [])
+        assert by_type["site_photo"]["structured_signal_count"] > 0
+        assert "高处临边" in (by_type["site_photo"]["structured_terms_preview"] or [])
+        by_dimension = {row["dimension_id"]: row for row in payload["by_dimension"]}
+        assert by_dimension["14"]["structured_signal_hits"] > 0
+        assert by_dimension["03"]["structured_signal_hits"] > 0
+
     @patch("app.main.save_materials")
     @patch("app.main.load_materials")
     @patch("app.main.load_projects")
@@ -2375,11 +2428,17 @@ class TestMaterialAdvancedParsing:
                     "material_type": "tender_qa",
                     "top_terms": ["工期", "质量标准", "危大工程", "项目"],
                     "top_numeric_terms": ["120", "30"],
+                    "structured_terms_preview": ["里程碑", "总控计划"],
+                    "focused_dimensions": ["09"],
+                    "numeric_category_summary": ["工期/节点：120、30"],
                 },
                 {
                     "material_type": "drawing",
                     "top_terms": ["节点", "剖面", "深化", "图纸"],
                     "top_numeric_terms": ["3.5", "600"],
+                    "structured_terms_preview": ["机电综合", "专业碰撞", "预留预埋"],
+                    "focused_dimensions": ["14", "06", "12"],
+                    "numeric_category_summary": ["规格/参数：3.5、600"],
                 },
             ],
             "by_dimension": [
@@ -2413,6 +2472,12 @@ class TestMaterialAdvancedParsing:
         assert patterns.get("source_mode") == "material_knowledge_profile"
         assert "tender_qa" in (patterns.get("source_types") or [])
         assert "120" in (patterns.get("hints") or [])
+        assert "里程碑" in (patterns.get("structured_terms") or [])
+        dim14 = next(r for r in reqs if r.get("dimension_id") == "14")
+        dim14_patterns = dim14.get("patterns") or {}
+        assert "专业碰撞" in (dim14_patterns.get("structured_terms") or [])
+        assert "14" in (dim14_patterns.get("focused_dimensions") or [])
+        assert int(dim14_patterns.get("structured_alignment_hits") or 0) >= 1
 
     def test_build_material_utilization_summary_tracks_dimension_requirements(self):
         from app.main import _build_material_utilization_summary
@@ -2466,6 +2531,46 @@ class TestMaterialAdvancedParsing:
         first_sheet = summary["sheets"][0]
         assert first_sheet["detected_columns"]["code"] == 0
         assert first_sheet["detected_columns"]["amount"] == 5
+        assert "工程量" in (summary.get("structured_terms") or [])
+        assert "13" in (summary.get("focused_dimensions") or [])
+
+    def test_build_drawing_structured_summary_extracts_structured_signals(self):
+        from app.main import _build_drawing_structured_summary
+
+        parsed_text = (
+            "[DWG预处理] 文件: 总图.dwg\n"
+            "实体统计: LINE:12、TEXT:3、INSERT:2\n"
+            "图层: A-ANNO-TEXT、M-EQPM、P-PIPE\n"
+            "块参照: DOOR_TAG、PUMP_TAG\n"
+            "节点 深化 BIM 综合管线 碰撞 净高 预留预埋 消防 管径 600 3.5"
+        )
+        summary = _build_drawing_structured_summary(b"DWGDATA", "总图.dwg", parsed_text=parsed_text)
+        assert summary["detected_format"] == "dwg"
+        assert "A-ANNO-TEXT" in (summary.get("top_layers") or [])
+        assert "机电综合" in (summary.get("discipline_keywords") or [])
+        assert "专业碰撞" in (summary.get("risk_keywords") or [])
+        assert "14" in (summary.get("focused_dimensions") or [])
+        assert "600" in (summary.get("top_numeric_terms") or [])
+
+    def test_build_site_photo_structured_summary_extracts_scene_tags(self):
+        from app.main import _build_site_photo_structured_summary
+
+        parsed_text = (
+            "[图像资料] 文件: 现场.jpg\n"
+            "格式: JPEG\n"
+            "[OCR文本提取]\n"
+            "临边防护 扬尘治理 围挡 道路冲洗 样板 实测 48 3"
+        )
+        summary = _build_site_photo_structured_summary(
+            b"IMGDATA",
+            "现场.jpg",
+            parsed_text=parsed_text,
+        )
+        assert summary["visual_capability"] == "ocr_text"
+        assert "高处临边" in (summary.get("safety_scene_tags") or [])
+        assert "扬尘治理" in (summary.get("civilization_scene_tags") or [])
+        assert "样板实测" in (summary.get("quality_scene_tags") or [])
+        assert "03" in (summary.get("focused_dimensions") or [])
 
     @patch("app.main.shutil.which")
     def test_read_uploaded_file_content_dwg_uses_preprocess_chain(self, mock_which):

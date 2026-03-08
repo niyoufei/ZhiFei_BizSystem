@@ -567,6 +567,18 @@ def _build_project_material_index(project_id: str) -> Dict[str, object]:
                     p.name,
                     parsed_text=text_value,
                 )
+            elif mat_type == "drawing":
+                entry["drawing_structured_summary"] = _build_drawing_structured_summary(
+                    content,
+                    p.name,
+                    parsed_text=text_value,
+                )
+            elif mat_type == "site_photo":
+                entry["site_photo_structured_summary"] = _build_site_photo_structured_summary(
+                    content,
+                    p.name,
+                    parsed_text=text_value,
+                )
             parsed_ok_files += 1
             parsed_ok_by_type[mat_type] = parsed_ok_by_type.get(mat_type, 0) + 1
             chars_by_type[mat_type] = chars_by_type.get(mat_type, 0) + chars
@@ -1541,6 +1553,17 @@ def _build_material_query_features(
                 material_profile_query_numeric_terms,
                 limit=18,
             )
+            _append_unique(
+                _filter_profile_terms(row.get("structured_terms_preview"), limit=5),
+                material_profile_query_terms,
+                limit=36,
+            )
+            if dim_id in [str(x or "").zfill(2) for x in (row.get("focused_dimensions") or [])]:
+                _append_unique(
+                    [str(x) for x in (DIMENSION_RAG_KEYWORDS.get(dim_id) or [])[:2]],
+                    material_profile_query_terms,
+                    limit=36,
+                )
         if (
             len(material_profile_query_terms) >= 36
             and len(material_profile_query_numeric_terms) >= 18
@@ -1562,6 +1585,9 @@ def _build_material_query_features(
         "project_requirement_count": len(project_requirements),
         "material_profile_query_terms_count": len(material_profile_query_terms),
         "material_profile_query_numeric_terms_count": len(material_profile_query_numeric_terms),
+        "material_profile_structured_terms_count": len(
+            _limit_unique_texts(material_profile_query_terms, limit=36)
+        ),
         "material_profile_focus_dimensions": material_profile_focus_dimensions[:8],
         "material_profile_query_terms_preview": material_profile_query_terms[:16],
         "material_profile_query_numeric_terms_preview": material_profile_query_numeric_terms[:12],
@@ -1665,6 +1691,10 @@ def _build_material_dimension_requirements(
             if text_value and text_value not in hints:
                 hints.append(text_value)
         numeric_terms: List[str] = []
+        structured_terms: List[str] = []
+        numeric_category_summary: List[str] = []
+        focused_dimensions: List[str] = []
+        structured_alignment_hits = 0
         for mat_type in source_types[:3]:
             row = by_type_map.get(mat_type)
             if not isinstance(row, dict):
@@ -1680,13 +1710,42 @@ def _build_material_dimension_requirements(
                     numeric_terms.append(token)
                 if len(numeric_terms) >= 4:
                     break
-        merged_hints = _to_text_items(hints + numeric_terms, max_items=10)
+            for term in _collect_terms(row.get("structured_terms_preview"), limit=4):
+                if term not in structured_terms:
+                    structured_terms.append(term)
+            for item in _to_text_items(row.get("numeric_category_summary"), max_items=2):
+                if item not in numeric_category_summary:
+                    numeric_category_summary.append(item)
+            row_focused_dimensions = [
+                str(item or "").zfill(2)
+                for item in (row.get("focused_dimensions") or [])
+                if str(item or "").strip()
+            ]
+            for focused_dim in row_focused_dimensions:
+                if focused_dim not in focused_dimensions:
+                    focused_dimensions.append(focused_dim)
+            if dim_id in row_focused_dimensions:
+                structured_alignment_hits += 1
+        merged_hints = _to_text_items(hints + structured_terms + numeric_terms, max_items=12)
         if len(merged_hints) < 3:
             continue
 
-        minimum_hint_hits = 2 if (coverage_score >= 0.58 or len(source_types) >= 2) else 1
+        minimum_hint_hits = (
+            2
+            if (coverage_score >= 0.52 or len(source_types) >= 2 or structured_alignment_hits > 0)
+            else 1
+        )
+        if coverage_score >= 0.72 and (structured_terms or numeric_terms):
+            minimum_hint_hits = max(minimum_hint_hits, 3)
         weight = round(
-            min(1.0, 0.58 + coverage_score * 0.28 + min(0.08, len(source_types) * 0.03)),
+            min(
+                1.2,
+                0.58
+                + coverage_score * 0.3
+                + min(0.08, len(source_types) * 0.03)
+                + min(0.12, structured_alignment_hits * 0.06)
+                + (0.04 if numeric_terms else 0.0),
+            ),
             2,
         )
         req_index += 1
@@ -1703,17 +1762,21 @@ def _build_material_dimension_requirements(
                 "patterns": {
                     "hints": merged_hints,
                     "minimum_hint_hits": minimum_hint_hits,
+                    "structured_terms": structured_terms[:6],
                     "source_types": source_types,
                     "source_mode": "material_knowledge_profile",
                     "source_coverage_score": round(coverage_score, 4),
                     "source_file_count": source_file_count,
+                    "focused_dimensions": focused_dimensions[:6],
+                    "numeric_category_summary": numeric_category_summary[:4],
+                    "structured_alignment_hits": structured_alignment_hits,
                     "top_numeric_terms": numeric_terms[:4],
                 },
                 "mandatory": False,
                 "weight": weight,
                 "source_anchor_id": None,
                 "source_pack_id": "runtime_material_dimension",
-                "source_pack_version": "v2-material-dimension-1",
+                "source_pack_version": "v2-material-dimension-2",
                 "priority": 89.0,
                 "override_key": f"runtime::material_dimension::{dim_id}",
                 "lint": {},
@@ -10010,6 +10073,167 @@ NUMERIC_ANCHOR_CATEGORY_LABELS: Dict[str, str] = {
     "threshold": "阈值/偏差",
 }
 
+DRAWING_DISCIPLINE_HINTS: Dict[str, List[str]] = {
+    "建筑": ["建筑", "平面", "立面", "剖面", "门窗", "装修"],
+    "结构": ["结构", "梁", "板", "柱", "基础", "钢筋"],
+    "给排水": ["给排水", "雨水", "污水", "喷淋", "消火栓", "管径"],
+    "暖通": ["暖通", "风管", "空调", "送风", "排风", "新风"],
+    "电气": ["电气", "桥架", "照明", "配电", "电缆", "接地"],
+    "消防": ["消防", "喷淋", "火警", "联动", "灭火", "报警"],
+    "机电综合": ["机电综合", "综合管线", "bim", "碰撞", "净高", "深化"],
+    "室外市政": ["道路", "路面", "管沟", "井位", "景观", "围墙", "绿化"],
+}
+
+DRAWING_RISK_HINTS: Dict[str, List[str]] = {
+    "专业碰撞": ["碰撞", "冲突", "综合管线", "bim", "净高"],
+    "预留预埋": ["预留", "预埋", "洞口", "套管"],
+    "节点深化": ["节点", "详图", "深化", "做法"],
+    "界面移交": ["移交", "穿插", "接口", "收口"],
+    "危大支护": ["支护", "基坑", "高支模", "脚手架", "吊装", "起重"],
+}
+
+SITE_PHOTO_SAFETY_HINTS: Dict[str, List[str]] = {
+    "高处临边": ["临边", "高处", "栏杆", "洞口", "安全带"],
+    "脚手架": ["脚手架", "连墙件", "立杆", "剪刀撑", "脚手板"],
+    "吊装机械": ["塔吊", "吊装", "起重", "吊篮", "机械"],
+    "消防用电": ["消防", "灭火器", "配电箱", "漏保", "电缆"],
+    "基坑支护": ["基坑", "支护", "护栏", "边坡", "降水"],
+}
+
+SITE_PHOTO_CIVILIZATION_HINTS: Dict[str, List[str]] = {
+    "扬尘治理": ["扬尘", "喷淋", "雾炮", "覆盖", "裸土"],
+    "围挡道路": ["围挡", "道路", "冲洗", "保洁", "门禁"],
+    "材料堆放": ["堆放", "码放", "标识", "分类", "仓库"],
+    "污水噪声": ["污水", "沉淀", "噪声", "洒水", "排水"],
+}
+
+SITE_PHOTO_QUALITY_HINTS: Dict[str, List[str]] = {
+    "样板实测": ["样板", "实测", "复核", "标高", "垂直度", "平整度"],
+    "成品保护": ["成品保护", "保护层", "遮挡", "覆盖", "封闭"],
+    "工序质量": ["质量", "缺陷", "裂缝", "蜂窝", "渗漏", "空鼓"],
+}
+
+
+def _limit_unique_texts(raw_items: List[object], *, limit: int = 12) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        text_value = str(item or "").strip()
+        if not text_value:
+            continue
+        key = text_value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text_value)
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
+
+
+def _limit_unique_numeric_tokens(raw_items: List[object], *, limit: int = 10) -> List[str]:
+    out: List[str] = []
+    for item in raw_items:
+        token = _normalize_numeric_token(item)
+        if token and token not in out:
+            out.append(token)
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
+
+
+STRUCTURED_SIGNAL_STOP_WORDS = {
+    "dwg",
+    "dxf",
+    "jpg",
+    "jpeg",
+    "png",
+    "photo",
+    "webp",
+    "bmp",
+    "ocr",
+    "text",
+    "mtext",
+    "line",
+    "insert",
+    "pdf",
+    "backend",
+    "图像资料",
+    "文本提取",
+    "实体统计",
+    "图层",
+    "块参照",
+    "预处理",
+    "文件",
+    "字节数",
+}
+
+
+def _filter_structured_signal_terms(raw_items: List[object], *, limit: int = 16) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        text_value = str(item or "").strip()
+        if not text_value:
+            continue
+        key = text_value.lower()
+        if key in STRUCTURED_SIGNAL_STOP_WORDS:
+            continue
+        if len(key) <= 1:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text_value)
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
+
+
+def _collect_keyword_labels(
+    text: str,
+    mapping: Dict[str, List[str]],
+    *,
+    limit: int = 8,
+) -> List[str]:
+    corpus = str(text or "").lower()
+    scored: List[tuple[str, int]] = []
+    for label, hints in mapping.items():
+        score = sum(
+            corpus.count(str(hint or "").lower()) for hint in hints if str(hint or "").strip()
+        )
+        if score > 0:
+            scored.append((label, score))
+    scored.sort(key=lambda item: (-item[1], item[0]))
+    return [label for label, _ in scored[: max(1, int(limit))]]
+
+
+def _parse_summary_list_line(text: str, prefix: str, *, limit: int = 12) -> List[str]:
+    match = re.search(rf"{re.escape(prefix)}:\s*(.+)", str(text or ""))
+    if not match:
+        return []
+    items = [item.strip() for item in re.split(r"[、,，]", match.group(1)) if item.strip()]
+    return _limit_unique_texts(items, limit=limit)
+
+
+def _parse_summary_count_line(text: str, prefix: str, *, limit: int = 12) -> Dict[str, int]:
+    match = re.search(rf"{re.escape(prefix)}:\s*(.+)", str(text or ""))
+    if not match:
+        return {}
+    out: Dict[str, int] = {}
+    for chunk in re.split(r"[、,，]", match.group(1)):
+        if ":" not in chunk:
+            continue
+        key, value = chunk.split(":", 1)
+        label = key.strip()
+        numeric = _to_float_or_none(value.strip())
+        if not label or numeric is None:
+            continue
+        out[label] = int(round(float(numeric)))
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
+
 
 def _classify_numeric_anchor_category(
     *,
@@ -10086,6 +10310,182 @@ def _build_numeric_anchor_category_summary(
             preview += " 等"
         summary.append(f"{label}：{preview}")
     return summary[:8]
+
+
+def _finalize_boq_structured_summary(
+    summary: Dict[str, object],
+    *,
+    parsed_text: str,
+) -> Dict[str, object]:
+    structured_terms: List[object] = []
+    numeric_terms: List[object] = []
+    column_labels = {
+        "code": "项目编码",
+        "name": "项目名称",
+        "unit": "单位",
+        "quantity": "工程量",
+        "unit_price": "综合单价",
+        "amount": "合价",
+    }
+    for sheet in summary.get("sheets") if isinstance(summary.get("sheets"), list) else []:
+        if not isinstance(sheet, dict):
+            continue
+        detected_columns = (
+            sheet.get("detected_columns") if isinstance(sheet.get("detected_columns"), dict) else {}
+        )
+        structured_terms.extend(
+            column_labels.get(str(key), str(key)) for key in detected_columns.keys()
+        )
+        structured_terms.extend(_to_text_items(sheet.get("units"), max_items=6))
+        for item in (sheet.get("top_items_by_amount") or [])[:6]:
+            if not isinstance(item, dict):
+                continue
+            structured_terms.extend(_extract_terms(str(item.get("name") or ""), max_terms=3))
+            numeric_terms.extend([item.get("quantity"), item.get("amount")])
+    for label, count in (
+        summary.get("keyword_hits") if isinstance(summary.get("keyword_hits"), dict) else {}
+    ).items():
+        if int(_to_float_or_none(count) or 0) > 0:
+            structured_terms.append(label)
+    structured_terms.extend(_extract_terms(parsed_text, max_terms=14))
+    numeric_terms.extend(_extract_numeric_terms(parsed_text, max_terms=12))
+    summary["structured_terms"] = _filter_structured_signal_terms(structured_terms, limit=18)
+    summary["top_numeric_terms"] = _limit_unique_numeric_tokens(numeric_terms, limit=10)
+    summary["focused_dimensions"] = ["04", "13", "15"]
+    return summary
+
+
+def _build_drawing_structured_summary(
+    content: bytes,
+    filename: str,
+    *,
+    parsed_text: str = "",
+) -> Dict[str, object]:
+    ext = Path(filename).suffix.lower()
+    text = str(parsed_text or "")
+    lower = text.lower()
+    detected_format = ext.lstrip(".")
+    if "[dxf解析摘要]" in lower or "检测到ascii dxf内容" in lower:
+        detected_format = "dxf"
+    elif "[dwg图纸]" in lower or "[dwg预处理]" in lower or ext == ".dwg":
+        detected_format = "dwg"
+    elif "[pdf_backend:" in lower or ext == ".pdf":
+        detected_format = "pdf"
+    elif ext in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
+        detected_format = "image"
+
+    top_layers = _parse_summary_list_line(text, "图层", limit=12)
+    top_blocks = _parse_summary_list_line(text, "块参照", limit=10)
+    entity_counts = _parse_summary_count_line(text, "实体统计", limit=12)
+    discipline_keywords = _collect_keyword_labels(
+        f"{filename}\n{text}",
+        DRAWING_DISCIPLINE_HINTS,
+        limit=8,
+    )
+    risk_keywords = _collect_keyword_labels(
+        f"{filename}\n{text}",
+        DRAWING_RISK_HINTS,
+        limit=8,
+    )
+    top_markers = _filter_structured_signal_terms(
+        top_layers + top_blocks + _extract_terms(text, max_terms=18),
+        limit=14,
+    )
+    top_numeric_terms = _limit_unique_numeric_tokens(
+        _extract_numeric_terms(text, max_terms=16), limit=10
+    )
+
+    focused_dimensions = ["14", "16"]
+    if discipline_keywords:
+        focused_dimensions.append("12")
+    if risk_keywords:
+        focused_dimensions.extend(["06", "07"])
+
+    structured_terms = _filter_structured_signal_terms(
+        discipline_keywords + risk_keywords + top_layers + top_blocks + top_markers,
+        limit=20,
+    )
+    signal_density = round(
+        (
+            float(len(structured_terms) + len(top_numeric_terms) + len(entity_counts))
+            / max(1.0, float(max(1, len(text.strip())) / 180.0))
+        ),
+        4,
+    )
+    return {
+        "filename": filename,
+        "detected_format": detected_format,
+        "bytes": len(content or b""),
+        "entity_counts": entity_counts,
+        "top_layers": top_layers,
+        "top_blocks": top_blocks,
+        "discipline_keywords": discipline_keywords,
+        "risk_keywords": risk_keywords,
+        "top_markers": top_markers[:12],
+        "top_numeric_terms": top_numeric_terms,
+        "structured_terms": structured_terms,
+        "focused_dimensions": _limit_unique_texts(focused_dimensions, limit=6),
+        "signal_density": signal_density,
+    }
+
+
+def _build_site_photo_structured_summary(
+    content: bytes,
+    filename: str,
+    *,
+    parsed_text: str = "",
+) -> Dict[str, object]:
+    ext = Path(filename).suffix.lower().lstrip(".")
+    text = str(parsed_text or "")
+    corpus = f"{filename}\n{text}"
+    safety_scene_tags = _collect_keyword_labels(corpus, SITE_PHOTO_SAFETY_HINTS, limit=8)
+    civilization_scene_tags = _collect_keyword_labels(
+        corpus, SITE_PHOTO_CIVILIZATION_HINTS, limit=8
+    )
+    quality_scene_tags = _collect_keyword_labels(corpus, SITE_PHOTO_QUALITY_HINTS, limit=8)
+    top_numeric_terms = _limit_unique_numeric_tokens(
+        _extract_numeric_terms(text, max_terms=12), limit=8
+    )
+    text_markers = _filter_structured_signal_terms(
+        _extract_terms(corpus, max_terms=16),
+        limit=12,
+    )
+    focused_dimensions: List[str] = []
+    if safety_scene_tags:
+        focused_dimensions.extend(["02", "07"])
+    if civilization_scene_tags:
+        focused_dimensions.append("03")
+    if quality_scene_tags:
+        focused_dimensions.extend(["08", "16"])
+    structured_terms = _filter_structured_signal_terms(
+        safety_scene_tags + civilization_scene_tags + quality_scene_tags + text_markers,
+        limit=18,
+    )
+    visual_capability = "metadata_only"
+    if "[ocr文本提取]" in text.lower():
+        visual_capability = "ocr_text"
+    if "未安装 pytesseract" in text.lower():
+        visual_capability = "ocr_unavailable"
+    evidence_density = round(
+        (
+            float(len(structured_terms) + len(top_numeric_terms))
+            / max(1.0, float(max(1, len(text.strip())) / 160.0))
+        ),
+        4,
+    )
+    return {
+        "filename": filename,
+        "detected_format": ext or "image",
+        "bytes": len(content or b""),
+        "visual_capability": visual_capability,
+        "safety_scene_tags": safety_scene_tags,
+        "civilization_scene_tags": civilization_scene_tags,
+        "quality_scene_tags": quality_scene_tags,
+        "top_numeric_terms": top_numeric_terms,
+        "structured_terms": structured_terms,
+        "focused_dimensions": _limit_unique_texts(focused_dimensions, limit=6),
+        "evidence_density": evidence_density,
+    }
 
 
 def _build_boq_structured_summary(
@@ -10216,7 +10616,7 @@ def _build_boq_structured_summary(
             summary["total_parsed_items"] = total_items
             summary["total_quantity"] = round(total_qty, 4)
             summary["total_amount"] = round(total_amt, 2)
-            return summary
+            return _finalize_boq_structured_summary(summary, parsed_text=parsed_text)
         except Exception as exc:
             summary["parse_error"] = f"excel_parse_failed: {type(exc).__name__}: {exc}"
 
@@ -10230,7 +10630,7 @@ def _build_boq_structured_summary(
             summary["total_parsed_items"] = int(csv_summary.get("parsed_items", 0))
             summary["total_quantity"] = float(csv_summary.get("quantity_sum", 0.0))
             summary["total_amount"] = float(csv_summary.get("amount_sum", 0.0))
-            return summary
+            return _finalize_boq_structured_summary(summary, parsed_text=parsed_text)
         except Exception as exc:
             summary["parse_error"] = f"csv_parse_failed: {type(exc).__name__}: {exc}"
 
@@ -10246,7 +10646,7 @@ def _build_boq_structured_summary(
         (float(sum(summary["keyword_hits"].values())) / max(1.0, float(len(text) / 100.0))),
         4,
     )
-    return summary
+    return _finalize_boq_structured_summary(summary, parsed_text=parsed_text)
 
 
 def _extract_binary_text_snippet(content: bytes, *, max_chars: int = 4000) -> str:
@@ -10472,6 +10872,30 @@ def _merge_materials_text(project_id: str) -> str:
                         section_block
                         + "\n\n[BOQ结构化摘要]\n"
                         + json.dumps(boq_struct, ensure_ascii=False)
+                    )
+            elif mat_type == "drawing":
+                drawing_struct = (
+                    row.get("drawing_structured_summary")
+                    if isinstance(row.get("drawing_structured_summary"), dict)
+                    else {}
+                )
+                if drawing_struct:
+                    section_block = (
+                        section_block
+                        + "\n\n[图纸结构化摘要]\n"
+                        + json.dumps(drawing_struct, ensure_ascii=False)
+                    )
+            elif mat_type == "site_photo":
+                photo_struct = (
+                    row.get("site_photo_structured_summary")
+                    if isinstance(row.get("site_photo_structured_summary"), dict)
+                    else {}
+                )
+                if photo_struct:
+                    section_block = (
+                        section_block
+                        + "\n\n[现场照片结构化摘要]\n"
+                        + json.dumps(photo_struct, ensure_ascii=False)
                     )
             section_lines.append(section_block)
         sections.append("\n\n".join(section_lines))
@@ -11674,7 +12098,10 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
     by_type_term_counter: Dict[str, Counter[str]] = {}
     by_type_numeric_counter: Dict[str, Counter[str]] = {}
     by_type_dim_counter: Dict[str, Counter[str]] = {}
+    by_type_structured_term_counter: Dict[str, Counter[str]] = {}
+    by_type_structured_dim_counter: Dict[str, Counter[str]] = {}
     by_type_numeric_categories: Dict[str, Dict[str, List[str]]] = {}
+    by_type_structured_signal_count: Dict[str, int] = {}
     by_type_file_count: Dict[str, int] = {}
     by_type_ok_files: Dict[str, int] = {}
     by_type_chars: Dict[str, int] = {}
@@ -11685,6 +12112,7 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         dim_id: {
             "keyword_hits": 0,
             "numeric_signal_hits": 0,
+            "structured_signal_hits": 0,
             "source_types": set(),
             "source_files": set(),
         }
@@ -11705,7 +12133,10 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         by_type_term_counter.setdefault(mat_type, Counter())
         by_type_numeric_counter.setdefault(mat_type, Counter())
         by_type_dim_counter.setdefault(mat_type, Counter())
+        by_type_structured_term_counter.setdefault(mat_type, Counter())
+        by_type_structured_dim_counter.setdefault(mat_type, Counter())
         by_type_numeric_categories.setdefault(mat_type, {})
+        by_type_structured_signal_count.setdefault(mat_type, 0)
         by_type_ok_files.setdefault(mat_type, 0)
         by_type_chars.setdefault(mat_type, 0)
         by_type_chunks.setdefault(mat_type, 0)
@@ -11747,6 +12178,31 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         )
         by_type_term_counter[mat_type].update(lexical_terms)
 
+        structured_summary: Dict[str, object] = {}
+        if mat_type == "boq":
+            structured_summary = (
+                row.get("boq_structured_summary")
+                if isinstance(row.get("boq_structured_summary"), dict)
+                else {}
+            )
+        elif mat_type == "drawing":
+            structured_summary = (
+                row.get("drawing_structured_summary")
+                if isinstance(row.get("drawing_structured_summary"), dict)
+                else {}
+            )
+        elif mat_type == "site_photo":
+            structured_summary = (
+                row.get("site_photo_structured_summary")
+                if isinstance(row.get("site_photo_structured_summary"), dict)
+                else {}
+            )
+
+        structured_terms = _to_text_items(structured_summary.get("structured_terms"), max_items=24)
+        if structured_terms:
+            by_type_term_counter[mat_type].update(structured_terms)
+            by_type_structured_term_counter[mat_type].update(structured_terms)
+
         numeric_terms = (
             row.get("numeric_terms_norm") if isinstance(row.get("numeric_terms_norm"), list) else []
         )
@@ -11759,12 +12215,44 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
                 )
                 if token
             ]
-        total_numeric_terms += len(set(numeric_terms))
-        by_type_numeric_counter[mat_type].update(numeric_terms)
+        structured_numeric_terms = _limit_unique_numeric_tokens(
+            list(structured_summary.get("top_numeric_terms") or []),
+            limit=10,
+        )
+        combined_numeric_terms = _limit_unique_numeric_tokens(
+            numeric_terms + structured_numeric_terms,
+            limit=48,
+        )
+        total_numeric_terms += len(set(combined_numeric_terms))
+        by_type_numeric_counter[mat_type].update(combined_numeric_terms)
+
+        structured_dims = [
+            str(item or "").zfill(2)
+            for item in (structured_summary.get("focused_dimensions") or [])
+            if str(item or "").strip().zfill(2) in DIMENSION_IDS
+        ]
+        file_name = filename
+        structured_signal_strength = max(
+            0,
+            len(structured_terms) + len(structured_numeric_terms) + len(structured_dims),
+        )
+        by_type_structured_signal_count[mat_type] = (
+            int(by_type_structured_signal_count.get(mat_type, 0)) + structured_signal_strength
+        )
+        if structured_dims:
+            structured_dim_boost = max(1, min(4, (structured_signal_strength + 2) // 3))
+            for dim_id in structured_dims:
+                by_dim_stats[dim_id]["structured_signal_hits"] = (
+                    int(by_dim_stats[dim_id].get("structured_signal_hits", 0))
+                    + structured_dim_boost
+                )
+                (by_dim_stats[dim_id].get("source_types") or set()).add(mat_type)
+                (by_dim_stats[dim_id].get("source_files") or set()).add(file_name)
+                by_type_dim_counter[mat_type][dim_id] += structured_dim_boost
+                by_type_structured_dim_counter[mat_type][dim_id] += structured_dim_boost
 
         lower = text.lower()
-        file_numeric_strength = min(8, len(set(numeric_terms)))
-        file_name = filename
+        file_numeric_strength = min(8, len(set(combined_numeric_terms)))
         for dim_id in DIMENSION_IDS:
             hit_count = 0
             for kw in DIMENSION_RAG_KEYWORDS.get(dim_id, [])[:10]:
@@ -11785,12 +12273,12 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         dominant_dim = by_type_dim_counter[mat_type].most_common(1)
         dominant_dim_id = str(dominant_dim[0][0]) if dominant_dim else ""
         numeric_category = _classify_numeric_anchor_category(
-            terms=lexical_terms[:12],
+            terms=(lexical_terms + structured_terms)[:18],
             material_type=mat_type,
             dimension_id=dominant_dim_id,
             label=filename,
         )
-        for token in sorted(set(numeric_terms)):
+        for token in sorted(set(combined_numeric_terms)):
             _append_numeric_anchor_bucket(
                 by_type_numeric_categories[mat_type], numeric_category, token
             )
@@ -11864,6 +12352,13 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
                     term
                     for term, _ in by_type_term_counter.get(mat_type, Counter()).most_common(10)
                 ],
+                "structured_terms_preview": [
+                    term
+                    for term, _ in by_type_structured_term_counter.get(
+                        mat_type, Counter()
+                    ).most_common(10)
+                ],
+                "structured_signal_count": int(by_type_structured_signal_count.get(mat_type, 0)),
                 "top_numeric_terms": [
                     term
                     for term, _ in by_type_numeric_counter.get(mat_type, Counter()).most_common(8)
@@ -11871,6 +12366,12 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
                 "numeric_category_summary": _build_numeric_anchor_category_summary(
                     by_type_numeric_categories.get(mat_type) or {}
                 ),
+                "focused_dimensions": [
+                    dim_id
+                    for dim_id, _ in by_type_structured_dim_counter.get(
+                        mat_type, Counter()
+                    ).most_common(4)
+                ],
                 "top_dimensions": top_dims,
             }
         )
@@ -11881,10 +12382,16 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         row = by_dim_stats.get(dim_id) or {}
         keyword_hits = int(row.get("keyword_hits", 0))
         numeric_signal_hits = int(row.get("numeric_signal_hits", 0))
+        structured_signal_hits = int(row.get("structured_signal_hits", 0))
         source_types = sorted(str(x) for x in (row.get("source_types") or set()) if str(x))
         source_files = sorted(str(x) for x in (row.get("source_files") or set()) if str(x))
         # 覆盖评分：关键词命中 + 跨类型覆盖共同决定（0..1）。
-        coverage_score = min(1.0, (keyword_hits / 8.0) + (len(source_types) * 0.18))
+        coverage_score = min(
+            1.0,
+            (keyword_hits / 8.0)
+            + (len(source_types) * 0.16)
+            + min(0.24, structured_signal_hits * 0.05),
+        )
         if numeric_signal_hits > 0:
             coverage_score = min(1.0, coverage_score + 0.06)
         coverage_level = (
@@ -11895,6 +12402,7 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
             "dimension_name": str((DIMENSIONS.get(dim_id) or {}).get("name") or dim_id),
             "keyword_hits": keyword_hits,
             "numeric_signal_hits": numeric_signal_hits,
+            "structured_signal_hits": structured_signal_hits,
             "source_types": source_types,
             "source_file_count": len(source_files),
             "source_files_preview": source_files[:6],
@@ -11951,6 +12459,7 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
             "total_parsed_chars": total_chars,
             "total_parsed_chunks": total_chunks,
             "total_numeric_terms": total_numeric_terms,
+            "structured_signal_total": int(sum(by_type_structured_signal_count.values())),
             "numeric_category_summary": _build_numeric_anchor_category_summary(
                 total_numeric_categories
             ),
