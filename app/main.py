@@ -100,6 +100,7 @@ from app.engine.dimensions import DIMENSIONS
 from app.engine.evaluation import evaluate_project_variants
 from app.engine.evolution import build_evolution_report
 from app.engine.feature_distillation import (
+    load_feature_kb,
     select_top_logic_skeletons,
     update_feature_confidence,
 )
@@ -1786,11 +1787,244 @@ def _build_material_dimension_requirements(
     return reqs
 
 
+def _logic_skeleton_to_runtime_hints(raw_lines: object, *, limit: int = 8) -> List[str]:
+    fragments: List[str] = []
+    for line in raw_lines if isinstance(raw_lines, list) else []:
+        text_value = str(line or "").strip()
+        if not text_value:
+            continue
+        normalized = re.sub(r"\[[^\]]+\]", " ", text_value)
+        parts = [part.strip() for part in re.split(r"\+|；|;|｜|\|", normalized) if part.strip()]
+        fragments.extend(parts if parts else [normalized])
+    hints = _filter_structured_signal_terms(fragments, limit=limit)
+    if len(hints) >= max(1, int(limit)):
+        return hints[: max(1, int(limit))]
+    lexical = _filter_structured_signal_terms(
+        _extract_terms("\n".join(str(x) for x in fragments), max_terms=limit * 2),
+        limit=limit,
+    )
+    merged = _filter_structured_signal_terms(hints + lexical, limit=limit)
+    return merged[: max(1, int(limit))]
+
+
+def _build_runtime_feature_requirements(
+    project_id: str,
+    *,
+    material_knowledge_profile: Optional[Dict[str, object]],
+    weights_norm: Optional[Dict[str, float]] = None,
+) -> List[Dict[str, object]]:
+    by_dimension_rows = (
+        material_knowledge_profile.get("by_dimension")
+        if isinstance(material_knowledge_profile, dict)
+        and isinstance(material_knowledge_profile.get("by_dimension"), list)
+        else []
+    )
+    weight_map = (
+        {dim_id: float(weights_norm.get(dim_id, 0.0)) for dim_id in DIMENSION_IDS}
+        if isinstance(weights_norm, dict)
+        else {}
+    )
+    baseline_weight = (1.0 / len(DIMENSION_IDS)) if DIMENSION_IDS else 0.0
+
+    focus_dims: List[str] = []
+    weighted_dims = sorted(
+        DIMENSION_IDS,
+        key=lambda dim_id: (-float(weight_map.get(dim_id, 0.0)), dim_id),
+    )
+    for dim_id in weighted_dims[:6]:
+        if float(weight_map.get(dim_id, 0.0)) > baseline_weight * 1.02 or len(focus_dims) < 3:
+            focus_dims.append(dim_id)
+
+    material_dims = sorted(
+        [row for row in by_dimension_rows if isinstance(row, dict)],
+        key=lambda row: (
+            -float(_to_float_or_none(row.get("coverage_score")) or 0.0),
+            str(row.get("dimension_id") or ""),
+        ),
+    )
+    for row in material_dims[:8]:
+        dim_id = str(row.get("dimension_id") or "").strip()
+        if not dim_id or dim_id in focus_dims:
+            continue
+        if float(_to_float_or_none(row.get("coverage_score")) or 0.0) < 0.28:
+            continue
+        focus_dims.append(dim_id)
+
+    now = _now_iso()
+    reqs: List[Dict[str, object]] = []
+    req_index = 0
+    for dim_id in focus_dims[:8]:
+        features = select_top_logic_skeletons(dimension_ids=[dim_id], top_k=2)
+        if not features:
+            continue
+        hints: List[str] = []
+        feature_ids: List[str] = []
+        confidences: List[float] = []
+        usage_counts: List[int] = []
+        for feature in features:
+            confidence = float(_to_float_or_none(getattr(feature, "confidence_score", None)) or 0.0)
+            if confidence < 0.45:
+                continue
+            feature_hints = _logic_skeleton_to_runtime_hints(
+                getattr(feature, "logic_skeleton", []) or [],
+                limit=6,
+            )
+            if not feature_hints:
+                continue
+            for hint in feature_hints:
+                if hint not in hints:
+                    hints.append(hint)
+            feature_id = str(getattr(feature, "feature_id", "") or "").strip()
+            if feature_id:
+                feature_ids.append(feature_id)
+            confidences.append(confidence)
+            usage_counts.append(int(_to_float_or_none(getattr(feature, "usage_count", 0)) or 0))
+        if len(hints) < 2 or not confidences:
+            continue
+        avg_confidence = sum(confidences) / len(confidences)
+        req_index += 1
+        reqs.append(
+            {
+                "id": f"runtime-feature-{project_id[:8]}-{req_index}",
+                "project_id": project_id,
+                "dimension_id": dim_id,
+                "req_label": (
+                    f"学习骨架约束：{str((DIMENSIONS.get(dim_id) or {}).get('name') or dim_id)}"
+                    "需体现高置信逻辑骨架"
+                ),
+                "req_type": "semantic",
+                "patterns": {
+                    "hints": _to_text_items(hints, max_items=10),
+                    "minimum_hint_hits": 2 if avg_confidence >= 0.7 and len(hints) >= 4 else 1,
+                    "source_mode": "feature_confidence_loop",
+                    "feature_ids": feature_ids[:4],
+                    "feature_confidence_scores": [round(val, 4) for val in confidences[:4]],
+                    "feature_usage_counts": usage_counts[:4],
+                    "focus_dimension": dim_id,
+                },
+                "mandatory": False,
+                "weight": round(min(1.25, 0.78 + avg_confidence * 0.4), 2),
+                "source_anchor_id": None,
+                "source_pack_id": "runtime_feature_confidence",
+                "source_pack_version": "v1",
+                "priority": 88.0,
+                "override_key": f"runtime::feature_confidence::{dim_id}",
+                "lint": {},
+                "created_at": now,
+            }
+        )
+    return reqs
+
+
+def _build_feature_confidence_summary(
+    project_id: str,
+    *,
+    material_knowledge_profile: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    features = load_feature_kb()
+    if not features:
+        return {
+            "project_id": project_id,
+            "active_count": 0,
+            "retired_count": 0,
+            "high_confidence_count": 0,
+            "focus_dimensions": [],
+            "top_dimensions": [],
+        }
+
+    by_dimension_rows = (
+        material_knowledge_profile.get("by_dimension")
+        if isinstance(material_knowledge_profile, dict)
+        and isinstance(material_knowledge_profile.get("by_dimension"), list)
+        else []
+    )
+    focus_dimensions: List[str] = []
+    ordered_rows = sorted(
+        [row for row in by_dimension_rows if isinstance(row, dict)],
+        key=lambda row: (
+            -float(_to_float_or_none(row.get("coverage_score")) or 0.0),
+            str(row.get("dimension_id") or ""),
+        ),
+    )
+    for row in ordered_rows[:6]:
+        dim_id = str(row.get("dimension_id") or "").strip()
+        if dim_id:
+            focus_dimensions.append(dim_id)
+
+    active_features = [feature for feature in features if bool(getattr(feature, "active", False))]
+    high_confidence_features = [
+        feature
+        for feature in active_features
+        if float(_to_float_or_none(getattr(feature, "confidence_score", None)) or 0.0) >= 0.7
+    ]
+    dim_stats: Dict[str, Dict[str, float]] = {}
+    for feature in active_features:
+        dim_id = str(getattr(feature, "dimension_id", "") or "").strip()
+        if not dim_id:
+            continue
+        row = dim_stats.setdefault(
+            dim_id,
+            {
+                "count": 0.0,
+                "high_confidence_count": 0.0,
+                "confidence_sum": 0.0,
+                "usage_sum": 0.0,
+            },
+        )
+        confidence = float(_to_float_or_none(getattr(feature, "confidence_score", None)) or 0.0)
+        usage_count = float(_to_float_or_none(getattr(feature, "usage_count", 0)) or 0.0)
+        row["count"] += 1.0
+        row["confidence_sum"] += confidence
+        row["usage_sum"] += usage_count
+        if confidence >= 0.7:
+            row["high_confidence_count"] += 1.0
+
+    top_dimensions = sorted(
+        [
+            {
+                "dimension_id": dim_id,
+                "dimension_name": str((DIMENSIONS.get(dim_id) or {}).get("name") or dim_id),
+                "active_feature_count": int(stats.get("count", 0.0)),
+                "high_confidence_count": int(stats.get("high_confidence_count", 0.0)),
+                "avg_confidence": round(
+                    float(stats.get("confidence_sum", 0.0))
+                    / max(1.0, float(stats.get("count", 0.0))),
+                    4,
+                ),
+                "avg_usage_count": round(
+                    float(stats.get("usage_sum", 0.0)) / max(1.0, float(stats.get("count", 0.0))),
+                    2,
+                ),
+                "is_project_focus": dim_id in focus_dimensions,
+            }
+            for dim_id, stats in dim_stats.items()
+        ],
+        key=lambda row: (
+            not bool(row.get("is_project_focus")),
+            -float(_to_float_or_none(row.get("avg_confidence")) or 0.0),
+            -int(_to_float_or_none(row.get("high_confidence_count")) or 0),
+            str(row.get("dimension_id") or ""),
+        ),
+    )
+
+    return {
+        "project_id": project_id,
+        "active_count": len(active_features),
+        "retired_count": len(
+            [feature for feature in features if not bool(getattr(feature, "active", False))]
+        ),
+        "high_confidence_count": len(high_confidence_features),
+        "focus_dimensions": focus_dimensions[:6],
+        "top_dimensions": top_dimensions[:8],
+    }
+
+
 def _build_runtime_custom_requirements(
     project_id: str,
     *,
     project: Dict[str, object],
     submission_text: str = "",
+    weights_norm: Optional[Dict[str, float]] = None,
 ) -> tuple[List[Dict[str, object]], Dict[str, object]]:
     evo = load_evolution_reports().get(project_id) or {}
     compilation = (
@@ -1971,9 +2205,15 @@ def _build_runtime_custom_requirements(
         material_knowledge_profile,
         available_material_types=available_material_types,
     )
+    feature_requirements = _build_runtime_feature_requirements(
+        project_id,
+        material_knowledge_profile=material_knowledge_profile,
+        weights_norm=weights_norm,
+    )
     runtime_requirements.extend(retrieval_requirements)
     runtime_requirements.extend(consistency_requirements)
     runtime_requirements.extend(material_dimension_requirements)
+    runtime_requirements.extend(feature_requirements)
 
     meta = {
         "required_sections": len(required_sections),
@@ -1986,6 +2226,7 @@ def _build_runtime_custom_requirements(
         "material_retrieval_requirements": len(retrieval_requirements),
         "material_consistency_requirements": len(consistency_requirements),
         "material_dimension_requirements": len(material_dimension_requirements),
+        "feature_confidence_requirements": len(feature_requirements),
         "material_retrieval_top_k": retrieval_top_k,
         "material_retrieval_per_type_quota": retrieval_per_type_quota,
         "material_retrieval_per_file_quota": retrieval_per_file_quota,
@@ -2083,6 +2324,18 @@ def _build_runtime_custom_requirements(
                 "source_file_count": (req.get("patterns") or {}).get("source_file_count"),
             }
             for req in material_dimension_requirements[:8]
+        ],
+        "feature_confidence_preview": [
+            {
+                "dimension_id": req.get("dimension_id"),
+                "label": req.get("req_label"),
+                "hints": (((req.get("patterns") or {}).get("hints")) or [])[:6],
+                "feature_ids": (((req.get("patterns") or {}).get("feature_ids")) or [])[:4],
+                "feature_confidence_scores": (
+                    ((req.get("patterns") or {}).get("feature_confidence_scores")) or []
+                )[:4],
+            }
+            for req in feature_requirements[:8]
         ],
     }
     return runtime_requirements, meta
@@ -5783,6 +6036,7 @@ def _score_submission_for_project(
             project_id,
             project=project,
             submission_text=text,
+            weights_norm=weights_norm,
         )
         effective_requirements = list(requirements) + list(runtime_custom_requirements)
         meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
@@ -6433,6 +6687,44 @@ def _refresh_evolution_report_from_ground_truth(project_id: str) -> Dict[str, ob
         )
 
     report = build_evolution_report(project_id, records, project_context)
+    material_knowledge_profile = _build_material_knowledge_profile(project_id)
+    report["material_learning_summary"] = {
+        "dimension_coverage_rate": float(
+            _to_float_or_none(
+                ((material_knowledge_profile.get("summary") or {}).get("dimension_coverage_rate"))
+                if isinstance(material_knowledge_profile, dict)
+                else None
+            )
+            or 0.0
+        ),
+        "low_coverage_dimensions": int(
+            _to_float_or_none(
+                ((material_knowledge_profile.get("summary") or {}).get("low_coverage_dimensions"))
+                if isinstance(material_knowledge_profile, dict)
+                else None
+            )
+            or 0
+        ),
+        "structured_signal_total": int(
+            _to_float_or_none(
+                ((material_knowledge_profile.get("summary") or {}).get("structured_signal_total"))
+                if isinstance(material_knowledge_profile, dict)
+                else None
+            )
+            or 0
+        ),
+        "available_types": [
+            str(row.get("material_type"))
+            for row in (material_knowledge_profile.get("by_type") or [])[:8]
+            if isinstance(row, dict) and str(row.get("material_type") or "").strip()
+        ]
+        if isinstance(material_knowledge_profile, dict)
+        else [],
+    }
+    report["feature_confidence_summary"] = _build_feature_confidence_summary(
+        project_id,
+        material_knowledge_profile=material_knowledge_profile,
+    )
     reports = load_evolution_reports()
     prev = reports.get(project_id) or {}
     # 自动闭环刷新时仅更新规则进化结果与编制指导；保留已有 LLM 增强来源标记。

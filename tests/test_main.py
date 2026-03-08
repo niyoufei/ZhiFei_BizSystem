@@ -2479,6 +2479,112 @@ class TestMaterialAdvancedParsing:
         assert "14" in (dim14_patterns.get("focused_dimensions") or [])
         assert int(dim14_patterns.get("structured_alignment_hits") or 0) >= 1
 
+    @patch("app.main.select_top_logic_skeletons")
+    def test_build_runtime_feature_requirements_uses_high_confidence_skeletons(
+        self,
+        mock_select_top_logic_skeletons,
+    ):
+        from app.main import _build_runtime_feature_requirements
+        from app.schemas import ExtractedFeature
+
+        mock_select_top_logic_skeletons.side_effect = lambda dimension_ids, top_k=2: (
+            [
+                ExtractedFeature(
+                    feature_id=f"feat-{dimension_ids[0]}",
+                    dimension_id=dimension_ids[0],
+                    logic_skeleton=[
+                        "[前置条件] 风险边界清晰 + [技术/动作] 动作链与责任分工 + [量化指标类型] 频次阈值与闭环验收"
+                    ],
+                    confidence_score=0.82,
+                    usage_count=5,
+                    active=True,
+                )
+            ]
+            if dimension_ids and dimension_ids[0] in {"09", "14"}
+            else []
+        )
+
+        profile = {
+            "by_dimension": [
+                {
+                    "dimension_id": "14",
+                    "coverage_score": 0.76,
+                    "source_file_count": 2,
+                    "source_types": ["drawing"],
+                }
+            ]
+        }
+        reqs = _build_runtime_feature_requirements(
+            "p1",
+            material_knowledge_profile=profile,
+            weights_norm={"09": 0.2, "14": 0.12, "01": 0.04},
+        )
+        assert reqs
+        dim_ids = {str(row.get("dimension_id")) for row in reqs}
+        assert {"09", "14"}.issubset(dim_ids)
+        dim14 = next(row for row in reqs if str(row.get("dimension_id")) == "14")
+        patterns = dim14.get("patterns") or {}
+        assert patterns.get("source_mode") == "feature_confidence_loop"
+        assert "feat-14" in (patterns.get("feature_ids") or [])
+        assert "动作链与责任分工" in " ".join(patterns.get("hints") or [])
+        assert float(dim14.get("weight") or 0.0) > 1.0
+
+    @patch("app.main.load_feature_kb")
+    def test_build_feature_confidence_summary_marks_project_focus_dimensions(
+        self,
+        mock_load_feature_kb,
+    ):
+        from app.main import _build_feature_confidence_summary
+        from app.schemas import ExtractedFeature
+
+        mock_load_feature_kb.return_value = [
+            ExtractedFeature(
+                feature_id="f-09",
+                dimension_id="09",
+                logic_skeleton=[
+                    "[前置条件] 关键节点明确 + [技术/动作] 总控计划纠偏 + [量化指标类型] 偏差阈值与闭环"
+                ],
+                confidence_score=0.83,
+                usage_count=6,
+                active=True,
+            ),
+            ExtractedFeature(
+                feature_id="f-14",
+                dimension_id="14",
+                logic_skeleton=[
+                    "[前置条件] 图纸接口明确 + [技术/动作] 深化碰撞复核 + [量化指标类型] 节点闭环"
+                ],
+                confidence_score=0.72,
+                usage_count=4,
+                active=True,
+            ),
+            ExtractedFeature(
+                feature_id="f-03-old",
+                dimension_id="03",
+                logic_skeleton=[
+                    "[前置条件] 文明施工场景明确 + [技术/动作] 扬尘围挡联动 + [量化指标类型] 频次记录"
+                ],
+                confidence_score=0.18,
+                usage_count=5,
+                active=False,
+            ),
+        ]
+        summary = _build_feature_confidence_summary(
+            "p1",
+            material_knowledge_profile={
+                "by_dimension": [
+                    {"dimension_id": "14", "coverage_score": 0.76},
+                    {"dimension_id": "09", "coverage_score": 0.61},
+                ]
+            },
+        )
+        assert summary["active_count"] == 2
+        assert summary["retired_count"] == 1
+        assert summary["high_confidence_count"] == 2
+        assert summary["focus_dimensions"] == ["14", "09"]
+        top_dim_ids = [row["dimension_id"] for row in summary["top_dimensions"]]
+        assert top_dim_ids[:2] == ["09", "14"] or top_dim_ids[:2] == ["14", "09"]
+
     def test_build_material_utilization_summary_tracks_dimension_requirements(self):
         from app.main import _build_material_utilization_summary
 
