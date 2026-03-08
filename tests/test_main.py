@@ -261,6 +261,9 @@ class TestIndexEndpoint:
         assert "证据薄弱维度" in page
         assert "维度支撑明细（16维）" in page
         assert "评分置信度" in page
+        assert "评分进化约束总览" in page
+        assert "进化反馈约束" in page
+        assert "高置信逻辑骨架约束" in page
 
     def test_index_frontend_has_no_broken_multiline_regex_literal(self, client):
         """Rendered JS should not contain regex literals split by line breaks (would break entire script)."""
@@ -2529,6 +2532,52 @@ class TestMaterialAdvancedParsing:
         assert "动作链与责任分工" in " ".join(patterns.get("hints") or [])
         assert float(dim14.get("weight") or 0.0) > 1.0
 
+    @patch("app.main.load_evolution_reports")
+    def test_build_runtime_feedback_requirements_uses_evolution_multipliers(
+        self,
+        mock_load_evolution_reports,
+    ):
+        from app.main import _build_runtime_feedback_requirements
+
+        mock_load_evolution_reports.return_value = {
+            "p1": {
+                "sample_count": 4,
+                "scoring_evolution": {
+                    "dimension_multipliers": {"09": 1.16, "14": 1.08, "03": 0.97},
+                    "rationale": {
+                        "09": "高分施组在进度计划与里程碑闭环方面更强。",
+                        "14": "高分施组在图纸深化、节点与碰撞复核方面更强。",
+                    },
+                },
+            }
+        }
+        reqs = _build_runtime_feedback_requirements(
+            "p1",
+            material_knowledge_profile={
+                "by_dimension": [
+                    {
+                        "dimension_id": "09",
+                        "coverage_score": 0.31,
+                        "suggested_keywords": ["关键节点", "里程碑", "纠偏"],
+                    },
+                    {
+                        "dimension_id": "14",
+                        "coverage_score": 0.76,
+                        "suggested_keywords": ["图纸", "深化", "碰撞"],
+                    },
+                ]
+            },
+        )
+        dim_ids = {str(row.get("dimension_id")) for row in reqs}
+        assert {"09", "14"}.issubset(dim_ids)
+        dim09 = next(row for row in reqs if str(row.get("dimension_id")) == "09")
+        patterns = dim09.get("patterns") or {}
+        assert patterns.get("source_mode") == "feedback_evolution"
+        assert patterns.get("multiplier") == pytest.approx(1.16, abs=1e-6)
+        assert patterns.get("sample_count") == 4
+        assert "关键节点" in (patterns.get("hints") or [])
+        assert float(dim09.get("weight") or 0.0) > 1.0
+
     @patch("app.main.load_feature_kb")
     def test_build_feature_confidence_summary_marks_project_focus_dimensions(
         self,
@@ -2654,8 +2703,10 @@ class TestMaterialAdvancedParsing:
         assert summary["detected_format"] == "dwg"
         assert "A-ANNO-TEXT" in (summary.get("top_layers") or [])
         assert "机电综合" in (summary.get("discipline_keywords") or [])
+        assert "总平面/平面布置" in (summary.get("sheet_type_tags") or [])
         assert "专业碰撞" in (summary.get("risk_keywords") or [])
         assert "14" in (summary.get("focused_dimensions") or [])
+        assert "12" in (summary.get("focused_dimensions") or [])
         assert "600" in (summary.get("top_numeric_terms") or [])
 
     def test_build_site_photo_structured_summary_extracts_scene_tags(self):
@@ -2665,7 +2716,7 @@ class TestMaterialAdvancedParsing:
             "[图像资料] 文件: 现场.jpg\n"
             "格式: JPEG\n"
             "[OCR文本提取]\n"
-            "临边防护 扬尘治理 围挡 道路冲洗 样板 实测 48 3"
+            "临边防护 扬尘治理 围挡 道路冲洗 样板 实测 夜间施工 材料进场 48 3"
         )
         summary = _build_site_photo_structured_summary(
             b"IMGDATA",
@@ -2676,7 +2727,9 @@ class TestMaterialAdvancedParsing:
         assert "高处临边" in (summary.get("safety_scene_tags") or [])
         assert "扬尘治理" in (summary.get("civilization_scene_tags") or [])
         assert "样板实测" in (summary.get("quality_scene_tags") or [])
+        assert "夜间施工" in (summary.get("progress_scene_tags") or [])
         assert "03" in (summary.get("focused_dimensions") or [])
+        assert "09" in (summary.get("focused_dimensions") or [])
 
     @patch("app.main.shutil.which")
     def test_read_uploaded_file_content_dwg_uses_preprocess_chain(self, mock_which):
@@ -4031,6 +4084,10 @@ class TestEvidenceTraceEndpoints:
         assert data["mece_inputs"]["materials_quality_gate_passed"] is True
         assert data["material_utilization"]["retrieval_hit_rate"] == pytest.approx(0.72, abs=1e-6)
         assert data["evidence_trace"]["source_files_hit_count"] == 3
+        assert data["material_retrieval"]["feedback_evolution_requirements"] == 0
+        assert data["material_retrieval"]["feature_confidence_requirements"] == 0
+        assert data["material_retrieval"]["feedback_evolution_preview"] == []
+        assert data["material_retrieval"]["feature_confidence_preview"] == []
 
     @patch("app.main._build_project_scoring_diagnostic")
     @patch("app.main.load_projects")
@@ -4105,7 +4162,29 @@ class TestEvidenceTraceEndpoints:
                 "scoring_status": "scored",
                 "mece_inputs": {"materials_quality_gate_passed": True},
                 "material_quality": {"total_files": 4},
-                "material_retrieval": {"chunks": 20},
+                "material_retrieval": {
+                    "chunks": 20,
+                    "feedback_evolution_requirements": 1,
+                    "feature_confidence_requirements": 1,
+                    "feedback_evolution_preview": [
+                        {
+                            "dimension_id": "09",
+                            "label": "进度计划体系与纠偏阈值",
+                            "hints": ["关键节点", "偏差阈值"],
+                            "multiplier": 1.16,
+                            "sample_count": 4,
+                        }
+                    ],
+                    "feature_confidence_preview": [
+                        {
+                            "dimension_id": "14",
+                            "label": "图纸会审、深化设计与变更闭环",
+                            "hints": ["会审问题单", "关闭条件"],
+                            "feature_ids": ["feat-1"],
+                            "feature_confidence_scores": [0.88],
+                        }
+                    ],
+                },
                 "material_utilization": {"retrieval_hit_rate": 0.75},
                 "material_utilization_gate": {"blocked": False, "reasons": []},
                 "evidence_trace": {"mandatory_hit_rate": 0.8},
@@ -4235,6 +4314,20 @@ class TestEvidenceTraceEndpoints:
         assert data["summary"]["evidence_total_hits"] == 12
         assert data["summary"]["retrieval_hit_rate"] == pytest.approx(0.75, abs=1e-6)
         assert data["evidence_trace"]["summary"]["source_files_hit_count"] == 3
+        assert data["scoring_basis"]["material_retrieval"]["feedback_evolution_requirements"] == 1
+        assert data["scoring_basis"]["material_retrieval"]["feature_confidence_requirements"] == 1
+        assert (
+            data["scoring_basis"]["material_retrieval"]["feedback_evolution_preview"][0][
+                "dimension_id"
+            ]
+            == "09"
+        )
+        assert (
+            data["scoring_basis"]["material_retrieval"]["feature_confidence_preview"][0][
+                "dimension_id"
+            ]
+            == "14"
+        )
         assert data["scoring_basis"]["material_utilization"]["retrieval_hit_rate"] == pytest.approx(
             0.75, abs=1e-6
         )

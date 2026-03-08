@@ -2019,6 +2019,116 @@ def _build_feature_confidence_summary(
     }
 
 
+def _build_runtime_feedback_requirements(
+    project_id: str,
+    *,
+    material_knowledge_profile: Optional[Dict[str, object]] = None,
+) -> List[Dict[str, object]]:
+    evo = load_evolution_reports().get(project_id) or {}
+    scoring_evolution = (
+        evo.get("scoring_evolution") if isinstance(evo.get("scoring_evolution"), dict) else {}
+    )
+    multipliers = (
+        scoring_evolution.get("dimension_multipliers")
+        if isinstance(scoring_evolution.get("dimension_multipliers"), dict)
+        else {}
+    )
+    rationales = (
+        scoring_evolution.get("rationale")
+        if isinstance(scoring_evolution.get("rationale"), dict)
+        else {}
+    )
+    sample_count = int(_to_float_or_none(evo.get("sample_count")) or 0)
+    if not multipliers or sample_count <= 0:
+        return []
+
+    by_dimension_rows = (
+        material_knowledge_profile.get("by_dimension")
+        if isinstance(material_knowledge_profile, dict)
+        and isinstance(material_knowledge_profile.get("by_dimension"), list)
+        else []
+    )
+    by_dimension_map = {
+        str(row.get("dimension_id") or "").strip(): row
+        for row in by_dimension_rows
+        if isinstance(row, dict) and str(row.get("dimension_id") or "").strip()
+    }
+
+    ranked_dims = sorted(
+        [
+            (str(dim_id).zfill(2), float(_to_float_or_none(multiplier) or 1.0))
+            for dim_id, multiplier in multipliers.items()
+            if str(dim_id).strip()
+        ],
+        key=lambda item: (-item[1], item[0]),
+    )
+    reqs: List[Dict[str, object]] = []
+    now = _now_iso()
+    req_index = 0
+    for dim_id, multiplier in ranked_dims[:8]:
+        if multiplier <= 1.03:
+            continue
+        material_dim_row = by_dimension_map.get(dim_id) or {}
+        coverage_score = float(_to_float_or_none(material_dim_row.get("coverage_score")) or 0.0)
+        rationale_text = str(rationales.get(dim_id) or "").strip()
+        rationale_hints = _filter_structured_signal_terms(
+            _extract_terms(rationale_text, max_terms=8),
+            limit=6,
+        )
+        material_hints = [
+            str(x)
+            for x in (material_dim_row.get("suggested_keywords") or [])[:4]
+            if str(x or "").strip()
+        ]
+        hints = _to_text_items(
+            rationale_hints + material_hints + list((DIMENSION_RAG_KEYWORDS.get(dim_id) or [])[:4]),
+            max_items=10,
+        )
+        if len(hints) < 2:
+            continue
+        req_index += 1
+        reqs.append(
+            {
+                "id": f"runtime-feedback-{project_id[:8]}-{req_index}",
+                "project_id": project_id,
+                "dimension_id": dim_id,
+                "req_label": (
+                    f"进化反馈约束：{str((DIMENSIONS.get(dim_id) or {}).get('name') or dim_id)}"
+                    "需体现近期真实评分偏好"
+                ),
+                "req_type": "semantic",
+                "patterns": {
+                    "hints": hints,
+                    "minimum_hint_hits": 2 if (sample_count >= 3 or multiplier >= 1.12) else 1,
+                    "source_mode": "feedback_evolution",
+                    "multiplier": round(multiplier, 4),
+                    "sample_count": sample_count,
+                    "material_coverage_score": round(coverage_score, 4),
+                    "rationale": rationale_text,
+                },
+                "mandatory": False,
+                "weight": round(
+                    min(
+                        1.3,
+                        0.8
+                        + min(0.22, (multiplier - 1.0) * 0.9)
+                        + (0.06 if sample_count >= 3 else 0.0)
+                        + (0.04 if coverage_score < 0.35 else 0.0),
+                    ),
+                    2,
+                ),
+                "source_anchor_id": None,
+                "source_pack_id": "runtime_feedback_evolution",
+                "source_pack_version": "v1",
+                "priority": 87.5,
+                "override_key": f"runtime::feedback_evolution::{dim_id}",
+                "lint": {},
+                "created_at": now,
+            }
+        )
+    return reqs
+
+
 def _build_runtime_custom_requirements(
     project_id: str,
     *,
@@ -2205,6 +2315,10 @@ def _build_runtime_custom_requirements(
         material_knowledge_profile,
         available_material_types=available_material_types,
     )
+    feedback_requirements = _build_runtime_feedback_requirements(
+        project_id,
+        material_knowledge_profile=material_knowledge_profile,
+    )
     feature_requirements = _build_runtime_feature_requirements(
         project_id,
         material_knowledge_profile=material_knowledge_profile,
@@ -2213,6 +2327,7 @@ def _build_runtime_custom_requirements(
     runtime_requirements.extend(retrieval_requirements)
     runtime_requirements.extend(consistency_requirements)
     runtime_requirements.extend(material_dimension_requirements)
+    runtime_requirements.extend(feedback_requirements)
     runtime_requirements.extend(feature_requirements)
 
     meta = {
@@ -2226,6 +2341,7 @@ def _build_runtime_custom_requirements(
         "material_retrieval_requirements": len(retrieval_requirements),
         "material_consistency_requirements": len(consistency_requirements),
         "material_dimension_requirements": len(material_dimension_requirements),
+        "feedback_evolution_requirements": len(feedback_requirements),
         "feature_confidence_requirements": len(feature_requirements),
         "material_retrieval_top_k": retrieval_top_k,
         "material_retrieval_per_type_quota": retrieval_per_type_quota,
@@ -2336,6 +2452,16 @@ def _build_runtime_custom_requirements(
                 )[:4],
             }
             for req in feature_requirements[:8]
+        ],
+        "feedback_evolution_preview": [
+            {
+                "dimension_id": req.get("dimension_id"),
+                "label": req.get("req_label"),
+                "hints": (((req.get("patterns") or {}).get("hints")) or [])[:6],
+                "multiplier": (req.get("patterns") or {}).get("multiplier"),
+                "sample_count": (req.get("patterns") or {}).get("sample_count"),
+            }
+            for req in feedback_requirements[:8]
         ],
     }
     return runtime_requirements, meta
@@ -2707,10 +2833,16 @@ def _normalize_material_retrieval_meta(raw: object) -> Dict[str, object]:
         meta["material_consistency_preview"] = []
     if not isinstance(meta.get("material_dimension_preview"), list):
         meta["material_dimension_preview"] = []
+    if not isinstance(meta.get("feature_confidence_preview"), list):
+        meta["feature_confidence_preview"] = []
+    if not isinstance(meta.get("feedback_evolution_preview"), list):
+        meta["feedback_evolution_preview"] = []
     if not isinstance(meta.get("material_profile_focus_dimensions"), list):
         meta["material_profile_focus_dimensions"] = []
     for key in (
         "material_dimension_requirements",
+        "feature_confidence_requirements",
+        "feedback_evolution_requirements",
         "material_profile_query_terms_count",
         "material_profile_query_numeric_terms_count",
     ):
@@ -10384,6 +10516,14 @@ DRAWING_RISK_HINTS: Dict[str, List[str]] = {
     "危大支护": ["支护", "基坑", "高支模", "脚手架", "吊装", "起重"],
 }
 
+DRAWING_SHEET_TYPE_HINTS: Dict[str, List[str]] = {
+    "总平面/平面布置": ["总图", "总平面", "平面图", "平面布置", "总平"],
+    "系统图/原理图": ["系统图", "原理图", "流程图", "干线图"],
+    "节点详图/大样": ["节点", "详图", "大样", "剖节点", "构造做法"],
+    "剖面/立面": ["剖面", "立面", "展开图"],
+    "综合排布/净高复核": ["综合排布", "综合管线", "净高", "碰撞", "bim"],
+}
+
 SITE_PHOTO_SAFETY_HINTS: Dict[str, List[str]] = {
     "高处临边": ["临边", "高处", "栏杆", "洞口", "安全带"],
     "脚手架": ["脚手架", "连墙件", "立杆", "剪刀撑", "脚手板"],
@@ -10403,6 +10543,12 @@ SITE_PHOTO_QUALITY_HINTS: Dict[str, List[str]] = {
     "样板实测": ["样板", "实测", "复核", "标高", "垂直度", "平整度"],
     "成品保护": ["成品保护", "保护层", "遮挡", "覆盖", "封闭"],
     "工序质量": ["质量", "缺陷", "裂缝", "蜂窝", "渗漏", "空鼓"],
+}
+
+SITE_PHOTO_PROGRESS_HINTS: Dict[str, List[str]] = {
+    "进度节点": ["节点", "封顶", "完成面", "移交", "样板段", "首件"],
+    "夜间施工": ["夜间", "夜施", "抢工", "照明", "加班"],
+    "资源调配": ["材料进场", "机械进场", "吊装", "堆场", "班组", "车辆"],
 }
 
 
@@ -10674,10 +10820,19 @@ def _build_drawing_structured_summary(
         DRAWING_DISCIPLINE_HINTS,
         limit=8,
     )
+    sheet_type_tags = _collect_keyword_labels(
+        f"{filename}\n{text}",
+        DRAWING_SHEET_TYPE_HINTS,
+        limit=6,
+    )
     risk_keywords = _collect_keyword_labels(
         f"{filename}\n{text}",
         DRAWING_RISK_HINTS,
         limit=8,
+    )
+    file_stem_terms = _filter_structured_signal_terms(
+        _extract_terms(Path(filename).stem, max_terms=8),
+        limit=6,
     )
     top_markers = _filter_structured_signal_terms(
         top_layers + top_blocks + _extract_terms(text, max_terms=18),
@@ -10690,11 +10845,23 @@ def _build_drawing_structured_summary(
     focused_dimensions = ["14", "16"]
     if discipline_keywords:
         focused_dimensions.append("12")
+    if sheet_type_tags:
+        focused_dimensions.append("01")
     if risk_keywords:
         focused_dimensions.extend(["06", "07"])
+    if any(tag in {"节点详图/大样", "剖面/立面"} for tag in sheet_type_tags):
+        focused_dimensions.extend(["06", "16"])
+    if any(tag in {"系统图/原理图", "综合排布/净高复核"} for tag in sheet_type_tags):
+        focused_dimensions.extend(["12", "14"])
 
     structured_terms = _filter_structured_signal_terms(
-        discipline_keywords + risk_keywords + top_layers + top_blocks + top_markers,
+        discipline_keywords
+        + sheet_type_tags
+        + risk_keywords
+        + file_stem_terms
+        + top_layers
+        + top_blocks
+        + top_markers,
         limit=20,
     )
     signal_density = round(
@@ -10712,6 +10879,7 @@ def _build_drawing_structured_summary(
         "top_layers": top_layers,
         "top_blocks": top_blocks,
         "discipline_keywords": discipline_keywords,
+        "sheet_type_tags": sheet_type_tags,
         "risk_keywords": risk_keywords,
         "top_markers": top_markers[:12],
         "top_numeric_terms": top_numeric_terms,
@@ -10735,11 +10903,12 @@ def _build_site_photo_structured_summary(
         corpus, SITE_PHOTO_CIVILIZATION_HINTS, limit=8
     )
     quality_scene_tags = _collect_keyword_labels(corpus, SITE_PHOTO_QUALITY_HINTS, limit=8)
+    progress_scene_tags = _collect_keyword_labels(corpus, SITE_PHOTO_PROGRESS_HINTS, limit=6)
     top_numeric_terms = _limit_unique_numeric_tokens(
         _extract_numeric_terms(text, max_terms=12), limit=8
     )
     text_markers = _filter_structured_signal_terms(
-        _extract_terms(corpus, max_terms=16),
+        _extract_terms(corpus, max_terms=18),
         limit=12,
     )
     focused_dimensions: List[str] = []
@@ -10749,8 +10918,14 @@ def _build_site_photo_structured_summary(
         focused_dimensions.append("03")
     if quality_scene_tags:
         focused_dimensions.extend(["08", "16"])
+    if progress_scene_tags:
+        focused_dimensions.extend(["09", "15"])
     structured_terms = _filter_structured_signal_terms(
-        safety_scene_tags + civilization_scene_tags + quality_scene_tags + text_markers,
+        safety_scene_tags
+        + civilization_scene_tags
+        + quality_scene_tags
+        + progress_scene_tags
+        + text_markers,
         limit=18,
     )
     visual_capability = "metadata_only"
@@ -10773,6 +10948,7 @@ def _build_site_photo_structured_summary(
         "safety_scene_tags": safety_scene_tags,
         "civilization_scene_tags": civilization_scene_tags,
         "quality_scene_tags": quality_scene_tags,
+        "progress_scene_tags": progress_scene_tags,
         "top_numeric_terms": top_numeric_terms,
         "structured_terms": structured_terms,
         "focused_dimensions": _limit_unique_texts(focused_dimensions, limit=6),
@@ -21557,6 +21733,9 @@ def index(
           const utilGate = (basis.material_utilization_gate && typeof basis.material_utilization_gate === 'object')
             ? basis.material_utilization_gate
             : {};
+          const basisRetrieval = (basis.material_retrieval && typeof basis.material_retrieval === 'object')
+            ? basis.material_retrieval
+            : {};
           const summary = (data.summary && typeof data.summary === 'object') ? data.summary : {};
           const recommendations = Array.isArray(data.recommendations) ? data.recommendations : [];
           const dimensionSupportCards = Array.isArray(data.dimension_support_cards) ? data.dimension_support_cards : [];
@@ -21566,6 +21745,14 @@ def index(
             ? traceSummary.source_files_hit
             : (Array.isArray(trace.source_files_hit) ? trace.source_files_hit : []);
           const gateReasons = Array.isArray(utilGate.reasons) ? utilGate.reasons : [];
+          const feedbackEvolutionPreview = Array.isArray(basisRetrieval.feedback_evolution_preview)
+            ? basisRetrieval.feedback_evolution_preview
+            : [];
+          const featureConfidencePreview = Array.isArray(basisRetrieval.feature_confidence_preview)
+            ? basisRetrieval.feature_confidence_preview
+            : [];
+          const feedbackEvolutionCount = Number(basisRetrieval.feedback_evolution_requirements || 0);
+          const featureConfidenceCount = Number(basisRetrieval.feature_confidence_requirements || 0);
           const byTypeDepth = Array.isArray(depth.by_type) ? depth.by_type : [];
           const utilByType = (util.by_type && typeof util.by_type === 'object') ? util.by_type : {};
           const utilAvailableTypes = Array.isArray(util.available_types) ? util.available_types : [];
@@ -21669,6 +21856,36 @@ def index(
               + '<td>' + escapeHtmlText(((row.suggested_keywords || []).join('、')) || '-') + '</td>'
               + '</tr>').join('');
             html += '</table></details>';
+          }
+          if (feedbackEvolutionCount > 0 || featureConfidenceCount > 0) {
+            html += '<div style="border:1px solid #cbd5e1;background:#f8fafc;border-radius:10px;padding:10px;margin:8px 0 12px 0">';
+            html += '<div style="font-weight:700;color:#0f172a;margin-bottom:6px">评分进化约束总览</div>';
+            html += '<p style="margin:4px 0;color:#334155">真实反馈驱动约束 '
+              + escapeHtmlText(feedbackEvolutionCount || 0)
+              + ' 条；高置信逻辑骨架约束 '
+              + escapeHtmlText(featureConfidenceCount || 0)
+              + ' 条。</p>';
+            if (feedbackEvolutionPreview.length) {
+              html += '<details style="margin-top:6px"><summary>进化反馈约束</summary><table><tr><th>维度</th><th>提示</th><th>倍率</th><th>样本数</th></tr>';
+              html += feedbackEvolutionPreview.slice(0, 8).map((row) => '<tr>'
+                + '<td>' + escapeHtmlText((row.dimension_id || '-') + ' ' + (row.label || '')) + '</td>'
+                + '<td>' + escapeHtmlText(((row.hints || []).join('、')) || '-') + '</td>'
+                + '<td>' + escapeHtmlText(row.multiplier != null ? String(row.multiplier) : '-') + '</td>'
+                + '<td>' + escapeHtmlText(row.sample_count != null ? String(row.sample_count) : '-') + '</td>'
+                + '</tr>').join('');
+              html += '</table></details>';
+            }
+            if (featureConfidencePreview.length) {
+              html += '<details style="margin-top:6px"><summary>高置信逻辑骨架约束</summary><table><tr><th>维度</th><th>提示</th><th>特征ID</th><th>置信度</th></tr>';
+              html += featureConfidencePreview.slice(0, 8).map((row) => '<tr>'
+                + '<td>' + escapeHtmlText((row.dimension_id || '-') + ' ' + (row.label || '')) + '</td>'
+                + '<td>' + escapeHtmlText(((row.hints || []).join('、')) || '-') + '</td>'
+                + '<td>' + escapeHtmlText(((row.feature_ids || []).join('、')) || '-') + '</td>'
+                + '<td>' + escapeHtmlText(((row.feature_confidence_scores || []).map((v) => Number(v).toFixed(2)).join('、')) || '-') + '</td>'
+                + '</tr>').join('');
+              html += '</table></details>';
+            }
+            html += '</div>';
           }
           if (typeCards.length) {
             const typeTone = (status) => {
@@ -22290,10 +22507,17 @@ def index(
             return;
           }
           const mece = (data.mece_inputs && typeof data.mece_inputs === 'object') ? data.mece_inputs : {};
+          const retrieval = (data.material_retrieval && typeof data.material_retrieval === 'object') ? data.material_retrieval : {};
           const util = (data.material_utilization && typeof data.material_utilization === 'object') ? data.material_utilization : {};
           const gate = (data.material_utilization_gate && typeof data.material_utilization_gate === 'object') ? data.material_utilization_gate : {};
           const trace = (data.evidence_trace && typeof data.evidence_trace === 'object') ? data.evidence_trace : {};
           const recommendations = Array.isArray(data.recommendations) ? data.recommendations : [];
+          const feedbackEvolutionPreview = Array.isArray(retrieval.feedback_evolution_preview)
+            ? retrieval.feedback_evolution_preview
+            : [];
+          const featureConfidencePreview = Array.isArray(retrieval.feature_confidence_preview)
+            ? retrieval.feature_confidence_preview
+            : [];
           let html = '<strong>评分依据审计（最新施组）</strong>';
           html += '<p style="margin:6px 0">文件：' + escapeHtmlText(data.filename || '-') + '；评分状态：' + escapeHtmlText(data.scoring_status || '-') + '</p>';
           html += '<table><tr><th>资料门禁</th><th>资料检索命中率</th><th>文件覆盖率</th><th>强制项命中率</th><th>命中文件数</th></tr>'
@@ -22307,6 +22531,26 @@ def index(
           const gateReasons = Array.isArray(gate.reasons) ? gate.reasons : [];
           if (gateReasons.length) {
             html += '<details style="margin-top:6px"><summary>门禁原因</summary><ul>' + gateReasons.slice(0, 8).map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('') + '</ul></details>';
+          }
+          if (feedbackEvolutionPreview.length) {
+            html += '<details style="margin-top:6px"><summary>进化反馈约束</summary><table><tr><th>维度</th><th>提示</th><th>倍率</th><th>样本数</th></tr>'
+              + feedbackEvolutionPreview.slice(0, 8).map((row) => '<tr>'
+                + '<td>' + escapeHtmlText((row.dimension_id || '-') + ' ' + (row.label || '')) + '</td>'
+                + '<td>' + escapeHtmlText(((row.hints || []).join('、')) || '-') + '</td>'
+                + '<td>' + escapeHtmlText(row.multiplier != null ? String(row.multiplier) : '-') + '</td>'
+                + '<td>' + escapeHtmlText(row.sample_count != null ? String(row.sample_count) : '-') + '</td>'
+                + '</tr>').join('')
+              + '</table></details>';
+          }
+          if (featureConfidencePreview.length) {
+            html += '<details style="margin-top:6px"><summary>高置信逻辑骨架约束</summary><table><tr><th>维度</th><th>提示</th><th>特征ID</th><th>置信度</th></tr>'
+              + featureConfidencePreview.slice(0, 8).map((row) => '<tr>'
+                + '<td>' + escapeHtmlText((row.dimension_id || '-') + ' ' + (row.label || '')) + '</td>'
+                + '<td>' + escapeHtmlText(((row.hints || []).join('、')) || '-') + '</td>'
+                + '<td>' + escapeHtmlText(((row.feature_ids || []).join('、')) || '-') + '</td>'
+                + '<td>' + escapeHtmlText(((row.feature_confidence_scores || []).map((v) => Number(v).toFixed(2)).join('、')) || '-') + '</td>'
+                + '</tr>').join('')
+              + '</table></details>';
           }
           if (recommendations.length) {
             html += '<strong>建议动作</strong><ul>' + recommendations.slice(0, 8).map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('') + '</ul>';
