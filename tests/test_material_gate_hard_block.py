@@ -46,15 +46,50 @@ def _base_cfg(block_on_any_parse_failure: bool) -> dict:
     }
 
 
+def _strong_material_knowledge() -> dict:
+    return {
+        "summary": {
+            "cross_type_consensus_score": 0.28,
+            "cross_type_consensus_type_count": 3,
+            "structured_quality_avg": 0.41,
+            "structured_quality_type_rate": 0.34,
+        },
+        "by_type": [
+            {
+                "material_type": "boq",
+                "structured_quality_score": 0.4,
+                "structured_quality_max": 0.48,
+                "structured_signal_count": 9,
+                "focused_dimensions": ["04", "11", "13"],
+            },
+            {
+                "material_type": "tender_qa",
+                "structured_quality_score": 0.39,
+                "structured_quality_max": 0.46,
+                "structured_signal_count": 7,
+                "focused_dimensions": ["01", "09", "14"],
+            },
+            {
+                "material_type": "drawing",
+                "structured_quality_score": 0.37,
+                "structured_quality_max": 0.45,
+                "structured_signal_count": 6,
+                "focused_dimensions": ["06", "12", "14"],
+            },
+        ],
+    }
+
+
 def test_material_gate_blocks_when_any_parse_failure_enabled():
     from app.main import _validate_material_gate_for_scoring
 
     snapshot = _base_snapshot()
     with patch("app.main._build_material_quality_snapshot", return_value=snapshot):
-        with patch("app.main._resolve_material_gate_config", return_value=_base_cfg(True)):
-            out, issues = _validate_material_gate_for_scoring(
-                "p1", {"meta": {}}, raise_on_fail=False
-            )
+        with patch("app.main._build_material_knowledge_profile", return_value={}):
+            with patch("app.main._resolve_material_gate_config", return_value=_base_cfg(True)):
+                out, issues = _validate_material_gate_for_scoring(
+                    "p1", {"meta": {}}, raise_on_fail=False
+                )
     gate = out.get("gate") or {}
     assert gate.get("passed") is False
     assert any("硬闸门" in str(x) for x in issues)
@@ -65,10 +100,87 @@ def test_material_gate_allows_parse_failure_when_hard_block_disabled():
 
     snapshot = _base_snapshot()
     with patch("app.main._build_material_quality_snapshot", return_value=snapshot):
-        with patch("app.main._resolve_material_gate_config", return_value=_base_cfg(False)):
-            out, issues = _validate_material_gate_for_scoring(
-                "p1", {"meta": {}}, raise_on_fail=False
-            )
+        with patch("app.main._build_material_knowledge_profile", return_value={}):
+            with patch("app.main._resolve_material_gate_config", return_value=_base_cfg(False)):
+                out, issues = _validate_material_gate_for_scoring(
+                    "p1", {"meta": {}}, raise_on_fail=False
+                )
     gate = out.get("gate") or {}
     assert gate.get("passed") is True
     assert issues == []
+
+
+def test_material_gate_adapts_numeric_threshold_when_evidence_is_strong():
+    from app.main import _validate_material_gate_for_scoring
+
+    snapshot = _base_snapshot()
+    snapshot["parsed_ok_files"] = 3
+    snapshot["parsed_failed_files"] = 0
+    snapshot["parsed_ok_by_type"] = {"tender_qa": 1, "boq": 1, "drawing": 1}
+    snapshot["parsed_fail_by_type"] = {}
+    snapshot["parse_fail_ratio"] = 0.0
+    snapshot["parsed_fail_details"] = []
+    snapshot["numeric_terms_by_type"] = {"tender_qa": 12, "boq": 6, "drawing": 6}
+    cfg = _base_cfg(False)
+    cfg["enforce_depth_gate"] = True
+    cfg["min_numeric_terms_by_type"] = {"tender_qa": 6, "boq": 8, "drawing": 4}
+
+    with patch("app.main._build_material_quality_snapshot", return_value=snapshot):
+        with patch(
+            "app.main._build_material_knowledge_profile",
+            return_value=_strong_material_knowledge(),
+        ):
+            with patch("app.main._resolve_material_gate_config", return_value=cfg):
+                out, issues = _validate_material_gate_for_scoring(
+                    "p1", {"meta": {}}, raise_on_fail=False
+                )
+    depth_gate = out.get("depth_gate") or {}
+    adjustments = depth_gate.get("adaptive_numeric_adjustments") or {}
+    assert depth_gate.get("passed") is True
+    assert issues == []
+    assert adjustments["boq"]["base_min_numeric_terms"] == 8
+    assert adjustments["boq"]["effective_min_numeric_terms"] == 6
+
+
+def test_material_gate_keeps_numeric_threshold_when_evidence_is_weak():
+    from app.main import _validate_material_gate_for_scoring
+
+    snapshot = _base_snapshot()
+    snapshot["parsed_ok_files"] = 3
+    snapshot["parsed_failed_files"] = 0
+    snapshot["parsed_ok_by_type"] = {"tender_qa": 1, "boq": 1, "drawing": 1}
+    snapshot["parsed_fail_by_type"] = {}
+    snapshot["parse_fail_ratio"] = 0.0
+    snapshot["parsed_fail_details"] = []
+    snapshot["numeric_terms_by_type"] = {"tender_qa": 12, "boq": 6, "drawing": 6}
+    cfg = _base_cfg(False)
+    cfg["enforce_depth_gate"] = True
+    cfg["min_numeric_terms_by_type"] = {"tender_qa": 6, "boq": 8, "drawing": 4}
+
+    weak_knowledge = {
+        "summary": {
+            "cross_type_consensus_score": 0.05,
+            "cross_type_consensus_type_count": 1,
+            "structured_quality_avg": 0.18,
+            "structured_quality_type_rate": 0.0,
+        },
+        "by_type": [
+            {
+                "material_type": "boq",
+                "structured_quality_score": 0.18,
+                "structured_quality_max": 0.22,
+                "structured_signal_count": 2,
+                "focused_dimensions": ["04"],
+            }
+        ],
+    }
+
+    with patch("app.main._build_material_quality_snapshot", return_value=snapshot):
+        with patch("app.main._build_material_knowledge_profile", return_value=weak_knowledge):
+            with patch("app.main._resolve_material_gate_config", return_value=cfg):
+                out, issues = _validate_material_gate_for_scoring(
+                    "p1", {"meta": {}}, raise_on_fail=False
+                )
+    depth_gate = out.get("depth_gate") or {}
+    assert depth_gate.get("passed") is False
+    assert any("清单数字约束提取不足" in str(x) for x in depth_gate.get("issues") or [])

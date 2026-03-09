@@ -7,6 +7,7 @@ import html as html_lib
 import io
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -12872,6 +12873,167 @@ def _build_material_quality_snapshot(project_id: str) -> Dict[str, object]:
     return copy.deepcopy(snapshot)
 
 
+def _compute_adaptive_numeric_term_gate(
+    project_id: str,
+    cfg: Dict[str, object],
+    snapshot: Dict[str, object],
+) -> tuple[Dict[str, int], Dict[str, Dict[str, object]], Dict[str, object]]:
+    base_numeric_map = dict(cfg.get("min_numeric_terms_by_type") or {})
+    effective_numeric_map: Dict[str, int] = {
+        _normalize_material_type(key): max(0, int(_to_float_or_none(value) or 0))
+        for key, value in base_numeric_map.items()
+        if _normalize_material_type(key)
+    }
+    adjustments: Dict[str, Dict[str, object]] = {}
+    required_types = [
+        _normalize_material_type(x)
+        for x in (cfg.get("required_types") or [])
+        if _normalize_material_type(x)
+    ]
+    if not required_types:
+        return effective_numeric_map, adjustments, {"applied": False, "summary": []}
+
+    min_chars_by_type = dict(cfg.get("min_chars_by_type") or {})
+    min_chunks_by_type = dict(cfg.get("min_chunks_by_type") or {})
+    chars_by_type = (
+        snapshot.get("chars_by_type") if isinstance(snapshot.get("chars_by_type"), dict) else {}
+    )
+    chunks_by_type = (
+        snapshot.get("chunks_by_type") if isinstance(snapshot.get("chunks_by_type"), dict) else {}
+    )
+    numeric_terms_by_type = (
+        snapshot.get("numeric_terms_by_type")
+        if isinstance(snapshot.get("numeric_terms_by_type"), dict)
+        else {}
+    )
+    counts_by_type = (
+        snapshot.get("counts_by_type") if isinstance(snapshot.get("counts_by_type"), dict) else {}
+    )
+
+    knowledge = _build_material_knowledge_profile(project_id)
+    summary = knowledge.get("summary") if isinstance(knowledge.get("summary"), dict) else {}
+    by_type = knowledge.get("by_type") if isinstance(knowledge.get("by_type"), list) else []
+    by_type_map: Dict[str, Dict[str, object]] = {}
+    for row in by_type:
+        if not isinstance(row, dict):
+            continue
+        mat_type = _normalize_material_type(row.get("material_type"))
+        if mat_type:
+            by_type_map[mat_type] = row
+
+    consensus_score = float(_to_float_or_none(summary.get("cross_type_consensus_score")) or 0.0)
+    consensus_type_count = int(
+        _to_float_or_none(summary.get("cross_type_consensus_type_count")) or 0
+    )
+    structured_quality_avg = float(_clip_score01(summary.get("structured_quality_avg")) or 0.0)
+    structured_quality_type_rate = float(
+        _clip_score01(summary.get("structured_quality_type_rate")) or 0.0
+    )
+    adaptive_summary: List[str] = []
+
+    for mat_type in required_types:
+        base_min = max(0, int(_to_float_or_none(base_numeric_map.get(mat_type)) or 0))
+        if base_min <= 0:
+            continue
+        if int(_to_float_or_none(counts_by_type.get(mat_type)) or 0) <= 0:
+            continue
+        parsed_numeric_terms = int(_to_float_or_none(numeric_terms_by_type.get(mat_type)) or 0)
+        if parsed_numeric_terms >= base_min:
+            continue
+
+        row = by_type_map.get(mat_type) or {}
+        parsed_chars = int(_to_float_or_none(chars_by_type.get(mat_type)) or 0)
+        parsed_chunks = int(_to_float_or_none(chunks_by_type.get(mat_type)) or 0)
+        min_chars = max(0, int(_to_float_or_none(min_chars_by_type.get(mat_type)) or 0))
+        min_chunks = max(0, int(_to_float_or_none(min_chunks_by_type.get(mat_type)) or 0))
+        row_quality = float(_clip_score01(row.get("structured_quality_score")) or 0.0)
+        row_quality_max = float(_clip_score01(row.get("structured_quality_max")) or 0.0)
+        row_signal_count = int(_to_float_or_none(row.get("structured_signal_count")) or 0)
+        focused_dimension_count = len(
+            [
+                dim_id
+                for dim_id in (row.get("focused_dimensions") or [])
+                if str(dim_id or "").strip().zfill(2) in DIMENSION_IDS
+            ]
+        )
+
+        relaxation = 0.0
+        reasons: List[str] = []
+        if min_chars > 0 and parsed_chars >= max(int(math.ceil(min_chars * 1.8)), min_chars + 1200):
+            relaxation += 0.10
+            reasons.append("parsed_chars_surplus")
+        if min_chunks > 0 and parsed_chunks >= max(
+            min_chunks + 2, int(math.ceil(min_chunks * 1.8))
+        ):
+            relaxation += 0.08
+            reasons.append("parsed_chunks_surplus")
+        if row_quality >= 0.35:
+            relaxation += 0.08
+            reasons.append("structured_quality_ok")
+        if row_quality_max >= 0.45:
+            relaxation += 0.04
+            reasons.append("structured_quality_peak")
+        if row_signal_count >= 6:
+            relaxation += 0.04
+            reasons.append("structured_signals_dense")
+        if focused_dimension_count >= 3:
+            relaxation += 0.03
+            reasons.append("focused_dimensions_sufficient")
+        if consensus_score >= 0.2 and consensus_type_count >= 2:
+            relaxation += 0.07
+            reasons.append("cross_material_consensus")
+        if structured_quality_avg >= 0.38:
+            relaxation += 0.04
+            reasons.append("project_structured_quality_ok")
+        if structured_quality_type_rate >= 0.34:
+            relaxation += 0.04
+            reasons.append("strong_structured_types_available")
+
+        relaxation = min(0.30, relaxation)
+        relaxed_min = max(1, int(math.ceil(base_min * (1.0 - relaxation))))
+        maximum_shortage = max(1, int(math.ceil(base_min * 0.30)))
+        shortage = base_min - parsed_numeric_terms
+
+        if (
+            relaxed_min < base_min
+            and parsed_numeric_terms >= relaxed_min
+            and shortage <= maximum_shortage
+        ):
+            effective_numeric_map[mat_type] = relaxed_min
+            adjustment = {
+                "material_type": mat_type,
+                "material_type_label": _material_type_label(mat_type),
+                "base_min_numeric_terms": base_min,
+                "effective_min_numeric_terms": relaxed_min,
+                "parsed_numeric_terms": parsed_numeric_terms,
+                "relaxation_ratio": round(relaxation, 4),
+                "reasons": reasons,
+                "consensus_score": round(consensus_score, 4),
+                "consensus_type_count": consensus_type_count,
+                "structured_quality_score": round(row_quality, 4),
+                "structured_quality_max": round(row_quality_max, 4),
+                "structured_signal_count": row_signal_count,
+                "focused_dimension_count": focused_dimension_count,
+            }
+            adjustments[mat_type] = adjustment
+            adaptive_summary.append(
+                f"{_material_type_label(mat_type)}数字约束门槛自适应调整：{base_min}→{relaxed_min}"
+            )
+
+    return (
+        effective_numeric_map,
+        adjustments,
+        {
+            "applied": bool(adjustments),
+            "summary": adaptive_summary[:8],
+            "cross_type_consensus_score": round(consensus_score, 4),
+            "cross_type_consensus_type_count": consensus_type_count,
+            "structured_quality_avg": round(structured_quality_avg, 4),
+            "structured_quality_type_rate": round(structured_quality_type_rate, 4),
+        },
+    )
+
+
 def _resolve_material_gate_config(project: Dict[str, object]) -> Dict[str, object]:
     meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
     enforce = bool(meta.get("enforce_material_gate", DEFAULT_ENFORCE_MATERIAL_GATE))
@@ -12965,6 +13127,11 @@ def _validate_material_gate_for_scoring(
 ) -> tuple[Dict[str, object], List[str]]:
     snapshot = _build_material_quality_snapshot(project_id)
     cfg = _resolve_material_gate_config(project)
+    (
+        effective_numeric_terms_map,
+        adaptive_numeric_adjustments,
+        adaptive_numeric_meta,
+    ) = _compute_adaptive_numeric_term_gate(project_id, cfg, snapshot)
     counts_by_type = snapshot.get("counts_by_type") if isinstance(snapshot, dict) else {}
     chars_by_type = snapshot.get("chars_by_type") if isinstance(snapshot, dict) else {}
     chunks_by_type = snapshot.get("chunks_by_type") if isinstance(snapshot, dict) else {}
@@ -12998,11 +13165,17 @@ def _validate_material_gate_for_scoring(
             depth_issues.append(
                 f"{label}解析分块不足：{parsed_chunks} 段（建议至少 {min_chunks} 段）"
             )
-        min_numeric_terms = int((cfg.get("min_numeric_terms_by_type") or {}).get(tpe, 0))
+        min_numeric_terms = int((effective_numeric_terms_map or {}).get(tpe, 0))
+        base_min_numeric_terms = int((cfg.get("min_numeric_terms_by_type") or {}).get(tpe, 0))
         parsed_numeric_terms = int(numeric_terms_by_type.get(tpe, 0))
         if min_numeric_terms > 0 and parsed_numeric_terms < min_numeric_terms:
+            base_suffix = (
+                f"（基础阈值 {base_min_numeric_terms} 项）"
+                if base_min_numeric_terms > min_numeric_terms
+                else ""
+            )
             depth_issues.append(
-                f"{label}数字约束提取不足：{parsed_numeric_terms} 项（建议至少 {min_numeric_terms} 项）"
+                f"{label}数字约束提取不足：{parsed_numeric_terms} 项（建议至少 {min_numeric_terms} 项）{base_suffix}"
             )
 
     total_parsed_chars = int(snapshot.get("total_parsed_chars", 0))
@@ -13060,6 +13233,9 @@ def _validate_material_gate_for_scoring(
         "required_types": required_types,
         "min_chunks_by_type": cfg.get("min_chunks_by_type", {}),
         "min_numeric_terms_by_type": cfg.get("min_numeric_terms_by_type", {}),
+        "effective_min_numeric_terms_by_type": effective_numeric_terms_map,
+        "adaptive_numeric_adjustments": adaptive_numeric_adjustments,
+        "adaptive_numeric_meta": adaptive_numeric_meta,
         "min_total_chunks": min_total_chunks,
         "issues": depth_issues,
         "passed": len(depth_issues) == 0,
