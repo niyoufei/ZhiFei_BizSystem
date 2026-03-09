@@ -2103,6 +2103,41 @@ class TestMaterialsEndpoint:
         assert by_dimension["14"]["structured_signal_hits"] > 0
         assert by_dimension["03"]["structured_signal_hits"] > 0
 
+    @patch("app.main._resolve_dwg_converter_binaries", return_value=["/usr/local/bin/dwg2dxf"])
+    @patch("app.main._now_iso", return_value="2026-02-27T00:00:00+00:00")
+    @patch("app.main.load_materials")
+    def test_build_material_knowledge_profile_includes_tender_qa_structured_signals(
+        self,
+        mock_load_materials,
+        mock_now_iso,
+        mock_dwg_bins,
+        tmp_path,
+    ):
+        from app.main import _build_material_knowledge_profile
+
+        tender_path = tmp_path / "招标答疑.txt"
+        tender_path.write_text(
+            "答疑澄清：总工期120日历天，评分办法要求BIM深化、危大工程专项方案、质量验收标准。",
+            encoding="utf-8",
+        )
+        mock_load_materials.return_value = [
+            {
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标答疑.txt",
+                "path": str(tender_path),
+                "created_at": "2026-02-26T00:00:01+00:00",
+            }
+        ]
+
+        payload = _build_material_knowledge_profile("p1")
+        by_type = {row["material_type"]: row for row in payload["by_type"]}
+        assert by_type["tender_qa"]["structured_signal_count"] > 0
+        assert "工期/里程碑" in (by_type["tender_qa"]["structured_terms_preview"] or [])
+        assert "09" in (by_type["tender_qa"]["focused_dimensions"] or [])
+        by_dimension = {row["dimension_id"]: row for row in payload["by_dimension"]}
+        assert by_dimension["09"]["structured_signal_hits"] > 0
+
     @patch("app.main.save_materials")
     @patch("app.main.load_materials")
     @patch("app.main.load_projects")
@@ -2698,6 +2733,25 @@ class TestMaterialAdvancedParsing:
         assert "13" in (summary.get("focused_dimensions") or [])
         assert "11" in (summary.get("focused_dimensions") or [])
 
+    def test_build_tender_qa_structured_summary_extracts_constraint_tags(self):
+        from app.main import _build_tender_qa_structured_summary
+
+        parsed_text = (
+            "招标范围包含装修及机电改造，答疑澄清明确总工期120日历天。"
+            "评分办法要求体现BIM深化、危大工程专项方案、绿色施工与质量验收标准。"
+        )
+        summary = _build_tender_qa_structured_summary(
+            b"TENDERDATA",
+            "招标答疑.pdf",
+            parsed_text=parsed_text,
+        )
+        assert "工期/里程碑" in (summary.get("constraint_tags") or [])
+        assert "信息化/BIM" in (summary.get("constraint_tags") or [])
+        assert "危大工程/专项方案" in (summary.get("constraint_tags") or [])
+        assert "120" in (summary.get("top_numeric_terms") or [])
+        assert "09" in (summary.get("focused_dimensions") or [])
+        assert "05" in (summary.get("focused_dimensions") or [])
+
     def test_build_drawing_structured_summary_extracts_structured_signals(self):
         from app.main import _build_drawing_structured_summary
 
@@ -2739,6 +2793,31 @@ class TestMaterialAdvancedParsing:
         assert "夜间施工" in (summary.get("progress_scene_tags") or [])
         assert "03" in (summary.get("focused_dimensions") or [])
         assert "09" in (summary.get("focused_dimensions") or [])
+
+    @patch("app.main.load_materials")
+    def test_merge_materials_text_includes_tender_structured_summary(
+        self, mock_load_materials, tmp_path
+    ):
+        from app.main import _merge_materials_text
+
+        tender_path = tmp_path / "招标答疑.txt"
+        tender_path.write_text(
+            "答疑澄清：总工期120日历天，评分办法要求BIM深化和专项方案。",
+            encoding="utf-8",
+        )
+        mock_load_materials.return_value = [
+            {
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标答疑.txt",
+                "path": str(tender_path),
+                "created_at": "2026-02-26T00:00:01+00:00",
+            }
+        ]
+
+        merged = _merge_materials_text("p1")
+        assert "[招标答疑结构化摘要]" in merged
+        assert "工期/里程碑" in merged
 
     @patch("app.main.shutil.which")
     def test_read_uploaded_file_content_dwg_uses_preprocess_chain(self, mock_which):

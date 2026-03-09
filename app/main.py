@@ -562,7 +562,13 @@ def _build_project_material_index(project_id: str) -> Dict[str, object]:
                     "lexical_terms": lexical_terms,
                 }
             )
-            if mat_type == "boq":
+            if mat_type == "tender_qa":
+                entry["tender_qa_structured_summary"] = _build_tender_qa_structured_summary(
+                    content,
+                    p.name,
+                    parsed_text=text_value,
+                )
+            elif mat_type == "boq":
                 entry["boq_structured_summary"] = _build_boq_structured_summary(
                     content,
                     p.name,
@@ -10660,6 +10666,18 @@ BOQ_STRUCTURE_HINTS: Dict[str, List[str]] = {
     "措施项目/抢工": ["措施项目", "脚手架", "模板", "垂直运输", "二次搬运", "夜间施工", "抢工"],
 }
 
+TENDER_QA_CONSTRAINT_HINTS: Dict[str, List[str]] = {
+    "招标范围/界面": ["招标范围", "承包范围", "界面", "工作内容", "施工范围", "实施范围"],
+    "答疑/补遗/澄清": ["答疑", "补遗", "澄清", "变更", "补充通知", "修正", "更正"],
+    "工期/里程碑": ["工期", "节点", "里程碑", "开工", "竣工", "总工期", "日历天"],
+    "质量目标/验收标准": ["质量目标", "质量标准", "验收", "创优", "样板", "合格标准"],
+    "安全文明/绿色": ["安全文明", "绿色施工", "文明施工", "扬尘", "围挡", "环保"],
+    "信息化/BIM": ["信息化", "bim", "智慧工地", "数字化", "综合管线", "碰撞"],
+    "危大工程/专项方案": ["危大工程", "专项方案", "支护", "吊装", "脚手架", "监测", "应急预案"],
+    "评审办法/评分点": ["评分", "评审", "打分", "评标", "得分点", "评分办法", "否决项"],
+    "材料设备/甲供界面": ["甲供", "甲指", "设备", "材料", "品牌", "暂估价", "限价"],
+}
+
 
 def _limit_unique_texts(raw_items: List[object], *, limit: int = 12) -> List[str]:
     out: List[str] = []
@@ -10857,6 +10875,65 @@ def _build_numeric_anchor_category_summary(
             preview += " 等"
         summary.append(f"{label}：{preview}")
     return summary[:8]
+
+
+def _build_tender_qa_structured_summary(
+    content: bytes,
+    filename: str,
+    *,
+    parsed_text: str = "",
+) -> Dict[str, object]:
+    text = str(parsed_text or "")
+    corpus = f"{filename}\n{text}"
+    constraint_tags = _collect_keyword_labels(corpus, TENDER_QA_CONSTRAINT_HINTS, limit=8)
+    text_terms = _filter_structured_signal_terms(
+        _extract_terms(corpus, max_terms=24),
+        limit=18,
+    )
+    top_numeric_terms = _limit_unique_numeric_tokens(
+        _extract_numeric_terms(text, max_terms=16),
+        limit=10,
+    )
+    focused_dimensions = ["01", "08", "09"]
+    if "招标范围/界面" in constraint_tags:
+        focused_dimensions.extend(["01", "12"])
+    if "答疑/补遗/澄清" in constraint_tags:
+        focused_dimensions.extend(["01", "14"])
+    if "工期/里程碑" in constraint_tags:
+        focused_dimensions.append("09")
+    if "质量目标/验收标准" in constraint_tags:
+        focused_dimensions.extend(["08", "16"])
+    if "安全文明/绿色" in constraint_tags:
+        focused_dimensions.extend(["02", "03"])
+    if "信息化/BIM" in constraint_tags:
+        focused_dimensions.extend(["05", "14"])
+    if "危大工程/专项方案" in constraint_tags:
+        focused_dimensions.extend(["07", "10"])
+    if "评审办法/评分点" in constraint_tags:
+        focused_dimensions.extend(["01", "16"])
+    if "材料设备/甲供界面" in constraint_tags:
+        focused_dimensions.extend(["04", "13", "15"])
+    structured_terms = _filter_structured_signal_terms(
+        constraint_tags + text_terms,
+        limit=18,
+    )
+    constraint_density = round(
+        (
+            float(len(structured_terms) + len(top_numeric_terms))
+            / max(1.0, float(max(1, len(text.strip())) / 180.0))
+        ),
+        4,
+    )
+    return {
+        "filename": filename,
+        "detected_format": Path(filename).suffix.lower().lstrip("."),
+        "bytes": len(content or b""),
+        "constraint_tags": constraint_tags,
+        "structured_terms": structured_terms,
+        "top_numeric_terms": top_numeric_terms,
+        "focused_dimensions": _limit_unique_texts(focused_dimensions, limit=10),
+        "constraint_density": constraint_density,
+    }
 
 
 def _finalize_boq_structured_summary(
@@ -11459,7 +11536,19 @@ def _merge_materials_text(project_id: str) -> str:
                 )
                 continue
             section_block = f"--- {filename} ({created_at}) ---\n{text}"
-            if mat_type == "boq":
+            if mat_type == "tender_qa":
+                tender_struct = (
+                    row.get("tender_qa_structured_summary")
+                    if isinstance(row.get("tender_qa_structured_summary"), dict)
+                    else {}
+                )
+                if tender_struct:
+                    section_block = (
+                        section_block
+                        + "\n\n[招标答疑结构化摘要]\n"
+                        + json.dumps(tender_struct, ensure_ascii=False)
+                    )
+            elif mat_type == "boq":
                 boq_struct = (
                     row.get("boq_structured_summary")
                     if isinstance(row.get("boq_structured_summary"), dict)
@@ -12777,7 +12866,13 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         by_type_term_counter[mat_type].update(lexical_terms)
 
         structured_summary: Dict[str, object] = {}
-        if mat_type == "boq":
+        if mat_type == "tender_qa":
+            structured_summary = (
+                row.get("tender_qa_structured_summary")
+                if isinstance(row.get("tender_qa_structured_summary"), dict)
+                else {}
+            )
+        elif mat_type == "boq":
             structured_summary = (
                 row.get("boq_structured_summary")
                 if isinstance(row.get("boq_structured_summary"), dict)
