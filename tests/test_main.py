@@ -58,12 +58,18 @@ class TestScoreSelfAwareness:
         material_knowledge_snapshot = {
             "summary": {
                 "dimension_coverage_rate": 0.81,
+                "structured_signal_total": 22,
                 "numeric_category_summary": [
                     "工期/节点：90",
                     "规格/参数：1200",
                     "阈值/偏差：48",
                 ],
-            }
+            },
+            "by_type": [
+                {"material_type": "tender_qa", "files": 1, "structured_signal_count": 8},
+                {"material_type": "drawing", "files": 1, "structured_signal_count": 7},
+                {"material_type": "boq", "files": 1, "structured_signal_count": 7},
+            ],
         }
 
         out = _build_score_self_awareness(
@@ -75,6 +81,8 @@ class TestScoreSelfAwareness:
         assert out["score_0_1"] >= 0.72
         assert out["dimension_coverage_rate"] == pytest.approx(0.81, abs=1e-6)
         assert out["source_files_hit_count"] == 3
+        assert out["structured_signal_total"] == 22
+        assert out["structured_type_coverage_rate"] == pytest.approx(1.0, abs=1e-6)
 
     def test_build_score_self_awareness_forces_low_when_material_gate_blocked(self):
         report = {
@@ -131,6 +139,44 @@ class TestScoreSelfAwareness:
 
         assert out["material_dimension_hit_rate"] == pytest.approx(1.0, abs=1e-6)
         assert report["meta"]["material_utilization"]["material_dimension_total"] == 1
+
+    def test_build_score_self_awareness_penalizes_weak_structured_material_signals(self):
+        report = {
+            "meta": {
+                "material_utilization": {
+                    "retrieval_file_coverage_rate": 0.78,
+                    "retrieval_hit_rate": 0.64,
+                    "material_dimension_hit_rate": 0.66,
+                },
+                "material_utilization_gate": {"blocked": False, "warned": False},
+                "evidence_trace": {
+                    "mandatory_hit_rate": 0.68,
+                    "source_files_hit_count": 2,
+                },
+            }
+        }
+        material_knowledge_snapshot = {
+            "summary": {
+                "dimension_coverage_rate": 0.6,
+                "structured_signal_total": 1,
+                "numeric_category_summary": ["工期/节点：90"],
+            },
+            "by_type": [
+                {"material_type": "tender_qa", "files": 1, "structured_signal_count": 1},
+                {"material_type": "drawing", "files": 1, "structured_signal_count": 0},
+                {"material_type": "boq", "files": 1, "structured_signal_count": 0},
+            ],
+        }
+
+        out = _build_score_self_awareness(
+            report,
+            material_knowledge_snapshot=material_knowledge_snapshot,
+        )
+
+        assert out["level"] in {"low", "medium"}
+        assert out["structured_signal_total"] == 1
+        assert out["structured_type_coverage_rate"] == pytest.approx(0.3333, abs=1e-6)
+        assert any("结构化资料信号偏弱" in reason for reason in out["reasons"])
 
 
 class TestIndexEndpoint:

@@ -5887,6 +5887,12 @@ def _build_score_self_awareness(
         and isinstance(material_knowledge_snapshot.get("summary"), dict)
         else {}
     )
+    knowledge_by_type = (
+        material_knowledge_snapshot.get("by_type")
+        if isinstance(material_knowledge_snapshot, dict)
+        and isinstance(material_knowledge_snapshot.get("by_type"), list)
+        else []
+    )
     pred_confidence = (
         report.get("pred_confidence") if isinstance(report.get("pred_confidence"), dict) else {}
     )
@@ -5910,6 +5916,34 @@ def _build_score_self_awareness(
             if str(item or "").strip()
         ]
     )
+    structured_signal_total = int(
+        _to_float_or_none(knowledge_summary.get("structured_signal_total")) or 0
+    )
+    structured_type_rows = [row for row in knowledge_by_type if isinstance(row, dict)]
+    available_structured_types = [
+        row for row in structured_type_rows if int(_to_float_or_none(row.get("files")) or 0) > 0
+    ]
+    strong_structured_types = [
+        row
+        for row in available_structured_types
+        if int(_to_float_or_none(row.get("structured_signal_count")) or 0) > 0
+    ]
+    structured_type_coverage_rate = (
+        max(
+            0.0,
+            min(
+                1.0,
+                float(len(strong_structured_types)) / float(len(available_structured_types)),
+            ),
+        )
+        if available_structured_types
+        else None
+    )
+    structured_signal_score = (
+        max(0.0, min(1.0, float(structured_signal_total) / 24.0))
+        if structured_signal_total > 0 or available_structured_types
+        else None
+    )
 
     source_file_signal = min(1.0, float(source_files_hit_count) / 3.0)
     numeric_cluster_signal = min(1.0, float(numeric_category_count) / 4.0)
@@ -5920,7 +5954,9 @@ def _build_score_self_awareness(
         (0.12, material_dimension_hit_rate, "资料维度约束命中率"),
         (0.20, mandatory_hit_rate, "强制项命中率"),
         (0.20, dimension_coverage_rate, "维度覆盖率"),
-        (0.06, source_file_signal, "命中文件广度"),
+        (0.06, structured_signal_score, "结构化资料信号"),
+        (0.04, structured_type_coverage_rate, "结构化资料类型覆盖"),
+        (0.04, source_file_signal, "命中文件广度"),
         (0.04, numeric_cluster_signal, "数值约束簇"),
     ]
     available_weight = sum(weight for weight, value, _ in weighted_metrics if value is not None)
@@ -5970,6 +6006,13 @@ def _build_score_self_awareness(
         reasons.append(f"强制项命中率偏低（{mandatory_hit_rate * 100:.1f}%）")
     if dimension_coverage_rate is not None and dimension_coverage_rate < 0.45:
         reasons.append(f"资料支撑维度覆盖率偏低（{dimension_coverage_rate * 100:.1f}%）")
+    if structured_signal_score is not None and structured_signal_score < 0.35:
+        reasons.append(f"结构化资料信号偏弱（{structured_signal_total}）")
+    if structured_type_coverage_rate is not None and structured_type_coverage_rate < 0.5:
+        reasons.append(
+            "具备结构化证据的资料类型不足"
+            f"（{len(strong_structured_types)}/{len(available_structured_types)}）"
+        )
     if source_files_hit_count <= 0:
         reasons.append("尚未形成有效命中文件")
     if numeric_category_count <= 0:
@@ -6000,6 +6043,17 @@ def _build_score_self_awareness(
         "material_dimension_hit_rate": material_dimension_hit_rate,
         "mandatory_hit_rate": mandatory_hit_rate,
         "dimension_coverage_rate": dimension_coverage_rate,
+        "structured_signal_total": structured_signal_total,
+        "structured_signal_score": (
+            round(float(structured_signal_score), 4)
+            if structured_signal_score is not None
+            else None
+        ),
+        "structured_type_coverage_rate": (
+            round(float(structured_type_coverage_rate), 4)
+            if structured_type_coverage_rate is not None
+            else None
+        ),
         "source_files_hit_count": source_files_hit_count,
         "numeric_category_count": numeric_category_count,
         "calibrator_sigma": round(float(sigma), 4) if sigma is not None else None,
