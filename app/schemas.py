@@ -253,6 +253,43 @@ class MaterialRecord(BaseModel):
     filename: str
     path: str
     created_at: str
+    parse_status: Optional[str] = None
+    parse_backend: Optional[str] = None
+    parse_confidence: Optional[float] = None
+    parse_error_class: Optional[str] = None
+    parse_error_message: Optional[str] = None
+    parse_started_at: Optional[str] = None
+    parse_finished_at: Optional[str] = None
+    parse_version: Optional[str] = None
+    structured_summary: Optional[Dict[str, Any]] = None
+    job_id: Optional[str] = None
+
+
+class MaterialParseJobRecord(BaseModel):
+    id: str
+    material_id: str
+    project_id: str
+    material_type: str
+    filename: str
+    status: str
+    attempt: int = 0
+    parse_backend: Optional[str] = None
+    next_retry_at: Optional[str] = None
+    created_at: str
+    updated_at: str
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    error_class: Optional[str] = None
+    error_message: Optional[str] = None
+    parse_confidence: Optional[float] = None
+
+
+class MaterialParseStatusResponse(BaseModel):
+    project_id: str
+    summary: Dict[str, Any] = Field(default_factory=dict)
+    jobs: List[MaterialParseJobRecord] = Field(default_factory=list)
+    materials: List[MaterialRecord] = Field(default_factory=list)
+    generated_at: str
 
 
 class ExpertProfileRecord(BaseModel):

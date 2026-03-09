@@ -77,6 +77,8 @@ def test_auto_update_feature_confidence_normalizes_five_scale_scores() -> None:
     assert out["applied_feature_ids"] == ["F-1", "F-2"]
     assert out["applied_dimension_ids"] == ["09", "14"]
     assert abs(out["delta_score_100"] - 4.0) < 1e-6
+    assert 0.0 < out["time_decay_weight"] <= 1.0
+    assert out["positive_or_negative_feedback"] == "positive"
     kwargs = mock_update.call_args.kwargs
     assert kwargs["applied_feature_ids"] == ["F-1", "F-2"]
     assert abs(kwargs["actual_score"] - 84.0) < 1e-6

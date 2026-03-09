@@ -258,6 +258,7 @@ class TestIndexEndpoint:
         assert 'id="shigongGateSummary"' in response.text
         assert 'id="scoringBasisResult"' in response.text
         assert 'id="scoringDiagnosticResult"' in response.text
+        assert "解析状态" in response.text
         assert 'id="groundTruthSubmissionSelect"' in response.text
         assert 'id="groundTruthFile"' not in response.text
         assert "/ground_truth/from_submission" in response.text
@@ -335,6 +336,10 @@ class TestIndexEndpoint:
         assert "function materialTypeUploadAnchor" in page
         assert "function applyMaterialUploadZoneHighlights" in page
         assert "function clearMaterialUploadZoneHighlights" in page
+        assert "function clearMaterialParsePolling" in page
+        assert "function applyMaterialParseZoneState" in page
+        assert "function scheduleMaterialParsePolling" in page
+        assert "/materials/parse_status" in page
         assert "资料提取锚点：" in page
         assert "资料锚点类别：" in page
         assert "命中证据：" in page
@@ -1232,6 +1237,9 @@ class TestMaterialsEndpoint:
         data = response.json()
         assert data["status"] == "ok"
         assert "material" in data
+        assert data["material"]["parse_status"] == "queued"
+        assert data["parse_job"]["status"] == "queued"
+        assert data["constraint_sync"]["mode"] == "async_parse_pending"
 
     @patch("app.main.save_materials")
     @patch("app.main.load_materials")
@@ -1340,6 +1348,110 @@ class TestMaterialsEndpoint:
         assert data["project_id"] == "p1"
         assert data["gate"]["passed"] is True
         mock_material_gate.assert_called_once()
+
+    @patch("app.main.load_material_parse_jobs")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_material_parse_status_success(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        mock_load_jobs,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1"}]
+        mock_load_materials.return_value = [
+            {
+                "id": "m1",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件.pdf",
+                "path": "/tmp/招标文件.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "processing",
+                "parse_backend": "gpt-5.4-vision",
+                "parse_confidence": 0.81,
+                "job_id": "j1",
+            }
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j1",
+                "material_id": "m1",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件.pdf",
+                "status": "processing",
+                "parse_backend": "gpt-5.4-vision",
+                "attempt": 1,
+            }
+        ]
+
+        response = client.get("/api/v1/projects/p1/materials/parse_status")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["summary"]["materials_total"] == 1
+        assert data["summary"]["queued_materials"] == 1
+        assert data["summary"]["backlog"] == 1
+        assert data["jobs"][0]["status"] == "processing"
+        assert data["materials"][0]["parse_backend"] == "queued"
+
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.save_materials")
+    @patch("app.main.load_material_parse_jobs")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_reparse_project_materials_requeues_and_clears_errors(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        mock_load_jobs,
+        mock_save_materials,
+        mock_save_jobs,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1"}]
+        mock_load_materials.return_value = [
+            {
+                "id": "m1",
+                "project_id": "p1",
+                "material_type": "drawing",
+                "filename": "总图.dxf",
+                "path": "/tmp/总图.dxf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "failed",
+                "parse_backend": "local",
+                "parse_error_class": "ocr_failed",
+                "parse_error_message": "empty_result",
+                "job_id": "j-old",
+            }
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-old",
+                "material_id": "m1",
+                "project_id": "p1",
+                "material_type": "drawing",
+                "filename": "总图.dxf",
+                "status": "failed",
+                "attempt": 2,
+            }
+        ]
+
+        response = client.post("/api/v1/projects/p1/materials/reparse")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["summary"]["queued_materials"] == 1
+        saved_rows = mock_save_materials.call_args[0][0]
+        assert saved_rows[0]["parse_status"] == "queued"
+        assert saved_rows[0]["parse_error_message"] is None
+        assert mock_save_jobs.called is True
 
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
@@ -4664,6 +4776,15 @@ class TestEvidenceTraceEndpoints:
                     "status": "active",
                     "status_label": "已参与评分",
                     "files": 1,
+                    "parse_status_counts": {"parsed": 2},
+                    "queued_count": 0,
+                    "processing_count": 0,
+                    "parsed_count": 2,
+                    "failed_count": 0,
+                    "parse_backend_summary": ["GPT-5.4×2"],
+                    "parse_confidence_avg": 0.86,
+                    "parse_confidence_max": 0.93,
+                    "parse_error_preview": [],
                     "parsed_chars": 12000,
                     "parsed_chunks": 12,
                     "numeric_terms": 8,
@@ -4767,9 +4888,26 @@ class TestEvidenceTraceEndpoints:
                 "material_low_coverage_dimensions": 6,
                 "material_covered_dimensions": 10,
                 "material_numeric_category_summary": ["工期/节点：90", "规格/参数：1200"],
+                "parse_job_summary": {
+                    "total_jobs": 2,
+                    "status_counts": {"parsed": 2},
+                    "backlog": 0,
+                    "failed_jobs": 0,
+                    "gpt_jobs": 2,
+                    "gpt_ratio": 1.0,
+                },
+                "parse_total_jobs": 2,
+                "parse_backlog": 0,
+                "parse_failed_jobs": 0,
+                "parse_gpt_ratio": 1.0,
+                "parsed_materials": 2,
+                "queued_materials": 0,
+                "processing_materials": 0,
+                "failed_materials": 0,
                 "current_weights_source": "evolution",
                 "current_feedback_evolution_requirements": 1,
                 "current_feature_confidence_requirements": 1,
+                "recent_feedback_context_active": True,
             },
             "recommendations": ["补充图纸中的设备型号锚点。"],
         }
@@ -4803,6 +4941,10 @@ class TestEvidenceTraceEndpoints:
         )
         assert len(data["material_type_cards"]) == 1
         assert data["material_type_cards"][0]["status"] == "active"
+        assert data["material_type_cards"][0]["parse_backend_summary"] == ["GPT-5.4×2"]
+        assert data["material_type_cards"][0]["parse_confidence_avg"] == pytest.approx(
+            0.86, abs=1e-6
+        )
         assert data["material_type_cards"][0]["uploaded_filenames"] == [
             "招标文件.pdf",
             "答疑纪要.docx",
@@ -4831,6 +4973,9 @@ class TestEvidenceTraceEndpoints:
         assert data["dimension_support_cards"][1]["coverage_level"] == "low"
         assert data["summary"]["material_dimension_coverage_rate"] == pytest.approx(0.625, abs=1e-6)
         assert data["summary"]["material_low_coverage_dimensions"] == 6
+        assert data["summary"]["parse_total_jobs"] == 2
+        assert data["summary"]["parse_gpt_ratio"] == pytest.approx(1.0, abs=1e-6)
+        assert data["summary"]["recent_feedback_context_active"] is True
 
     @patch("app.main._build_project_scoring_diagnostic")
     @patch("app.main.load_projects")
@@ -6087,6 +6232,9 @@ class TestSystemSelfCheckCapabilities:
         assert payload["checks"]["parser_pdf"] is True
         assert payload["summary"]["parser_capability_total"] == 4
         assert payload["summary"]["data_hygiene_orphan_records"] == 0
+        assert "openai_api_available" in payload["checks"]
+        assert "parse_job_summary" in payload["summary"]
+        assert "structured_summary_schema_ok" in payload["summary"]
 
     @patch(
         "app.main._build_data_hygiene_report",
@@ -6116,9 +6264,10 @@ class TestSystemSelfCheckCapabilities:
         assert payload.get("required_ok") is True
         assert payload.get("degraded") is True
         assert payload.get("failed_required_count") == 0
-        assert payload.get("failed_optional_count") == 1
+        assert payload.get("failed_optional_count") >= 1
         assert payload["checks"]["parser_dwg_converter"] is False
         assert "parser_dwg_converter" in payload["summary"]["failed_optional_items"]
+        assert "openai_api_available" in payload["checks"]
         items = payload.get("items") or []
         dwg_item = next((x for x in items if x.get("name") == "parser_dwg_converter"), {})
         assert dwg_item.get("ok") is False

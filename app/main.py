@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import unicodedata
 from collections import Counter
 from datetime import datetime, timezone
@@ -116,6 +117,11 @@ from app.engine.history import (
 from app.engine.insights import build_project_insights
 from app.engine.learning import build_learning_profile
 from app.engine.llm_evolution import enhance_evolution_report_with_llm, get_llm_backend_status
+from app.engine.openai_compat import (
+    call_openai_multimodal_json,
+    get_openai_api_key,
+    get_openai_model,
+)
 from app.engine.reflection import (
     build_calibration_samples,
     build_delta_cases,
@@ -175,6 +181,8 @@ from app.schemas import (
     MaterialDepthReportResponse,
     MaterialKnowledgeProfileMarkdownResponse,
     MaterialKnowledgeProfileResponse,
+    MaterialParseJobRecord,
+    MaterialParseStatusResponse,
     MaterialRecord,
     PatchDeploymentRecord,
     PatchDeployRequest,
@@ -221,6 +229,7 @@ from app.storage import (
     load_expert_profiles,
     load_ground_truth,
     load_learning_profiles,
+    load_material_parse_jobs,
     load_materials,
     load_patch_deployments,
     load_patch_packages,
@@ -240,6 +249,7 @@ from app.storage import (
     save_expert_profiles,
     save_ground_truth,
     save_learning_profiles,
+    save_material_parse_jobs,
     save_materials,
     save_patch_deployments,
     save_patch_packages,
@@ -352,6 +362,10 @@ DEFAULT_MIN_UPLOADED_TYPE_COVERAGE_RATE = 1.0
 DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR = 200
 DEFAULT_PDF_OCR_MAX_PAGES = 30
 DEFAULT_MATERIAL_INDEX_CACHE_SIZE = 12
+DEFAULT_MATERIAL_PARSE_VERSION = "v3-gpt-async"
+DEFAULT_MATERIAL_PARSE_JOB_POLL_SECONDS = 1.0
+DEFAULT_MATERIAL_PARSE_MAX_ATTEMPTS = 3
+DEFAULT_MATERIAL_PARSE_BACKLOG_WARN = 18
 DEFAULT_CALIBRATION_MIN_SAMPLES = 20
 DEFAULT_CALIBRATION_FRESHNESS_DAYS = 90
 DEFAULT_CALIBRATION_MIN_RECENT_RATIO = 0.6
@@ -403,6 +417,9 @@ DEFAULT_CHAPTER_REQUIREMENTS = {
 _MATERIAL_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
 _MATERIAL_INDEX_CACHE_ORDER: List[str] = []
 _MATERIAL_INDEX_CACHE_LOCK = threading.RLock()
+_MATERIAL_PARSE_STATE_LOCK = threading.RLock()
+_MATERIAL_PARSE_STOP_EVENT = threading.Event()
+_MATERIAL_PARSE_WORKER: Optional[threading.Thread] = None
 
 
 def _material_row_cache_token(row: Dict[str, object]) -> Dict[str, object]:
@@ -462,6 +479,228 @@ def _invalidate_material_index_cache(project_id: Optional[str] = None) -> None:
             _MATERIAL_INDEX_CACHE_ORDER.remove(project_id)
 
 
+def _default_material_parse_state(material_type: str, *, path: str = "") -> Dict[str, object]:
+    has_path = bool(str(path or "").strip())
+    return {
+        "parse_status": "queued" if has_path else "failed",
+        "parse_backend": "queued" if has_path else "none",
+        "parse_confidence": 0.0,
+        "parse_error_class": None if has_path else "missing_path",
+        "parse_error_message": None if has_path else "missing_path",
+        "parse_started_at": None,
+        "parse_finished_at": None,
+        "parse_version": DEFAULT_MATERIAL_PARSE_VERSION,
+        "structured_summary": None,
+        "job_id": None,
+        "parsed_text": "",
+        "parsed_chars": 0,
+        "parsed_chunks": [],
+        "numeric_terms_norm": [],
+        "lexical_terms": [],
+        "updated_at": _now_iso(),
+    }
+
+
+def _normalize_material_row_for_parse(row: Dict[str, object]) -> tuple[Dict[str, object], bool]:
+    normalized = dict(row)
+    changed = False
+    filename = str(normalized.get("filename") or "")
+    material_type = _normalize_material_type(normalized.get("material_type"), filename=filename)
+    if str(normalized.get("material_type") or "") != material_type:
+        normalized["material_type"] = material_type
+        changed = True
+    defaults = _default_material_parse_state(material_type, path=str(normalized.get("path") or ""))
+    for key, value in defaults.items():
+        if key not in normalized:
+            normalized[key] = value
+            changed = True
+    if str(normalized.get("parse_status") or "") == "processing":
+        normalized["parse_status"] = "queued"
+        normalized["parse_backend"] = "queued"
+        normalized["parse_error_class"] = "worker_recovered"
+        normalized["parse_error_message"] = "worker_recovered"
+        normalized["parse_started_at"] = None
+        normalized["updated_at"] = _now_iso()
+        changed = True
+    return normalized, changed
+
+
+def _normalize_material_parse_job(job: Dict[str, object]) -> tuple[Dict[str, object], bool]:
+    normalized = dict(job)
+    changed = False
+    now = _now_iso()
+    defaults: Dict[str, object] = {
+        "status": "queued",
+        "attempt": 0,
+        "parse_backend": None,
+        "next_retry_at": None,
+        "created_at": now,
+        "updated_at": now,
+        "started_at": None,
+        "finished_at": None,
+        "error_class": None,
+        "error_message": None,
+        "parse_confidence": 0.0,
+    }
+    for key, value in defaults.items():
+        if key not in normalized:
+            normalized[key] = value
+            changed = True
+    return normalized, changed
+
+
+def _ensure_material_parse_job(
+    jobs: List[Dict[str, object]],
+    material_row: Dict[str, object],
+    *,
+    force_requeue: bool = False,
+) -> tuple[List[Dict[str, object]], Optional[str], bool]:
+    material_id = str(material_row.get("id") or "").strip()
+    if not material_id:
+        return jobs, None, False
+    latest_job: Optional[Dict[str, object]] = None
+    for job in jobs:
+        if str(job.get("material_id") or "") != material_id:
+            continue
+        if latest_job is None or str(job.get("created_at") or "") > str(
+            latest_job.get("created_at") or ""
+        ):
+            latest_job = job
+    if latest_job and not force_requeue:
+        status = str(latest_job.get("status") or "")
+        if status in {"queued", "processing", "parsed"}:
+            return jobs, str(latest_job.get("id") or ""), False
+
+    job_id = str(uuid4())
+    now = _now_iso()
+    job = {
+        "id": job_id,
+        "material_id": material_id,
+        "project_id": str(material_row.get("project_id") or ""),
+        "material_type": _normalize_material_type(
+            material_row.get("material_type"), filename=material_row.get("filename")
+        ),
+        "filename": str(material_row.get("filename") or ""),
+        "status": "queued",
+        "attempt": 0,
+        "parse_backend": None,
+        "next_retry_at": None,
+        "created_at": now,
+        "updated_at": now,
+        "started_at": None,
+        "finished_at": None,
+        "error_class": None,
+        "error_message": None,
+        "parse_confidence": 0.0,
+    }
+    jobs.append(job)
+    return jobs, job_id, True
+
+
+def _bootstrap_material_parse_state() -> Dict[str, int]:
+    materials = load_materials()
+    jobs = load_material_parse_jobs()
+    materials_changed = False
+    jobs_changed = False
+    queued_count = 0
+    for idx, row in enumerate(materials):
+        normalized, row_changed = _normalize_material_row_for_parse(row)
+        job_id = str(normalized.get("job_id") or "")
+        created = False
+        if str(normalized.get("parse_status") or "") != "parsed":
+            force_requeue = row_changed or str(normalized.get("parse_status") or "") in {
+                "queued",
+                "failed",
+            }
+            jobs, job_id, created = _ensure_material_parse_job(
+                jobs,
+                normalized,
+                force_requeue=force_requeue,
+            )
+            if created:
+                normalized["job_id"] = job_id
+                normalized["parse_status"] = "queued"
+                normalized["parse_backend"] = "queued"
+                normalized["updated_at"] = _now_iso()
+                jobs_changed = True
+                queued_count += 1
+                row_changed = True
+        if row_changed:
+            materials[idx] = normalized
+            materials_changed = True
+    normalized_jobs: List[Dict[str, object]] = []
+    for job in jobs:
+        normalized_job, job_changed = _normalize_material_parse_job(job)
+        normalized_jobs.append(normalized_job)
+        jobs_changed = jobs_changed or job_changed
+    if materials_changed:
+        save_materials(materials)
+    if jobs_changed:
+        save_material_parse_jobs(normalized_jobs)
+    return {
+        "materials_changed": int(materials_changed),
+        "jobs_changed": int(jobs_changed),
+        "queued_count": int(queued_count),
+    }
+
+
+def _build_material_parse_jobs_summary(
+    project_id: Optional[str] = None,
+) -> tuple[List[Dict[str, object]], Dict[str, object]]:
+    jobs = load_material_parse_jobs()
+    filtered: List[Dict[str, object]] = []
+    status_counts: Dict[str, int] = {}
+    backlog = 0
+    failure_count = 0
+    gpt_jobs = 0
+    for job in jobs:
+        normalized, _ = _normalize_material_parse_job(job)
+        if project_id and str(normalized.get("project_id") or "") != str(project_id):
+            continue
+        filtered.append(normalized)
+        status = str(normalized.get("status") or "queued")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if status in {"queued", "processing"}:
+            backlog += 1
+        if status == "failed":
+            failure_count += 1
+        if str(normalized.get("parse_backend") or "").startswith("gpt"):
+            gpt_jobs += 1
+    total_jobs = len(filtered)
+    return filtered, {
+        "total_jobs": total_jobs,
+        "status_counts": status_counts,
+        "backlog": backlog,
+        "failed_jobs": failure_count,
+        "gpt_jobs": gpt_jobs,
+        "gpt_ratio": round(float(gpt_jobs) / float(total_jobs), 4) if total_jobs > 0 else 0.0,
+    }
+
+
+def _material_parse_status_label(
+    parse_status: Optional[str],
+    *,
+    parse_backend: Optional[str] = None,
+    parse_error_message: Optional[str] = None,
+) -> str:
+    status = str(parse_status or "").strip().lower()
+    backend = str(parse_backend or "").strip()
+    if status == "parsed":
+        if backend.startswith("gpt"):
+            return "已解析（GPT-5.4）"
+        if backend:
+            return f"已解析（{backend}）"
+        return "已解析"
+    if status == "processing":
+        return "解析中"
+    if status == "failed":
+        detail = str(parse_error_message or "").strip()
+        return f"解析失败：{detail[:36]}" if detail else "解析失败"
+    if status == "queued":
+        return "排队中"
+    return "待解析"
+
+
 def _build_project_material_index(project_id: str) -> Dict[str, object]:
     rows = [m for m in load_materials() if str(m.get("project_id")) == str(project_id)]
     rows.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
@@ -475,6 +714,7 @@ def _build_project_material_index(project_id: str) -> Dict[str, object]:
     counts_by_type: Dict[str, int] = {}
     parsed_ok_by_type: Dict[str, int] = {}
     parsed_fail_by_type: Dict[str, int] = {}
+    parse_status_by_type: Dict[str, Dict[str, int]] = {}
     chars_by_type: Dict[str, int] = {}
     chunks_by_type: Dict[str, int] = {}
     numeric_terms_by_type: Dict[str, int] = {}
@@ -489,7 +729,11 @@ def _build_project_material_index(project_id: str) -> Dict[str, object]:
     available_types: List[str] = []
     available_filenames: List[str] = []
 
-    for row in rows:
+    for raw_row in rows:
+        legacy_sync_parse = (
+            "parse_status" not in raw_row and not str(raw_row.get("job_id") or "").strip()
+        )
+        row, _ = _normalize_material_row_for_parse(raw_row)
         filename = str(row.get("filename") or "").strip()
         mat_type = _normalize_material_type(row.get("material_type"), filename=filename)
         if mat_type and mat_type not in available_types:
@@ -497,6 +741,11 @@ def _build_project_material_index(project_id: str) -> Dict[str, object]:
         if filename and filename not in available_filenames:
             available_filenames.append(filename)
         counts_by_type[mat_type] = counts_by_type.get(mat_type, 0) + 1
+        parse_status = str(row.get("parse_status") or "queued")
+        parse_status_by_type.setdefault(mat_type, {})
+        parse_status_by_type[mat_type][parse_status] = (
+            parse_status_by_type[mat_type].get(parse_status, 0) + 1
+        )
 
         entry: Dict[str, object] = {
             "id": str(row.get("id") or ""),
@@ -505,6 +754,7 @@ def _build_project_material_index(project_id: str) -> Dict[str, object]:
             "filename": filename,
             "path": str(row.get("path") or "").strip(),
             "created_at": str(row.get("created_at") or ""),
+            "updated_at": str(row.get("updated_at") or ""),
             "row": dict(row),
             "parsed_ok": False,
             "chars": 0,
@@ -513,6 +763,10 @@ def _build_project_material_index(project_id: str) -> Dict[str, object]:
             "lexical_terms": [],
             "text": "",
             "parse_error": "",
+            "parse_status": parse_status,
+            "parse_backend": str(row.get("parse_backend") or ""),
+            "parse_confidence": float(_to_float_or_none(row.get("parse_confidence")) or 0.0),
+            "job_id": str(row.get("job_id") or ""),
         }
 
         path = str(row.get("path") or "").strip()
@@ -537,23 +791,45 @@ def _build_project_material_index(project_id: str) -> Dict[str, object]:
             files.append(entry)
             continue
 
-        try:
-            content = p.read_bytes()
-            text = _read_uploaded_file_content(content, p.name)
-            text_value = str(text or "")
-            chars = len(text_value.strip())
-            chunks = _split_material_text_chunks(text_value, max_chars=900)
-            numeric_terms_norm = sorted(
-                {
-                    token
-                    for token in (
-                        _normalize_numeric_token(item)
-                        for item in _extract_numeric_terms(text_value, max_terms=260)
-                    )
-                    if token
-                }
+        if parse_status == "parsed":
+            text_value = str(row.get("parsed_text") or row.get("text") or "")
+            chars = int(_to_float_or_none(row.get("parsed_chars")) or len(text_value.strip()))
+            chunks = (
+                row.get("parsed_chunks")
+                if isinstance(row.get("parsed_chunks"), list)
+                else row.get("chunks")
             )
-            lexical_terms = _extract_terms(text_value, max_terms=220)
+            chunks = (
+                chunks
+                if isinstance(chunks, list)
+                else _split_material_text_chunks(text_value, max_chars=900)
+            )
+            numeric_terms_norm = (
+                row.get("numeric_terms_norm")
+                if isinstance(row.get("numeric_terms_norm"), list)
+                else []
+            )
+            if not numeric_terms_norm and text_value:
+                numeric_terms_norm = sorted(
+                    {
+                        token
+                        for token in (
+                            _normalize_numeric_token(item)
+                            for item in _extract_numeric_terms(text_value, max_terms=260)
+                        )
+                        if token
+                    }
+                )
+            lexical_terms = (
+                row.get("lexical_terms") if isinstance(row.get("lexical_terms"), list) else []
+            )
+            if not lexical_terms and text_value:
+                lexical_terms = _extract_terms(text_value, max_terms=220)
+            structured_summary = (
+                row.get("structured_summary")
+                if isinstance(row.get("structured_summary"), dict)
+                else {}
+            )
             entry.update(
                 {
                     "parsed_ok": True,
@@ -562,32 +838,17 @@ def _build_project_material_index(project_id: str) -> Dict[str, object]:
                     "chunks": chunks,
                     "numeric_terms_norm": numeric_terms_norm,
                     "lexical_terms": lexical_terms,
+                    "structured_summary": structured_summary,
                 }
             )
-            if mat_type == "tender_qa":
-                entry["tender_qa_structured_summary"] = _build_tender_qa_structured_summary(
-                    content,
-                    p.name,
-                    parsed_text=text_value,
-                )
-            elif mat_type == "boq":
-                entry["boq_structured_summary"] = _build_boq_structured_summary(
-                    content,
-                    p.name,
-                    parsed_text=text_value,
-                )
-            elif mat_type == "drawing":
-                entry["drawing_structured_summary"] = _build_drawing_structured_summary(
-                    content,
-                    p.name,
-                    parsed_text=text_value,
-                )
-            elif mat_type == "site_photo":
-                entry["site_photo_structured_summary"] = _build_site_photo_structured_summary(
-                    content,
-                    p.name,
-                    parsed_text=text_value,
-                )
+            if isinstance(row.get("tender_qa_structured_summary"), dict):
+                entry["tender_qa_structured_summary"] = row.get("tender_qa_structured_summary")
+            if isinstance(row.get("boq_structured_summary"), dict):
+                entry["boq_structured_summary"] = row.get("boq_structured_summary")
+            if isinstance(row.get("drawing_structured_summary"), dict):
+                entry["drawing_structured_summary"] = row.get("drawing_structured_summary")
+            if isinstance(row.get("site_photo_structured_summary"), dict):
+                entry["site_photo_structured_summary"] = row.get("site_photo_structured_summary")
             parsed_ok_files += 1
             parsed_ok_by_type[mat_type] = parsed_ok_by_type.get(mat_type, 0) + 1
             chars_by_type[mat_type] = chars_by_type.get(mat_type, 0) + chars
@@ -601,13 +862,93 @@ def _build_project_material_index(project_id: str) -> Dict[str, object]:
             total_parsed_chunks += len(chunks)
             total_numeric_terms += len(numeric_terms_norm)
             total_lexical_terms += len(lexical_terms)
-        except Exception as exc:
-            parsed_failed_files += 1
-            parsed_fail_by_type[mat_type] = parsed_fail_by_type.get(mat_type, 0) + 1
-            reason = f"{type(exc).__name__}: {exc}"
+        elif legacy_sync_parse:
+            try:
+                content = p.read_bytes()
+                text = _read_uploaded_file_content(content, p.name)
+                text_value = str(text or "")
+                chars = len(text_value.strip())
+                chunks = _split_material_text_chunks(text_value, max_chars=900)
+                numeric_terms_norm = sorted(
+                    {
+                        token
+                        for token in (
+                            _normalize_numeric_token(item)
+                            for item in _extract_numeric_terms(text_value, max_terms=260)
+                        )
+                        if token
+                    }
+                )
+                lexical_terms = _extract_terms(text_value, max_terms=220)
+                entry.update(
+                    {
+                        "parsed_ok": True,
+                        "parse_status": "parsed",
+                        "parse_backend": "legacy_sync",
+                        "text": text_value,
+                        "chars": chars,
+                        "chunks": chunks,
+                        "numeric_terms_norm": numeric_terms_norm,
+                        "lexical_terms": lexical_terms,
+                    }
+                )
+                if mat_type == "tender_qa":
+                    summary = _build_tender_qa_structured_summary(
+                        content, p.name, parsed_text=text_value
+                    )
+                    entry["tender_qa_structured_summary"] = summary
+                    entry["structured_summary"] = summary
+                elif mat_type == "boq":
+                    summary = _build_boq_structured_summary(content, p.name, parsed_text=text_value)
+                    entry["boq_structured_summary"] = summary
+                    entry["structured_summary"] = summary
+                elif mat_type == "drawing":
+                    summary = _build_drawing_structured_summary(
+                        content, p.name, parsed_text=text_value
+                    )
+                    entry["drawing_structured_summary"] = summary
+                    entry["structured_summary"] = summary
+                elif mat_type == "site_photo":
+                    summary = _build_site_photo_structured_summary(
+                        content, p.name, parsed_text=text_value
+                    )
+                    entry["site_photo_structured_summary"] = summary
+                    entry["structured_summary"] = summary
+                parsed_ok_files += 1
+                parsed_ok_by_type[mat_type] = parsed_ok_by_type.get(mat_type, 0) + 1
+                chars_by_type[mat_type] = chars_by_type.get(mat_type, 0) + chars
+                chunks_by_type[mat_type] = chunks_by_type.get(mat_type, 0) + len(chunks)
+                numeric_terms_by_type[mat_type] = numeric_terms_by_type.get(mat_type, 0) + len(
+                    numeric_terms_norm
+                )
+                lexical_terms_by_type[mat_type] = lexical_terms_by_type.get(mat_type, 0) + len(
+                    lexical_terms
+                )
+                total_parsed_chunks += len(chunks)
+                total_numeric_terms += len(numeric_terms_norm)
+                total_lexical_terms += len(lexical_terms)
+            except Exception as exc:
+                parsed_failed_files += 1
+                parsed_fail_by_type[mat_type] = parsed_fail_by_type.get(mat_type, 0) + 1
+                reason = f"{type(exc).__name__}: {exc}"
+                entry["parse_error"] = reason
+                parsed_fail_details.append(
+                    {"filename": filename, "material_type": mat_type, "reason": reason}
+                )
+        else:
+            parsed_failed_files += 1 if parse_status == "failed" else 0
+            if parse_status == "failed":
+                parsed_fail_by_type[mat_type] = parsed_fail_by_type.get(mat_type, 0) + 1
+            reason = str(
+                row.get("parse_error_message") or row.get("parse_error_class") or parse_status
+            )
             entry["parse_error"] = reason
             parsed_fail_details.append(
-                {"filename": filename, "material_type": mat_type, "reason": reason}
+                {
+                    "filename": filename,
+                    "material_type": mat_type,
+                    "reason": reason,
+                }
             )
         files.append(entry)
 
@@ -618,8 +959,15 @@ def _build_project_material_index(project_id: str) -> Dict[str, object]:
         "project_id": project_id,
         "total_files": total_files,
         "counts_by_type": counts_by_type,
+        "parse_status_by_type": parse_status_by_type,
         "parsed_ok_files": parsed_ok_files,
         "parsed_failed_files": parsed_failed_files,
+        "queued_files": sum(
+            int(statuses.get("queued", 0)) for statuses in parse_status_by_type.values()
+        ),
+        "processing_files": sum(
+            int(statuses.get("processing", 0)) for statuses in parse_status_by_type.values()
+        ),
         "parsed_ok_by_type": parsed_ok_by_type,
         "parsed_fail_by_type": parsed_fail_by_type,
         "chars_by_type": chars_by_type,
@@ -648,7 +996,694 @@ def _build_project_material_index(project_id: str) -> Dict[str, object]:
     with _MATERIAL_INDEX_CACHE_LOCK:
         _MATERIAL_INDEX_CACHE[project_id] = index
         _touch_material_index_cache(project_id)
-        return index
+    return index
+
+
+def _merge_unique_text_values(*groups: object, limit: int = 24) -> List[str]:
+    merged: List[str] = []
+    for group in groups:
+        merged.extend(_to_text_items(group, max_items=limit * 2))
+    return _limit_unique_texts(merged, limit=limit)
+
+
+def _merge_numeric_values(*groups: object, limit: int = 18) -> List[str]:
+    merged: List[str] = []
+    for group in groups:
+        merged.extend(_to_text_items(group, max_items=limit * 2))
+    return _limit_unique_numeric_tokens(merged, limit=limit)
+
+
+def _render_pdf_page_pngs_for_gpt(
+    content: bytes,
+    *,
+    max_pages: int = 8,
+) -> List[Dict[str, object]]:
+    if pymupdf is None:
+        return []
+    pages: List[Dict[str, object]] = []
+    doc = pymupdf.open(stream=content, filetype="pdf")
+    try:
+        for idx, page in enumerate(doc, start=1):
+            if len(pages) >= max_pages:
+                break
+            page_text = _normalize_ocr_text_block(page.get_text() or "")
+            should_pick = idx <= 4 or len(page_text.strip()) < 200
+            if not should_pick and any(
+                token in page_text.lower()
+                for token in ("评分", "评审", "得分", "加分", "扣分", "目录", "答疑", "补遗")
+            ):
+                should_pick = True
+            if not should_pick:
+                continue
+            try:
+                pix = page.get_pixmap(matrix=pymupdf.Matrix(1.8, 1.8), alpha=False)
+                pages.append(
+                    {
+                        "page_no": idx,
+                        "text": page_text[:4000],
+                        "image_bytes": pix.tobytes("png"),
+                        "image_mime": "image/png",
+                    }
+                )
+            except Exception:
+                continue
+    finally:
+        doc.close()
+    return pages
+
+
+def _build_gpt_pdf_page_prompt(
+    filename: str,
+    page_no: int,
+    page_text: str,
+) -> str:
+    excerpt = str(page_text or "")[:3200]
+    return (
+        "你是施工招标资料结构化解析器。请基于当前 PDF 页面，输出 JSON，禁止解释性文本。"
+        "字段必须包含：page_type, section_title, section_level, section_path, scoring_terms, mandatory_clauses, "
+        "numeric_constraints, table_rows, focused_dimensions, parse_confidence。"
+        "page_type 仅可取 cover/toc/chapter/scoring_rules/table/attachment/drawing_like/narrative。"
+        "section_path、scoring_terms、mandatory_clauses、numeric_constraints、focused_dimensions、table_rows 必须为数组。"
+        "focused_dimensions 使用两位维度编号。"
+        f"\n文件名：{filename}\n页码：{page_no}\n本地预读文本：\n{excerpt}"
+    )
+
+
+def _build_gpt_drawing_prompt(filename: str, local_text: str) -> str:
+    excerpt = str(local_text or "")[:3600]
+    return (
+        "你是施工图纸结构化解析器。请输出 JSON，禁止解释性文本。"
+        "字段必须包含：discipline, sheet_type, layout_tags, space_tags, component_tags, dimension_markers, "
+        "risk_tags, constraint_terms, numeric_constraints, focused_dimensions, parse_confidence。"
+        "focused_dimensions 使用两位维度编号，所有 tags/constraints 都使用数组。"
+        f"\n文件名：{filename}\n本地预读文本：\n{excerpt}"
+    )
+
+
+def _build_gpt_site_photo_prompt(filename: str, local_text: str) -> str:
+    excerpt = str(local_text or "")[:1600]
+    return (
+        "你是施工现场照片证据解析器。请输出 JSON，禁止解释性文本。"
+        "字段必须包含：scene_type, safety_findings, civilization_findings, quality_findings, progress_findings, "
+        "visible_objects, visible_text, numeric_markers, risk_level, evidence_confidence。"
+        "所有 findings 和 visible_objects/visible_text/numeric_markers 必须为数组。"
+        f"\n文件名：{filename}\n已有 OCR/本地线索：\n{excerpt}"
+    )
+
+
+def _build_gpt_tender_prompt(filename: str, local_text: str) -> str:
+    excerpt = str(local_text or "")[:4200]
+    return (
+        "你是招标文件/答疑评分规则解析器。请输出 JSON，禁止解释性文本。"
+        "字段必须包含：section_titles, scoring_point_terms, mandatory_clause_terms, numeric_constraints, "
+        "focused_dimensions, parse_confidence。所有字段都使用数组，parse_confidence 为 0~1 浮点。"
+        f"\n文件名：{filename}\n已有文本：\n{excerpt}"
+    )
+
+
+def _call_gpt_material_parser(
+    prompt: str,
+    *,
+    image_bytes: Optional[bytes] = None,
+    image_mime: str = "image/png",
+) -> tuple[bool, Dict[str, object], str]:
+    if not get_openai_api_key():
+        return False, {}, "missing_openai_credentials"
+    ok, payload, err = call_openai_multimodal_json(
+        prompt,
+        image_bytes=image_bytes,
+        image_mime=image_mime,
+        model=get_openai_model(),
+        max_tokens=2200,
+        timeout=120,
+        temperature=0.1,
+    )
+    if not ok or not isinstance(payload, dict):
+        return False, {}, err or "gpt_parse_failed"
+    return True, payload, ""
+
+
+def _augment_tender_summary_with_gpt(
+    content: bytes,
+    filename: str,
+    parsed_text: str,
+    local_summary: Dict[str, object],
+) -> tuple[Dict[str, object], str, float, str]:
+    gpt_backend = "local"
+    gpt_error = ""
+    parse_confidence = float(_clip_score01(local_summary.get("structured_quality_score") or 0.0))
+    merged = dict(local_summary)
+    page_structures: List[Dict[str, object]] = []
+    pages = (
+        _render_pdf_page_pngs_for_gpt(content, max_pages=8)
+        if filename.lower().endswith(".pdf")
+        else []
+    )
+    if pages:
+        for page in pages:
+            ok, payload, err = _call_gpt_material_parser(
+                _build_gpt_pdf_page_prompt(
+                    filename, int(page.get("page_no") or 0), str(page.get("text") or "")
+                ),
+                image_bytes=page.get("image_bytes")
+                if isinstance(page.get("image_bytes"), (bytes, bytearray))
+                else None,
+                image_mime=str(page.get("image_mime") or "image/png"),
+            )
+            if ok:
+                payload["page_no"] = int(page.get("page_no") or 0)
+                page_structures.append(payload)
+            elif err and not gpt_error:
+                gpt_error = err
+        if page_structures:
+            gpt_backend = "hybrid"
+            merged["page_structures"] = page_structures[:12]
+            merged["section_titles"] = _merge_unique_text_values(
+                merged.get("section_titles"),
+                [p.get("section_title") for p in page_structures],
+                [p.get("section_path") for p in page_structures],
+                limit=14,
+            )
+            merged["scoring_point_terms"] = _merge_unique_text_values(
+                merged.get("scoring_point_terms"),
+                *[p.get("scoring_terms") for p in page_structures],
+                limit=16,
+            )
+            merged["mandatory_clause_terms"] = _merge_unique_text_values(
+                merged.get("mandatory_clause_terms"),
+                *[p.get("mandatory_clauses") for p in page_structures],
+                limit=12,
+            )
+            merged["top_numeric_terms"] = _merge_numeric_values(
+                merged.get("top_numeric_terms"),
+                *[p.get("numeric_constraints") for p in page_structures],
+                limit=14,
+            )
+            merged["focused_dimensions"] = _merge_unique_text_values(
+                merged.get("focused_dimensions"),
+                *[p.get("focused_dimensions") for p in page_structures],
+                limit=10,
+            )
+            merged["structured_terms"] = _merge_unique_text_values(
+                merged.get("structured_terms"),
+                merged.get("section_titles"),
+                merged.get("scoring_point_terms"),
+                merged.get("mandatory_clause_terms"),
+                limit=28,
+            )
+            gpt_conf = sum(
+                float(_to_float_or_none(p.get("parse_confidence")) or 0.0) for p in page_structures
+            ) / max(1, len(page_structures))
+            parse_confidence = round(max(parse_confidence, _clip_score01(gpt_conf)), 4)
+            merged["structured_quality_score"] = round(
+                max(
+                    float(_to_float_or_none(merged.get("structured_quality_score")) or 0.0),
+                    0.45 + 0.35 * parse_confidence,
+                ),
+                4,
+            )
+            return merged, gpt_backend, parse_confidence, gpt_error
+
+    ok, payload, err = _call_gpt_material_parser(_build_gpt_tender_prompt(filename, parsed_text))
+    if ok:
+        gpt_backend = "hybrid"
+        merged["section_titles"] = _merge_unique_text_values(
+            merged.get("section_titles"),
+            payload.get("section_titles"),
+            limit=14,
+        )
+        merged["scoring_point_terms"] = _merge_unique_text_values(
+            merged.get("scoring_point_terms"),
+            payload.get("scoring_point_terms"),
+            limit=16,
+        )
+        merged["mandatory_clause_terms"] = _merge_unique_text_values(
+            merged.get("mandatory_clause_terms"),
+            payload.get("mandatory_clause_terms"),
+            limit=12,
+        )
+        merged["top_numeric_terms"] = _merge_numeric_values(
+            merged.get("top_numeric_terms"),
+            payload.get("numeric_constraints"),
+            limit=14,
+        )
+        merged["focused_dimensions"] = _merge_unique_text_values(
+            merged.get("focused_dimensions"),
+            payload.get("focused_dimensions"),
+            limit=10,
+        )
+        merged["structured_terms"] = _merge_unique_text_values(
+            merged.get("structured_terms"),
+            merged.get("section_titles"),
+            merged.get("scoring_point_terms"),
+            merged.get("mandatory_clause_terms"),
+            limit=28,
+        )
+        parse_confidence = round(
+            max(parse_confidence, float(_to_float_or_none(payload.get("parse_confidence")) or 0.0)),
+            4,
+        )
+        merged["structured_quality_score"] = round(
+            max(
+                float(_to_float_or_none(merged.get("structured_quality_score")) or 0.0),
+                0.42 + 0.32 * parse_confidence,
+            ),
+            4,
+        )
+    else:
+        gpt_error = err
+    return merged, gpt_backend, parse_confidence, gpt_error
+
+
+def _augment_drawing_summary_with_gpt(
+    content: bytes,
+    filename: str,
+    parsed_text: str,
+    local_summary: Dict[str, object],
+) -> tuple[Dict[str, object], str, float, str]:
+    merged = dict(local_summary)
+    parse_confidence = float(_clip_score01(local_summary.get("structured_quality_score") or 0.0))
+    image_bytes: Optional[bytes] = None
+    image_mime = "image/png"
+    ext = Path(filename).suffix.lower()
+    if ext == ".pdf":
+        previews = _render_pdf_page_pngs_for_gpt(content, max_pages=1)
+        if previews:
+            image_bytes = (
+                previews[0].get("image_bytes")
+                if isinstance(previews[0].get("image_bytes"), (bytes, bytearray))
+                else None
+            )
+    elif ext in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
+        image_bytes = content
+        image_mime = f"image/{'jpeg' if ext in {'.jpg', '.jpeg'} else ext.lstrip('.')}"
+    ok, payload, err = _call_gpt_material_parser(
+        _build_gpt_drawing_prompt(filename, parsed_text),
+        image_bytes=image_bytes,
+        image_mime=image_mime,
+    )
+    if not ok:
+        return merged, "local", parse_confidence, err
+    merged["discipline"] = str(payload.get("discipline") or merged.get("discipline") or "")
+    merged["sheet_type"] = str(payload.get("sheet_type") or merged.get("sheet_type") or "")
+    for field in (
+        "layout_tags",
+        "space_tags",
+        "component_tags",
+        "dimension_markers",
+        "risk_tags",
+        "constraint_terms",
+        "numeric_constraints",
+        "focused_dimensions",
+    ):
+        merged[field] = _merge_unique_text_values(merged.get(field), payload.get(field), limit=18)
+    merged["structured_terms"] = _merge_unique_text_values(
+        merged.get("structured_terms"),
+        payload.get("layout_tags"),
+        payload.get("space_tags"),
+        payload.get("component_tags"),
+        payload.get("constraint_terms"),
+        limit=28,
+    )
+    merged["top_numeric_terms"] = _merge_numeric_values(
+        merged.get("top_numeric_terms"),
+        payload.get("dimension_markers"),
+        payload.get("numeric_constraints"),
+        limit=16,
+    )
+    parse_confidence = round(
+        max(parse_confidence, float(_to_float_or_none(payload.get("parse_confidence")) or 0.0)),
+        4,
+    )
+    merged["structured_quality_score"] = round(
+        max(
+            float(_to_float_or_none(merged.get("structured_quality_score")) or 0.0),
+            0.44 + 0.34 * parse_confidence,
+        ),
+        4,
+    )
+    return merged, "hybrid", parse_confidence, ""
+
+
+def _augment_site_photo_summary_with_gpt(
+    content: bytes,
+    filename: str,
+    parsed_text: str,
+    local_summary: Dict[str, object],
+) -> tuple[Dict[str, object], str, float, str]:
+    merged = dict(local_summary)
+    ext = Path(filename).suffix.lower()
+    image_mime = f"image/{'jpeg' if ext in {'.jpg', '.jpeg'} else ext.lstrip('.')}"
+    ok, payload, err = _call_gpt_material_parser(
+        _build_gpt_site_photo_prompt(filename, parsed_text),
+        image_bytes=content,
+        image_mime=image_mime,
+    )
+    parse_confidence = float(_clip_score01(local_summary.get("structured_quality_score") or 0.0))
+    if not ok:
+        return merged, "local", parse_confidence, err
+    for field in (
+        "safety_findings",
+        "civilization_findings",
+        "quality_findings",
+        "progress_findings",
+        "visible_objects",
+        "visible_text",
+        "numeric_markers",
+    ):
+        merged[field] = _merge_unique_text_values(merged.get(field), payload.get(field), limit=16)
+    merged["scene_type"] = str(payload.get("scene_type") or merged.get("scene_type") or "")
+    merged["risk_level"] = str(payload.get("risk_level") or merged.get("risk_level") or "")
+    merged["structured_terms"] = _merge_unique_text_values(
+        merged.get("structured_terms"),
+        payload.get("safety_findings"),
+        payload.get("civilization_findings"),
+        payload.get("quality_findings"),
+        payload.get("progress_findings"),
+        payload.get("visible_objects"),
+        limit=30,
+    )
+    merged["top_numeric_terms"] = _merge_numeric_values(
+        merged.get("top_numeric_terms"),
+        payload.get("numeric_markers"),
+        limit=12,
+    )
+    parse_confidence = round(
+        max(
+            parse_confidence,
+            float(_to_float_or_none(payload.get("evidence_confidence")) or 0.0),
+        ),
+        4,
+    )
+    merged["evidence_confidence"] = parse_confidence
+    merged["visual_capability"] = "gpt_vision_hybrid"
+    merged["structured_quality_score"] = round(
+        max(
+            float(_to_float_or_none(merged.get("structured_quality_score")) or 0.0),
+            0.46 + 0.30 * parse_confidence,
+        ),
+        4,
+    )
+    return merged, "hybrid", parse_confidence, ""
+
+
+def _parse_material_record_payload(row: Dict[str, object]) -> Dict[str, object]:
+    path = Path(str(row.get("path") or "").strip())
+    if not path.exists():
+        raise FileNotFoundError("path_not_exists")
+    content = path.read_bytes()
+    filename = path.name
+    material_type = _normalize_material_type(row.get("material_type"), filename=filename)
+    parsed_text = _read_uploaded_file_content(content, filename)
+    text_value = str(parsed_text or "")
+    chunks = _split_material_text_chunks(text_value, max_chars=900)
+    numeric_terms_norm = sorted(
+        {
+            token
+            for token in (
+                _normalize_numeric_token(item)
+                for item in _extract_numeric_terms(text_value, max_terms=260)
+            )
+            if token
+        }
+    )
+    lexical_terms = _extract_terms(text_value, max_terms=220)
+    backend = "local"
+    parse_confidence = 0.0
+    parse_error_class = None
+    parse_error_message = None
+    structured_summary: Dict[str, object] = {}
+    type_specific: Dict[str, object] = {}
+    if material_type == "tender_qa":
+        local_summary = _build_tender_qa_structured_summary(
+            content, filename, parsed_text=text_value
+        )
+        structured_summary, backend, parse_confidence, gpt_error = _augment_tender_summary_with_gpt(
+            content,
+            filename,
+            text_value,
+            local_summary,
+        )
+        type_specific["tender_qa_structured_summary"] = structured_summary
+        if gpt_error and backend == "local":
+            parse_error_class = "gpt_parse_failed"
+            parse_error_message = gpt_error
+    elif material_type == "boq":
+        structured_summary = _build_boq_structured_summary(
+            content, filename, parsed_text=text_value
+        )
+        parse_confidence = float(
+            _clip_score01(structured_summary.get("structured_quality_score") or 0.0)
+        )
+        type_specific["boq_structured_summary"] = structured_summary
+    elif material_type == "drawing":
+        local_summary = _build_drawing_structured_summary(content, filename, parsed_text=text_value)
+        (
+            structured_summary,
+            backend,
+            parse_confidence,
+            gpt_error,
+        ) = _augment_drawing_summary_with_gpt(
+            content,
+            filename,
+            text_value,
+            local_summary,
+        )
+        type_specific["drawing_structured_summary"] = structured_summary
+        if gpt_error and backend == "local":
+            parse_error_class = "gpt_parse_failed"
+            parse_error_message = gpt_error
+    elif material_type == "site_photo":
+        local_summary = _build_site_photo_structured_summary(
+            content, filename, parsed_text=text_value
+        )
+        (
+            structured_summary,
+            backend,
+            parse_confidence,
+            gpt_error,
+        ) = _augment_site_photo_summary_with_gpt(
+            content,
+            filename,
+            text_value,
+            local_summary,
+        )
+        type_specific["site_photo_structured_summary"] = structured_summary
+        if gpt_error and backend == "local":
+            parse_error_class = "gpt_parse_failed"
+            parse_error_message = gpt_error
+    else:
+        structured_summary = {
+            "filename": filename,
+            "structured_terms": lexical_terms[:24],
+            "top_numeric_terms": numeric_terms_norm[:16],
+            "focused_dimensions": [],
+            "structured_quality_score": min(1.0, len(lexical_terms) / 50.0),
+        }
+        parse_confidence = float(
+            _clip_score01(structured_summary.get("structured_quality_score") or 0.0)
+        )
+    return {
+        "parse_status": "parsed",
+        "parse_backend": backend,
+        "parse_confidence": round(parse_confidence, 4),
+        "parse_error_class": parse_error_class,
+        "parse_error_message": parse_error_message,
+        "parse_finished_at": _now_iso(),
+        "parse_version": DEFAULT_MATERIAL_PARSE_VERSION,
+        "structured_summary": structured_summary,
+        "parsed_text": text_value,
+        "parsed_chars": len(text_value.strip()),
+        "parsed_chunks": chunks,
+        "numeric_terms_norm": numeric_terms_norm,
+        "lexical_terms": lexical_terms,
+        **type_specific,
+    }
+
+
+def _claim_next_material_parse_job() -> Optional[Dict[str, object]]:
+    with _MATERIAL_PARSE_STATE_LOCK:
+        jobs = load_material_parse_jobs()
+        materials = load_materials()
+        now = datetime.now(timezone.utc)
+        material_by_id = {str(row.get("id") or ""): dict(row) for row in materials}
+        jobs_changed = False
+        materials_changed = False
+        claimed: Optional[Dict[str, object]] = None
+        for idx, job in enumerate(jobs):
+            job, normalized = _normalize_material_parse_job(job)
+            jobs[idx] = job
+            jobs_changed = jobs_changed or normalized
+            status = str(job.get("status") or "queued")
+            due_at = _parse_iso_datetime_utc(job.get("next_retry_at"))
+            if status == "processing":
+                continue
+            if status == "failed":
+                if (
+                    int(_to_float_or_none(job.get("attempt")) or 0)
+                    >= DEFAULT_MATERIAL_PARSE_MAX_ATTEMPTS
+                ):
+                    continue
+                if due_at and due_at > now:
+                    continue
+            if status not in {"queued", "failed"}:
+                continue
+            material_id = str(job.get("material_id") or "")
+            material = material_by_id.get(material_id)
+            if not material:
+                continue
+            started_at = _now_iso()
+            job["status"] = "processing"
+            job["started_at"] = started_at
+            job["updated_at"] = started_at
+            jobs[idx] = job
+            material, _ = _normalize_material_row_for_parse(material)
+            material["parse_status"] = "processing"
+            material["parse_backend"] = "gpt-5.4" if get_openai_api_key() else "local"
+            material["parse_started_at"] = started_at
+            material["parse_error_class"] = None
+            material["parse_error_message"] = None
+            material["updated_at"] = started_at
+            for m_idx, raw_row in enumerate(materials):
+                if str(raw_row.get("id") or "") == material_id:
+                    materials[m_idx] = material
+                    materials_changed = True
+                    break
+            claimed = dict(job)
+            break
+        if jobs_changed or claimed is not None:
+            save_material_parse_jobs(jobs)
+        if materials_changed:
+            save_materials(materials)
+            _invalidate_material_index_cache(claimed.get("project_id") if claimed else None)
+        return claimed
+
+
+def _complete_material_parse_job(
+    job_id: str, updates: Dict[str, object], *, failed: bool = False
+) -> None:
+    with _MATERIAL_PARSE_STATE_LOCK:
+        jobs = load_material_parse_jobs()
+        materials = load_materials()
+        target_job: Optional[Dict[str, object]] = None
+        target_material_id = ""
+        for idx, job in enumerate(jobs):
+            if str(job.get("id") or "") != job_id:
+                continue
+            target_job = dict(job)
+            target_material_id = str(job.get("material_id") or "")
+            target_job.update(
+                {
+                    "status": "failed" if failed else "parsed",
+                    "updated_at": _now_iso(),
+                    "finished_at": _now_iso(),
+                    "attempt": int(_to_float_or_none(job.get("attempt")) or 0) + 1,
+                    "parse_backend": updates.get("parse_backend") or job.get("parse_backend"),
+                    "parse_confidence": float(
+                        _to_float_or_none(
+                            updates.get("parse_confidence") or job.get("parse_confidence")
+                        )
+                        or 0.0
+                    ),
+                    "error_class": updates.get("parse_error_class"),
+                    "error_message": updates.get("parse_error_message"),
+                }
+            )
+            if failed and target_job["attempt"] < DEFAULT_MATERIAL_PARSE_MAX_ATTEMPTS:
+                retry_at = datetime.now(timezone.utc).timestamp() + min(
+                    60.0, 8.0 * target_job["attempt"]
+                )
+                target_job["next_retry_at"] = datetime.fromtimestamp(
+                    retry_at, tz=timezone.utc
+                ).isoformat()
+            else:
+                target_job["next_retry_at"] = None
+            jobs[idx] = target_job
+            break
+        for idx, row in enumerate(materials):
+            if str(row.get("id") or "") != target_material_id:
+                continue
+            normalized, _ = _normalize_material_row_for_parse(row)
+            normalized.update(updates)
+            normalized["parse_status"] = "failed" if failed else "parsed"
+            normalized["updated_at"] = _now_iso()
+            materials[idx] = normalized
+            _invalidate_material_index_cache(str(normalized.get("project_id") or ""))
+            break
+        save_material_parse_jobs(jobs)
+        save_materials(materials)
+    project_id = str(updates.get("project_id") or "")
+    if project_id and not failed:
+        try:
+            _rebuild_project_anchors_and_requirements(project_id)
+        except Exception:
+            pass
+
+
+def _process_material_parse_job(job: Dict[str, object]) -> None:
+    material_id = str(job.get("material_id") or "")
+    materials = load_materials()
+    row = next((dict(item) for item in materials if str(item.get("id") or "") == material_id), None)
+    if not row:
+        _complete_material_parse_job(
+            str(job.get("id") or ""),
+            {
+                "parse_error_class": "material_not_found",
+                "parse_error_message": "material_not_found",
+            },
+            failed=True,
+        )
+        return
+    try:
+        payload = _parse_material_record_payload(row)
+        payload["project_id"] = str(row.get("project_id") or "")
+        _complete_material_parse_job(str(job.get("id") or ""), payload, failed=False)
+    except Exception as exc:
+        _complete_material_parse_job(
+            str(job.get("id") or ""),
+            {
+                "project_id": str(row.get("project_id") or ""),
+                "parse_backend": "local",
+                "parse_confidence": 0.0,
+                "parse_error_class": type(exc).__name__,
+                "parse_error_message": str(exc),
+                "parse_finished_at": _now_iso(),
+                "parse_version": DEFAULT_MATERIAL_PARSE_VERSION,
+            },
+            failed=True,
+        )
+
+
+def _material_parse_worker_loop() -> None:
+    while not _MATERIAL_PARSE_STOP_EVENT.is_set():
+        job = _claim_next_material_parse_job()
+        if not job:
+            _MATERIAL_PARSE_STOP_EVENT.wait(DEFAULT_MATERIAL_PARSE_JOB_POLL_SECONDS)
+            continue
+        _process_material_parse_job(job)
+
+
+def _start_material_parse_worker() -> None:
+    global _MATERIAL_PARSE_WORKER
+    if _MATERIAL_PARSE_WORKER and _MATERIAL_PARSE_WORKER.is_alive():
+        return
+    _MATERIAL_PARSE_STOP_EVENT.clear()
+    _bootstrap_material_parse_state()
+    worker = threading.Thread(
+        target=_material_parse_worker_loop,
+        name="material-parse-worker",
+        daemon=True,
+    )
+    worker.start()
+    _MATERIAL_PARSE_WORKER = worker
+
+
+def _stop_material_parse_worker() -> None:
+    global _MATERIAL_PARSE_WORKER
+    _MATERIAL_PARSE_STOP_EVENT.set()
+    if _MATERIAL_PARSE_WORKER and _MATERIAL_PARSE_WORKER.is_alive():
+        _MATERIAL_PARSE_WORKER.join(timeout=2.0)
+    _MATERIAL_PARSE_WORKER = None
 
 
 def _now_iso() -> str:
@@ -1988,6 +3023,126 @@ def _build_runtime_feature_requirements(
     return reqs
 
 
+def _build_material_constraint_pack(
+    *,
+    project_id: str,
+    project: Dict[str, object],
+    submission_text: str,
+    material_index: Dict[str, object],
+    material_knowledge_profile: Dict[str, object],
+    weights_norm: Optional[Dict[str, float]],
+    query_features: Dict[str, object],
+    retrieval_cfg: Dict[str, object],
+) -> Dict[str, object]:
+    material_rows = list(material_index.get("rows") or [])
+    available_material_types = [
+        str(x) for x in (material_index.get("available_types") or []) if str(x).strip()
+    ]
+    available_material_filenames = [
+        str(x) for x in (material_index.get("available_filenames") or []) if str(x).strip()
+    ]
+    retrieval_budget = _compute_dynamic_retrieval_budget(
+        project_id,
+        retrieval_cfg,
+        material_rows,
+        available_material_types=available_material_types,
+    )
+    retrieval_top_k = int(
+        retrieval_budget.get("top_k")
+        or retrieval_cfg.get("top_k")
+        or DEFAULT_MATERIAL_RETRIEVAL_TOP_K
+    )
+    retrieval_per_type_quota = int(
+        retrieval_budget.get("per_type_quota")
+        or retrieval_cfg.get("per_type_quota")
+        or DEFAULT_MATERIAL_RETRIEVAL_PER_TYPE_QUOTA
+    )
+    retrieval_per_file_quota = int(
+        retrieval_budget.get("per_file_quota")
+        or retrieval_cfg.get("per_file_quota")
+        or DEFAULT_MATERIAL_RETRIEVAL_PER_FILE_QUOTA
+    )
+    retrieval_chunks = _select_material_retrieval_chunks(
+        project_id,
+        submission_text,
+        top_k=retrieval_top_k,
+        per_type_quota=retrieval_per_type_quota,
+        per_file_quota=retrieval_per_file_quota,
+        query_terms_extra=query_features.get("query_terms"),
+        query_numeric_terms=query_features.get("query_numeric_terms"),
+        material_index=material_index,
+    )
+    retrieval_selected_filenames: List[str] = []
+    for chunk in retrieval_chunks:
+        filename_text = str(chunk.get("filename") or "").strip()
+        if filename_text and filename_text not in retrieval_selected_filenames:
+            retrieval_selected_filenames.append(filename_text)
+    retrieval_types = sorted(
+        {
+            str(c.get("material_type") or "")
+            for c in retrieval_chunks
+            if str(c.get("material_type") or "").strip()
+        }
+    )
+    retrieval_selected_via_counts: Dict[str, int] = {}
+    for chunk in retrieval_chunks:
+        selected_via = str(chunk.get("selected_via") or "").strip() or "unknown"
+        retrieval_selected_via_counts[selected_via] = (
+            int(retrieval_selected_via_counts.get(selected_via, 0)) + 1
+        )
+    retrieval_requirements = _build_material_retrieval_requirements(project_id, retrieval_chunks)
+    consistency_requirements = _build_material_consistency_requirements(
+        project_id,
+        retrieval_chunks,
+        available_material_types=available_material_types,
+    )
+    material_dimension_requirements = _build_material_dimension_requirements(
+        project_id,
+        material_knowledge_profile,
+        available_material_types=available_material_types,
+    )
+    material_consensus_requirements = _build_material_consensus_requirements(
+        project_id,
+        material_knowledge_profile,
+        available_material_types=available_material_types,
+    )
+    feedback_requirements = _build_runtime_feedback_requirements(
+        project_id,
+        material_knowledge_profile=material_knowledge_profile,
+    )
+    feature_requirements = _build_runtime_feature_requirements(
+        project_id,
+        material_knowledge_profile=material_knowledge_profile,
+        weights_norm=weights_norm,
+    )
+    all_requirements: List[Dict[str, object]] = []
+    all_requirements.extend(retrieval_requirements)
+    all_requirements.extend(consistency_requirements)
+    all_requirements.extend(material_dimension_requirements)
+    all_requirements.extend(material_consensus_requirements)
+    all_requirements.extend(feedback_requirements)
+    all_requirements.extend(feature_requirements)
+    return {
+        "requirements": all_requirements,
+        "retrieval_chunks": retrieval_chunks,
+        "retrieval_requirements": retrieval_requirements,
+        "consistency_requirements": consistency_requirements,
+        "material_dimension_requirements": material_dimension_requirements,
+        "material_consensus_requirements": material_consensus_requirements,
+        "feedback_requirements": feedback_requirements,
+        "feature_requirements": feature_requirements,
+        "available_material_types": available_material_types,
+        "available_material_filenames": available_material_filenames,
+        "retrieval_budget": retrieval_budget,
+        "retrieval_top_k": retrieval_top_k,
+        "retrieval_per_type_quota": retrieval_per_type_quota,
+        "retrieval_per_file_quota": retrieval_per_file_quota,
+        "retrieval_selected_filenames": retrieval_selected_filenames,
+        "retrieval_selected_via_counts": retrieval_selected_via_counts,
+        "retrieval_types": retrieval_types,
+    }
+
+
 def _build_feature_confidence_summary(
     project_id: str,
     *,
@@ -2232,6 +3387,15 @@ def _build_runtime_feedback_requirements(
                     "recent_feedback_negative_count": feedback_negative_count,
                     "recent_feedback_avg_delta_100": round(avg_delta_100, 4),
                     "recent_feedback_avg_strength": round(avg_strength, 4),
+                    "recent_feedback_decay_weight": round(
+                        float(
+                            _to_float_or_none(feedback_boost.get("avg_time_decay_weight")) or 0.0
+                        ),
+                        4,
+                    ),
+                    "recent_feedback_polarity": str(
+                        feedback_boost.get("feedback_polarity") or "mixed"
+                    ),
                 },
                 "mandatory": False,
                 "weight": round(
@@ -2508,13 +3672,6 @@ def _build_runtime_custom_requirements(
         )
 
     material_index = _build_project_material_index(project_id)
-    material_rows = list(material_index.get("rows") or [])
-    available_material_types = [
-        str(x) for x in (material_index.get("available_types") or []) if str(x).strip()
-    ]
-    available_material_filenames = [
-        str(x) for x in (material_index.get("available_filenames") or []) if str(x).strip()
-    ]
     material_knowledge_profile = _build_material_knowledge_profile(project_id)
     retrieval_cfg = _resolve_material_retrieval_config(project)
     query_features = _build_material_query_features(
@@ -2527,86 +3684,97 @@ def _build_runtime_custom_requirements(
         context_text=context_text,
         material_knowledge_profile=material_knowledge_profile,
     )
-    retrieval_budget = _compute_dynamic_retrieval_budget(
-        project_id,
-        retrieval_cfg,
-        material_rows,
-        available_material_types=available_material_types,
+    constraint_pack = _build_material_constraint_pack(
+        project_id=project_id,
+        project=project,
+        submission_text=submission_text,
+        material_index=material_index,
+        material_knowledge_profile=material_knowledge_profile,
+        weights_norm=weights_norm,
+        query_features=query_features,
+        retrieval_cfg=retrieval_cfg,
+    )
+    retrieval_budget = (
+        constraint_pack.get("retrieval_budget")
+        if isinstance(constraint_pack.get("retrieval_budget"), dict)
+        else {}
     )
     retrieval_top_k = int(
-        retrieval_budget.get("top_k")
+        constraint_pack.get("retrieval_top_k")
         or retrieval_cfg.get("top_k")
         or DEFAULT_MATERIAL_RETRIEVAL_TOP_K
     )
     retrieval_per_type_quota = int(
-        retrieval_budget.get("per_type_quota")
+        constraint_pack.get("retrieval_per_type_quota")
         or retrieval_cfg.get("per_type_quota")
         or DEFAULT_MATERIAL_RETRIEVAL_PER_TYPE_QUOTA
     )
     retrieval_per_file_quota = int(
-        retrieval_budget.get("per_file_quota")
+        constraint_pack.get("retrieval_per_file_quota")
         or retrieval_cfg.get("per_file_quota")
         or DEFAULT_MATERIAL_RETRIEVAL_PER_FILE_QUOTA
     )
-    retrieval_chunks = _select_material_retrieval_chunks(
-        project_id,
-        submission_text,
-        top_k=retrieval_top_k,
-        per_type_quota=retrieval_per_type_quota,
-        per_file_quota=retrieval_per_file_quota,
-        query_terms_extra=query_features.get("query_terms"),
-        query_numeric_terms=query_features.get("query_numeric_terms"),
-        material_index=material_index,
+    retrieval_chunks = (
+        list(constraint_pack.get("retrieval_chunks") or [])
+        if isinstance(constraint_pack.get("retrieval_chunks"), list)
+        else []
     )
-    retrieval_selected_filenames: List[str] = []
-    for chunk in retrieval_chunks:
-        filename_text = str(chunk.get("filename") or "").strip()
-        if filename_text and filename_text not in retrieval_selected_filenames:
-            retrieval_selected_filenames.append(filename_text)
-    retrieval_types = sorted(
-        {
-            str(c.get("material_type") or "")
-            for c in retrieval_chunks
-            if str(c.get("material_type") or "").strip()
-        }
+    retrieval_requirements = (
+        list(constraint_pack.get("retrieval_requirements") or [])
+        if isinstance(constraint_pack.get("retrieval_requirements"), list)
+        else []
     )
-    retrieval_selected_via_counts: Dict[str, int] = {}
-    for chunk in retrieval_chunks:
-        selected_via = str(chunk.get("selected_via") or "").strip() or "unknown"
-        retrieval_selected_via_counts[selected_via] = (
-            int(retrieval_selected_via_counts.get(selected_via, 0)) + 1
-        )
-    retrieval_requirements = _build_material_retrieval_requirements(project_id, retrieval_chunks)
-    consistency_requirements = _build_material_consistency_requirements(
-        project_id,
-        retrieval_chunks,
-        available_material_types=available_material_types,
+    consistency_requirements = (
+        list(constraint_pack.get("consistency_requirements") or [])
+        if isinstance(constraint_pack.get("consistency_requirements"), list)
+        else []
     )
-    material_dimension_requirements = _build_material_dimension_requirements(
-        project_id,
-        material_knowledge_profile,
-        available_material_types=available_material_types,
+    material_dimension_requirements = (
+        list(constraint_pack.get("material_dimension_requirements") or [])
+        if isinstance(constraint_pack.get("material_dimension_requirements"), list)
+        else []
     )
-    material_consensus_requirements = _build_material_consensus_requirements(
-        project_id,
-        material_knowledge_profile,
-        available_material_types=available_material_types,
+    material_consensus_requirements = (
+        list(constraint_pack.get("material_consensus_requirements") or [])
+        if isinstance(constraint_pack.get("material_consensus_requirements"), list)
+        else []
     )
-    feedback_requirements = _build_runtime_feedback_requirements(
-        project_id,
-        material_knowledge_profile=material_knowledge_profile,
+    feedback_requirements = (
+        list(constraint_pack.get("feedback_requirements") or [])
+        if isinstance(constraint_pack.get("feedback_requirements"), list)
+        else []
     )
-    feature_requirements = _build_runtime_feature_requirements(
-        project_id,
-        material_knowledge_profile=material_knowledge_profile,
-        weights_norm=weights_norm,
+    feature_requirements = (
+        list(constraint_pack.get("feature_requirements") or [])
+        if isinstance(constraint_pack.get("feature_requirements"), list)
+        else []
     )
-    runtime_requirements.extend(retrieval_requirements)
-    runtime_requirements.extend(consistency_requirements)
-    runtime_requirements.extend(material_dimension_requirements)
-    runtime_requirements.extend(material_consensus_requirements)
-    runtime_requirements.extend(feedback_requirements)
-    runtime_requirements.extend(feature_requirements)
+    available_material_types = (
+        list(constraint_pack.get("available_material_types") or [])
+        if isinstance(constraint_pack.get("available_material_types"), list)
+        else []
+    )
+    available_material_filenames = (
+        list(constraint_pack.get("available_material_filenames") or [])
+        if isinstance(constraint_pack.get("available_material_filenames"), list)
+        else []
+    )
+    retrieval_selected_filenames = (
+        list(constraint_pack.get("retrieval_selected_filenames") or [])
+        if isinstance(constraint_pack.get("retrieval_selected_filenames"), list)
+        else []
+    )
+    retrieval_selected_via_counts = (
+        dict(constraint_pack.get("retrieval_selected_via_counts") or {})
+        if isinstance(constraint_pack.get("retrieval_selected_via_counts"), dict)
+        else {}
+    )
+    retrieval_types = (
+        list(constraint_pack.get("retrieval_types") or [])
+        if isinstance(constraint_pack.get("retrieval_types"), list)
+        else []
+    )
+    runtime_requirements.extend(list(constraint_pack.get("requirements") or []))
 
     meta = {
         "required_sections": len(required_sections),
@@ -2675,7 +3843,9 @@ def _build_runtime_custom_requirements(
             )
             or 0.0
         ),
-        "material_available_files": len(material_rows),
+        "material_available_files": len(
+            (material_index.get("files") or []) if isinstance(material_index, dict) else []
+        ),
         "material_available_filenames": available_material_filenames[:120],
         "material_available_types": available_material_types,
         "material_total_size_mb": float(retrieval_budget.get("material_total_size_mb") or 0.0),
@@ -2686,6 +3856,20 @@ def _build_runtime_custom_requirements(
         "material_retrieval_missing_types": [
             t for t in available_material_types if t not in retrieval_types
         ],
+        "material_constraint_pack": {
+            "requirement_total": len(list(constraint_pack.get("requirements") or [])),
+            "retrieval_gating": len(retrieval_requirements),
+            "dimension_gating": len(
+                material_dimension_requirements
+                + material_consensus_requirements
+                + feedback_requirements
+                + feature_requirements
+            ),
+            "score_shaping": len(feedback_requirements + feature_requirements),
+            "available_types": available_material_types[:8],
+            "selected_filenames": retrieval_selected_filenames[:12],
+            "pack_version": "v3-unified-material-pack",
+        },
         "material_retrieval_preview": [
             {
                 "material_type": c.get("material_type"),
@@ -3785,7 +4969,12 @@ def _build_project_scoring_diagnostic(
     readiness = _build_scoring_readiness(project_id, project)
     material_depth = _build_material_depth_report(project_id, project)
     material_knowledge = _build_material_knowledge_profile(project_id)
-    material_rows = [m for m in load_materials() if str(m.get("project_id") or "") == project_id]
+    material_rows = [
+        _normalize_material_row_for_parse(dict(m))[0]
+        for m in load_materials()
+        if str(m.get("project_id") or "") == project_id
+    ]
+    _, parse_job_summary = _build_material_parse_jobs_summary(project_id)
 
     submissions = load_submissions()
     latest = _latest_project_submission(project_id, submissions, prefer_scored=True)
@@ -4121,6 +5310,42 @@ def _build_project_scoring_diagnostic(
 
     material_type_cards: List[Dict[str, object]] = []
     for mat_type in all_types:
+        parse_rows = [
+            row
+            for row in material_rows
+            if _normalize_material_type(row.get("material_type"), filename=row.get("filename"))
+            == mat_type
+        ]
+        parse_status_counts: Dict[str, int] = {}
+        parse_backend_counts: Dict[str, int] = {}
+        parse_error_preview: List[str] = []
+        parse_confidence_values: List[float] = []
+        queued_count = 0
+        processing_count = 0
+        failed_count = 0
+        parsed_count = 0
+        for parse_row in parse_rows:
+            parse_status = str(parse_row.get("parse_status") or "queued").strip().lower()
+            parse_status_counts[parse_status] = parse_status_counts.get(parse_status, 0) + 1
+            if parse_status == "queued":
+                queued_count += 1
+            elif parse_status == "processing":
+                processing_count += 1
+            elif parse_status == "failed":
+                failed_count += 1
+            elif parse_status == "parsed":
+                parsed_count += 1
+            backend_key = str(parse_row.get("parse_backend") or "").strip()
+            if backend_key:
+                parse_backend_counts[backend_key] = parse_backend_counts.get(backend_key, 0) + 1
+            conf = _to_float_or_none(parse_row.get("parse_confidence"))
+            if conf is not None:
+                parse_confidence_values.append(float(conf))
+            error_text = str(
+                parse_row.get("parse_error_message") or parse_row.get("parse_error_class") or ""
+            ).strip()
+            if error_text and error_text not in parse_error_preview:
+                parse_error_preview.append(error_text[:120])
         depth_row = (
             depth_by_type.get(mat_type) if isinstance(depth_by_type.get(mat_type), dict) else {}
         )
@@ -4197,6 +5422,20 @@ def _build_project_scoring_diagnostic(
             status = "missing"
             status_label = "缺失"
             guidance.append(f"缺少{_material_type_label(mat_type)}，当前不能形成完整评分依据。")
+        elif processing_count > 0:
+            status = "processing"
+            status_label = "解析中"
+            guidance.append(f"{_material_type_label(mat_type)}正在后台深读，完成后才会进入评分。")
+        elif queued_count > 0:
+            status = "queued"
+            status_label = "排队中"
+            guidance.append(f"{_material_type_label(mat_type)}已进入深读队列，请等待解析完成。")
+        elif parsed_count <= 0 and failed_count > 0:
+            status = "failed"
+            status_label = "解析失败"
+            guidance.append(
+                f"{_material_type_label(mat_type)}解析失败，请重试或更换更清晰的源文件。"
+            )
         elif files <= 0:
             status = "idle"
             status_label = "未上传"
@@ -4261,6 +5500,28 @@ def _build_project_scoring_diagnostic(
                 "structured_quality_score": round(structured_quality_score, 4),
                 "structured_quality_max": round(structured_quality_max, 4),
                 "structured_quality_signal_coverage": round(structured_quality_signal_coverage, 4),
+                "parse_status_counts": parse_status_counts,
+                "queued_count": queued_count,
+                "processing_count": processing_count,
+                "parsed_count": parsed_count,
+                "failed_count": failed_count,
+                "parse_backend_summary": [
+                    (("GPT-5.4" if str(key).startswith("gpt") else str(key)) + "×" + str(value))
+                    for key, value in sorted(
+                        parse_backend_counts.items(),
+                        key=lambda item: (-item[1], item[0]),
+                    )
+                ][:6],
+                "parse_confidence_avg": round(
+                    sum(parse_confidence_values) / max(1, len(parse_confidence_values)),
+                    4,
+                )
+                if parse_confidence_values
+                else 0.0,
+                "parse_confidence_max": round(max(parse_confidence_values), 4)
+                if parse_confidence_values
+                else 0.0,
+                "parse_error_preview": parse_error_preview[:4],
                 "hit_numeric_terms": hit_numeric_terms[:12],
                 "hit_numeric_term_count": len(hit_numeric_terms),
                 "expected_numeric_terms": expected_numeric_terms[:12],
@@ -4323,6 +5584,23 @@ def _build_project_scoring_diagnostic(
         "summary": {
             "ready_to_score": bool(readiness.get("ready")),
             "material_gate_passed": bool(readiness.get("gate_passed")),
+            "parse_job_summary": parse_job_summary,
+            "parse_total_jobs": int(_to_float_or_none(parse_job_summary.get("total_jobs")) or 0),
+            "parse_backlog": int(_to_float_or_none(parse_job_summary.get("backlog")) or 0),
+            "parse_failed_jobs": int(_to_float_or_none(parse_job_summary.get("failed_jobs")) or 0),
+            "parse_gpt_ratio": _to_float_or_none(parse_job_summary.get("gpt_ratio")),
+            "parsed_materials": sum(
+                1 for row in material_rows if str(row.get("parse_status") or "") == "parsed"
+            ),
+            "queued_materials": sum(
+                1 for row in material_rows if str(row.get("parse_status") or "") == "queued"
+            ),
+            "processing_materials": sum(
+                1 for row in material_rows if str(row.get("parse_status") or "") == "processing"
+            ),
+            "failed_materials": sum(
+                1 for row in material_rows if str(row.get("parse_status") or "") == "failed"
+            ),
             "material_files": int(_to_float_or_none(quality_summary.get("total_files")) or 0),
             "material_parsed_chars": int(
                 _to_float_or_none(quality_summary.get("total_parsed_chars")) or 0
@@ -4419,6 +5697,22 @@ def _build_project_scoring_diagnostic(
                     (basis_runtime_constraints or {}).get("feature_confidence_requirements")
                 )
                 or 0
+            ),
+            "recent_feedback_context_active": bool(
+                (
+                    _to_float_or_none(
+                        (basis_runtime_constraints or {}).get("feedback_evolution_requirements")
+                    )
+                    or 0
+                )
+                > 0
+                or (
+                    _to_float_or_none(
+                        (basis_runtime_constraints or {}).get("feature_confidence_requirements")
+                    )
+                    or 0
+                )
+                > 0
             ),
             "latest_score_self_awareness": (
                 latest_submission.get("score_self_awareness")
@@ -7867,12 +9161,16 @@ def _build_recent_feedback_dimension_boosts(
                     "positive_count": 0.0,
                     "negative_count": 0.0,
                     "weight_sum": 0.0,
+                    "decay_weight_sum": 0.0,
                     "delta_sum": 0.0,
                     "strength_sum": 0.0,
                 },
             )
             bucket["sample_count"] += 1.0
             bucket["weight_sum"] += decay_weight
+            bucket["decay_weight_sum"] += float(
+                _to_float_or_none(update.get("time_decay_weight")) or decay_weight
+            )
             bucket["delta_sum"] += delta_score_100 * decay_weight
             bucket["strength_sum"] += strength
             if delta_score_100 >= 1.0:
@@ -7891,6 +9189,22 @@ def _build_recent_feedback_dimension_boosts(
             "negative_count": int(bucket.get("negative_count") or 0.0),
             "avg_delta_100": round(avg_delta, 4),
             "avg_strength": round(avg_strength, 4),
+            "avg_time_decay_weight": round(
+                float(bucket.get("decay_weight_sum") or 0.0)
+                / max(1.0, float(bucket.get("sample_count") or 0.0)),
+                4,
+            ),
+            "feedback_polarity": (
+                "positive"
+                if float(bucket.get("positive_count") or 0.0)
+                > float(bucket.get("negative_count") or 0.0)
+                else (
+                    "negative"
+                    if float(bucket.get("negative_count") or 0.0)
+                    > float(bucket.get("positive_count") or 0.0)
+                    else "mixed"
+                )
+            ),
         }
     return out
 
@@ -7941,7 +9255,22 @@ def _auto_update_feature_confidence_on_ground_truth(
     update_result["applied_dimension_ids"] = applied_dimension_ids
     update_result["actual_score_100"] = round(float(actual_score_100), 2)
     update_result["predicted_score_100"] = round(float(pred_score_100), 2)
-    update_result["delta_score_100"] = round(float(actual_score_100) - float(pred_score_100), 2)
+    delta_score_100 = round(float(actual_score_100) - float(pred_score_100), 2)
+    feedback_polarity = "neutral"
+    if delta_score_100 >= 1.0:
+        feedback_polarity = "positive"
+    elif delta_score_100 <= -1.0:
+        feedback_polarity = "negative"
+    update_result["delta_score_100"] = delta_score_100
+    update_result["time_decay_weight"] = round(
+        compute_time_decay_weight(
+            record_time=gt_record.get("updated_at") or gt_record.get("created_at"),
+            half_life_days=30.0,
+            min_decay=0.05,
+        ),
+        4,
+    )
+    update_result["positive_or_negative_feedback"] = feedback_polarity
     return update_result
 
 
@@ -8289,6 +9618,16 @@ app = FastAPI(
 
 # Setup rate limiting (infrastructure ready, decorators disabled due to compatibility)
 setup_rate_limiting(app)
+
+
+@app.on_event("startup")
+async def _startup_material_parse_worker() -> None:
+    _start_material_parse_worker()
+
+
+@app.on_event("shutdown")
+async def _shutdown_material_parse_worker() -> None:
+    _stop_material_parse_worker()
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -8680,6 +10019,9 @@ def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
     project_missing_required_types: List[str] = []
     project_issues_preview = "-"
     project_warnings_preview = "-"
+    parse_job_summary: Dict[str, object] = {}
+    openai_api_available = False
+    structured_summary_schema_ok = True
 
     # health (always true if request reaches server)
     add("health", True, "service reachable", category="service")
@@ -8722,6 +10064,15 @@ def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
     except Exception as e:
         add("rate_limit_status", False, str(e), category="security", required=False)
 
+    openai_api_available = bool(get_openai_api_key())
+    add(
+        "openai_api_available",
+        openai_api_available,
+        f"model={get_openai_model()}" if openai_api_available else "OPENAI_API_KEY missing",
+        category="llm",
+        required=False,
+    )
+
     # parser/runtime capability checks
     pdf_backend = _pdf_backend_name()
     add(
@@ -8759,6 +10110,59 @@ def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
         )
     except Exception as e:
         add("parser_dwg_converter", False, str(e), category="parser", required=False)
+    try:
+        jobs, parse_job_summary = _build_material_parse_jobs_summary(project_id)
+        backlog = int(_to_float_or_none(parse_job_summary.get("backlog")) or 0)
+        failed_jobs = int(_to_float_or_none(parse_job_summary.get("failed_jobs")) or 0)
+        total_jobs = int(_to_float_or_none(parse_job_summary.get("total_jobs")) or 0)
+        failure_rate = float(failed_jobs) / float(total_jobs) if total_jobs > 0 else 0.0
+        worker_ok = bool(_MATERIAL_PARSE_WORKER and _MATERIAL_PARSE_WORKER.is_alive())
+        add(
+            "vision_parse_queue_healthy",
+            worker_ok and backlog <= DEFAULT_MATERIAL_PARSE_BACKLOG_WARN,
+            f"worker={worker_ok}, backlog={backlog}",
+            category="async_parse",
+            required=False,
+        )
+        add(
+            "material_parse_backlog_ok",
+            backlog <= DEFAULT_MATERIAL_PARSE_BACKLOG_WARN,
+            f"backlog={backlog}",
+            category="async_parse",
+            required=False,
+        )
+        add(
+            "gpt_parse_failure_rate_ok",
+            failure_rate <= 0.35,
+            f"failed_jobs={failed_jobs}, total_jobs={total_jobs}, rate={failure_rate:.1%}",
+            category="async_parse",
+            required=False,
+        )
+        parsed_rows = [
+            row
+            for row in (
+                _normalize_material_row_for_parse(dict(m))[0]
+                for m in load_materials()
+                if (not project_id or str(m.get("project_id") or "") == str(project_id))
+            )
+            if str(row.get("parse_status") or "") == "parsed"
+        ]
+        if parsed_rows:
+            structured_summary_schema_ok = all(
+                isinstance(row.get("structured_summary"), dict) for row in parsed_rows[:20]
+            )
+        add(
+            "structured_summary_schema_ok",
+            structured_summary_schema_ok,
+            f"parsed_rows={len(parsed_rows)}",
+            category="async_parse",
+            required=False,
+        )
+    except Exception as e:
+        add("vision_parse_queue_healthy", False, str(e), category="async_parse", required=False)
+        add("material_parse_backlog_ok", False, str(e), category="async_parse", required=False)
+        add("gpt_parse_failure_rate_ok", False, str(e), category="async_parse", required=False)
+        add("structured_summary_schema_ok", False, str(e), category="async_parse", required=False)
 
     # data hygiene (non-blocking): 用于识别孤儿项目数据，避免统计/审计偏差
     try:
@@ -8905,6 +10309,9 @@ def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
         "pdf_backend": pdf_backend,
         "ocr_available": ocr_available,
         "dwg_converter_found": dwg_converter_found,
+        "openai_api_available": openai_api_available,
+        "parse_job_summary": parse_job_summary,
+        "structured_summary_schema_ok": structured_summary_schema_ok,
         "data_hygiene_orphan_records": data_hygiene_orphan_count,
         "data_hygiene_impacted_datasets": data_hygiene_impacted,
         "project_id": project_id,
@@ -9755,6 +11162,7 @@ def _delete_project_cascade(project_id: str, *, locale: str = "zh") -> Dict[str,
 
     materials = load_materials()
     project_materials = [m for m in materials if m.get("project_id") == project_id]
+    project_material_ids = {str(m.get("id") or "") for m in project_materials}
     removed_counts["materials"] = len(project_materials)
     for m in project_materials:
         path = Path(str(m.get("path") or ""))
@@ -9764,6 +11172,14 @@ def _delete_project_cascade(project_id: str, *, locale: str = "zh") -> Dict[str,
             except Exception:
                 pass
     save_materials([m for m in materials if m.get("project_id") != project_id])
+    save_material_parse_jobs(
+        [
+            j
+            for j in load_material_parse_jobs()
+            if str(j.get("project_id") or "") != str(project_id)
+            and str(j.get("material_id") or "") not in project_material_ids
+        ]
+    )
     _invalidate_material_index_cache(project_id)
 
     project_dir = MATERIALS_DIR / project_id
@@ -10284,22 +11700,40 @@ def upload_material(
         "filename": normalized_name,
         "path": str(target),
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "parse_status": "queued",
+        "parse_backend": "queued",
+        "parse_confidence": 0.0,
+        "parse_error_class": None,
+        "parse_error_message": None,
+        "parse_started_at": None,
+        "parse_finished_at": None,
+        "parse_version": DEFAULT_MATERIAL_PARSE_VERSION,
+        "structured_summary": None,
+        "parsed_text": "",
+        "parsed_chars": 0,
+        "parsed_chunks": [],
+        "numeric_terms_norm": [],
+        "lexical_terms": [],
     }
+    jobs = load_material_parse_jobs()
+    jobs, job_id, _ = _ensure_material_parse_job(jobs, record, force_requeue=True)
+    record["job_id"] = job_id
     materials.append(record)
     save_materials(materials)
+    save_material_parse_jobs(jobs)
     _invalidate_material_index_cache(project_id)
-    # 材料更新后立即重建锚点/要求，避免后续评分继续使用旧约束。
-    constraint_sync: Dict[str, object] = {"rebuilt": False}
-    try:
-        anchors, requirements = _rebuild_project_anchors_and_requirements(project_id)
-        constraint_sync = {
-            "rebuilt": True,
-            "anchors": len(anchors),
-            "requirements": len(requirements),
-        }
-    except Exception as exc:
-        constraint_sync = {"rebuilt": False, "error": f"{type(exc).__name__}: {exc}"}
-    return {"status": "ok", "material": record, "constraint_sync": constraint_sync}
+    return {
+        "status": "ok",
+        "material": record,
+        "parse_job": {
+            "id": job_id,
+            "status": "queued",
+            "material_id": record["id"],
+            "project_id": project_id,
+        },
+        "constraint_sync": {"rebuilt": False, "mode": "async_parse_pending"},
+    }
 
 
 @router.get(
@@ -10318,12 +11752,94 @@ def list_materials(project_id: str, locale: str = Depends(get_locale)) -> list[M
     materials.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
     normalized_rows: List[dict] = []
     for material in materials:
-        row = dict(material)
+        row, _ = _normalize_material_row_for_parse(dict(material))
         row["material_type"] = _normalize_material_type(
             row.get("material_type"), filename=row.get("filename")
         )
         normalized_rows.append(row)
     return [MaterialRecord(**m) for m in normalized_rows]
+
+
+@router.get(
+    "/projects/{project_id}/materials/parse_status",
+    response_model=MaterialParseStatusResponse,
+    tags=["项目管理"],
+    responses={**RESPONSES_404},
+)
+def get_material_parse_status(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> MaterialParseStatusResponse:
+    ensure_data_dirs()
+    projects = load_projects()
+    if not any(p["id"] == project_id for p in projects):
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    materials = [
+        _normalize_material_row_for_parse(dict(m))[0]
+        for m in load_materials()
+        if str(m.get("project_id") or "") == str(project_id)
+    ]
+    jobs, summary = _build_material_parse_jobs_summary(project_id)
+    summary["materials_total"] = len(materials)
+    summary["parsed_materials"] = sum(
+        1 for row in materials if str(row.get("parse_status") or "") == "parsed"
+    )
+    summary["failed_materials"] = sum(
+        1 for row in materials if str(row.get("parse_status") or "") == "failed"
+    )
+    summary["processing_materials"] = sum(
+        1 for row in materials if str(row.get("parse_status") or "") == "processing"
+    )
+    summary["queued_materials"] = sum(
+        1 for row in materials if str(row.get("parse_status") or "") == "queued"
+    )
+    return MaterialParseStatusResponse(
+        project_id=project_id,
+        summary=summary,
+        jobs=[MaterialParseJobRecord(**job) for job in jobs],
+        materials=[MaterialRecord(**row) for row in materials],
+        generated_at=_now_iso(),
+    )
+
+
+@router.post(
+    "/projects/{project_id}/materials/reparse",
+    response_model=MaterialParseStatusResponse,
+    tags=["项目管理"],
+    responses={**RESPONSES_401, **RESPONSES_404},
+)
+def reparse_project_materials(
+    project_id: str,
+    api_key: Optional[str] = Depends(verify_api_key),
+    locale: str = Depends(get_locale),
+) -> MaterialParseStatusResponse:
+    ensure_data_dirs()
+    projects = load_projects()
+    if not any(p["id"] == project_id for p in projects):
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    materials = load_materials()
+    jobs = load_material_parse_jobs()
+    changed = False
+    for idx, row in enumerate(materials):
+        if str(row.get("project_id") or "") != str(project_id):
+            continue
+        normalized, _ = _normalize_material_row_for_parse(dict(row))
+        jobs, job_id, created = _ensure_material_parse_job(jobs, normalized, force_requeue=True)
+        normalized["job_id"] = job_id
+        normalized["parse_status"] = "queued"
+        normalized["parse_backend"] = "queued"
+        normalized["parse_error_class"] = None
+        normalized["parse_error_message"] = None
+        normalized["parse_started_at"] = None
+        normalized["parse_finished_at"] = None
+        normalized["updated_at"] = _now_iso()
+        materials[idx] = normalized
+        changed = True or created
+    if changed:
+        save_materials(materials)
+        save_material_parse_jobs(jobs)
+        _invalidate_material_index_cache(project_id)
+    return get_material_parse_status(project_id, locale)
 
 
 @router.get(
@@ -10659,6 +12175,9 @@ def delete_material(
         path.unlink()
     materials = [m for m in materials if m.get("id") != material_id]
     save_materials(materials)
+    save_material_parse_jobs(
+        [j for j in load_material_parse_jobs() if str(j.get("material_id") or "") != material_id]
+    )
     _invalidate_material_index_cache(project_id)
     return {"ok": True, "id": material_id}
 
@@ -12839,6 +14358,8 @@ def _infer_chunk_dimension_id(material_type: str, chunk_text: str) -> str:
 
 
 def _get_material_file_structured_summary(file_entry: Dict[str, object]) -> Dict[str, object]:
+    if isinstance(file_entry.get("structured_summary"), dict):
+        return file_entry.get("structured_summary")  # type: ignore[return-value]
     mat_type = _normalize_material_type(file_entry.get("material_type"))
     if mat_type == "tender_qa":
         return (
@@ -13543,10 +15064,16 @@ def _validate_material_gate_for_scoring(
     numeric_terms_by_type = (
         snapshot.get("numeric_terms_by_type") if isinstance(snapshot, dict) else {}
     )
+    parse_status_by_type = (
+        snapshot.get("parse_status_by_type")
+        if isinstance(snapshot.get("parse_status_by_type"), dict)
+        else {}
+    )
     counts_by_type = counts_by_type if isinstance(counts_by_type, dict) else {}
     chars_by_type = chars_by_type if isinstance(chars_by_type, dict) else {}
     chunks_by_type = chunks_by_type if isinstance(chunks_by_type, dict) else {}
     numeric_terms_by_type = numeric_terms_by_type if isinstance(numeric_terms_by_type, dict) else {}
+    parse_status_by_type = parse_status_by_type if isinstance(parse_status_by_type, dict) else {}
     issues: List[str] = []
     depth_issues: List[str] = []
     required_types = cfg.get("required_types") if isinstance(cfg, dict) else []
@@ -13559,6 +15086,23 @@ def _validate_material_gate_for_scoring(
             if tpe not in missing_required_types:
                 missing_required_types.append(str(tpe))
             issues.append(f"缺少必需资料类型：{label}")
+            continue
+        status_counts = (
+            parse_status_by_type.get(tpe) if isinstance(parse_status_by_type.get(tpe), dict) else {}
+        )
+        queued_count = int(_to_float_or_none(status_counts.get("queued")) or 0)
+        processing_count = int(_to_float_or_none(status_counts.get("processing")) or 0)
+        parsed_count = int(_to_float_or_none(status_counts.get("parsed")) or 0)
+        failed_count = int(_to_float_or_none(status_counts.get("failed")) or 0)
+        if parsed_count <= 0:
+            if processing_count > 0:
+                issues.append(f"{label}正在深读解析中：{processing_count} 份，请稍后再评分。")
+            elif queued_count > 0:
+                issues.append(f"{label}已上传但尚未开始深读：{queued_count} 份，请等待解析完成。")
+            elif failed_count > 0:
+                issues.append(f"{label}解析失败：{failed_count} 份，请重试或更换文件后再评分。")
+            else:
+                issues.append(f"{label}尚未完成解析，暂不可评分。")
             continue
         min_chars = int((cfg.get("min_chars_by_type") or {}).get(tpe, 0))
         parsed_chars = int(chars_by_type.get(tpe, 0))
@@ -13631,6 +15175,7 @@ def _validate_material_gate_for_scoring(
         "block_on_any_parse_failure": block_on_parse_failure,
         "issues": issues,
         "passed": len(issues) == 0,
+        "parse_status_by_type": parse_status_by_type,
     }
     enforce_depth_gate = bool(cfg.get("enforce_depth_gate", DEFAULT_ENFORCE_MATERIAL_DEPTH_GATE))
     snapshot["depth_gate"] = {
@@ -13681,10 +15226,15 @@ def _build_scoring_readiness(project_id: str, project: Dict[str, object]) -> Dic
     elif scored_submission_count <= 0:
         warnings.append("当前施组尚未完成评分，可点击“评分施组”触发。")
 
-    parsed_ok_files = int(_to_float_or_none(snapshot.get("parsed_ok_files")) or 0)
-    total_files = int(_to_float_or_none(snapshot.get("total_files")) or 0)
-    if total_files > 0 and parsed_ok_files < total_files:
-        warnings.append(f"存在 {total_files - parsed_ok_files} 份资料解析失败，建议修复后再评分。")
+    parsed_failed_files = int(_to_float_or_none(snapshot.get("parsed_failed_files")) or 0)
+    queued_files = int(_to_float_or_none(snapshot.get("queued_files")) or 0)
+    processing_files = int(_to_float_or_none(snapshot.get("processing_files")) or 0)
+    if parsed_failed_files > 0:
+        warnings.append(f"存在 {parsed_failed_files} 份资料解析失败，建议修复后再评分。")
+    if queued_files > 0 or processing_files > 0:
+        warnings.append(
+            f"仍有 {queued_files} 份资料排队、{processing_files} 份资料解析中，待深读完成后评分更稳定。"
+        )
     depth_issues = depth_gate.get("issues") if isinstance(depth_gate.get("issues"), list) else []
     depth_issue_texts = [str(x).strip() for x in depth_issues if str(x).strip()]
     if depth_issue_texts:
@@ -18740,21 +20290,33 @@ def index(
             ]
             selected_materials.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
             for m in selected_materials:
+                normalized_m, _ = _normalize_material_row_for_parse(dict(m))
                 material_id = html_lib.escape(str(m.get("id", "")))
-                filename_raw = str(m.get("filename", ""))
+                filename_raw = str(normalized_m.get("filename", ""))
                 filename = html_lib.escape(filename_raw)
                 material_type_label = html_lib.escape(
-                    _material_type_label(m.get("material_type"), filename=m.get("filename"))
+                    _material_type_label(
+                        normalized_m.get("material_type"),
+                        filename=normalized_m.get("filename"),
+                    )
                 )
-                created_at = html_lib.escape(str(m.get("created_at", ""))[:19])
+                created_at = html_lib.escape(str(normalized_m.get("created_at", ""))[:19])
+                parse_status_label = html_lib.escape(
+                    _material_parse_status_label(
+                        normalized_m.get("parse_status"),
+                        parse_backend=normalized_m.get("parse_backend"),
+                        parse_error_message=normalized_m.get("parse_error_message"),
+                    )
+                )
                 initial_material_rows.append(
                     "<tr>"
                     + f"<td>{material_type_label}</td>"
                     + f"<td>{filename}</td>"
+                    + f"<td>{parse_status_label}</td>"
                     + f"<td>{created_at}</td>"
                     + (
                         "<td>"
-                        + f'<button type="button" class="btn-danger js-delete-material" data-material-id="{material_id}" data-project-id="{html_lib.escape(str(m.get("project_id") or ""))}" data-filename="{html_lib.escape(filename_raw)}" onclick="return window.__zhifeiFallbackDelete(event, \'material\', this.getAttribute(\'data-material-id\'), this.getAttribute(\'data-filename\'), this.getAttribute(\'data-project-id\'))">删除</button>'
+                        + f'<button type="button" class="btn-danger js-delete-material" data-material-id="{material_id}" data-project-id="{html_lib.escape(str(normalized_m.get("project_id") or ""))}" data-filename="{html_lib.escape(filename_raw)}" onclick="return window.__zhifeiFallbackDelete(event, \'material\', this.getAttribute(\'data-material-id\'), this.getAttribute(\'data-filename\'), this.getAttribute(\'data-project-id\'))">删除</button>'
                         + "</td>"
                     )
                     + "</tr>"
@@ -19438,7 +21000,7 @@ def index(
           <button type="button" id="btnMaterialKnowledgeProfile" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialKnowledgeProfile')">知识画像</button>
           <button type="button" id="btnMaterialKnowledgeProfileDownload" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialKnowledgeProfileDownload')">下载知识画像(.md)</button>
         </div>
-        <table id="materialsTable"><thead><tr><th>资料类型</th><th>文件名</th><th>上传时间</th><th>操作</th></tr></thead><tbody>__MATERIAL_ROWS__</tbody></table>
+        <table id="materialsTable"><thead><tr><th>资料类型</th><th>文件名</th><th>解析状态</th><th>上传时间</th><th>操作</th></tr></thead><tbody>__MATERIAL_ROWS__</tbody></table>
         <p id="materialsEmpty" style="font-size:13px;color:#64748b;margin:6px 0 0 0;display:__MATERIALS_EMPTY_DISPLAY__">暂无资料，请下方添加。</p>
         <div id="materialDepthReportResult" class="result-block" style="display:none"></div>
         <div id="materialKnowledgeProfileResult" class="result-block" style="display:none"></div>
@@ -20157,15 +21719,15 @@ def index(
             if (tbody) tbody.innerHTML = '';
             let res;
             let text = '';
-            let rows = [];
+            let payload = {};
             try {
-              res = await fetch('/api/v1/projects/' + encodeURIComponent(pid) + '/materials?t=' + Date.now(), {
+              res = await fetch('/api/v1/projects/' + encodeURIComponent(pid) + '/materials/parse_status?t=' + Date.now(), {
                 method: 'GET',
                 headers: fallbackAuthHeaders(),
                 cache: 'no-store',
               });
               text = await res.text();
-              rows = fallbackParseJson(text);
+              payload = fallbackParseJson(text);
             } catch (_) {
               if (emptyEl) {
                 emptyEl.textContent = '资料列表加载失败，请稍后重试。';
@@ -20173,7 +21735,9 @@ def index(
               }
               return;
             }
-            if (!res.ok || !Array.isArray(rows)) {
+            const rows = Array.isArray(payload && payload.materials) ? payload.materials : [];
+            const summary = (payload && typeof payload.summary === 'object') ? payload.summary : {};
+            if (!res.ok || !payload || typeof payload !== 'object') {
               if (emptyEl) {
                 emptyEl.textContent = '资料列表加载失败（HTTP ' + String((res && res.status) || 0) + '）';
                 emptyEl.style.display = 'block';
@@ -20185,22 +21749,17 @@ def index(
                 emptyEl.textContent = '暂无资料，请下方添加。';
                 emptyEl.style.display = 'block';
               }
+              if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState([], summary);
               return;
             }
             if (emptyEl) emptyEl.style.display = 'none';
+            if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState(rows, summary);
             rows.forEach((m) => {
               const tr = document.createElement('tr');
-              const mid = fallbackEscapeHtml(String((m && m.id) || ''));
-              const fn = fallbackEscapeHtml(String((m && m.filename) || ''));
-              const mt = fallbackEscapeHtml(materialTypeLabel((m && m.material_type) || 'tender_qa'));
-              const createdAt = fallbackEscapeHtml(String((m && m.created_at) || '').slice(0, 19));
-              tr.innerHTML =
-                '<td>' + mt + '</td>'
-                + '<td>' + fn + '</td>'
-                + '<td>' + createdAt + '</td>'
-                + '<td><button type="button" class="btn-danger js-delete-material" data-material-id="' + mid + '" data-project-id="' + fallbackEscapeHtml(pid) + '" data-filename="' + fn + '">删除</button></td>';
+              tr.innerHTML = buildMaterialTableRowHtml(m, pid);
               if (tbody) tbody.appendChild(tr);
             });
+            scheduleMaterialParsePolling(pid, summary, null);
           }
           async function fallbackRefreshSubmissionsTable(projectId) {
             const pid = String(projectId || '').trim();
@@ -21002,6 +22561,7 @@ def index(
         }
 
         let projectSwitchSeq = 0;
+        let materialParsePollTimer = null;
         function selectedProjectIdStrict() {
           const sel = document.getElementById('projectSelect');
           return (sel && sel.value) ? String(sel.value) : '';
@@ -21010,6 +22570,119 @@ def index(
           if (!expectedProjectId) return false;
           if (typeof seq === 'number' && seq !== projectSwitchSeq) return true;
           return selectedProjectIdStrict() !== String(expectedProjectId);
+        }
+        function clearMaterialParsePolling() {
+          if (materialParsePollTimer) {
+            clearTimeout(materialParsePollTimer);
+            materialParsePollTimer = null;
+          }
+        }
+        function materialParseBackendLabel(backend) {
+          const raw = String(backend || '').trim();
+          if (!raw) return '-';
+          if (raw === 'queued') return '排队中';
+          if (raw.startsWith('gpt')) return 'GPT-5.4';
+          if (raw === 'local') return '本地解析';
+          if (raw === 'hybrid') return '混合解析';
+          return raw;
+        }
+        function materialParseStatusMeta(material) {
+          const row = (material && typeof material === 'object') ? material : {};
+          const status = String(row.parse_status || 'queued').trim().toLowerCase();
+          const backend = materialParseBackendLabel(row.parse_backend);
+          const errorText = String(row.parse_error_message || row.parse_error_class || '').trim();
+          if (status === 'parsed') {
+            return { status: 'parsed', label: backend === '-' ? '已解析' : ('已解析（' + backend + ')'), tone: '#166534' };
+          }
+          if (status === 'processing') {
+            return { status: 'processing', label: '解析中（' + backend + '）', tone: '#92400e' };
+          }
+          if (status === 'failed') {
+            return { status: 'failed', label: errorText ? ('解析失败：' + errorText.slice(0, 48)) : '解析失败', tone: '#991b1b' };
+          }
+          if (status === 'queued') {
+            return { status: 'queued', label: '排队中', tone: '#475569' };
+          }
+          return { status: status || 'idle', label: '待解析', tone: '#64748b' };
+        }
+        function buildMaterialTableRowHtml(material, projectId) {
+          const row = (material && typeof material === 'object') ? material : {};
+          const parseMeta = materialParseStatusMeta(row);
+          return ''
+            + '<td>' + escapeHtmlText(materialTypeLabel(row.material_type || 'tender_qa')) + '</td>'
+            + '<td>' + escapeHtmlText(row.filename || '') + '</td>'
+            + '<td><span style="color:' + escapeHtmlText(parseMeta.tone || '#475569') + '">' + escapeHtmlText(parseMeta.label || '-') + '</span></td>'
+            + '<td>' + escapeHtmlText(String(row.created_at || '').slice(0, 19)) + '</td>'
+            + '<td><button type="button" class="btn-danger js-delete-material" data-material-id="' + escapeHtmlText(String(row.id || '')) + '" data-project-id="' + escapeHtmlText(String(projectId || '')) + '" data-filename="' + escapeHtmlText(String(row.filename || '')) + '">删除</button></td>';
+        }
+        function applyMaterialParseZoneState(materials, summary) {
+          const cardsByType = {};
+          const rows = Array.isArray(materials) ? materials : [];
+          rows.forEach((row) => {
+            if (!row || typeof row !== 'object') return;
+            const typeKey = String(row.material_type || '').trim() || 'tender_qa';
+            if (!cardsByType[typeKey]) cardsByType[typeKey] = { total: 0, parsed: 0, queued: 0, processing: 0, failed: 0 };
+            const bucket = cardsByType[typeKey];
+            bucket.total += 1;
+            const status = String(row.parse_status || 'queued').trim().toLowerCase();
+            if (status === 'parsed') bucket.parsed += 1;
+            else if (status === 'processing') bucket.processing += 1;
+            else if (status === 'failed') bucket.failed += 1;
+            else bucket.queued += 1;
+          });
+          ['tender_qa', 'boq', 'drawing', 'site_photo'].forEach((materialType) => {
+            const zoneEl = document.getElementById(materialTypeUploadZoneId(materialType));
+            const stateEl = document.getElementById(materialTypeUploadZoneStateId(materialType));
+            if (!zoneEl || !stateEl) return;
+            const bucket = cardsByType[materialType];
+            if (!bucket || !bucket.total) {
+              zoneEl.dataset.health = 'idle';
+              stateEl.style.color = '#64748b';
+              stateEl.textContent = '当前状态：未上传。';
+              return;
+            }
+            if (bucket.processing > 0) {
+              zoneEl.dataset.health = 'processing';
+              stateEl.style.color = '#92400e';
+              stateEl.textContent = '当前状态：解析中 ' + bucket.processing + ' 份；已解析 ' + bucket.parsed + ' 份。';
+              return;
+            }
+            if (bucket.queued > 0) {
+              zoneEl.dataset.health = 'queued';
+              stateEl.style.color = '#475569';
+              stateEl.textContent = '当前状态：排队中 ' + bucket.queued + ' 份；已解析 ' + bucket.parsed + ' 份。';
+              return;
+            }
+            if (bucket.failed > 0 && bucket.parsed <= 0) {
+              zoneEl.dataset.health = 'failed';
+              stateEl.style.color = '#991b1b';
+              stateEl.textContent = '当前状态：解析失败 ' + bucket.failed + ' 份，请重试或更换可解析文件。';
+              return;
+            }
+            if (bucket.failed > 0) {
+              zoneEl.dataset.health = 'parsed_not_used';
+              stateEl.style.color = '#9a3412';
+              stateEl.textContent = '当前状态：已解析 ' + bucket.parsed + ' 份；失败 ' + bucket.failed + ' 份。';
+              return;
+            }
+            zoneEl.dataset.health = 'parsed';
+            stateEl.style.color = '#166534';
+            stateEl.textContent = '当前状态：已解析 ' + bucket.parsed + ' 份，可参与评分。';
+          });
+        }
+        function scheduleMaterialParsePolling(projectId, summary, switchSeq) {
+          clearMaterialParsePolling();
+          const meta = (summary && typeof summary === 'object') ? summary : {};
+          const backlog = Number(meta.backlog || 0);
+          const processing = Number(meta.processing_materials || 0);
+          const queued = Number(meta.queued_materials || 0);
+          if (!projectId || isStaleProjectResponse(projectId, switchSeq) || (backlog + processing + queued) <= 0) return;
+          materialParsePollTimer = setTimeout(async () => {
+            if (isStaleProjectResponse(projectId, switchSeq)) return;
+            await refreshMaterials(projectId, switchSeq);
+            if (typeof refreshScoringDiagnostic === 'function') await refreshScoringDiagnostic(projectId, switchSeq);
+            if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(projectId, switchSeq);
+          }, 1200);
         }
         function setTableStandby(tableId, emptyId, message) {
           const table = document.getElementById(tableId);
@@ -21029,6 +22702,7 @@ def index(
         }
         function resetProjectPanelsToStandby(projectId) {
           const hasProject = !!projectId;
+          clearMaterialParsePolling();
           setTableStandby(
             'materialsTable',
             'materialsEmpty',
@@ -21382,6 +23056,10 @@ def index(
         function renderSelfCheckPanel(data) {
           const el = document.getElementById('selfCheckResult');
           if (!el) return;
+          const pctText = (value) => {
+            const n = Number(value);
+            return Number.isFinite(n) ? ((n * 100).toFixed(1) + '%') : '-';
+          };
           const payload = (data && typeof data === 'object') ? data : {};
           const items = Array.isArray(payload.items) ? payload.items : [];
           const checks = (payload.checks && typeof payload.checks === 'object') ? payload.checks : {};
@@ -21404,6 +23082,15 @@ def index(
           const parserCapabilities = (meta.parser_capabilities && typeof meta.parser_capabilities === 'object')
             ? meta.parser_capabilities
             : {};
+          const parseSummary = (meta.parse_job_summary && typeof meta.parse_job_summary === 'object')
+            ? meta.parse_job_summary
+            : {};
+          const openaiCheck = items.find((x) => x && x.name === 'openai_api_available') || {};
+          const asyncSummary = [
+            '积压 ' + String(meta.parse_job_summary && meta.parse_job_summary.backlog != null ? meta.parse_job_summary.backlog : 0),
+            '失败 ' + String(meta.parse_job_summary && meta.parse_job_summary.failed_jobs != null ? meta.parse_job_summary.failed_jobs : 0),
+            'GPT占比 ' + pctText(parseSummary.gpt_ratio),
+          ].join('；');
           const capabilityNames = ['parser_pdf', 'parser_docx', 'parser_ocr', 'parser_dwg_converter'];
           const capabilitySummary = capabilityNames
             .filter((name) => Object.prototype.hasOwnProperty.call(parserCapabilities, name) || Object.prototype.hasOwnProperty.call(checks, name))
@@ -21430,6 +23117,17 @@ def index(
             + '<tr><td>解析能力</td><td>' + escapeHtmlText(String(meta.parser_capability_count || 0)) + ' / '
             + escapeHtmlText(String(meta.parser_capability_total || 0)) + '</td><td>PDF后端 '
             + escapeHtmlText(String(meta.pdf_backend || '-')) + '</td></tr>'
+            + '<tr><td>GPT/异步深读</td><td>'
+            + escapeHtmlText(checks.openai_api_available ? 'OpenAI可用' : 'OpenAI不可用')
+            + '；' + escapeHtmlText(String(openaiCheck.detail || '-'))
+            + '</td><td>' + escapeHtmlText(asyncSummary) + '</td></tr>'
+            + '<tr><td>结构化摘要</td><td>'
+            + escapeHtmlText(meta.structured_summary_schema_ok ? 'Schema正常' : 'Schema异常')
+            + '</td><td>队列健康 '
+            + escapeHtmlText(checks.vision_parse_queue_healthy ? '正常' : '异常')
+            + '；失败率 '
+            + escapeHtmlText(checks.gpt_parse_failure_rate_ok ? '可接受' : '偏高')
+            + '</td></tr>'
             + '<tr><td>数据卫生</td><td>' + escapeHtmlText(String(meta.data_hygiene_orphan_records || 0)) + ' 个孤儿记录</td><td>影响数据集 '
             + escapeHtmlText(String(meta.data_hygiene_impacted_datasets || 0)) + ' 个</td></tr>'
             + '<tr><td>安全状态</td><td>鉴权 '
@@ -21966,7 +23664,7 @@ def index(
             if (out) out.textContent = cfg.typeLabel + '上传完成：成功 ' + okCount + '，失败 ' + failCount + NL + details.join(NL);
             setActionStatus(
               cfg.statusId,
-              '上传完成：成功 ' + okCount + '，失败 ' + failCount + '。',
+              '上传完成：成功 ' + okCount + '，失败 ' + failCount + '；成功文件已进入后台深读队列。',
               failCount > 0
             );
             if (okCount > 0) {
@@ -22530,17 +24228,20 @@ def index(
           const emptyEl = document.getElementById('materialsEmpty');
           if (tbody) tbody.innerHTML = '';
           if (!id) {
+            clearMaterialParsePolling();
             if (emptyEl) {
               emptyEl.textContent = '暂无资料，请先选择项目。';
               emptyEl.style.display = 'block';
             }
+            if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState([], {});
             if (typeof clearScoringReadinessPanel === 'function') clearScoringReadinessPanel();
             if (typeof clearScoringDiagnosticPanel === 'function') clearScoringDiagnosticPanel();
             return;
           }
           let res;
+          let payload = {};
           try {
-            res = await fetch('/api/v1/projects/' + id + '/materials?t=' + Date.now(), { cache: 'no-store' });
+            res = await fetch('/api/v1/projects/' + id + '/materials/parse_status?t=' + Date.now(), { cache: 'no-store' });
           } catch (err) {
             if (isStaleProjectResponse(id, switchSeq)) return;
             if (emptyEl) {
@@ -22550,12 +24251,15 @@ def index(
             return;
           }
           if (isStaleProjectResponse(id, switchSeq)) return;
-          const mats = await res.json().catch(() => []);
-          if (!res.ok) {
+          payload = await res.json().catch(() => ({}));
+          const mats = Array.isArray(payload && payload.materials) ? payload.materials : [];
+          const summary = (payload && typeof payload.summary === 'object') ? payload.summary : {};
+          if (!res.ok || !payload || typeof payload !== 'object') {
             if (emptyEl) {
               emptyEl.textContent = '资料列表加载失败（HTTP ' + String(res.status || 0) + '）';
               emptyEl.style.display = 'block';
             }
+            if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState([], {});
             if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             return;
           }
@@ -22564,21 +24268,20 @@ def index(
               emptyEl.textContent = '暂无资料，请下方添加。';
               emptyEl.style.display = 'block';
             }
+            if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState([], summary);
+            scheduleMaterialParsePolling(id, summary, switchSeq);
             if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             return;
           }
           if (emptyEl) emptyEl.style.display = 'none';
+          if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState(mats, summary);
           mats.forEach(m => {
             const tr = document.createElement('tr');
-            const typeLabel = materialTypeLabel((m && m.material_type) || 'tender_qa');
-            tr.innerHTML =
-              '<td>' + escapeHtmlText(typeLabel) + '</td>' +
-              '<td>' + escapeHtmlText(m.filename || '') + '</td>' +
-              '<td>' + escapeHtmlText((m.created_at || '').slice(0,19)) + '</td>' +
-              '<td><button type="button" class="btn-danger js-delete-material" data-material-id="' + escapeHtmlText(String(m.id || '')) + '" data-project-id="' + escapeHtmlText(String(id || '')) + '" data-filename="' + escapeHtmlText(String(m.filename || '')) + '">删除</button></td>';
+            tr.innerHTML = buildMaterialTableRowHtml(m, id);
             if (tbody) tbody.appendChild(tr);
           });
           updateTableEmptyState('materialsTable', 'materialsEmpty');
+          scheduleMaterialParsePolling(id, summary, switchSeq);
           if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
         }
         bindDeleteRowHandlers();
@@ -23100,6 +24803,18 @@ def index(
             const projectNumericCategorySummary = Array.isArray(card.project_numeric_category_summary)
               ? card.project_numeric_category_summary
               : [];
+            const parseStatusCounts = (card.parse_status_counts && typeof card.parse_status_counts === 'object')
+              ? card.parse_status_counts
+              : {};
+            const parseStatusSummary = Object.keys(parseStatusCounts).length
+              ? Object.keys(parseStatusCounts).map((key) => key + ':' + String(parseStatusCounts[key] || 0)).join('，')
+              : '';
+            const parseBackendSummary = Array.isArray(card.parse_backend_summary)
+              ? card.parse_backend_summary
+              : [];
+            const parseErrorPreview = Array.isArray(card.parse_error_preview)
+              ? card.parse_error_preview
+              : [];
             const statusLabel = String(card.status_label || '未上传');
             let text = '当前状态：' + statusLabel;
             if (status === 'active') {
@@ -23107,7 +24822,20 @@ def index(
               if (hitRequirementCount > 0) text += '；已命中约束 ' + String(hitRequirementCount) + ' 条';
               if (missingNumericCount > 0) text += '；仍缺数值锚点 ' + String(missingNumericCount) + ' 项';
               if (missingNumericCategorySummary.length) text += '；重点缺口 ' + String(missingNumericCategorySummary[0] || '');
+              if (parseBackendSummary.length) text += '；解析来源 ' + String(parseBackendSummary[0] || '');
               stateEl.style.color = '#166534';
+            } else if (status === 'processing') {
+              text += '；后台深读进行中';
+              if (parseStatusSummary) text += '；' + parseStatusSummary;
+              stateEl.style.color = '#92400e';
+            } else if (status === 'queued') {
+              text += '；已进入深读队列';
+              if (parseStatusSummary) text += '；' + parseStatusSummary;
+              stateEl.style.color = '#475569';
+            } else if (status === 'failed') {
+              text += '；请点击重新解析';
+              if (parseErrorPreview.length) text += '；最近错误 ' + String(parseErrorPreview[0] || '');
+              stateEl.style.color = '#991b1b';
             } else if (status === 'parsed_not_used') {
               text += '；已解析但尚未进入评分证据链';
               if (missingNumericCount > 0) text += '；建议补充数值锚点 ' + String(missingNumericCount) + ' 项';
@@ -23164,7 +24892,7 @@ def index(
           }
           const attentionCards = typeCards.filter((card) => {
             const status = String((card && card.status) || '');
-            return status === 'uploaded_unparsed' || status === 'parsed_not_used';
+            return status === 'uploaded_unparsed' || status === 'parsed_not_used' || status === 'queued' || status === 'processing' || status === 'failed';
           });
           if (attentionCards.length) {
             const tokens = attentionCards.slice(0, 2).map((card) => {
@@ -23566,6 +25294,9 @@ def index(
             ? basis.current_runtime_constraints
             : {};
           const summary = (data.summary && typeof data.summary === 'object') ? data.summary : {};
+          const parseSummary = (summary.parse_job_summary && typeof summary.parse_job_summary === 'object')
+            ? summary.parse_job_summary
+            : {};
           const recommendations = Array.isArray(data.recommendations) ? data.recommendations : [];
           const dimensionSupportCards = Array.isArray(data.dimension_support_cards) ? data.dimension_support_cards : [];
           const issues = Array.isArray(readiness.issues) ? readiness.issues : [];
@@ -23631,6 +25362,15 @@ def index(
             + (latest.exists ? escapeHtmlText(latest.filename || '-') : '<span style="color:#64748b">暂无施组</span>')
             + '；状态：' + statusLabel
             + '；生成时间：' + escapeHtmlText(String(data.generated_at || '').slice(0, 19) || '-')
+            + '</p>';
+          html += '<p style="margin:4px 0;color:#334155">资料异步深读：总任务 '
+            + escapeHtmlText(summary.parse_total_jobs || 0)
+            + '；积压 '
+            + escapeHtmlText(summary.parse_backlog || 0)
+            + '；失败 '
+            + escapeHtmlText(summary.parse_failed_jobs || 0)
+            + '；GPT占比 '
+            + escapeHtmlText(toPct(summary.parse_gpt_ratio))
             + '</p>';
           if (basisRuntime && Object.keys(basisRuntime).length) {
             html += '<p style="margin:4px 0;color:#334155">当前有效权重来源：'
@@ -23746,6 +25486,9 @@ def index(
             const typeTone = (status) => {
               const s = String(status || '');
               if (s === 'active') return { border: '#16a34a', bg: '#f0fdf4', title: '#166534' };
+              if (s === 'processing') return { border: '#d97706', bg: '#fff7ed', title: '#92400e' };
+              if (s === 'queued') return { border: '#94a3b8', bg: '#f8fafc', title: '#475569' };
+              if (s === 'failed') return { border: '#dc2626', bg: '#fef2f2', title: '#991b1b' };
               if (s === 'parsed_not_used') return { border: '#d97706', bg: '#fff7ed', title: '#9a3412' };
               if (s === 'uploaded_unparsed') return { border: '#dc2626', bg: '#fef2f2', title: '#991b1b' };
               if (s === 'missing') return { border: '#dc2626', bg: '#fef2f2', title: '#991b1b' };
@@ -23768,6 +25511,11 @@ def index(
               const missingNumericTerms = Array.isArray(card.missing_numeric_terms) ? card.missing_numeric_terms : [];
               const hitNumericCategorySummary = Array.isArray(card.hit_numeric_category_summary) ? card.hit_numeric_category_summary : [];
               const missingNumericCategorySummary = Array.isArray(card.missing_numeric_category_summary) ? card.missing_numeric_category_summary : [];
+              const safeParseBackendSummary = Array.isArray(card.parse_backend_summary) ? card.parse_backend_summary : [];
+              const parseErrorPreview = Array.isArray(card.parse_error_preview) ? card.parse_error_preview : [];
+              const parseStatusCounts = (card.parse_status_counts && typeof card.parse_status_counts === 'object')
+                ? card.parse_status_counts
+                : {};
               const uploadedPreview = uploadedFiles.slice(0, 3).join('；');
               const hitPreview = hitFilesByType.slice(0, 3).join('；');
               const hitLabelPreview = hitLabels.slice(0, 3).join('；');
@@ -23791,6 +25539,7 @@ def index(
               const missNumericPreview = missingNumericTerms.slice(0, 4).join('、');
               const hitNumericCategoryPreview = hitNumericCategorySummary.slice(0, 2).join('；');
               const missNumericCategoryPreview = missingNumericCategorySummary.slice(0, 2).join('；');
+              const parseStatusPreview = Object.keys(parseStatusCounts).map((key) => key + ':' + String(parseStatusCounts[key] || 0)).join('；');
               const evidenceText = Number(card.retrieval_total || 0) > 0 || Number(card.consistency_total || 0) > 0 || Number(card.fallback_total || 0) > 0
                 ? (
                     '检索 ' + escapeHtmlText(card.retrieval_hit || 0) + '/' + escapeHtmlText(card.retrieval_total || 0)
@@ -23807,6 +25556,10 @@ def index(
                 + '<div style="font-size:12px;color:#334155;line-height:1.6">'
                 + '<div>文件 ' + escapeHtmlText(card.files || 0) + '；字数 ' + escapeHtmlText(card.parsed_chars || 0) + '</div>'
                 + '<div>分块 ' + escapeHtmlText(card.parsed_chunks || 0) + '；数值项 ' + escapeHtmlText(card.numeric_terms || 0) + '</div>'
+                + '<div>解析任务：' + (parseStatusPreview ? escapeHtmlText(parseStatusPreview) : '<span style="color:#64748b">暂无</span>') + '</div>'
+                + '<div>解析来源：' + (safeParseBackendSummary.length ? escapeHtmlText(safeParseBackendSummary.join('；')) : '<span style="color:#64748b">暂无</span>') + '</div>'
+                + '<div>解析置信度 ' + escapeHtmlText(toPct(card.parse_confidence_avg))
+                + '；峰值 ' + escapeHtmlText(toPct(card.parse_confidence_max)) + '</div>'
                 + '<div>结构化质量 ' + escapeHtmlText(toPct(card.structured_quality_score))
                 + '；峰值 ' + escapeHtmlText(toPct(card.structured_quality_max))
                 + '；信号覆盖 ' + escapeHtmlText(toPct(card.structured_quality_signal_coverage)) + '</div>'
@@ -23826,6 +25579,7 @@ def index(
                 + '<div>命中类别：' + (hitNumericCategorySummary.length ? escapeHtmlText(hitNumericCategoryPreview) : '<span style="color:#64748b">暂无</span>') + '</div>'
                 + '<div>待补类别：' + (missingNumericCategorySummary.length ? escapeHtmlText(missNumericCategoryPreview) : '<span style="color:#64748b">暂无</span>') + '</div>'
                 + '<div>角色：' + (card.required ? '必需资料' : '补充资料') + '</div>'
+                + '<div>解析异常：' + (parseErrorPreview.length ? escapeHtmlText(parseErrorPreview[0]) : '<span style="color:#64748b">暂无</span>') + '</div>'
                 + '</div>'
                 + (guidance.length
                   ? '<ul style="margin:8px 0 0 18px;font-size:12px;color:#475569">' + guidance.slice(0, 2).map((item) => '<li>' + escapeHtmlText(item) + '</li>').join('') + '</ul>'

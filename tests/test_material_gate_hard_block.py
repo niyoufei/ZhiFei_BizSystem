@@ -12,6 +12,11 @@ def _base_snapshot() -> dict:
         "parsed_failed_files": 1,
         "parsed_ok_by_type": {"tender_qa": 1, "boq": 1, "drawing": 0},
         "parsed_fail_by_type": {"drawing": 1},
+        "parse_status_by_type": {
+            "tender_qa": {"parsed": 1},
+            "boq": {"parsed": 1},
+            "drawing": {"failed": 1},
+        },
         "chars_by_type": {"tender_qa": 20000, "boq": 3000, "drawing": 2000},
         "chunks_by_type": {"tender_qa": 20, "boq": 4, "drawing": 3},
         "numeric_terms_by_type": {"tender_qa": 12, "boq": 12, "drawing": 6},
@@ -106,8 +111,8 @@ def test_material_gate_allows_parse_failure_when_hard_block_disabled():
                     "p1", {"meta": {}}, raise_on_fail=False
                 )
     gate = out.get("gate") or {}
-    assert gate.get("passed") is True
-    assert issues == []
+    assert gate.get("passed") is False
+    assert any("图纸解析失败" in str(x) for x in issues)
 
 
 def test_material_gate_adapts_numeric_threshold_when_evidence_is_strong():
@@ -118,6 +123,11 @@ def test_material_gate_adapts_numeric_threshold_when_evidence_is_strong():
     snapshot["parsed_failed_files"] = 0
     snapshot["parsed_ok_by_type"] = {"tender_qa": 1, "boq": 1, "drawing": 1}
     snapshot["parsed_fail_by_type"] = {}
+    snapshot["parse_status_by_type"] = {
+        "tender_qa": {"parsed": 1},
+        "boq": {"parsed": 1},
+        "drawing": {"parsed": 1},
+    }
     snapshot["parse_fail_ratio"] = 0.0
     snapshot["parsed_fail_details"] = []
     snapshot["numeric_terms_by_type"] = {"tender_qa": 12, "boq": 6, "drawing": 6}
@@ -150,6 +160,11 @@ def test_material_gate_keeps_numeric_threshold_when_evidence_is_weak():
     snapshot["parsed_failed_files"] = 0
     snapshot["parsed_ok_by_type"] = {"tender_qa": 1, "boq": 1, "drawing": 1}
     snapshot["parsed_fail_by_type"] = {}
+    snapshot["parse_status_by_type"] = {
+        "tender_qa": {"parsed": 1},
+        "boq": {"parsed": 1},
+        "drawing": {"parsed": 1},
+    }
     snapshot["parse_fail_ratio"] = 0.0
     snapshot["parsed_fail_details"] = []
     snapshot["numeric_terms_by_type"] = {"tender_qa": 12, "boq": 6, "drawing": 6}

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from base64 import b64encode
 from typing import Any, Dict, Optional, Tuple
 
 OPENAI_HTTP_URL = "https://api.openai.com/v1/chat/completions"
@@ -99,6 +100,76 @@ def call_openai_json(
     if not content:
         return False, None, "empty_content"
     parsed = extract_json_from_content(content)
+    if parsed is None:
+        return False, None, "json_parse_failed"
+    return True, parsed, ""
+
+
+def call_openai_multimodal_json(
+    user_message: str,
+    *,
+    image_bytes: bytes | None = None,
+    image_mime: str = "image/png",
+    model: str | None = None,
+    max_tokens: int = 4096,
+    timeout: int = 120,
+    temperature: float = 0.2,
+) -> Tuple[bool, Optional[Dict[str, Any]], str]:
+    key = get_openai_api_key()
+    if not key:
+        return False, None, "missing_credentials"
+    try:
+        import urllib.request
+
+        resolved_model = resolve_openai_model(model)
+        content: list[Dict[str, Any]] = [{"type": "text", "text": user_message}]
+        if image_bytes:
+            encoded = b64encode(image_bytes).decode("ascii")
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{image_mime};base64,{encoded}"},
+                }
+            )
+        body = json.dumps(
+            {
+                "model": resolved_model,
+                "messages": [{"role": "user", "content": content}],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            OPENAI_HTTP_URL,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {key}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        return False, None, str(exc)
+
+    choices = data.get("choices")
+    if not choices or not isinstance(choices, list):
+        return False, None, "invalid_response_no_choices"
+    msg = choices[0].get("message") if choices else {}
+    raw_content = msg.get("content")
+    if isinstance(raw_content, list):
+        parts: list[str] = []
+        for item in raw_content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text") or ""))
+        content_text = "\n".join(x for x in parts if x).strip()
+    else:
+        content_text = str(raw_content or "").strip()
+    if not content_text:
+        return False, None, "empty_content"
+    parsed = extract_json_from_content(content_text)
     if parsed is None:
         return False, None, "json_parse_failed"
     return True, parsed, ""

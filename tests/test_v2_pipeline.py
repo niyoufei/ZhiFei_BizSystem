@@ -1812,10 +1812,10 @@ class TestScoringMeceInjection:
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
-        assert data["constraint_sync"]["rebuilt"] is True
-        assert data["constraint_sync"]["anchors"] == 1
-        assert data["constraint_sync"]["requirements"] == 1
-        mock_rebuild_constraints.assert_called_once_with("p1")
+        assert data["constraint_sync"]["rebuilt"] is False
+        assert data["constraint_sync"]["mode"] == "async_parse_pending"
+        assert data["parse_job"]["status"] == "queued"
+        mock_rebuild_constraints.assert_not_called()
         mock_save_materials.assert_called_once()
 
     @patch("app.main._apply_prediction_to_report")

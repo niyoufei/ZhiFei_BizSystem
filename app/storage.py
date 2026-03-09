@@ -31,6 +31,7 @@ CALIBRATION_SAMPLES_PATH = DATA_DIR / "calibration_samples.json"
 PATCH_PACKAGES_PATH = DATA_DIR / "patch_packages.json"
 PATCH_DEPLOYMENTS_PATH = DATA_DIR / "patch_deployments.json"
 HIGH_SCORE_FEATURES_PATH = DATA_DIR / "high_score_features.json"
+MATERIAL_PARSE_JOBS_PATH = DATA_DIR / "material_parse_jobs.json"
 
 _PATH_LOCKS: Dict[str, threading.RLock] = {}
 _PATH_LOCKS_GUARD = threading.Lock()
@@ -155,6 +156,14 @@ def load_materials() -> List[Dict[str, Any]]:
 
 def save_materials(data: List[Dict[str, Any]]) -> None:
     save_json(MATERIALS_PATH, data)
+
+
+def load_material_parse_jobs() -> List[Dict[str, Any]]:
+    return load_json(MATERIAL_PARSE_JOBS_PATH, [])
+
+
+def save_material_parse_jobs(data: List[Dict[str, Any]]) -> None:
+    save_json(MATERIAL_PARSE_JOBS_PATH, data)
 
 
 def load_learning_profiles() -> List[Dict[str, Any]]:
