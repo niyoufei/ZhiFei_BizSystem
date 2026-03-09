@@ -2199,6 +2199,143 @@ def _build_runtime_feedback_requirements(
     return reqs
 
 
+def _build_material_consensus_requirements(
+    project_id: str,
+    material_knowledge_profile: Optional[Dict[str, object]],
+    *,
+    available_material_types: Optional[List[str]] = None,
+) -> List[Dict[str, object]]:
+    if not isinstance(material_knowledge_profile, dict):
+        return []
+    summary = (
+        material_knowledge_profile.get("summary")
+        if isinstance(material_knowledge_profile.get("summary"), dict)
+        else {}
+    )
+    consensus_score = float(_to_float_or_none(summary.get("cross_type_consensus_score")) or 0.0)
+    if consensus_score < 0.18:
+        return []
+
+    source_types = []
+    for row in (
+        material_knowledge_profile.get("by_type")
+        if isinstance(material_knowledge_profile.get("by_type"), list)
+        else []
+    ):
+        if not isinstance(row, dict):
+            continue
+        mat_type = _normalize_material_type(row.get("material_type"))
+        if not mat_type:
+            continue
+        if float(_clip_score01(row.get("structured_quality_score")) or 0.0) < 0.25:
+            continue
+        source_types.append(mat_type)
+    source_types = _limit_unique_texts(source_types, limit=6)
+    allowed_types = {
+        _normalize_material_type(item)
+        for item in (available_material_types or [])
+        if str(item or "").strip()
+    }
+    if allowed_types:
+        source_types = [item for item in source_types if item in allowed_types]
+
+    consensus_terms = _to_text_items(summary.get("cross_type_consensus_terms"), max_items=10)
+    numeric_summary_items = (
+        summary.get("cross_type_numeric_category_summary")
+        if isinstance(summary.get("cross_type_numeric_category_summary"), list)
+        else []
+    )
+    if not source_types or not numeric_summary_items:
+        return []
+
+    focus_dimensions = [
+        str(item or "").zfill(2)
+        for item in (summary.get("cross_type_focus_dimensions") or [])
+        if str(item or "").strip().zfill(2) in DIMENSION_IDS
+    ]
+
+    now = _now_iso()
+    reqs: List[Dict[str, object]] = []
+    req_index = 0
+    for item in numeric_summary_items[:4]:
+        match = re.match(r"([^：:]+)[：:]\s*(.+)", str(item or "").strip())
+        if not match:
+            continue
+        label = match.group(1).strip()
+        category = next(
+            (key for key, value in NUMERIC_ANCHOR_CATEGORY_LABELS.items() if str(value) == label),
+            "",
+        )
+        if not category:
+            continue
+        dim_candidates = [
+            dim
+            for dim in (NUMERIC_ANCHOR_CATEGORY_DIMENSIONS.get(category) or ["01"])
+            if dim in DIMENSION_IDS
+        ] or ["01"]
+        dim_candidates = [
+            dim for dim in dim_candidates if not focus_dimensions or dim in focus_dimensions
+        ] or dim_candidates
+        dim_id = next((dim for dim in dim_candidates if dim in DIMENSION_IDS), "01")
+        numeric_terms = [
+            token
+            for token in (
+                _normalize_numeric_token(x.replace("等", ""))
+                for x in re.split(r"[、,，\s]+", match.group(2))
+            )
+            if token
+        ][:4]
+        if not numeric_terms:
+            continue
+        hints = _to_text_items(
+            consensus_terms[:4] + list((DIMENSION_RAG_KEYWORDS.get(dim_id) or [])[:4]),
+            max_items=8,
+        )
+        req_index += 1
+        reqs.append(
+            {
+                "id": f"runtime-consensus-{project_id[:8]}-{req_index}",
+                "project_id": project_id,
+                "dimension_id": dim_id,
+                "req_label": f"跨资料共识约束：{label}",
+                "req_type": "material_consistency",
+                "patterns": {
+                    "must_hit_terms": hints[:6],
+                    "minimum_terms": 1 if hints else 0,
+                    "must_hit_numbers": numeric_terms,
+                    "minimum_numbers": 2 if len(numeric_terms) >= 3 else 1,
+                    "material_type": "cross_material_consensus",
+                    "source_types": source_types,
+                    "consensus_score": round(consensus_score, 4),
+                    "consensus_terms": consensus_terms[:6],
+                    "numeric_category_label": label,
+                    "within_dimension_scope": False,
+                    "source_mode": "cross_material_consensus",
+                },
+                "mandatory": len(source_types) >= 2 and category in {"duration", "specification"},
+                "weight": round(
+                    min(
+                        1.28,
+                        0.92
+                        + min(0.18, consensus_score * 0.28)
+                        + min(0.08, len(source_types) * 0.03)
+                        + min(0.08, len(numeric_terms) * 0.02),
+                    ),
+                    2,
+                ),
+                "material_type": "cross_material_consensus",
+                "source_anchor_id": None,
+                "source_pack_id": "runtime_material_consensus",
+                "source_pack_version": "v1",
+                "priority": 91.0,
+                "override_key": f"runtime::material_consensus::{category}",
+                "lint": {},
+                "created_at": now,
+            }
+        )
+    return reqs
+
+
 def _build_runtime_custom_requirements(
     project_id: str,
     *,
@@ -2385,6 +2522,11 @@ def _build_runtime_custom_requirements(
         material_knowledge_profile,
         available_material_types=available_material_types,
     )
+    material_consensus_requirements = _build_material_consensus_requirements(
+        project_id,
+        material_knowledge_profile,
+        available_material_types=available_material_types,
+    )
     feedback_requirements = _build_runtime_feedback_requirements(
         project_id,
         material_knowledge_profile=material_knowledge_profile,
@@ -2397,6 +2539,7 @@ def _build_runtime_custom_requirements(
     runtime_requirements.extend(retrieval_requirements)
     runtime_requirements.extend(consistency_requirements)
     runtime_requirements.extend(material_dimension_requirements)
+    runtime_requirements.extend(material_consensus_requirements)
     runtime_requirements.extend(feedback_requirements)
     runtime_requirements.extend(feature_requirements)
 
@@ -2411,6 +2554,7 @@ def _build_runtime_custom_requirements(
         "material_retrieval_requirements": len(retrieval_requirements),
         "material_consistency_requirements": len(consistency_requirements),
         "material_dimension_requirements": len(material_dimension_requirements),
+        "material_consensus_requirements": len(material_consensus_requirements),
         "feedback_evolution_requirements": len(feedback_requirements),
         "feature_confidence_requirements": len(feature_requirements),
         "material_retrieval_top_k": retrieval_top_k,
@@ -2511,6 +2655,17 @@ def _build_runtime_custom_requirements(
                 "source_file_count": (req.get("patterns") or {}).get("source_file_count"),
             }
             for req in material_dimension_requirements[:8]
+        ],
+        "material_consensus_preview": [
+            {
+                "dimension_id": req.get("dimension_id"),
+                "label": req.get("req_label"),
+                "terms": (((req.get("patterns") or {}).get("must_hit_terms")) or [])[:6],
+                "numbers": (((req.get("patterns") or {}).get("must_hit_numbers")) or [])[:4],
+                "source_types": (((req.get("patterns") or {}).get("source_types")) or [])[:4],
+                "consensus_score": (req.get("patterns") or {}).get("consensus_score"),
+            }
+            for req in material_consensus_requirements[:6]
         ],
         "feature_confidence_preview": [
             {
@@ -10809,6 +10964,13 @@ NUMERIC_ANCHOR_CATEGORY_LABELS: Dict[str, str] = {
     "threshold": "阈值/偏差",
 }
 
+NUMERIC_ANCHOR_CATEGORY_DIMENSIONS: Dict[str, List[str]] = {
+    "duration": ["09", "15"],
+    "quantity": ["04", "11", "15"],
+    "specification": ["06", "13", "14", "16"],
+    "threshold": ["02", "03", "07", "08", "16"],
+}
+
 DRAWING_DISCIPLINE_HINTS: Dict[str, List[str]] = {
     "建筑": ["建筑", "平面", "立面", "剖面", "门窗", "装修"],
     "结构": ["结构", "梁", "板", "柱", "基础", "钢筋"],
@@ -11200,6 +11362,125 @@ def _build_numeric_anchor_category_summary(
             preview += " 等"
         summary.append(f"{label}：{preview}")
     return summary[:8]
+
+
+def _build_cross_type_material_consensus(
+    by_type_rows: List[Dict[str, object]],
+) -> Dict[str, object]:
+    if not isinstance(by_type_rows, list):
+        return {}
+    term_type_sets: Dict[str, set[str]] = {}
+    numeric_type_sets: Dict[str, set[str]] = {}
+    numeric_buckets: Dict[str, List[str]] = {key: [] for key in NUMERIC_ANCHOR_CATEGORY_LABELS}
+    focused_dimensions: List[str] = []
+    source_types: List[str] = []
+
+    for row in by_type_rows:
+        if not isinstance(row, dict):
+            continue
+        mat_type = _normalize_material_type(row.get("material_type"))
+        if not mat_type:
+            continue
+        if int(_to_float_or_none(row.get("parsed_ok_files")) or 0) <= 0:
+            continue
+        if mat_type not in source_types:
+            source_types.append(mat_type)
+        row_quality = float(_clip_score01(row.get("structured_quality_score")) or 0.0)
+        if row_quality < 0.25:
+            continue
+        term_candidates = (
+            _to_text_items(row.get("structured_terms_preview"), max_items=8)
+            + _to_text_items(row.get("section_titles_preview"), max_items=4)
+            + _to_text_items(row.get("scoring_point_terms_preview"), max_items=4)
+            + _to_text_items(row.get("mandatory_clause_terms_preview"), max_items=3)
+        )
+        filtered_terms = _filter_structured_signal_terms(
+            term_candidates,
+            limit=10,
+            material_type=mat_type,
+        )
+        for term in filtered_terms:
+            term_type_sets.setdefault(str(term), set()).add(mat_type)
+
+        raw_numeric_summary = row.get("numeric_category_summary")
+        numeric_summary_items = raw_numeric_summary if isinstance(raw_numeric_summary, list) else []
+        for item in numeric_summary_items:
+            match = re.match(r"([^：:]+)[：:]\s*(.+)", str(item or "").strip())
+            if not match:
+                continue
+            label = match.group(1).strip()
+            category = next(
+                (
+                    key
+                    for key, value in NUMERIC_ANCHOR_CATEGORY_LABELS.items()
+                    if str(value) == label
+                ),
+                "",
+            )
+            if not category:
+                continue
+            for token in re.split(r"[、,，\s]+", match.group(2)):
+                normalized = _normalize_numeric_token(token.replace("等", ""))
+                if not normalized:
+                    continue
+                if normalized not in numeric_buckets[category]:
+                    numeric_buckets[category].append(normalized)
+                numeric_type_sets.setdefault(normalized, set()).add(mat_type)
+
+        for dim_id in [
+            str(item or "").zfill(2)
+            for item in (row.get("focused_dimensions") or [])
+            if str(item or "").strip().zfill(2) in DIMENSION_IDS
+        ]:
+            if dim_id not in focused_dimensions:
+                focused_dimensions.append(dim_id)
+
+    consensus_terms = [
+        term
+        for term, types in sorted(
+            term_type_sets.items(),
+            key=lambda item: (-len(item[1]), -len(item[0]), item[0]),
+        )
+        if len(types) >= 2
+    ][:10]
+    consensus_numeric_buckets: Dict[str, List[str]] = {}
+    for category, tokens in numeric_buckets.items():
+        kept = [token for token in tokens if len(numeric_type_sets.get(token) or set()) >= 2][:6]
+        if kept:
+            consensus_numeric_buckets[category] = kept
+    consensus_numeric_category_summary = _build_numeric_anchor_category_summary(
+        consensus_numeric_buckets
+    )
+    strong_type_count = len(
+        [
+            row
+            for row in by_type_rows
+            if isinstance(row, dict)
+            and float(_clip_score01(row.get("structured_quality_score")) or 0.0) >= 0.45
+        ]
+    )
+    consensus_score = round(
+        min(
+            1.0,
+            min(0.36, len(source_types) * 0.12)
+            + min(0.24, len(consensus_terms) * 0.04)
+            + min(
+                0.28,
+                sum(len(tokens) for tokens in consensus_numeric_buckets.values()) * 0.05,
+            )
+            + min(0.12, strong_type_count * 0.03),
+        ),
+        4,
+    )
+    return {
+        "source_types": source_types[:6],
+        "source_type_count": len(source_types),
+        "focused_dimensions": focused_dimensions[:8],
+        "consensus_terms": consensus_terms,
+        "consensus_numeric_buckets": consensus_numeric_buckets,
+        "consensus_numeric_category_summary": consensus_numeric_category_summary,
+        "consensus_score": consensus_score,
+    }
 
 
 def _clip_score01(value: object) -> float:
@@ -13774,6 +14055,7 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         if quality_rows
         else 0.0
     )
+    cross_type_consensus = _build_cross_type_material_consensus(by_type_rows)
 
     by_dimension_rows: List[Dict[str, object]] = []
     low_dims: List[Dict[str, object]] = []
@@ -13841,6 +14123,10 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         recommendations.append(
             "高质量结构化资料类型不足，建议优先增强招答、清单、图纸三类核心资料。"
         )
+    if float(_to_float_or_none(cross_type_consensus.get("consensus_score")) or 0.0) < 0.2:
+        recommendations.append(
+            "跨资料共识锚点偏弱，建议让招答、清单、图纸在工期/规格/阈值类关键参数上形成一致表述。"
+        )
     for dim_row in low_dims[:6]:
         dim_name = str(dim_row.get("dimension_name") or dim_row.get("dimension_id") or "")
         kw = "、".join(str(x) for x in (dim_row.get("suggested_keywords") or [])[:3])
@@ -13874,6 +14160,19 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
             "numeric_category_summary": _build_numeric_anchor_category_summary(
                 total_numeric_categories
             ),
+            "cross_type_consensus_score": float(cross_type_consensus.get("consensus_score") or 0.0),
+            "cross_type_consensus_type_count": int(
+                _to_float_or_none(cross_type_consensus.get("source_type_count")) or 0
+            ),
+            "cross_type_focus_dimensions": list(
+                cross_type_consensus.get("focused_dimensions") or []
+            )[:8],
+            "cross_type_consensus_terms": list(cross_type_consensus.get("consensus_terms") or [])[
+                :10
+            ],
+            "cross_type_numeric_category_summary": list(
+                cross_type_consensus.get("consensus_numeric_category_summary") or []
+            )[:8],
             "covered_dimensions": covered_dimensions,
             "dimension_coverage_rate": coverage_rate,
             "low_coverage_dimensions": len(low_dims),

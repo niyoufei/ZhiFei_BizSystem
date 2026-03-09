@@ -2131,6 +2131,8 @@ class TestMaterialsEndpoint:
         assert payload["summary"]["covered_dimensions"] >= 1
         assert payload["summary"]["structured_quality_avg"] > 0
         assert payload["summary"]["numeric_category_summary"]
+        assert payload["summary"]["cross_type_consensus_score"] > 0
+        assert payload["summary"]["cross_type_consensus_type_count"] >= 2
         assert len(payload["by_type"]) >= 2
         assert any(row.get("numeric_category_summary") for row in payload["by_type"])
         dim_ids = {row["dimension_id"] for row in payload["by_dimension"]}
@@ -2619,6 +2621,53 @@ class TestMaterialAdvancedParsing:
         assert "专业碰撞" in (dim14_patterns.get("structured_terms") or [])
         assert "14" in (dim14_patterns.get("focused_dimensions") or [])
         assert int(dim14_patterns.get("structured_alignment_hits") or 0) >= 1
+
+    def test_build_material_consensus_requirements_from_knowledge_profile(self):
+        from app.main import _build_material_consensus_requirements
+
+        profile = {
+            "summary": {
+                "cross_type_consensus_score": 0.66,
+                "cross_type_focus_dimensions": ["09", "14"],
+                "cross_type_consensus_terms": ["关键节点", "深化设计", "BIM"],
+                "cross_type_numeric_category_summary": [
+                    "工期/节点：120、30",
+                    "规格/参数：600、3.5",
+                ],
+            },
+            "by_type": [
+                {
+                    "material_type": "tender_qa",
+                    "parsed_ok_files": 1,
+                    "structured_quality_score": 0.82,
+                },
+                {
+                    "material_type": "drawing",
+                    "parsed_ok_files": 1,
+                    "structured_quality_score": 0.74,
+                },
+                {
+                    "material_type": "boq",
+                    "parsed_ok_files": 1,
+                    "structured_quality_score": 0.68,
+                },
+            ],
+        }
+
+        reqs = _build_material_consensus_requirements(
+            "p1",
+            profile,
+            available_material_types=["tender_qa", "drawing", "boq"],
+        )
+
+        assert len(reqs) >= 2
+        duration_req = next(row for row in reqs if row.get("dimension_id") == "09")
+        duration_patterns = duration_req.get("patterns") or {}
+        assert duration_req.get("source_pack_id") == "runtime_material_consensus"
+        assert duration_patterns.get("source_mode") == "cross_material_consensus"
+        assert "120" in (duration_patterns.get("must_hit_numbers") or [])
+        assert "关键节点" in " ".join(duration_patterns.get("must_hit_terms") or [])
+        assert float(duration_patterns.get("consensus_score") or 0.0) >= 0.6
 
     @patch("app.main.select_top_logic_skeletons")
     def test_build_runtime_feature_requirements_uses_high_confidence_skeletons(
