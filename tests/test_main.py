@@ -2763,6 +2763,48 @@ class TestMaterialAdvancedParsing:
         assert patterns.get("multiplier") == pytest.approx(1.16, abs=1e-6)
         assert patterns.get("sample_count") == 4
         assert "关键节点" in (patterns.get("hints") or [])
+
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_evolution_reports")
+    def test_build_runtime_feedback_requirements_uses_recent_ground_truth_feedback_without_evo(
+        self,
+        mock_load_evolution_reports,
+        mock_load_ground_truth,
+    ):
+        from app.main import _build_runtime_feedback_requirements
+
+        mock_load_evolution_reports.return_value = {"p1": {}}
+        mock_load_ground_truth.return_value = [
+            {
+                "project_id": "p1",
+                "created_at": "2026-03-08T12:00:00+08:00",
+                "feature_confidence_update": {
+                    "applied_dimension_ids": ["09"],
+                    "applied_feature_ids": ["F-09"],
+                    "delta_score_100": 6.0,
+                    "updated": 1,
+                },
+            }
+        ]
+        reqs = _build_runtime_feedback_requirements(
+            "p1",
+            material_knowledge_profile={
+                "by_dimension": [
+                    {
+                        "dimension_id": "09",
+                        "coverage_score": 0.28,
+                        "suggested_keywords": ["关键节点", "里程碑", "纠偏"],
+                    }
+                ]
+            },
+        )
+        assert reqs
+        dim09 = next(row for row in reqs if str(row.get("dimension_id")) == "09")
+        patterns = dim09.get("patterns") or {}
+        assert patterns.get("recent_feedback_count") == 1
+        assert patterns.get("recent_feedback_positive_count") == 1
+        assert float(patterns.get("recent_feedback_avg_delta_100") or 0.0) > 0.0
+        assert float(dim09.get("weight") or 0.0) > 1.0
         assert float(dim09.get("weight") or 0.0) > 1.0
 
     @patch("app.main.load_feature_kb")
@@ -2914,6 +2956,19 @@ class TestMaterialAdvancedParsing:
             for x in (summary.get("mandatory_clause_terms") or [])
         )
 
+    def test_extract_tender_qa_section_titles_tolerates_ocr_spacing(self):
+        from app.main import _extract_tender_qa_section_titles
+
+        parsed_text = (
+            "第 一 章 施 工 组 织 设 计 总 体 部 署\n"
+            "1 . 2 质 量 管 理 与 验 收 标 准\n"
+            "二 、 进 度 计 划 与 节 点 控 制\n"
+        )
+        titles = _extract_tender_qa_section_titles(parsed_text, limit=6)
+        assert any("施工组织设计总体部署" in item for item in titles)
+        assert any("质量管理与验收标准" in item for item in titles)
+        assert any("进度计划与节点控制" in item for item in titles)
+
     def test_filter_structured_signal_terms_prefers_material_specific_terms(self):
         from app.main import _filter_structured_signal_terms
 
@@ -2949,11 +3004,17 @@ class TestMaterialAdvancedParsing:
             "实体统计: LINE:12、TEXT:3、INSERT:2\n"
             "图层: A-ANNO-TEXT、M-EQPM、P-PIPE\n"
             "块参照: DOOR_TAG、PUMP_TAG\n"
+            "布局/空间: 首层平面、屋面层\n"
+            "标注值: 600、3500\n"
+            "二进制标识提取: PLAN_VIEW、MEP_ROUTE\n"
             "节点 深化 BIM 综合管线 碰撞 净高 预留预埋 消防 管径 600 3.5"
         )
         summary = _build_drawing_structured_summary(b"DWGDATA", "总图.dwg", parsed_text=parsed_text)
         assert summary["detected_format"] == "dwg"
         assert "A-ANNO-TEXT" in (summary.get("top_layers") or [])
+        assert "首层平面" in (summary.get("layout_tags") or [])
+        assert "3500" in (summary.get("dimension_markers") or [])
+        assert "PLAN_VIEW" in (summary.get("binary_marker_terms") or [])
         assert "机电综合" in (summary.get("discipline_keywords") or [])
         assert "总平面/平面布置" in (summary.get("sheet_type_tags") or [])
         assert "专业碰撞" in (summary.get("risk_keywords") or [])
@@ -2968,6 +3029,8 @@ class TestMaterialAdvancedParsing:
         parsed_text = (
             "[图像资料] 文件: 现场.jpg\n"
             "格式: JPEG\n"
+            "OCR模式: gray_2x:psm6\n"
+            "OCR质量分: 4.8\n"
             "[OCR文本提取]\n"
             "临边防护 扬尘治理 围挡 道路冲洗 样板 实测 夜间施工 材料进场 48 3"
         )
@@ -2976,7 +3039,9 @@ class TestMaterialAdvancedParsing:
             "现场.jpg",
             parsed_text=parsed_text,
         )
-        assert summary["visual_capability"] == "ocr_text"
+        assert summary["visual_capability"] == "ocr_multistage"
+        assert summary["ocr_mode"] == "gray_2x:psm6"
+        assert float(summary["ocr_quality_score"]) > 0
         assert "高处临边" in (summary.get("safety_scene_tags") or [])
         assert "扬尘治理" in (summary.get("civilization_scene_tags") or [])
         assert "样板实测" in (summary.get("quality_scene_tags") or [])

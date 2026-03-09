@@ -60,16 +60,23 @@ def test_auto_update_feature_confidence_normalizes_five_scale_scores() -> None:
 
     with patch("app.main._collect_applied_feature_ids_from_report") as mock_collect:
         with patch("app.main.update_feature_confidence") as mock_update:
-            mock_collect.return_value = ["F-1", "F-2"]
-            mock_update.return_value = {"updated": 2, "retired": 0}
-            out = _auto_update_feature_confidence_on_ground_truth(
-                report=report,
-                gt_record=gt_record,
-                project_score_scale_max=5,
-            )
+            with patch("app.main.load_feature_kb") as mock_load_feature_kb:
+                mock_collect.return_value = ["F-1", "F-2"]
+                mock_update.return_value = {"updated": 2, "retired": 0}
+                mock_load_feature_kb.return_value = [
+                    SimpleNamespace(feature_id="F-1", dimension_id="09"),
+                    SimpleNamespace(feature_id="F-2", dimension_id="P14"),
+                ]
+                out = _auto_update_feature_confidence_on_ground_truth(
+                    report=report,
+                    gt_record=gt_record,
+                    project_score_scale_max=5,
+                )
 
     assert out["updated"] == 2
     assert out["applied_feature_ids"] == ["F-1", "F-2"]
+    assert out["applied_dimension_ids"] == ["09", "14"]
+    assert abs(out["delta_score_100"] - 4.0) < 1e-6
     kwargs = mock_update.call_args.kwargs
     assert kwargs["applied_feature_ids"] == ["F-1", "F-2"]
     assert abs(kwargs["actual_score"] - 84.0) < 1e-6

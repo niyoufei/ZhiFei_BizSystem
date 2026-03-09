@@ -44,9 +44,10 @@ try:
 except Exception:
     Document = None
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps
 except Exception:
     Image = None
+    ImageOps = None
 try:
     import pytesseract
 except Exception:
@@ -2110,7 +2111,8 @@ def _build_runtime_feedback_requirements(
         else {}
     )
     sample_count = int(_to_float_or_none(evo.get("sample_count")) or 0)
-    if not multipliers or sample_count <= 0:
+    recent_feedback_boosts = _build_recent_feedback_dimension_boosts(project_id)
+    if (not multipliers or sample_count <= 0) and not recent_feedback_boosts:
         return []
 
     by_dimension_rows = (
@@ -2124,20 +2126,57 @@ def _build_runtime_feedback_requirements(
         for row in by_dimension_rows
         if isinstance(row, dict) and str(row.get("dimension_id") or "").strip()
     }
+    dimension_candidates: List[tuple[str, float]] = []
+    seen_dims: set[str] = set()
+    for dim_id, multiplier in multipliers.items():
+        normalized_dim = str(dim_id).zfill(2)
+        if normalized_dim not in DIMENSION_IDS or normalized_dim in seen_dims:
+            continue
+        seen_dims.add(normalized_dim)
+        dimension_candidates.append((normalized_dim, float(_to_float_or_none(multiplier) or 1.0)))
+    for dim_id, boost in recent_feedback_boosts.items():
+        if dim_id in seen_dims or dim_id not in DIMENSION_IDS:
+            continue
+        avg_strength = float(_to_float_or_none(boost.get("avg_strength")) or 0.0)
+        positive_count = int(_to_float_or_none(boost.get("positive_count")) or 0)
+        if avg_strength <= 0.08 and positive_count <= 0:
+            continue
+        seen_dims.add(dim_id)
+        dimension_candidates.append(
+            (dim_id, 1.0 + min(0.18, max(0.0, avg_strength) * 0.18 + positive_count * 0.02))
+        )
 
     ranked_dims = sorted(
-        [
-            (str(dim_id).zfill(2), float(_to_float_or_none(multiplier) or 1.0))
-            for dim_id, multiplier in multipliers.items()
-            if str(dim_id).strip()
-        ],
-        key=lambda item: (-item[1], item[0]),
+        dimension_candidates,
+        key=lambda item: (
+            -(
+                item[1]
+                + max(
+                    0.0,
+                    float(
+                        _to_float_or_none(
+                            (recent_feedback_boosts.get(item[0]) or {}).get("avg_strength")
+                        )
+                        or 0.0
+                    ),
+                )
+                * 0.15
+            ),
+            item[0],
+        ),
     )
     reqs: List[Dict[str, object]] = []
     now = _now_iso()
     req_index = 0
     for dim_id, multiplier in ranked_dims[:8]:
-        if multiplier <= 1.03:
+        feedback_boost = recent_feedback_boosts.get(dim_id) or {}
+        avg_strength = float(_to_float_or_none(feedback_boost.get("avg_strength")) or 0.0)
+        avg_delta_100 = float(_to_float_or_none(feedback_boost.get("avg_delta_100")) or 0.0)
+        feedback_positive_count = int(_to_float_or_none(feedback_boost.get("positive_count")) or 0)
+        feedback_negative_count = int(_to_float_or_none(feedback_boost.get("negative_count")) or 0)
+        feedback_sample_count = int(_to_float_or_none(feedback_boost.get("sample_count")) or 0)
+        effective_multiplier = float(multiplier) + max(0.0, avg_strength) * 0.16
+        if effective_multiplier <= 1.03 and avg_strength <= 0.08:
             continue
         material_dim_row = by_dimension_map.get(dim_id) or {}
         coverage_score = float(_to_float_or_none(material_dim_row.get("coverage_score")) or 0.0)
@@ -2151,12 +2190,24 @@ def _build_runtime_feedback_requirements(
             for x in (material_dim_row.get("suggested_keywords") or [])[:4]
             if str(x or "").strip()
         ]
+        feedback_hints = [
+            str((DIMENSIONS.get(dim_id) or {}).get("name") or dim_id),
+            "真实评分反馈",
+            f"近期样本{feedback_sample_count}条" if feedback_sample_count > 0 else "",
+            f"平均分差{round(avg_delta_100, 2)}" if abs(avg_delta_100) >= 0.5 else "",
+        ]
         hints = _to_text_items(
-            rationale_hints + material_hints + list((DIMENSION_RAG_KEYWORDS.get(dim_id) or [])[:4]),
+            rationale_hints
+            + material_hints
+            + feedback_hints
+            + list((DIMENSION_RAG_KEYWORDS.get(dim_id) or [])[:4]),
             max_items=10,
         )
         if len(hints) < 2:
             continue
+        minimum_hint_hits = 2 if (sample_count >= 3 or effective_multiplier >= 1.12) else 1
+        if feedback_positive_count >= 2 or avg_delta_100 >= 4.0:
+            minimum_hint_hits = max(minimum_hint_hits, 3)
         req_index += 1
         reqs.append(
             {
@@ -2170,27 +2221,40 @@ def _build_runtime_feedback_requirements(
                 "req_type": "semantic",
                 "patterns": {
                     "hints": hints,
-                    "minimum_hint_hits": 2 if (sample_count >= 3 or multiplier >= 1.12) else 1,
+                    "minimum_hint_hits": minimum_hint_hits,
                     "source_mode": "feedback_evolution",
-                    "multiplier": round(multiplier, 4),
+                    "multiplier": round(effective_multiplier, 4),
                     "sample_count": sample_count,
                     "material_coverage_score": round(coverage_score, 4),
                     "rationale": rationale_text,
+                    "recent_feedback_count": feedback_sample_count,
+                    "recent_feedback_positive_count": feedback_positive_count,
+                    "recent_feedback_negative_count": feedback_negative_count,
+                    "recent_feedback_avg_delta_100": round(avg_delta_100, 4),
+                    "recent_feedback_avg_strength": round(avg_strength, 4),
                 },
                 "mandatory": False,
                 "weight": round(
                     min(
-                        1.3,
+                        1.42,
                         0.8
-                        + min(0.22, (multiplier - 1.0) * 0.9)
+                        + min(0.22, (effective_multiplier - 1.0) * 0.9)
                         + (0.06 if sample_count >= 3 else 0.0)
-                        + (0.04 if coverage_score < 0.35 else 0.0),
+                        + (0.04 if coverage_score < 0.35 else 0.0)
+                        + min(
+                            0.12,
+                            max(0.0, avg_strength) * 0.18 + feedback_positive_count * 0.02,
+                        )
+                        - min(
+                            0.05,
+                            max(0.0, -avg_strength) * 0.08 + feedback_negative_count * 0.01,
+                        ),
                     ),
                     2,
                 ),
                 "source_anchor_id": None,
                 "source_pack_id": "runtime_feedback_evolution",
-                "source_pack_version": "v1",
+                "source_pack_version": "v2-feedback-boost",
                 "priority": 87.5,
                 "override_key": f"runtime::feedback_evolution::{dim_id}",
                 "lint": {},
@@ -7715,6 +7779,122 @@ def _collect_applied_feature_ids_from_report(
     return sorted(feature_ids)
 
 
+def _map_feature_ids_to_dimension_ids(
+    feature_ids: List[str],
+    *,
+    report: Optional[Dict[str, object]] = None,
+) -> List[str]:
+    target_ids = {str(item or "").strip() for item in feature_ids if str(item or "").strip()}
+    if not target_ids:
+        return []
+
+    mapped_dims: set[str] = set()
+    for feature in load_feature_kb():
+        fid = str(getattr(feature, "feature_id", "") or "").strip()
+        dim_id = str(getattr(feature, "dimension_id", "") or "").strip().upper()
+        if fid not in target_ids:
+            continue
+        if dim_id.startswith("P") and dim_id[1:] in DIMENSION_IDS:
+            mapped_dims.add(dim_id[1:])
+        elif dim_id in DIMENSION_IDS:
+            mapped_dims.add(dim_id)
+
+    suggestions = report.get("suggestions") if isinstance(report, dict) else None
+    if isinstance(suggestions, list):
+        for item in suggestions:
+            if not isinstance(item, dict):
+                continue
+            dim_id = str(item.get("dimension_id") or "").strip().upper()
+            if dim_id.startswith("P") and dim_id[1:] in DIMENSION_IDS:
+                dim_id = dim_id[1:]
+            if dim_id not in DIMENSION_IDS:
+                continue
+            raw_feature_ids = item.get("applied_feature_ids")
+            if not isinstance(raw_feature_ids, list):
+                continue
+            if any(str(fid or "").strip() in target_ids for fid in raw_feature_ids):
+                mapped_dims.add(dim_id)
+
+    return sorted(mapped_dims)
+
+
+def _build_recent_feedback_dimension_boosts(
+    project_id: str,
+    *,
+    recent_limit: int = 16,
+) -> Dict[str, Dict[str, object]]:
+    rows = [row for row in load_ground_truth() if str(row.get("project_id") or "") == project_id]
+    rows.sort(
+        key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""),
+        reverse=True,
+    )
+    stats: Dict[str, Dict[str, float]] = {}
+    for row in rows[: max(1, int(recent_limit))]:
+        update = row.get("feature_confidence_update")
+        if not isinstance(update, dict):
+            continue
+        dims = [
+            str(item or "").zfill(2)
+            for item in (update.get("applied_dimension_ids") or [])
+            if str(item or "").strip().zfill(2) in DIMENSION_IDS
+        ]
+        if not dims:
+            dims = _map_feature_ids_to_dimension_ids(
+                [
+                    str(item or "").strip()
+                    for item in (update.get("applied_feature_ids") or [])
+                    if str(item or "").strip()
+                ]
+            )
+        if not dims:
+            continue
+        delta_score_100 = float(
+            _to_float_or_none(update.get("delta_score_100"))
+            or _to_float_or_none(update.get("delta"))
+            or 0.0
+        )
+        decay_weight = compute_time_decay_weight(
+            record_time=row.get("updated_at") or row.get("created_at"),
+            half_life_days=30.0,
+            min_decay=0.05,
+        )
+        strength = max(-1.0, min(1.0, delta_score_100 / 12.0)) * decay_weight
+        for dim_id in dims:
+            bucket = stats.setdefault(
+                dim_id,
+                {
+                    "sample_count": 0.0,
+                    "positive_count": 0.0,
+                    "negative_count": 0.0,
+                    "weight_sum": 0.0,
+                    "delta_sum": 0.0,
+                    "strength_sum": 0.0,
+                },
+            )
+            bucket["sample_count"] += 1.0
+            bucket["weight_sum"] += decay_weight
+            bucket["delta_sum"] += delta_score_100 * decay_weight
+            bucket["strength_sum"] += strength
+            if delta_score_100 >= 1.0:
+                bucket["positive_count"] += 1.0
+            elif delta_score_100 <= -1.0:
+                bucket["negative_count"] += 1.0
+
+    out: Dict[str, Dict[str, object]] = {}
+    for dim_id, bucket in stats.items():
+        weight_sum = max(1e-6, float(bucket.get("weight_sum") or 0.0))
+        avg_delta = float(bucket.get("delta_sum") or 0.0) / weight_sum
+        avg_strength = float(bucket.get("strength_sum") or 0.0) / weight_sum
+        out[dim_id] = {
+            "sample_count": int(bucket.get("sample_count") or 0.0),
+            "positive_count": int(bucket.get("positive_count") or 0.0),
+            "negative_count": int(bucket.get("negative_count") or 0.0),
+            "avg_delta_100": round(avg_delta, 4),
+            "avg_strength": round(avg_strength, 4),
+        }
+    return out
+
+
 def _auto_update_feature_confidence_on_ground_truth(
     *,
     report: Dict[str, object],
@@ -7753,9 +7933,15 @@ def _auto_update_feature_confidence_on_ground_truth(
         actual_score=float(actual_score_100),
         predicted_score=float(pred_score_100),
     )
+    applied_dimension_ids = _map_feature_ids_to_dimension_ids(
+        applied_feature_ids,
+        report=report,
+    )
     update_result["applied_feature_ids"] = applied_feature_ids
+    update_result["applied_dimension_ids"] = applied_dimension_ids
     update_result["actual_score_100"] = round(float(actual_score_100), 2)
     update_result["predicted_score_100"] = round(float(pred_score_100), 2)
+    update_result["delta_score_100"] = round(float(actual_score_100) - float(pred_score_100), 2)
     return update_result
 
 
@@ -10546,6 +10732,8 @@ def _extract_dxf_text(content: bytes) -> str:
     extracted_texts: List[str] = []
     layers: set[str] = set()
     blocks: set[str] = set()
+    layouts: set[str] = set()
+    dimension_markers: List[str] = []
 
     in_entities = False
     waiting_section_name = False
@@ -10553,9 +10741,12 @@ def _extract_dxf_text(content: bytes) -> str:
     current_entity_texts: List[str] = []
     current_layer = ""
     current_block = ""
+    current_layout = ""
+    current_dimension_values: List[str] = []
 
     def _flush_entity() -> None:
         nonlocal current_entity_type, current_entity_texts, current_layer, current_block
+        nonlocal current_layout, current_dimension_values
         if not current_entity_type:
             return
         entity_counts[current_entity_type] = entity_counts.get(current_entity_type, 0) + 1
@@ -10563,6 +10754,8 @@ def _extract_dxf_text(content: bytes) -> str:
             layers.add(current_layer)
         if current_block:
             blocks.add(current_block)
+        if current_layout:
+            layouts.add(current_layout)
         for item in current_entity_texts:
             if not item:
                 continue
@@ -10575,10 +10768,16 @@ def _extract_dxf_text(content: bytes) -> str:
             )
             if normalized and normalized not in extracted_texts:
                 extracted_texts.append(normalized)
+        for item in current_dimension_values:
+            normalized_dim = _normalize_numeric_token(item) or str(item or "").strip()
+            if normalized_dim and normalized_dim not in dimension_markers:
+                dimension_markers.append(normalized_dim)
         current_entity_type = ""
         current_entity_texts = []
         current_layer = ""
         current_block = ""
+        current_layout = ""
+        current_dimension_values = []
 
     for code, value in pairs:
         token = value.upper().strip()
@@ -10606,11 +10805,17 @@ def _extract_dxf_text(content: bytes) -> str:
         if code == 8:
             current_layer = value.strip()
             continue
+        if code == 410:
+            current_layout = value.strip()
+            continue
         if code == 2 and current_entity_type == "INSERT":
             current_block = value.strip()
             continue
         if code in (1, 3) and current_entity_type in text_entity_types:
             current_entity_texts.append(value)
+            continue
+        if current_entity_type == "DIMENSION" and code in (1, 42):
+            current_dimension_values.append(value)
 
     _flush_entity()
 
@@ -10630,6 +10835,10 @@ def _extract_dxf_text(content: bytes) -> str:
         summary_lines.append("图层: " + "、".join(sorted(layers)[:20]))
     if blocks:
         summary_lines.append("块参照: " + "、".join(sorted(blocks)[:20]))
+    if layouts:
+        summary_lines.append("布局/空间: " + "、".join(sorted(layouts)[:16]))
+    if dimension_markers:
+        summary_lines.append("标注值: " + "、".join(dimension_markers[:20]))
 
     if extracted_texts:
         summary_lines.append("")
@@ -11491,16 +11700,146 @@ def _clip_score01(value: object) -> float:
     return max(0.0, min(1.0, float(numeric)))
 
 
+def _normalize_ocr_text_block(text: object) -> str:
+    raw = unicodedata.normalize("NFKC", str(text or "")).replace("\x0c", " ")
+    normalized_lines: List[str] = []
+    seen: set[str] = set()
+    for raw_line in raw.splitlines():
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        line = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", line)
+        line = re.sub(r"(?<=第)\s+(?=[一二三四五六七八九十百零两0-9])", "", line)
+        line = re.sub(r"(?<=[一二三四五六七八九十百零两0-9])\s+(?=章)", "", line)
+        line = re.sub(r"(?<=\d)\s*[.．]\s*(?=\d)", ".", line)
+        line = re.sub(r"\s+", " ", line)
+        key = line.lower()
+        if len(line) < 2 or key in seen:
+            continue
+        seen.add(key)
+        normalized_lines.append(line)
+    return "\n".join(normalized_lines).strip()
+
+
+def _score_ocr_text_candidate(
+    text: object,
+    *,
+    context_tokens: Optional[List[str]] = None,
+) -> float:
+    normalized = _normalize_ocr_text_block(text)
+    if not normalized:
+        return 0.0
+    cjk_count = len(re.findall(r"[\u4e00-\u9fff]", normalized))
+    digit_count = len(re.findall(r"\d", normalized))
+    alpha_count = len(re.findall(r"[A-Za-z]", normalized))
+    lines = [line for line in normalized.splitlines() if line.strip()]
+    line_count = len(lines)
+    text_len = len(normalized)
+    keyword_hits = 0
+    for token in context_tokens or []:
+        key = str(token or "").strip().lower()
+        if key and key in normalized.lower():
+            keyword_hits += 1
+    score = 0.0
+    score += min(3.2, cjk_count / 45.0)
+    score += min(1.3, digit_count / 16.0)
+    score += min(0.8, alpha_count / 40.0)
+    score += min(1.6, line_count * 0.18)
+    score += min(1.2, text_len / 420.0)
+    score += min(1.8, keyword_hits * 0.32)
+    if re.search(r"(?:第[一二三四五六七八九十百零两0-9]+章|[0-9]+\.[0-9]+)", normalized):
+        score += 0.45
+    if re.search(r"[^\u4e00-\u9fffA-Za-z0-9\s:：、,，.。/()（）-]", normalized):
+        score -= 0.2
+    return round(max(0.0, score), 4)
+
+
+def _extract_best_ocr_text_from_image(
+    img: object,
+    *,
+    context_tokens: Optional[List[str]] = None,
+) -> Dict[str, object]:
+    if Image is None or pytesseract is None or img is None:
+        return {"text": "", "mode": "", "score": 0.0, "attempts": 0}
+
+    base = img.convert("RGB") if hasattr(img, "convert") else img
+    gray = ImageOps.grayscale(base) if ImageOps is not None else base.convert("L")
+    variants: List[tuple[str, object]] = [("raw_rgb", base), ("gray", gray)]
+    width = max(1, int(getattr(gray, "width", 1)))
+    height = max(1, int(getattr(gray, "height", 1)))
+    if width < 2600 and height < 2600:
+        variants.append(("gray_2x", gray.resize((width * 2, height * 2))))
+    if ImageOps is not None:
+        variants.append(("autocontrast", ImageOps.autocontrast(gray)))
+    variants.append(("binary_180", gray.point(lambda p: 255 if int(p) > 180 else 0).convert("L")))
+
+    candidates: List[Dict[str, object]] = []
+    attempts = 0
+    for variant_name, variant_img in variants:
+        for psm in ("6", "11"):
+            attempts += 1
+            try:
+                raw_text = str(
+                    pytesseract.image_to_string(
+                        variant_img,
+                        lang="chi_sim+eng",
+                        config=f"--psm {psm}",
+                    )
+                    or ""
+                )
+            except Exception:
+                raw_text = ""
+            normalized = _normalize_ocr_text_block(raw_text)
+            if not normalized:
+                continue
+            candidates.append(
+                {
+                    "text": normalized,
+                    "mode": f"{variant_name}:psm{psm}",
+                    "score": _score_ocr_text_candidate(
+                        normalized,
+                        context_tokens=context_tokens,
+                    ),
+                }
+            )
+
+    if not candidates:
+        return {"text": "", "mode": "", "score": 0.0, "attempts": attempts}
+
+    candidates.sort(
+        key=lambda item: (
+            -float(_to_float_or_none(item.get("score")) or 0.0),
+            -len(str(item.get("text") or "")),
+        )
+    )
+    best = candidates[0]
+    merged_lines: List[str] = []
+    seen_lines: set[str] = set()
+    for candidate in candidates[:2]:
+        for raw_line in str(candidate.get("text") or "").splitlines():
+            line = str(raw_line or "").strip()
+            if not line:
+                continue
+            key = line.lower()
+            if key in seen_lines:
+                continue
+            seen_lines.add(key)
+            merged_lines.append(line)
+    best["text"] = "\n".join(merged_lines).strip() or str(best.get("text") or "")
+    best["attempts"] = attempts
+    return best
+
+
 def _extract_tender_qa_section_titles(text: str, *, limit: int = 10) -> List[str]:
     titles: List[str] = []
     seen: set[str] = set()
     patterns = (
-        r"^(?:第[一二三四五六七八九十百0-9]+章)\s*([^\n]{2,40})$",
-        r"^(?:[0-9]{1,2}(?:\.[0-9]{1,2}){0,2})\s*([^\n]{2,40})$",
-        r"^(?:[一二三四五六七八九十]+、)\s*([^\n]{2,40})$",
+        r"^(?:第\s*[一二三四五六七八九十百零两0-9]+\s*章)\s*[:：、.)）.-]?\s*([^\n]{2,40})$",
+        r"^(?:[0-9]{1,2}(?:\s*[.．]\s*[0-9]{1,2}){0,2})\s*[、.)）-]?\s*([^\n]{2,40})$",
+        r"^(?:[一二三四五六七八九十百零两]+\s*[、.)）-])\s*([^\n]{2,40})$",
     )
     for raw_line in str(text or "").splitlines():
-        line = re.sub(r"\s+", " ", str(raw_line or "").strip(" \t-—_:：.。"))
+        line = _normalize_ocr_text_block(str(raw_line or "").strip(" \t-—_:：.。"))
         if not line or len(line) > 42:
             continue
         if "[page" in line.lower():
@@ -11796,6 +12135,9 @@ def _build_drawing_structured_summary(
 
     top_layers = _parse_summary_list_line(text, "图层", limit=12)
     top_blocks = _parse_summary_list_line(text, "块参照", limit=10)
+    layout_tags = _parse_summary_list_line(text, "布局/空间", limit=10)
+    dimension_markers = _parse_summary_list_line(text, "标注值", limit=10)
+    binary_marker_terms = _parse_summary_list_line(text, "二进制标识提取", limit=12)
     entity_counts = _parse_summary_count_line(text, "实体统计", limit=12)
     discipline_keywords = _collect_keyword_labels(
         f"{filename}\n{text}",
@@ -11818,12 +12160,20 @@ def _build_drawing_structured_summary(
         material_type="drawing",
     )
     top_markers = _filter_structured_signal_terms(
-        top_layers + top_blocks + _extract_terms(text, max_terms=18),
+        top_layers
+        + top_blocks
+        + layout_tags
+        + binary_marker_terms
+        + _extract_terms(text, max_terms=18),
         limit=14,
         material_type="drawing",
     )
     top_numeric_terms = _limit_unique_numeric_tokens(
-        _extract_numeric_terms(text, max_terms=16), limit=10
+        _extract_numeric_terms(
+            text + "\n" + "\n".join(str(item or "") for item in dimension_markers),
+            max_terms=20,
+        ),
+        limit=12,
     )
 
     focused_dimensions = ["14", "16"]
@@ -11831,8 +12181,12 @@ def _build_drawing_structured_summary(
         focused_dimensions.append("12")
     if sheet_type_tags:
         focused_dimensions.append("01")
+    if layout_tags:
+        focused_dimensions.extend(["01", "12"])
     if risk_keywords:
         focused_dimensions.extend(["06", "07"])
+    if dimension_markers:
+        focused_dimensions.extend(["06", "16"])
     if any(tag in {"节点详图/大样", "剖面/立面"} for tag in sheet_type_tags):
         focused_dimensions.extend(["06", "16"])
     if any(tag in {"系统图/原理图", "综合排布/净高复核"} for tag in sheet_type_tags):
@@ -11845,6 +12199,9 @@ def _build_drawing_structured_summary(
         + file_stem_terms
         + top_layers
         + top_blocks
+        + layout_tags
+        + binary_marker_terms
+        + dimension_markers
         + top_markers,
         limit=20,
         material_type="drawing",
@@ -11863,6 +12220,7 @@ def _build_drawing_structured_summary(
             + min(0.2, len(discipline_keywords) * 0.03)
             + min(0.14, len(sheet_type_tags) * 0.03)
             + min(0.16, len(risk_keywords) * 0.03)
+            + min(0.08, len(layout_tags) * 0.02)
             + min(0.1, len(top_numeric_terms) * 0.02),
         ),
         4,
@@ -11874,6 +12232,9 @@ def _build_drawing_structured_summary(
         "entity_counts": entity_counts,
         "top_layers": top_layers,
         "top_blocks": top_blocks,
+        "layout_tags": layout_tags,
+        "dimension_markers": dimension_markers[:10],
+        "binary_marker_terms": binary_marker_terms[:10],
         "discipline_keywords": discipline_keywords,
         "sheet_type_tags": sheet_type_tags,
         "risk_keywords": risk_keywords,
@@ -11928,8 +12289,19 @@ def _build_site_photo_structured_summary(
         material_type="site_photo",
     )
     visual_capability = "metadata_only"
+    ocr_mode = ""
+    ocr_quality_score = 0.0
     if "[ocr文本提取]" in text.lower():
         visual_capability = "ocr_text"
+    match_mode = re.search(r"OCR模式:\s*([^\n]+)", text)
+    if match_mode:
+        ocr_mode = str(match_mode.group(1) or "").strip()
+        visual_capability = "ocr_multistage"
+    match_quality = re.search(r"OCR质量分:\s*([0-9]+(?:\.[0-9]+)?)", text)
+    if match_quality:
+        ocr_quality_score = _clip_score01(
+            float(_to_float_or_none(match_quality.group(1)) or 0.0) / 6.0
+        )
     if "未安装 pytesseract" in text.lower():
         visual_capability = "ocr_unavailable"
     evidence_density = round(
@@ -11947,7 +12319,8 @@ def _build_site_photo_structured_summary(
             + min(0.14, len(civilization_scene_tags) * 0.025)
             + min(0.14, len(quality_scene_tags) * 0.025)
             + min(0.12, len(progress_scene_tags) * 0.025)
-            + (0.08 if visual_capability == "ocr_text" else 0.0),
+            + (0.08 if visual_capability in {"ocr_text", "ocr_multistage"} else 0.0)
+            + min(0.12, ocr_quality_score * 0.12),
         ),
         4,
     )
@@ -11956,6 +12329,8 @@ def _build_site_photo_structured_summary(
         "detected_format": ext or "image",
         "bytes": len(content or b""),
         "visual_capability": visual_capability,
+        "ocr_mode": ocr_mode,
+        "ocr_quality_score": round(ocr_quality_score, 4),
         "safety_scene_tags": safety_scene_tags,
         "civilization_scene_tags": civilization_scene_tags,
         "quality_scene_tags": quality_scene_tags,
@@ -12149,13 +12524,16 @@ def _extract_image_content(content: bytes, filename: str) -> str:
             lines.append(f"尺寸: {img.width}x{img.height}")
             lines.append(f"模式: {img.mode}")
             if pytesseract is not None:
-                try:
-                    ocr_text = str(
-                        pytesseract.image_to_string(img, lang="chi_sim+eng") or ""
-                    ).strip()
-                except Exception:
-                    ocr_text = ""
+                ocr_result = _extract_best_ocr_text_from_image(
+                    img,
+                    context_tokens=_extract_terms(filename, max_terms=8),
+                )
+                ocr_text = str(ocr_result.get("text") or "").strip()
                 if ocr_text:
+                    lines.append(f"OCR模式: {ocr_result.get('mode') or 'single_pass'}")
+                    lines.append(
+                        f"OCR质量分: {round(float(_to_float_or_none(ocr_result.get('score')) or 0.0), 4)}"
+                    )
                     lines.append("[OCR文本提取]")
                     lines.append(ocr_text[:4000])
                 else:
@@ -12201,32 +12579,59 @@ def _extract_pdf_text(content: bytes, filename: str) -> str:
         doc = pymupdf.open(stream=content, filetype="pdf")
         try:
             parts: List[str] = []
+            filename_terms = _extract_terms(filename, max_terms=10)
             for idx, page in enumerate(doc, start=1):
                 # Embed stable page markers so downstream diagnostics can map evidence to pages.
-                page_text = page.get_text() or ""
-                parts.append(f"[PAGE:{idx}]\n{page_text}")
-            merged_pdf_text = "\n\n".join(parts).strip()
-            text_chars = len(merged_pdf_text.replace("\n", "").strip())
-            need_ocr = text_chars < DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR
-            if need_ocr and pytesseract is not None and Image is not None:
-                ocr_chunks: List[str] = []
-                for idx, page in enumerate(doc, start=1):
-                    if idx > DEFAULT_PDF_OCR_MAX_PAGES:
-                        break
+                page_text = _normalize_ocr_text_block(page.get_text() or "")
+                page_lines: List[str] = [f"[PAGE:{idx}]"]
+                ocr_result: Dict[str, object] = {"text": "", "mode": "", "score": 0.0}
+                need_page_ocr = (
+                    len(page_text.replace("\n", "").strip()) < DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR
+                    or _score_ocr_text_candidate(
+                        page_text,
+                        context_tokens=filename_terms,
+                    )
+                    < 2.2
+                )
+                if (
+                    need_page_ocr
+                    and idx <= DEFAULT_PDF_OCR_MAX_PAGES
+                    and pytesseract is not None
+                    and Image is not None
+                ):
                     try:
                         pix = page.get_pixmap(matrix=pymupdf.Matrix(2.0, 2.0), alpha=False)
                         with Image.open(io.BytesIO(pix.tobytes("png"))) as img:
-                            ocr_text = str(
-                                pytesseract.image_to_string(img, lang="chi_sim+eng") or ""
-                            ).strip()
+                            ocr_result = _extract_best_ocr_text_from_image(
+                                img,
+                                context_tokens=filename_terms
+                                + _extract_terms(page_text, max_terms=8),
+                            )
                     except Exception:
-                        ocr_text = ""
-                    if ocr_text:
-                        ocr_chunks.append(f"[PAGE_OCR:{idx}]\n{ocr_text[:5000]}")
-                if ocr_chunks:
-                    merged_pdf_text = (
-                        merged_pdf_text + "\n\n[PDF_OCR_FALLBACK]\n" + "\n\n".join(ocr_chunks)
+                        ocr_result = {"text": "", "mode": "", "score": 0.0}
+                page_ocr_text = str(ocr_result.get("text") or "").strip()
+                combined_text = page_text
+                if page_ocr_text:
+                    combined_text = (
+                        combined_text + ("\n" if combined_text else "") + page_ocr_text
                     ).strip()
+                    page_lines.append(
+                        f"[PAGE_OCR_MODE:{idx}] {ocr_result.get('mode') or 'single_pass'} score={round(float(_to_float_or_none(ocr_result.get('score')) or 0.0), 4)}"
+                    )
+                    page_lines.append(f"[PAGE_OCR:{idx}]")
+                    page_lines.append(page_ocr_text[:5000])
+                if combined_text:
+                    section_hints = _extract_tender_qa_section_titles(combined_text, limit=4)
+                    if section_hints:
+                        page_lines.append(
+                            f"[PAGE_SECTION_HINTS:{idx}] " + "、".join(section_hints[:4])
+                        )
+                if page_text:
+                    page_lines.append(page_text)
+                elif page_ocr_text:
+                    page_lines.append(page_ocr_text[:5000])
+                parts.append("\n".join(page_lines).strip())
+            merged_pdf_text = "\n\n".join(part for part in parts if part.strip()).strip()
             if merged_pdf_text:
                 return f"[PDF_BACKEND:pymupdf]\n{merged_pdf_text}"
         finally:
