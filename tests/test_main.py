@@ -2737,8 +2737,11 @@ class TestMaterialAdvancedParsing:
         from app.main import _build_tender_qa_structured_summary
 
         parsed_text = (
-            "招标范围包含装修及机电改造，答疑澄清明确总工期120日历天。"
-            "评分办法要求体现BIM深化、危大工程专项方案、绿色施工与质量验收标准。"
+            "第一章 施工组织设计总体部署\n"
+            "第二章 质量管理与验收标准\n"
+            "招标范围包含装修及机电改造，答疑澄清明确总工期120日历天。\n"
+            "评分办法要求体现BIM深化、危大工程专项方案、绿色施工与质量验收标准。\n"
+            "投标文件必须响应关键节点，不得缺少专项方案。"
         )
         summary = _build_tender_qa_structured_summary(
             b"TENDERDATA",
@@ -2751,6 +2754,12 @@ class TestMaterialAdvancedParsing:
         assert "120" in (summary.get("top_numeric_terms") or [])
         assert "09" in (summary.get("focused_dimensions") or [])
         assert "05" in (summary.get("focused_dimensions") or [])
+        assert "施工组织设计总体部署" in (summary.get("section_titles") or [])
+        assert "bim" in [str(x).lower() for x in (summary.get("scoring_point_terms") or [])]
+        assert any(
+            "必须" in str(x) or "不得" in str(x)
+            for x in (summary.get("mandatory_clause_terms") or [])
+        )
 
     def test_build_drawing_structured_summary_extracts_structured_signals(self):
         from app.main import _build_drawing_structured_summary

@@ -10877,6 +10877,122 @@ def _build_numeric_anchor_category_summary(
     return summary[:8]
 
 
+def _extract_tender_qa_section_titles(text: str, *, limit: int = 10) -> List[str]:
+    titles: List[str] = []
+    seen: set[str] = set()
+    patterns = (
+        r"^(?:第[一二三四五六七八九十百0-9]+章)\s*([^\n]{2,40})$",
+        r"^(?:[0-9]{1,2}(?:\.[0-9]{1,2}){0,2})\s*([^\n]{2,40})$",
+        r"^(?:[一二三四五六七八九十]+、)\s*([^\n]{2,40})$",
+    )
+    for raw_line in str(text or "").splitlines():
+        line = re.sub(r"\s+", " ", str(raw_line or "").strip(" \t-—_:：.。"))
+        if not line or len(line) > 42:
+            continue
+        if "[page" in line.lower():
+            continue
+        candidate = ""
+        for pattern in patterns:
+            match = re.match(pattern, line)
+            if match:
+                candidate = str(match.group(1) or "").strip()
+                break
+        if not candidate:
+            lower = line.lower()
+            if any(
+                token in lower
+                for token in (
+                    "方案",
+                    "措施",
+                    "管理",
+                    "计划",
+                    "要求",
+                    "标准",
+                    "施工",
+                    "部署",
+                    "组织",
+                )
+            ):
+                candidate = line
+        candidate = re.sub(r"\s+", " ", candidate).strip()
+        if not candidate or len(candidate) < 2:
+            continue
+        key = candidate.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        titles.append(candidate[:36])
+        if len(titles) >= max(1, int(limit)):
+            break
+    return titles
+
+
+def _extract_tender_qa_scoring_point_terms(text: str, *, limit: int = 12) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    score_lines: List[str] = []
+    for raw_line in str(text or "").splitlines():
+        line = re.sub(r"\s+", " ", str(raw_line or "").strip())
+        if not line:
+            continue
+        lower = line.lower()
+        if any(
+            token in lower for token in ("评分", "评审", "打分", "得分", "评标", "加分", "扣分")
+        ):
+            score_lines.append(line[:80])
+    source_terms = _extract_terms("\n".join(score_lines), max_terms=36)
+    for item in source_terms:
+        token = str(item or "").strip()
+        if not token:
+            continue
+        key = token.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(token)
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
+
+
+def _extract_tender_qa_mandatory_clauses(text: str, *, limit: int = 8) -> List[str]:
+    clauses: List[str] = []
+    seen: set[str] = set()
+    for raw_line in str(text or "").splitlines():
+        line = re.sub(r"\s+", " ", str(raw_line or "").strip())
+        if not line:
+            continue
+        lower = line.lower()
+        if not any(token in lower for token in ("必须", "不得", "严禁", "应", "需", "须", "否决")):
+            continue
+        compact = line[:48]
+        key = compact.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        clauses.append(compact)
+        if len(clauses) >= max(1, int(limit)):
+            break
+    return clauses
+
+
+def _infer_focus_dimensions_from_tender_terms(
+    raw_items: List[object], *, limit: int = 6
+) -> List[str]:
+    corpus = " ".join(str(item or "") for item in raw_items if str(item or "").strip()).lower()
+    scored: List[tuple[str, int]] = []
+    for dim_id in DIMENSION_IDS:
+        score = 0
+        for kw in DIMENSION_RAG_KEYWORDS.get(dim_id, [])[:8]:
+            token = str(kw or "").strip().lower()
+            if token and token in corpus:
+                score += 1
+        if score > 0:
+            scored.append((dim_id, score))
+    scored.sort(key=lambda item: (-item[1], item[0]))
+    return [dim_id for dim_id, _ in scored[: max(1, int(limit))]]
+
+
 def _build_tender_qa_structured_summary(
     content: bytes,
     filename: str,
@@ -10886,6 +11002,9 @@ def _build_tender_qa_structured_summary(
     text = str(parsed_text or "")
     corpus = f"{filename}\n{text}"
     constraint_tags = _collect_keyword_labels(corpus, TENDER_QA_CONSTRAINT_HINTS, limit=8)
+    section_titles = _extract_tender_qa_section_titles(text, limit=10)
+    scoring_point_terms = _extract_tender_qa_scoring_point_terms(text, limit=12)
+    mandatory_clause_terms = _extract_tender_qa_mandatory_clauses(text, limit=8)
     text_terms = _filter_structured_signal_terms(
         _extract_terms(corpus, max_terms=24),
         limit=18,
@@ -10913,9 +11032,19 @@ def _build_tender_qa_structured_summary(
         focused_dimensions.extend(["01", "16"])
     if "材料设备/甲供界面" in constraint_tags:
         focused_dimensions.extend(["04", "13", "15"])
+    focused_dimensions.extend(
+        _infer_focus_dimensions_from_tender_terms(
+            section_titles + scoring_point_terms + mandatory_clause_terms,
+            limit=6,
+        )
+    )
     structured_terms = _filter_structured_signal_terms(
-        constraint_tags + text_terms,
-        limit=18,
+        constraint_tags
+        + section_titles
+        + scoring_point_terms
+        + mandatory_clause_terms
+        + text_terms,
+        limit=24,
     )
     constraint_density = round(
         (
@@ -10929,6 +11058,9 @@ def _build_tender_qa_structured_summary(
         "detected_format": Path(filename).suffix.lower().lstrip("."),
         "bytes": len(content or b""),
         "constraint_tags": constraint_tags,
+        "section_titles": section_titles,
+        "scoring_point_terms": scoring_point_terms,
+        "mandatory_clause_terms": mandatory_clause_terms,
         "structured_terms": structured_terms,
         "top_numeric_terms": top_numeric_terms,
         "focused_dimensions": _limit_unique_texts(focused_dimensions, limit=10),
