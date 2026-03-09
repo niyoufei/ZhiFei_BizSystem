@@ -1565,6 +1565,21 @@ def _build_material_query_features(
                 material_profile_query_terms,
                 limit=36,
             )
+            _append_unique(
+                _filter_profile_terms(row.get("section_titles_preview"), limit=4),
+                material_profile_query_terms,
+                limit=36,
+            )
+            _append_unique(
+                _filter_profile_terms(row.get("scoring_point_terms_preview"), limit=4),
+                material_profile_query_terms,
+                limit=36,
+            )
+            _append_unique(
+                _filter_profile_terms(row.get("mandatory_clause_terms_preview"), limit=3),
+                material_profile_query_terms,
+                limit=36,
+            )
             if dim_id in [str(x or "").zfill(2) for x in (row.get("focused_dimensions") or [])]:
                 _append_unique(
                     [str(x) for x in (DIMENSION_RAG_KEYWORDS.get(dim_id) or [])[:2]],
@@ -1699,6 +1714,9 @@ def _build_material_dimension_requirements(
                 hints.append(text_value)
         numeric_terms: List[str] = []
         structured_terms: List[str] = []
+        section_titles: List[str] = []
+        scoring_point_terms: List[str] = []
+        mandatory_clause_terms: List[str] = []
         numeric_category_summary: List[str] = []
         focused_dimensions: List[str] = []
         structured_alignment_hits = 0
@@ -1720,6 +1738,15 @@ def _build_material_dimension_requirements(
             for term in _collect_terms(row.get("structured_terms_preview"), limit=4):
                 if term not in structured_terms:
                     structured_terms.append(term)
+            for term in _collect_terms(row.get("section_titles_preview"), limit=3):
+                if term not in section_titles:
+                    section_titles.append(term)
+            for term in _collect_terms(row.get("scoring_point_terms_preview"), limit=3):
+                if term not in scoring_point_terms:
+                    scoring_point_terms.append(term)
+            for term in _collect_terms(row.get("mandatory_clause_terms_preview"), limit=2):
+                if term not in mandatory_clause_terms:
+                    mandatory_clause_terms.append(term)
             for item in _to_text_items(row.get("numeric_category_summary"), max_items=2):
                 if item not in numeric_category_summary:
                     numeric_category_summary.append(item)
@@ -1733,7 +1760,15 @@ def _build_material_dimension_requirements(
                     focused_dimensions.append(focused_dim)
             if dim_id in row_focused_dimensions:
                 structured_alignment_hits += 1
-        merged_hints = _to_text_items(hints + structured_terms + numeric_terms, max_items=12)
+        merged_hints = _to_text_items(
+            hints
+            + section_titles
+            + scoring_point_terms
+            + mandatory_clause_terms
+            + structured_terms
+            + numeric_terms,
+            max_items=14,
+        )
         if len(merged_hints) < 3:
             continue
 
@@ -1742,6 +1777,8 @@ def _build_material_dimension_requirements(
             if (coverage_score >= 0.52 or len(source_types) >= 2 or structured_alignment_hits > 0)
             else 1
         )
+        if mandatory_clause_terms:
+            minimum_hint_hits = max(minimum_hint_hits, 3)
         if coverage_score >= 0.72 and (structured_terms or numeric_terms):
             minimum_hint_hits = max(minimum_hint_hits, 3)
         weight = round(
@@ -1751,6 +1788,9 @@ def _build_material_dimension_requirements(
                 + coverage_score * 0.3
                 + min(0.08, len(source_types) * 0.03)
                 + min(0.12, structured_alignment_hits * 0.06)
+                + min(0.08, len(section_titles) * 0.02)
+                + min(0.08, len(scoring_point_terms) * 0.025)
+                + min(0.1, len(mandatory_clause_terms) * 0.04)
                 + (0.04 if numeric_terms else 0.0),
             ),
             2,
@@ -1770,6 +1810,9 @@ def _build_material_dimension_requirements(
                     "hints": merged_hints,
                     "minimum_hint_hits": minimum_hint_hits,
                     "structured_terms": structured_terms[:6],
+                    "section_titles": section_titles[:4],
+                    "scoring_point_terms": scoring_point_terms[:4],
+                    "mandatory_clause_terms": mandatory_clause_terms[:3],
                     "source_types": source_types,
                     "source_mode": "material_knowledge_profile",
                     "source_coverage_score": round(coverage_score, 4),
@@ -12919,6 +12962,9 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
     by_type_dim_counter: Dict[str, Counter[str]] = {}
     by_type_structured_term_counter: Dict[str, Counter[str]] = {}
     by_type_structured_dim_counter: Dict[str, Counter[str]] = {}
+    by_type_section_title_counter: Dict[str, Counter[str]] = {}
+    by_type_scoring_point_counter: Dict[str, Counter[str]] = {}
+    by_type_mandatory_clause_counter: Dict[str, Counter[str]] = {}
     by_type_numeric_categories: Dict[str, Dict[str, List[str]]] = {}
     by_type_structured_signal_count: Dict[str, int] = {}
     by_type_file_count: Dict[str, int] = {}
@@ -12954,6 +13000,9 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         by_type_dim_counter.setdefault(mat_type, Counter())
         by_type_structured_term_counter.setdefault(mat_type, Counter())
         by_type_structured_dim_counter.setdefault(mat_type, Counter())
+        by_type_section_title_counter.setdefault(mat_type, Counter())
+        by_type_scoring_point_counter.setdefault(mat_type, Counter())
+        by_type_mandatory_clause_counter.setdefault(mat_type, Counter())
         by_type_numeric_categories.setdefault(mat_type, {})
         by_type_structured_signal_count.setdefault(mat_type, 0)
         by_type_ok_files.setdefault(mat_type, 0)
@@ -13027,6 +13076,24 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         if structured_terms:
             by_type_term_counter[mat_type].update(structured_terms)
             by_type_structured_term_counter[mat_type].update(structured_terms)
+        section_titles = _to_text_items(structured_summary.get("section_titles"), max_items=12)
+        if section_titles:
+            by_type_term_counter[mat_type].update(section_titles)
+            by_type_section_title_counter[mat_type].update(section_titles)
+        scoring_point_terms = _to_text_items(
+            structured_summary.get("scoring_point_terms"),
+            max_items=12,
+        )
+        if scoring_point_terms:
+            by_type_term_counter[mat_type].update(scoring_point_terms)
+            by_type_scoring_point_counter[mat_type].update(scoring_point_terms)
+        mandatory_clause_terms = _to_text_items(
+            structured_summary.get("mandatory_clause_terms"),
+            max_items=10,
+        )
+        if mandatory_clause_terms:
+            by_type_term_counter[mat_type].update(mandatory_clause_terms)
+            by_type_mandatory_clause_counter[mat_type].update(mandatory_clause_terms)
 
         numeric_terms = (
             row.get("numeric_terms_norm") if isinstance(row.get("numeric_terms_norm"), list) else []
@@ -13182,6 +13249,24 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
                     for term, _ in by_type_structured_term_counter.get(
                         mat_type, Counter()
                     ).most_common(10)
+                ],
+                "section_titles_preview": [
+                    term
+                    for term, _ in by_type_section_title_counter.get(
+                        mat_type, Counter()
+                    ).most_common(8)
+                ],
+                "scoring_point_terms_preview": [
+                    term
+                    for term, _ in by_type_scoring_point_counter.get(
+                        mat_type, Counter()
+                    ).most_common(8)
+                ],
+                "mandatory_clause_terms_preview": [
+                    term
+                    for term, _ in by_type_mandatory_clause_counter.get(
+                        mat_type, Counter()
+                    ).most_common(6)
                 ],
                 "structured_signal_count": int(by_type_structured_signal_count.get(mat_type, 0)),
                 "top_numeric_terms": [

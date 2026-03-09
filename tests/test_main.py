@@ -2117,7 +2117,8 @@ class TestMaterialsEndpoint:
 
         tender_path = tmp_path / "招标答疑.txt"
         tender_path.write_text(
-            "答疑澄清：总工期120日历天，评分办法要求BIM深化、危大工程专项方案、质量验收标准。",
+            "答疑澄清：总工期120日历天，评分办法要求BIM深化、危大工程专项方案、质量验收标准。"
+            "投标文件必须响应关键节点，不得缺少专项方案。",
             encoding="utf-8",
         )
         mock_load_materials.return_value = [
@@ -2135,6 +2136,7 @@ class TestMaterialsEndpoint:
         assert by_type["tender_qa"]["structured_signal_count"] > 0
         assert "工期/里程碑" in (by_type["tender_qa"]["structured_terms_preview"] or [])
         assert "09" in (by_type["tender_qa"]["focused_dimensions"] or [])
+        assert by_type["tender_qa"]["mandatory_clause_terms_preview"]
         by_dimension = {row["dimension_id"]: row for row in payload["by_dimension"]}
         assert by_dimension["09"]["structured_signal_hits"] > 0
 
@@ -2468,6 +2470,9 @@ class TestMaterialAdvancedParsing:
                     "top_terms": ["工期", "质量标准", "危大工程", "项目"],
                     "top_numeric_terms": ["120", "30"],
                     "structured_terms_preview": ["里程碑", "总控计划"],
+                    "section_titles_preview": ["施工组织设计总体部署"],
+                    "scoring_point_terms_preview": ["bim", "深化"],
+                    "mandatory_clause_terms_preview": ["投标文件必须响应关键节点"],
                     "focused_dimensions": ["09"],
                     "numeric_category_summary": ["工期/节点：120、30"],
                 },
@@ -2512,6 +2517,10 @@ class TestMaterialAdvancedParsing:
         assert "tender_qa" in (patterns.get("source_types") or [])
         assert "120" in (patterns.get("hints") or [])
         assert "里程碑" in (patterns.get("structured_terms") or [])
+        assert "施工组织设计总体部署" in (patterns.get("section_titles") or [])
+        assert "bim" in [str(x).lower() for x in (patterns.get("scoring_point_terms") or [])]
+        assert patterns.get("mandatory_clause_terms")
+        assert int(patterns.get("minimum_hint_hits") or 0) >= 3
         dim14 = next(r for r in reqs if r.get("dimension_id") == "14")
         dim14_patterns = dim14.get("patterns") or {}
         assert "专业碰撞" in (dim14_patterns.get("structured_terms") or [])
