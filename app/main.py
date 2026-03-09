@@ -1543,8 +1543,14 @@ def _build_material_query_features(
             row = by_type_map.get(_normalize_material_type(mat_type))
             if not isinstance(row, dict):
                 continue
+            row_quality = float(_clip_score01(row.get("structured_quality_score")) or 0.0)
+            top_terms_limit = 5 if row_quality >= 0.45 else 3
+            structured_terms_limit = 5 if row_quality >= 0.45 else 3
+            section_terms_limit = 4 if row_quality >= 0.5 else 2
+            scoring_terms_limit = 4 if row_quality >= 0.5 else 2
+            mandatory_terms_limit = 3 if row_quality >= 0.4 else 1
             _append_unique(
-                _filter_profile_terms(row.get("top_terms"), limit=4),
+                _filter_profile_terms(row.get("top_terms"), limit=top_terms_limit),
                 material_profile_query_terms,
                 limit=36,
             )
@@ -1558,25 +1564,32 @@ def _build_material_query_features(
                     if token
                 ],
                 material_profile_query_numeric_terms,
-                limit=18,
+                limit=24 if row_quality >= 0.45 else 18,
             )
             _append_unique(
-                _filter_profile_terms(row.get("structured_terms_preview"), limit=5),
+                _filter_profile_terms(
+                    row.get("structured_terms_preview"), limit=structured_terms_limit
+                ),
                 material_profile_query_terms,
                 limit=36,
             )
             _append_unique(
-                _filter_profile_terms(row.get("section_titles_preview"), limit=4),
+                _filter_profile_terms(row.get("section_titles_preview"), limit=section_terms_limit),
                 material_profile_query_terms,
                 limit=36,
             )
             _append_unique(
-                _filter_profile_terms(row.get("scoring_point_terms_preview"), limit=4),
+                _filter_profile_terms(
+                    row.get("scoring_point_terms_preview"), limit=scoring_terms_limit
+                ),
                 material_profile_query_terms,
                 limit=36,
             )
             _append_unique(
-                _filter_profile_terms(row.get("mandatory_clause_terms_preview"), limit=3),
+                _filter_profile_terms(
+                    row.get("mandatory_clause_terms_preview"),
+                    limit=mandatory_terms_limit,
+                ),
                 material_profile_query_terms,
                 limit=36,
             )
@@ -1720,10 +1733,18 @@ def _build_material_dimension_requirements(
         numeric_category_summary: List[str] = []
         focused_dimensions: List[str] = []
         structured_alignment_hits = 0
+        strongest_structured_quality = 0.0
+        strong_quality_sources = 0
         for mat_type in source_types[:3]:
             row = by_type_map.get(mat_type)
             if not isinstance(row, dict):
                 continue
+            row_structured_quality = float(
+                _clip_score01(row.get("structured_quality_score")) or 0.0
+            )
+            strongest_structured_quality = max(strongest_structured_quality, row_structured_quality)
+            if row_structured_quality >= 0.45:
+                strong_quality_sources += 1
             for term in _collect_terms(row.get("top_terms"), limit=5):
                 if term not in hints:
                     hints.append(term)
@@ -1781,6 +1802,8 @@ def _build_material_dimension_requirements(
             minimum_hint_hits = max(minimum_hint_hits, 3)
         if coverage_score >= 0.72 and (structured_terms or numeric_terms):
             minimum_hint_hits = max(minimum_hint_hits, 3)
+        if strongest_structured_quality >= 0.6:
+            minimum_hint_hits = max(minimum_hint_hits, 3)
         weight = round(
             min(
                 1.2,
@@ -1788,6 +1811,8 @@ def _build_material_dimension_requirements(
                 + coverage_score * 0.3
                 + min(0.08, len(source_types) * 0.03)
                 + min(0.12, structured_alignment_hits * 0.06)
+                + min(0.12, strongest_structured_quality * 0.16)
+                + min(0.08, strong_quality_sources * 0.03)
                 + min(0.08, len(section_titles) * 0.02)
                 + min(0.08, len(scoring_point_terms) * 0.025)
                 + min(0.1, len(mandatory_clause_terms) * 0.04)
@@ -1820,13 +1845,15 @@ def _build_material_dimension_requirements(
                     "focused_dimensions": focused_dimensions[:6],
                     "numeric_category_summary": numeric_category_summary[:4],
                     "structured_alignment_hits": structured_alignment_hits,
+                    "strongest_structured_quality": round(strongest_structured_quality, 4),
+                    "strong_quality_sources": strong_quality_sources,
                     "top_numeric_terms": numeric_terms[:4],
                 },
                 "mandatory": False,
                 "weight": weight,
                 "source_anchor_id": None,
                 "source_pack_id": "runtime_material_dimension",
-                "source_pack_version": "v2-material-dimension-2",
+                "source_pack_version": "v2-material-dimension-3",
                 "priority": 89.0,
                 "override_key": f"runtime::material_dimension::{dim_id}",
                 "lint": {},
@@ -3678,6 +3705,11 @@ def _build_project_scoring_diagnostic(
         knowledge_numeric_summary_by_type[mat_type] = _build_numeric_anchor_category_summary(
             category_buckets
         )
+    knowledge_by_type_map = {
+        _normalize_material_type(row.get("material_type")): row
+        for row in knowledge_rows
+        if isinstance(row, dict) and _normalize_material_type(row.get("material_type"))
+    }
     util_by_type = basis_util.get("by_type") if isinstance(basis_util.get("by_type"), dict) else {}
     requirement_hits = (
         evidence_trace.get("requirement_hits") if isinstance(evidence_trace, dict) else []
@@ -3932,6 +3964,20 @@ def _build_project_scoring_diagnostic(
         meets_numeric_terms = bool(depth_row.get("meets_numeric_terms")) if depth_row else False
 
         guidance: List[str] = []
+        knowledge_row = (
+            knowledge_by_type_map.get(mat_type)
+            if isinstance(knowledge_by_type_map.get(mat_type), dict)
+            else {}
+        )
+        structured_quality_score = float(
+            _to_float_or_none(knowledge_row.get("structured_quality_score")) or 0.0
+        )
+        structured_quality_max = float(
+            _to_float_or_none(knowledge_row.get("structured_quality_max")) or 0.0
+        )
+        structured_quality_signal_coverage = float(
+            _to_float_or_none(knowledge_row.get("structured_quality_signal_coverage")) or 0.0
+        )
         if files <= 0 and required:
             status = "missing"
             status_label = "缺失"
@@ -3967,6 +4013,10 @@ def _build_project_scoring_diagnostic(
             guidance.append(
                 f"{_material_type_label(mat_type)}中的数值约束不足，建议补充工期、规格、阈值、清单量等硬参数。"
             )
+        if files > 0 and structured_quality_score < 0.35:
+            guidance.append(
+                f"{_material_type_label(mat_type)}已形成结构化解析，但质量偏弱，建议补充章节标题、评分点、强制条款或更清晰的硬参数。"
+            )
 
         material_type_cards.append(
             {
@@ -3993,6 +4043,9 @@ def _build_project_scoring_diagnostic(
                 "project_numeric_terms": project_numeric_terms[:12],
                 "project_numeric_term_count": len(project_numeric_terms),
                 "project_numeric_category_summary": project_numeric_category_summary[:8],
+                "structured_quality_score": round(structured_quality_score, 4),
+                "structured_quality_max": round(structured_quality_max, 4),
+                "structured_quality_signal_coverage": round(structured_quality_signal_coverage, 4),
                 "hit_numeric_terms": hit_numeric_terms[:12],
                 "hit_numeric_term_count": len(hit_numeric_terms),
                 "expected_numeric_terms": expected_numeric_terms[:12],
@@ -4107,6 +4160,21 @@ def _build_project_scoring_diagnostic(
             ),
             "material_dimension_coverage_rate": _to_float_or_none(
                 knowledge_summary.get("dimension_coverage_rate")
+            ),
+            "material_structured_signal_total": int(
+                _to_float_or_none(knowledge_summary.get("structured_signal_total")) or 0
+            ),
+            "material_structured_quality_avg": _to_float_or_none(
+                knowledge_summary.get("structured_quality_avg")
+            ),
+            "material_structured_quality_max": _to_float_or_none(
+                knowledge_summary.get("structured_quality_max")
+            ),
+            "material_structured_quality_type_rate": _to_float_or_none(
+                knowledge_summary.get("structured_quality_type_rate")
+            ),
+            "material_strong_structured_types": int(
+                _to_float_or_none(knowledge_summary.get("strong_structured_types")) or 0
             ),
             "material_low_coverage_dimensions": int(
                 _to_float_or_none(knowledge_summary.get("low_coverage_dimensions")) or 0
@@ -5919,6 +5987,8 @@ def _build_score_self_awareness(
     structured_signal_total = int(
         _to_float_or_none(knowledge_summary.get("structured_signal_total")) or 0
     )
+    structured_quality_avg = _clip01(knowledge_summary.get("structured_quality_avg"))
+    structured_quality_type_rate = _clip01(knowledge_summary.get("structured_quality_type_rate"))
     structured_type_rows = [row for row in knowledge_by_type if isinstance(row, dict)]
     available_structured_types = [
         row for row in structured_type_rows if int(_to_float_or_none(row.get("files")) or 0) > 0
@@ -5944,6 +6014,32 @@ def _build_score_self_awareness(
         if structured_signal_total > 0 or available_structured_types
         else None
     )
+    if structured_quality_avg is None and available_structured_types:
+        structured_quality_avg = max(
+            0.0,
+            min(
+                1.0,
+                sum(
+                    float(_to_float_or_none(row.get("structured_quality_score")) or 0.0)
+                    for row in available_structured_types
+                )
+                / float(len(available_structured_types)),
+            ),
+        )
+    strong_quality_structured_types = [
+        row
+        for row in available_structured_types
+        if float(_to_float_or_none(row.get("structured_quality_score")) or 0.0) >= 0.45
+    ]
+    if structured_quality_type_rate is None and available_structured_types:
+        structured_quality_type_rate = max(
+            0.0,
+            min(
+                1.0,
+                float(len(strong_quality_structured_types))
+                / float(len(available_structured_types)),
+            ),
+        )
 
     source_file_signal = min(1.0, float(source_files_hit_count) / 3.0)
     numeric_cluster_signal = min(1.0, float(numeric_category_count) / 4.0)
@@ -5956,6 +6052,8 @@ def _build_score_self_awareness(
         (0.20, dimension_coverage_rate, "维度覆盖率"),
         (0.06, structured_signal_score, "结构化资料信号"),
         (0.04, structured_type_coverage_rate, "结构化资料类型覆盖"),
+        (0.06, structured_quality_avg, "结构化资料质量"),
+        (0.04, structured_quality_type_rate, "高质量结构化资料覆盖"),
         (0.04, source_file_signal, "命中文件广度"),
         (0.04, numeric_cluster_signal, "数值约束簇"),
     ]
@@ -6013,6 +6111,13 @@ def _build_score_self_awareness(
             "具备结构化证据的资料类型不足"
             f"（{len(strong_structured_types)}/{len(available_structured_types)}）"
         )
+    if structured_quality_avg is not None and structured_quality_avg < 0.42:
+        reasons.append(f"结构化资料质量偏弱（{structured_quality_avg * 100:.1f}%）")
+    if structured_quality_type_rate is not None and structured_quality_type_rate < 0.34:
+        reasons.append(
+            "高质量结构化资料类型不足"
+            f"（{len(strong_quality_structured_types)}/{len(available_structured_types)}）"
+        )
     if source_files_hit_count <= 0:
         reasons.append("尚未形成有效命中文件")
     if numeric_category_count <= 0:
@@ -6047,6 +6152,14 @@ def _build_score_self_awareness(
         "structured_signal_score": (
             round(float(structured_signal_score), 4)
             if structured_signal_score is not None
+            else None
+        ),
+        "structured_quality_avg": (
+            round(float(structured_quality_avg), 4) if structured_quality_avg is not None else None
+        ),
+        "structured_quality_type_rate": (
+            round(float(structured_quality_type_rate), 4)
+            if structured_quality_type_rate is not None
             else None
         ),
         "structured_type_coverage_rate": (
@@ -10974,6 +11087,13 @@ def _build_numeric_anchor_category_summary(
     return summary[:8]
 
 
+def _clip_score01(value: object) -> float:
+    numeric = _to_float_or_none(value)
+    if numeric is None:
+        return 0.0
+    return max(0.0, min(1.0, float(numeric)))
+
+
 def _extract_tender_qa_section_titles(text: str, *, limit: int = 10) -> List[str]:
     titles: List[str] = []
     seen: set[str] = set()
@@ -11150,6 +11270,17 @@ def _build_tender_qa_structured_summary(
         ),
         4,
     )
+    structured_quality_score = round(
+        min(
+            1.0,
+            _clip_score01(constraint_density / 10.0) * 0.35
+            + min(0.25, len(constraint_tags) * 0.03)
+            + min(0.12, len(section_titles) * 0.02)
+            + min(0.14, len(scoring_point_terms) * 0.025)
+            + min(0.14, len(mandatory_clause_terms) * 0.035),
+        ),
+        4,
+    )
     return {
         "filename": filename,
         "detected_format": Path(filename).suffix.lower().lstrip("."),
@@ -11162,6 +11293,7 @@ def _build_tender_qa_structured_summary(
         "top_numeric_terms": top_numeric_terms,
         "focused_dimensions": _limit_unique_texts(focused_dimensions, limit=10),
         "constraint_density": constraint_density,
+        "structured_quality_score": structured_quality_score,
     }
 
 
@@ -11226,6 +11358,17 @@ def _finalize_boq_structured_summary(
         focused_dimensions.extend(["09", "15"])
     summary["cost_structure_tags"] = cost_structure_tags
     summary["focused_dimensions"] = _limit_unique_texts(focused_dimensions, limit=6)
+    parsed_items = int(_to_float_or_none(summary.get("total_parsed_items")) or 0)
+    summary["structured_quality_score"] = round(
+        min(
+            1.0,
+            min(0.34, parsed_items / 20.0)
+            + min(0.24, len(cost_structure_tags) * 0.04)
+            + min(0.16, len(summary.get("top_numeric_terms") or []) * 0.02)
+            + min(0.16, len(summary.get("structured_terms") or []) * 0.015),
+        ),
+        4,
+    )
     return summary
 
 
@@ -11307,6 +11450,17 @@ def _build_drawing_structured_summary(
         ),
         4,
     )
+    structured_quality_score = round(
+        min(
+            1.0,
+            _clip_score01(signal_density / 4.0) * 0.34
+            + min(0.2, len(discipline_keywords) * 0.03)
+            + min(0.14, len(sheet_type_tags) * 0.03)
+            + min(0.16, len(risk_keywords) * 0.03)
+            + min(0.1, len(top_numeric_terms) * 0.02),
+        ),
+        4,
+    )
     return {
         "filename": filename,
         "detected_format": detected_format,
@@ -11322,6 +11476,7 @@ def _build_drawing_structured_summary(
         "structured_terms": structured_terms,
         "focused_dimensions": _limit_unique_texts(focused_dimensions, limit=6),
         "signal_density": signal_density,
+        "structured_quality_score": structured_quality_score,
     }
 
 
@@ -11376,6 +11531,18 @@ def _build_site_photo_structured_summary(
         ),
         4,
     )
+    structured_quality_score = round(
+        min(
+            1.0,
+            _clip_score01(evidence_density / 4.0) * 0.32
+            + min(0.18, len(safety_scene_tags) * 0.025)
+            + min(0.14, len(civilization_scene_tags) * 0.025)
+            + min(0.14, len(quality_scene_tags) * 0.025)
+            + min(0.12, len(progress_scene_tags) * 0.025)
+            + (0.08 if visual_capability == "ocr_text" else 0.0),
+        ),
+        4,
+    )
     return {
         "filename": filename,
         "detected_format": ext or "image",
@@ -11389,6 +11556,7 @@ def _build_site_photo_structured_summary(
         "structured_terms": structured_terms,
         "focused_dimensions": _limit_unique_texts(focused_dimensions, limit=6),
         "evidence_density": evidence_density,
+        "structured_quality_score": structured_quality_score,
     }
 
 
@@ -13021,6 +13189,9 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
     by_type_mandatory_clause_counter: Dict[str, Counter[str]] = {}
     by_type_numeric_categories: Dict[str, Dict[str, List[str]]] = {}
     by_type_structured_signal_count: Dict[str, int] = {}
+    by_type_structured_quality_sum: Dict[str, float] = {}
+    by_type_structured_quality_max: Dict[str, float] = {}
+    by_type_structured_quality_files: Dict[str, int] = {}
     by_type_file_count: Dict[str, int] = {}
     by_type_ok_files: Dict[str, int] = {}
     by_type_chars: Dict[str, int] = {}
@@ -13059,6 +13230,9 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         by_type_mandatory_clause_counter.setdefault(mat_type, Counter())
         by_type_numeric_categories.setdefault(mat_type, {})
         by_type_structured_signal_count.setdefault(mat_type, 0)
+        by_type_structured_quality_sum.setdefault(mat_type, 0.0)
+        by_type_structured_quality_max.setdefault(mat_type, 0.0)
+        by_type_structured_quality_files.setdefault(mat_type, 0)
         by_type_ok_files.setdefault(mat_type, 0)
         by_type_chars.setdefault(mat_type, 0)
         by_type_chunks.setdefault(mat_type, 0)
@@ -13124,6 +13298,18 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
                 row.get("site_photo_structured_summary")
                 if isinstance(row.get("site_photo_structured_summary"), dict)
                 else {}
+            )
+        structured_quality_score = _clip_score01(structured_summary.get("structured_quality_score"))
+        if structured_quality_score is not None:
+            by_type_structured_quality_sum[mat_type] = float(
+                by_type_structured_quality_sum.get(mat_type, 0.0)
+            ) + float(structured_quality_score)
+            by_type_structured_quality_max[mat_type] = max(
+                float(by_type_structured_quality_max.get(mat_type, 0.0)),
+                float(structured_quality_score),
+            )
+            by_type_structured_quality_files[mat_type] = (
+                int(by_type_structured_quality_files.get(mat_type, 0)) + 1
             )
 
         structured_terms = _to_text_items(structured_summary.get("structured_terms"), max_items=24)
@@ -13274,6 +13460,16 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
     by_type_rows: List[Dict[str, object]] = []
     for mat_type in all_types:
         dim_hits = by_type_dim_counter.get(mat_type, Counter())
+        parsed_ok_count = int(by_type_ok_files.get(mat_type, 0))
+        quality_files = int(by_type_structured_quality_files.get(mat_type, 0))
+        quality_avg = (
+            float(by_type_structured_quality_sum.get(mat_type, 0.0)) / float(parsed_ok_count)
+            if parsed_ok_count > 0
+            else 0.0
+        )
+        quality_signal_coverage = (
+            float(quality_files) / float(parsed_ok_count) if parsed_ok_count > 0 else 0.0
+        )
         top_dims = [
             {
                 "dimension_id": dim_id,
@@ -13323,6 +13519,12 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
                     ).most_common(6)
                 ],
                 "structured_signal_count": int(by_type_structured_signal_count.get(mat_type, 0)),
+                "structured_quality_score": round(float(quality_avg), 4),
+                "structured_quality_max": round(
+                    float(by_type_structured_quality_max.get(mat_type, 0.0)),
+                    4,
+                ),
+                "structured_quality_signal_coverage": round(float(quality_signal_coverage), 4),
                 "top_numeric_terms": [
                     term
                     for term, _ in by_type_numeric_counter.get(mat_type, Counter()).most_common(8)
@@ -13339,6 +13541,43 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
                 "top_dimensions": top_dims,
             }
         )
+
+    quality_rows = [
+        row for row in by_type_rows if int(_to_float_or_none(row.get("parsed_ok_files")) or 0) > 0
+    ]
+    structured_quality_avg = (
+        round(
+            sum(
+                float(_to_float_or_none(row.get("structured_quality_score")) or 0.0)
+                for row in quality_rows
+            )
+            / float(len(quality_rows)),
+            4,
+        )
+        if quality_rows
+        else 0.0
+    )
+    structured_quality_max = (
+        round(
+            max(
+                float(_to_float_or_none(row.get("structured_quality_max")) or 0.0)
+                for row in quality_rows
+            ),
+            4,
+        )
+        if quality_rows
+        else 0.0
+    )
+    strong_structured_types = [
+        row
+        for row in quality_rows
+        if float(_to_float_or_none(row.get("structured_quality_score")) or 0.0) >= 0.45
+    ]
+    structured_quality_type_rate = (
+        round(float(len(strong_structured_types)) / float(len(quality_rows)), 4)
+        if quality_rows
+        else 0.0
+    )
 
     by_dimension_rows: List[Dict[str, object]] = []
     low_dims: List[Dict[str, object]] = []
@@ -13398,6 +13637,14 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         recommendations.append(
             "已上传 PDF 资料但 PDF 解析后端不可用，建议安装 PyMuPDF 或 pypdf 后重评分。"
         )
+    if quality_rows and structured_quality_avg < 0.35:
+        recommendations.append(
+            "资料已解析，但整体结构化质量偏弱，建议补充章节标题、评分点、强制条款和硬参数。"
+        )
+    if quality_rows and structured_quality_type_rate < 0.34:
+        recommendations.append(
+            "高质量结构化资料类型不足，建议优先增强招答、清单、图纸三类核心资料。"
+        )
     for dim_row in low_dims[:6]:
         dim_name = str(dim_row.get("dimension_name") or dim_row.get("dimension_id") or "")
         kw = "、".join(str(x) for x in (dim_row.get("suggested_keywords") or [])[:3])
@@ -13424,6 +13671,10 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
             "total_parsed_chunks": total_chunks,
             "total_numeric_terms": total_numeric_terms,
             "structured_signal_total": int(sum(by_type_structured_signal_count.values())),
+            "structured_quality_avg": structured_quality_avg,
+            "structured_quality_max": structured_quality_max,
+            "strong_structured_types": len(strong_structured_types),
+            "structured_quality_type_rate": structured_quality_type_rate,
             "numeric_category_summary": _build_numeric_anchor_category_summary(
                 total_numeric_categories
             ),
@@ -13462,6 +13713,9 @@ def _render_material_knowledge_profile_markdown(payload: Dict[str, object]) -> s
         f"- 解析字数：`{summary.get('total_parsed_chars', 0)}`",
         f"- 分块数：`{summary.get('total_parsed_chunks', 0)}`",
         f"- 数字约束项：`{summary.get('total_numeric_terms', 0)}`",
+        f"- 结构化信号总量：`{summary.get('structured_signal_total', 0)}`",
+        f"- 结构化平均质量：`{float(summary.get('structured_quality_avg', 0.0) or 0.0):.2%}`",
+        f"- 高质量资料类型覆盖：`{float(summary.get('structured_quality_type_rate', 0.0) or 0.0):.2%}`",
         f"- 数值约束簇：`{'；'.join(str(x) for x in (summary.get('numeric_category_summary') or [])) or '-'}`",
         f"- 维度覆盖率：`{summary.get('dimension_coverage_rate', 0.0):.2%}`",
         "",
@@ -22336,6 +22590,12 @@ def index(
               + '；已覆盖维度 ' + escapeHtmlText(summary.material_covered_dimensions || 0)
               + '；低覆盖维度 ' + escapeHtmlText(summary.material_low_coverage_dimensions || 0)
               + '</p>';
+            html += '<p style="margin:4px 0;color:#334155">'
+              + '结构化信号 ' + escapeHtmlText(summary.material_structured_signal_total || 0)
+              + '；平均质量 ' + escapeHtmlText(toPct(summary.material_structured_quality_avg))
+              + '；高质量资料类型 ' + escapeHtmlText(summary.material_strong_structured_types || 0)
+              + '；高质量覆盖率 ' + escapeHtmlText(toPct(summary.material_structured_quality_type_rate))
+              + '</p>';
             if (numericClusterSummary.length) {
               html += '<p style="margin:4px 0;color:#334155"><strong>资料约束簇：</strong>'
                 + escapeHtmlText(numericClusterSummary.join('；'))
@@ -22471,6 +22731,9 @@ def index(
                 + '<div style="font-size:12px;color:#334155;line-height:1.6">'
                 + '<div>文件 ' + escapeHtmlText(card.files || 0) + '；字数 ' + escapeHtmlText(card.parsed_chars || 0) + '</div>'
                 + '<div>分块 ' + escapeHtmlText(card.parsed_chunks || 0) + '；数值项 ' + escapeHtmlText(card.numeric_terms || 0) + '</div>'
+                + '<div>结构化质量 ' + escapeHtmlText(toPct(card.structured_quality_score))
+                + '；峰值 ' + escapeHtmlText(toPct(card.structured_quality_max))
+                + '；信号覆盖 ' + escapeHtmlText(toPct(card.structured_quality_signal_coverage)) + '</div>'
                 + '<div>' + evidenceText + '</div>'
                 + '<div>已上传：' + (uploadedFiles.length ? (escapeHtmlText(uploadedPreview) + (uploadedFiles.length > 3 ? ' 等' : '')) : '<span style="color:#64748b">无</span>') + '</div>'
                 + '<div>已命中：' + (hitFilesByType.length ? (escapeHtmlText(hitPreview) + (hitFilesByType.length > 3 ? ' 等' : '')) : '<span style="color:#64748b">暂无命中</span>') + '</div>'

@@ -59,6 +59,8 @@ class TestScoreSelfAwareness:
             "summary": {
                 "dimension_coverage_rate": 0.81,
                 "structured_signal_total": 22,
+                "structured_quality_avg": 0.78,
+                "structured_quality_type_rate": 1.0,
                 "numeric_category_summary": [
                     "工期/节点：90",
                     "规格/参数：1200",
@@ -66,9 +68,24 @@ class TestScoreSelfAwareness:
                 ],
             },
             "by_type": [
-                {"material_type": "tender_qa", "files": 1, "structured_signal_count": 8},
-                {"material_type": "drawing", "files": 1, "structured_signal_count": 7},
-                {"material_type": "boq", "files": 1, "structured_signal_count": 7},
+                {
+                    "material_type": "tender_qa",
+                    "files": 1,
+                    "structured_signal_count": 8,
+                    "structured_quality_score": 0.82,
+                },
+                {
+                    "material_type": "drawing",
+                    "files": 1,
+                    "structured_signal_count": 7,
+                    "structured_quality_score": 0.76,
+                },
+                {
+                    "material_type": "boq",
+                    "files": 1,
+                    "structured_signal_count": 7,
+                    "structured_quality_score": 0.75,
+                },
             ],
         }
 
@@ -82,6 +99,8 @@ class TestScoreSelfAwareness:
         assert out["dimension_coverage_rate"] == pytest.approx(0.81, abs=1e-6)
         assert out["source_files_hit_count"] == 3
         assert out["structured_signal_total"] == 22
+        assert out["structured_quality_avg"] == pytest.approx(0.78, abs=1e-6)
+        assert out["structured_quality_type_rate"] == pytest.approx(1.0, abs=1e-6)
         assert out["structured_type_coverage_rate"] == pytest.approx(1.0, abs=1e-6)
 
     def test_build_score_self_awareness_forces_low_when_material_gate_blocked(self):
@@ -159,12 +178,29 @@ class TestScoreSelfAwareness:
             "summary": {
                 "dimension_coverage_rate": 0.6,
                 "structured_signal_total": 1,
+                "structured_quality_avg": 0.12,
+                "structured_quality_type_rate": 0.0,
                 "numeric_category_summary": ["工期/节点：90"],
             },
             "by_type": [
-                {"material_type": "tender_qa", "files": 1, "structured_signal_count": 1},
-                {"material_type": "drawing", "files": 1, "structured_signal_count": 0},
-                {"material_type": "boq", "files": 1, "structured_signal_count": 0},
+                {
+                    "material_type": "tender_qa",
+                    "files": 1,
+                    "structured_signal_count": 1,
+                    "structured_quality_score": 0.12,
+                },
+                {
+                    "material_type": "drawing",
+                    "files": 1,
+                    "structured_signal_count": 0,
+                    "structured_quality_score": 0.06,
+                },
+                {
+                    "material_type": "boq",
+                    "files": 1,
+                    "structured_signal_count": 0,
+                    "structured_quality_score": 0.08,
+                },
             ],
         }
 
@@ -175,8 +211,11 @@ class TestScoreSelfAwareness:
 
         assert out["level"] in {"low", "medium"}
         assert out["structured_signal_total"] == 1
+        assert out["structured_quality_avg"] == pytest.approx(0.12, abs=1e-6)
+        assert out["structured_quality_type_rate"] == pytest.approx(0.0, abs=1e-6)
         assert out["structured_type_coverage_rate"] == pytest.approx(0.3333, abs=1e-6)
         assert any("结构化资料信号偏弱" in reason for reason in out["reasons"])
+        assert any("结构化资料质量偏弱" in reason for reason in out["reasons"])
 
 
 class TestIndexEndpoint:
@@ -2090,6 +2129,7 @@ class TestMaterialsEndpoint:
         assert payload["summary"]["total_files"] == 2
         assert payload["summary"]["parsed_ok_files"] == 2
         assert payload["summary"]["covered_dimensions"] >= 1
+        assert payload["summary"]["structured_quality_avg"] > 0
         assert payload["summary"]["numeric_category_summary"]
         assert len(payload["by_type"]) >= 2
         assert any(row.get("numeric_category_summary") for row in payload["by_type"])
@@ -2141,9 +2181,11 @@ class TestMaterialsEndpoint:
         payload = _build_material_knowledge_profile("p1")
         by_type = {row["material_type"]: row for row in payload["by_type"]}
         assert by_type["drawing"]["structured_signal_count"] > 0
+        assert by_type["drawing"]["structured_quality_score"] > 0
         assert "机电综合" in (by_type["drawing"]["structured_terms_preview"] or [])
         assert "14" in (by_type["drawing"]["focused_dimensions"] or [])
         assert by_type["site_photo"]["structured_signal_count"] > 0
+        assert by_type["site_photo"]["structured_quality_score"] > 0
         assert "高处临边" in (by_type["site_photo"]["structured_terms_preview"] or [])
         by_dimension = {row["dimension_id"]: row for row in payload["by_dimension"]}
         assert by_dimension["14"]["structured_signal_hits"] > 0
@@ -2180,6 +2222,7 @@ class TestMaterialsEndpoint:
         payload = _build_material_knowledge_profile("p1")
         by_type = {row["material_type"]: row for row in payload["by_type"]}
         assert by_type["tender_qa"]["structured_signal_count"] > 0
+        assert by_type["tender_qa"]["structured_quality_score"] > 0
         assert "工期/里程碑" in (by_type["tender_qa"]["structured_terms_preview"] or [])
         assert "09" in (by_type["tender_qa"]["focused_dimensions"] or [])
         assert by_type["tender_qa"]["mandatory_clause_terms_preview"]
@@ -2519,6 +2562,7 @@ class TestMaterialAdvancedParsing:
                     "section_titles_preview": ["施工组织设计总体部署"],
                     "scoring_point_terms_preview": ["bim", "深化"],
                     "mandatory_clause_terms_preview": ["投标文件必须响应关键节点"],
+                    "structured_quality_score": 0.78,
                     "focused_dimensions": ["09"],
                     "numeric_category_summary": ["工期/节点：120、30"],
                 },
@@ -2527,6 +2571,7 @@ class TestMaterialAdvancedParsing:
                     "top_terms": ["节点", "剖面", "深化", "图纸"],
                     "top_numeric_terms": ["3.5", "600"],
                     "structured_terms_preview": ["机电综合", "专业碰撞", "预留预埋"],
+                    "structured_quality_score": 0.62,
                     "focused_dimensions": ["14", "06", "12"],
                     "numeric_category_summary": ["规格/参数：3.5、600"],
                 },
@@ -2559,6 +2604,7 @@ class TestMaterialAdvancedParsing:
         dim09 = next(r for r in reqs if r.get("dimension_id") == "09")
         patterns = dim09.get("patterns") or {}
         assert dim09.get("source_pack_id") == "runtime_material_dimension"
+        assert dim09.get("source_pack_version") == "v2-material-dimension-3"
         assert patterns.get("source_mode") == "material_knowledge_profile"
         assert "tender_qa" in (patterns.get("source_types") or [])
         assert "120" in (patterns.get("hints") or [])
@@ -2567,6 +2613,7 @@ class TestMaterialAdvancedParsing:
         assert "bim" in [str(x).lower() for x in (patterns.get("scoring_point_terms") or [])]
         assert patterns.get("mandatory_clause_terms")
         assert int(patterns.get("minimum_hint_hits") or 0) >= 3
+        assert float(patterns.get("strongest_structured_quality") or 0.0) >= 0.7
         dim14 = next(r for r in reqs if r.get("dimension_id") == "14")
         dim14_patterns = dim14.get("patterns") or {}
         assert "专业碰撞" in (dim14_patterns.get("structured_terms") or [])
@@ -2787,6 +2834,7 @@ class TestMaterialAdvancedParsing:
         assert "措施项目/抢工" in (summary.get("cost_structure_tags") or [])
         assert "13" in (summary.get("focused_dimensions") or [])
         assert "11" in (summary.get("focused_dimensions") or [])
+        assert summary["structured_quality_score"] > 0
 
     def test_build_tender_qa_structured_summary_extracts_constraint_tags(self):
         from app.main import _build_tender_qa_structured_summary
@@ -2811,6 +2859,7 @@ class TestMaterialAdvancedParsing:
         assert "05" in (summary.get("focused_dimensions") or [])
         assert "施工组织设计总体部署" in (summary.get("section_titles") or [])
         assert "bim" in [str(x).lower() for x in (summary.get("scoring_point_terms") or [])]
+        assert summary["structured_quality_score"] > 0
         assert any(
             "必须" in str(x) or "不得" in str(x)
             for x in (summary.get("mandatory_clause_terms") or [])
@@ -2835,6 +2884,7 @@ class TestMaterialAdvancedParsing:
         assert "14" in (summary.get("focused_dimensions") or [])
         assert "12" in (summary.get("focused_dimensions") or [])
         assert "600" in (summary.get("top_numeric_terms") or [])
+        assert summary["structured_quality_score"] > 0
 
     def test_build_site_photo_structured_summary_extracts_scene_tags(self):
         from app.main import _build_site_photo_structured_summary
@@ -2857,6 +2907,7 @@ class TestMaterialAdvancedParsing:
         assert "夜间施工" in (summary.get("progress_scene_tags") or [])
         assert "03" in (summary.get("focused_dimensions") or [])
         assert "09" in (summary.get("focused_dimensions") or [])
+        assert summary["structured_quality_score"] > 0
 
     @patch("app.main.load_materials")
     def test_merge_materials_text_includes_tender_structured_summary(
