@@ -95,7 +95,7 @@ from app.engine.calibrator import (
     train_offset_calibrator,
     train_ridge_calibrator,
 )
-from app.engine.compare import build_compare_narrative
+from app.engine.compare import build_compare_narrative, build_compare_sort_fields, compare_sort_key
 from app.engine.dimensions import DIMENSIONS
 from app.engine.evaluation import evaluate_project_variants
 from app.engine.evolution import build_evolution_report
@@ -1427,34 +1427,19 @@ def _build_material_query_features(
             if len(target) >= limit:
                 return
 
-    def _filter_profile_terms(raw_terms: object, *, limit: int = 8) -> List[str]:
-        generic_terms = {
-            "工程",
-            "施工",
-            "项目",
-            "资料",
-            "要求",
-            "内容",
-            "现场",
-            "部位",
-            "方案",
-            "措施",
-            "管理",
-            "控制",
-        }
-        items: List[str] = []
-        seen: set[str] = set()
-        for item in raw_terms if isinstance(raw_terms, list) else []:
-            token = str(item or "").strip().lower()
-            if not token or len(token) < 2 or token in generic_terms:
-                continue
-            if token in seen:
-                continue
-            items.append(token)
-            seen.add(token)
-            if len(items) >= limit:
-                break
-        return items
+    def _filter_profile_terms(
+        raw_terms: object,
+        *,
+        limit: int = 8,
+        material_type: str = "",
+    ) -> List[str]:
+        candidates = raw_terms if isinstance(raw_terms, list) else []
+        cleaned = _filter_structured_signal_terms(
+            [str(item or "").strip().lower() for item in candidates],
+            limit=limit,
+            material_type=material_type,
+        )
+        return [str(item or "").strip().lower() for item in cleaned if str(item or "").strip()]
 
     seed_lines: List[str] = []
     seed_lines.extend(required_sections)
@@ -1540,7 +1525,8 @@ def _build_material_query_features(
             limit=36,
         )
         for mat_type in dim_row.get("source_types") or []:
-            row = by_type_map.get(_normalize_material_type(mat_type))
+            normalized_type = _normalize_material_type(mat_type)
+            row = by_type_map.get(normalized_type)
             if not isinstance(row, dict):
                 continue
             row_quality = float(_clip_score01(row.get("structured_quality_score")) or 0.0)
@@ -1550,7 +1536,11 @@ def _build_material_query_features(
             scoring_terms_limit = 4 if row_quality >= 0.5 else 2
             mandatory_terms_limit = 3 if row_quality >= 0.4 else 1
             _append_unique(
-                _filter_profile_terms(row.get("top_terms"), limit=top_terms_limit),
+                _filter_profile_terms(
+                    row.get("top_terms"),
+                    limit=top_terms_limit,
+                    material_type=normalized_type,
+                ),
                 material_profile_query_terms,
                 limit=36,
             )
@@ -1568,19 +1558,27 @@ def _build_material_query_features(
             )
             _append_unique(
                 _filter_profile_terms(
-                    row.get("structured_terms_preview"), limit=structured_terms_limit
+                    row.get("structured_terms_preview"),
+                    limit=structured_terms_limit,
+                    material_type=normalized_type,
                 ),
                 material_profile_query_terms,
                 limit=36,
             )
             _append_unique(
-                _filter_profile_terms(row.get("section_titles_preview"), limit=section_terms_limit),
+                _filter_profile_terms(
+                    row.get("section_titles_preview"),
+                    limit=section_terms_limit,
+                    material_type=normalized_type,
+                ),
                 material_profile_query_terms,
                 limit=36,
             )
             _append_unique(
                 _filter_profile_terms(
-                    row.get("scoring_point_terms_preview"), limit=scoring_terms_limit
+                    row.get("scoring_point_terms_preview"),
+                    limit=scoring_terms_limit,
+                    material_type=normalized_type,
                 ),
                 material_profile_query_terms,
                 limit=36,
@@ -1589,6 +1587,7 @@ def _build_material_query_features(
                 _filter_profile_terms(
                     row.get("mandatory_clause_terms_preview"),
                     limit=mandatory_terms_limit,
+                    material_type=normalized_type,
                 ),
                 material_profile_query_terms,
                 limit=36,
@@ -1651,35 +1650,14 @@ def _build_material_dimension_requirements(
     if not by_type_rows or not by_dimension_rows:
         return []
 
-    generic_terms = {
-        "工程",
-        "施工",
-        "项目",
-        "资料",
-        "要求",
-        "内容",
-        "现场",
-        "部位",
-        "方案",
-        "措施",
-        "管理",
-        "控制",
-    }
-
-    def _collect_terms(raw_terms: object, *, limit: int = 8) -> List[str]:
-        out: List[str] = []
-        seen: set[str] = set()
-        for item in raw_terms if isinstance(raw_terms, list) else []:
-            token = str(item or "").strip().lower()
-            if not token or len(token) < 2 or token in generic_terms:
-                continue
-            if token in seen:
-                continue
-            out.append(token)
-            seen.add(token)
-            if len(out) >= limit:
-                break
-        return out
+    def _collect_terms(raw_terms: object, *, limit: int = 8, material_type: str = "") -> List[str]:
+        candidates = raw_terms if isinstance(raw_terms, list) else []
+        cleaned = _filter_structured_signal_terms(
+            [str(item or "").strip().lower() for item in candidates],
+            limit=limit,
+            material_type=material_type,
+        )
+        return [str(item or "").strip().lower() for item in cleaned if str(item or "").strip()]
 
     allowed_types = {
         _normalize_material_type(item)
@@ -1745,7 +1723,7 @@ def _build_material_dimension_requirements(
             strongest_structured_quality = max(strongest_structured_quality, row_structured_quality)
             if row_structured_quality >= 0.45:
                 strong_quality_sources += 1
-            for term in _collect_terms(row.get("top_terms"), limit=5):
+            for term in _collect_terms(row.get("top_terms"), limit=5, material_type=mat_type):
                 if term not in hints:
                     hints.append(term)
                 if len(hints) >= 8:
@@ -1756,16 +1734,32 @@ def _build_material_dimension_requirements(
                     numeric_terms.append(token)
                 if len(numeric_terms) >= 4:
                     break
-            for term in _collect_terms(row.get("structured_terms_preview"), limit=4):
+            for term in _collect_terms(
+                row.get("structured_terms_preview"),
+                limit=4,
+                material_type=mat_type,
+            ):
                 if term not in structured_terms:
                     structured_terms.append(term)
-            for term in _collect_terms(row.get("section_titles_preview"), limit=3):
+            for term in _collect_terms(
+                row.get("section_titles_preview"),
+                limit=3,
+                material_type=mat_type,
+            ):
                 if term not in section_titles:
                     section_titles.append(term)
-            for term in _collect_terms(row.get("scoring_point_terms_preview"), limit=3):
+            for term in _collect_terms(
+                row.get("scoring_point_terms_preview"),
+                limit=3,
+                material_type=mat_type,
+            ):
                 if term not in scoring_point_terms:
                     scoring_point_terms.append(term)
-            for term in _collect_terms(row.get("mandatory_clause_terms_preview"), limit=2):
+            for term in _collect_terms(
+                row.get("mandatory_clause_terms_preview"),
+                limit=2,
+                material_type=mat_type,
+            ):
                 if term not in mandatory_clause_terms:
                     mandatory_clause_terms.append(term)
             for item in _to_text_items(row.get("numeric_category_summary"), max_items=2):
@@ -10943,23 +10937,143 @@ STRUCTURED_SIGNAL_STOP_WORDS = {
     "字节数",
 }
 
+STRUCTURED_SIGNAL_GENERIC_TERMS = {
+    "工程",
+    "施工",
+    "项目",
+    "资料",
+    "要求",
+    "内容",
+    "现场",
+    "部位",
+    "方案",
+    "措施",
+    "管理",
+    "控制",
+    "文本",
+    "图纸",
+    "照片",
+    "图片",
+    "数据",
+    "信息",
+    "记录",
+    "说明",
+    "摘要",
+    "文件",
+}
 
-def _filter_structured_signal_terms(raw_items: List[object], *, limit: int = 16) -> List[str]:
+_STRUCTURED_SIGNAL_HINT_MAPS: Dict[str, List[Dict[str, List[str]]]] = {
+    "tender_qa": [TENDER_QA_CONSTRAINT_HINTS],
+    "boq": [BOQ_STRUCTURE_HINTS],
+    "drawing": [DRAWING_DISCIPLINE_HINTS, DRAWING_RISK_HINTS, DRAWING_SHEET_TYPE_HINTS],
+    "site_photo": [
+        SITE_PHOTO_SAFETY_HINTS,
+        SITE_PHOTO_CIVILIZATION_HINTS,
+        SITE_PHOTO_QUALITY_HINTS,
+        SITE_PHOTO_PROGRESS_HINTS,
+    ],
+}
+
+
+def _structured_signal_material_keywords(material_type: str) -> set[str]:
+    mat_type = _normalize_material_type(material_type)
+    keywords: set[str] = set()
+    for mapping in _STRUCTURED_SIGNAL_HINT_MAPS.get(mat_type, []):
+        for label, hints in mapping.items():
+            label_text = str(label or "").strip().lower()
+            if label_text:
+                keywords.add(label_text)
+            for hint in hints:
+                hint_text = str(hint or "").strip().lower()
+                if hint_text:
+                    keywords.add(hint_text)
+    return keywords
+
+
+def _structured_signal_quality_score(term: object, *, material_type: str = "") -> float:
+    text_value = str(term or "").strip()
+    if not text_value:
+        return -1.0
+    key = text_value.lower()
+    if key in STRUCTURED_SIGNAL_STOP_WORDS or key in STRUCTURED_SIGNAL_GENERIC_TERMS:
+        return -1.0
+    if len(key) <= 1:
+        return -1.0
+    if re.fullmatch(r"[-_./\\]+", key):
+        return -1.0
+    if re.fullmatch(r"(?:\d+|\d+\.\d+)", key):
+        return -1.0
+    if re.fullmatch(r"[a-z]{1,2}\d*", key) and key not in {"bim", "iot", "ocr", "cad"}:
+        return -0.6
+    if re.fullmatch(r"(?:sheet|page|layer|block)\d*", key):
+        return -0.8
+
+    score = 0.0
+    if re.search(r"[\u4e00-\u9fff]", text_value):
+        score += 0.95
+    if re.search(r"[A-Za-z]", text_value):
+        score += 0.2
+    if re.search(r"\d", text_value):
+        score += 0.18
+    if any(char in text_value for char in "/、-（）()"):
+        score += 0.12
+    if 2 <= len(text_value) <= 18:
+        score += 0.28
+    elif len(text_value) <= 30:
+        score += 0.12
+    else:
+        score -= 0.08
+    if any(unit in key for unit in ["mm", "cm", "dn", "kw", "kva", "m³", "㎡", "c30", "c35"]):
+        score += 0.2
+    if any(noise in key for noise in ("文件", "资料", "文本", "内容", "说明")):
+        score -= 0.28
+
+    material_keywords = _structured_signal_material_keywords(material_type)
+    if material_keywords and any(hint in key or key in hint for hint in material_keywords):
+        score += 0.72
+    return round(score, 4)
+
+
+def _filter_structured_signal_terms(
+    raw_items: List[object],
+    *,
+    limit: int = 16,
+    material_type: str = "",
+) -> List[str]:
     out: List[str] = []
+    kept_scores: List[float] = []
     seen: set[str] = set()
     for item in raw_items:
         text_value = str(item or "").strip()
         if not text_value:
             continue
         key = text_value.lower()
-        if key in STRUCTURED_SIGNAL_STOP_WORDS:
-            continue
-        if len(key) <= 1:
+        score = _structured_signal_quality_score(text_value, material_type=material_type)
+        if score < 0.72:
             continue
         if key in seen:
             continue
+        replaced = False
+        for idx, kept in enumerate(list(out)):
+            kept_key = kept.lower()
+            kept_score = kept_scores[idx]
+            if key in kept_key and len(kept_key) - len(key) >= 2 and kept_score >= score:
+                replaced = True
+                break
+            if kept_key in key and len(key) - len(kept_key) >= 2 and score >= kept_score:
+                seen.discard(kept_key)
+                out[idx] = text_value
+                kept_scores[idx] = score
+                seen.add(key)
+                replaced = True
+                break
+        if replaced:
+            if len(out) >= max(1, int(limit)):
+                return out[: max(1, int(limit))]
+            continue
         seen.add(key)
         out.append(text_value)
+        kept_scores.append(score)
         if len(out) >= max(1, int(limit)):
             break
     return out
@@ -11225,6 +11339,7 @@ def _build_tender_qa_structured_summary(
     text_terms = _filter_structured_signal_terms(
         _extract_terms(corpus, max_terms=24),
         limit=18,
+        material_type="tender_qa",
     )
     top_numeric_terms = _limit_unique_numeric_tokens(
         _extract_numeric_terms(text, max_terms=16),
@@ -11262,6 +11377,7 @@ def _build_tender_qa_structured_summary(
         + mandatory_clause_terms
         + text_terms,
         limit=24,
+        material_type="tender_qa",
     )
     constraint_density = round(
         (
@@ -11347,7 +11463,11 @@ def _finalize_boq_structured_summary(
     structured_terms.extend(_extract_terms(parsed_text, max_terms=14))
     structured_terms.extend(cost_structure_tags)
     numeric_terms.extend(_extract_numeric_terms(parsed_text, max_terms=12))
-    summary["structured_terms"] = _filter_structured_signal_terms(structured_terms, limit=18)
+    summary["structured_terms"] = _filter_structured_signal_terms(
+        structured_terms,
+        limit=18,
+        material_type="boq",
+    )
     summary["top_numeric_terms"] = _limit_unique_numeric_tokens(numeric_terms, limit=10)
     focused_dimensions = ["04", "13", "15"]
     if "安全文明/绿色措施" in cost_structure_tags:
@@ -11412,10 +11532,12 @@ def _build_drawing_structured_summary(
     file_stem_terms = _filter_structured_signal_terms(
         _extract_terms(Path(filename).stem, max_terms=8),
         limit=6,
+        material_type="drawing",
     )
     top_markers = _filter_structured_signal_terms(
         top_layers + top_blocks + _extract_terms(text, max_terms=18),
         limit=14,
+        material_type="drawing",
     )
     top_numeric_terms = _limit_unique_numeric_tokens(
         _extract_numeric_terms(text, max_terms=16), limit=10
@@ -11442,6 +11564,7 @@ def _build_drawing_structured_summary(
         + top_blocks
         + top_markers,
         limit=20,
+        material_type="drawing",
     )
     signal_density = round(
         (
@@ -11501,6 +11624,7 @@ def _build_site_photo_structured_summary(
     text_markers = _filter_structured_signal_terms(
         _extract_terms(corpus, max_terms=18),
         limit=12,
+        material_type="site_photo",
     )
     focused_dimensions: List[str] = []
     if safety_scene_tags:
@@ -11518,6 +11642,7 @@ def _build_site_photo_structured_summary(
         + progress_scene_tags
         + text_markers,
         limit=18,
+        material_type="site_photo",
     )
     visual_capability = "metadata_only"
     if "[ocr文本提取]" in text.lower():
@@ -15564,23 +15689,23 @@ def compare_submissions(
             allow_pred_score=allow_pred_score,
             score_scale_max=score_scale_max,
         )
-        rankings.append(
-            {
-                "submission_id": s["id"],
-                "filename": s["filename"],
-                "total_score": score_fields["total_score"],
-                "pred_total_score": score_fields["pred_total_score"],
-                "rule_total_score": score_fields["rule_total_score"],
-                "score_source": score_fields["score_source"],
-                "score_confidence_level": str(
-                    ((report_for_awareness or {}).get("meta") or {}).get("score_confidence_level")
-                    or ""
-                ),
-                "score_self_awareness": awareness if isinstance(awareness, dict) else {},
-                "created_at": s["created_at"],
-            }
-        )
-    rankings = sorted(rankings, key=lambda x: float(x["total_score"]), reverse=True)
+        ranking_row = {
+            "submission_id": s["id"],
+            "id": s["id"],
+            "filename": s["filename"],
+            "total_score": score_fields["total_score"],
+            "pred_total_score": score_fields["pred_total_score"],
+            "rule_total_score": score_fields["rule_total_score"],
+            "score_source": score_fields["score_source"],
+            "score_confidence_level": str(
+                ((report_for_awareness or {}).get("meta") or {}).get("score_confidence_level") or ""
+            ),
+            "score_self_awareness": awareness if isinstance(awareness, dict) else {},
+            "created_at": s["created_at"],
+        }
+        ranking_row.update(build_compare_sort_fields(ranking_row))
+        rankings.append(ranking_row)
+    rankings = sorted(rankings, key=compare_sort_key, reverse=True)
     dimension_totals: dict[str, float] = {}
     dimension_counts: dict[str, int] = {}
     penalty_stats: dict[str, int] = {}

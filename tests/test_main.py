@@ -2865,6 +2865,33 @@ class TestMaterialAdvancedParsing:
             for x in (summary.get("mandatory_clause_terms") or [])
         )
 
+    def test_filter_structured_signal_terms_prefers_material_specific_terms(self):
+        from app.main import _filter_structured_signal_terms
+
+        terms = _filter_structured_signal_terms(
+            [
+                "文件",
+                "资料",
+                "text",
+                "layer1",
+                "综合管线",
+                "综合管线净高复核",
+                "节点详图",
+                "A1",
+                "BIM",
+            ],
+            limit=6,
+            material_type="drawing",
+        )
+
+        assert "综合管线净高复核" in terms
+        assert "节点详图" in terms
+        assert "BIM" in terms
+        assert "文件" not in terms
+        assert "资料" not in terms
+        assert "layer1" not in terms
+        assert "综合管线" not in terms
+
     def test_build_drawing_structured_summary_extracts_structured_signals(self):
         from app.main import _build_drawing_structured_summary
 
@@ -3858,8 +3885,71 @@ class TestCompareEndpoints:
         data = response.json()
         assert data["project_id"] == "p1"
         assert len(data["rankings"]) == 2
-        # First should have higher score
-        assert data["rankings"][0]["total_score"] == 80.0
+        # First should be the higher ranked submission; displayed total may be scaled by project score scale.
+        assert data["rankings"][0]["submission_id"] == "s1"
+        assert (
+            data["rankings"][0]["ranking_sort_score"] >= data["rankings"][1]["ranking_sort_score"]
+        )
+        assert "ranking_evidence_bonus" in data["rankings"][0]
+
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_compare_uses_evidence_bonus_for_near_ties(self, mock_ensure, mock_load, client):
+        mock_load.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "raw_high_low_conf.txt",
+                "total_score": 85.0,
+                "report": {
+                    "dimension_scores": {"09": {"score": 7.0}},
+                    "penalties": [],
+                    "meta": {
+                        "score_confidence_level": "low",
+                        "score_self_awareness": {
+                            "level": "low",
+                            "score_0_100": 24.0,
+                            "structured_quality_avg": 0.12,
+                            "structured_quality_type_rate": 0.0,
+                            "retrieval_file_coverage_rate": 0.18,
+                            "dimension_coverage_rate": 0.2,
+                        },
+                    },
+                },
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            {
+                "id": "s2",
+                "project_id": "p1",
+                "filename": "raw_low_high_conf.txt",
+                "total_score": 84.8,
+                "report": {
+                    "dimension_scores": {"09": {"score": 7.2}},
+                    "penalties": [],
+                    "meta": {
+                        "score_confidence_level": "high",
+                        "score_self_awareness": {
+                            "level": "high",
+                            "score_0_100": 89.0,
+                            "structured_quality_avg": 0.88,
+                            "structured_quality_type_rate": 1.0,
+                            "retrieval_file_coverage_rate": 0.92,
+                            "dimension_coverage_rate": 0.86,
+                        },
+                    },
+                },
+                "created_at": "2026-01-02T00:00:00Z",
+            },
+        ]
+        response = client.get("/api/v1/projects/p1/compare")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["rankings"][0]["submission_id"] == "s2"
+        assert data["rankings"][0]["ranking_sort_score"] > data["rankings"][1]["ranking_sort_score"]
+        assert (
+            data["rankings"][0]["ranking_evidence_bonus"]
+            > data["rankings"][1]["ranking_evidence_bonus"]
+        )
 
     @patch("app.main.load_calibration_models")
     @patch("app.main.load_projects")

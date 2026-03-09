@@ -61,16 +61,96 @@ def _score_awareness_meta(submission: Dict[str, Any]) -> Dict[str, Any]:
     report = submission.get("report") or {}
     meta = report.get("meta") if isinstance(report, dict) else {}
     meta = meta if isinstance(meta, dict) else {}
-    awareness = meta.get("score_self_awareness")
+    awareness = submission.get("score_self_awareness")
+    awareness = awareness if isinstance(awareness, dict) else meta.get("score_self_awareness")
     awareness = awareness if isinstance(awareness, dict) else {}
     reasons = awareness.get("reasons") if isinstance(awareness.get("reasons"), list) else []
+    confidence_level = _safe_str(
+        submission.get("score_confidence_level")
+        or meta.get("score_confidence_level")
+        or awareness.get("level")
+        or ""
+    )
+    confidence_score = round(_safe_float(awareness.get("score_0_100")), 2)
+    if confidence_score <= 0 and confidence_level:
+        confidence_score = {
+            "high": 82.0,
+            "medium": 58.0,
+            "low": 26.0,
+        }.get(confidence_level, 0.0)
+    structured_quality_avg = round(_safe_float(awareness.get("structured_quality_avg")), 4)
+    structured_quality_type_rate = round(
+        _safe_float(awareness.get("structured_quality_type_rate")),
+        4,
+    )
+    retrieval_file_coverage_rate = round(
+        _safe_float(awareness.get("retrieval_file_coverage_rate")),
+        4,
+    )
+    dimension_coverage_rate = round(_safe_float(awareness.get("dimension_coverage_rate")), 4)
     return {
-        "score_confidence_level": _safe_str(
-            meta.get("score_confidence_level") or awareness.get("level") or ""
-        ),
-        "score_confidence_score": round(_safe_float(awareness.get("score_0_100")), 2),
+        "score_confidence_level": confidence_level,
+        "score_confidence_score": confidence_score,
         "score_confidence_reason": _safe_str(reasons[0]) if reasons else "",
+        "structured_quality_avg": structured_quality_avg,
+        "structured_quality_type_rate": structured_quality_type_rate,
+        "retrieval_file_coverage_rate": retrieval_file_coverage_rate,
+        "dimension_coverage_rate": dimension_coverage_rate,
     }
+
+
+def build_compare_sort_fields(submission: Dict[str, Any]) -> Dict[str, Any]:
+    awareness_meta = _score_awareness_meta(submission)
+    total_score = round(_safe_float(submission.get("total_score")), 4)
+    confidence_signal = max(
+        0.0,
+        min(1.0, _safe_float(awareness_meta.get("score_confidence_score")) / 100.0),
+    )
+    structured_quality_avg = max(
+        0.0,
+        min(1.0, _safe_float(awareness_meta.get("structured_quality_avg"))),
+    )
+    structured_quality_type_rate = max(
+        0.0,
+        min(1.0, _safe_float(awareness_meta.get("structured_quality_type_rate"))),
+    )
+    retrieval_file_coverage_rate = max(
+        0.0,
+        min(1.0, _safe_float(awareness_meta.get("retrieval_file_coverage_rate"))),
+    )
+    dimension_coverage_rate = max(
+        0.0,
+        min(1.0, _safe_float(awareness_meta.get("dimension_coverage_rate"))),
+    )
+    evidence_bonus = round(
+        min(
+            0.45,
+            confidence_signal * 0.22
+            + structured_quality_avg * 0.12
+            + structured_quality_type_rate * 0.07
+            + retrieval_file_coverage_rate * 0.03
+            + dimension_coverage_rate * 0.01,
+        ),
+        4,
+    )
+    ranking_sort_score = round(total_score + evidence_bonus, 4)
+    return {
+        **awareness_meta,
+        "ranking_evidence_bonus": evidence_bonus,
+        "ranking_sort_score": ranking_sort_score,
+    }
+
+
+def compare_sort_key(submission: Dict[str, Any]) -> Tuple[float, float, float, float, float, str]:
+    sort_fields = build_compare_sort_fields(submission)
+    return (
+        _safe_float(sort_fields.get("ranking_sort_score")),
+        _safe_float(submission.get("total_score")),
+        _safe_float(sort_fields.get("score_confidence_score")),
+        _safe_float(sort_fields.get("structured_quality_avg")),
+        _safe_float(sort_fields.get("structured_quality_type_rate")),
+        _safe_str(submission.get("filename") or submission.get("id")),
+    )
 
 
 def _build_page_markers(text: str) -> List[Tuple[int, int]]:
@@ -755,7 +835,7 @@ def _build_submission_optimization_cards(
     top_dims = (top.get("report") or {}).get("dimension_scores", {}) or {}
     top_total = _safe_float(top.get("total_score"))
 
-    for s in sorted(rankings, key=lambda x: _safe_float(x.get("total_score"))):
+    for s in sorted(rankings, key=compare_sort_key):
         sid = _safe_str(s.get("id"))
         filename = _safe_str(s.get("filename"))
         total_score = round(_safe_float(s.get("total_score")), 2)
@@ -1007,7 +1087,7 @@ def _build_submission_scorecards(
         filename = _safe_str(s.get("filename"))
         total_score = round(_safe_float(s.get("total_score")), 2)
         report = s.get("report") or {}
-        awareness = _score_awareness_meta(s)
+        awareness = build_compare_sort_fields(s)
         own_dims = report.get("dimension_scores", {}) or {}
         text = _safe_str(s.get("text"))
         markers = _build_page_markers(text)
@@ -1105,6 +1185,8 @@ def _build_submission_scorecards(
                 "score_confidence_level": awareness.get("score_confidence_level") or "",
                 "score_confidence_score": awareness.get("score_confidence_score"),
                 "score_confidence_reason": awareness.get("score_confidence_reason") or "",
+                "ranking_evidence_bonus": awareness.get("ranking_evidence_bonus"),
+                "ranking_sort_score": awareness.get("ranking_sort_score"),
                 "target_full_score": FULL_TARGET_TOTAL_SCORE,
                 "gap_to_full_total": round(max(0.0, FULL_TARGET_TOTAL_SCORE - total_score), 2),
                 "total_deduction_points": round(total_deduction_points, 2),
@@ -1133,9 +1215,7 @@ def build_compare_narrative(submissions: List[Dict[str, Any]]) -> Dict[str, Any]
             "submission_scorecards": [],
         }
 
-    rankings = sorted(
-        submissions, key=lambda x: _safe_float(x.get("total_score", 0.0)), reverse=True
-    )
+    rankings = sorted(submissions, key=compare_sort_key, reverse=True)
     top = rankings[0]
     bottom = rankings[-1]
     scores = [_safe_float(s.get("total_score")) for s in rankings]
@@ -1317,10 +1397,8 @@ def build_compare_narrative(submissions: List[Dict[str, Any]]) -> Dict[str, Any]
     )
 
     submission_diagnostics: List[Dict[str, Any]] = []
-    for rank, s in enumerate(
-        sorted(rankings, key=lambda x: _safe_float(x.get("total_score"))), start=1
-    ):
-        awareness = _score_awareness_meta(s)
+    for rank, s in enumerate(sorted(rankings, key=compare_sort_key), start=1):
+        awareness = build_compare_sort_fields(s)
         dim_rows = (s.get("report") or {}).get("dimension_scores", {}) or {}
         dim_rank = sorted(
             [
@@ -1407,6 +1485,7 @@ def build_compare_narrative(submissions: List[Dict[str, Any]]) -> Dict[str, Any]
             if low_confidence_files
             else "当前评分置信度未见明显低位异常。"
         )
+        + "对近似分数施组，排序已叠加极小的证据质量加成以提高稳定性。"
         + "报告已给出逐文件、逐页定位的优化动作，可直接用于编制迭代。"
     )
 
@@ -1416,13 +1495,13 @@ def build_compare_narrative(submissions: List[Dict[str, Any]]) -> Dict[str, Any]
             "id": top.get("id"),
             "filename": top.get("filename"),
             "total_score": top.get("total_score"),
-            **_score_awareness_meta(top),
+            **build_compare_sort_fields(top),
         },
         "bottom_submission": {
             "id": bottom.get("id"),
             "filename": bottom.get("filename"),
             "total_score": bottom.get("total_score"),
-            **_score_awareness_meta(bottom),
+            **build_compare_sort_fields(bottom),
         },
         "key_diffs": key_diffs,
         "score_overview": {
@@ -1434,6 +1513,17 @@ def build_compare_narrative(submissions: List[Dict[str, Any]]) -> Dict[str, Any]
             "project_std_score": round(pstdev(scores), 2) if len(scores) > 1 else 0.0,
             "low_confidence_submission_count": len(low_confidence_files),
             "low_confidence_filenames": low_confidence_files[:8],
+            "ranking_mode": "total_score+evidence_bonus",
+            "max_ranking_evidence_bonus": round(
+                max(
+                    (
+                        _safe_float(build_compare_sort_fields(s).get("ranking_evidence_bonus"))
+                        for s in rankings
+                    ),
+                    default=0.0,
+                ),
+                4,
+            ),
         },
         "dimension_diagnostics": diffs[:8],
         "penalty_diagnostics": penalty_diagnostics[:8],

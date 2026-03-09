@@ -261,6 +261,65 @@ def test_compare_narrative_carries_score_confidence_metadata():
     assert low_card.get("score_confidence_score") == 22.0
 
 
+def test_compare_narrative_uses_evidence_bonus_for_near_ties():
+    submissions = [
+        {
+            "id": "s-raw-high",
+            "filename": "原始分略高但证据弱.pdf",
+            "total_score": 85.0,
+            "report": {
+                "meta": {
+                    "score_confidence_level": "low",
+                    "score_self_awareness": {
+                        "level": "low",
+                        "score_0_100": 24.0,
+                        "structured_quality_avg": 0.12,
+                        "structured_quality_type_rate": 0.0,
+                        "retrieval_file_coverage_rate": 0.18,
+                        "dimension_coverage_rate": 0.2,
+                        "reasons": ["资料结构化质量偏弱"],
+                    },
+                },
+                "dimension_scores": {"09": {"score": 7.0}},
+                "penalties": [],
+            },
+        },
+        {
+            "id": "s-evidence-strong",
+            "filename": "原始分略低但证据强.pdf",
+            "total_score": 84.8,
+            "report": {
+                "meta": {
+                    "score_confidence_level": "high",
+                    "score_self_awareness": {
+                        "level": "high",
+                        "score_0_100": 89.0,
+                        "structured_quality_avg": 0.88,
+                        "structured_quality_type_rate": 1.0,
+                        "retrieval_file_coverage_rate": 0.92,
+                        "dimension_coverage_rate": 0.86,
+                        "reasons": ["资料覆盖与结构化质量较强"],
+                    },
+                },
+                "dimension_scores": {"09": {"score": 7.2}},
+                "penalties": [],
+            },
+        },
+    ]
+    result = build_compare_narrative(submissions)
+    assert result["top_submission"]["id"] == "s-evidence-strong"
+    assert (
+        result["top_submission"]["ranking_sort_score"]
+        > result["bottom_submission"]["ranking_sort_score"]
+    )
+    assert (
+        result["top_submission"]["ranking_evidence_bonus"]
+        > result["bottom_submission"]["ranking_evidence_bonus"]
+    )
+    assert result["score_overview"]["ranking_mode"] == "total_score+evidence_bonus"
+    assert result["score_overview"]["max_ranking_evidence_bonus"] > 0
+
+
 def test_compare_submission_cards_use_full_score_gap_not_top_gap():
     """Dimension optimization should target full score, not only current project top."""
     submissions = [
