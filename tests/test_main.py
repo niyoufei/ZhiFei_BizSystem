@@ -3262,6 +3262,48 @@ class TestMaterialAdvancedParsing:
             numeric_hits = chunks[0].get("matched_numeric_terms") or []
             assert "120" in numeric_hits or "30" in numeric_hits
 
+    def test_select_material_retrieval_chunks_prefers_high_quality_structured_file(self):
+        from app.main import _select_material_retrieval_chunks
+
+        material_index = {
+            "available_types": ["drawing"],
+            "files": [
+                {
+                    "material_type": "drawing",
+                    "filename": "low_quality.dwg",
+                    "parsed_ok": True,
+                    "chunks": ["综合管线 节点 深化"],
+                    "drawing_structured_summary": {
+                        "structured_quality_score": 0.15,
+                        "structured_terms": ["综合管线", "文件", "资料"],
+                    },
+                },
+                {
+                    "material_type": "drawing",
+                    "filename": "high_quality.dwg",
+                    "parsed_ok": True,
+                    "chunks": ["综合管线净高复核 节点详图 BIM 深化"],
+                    "drawing_structured_summary": {
+                        "structured_quality_score": 0.88,
+                        "structured_terms": ["综合管线净高复核", "节点详图", "BIM"],
+                    },
+                },
+            ],
+        }
+
+        chunks = _select_material_retrieval_chunks(
+            "p1",
+            "综合管线 节点 BIM",
+            top_k=1,
+            per_type_quota=1,
+            per_file_quota=1,
+            material_index=material_index,
+        )
+
+        assert chunks
+        assert chunks[0]["filename"] == "high_quality.dwg"
+        assert float(chunks[0].get("file_structured_quality") or 0.0) >= 0.88
+
     def test_build_material_utilization_summary_reports_uncovered_types(self):
         from app.main import _build_material_utilization_summary
 

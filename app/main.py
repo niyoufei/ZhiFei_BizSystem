@@ -2484,6 +2484,7 @@ def _build_runtime_custom_requirements(
                 "chunk_id": c.get("chunk_id"),
                 "dimension_id": c.get("dimension_id"),
                 "score": c.get("score"),
+                "file_structured_quality": c.get("file_structured_quality"),
                 "matched_terms": c.get("matched_terms"),
                 "matched_numeric_terms": c.get("matched_numeric_terms"),
                 "selected_via": c.get("selected_via"),
@@ -12150,6 +12151,40 @@ def _infer_chunk_dimension_id(material_type: str, chunk_text: str) -> str:
     return best_dim
 
 
+def _get_material_file_structured_summary(file_entry: Dict[str, object]) -> Dict[str, object]:
+    mat_type = _normalize_material_type(file_entry.get("material_type"))
+    if mat_type == "tender_qa":
+        return (
+            file_entry.get("tender_qa_structured_summary")
+            if isinstance(file_entry.get("tender_qa_structured_summary"), dict)
+            else {}
+        )
+    if mat_type == "boq":
+        return (
+            file_entry.get("boq_structured_summary")
+            if isinstance(file_entry.get("boq_structured_summary"), dict)
+            else {}
+        )
+    if mat_type == "drawing":
+        return (
+            file_entry.get("drawing_structured_summary")
+            if isinstance(file_entry.get("drawing_structured_summary"), dict)
+            else {}
+        )
+    if mat_type == "site_photo":
+        return (
+            file_entry.get("site_photo_structured_summary")
+            if isinstance(file_entry.get("site_photo_structured_summary"), dict)
+            else {}
+        )
+    return {}
+
+
+def _get_material_file_structured_quality(file_entry: Dict[str, object]) -> float:
+    summary = _get_material_file_structured_summary(file_entry)
+    return float(_clip_score01(summary.get("structured_quality_score")) or 0.0)
+
+
 def _select_material_retrieval_chunks(
     project_id: str,
     submission_text: str,
@@ -12189,6 +12224,16 @@ def _select_material_retrieval_chunks(
             continue
         filename = str(file_entry.get("filename") or "").strip()
         mat_type = str(file_entry.get("material_type") or "").strip()
+        structured_summary = _get_material_file_structured_summary(file_entry)
+        file_structured_quality = _get_material_file_structured_quality(file_entry)
+        file_structured_terms = _filter_structured_signal_terms(
+            _to_text_items(structured_summary.get("structured_terms"), max_items=12)
+            + _to_text_items(structured_summary.get("section_titles"), max_items=6)
+            + _to_text_items(structured_summary.get("scoring_point_terms"), max_items=6)
+            + _to_text_items(structured_summary.get("mandatory_clause_terms"), max_items=4),
+            limit=12,
+            material_type=mat_type,
+        )
         chunks = file_entry.get("chunks") if isinstance(file_entry.get("chunks"), list) else []
         if not chunks:
             text_raw = str(file_entry.get("text") or "")
@@ -12198,6 +12243,11 @@ def _select_material_retrieval_chunks(
             chunk_text = str(chunk or "")
             lower = chunk_text.lower()
             matched_terms = [t for t in query_terms if t and t in lower][:8]
+            structured_term_hits = [
+                term.lower()
+                for term in file_structured_terms
+                if str(term or "").strip() and str(term).lower() in lower
+            ][:4]
             chunk_numeric_terms = _extract_numeric_terms(chunk_text, max_terms=30)
             chunk_numeric_set = {str(x) for x in chunk_numeric_terms}
             matched_numeric_terms = [
@@ -12206,6 +12256,12 @@ def _select_material_retrieval_chunks(
             type_keyword_hits = [
                 kw.lower() for kw in MATERIAL_TYPE_KEYWORDS.get(mat_type, []) if kw.lower() in lower
             ][:6]
+            if structured_term_hits:
+                for term in structured_term_hits:
+                    if term not in matched_terms:
+                        matched_terms.append(term)
+                    if len(matched_terms) >= 8:
+                        break
             if not matched_terms:
                 # 兜底：若命中该类型关键词也纳入候选
                 matched_terms = list(type_keyword_hits)
@@ -12225,6 +12281,8 @@ def _select_material_retrieval_chunks(
                 fallback_score += min(4, len(lexical_terms))
                 fallback_score += min(4, len(chunk_numeric_norm))
                 fallback_score += min(3, len(type_keyword_hits))
+                fallback_score += min(3, len(structured_term_hits))
+                fallback_score += min(4, int(round(file_structured_quality * 4)))
                 if mat_type in {"boq", "drawing"}:
                     fallback_score += 1
                 if fallback_score <= 0 or len(chunk_text.strip()) < 24:
@@ -12236,19 +12294,24 @@ def _select_material_retrieval_chunks(
                         "chunk_id": f"{filename}#c{idx:03d}",
                         "dimension_id": _infer_chunk_dimension_id(mat_type, chunk),
                         "score": fallback_score,
-                        "matched_terms": type_keyword_hits or lexical_terms[:6],
+                        "matched_terms": structured_term_hits
+                        or type_keyword_hits
+                        or lexical_terms[:6],
                         "matched_numeric_terms": chunk_numeric_norm[:6],
                         "chunk_preview": chunk_text[:220],
                         "is_backfill": True,
+                        "file_structured_quality": round(file_structured_quality, 4),
                     }
                 )
                 continue
             dimension_id = _infer_chunk_dimension_id(mat_type, chunk)
             score = len(matched_terms) + (2 if mat_type in {"boq", "drawing"} else 1)
+            score += min(3, len(structured_term_hits))
             if matched_numeric_terms:
                 score += min(4, len(matched_numeric_terms))
                 if mat_type in {"tender_qa", "boq", "drawing"}:
                     score += 1
+            score += min(4, file_structured_quality * 4.0)
             candidates.append(
                 {
                     "material_type": mat_type,
@@ -12259,6 +12322,7 @@ def _select_material_retrieval_chunks(
                     "matched_terms": matched_terms,
                     "matched_numeric_terms": matched_numeric_terms,
                     "chunk_preview": chunk_text[:220],
+                    "file_structured_quality": round(file_structured_quality, 4),
                 }
             )
 
@@ -12266,7 +12330,8 @@ def _select_material_retrieval_chunks(
         return []
     candidates.sort(
         key=lambda x: (
-            -int(x.get("score", 0)),
+            -float(x.get("score", 0)),
+            -float(x.get("file_structured_quality", 0.0)),
             str(x.get("material_type")),
             str(x.get("filename")),
             str(x.get("chunk_id")),
@@ -12274,7 +12339,8 @@ def _select_material_retrieval_chunks(
     )
     backfill_candidates.sort(
         key=lambda x: (
-            -int(x.get("score", 0)),
+            -float(x.get("score", 0)),
+            -float(x.get("file_structured_quality", 0.0)),
             str(x.get("material_type")),
             str(x.get("filename")),
             str(x.get("chunk_id")),
@@ -12293,7 +12359,12 @@ def _select_material_retrieval_chunks(
         if not chunk_id or chunk_id in seen_chunk_ids:
             return False
         filename_text = str(candidate.get("filename") or "").strip()
-        if filename_text and int(selected_per_file.get(filename_text, 0)) >= file_quota:
+        candidate_file_quota = file_quota + (
+            1
+            if float(_to_float_or_none(candidate.get("file_structured_quality")) or 0.0) >= 0.72
+            else 0
+        )
+        if filename_text and int(selected_per_file.get(filename_text, 0)) >= candidate_file_quota:
             return False
         row = dict(candidate)
         row["selected_via"] = selected_via
