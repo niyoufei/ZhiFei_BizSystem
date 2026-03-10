@@ -45,9 +45,10 @@ try:
 except Exception:
     Document = None
 try:
-    from PIL import Image, ImageOps
+    from PIL import Image, ImageDraw, ImageOps
 except Exception:
     Image = None
+    ImageDraw = None
     ImageOps = None
 try:
     import pytesseract
@@ -1123,6 +1124,323 @@ def _call_gpt_material_parser(
     return True, payload, ""
 
 
+def _normalize_gpt_pdf_page_payload(
+    payload: Dict[str, object],
+    *,
+    page_no: int,
+) -> Dict[str, object]:
+    normalized: Dict[str, object] = dict(payload or {})
+    page_type = str(normalized.get("page_type") or "").strip().lower()
+    if page_type not in {
+        "cover",
+        "toc",
+        "chapter",
+        "scoring_rules",
+        "table",
+        "attachment",
+        "drawing_like",
+        "narrative",
+    }:
+        page_type = "narrative"
+    normalized["page_type"] = page_type
+    normalized["page_no"] = int(page_no)
+    normalized["section_title"] = str(normalized.get("section_title") or "").strip()[:80]
+    try:
+        section_level = int(float(normalized.get("section_level") or 0))
+    except (TypeError, ValueError):
+        section_level = 0
+    normalized["section_level"] = max(0, min(6, section_level))
+    normalized["section_path"] = _merge_unique_text_values(normalized.get("section_path"), limit=6)
+    normalized["scoring_terms"] = _filter_structured_signal_terms(
+        _to_text_items(normalized.get("scoring_terms"), max_items=12),
+        limit=10,
+        material_type="tender_qa",
+    )
+    normalized["mandatory_clauses"] = _merge_unique_text_values(
+        normalized.get("mandatory_clauses"),
+        limit=8,
+    )
+    normalized["numeric_constraints"] = _merge_numeric_values(
+        normalized.get("numeric_constraints"),
+        limit=10,
+    )
+    normalized["focused_dimensions"] = _limit_unique_texts(
+        [
+            str(item or "").zfill(2)
+            for item in _to_text_items(normalized.get("focused_dimensions"), max_items=8)
+            if str(item or "").strip().zfill(2) in DIMENSION_IDS
+        ],
+        limit=8,
+    )
+    table_rows: List[Dict[str, object]] = []
+    raw_rows = normalized.get("table_rows")
+    if isinstance(raw_rows, list):
+        for item in raw_rows[:12]:
+            if isinstance(item, dict):
+                row_obj = {
+                    "label": str(item.get("label") or item.get("name") or "").strip()[:80],
+                    "value": str(item.get("value") or item.get("content") or "").strip()[:120],
+                    "numbers": _merge_numeric_values(item.get("numbers"), limit=6),
+                }
+                if row_obj["label"] or row_obj["value"] or row_obj["numbers"]:
+                    table_rows.append(row_obj)
+            else:
+                text_value = str(item or "").strip()
+                if text_value:
+                    table_rows.append(
+                        {
+                            "label": text_value[:80],
+                            "value": text_value[:120],
+                            "numbers": _merge_numeric_values(text_value, limit=6),
+                        }
+                    )
+    normalized["table_rows"] = table_rows
+    normalized["parse_confidence"] = round(
+        _clip_score01(normalized.get("parse_confidence") or 0.0),
+        4,
+    )
+    return normalized
+
+
+def _aggregate_tender_page_structures(
+    page_structures: List[Dict[str, object]],
+) -> Dict[str, object]:
+    if not page_structures:
+        return {}
+    page_type_counter: Counter[str] = Counter()
+    outline_rows: List[Dict[str, object]] = []
+    scoring_rule_pages: List[int] = []
+    table_constraint_rows: List[Dict[str, object]] = []
+    section_title_paths: List[str] = []
+    table_numeric_constraints: List[str] = []
+    for page in page_structures:
+        if not isinstance(page, dict):
+            continue
+        page_type = str(page.get("page_type") or "narrative").strip() or "narrative"
+        page_no = int(_to_float_or_none(page.get("page_no")) or 0)
+        page_type_counter[page_type] += 1
+        section_title = str(page.get("section_title") or "").strip()
+        section_level = int(_to_float_or_none(page.get("section_level")) or 0)
+        section_path = _merge_unique_text_values(page.get("section_path"), limit=6)
+        if section_path:
+            section_title_paths.extend(section_path)
+        elif section_title:
+            section_title_paths.append(section_title)
+        if section_title or section_path:
+            outline_rows.append(
+                {
+                    "page_no": page_no,
+                    "page_type": page_type,
+                    "section_title": section_title,
+                    "section_level": section_level,
+                    "section_path": section_path,
+                    "parse_confidence": round(
+                        float(_to_float_or_none(page.get("parse_confidence")) or 0.0),
+                        4,
+                    ),
+                }
+            )
+        if (
+            page_type in {"scoring_rules", "table"}
+            or page.get("scoring_terms")
+            or page.get("mandatory_clauses")
+        ):
+            if page_no > 0 and page_no not in scoring_rule_pages:
+                scoring_rule_pages.append(page_no)
+        for row in page.get("table_rows") or []:
+            if not isinstance(row, dict):
+                continue
+            row_obj = {
+                "page_no": page_no,
+                "label": str(row.get("label") or "").strip()[:80],
+                "value": str(row.get("value") or "").strip()[:120],
+                "numbers": _merge_numeric_values(row.get("numbers"), limit=6),
+            }
+            if row_obj["label"] or row_obj["value"] or row_obj["numbers"]:
+                table_constraint_rows.append(row_obj)
+                table_numeric_constraints.extend(
+                    _extract_numeric_terms(
+                        "\n".join(
+                            [
+                                str(row_obj.get("label") or ""),
+                                str(row_obj.get("value") or ""),
+                                " ".join(str(x) for x in (row_obj.get("numbers") or [])),
+                            ]
+                        ),
+                        max_terms=8,
+                    )
+                )
+        table_numeric_constraints.extend(
+            _merge_numeric_values(page.get("numeric_constraints"), limit=8)
+        )
+    page_type_summary = [
+        {"page_type": page_type, "count": int(count)}
+        for page_type, count in sorted(
+            page_type_counter.items(), key=lambda item: (-item[1], item[0])
+        )
+    ]
+    outline_rows.sort(
+        key=lambda item: (
+            int(_to_float_or_none(item.get("page_no")) or 0),
+            int(_to_float_or_none(item.get("section_level")) or 0),
+            str(item.get("section_title") or ""),
+        )
+    )
+    return {
+        "page_type_summary": page_type_summary,
+        "document_outline": outline_rows[:24],
+        "section_title_paths": _limit_unique_texts(section_title_paths, limit=16),
+        "scoring_rule_pages": sorted(scoring_rule_pages)[:12],
+        "table_constraint_rows": table_constraint_rows[:16],
+        "table_numeric_constraints": _limit_unique_numeric_tokens(
+            table_numeric_constraints, limit=14
+        ),
+    }
+
+
+def _extract_dwg_binary_marker_terms(
+    content: bytes,
+    *,
+    limit: int = 18,
+) -> List[str]:
+    if not content:
+        return []
+    patterns = [
+        rb"[A-Za-z][A-Za-z0-9_./:-]{2,40}",
+        rb"\d+(?:\.\d+)?",
+    ]
+    raw_tokens: List[str] = []
+    for pattern in patterns:
+        for match in re.findall(pattern, content):
+            try:
+                token = (
+                    match.decode("utf-8", errors="ignore")
+                    if isinstance(match, (bytes, bytearray))
+                    else str(match)
+                )
+            except Exception:
+                token = str(match)
+            token = str(token or "").strip().strip("\x00")
+            if token:
+                raw_tokens.append(token)
+    return _filter_structured_signal_terms(raw_tokens, limit=limit, material_type="drawing")
+
+
+def _render_text_preview_png(lines: List[str]) -> Optional[bytes]:
+    if Image is None or ImageDraw is None:
+        return None
+    safe_lines = [str(line or "").strip() for line in lines if str(line or "").strip()][:10]
+    if not safe_lines:
+        return None
+    width = 1280
+    height = 80 + len(safe_lines) * 56
+    img = Image.new("RGB", (width, min(height, 1400)), color=(248, 250, 252))
+    draw = ImageDraw.Draw(img)
+    y = 24
+    for idx, line in enumerate(safe_lines):
+        prefix = f"{idx + 1}. "
+        draw.text((28, y), prefix + line[:96], fill=(15, 23, 42))
+        y += 50
+        if y >= img.height - 40:
+            break
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _build_site_photo_evidence_summary(
+    photo_summaries: List[Dict[str, object]],
+) -> Dict[str, object]:
+    if not photo_summaries:
+        return {}
+    signature_counter: Counter[str] = Counter()
+    unique_evidence: List[Dict[str, object]] = []
+    scene_counter: Counter[str] = Counter()
+    risk_counter: Counter[str] = Counter()
+    findings_counter: Counter[str] = Counter()
+    object_counter: Counter[str] = Counter()
+    numeric_markers: List[str] = []
+    confidence_values: List[float] = []
+    for summary in photo_summaries:
+        if not isinstance(summary, dict):
+            continue
+        scene_type = str(summary.get("scene_type") or "").strip() or "unknown"
+        risk_level = str(summary.get("risk_level") or "").strip() or "unknown"
+        findings = _merge_unique_text_values(
+            summary.get("safety_findings"),
+            summary.get("civilization_findings"),
+            summary.get("quality_findings"),
+            summary.get("progress_findings"),
+            limit=8,
+        )
+        visible_objects = _merge_unique_text_values(summary.get("visible_objects"), limit=8)
+        signature_parts = (
+            [scene_type, risk_level] + sorted(findings[:3]) + sorted(visible_objects[:3])
+        )
+        signature = "|".join(part.lower() for part in signature_parts if part)
+        if not signature:
+            signature = f"unknown|{len(unique_evidence)}"
+        signature_counter[signature] += 1
+        confidence = float(
+            _clip_score01(
+                summary.get("evidence_confidence")
+                or summary.get("structured_quality_score")
+                or summary.get("ocr_quality_score")
+                or 0.0
+            )
+        )
+        confidence_values.append(confidence)
+        scene_counter[scene_type] += 1
+        risk_counter[risk_level] += 1
+        findings_counter.update(findings)
+        object_counter.update(visible_objects)
+        numeric_markers.extend(
+            _merge_numeric_values(
+                summary.get("numeric_markers"), summary.get("top_numeric_terms"), limit=8
+            )
+        )
+        if signature_counter[signature] == 1:
+            unique_evidence.append(
+                {
+                    "scene_type": scene_type,
+                    "risk_level": risk_level,
+                    "findings": findings[:6],
+                    "visible_objects": visible_objects[:6],
+                    "numeric_markers": _merge_numeric_values(
+                        summary.get("numeric_markers"),
+                        summary.get("top_numeric_terms"),
+                        limit=6,
+                    ),
+                    "confidence": round(confidence, 4),
+                }
+            )
+    duplicate_items = sum(max(0, count - 1) for count in signature_counter.values())
+    return {
+        "photo_count": len(photo_summaries),
+        "unique_evidence_count": len(unique_evidence),
+        "duplicate_evidence_count": duplicate_items,
+        "dedup_ratio": round(
+            float(duplicate_items) / float(max(1, len(photo_summaries))),
+            4,
+        ),
+        "scene_type_summary": [
+            {"scene_type": key, "count": int(value)} for key, value in scene_counter.most_common(6)
+        ],
+        "risk_level_summary": [
+            {"risk_level": key, "count": int(value)} for key, value in risk_counter.most_common(4)
+        ],
+        "top_findings": [key for key, _ in findings_counter.most_common(10)],
+        "top_visible_objects": [key for key, _ in object_counter.most_common(10)],
+        "numeric_markers": _limit_unique_numeric_tokens(numeric_markers, limit=10),
+        "avg_evidence_confidence": round(
+            sum(confidence_values) / float(max(1, len(confidence_values))),
+            4,
+        ),
+        "max_evidence_confidence": round(max(confidence_values) if confidence_values else 0.0, 4),
+        "unique_evidence_preview": unique_evidence[:8],
+    }
+
+
 def _augment_tender_summary_with_gpt(
     content: bytes,
     filename: str,
@@ -1151,22 +1469,39 @@ def _augment_tender_summary_with_gpt(
                 image_mime=str(page.get("image_mime") or "image/png"),
             )
             if ok:
-                payload["page_no"] = int(page.get("page_no") or 0)
-                page_structures.append(payload)
+                page_structures.append(
+                    _normalize_gpt_pdf_page_payload(
+                        payload,
+                        page_no=int(page.get("page_no") or 0),
+                    )
+                )
             elif err and not gpt_error:
                 gpt_error = err
         if page_structures:
             gpt_backend = "hybrid"
             merged["page_structures"] = page_structures[:12]
+            page_aggregate = _aggregate_tender_page_structures(page_structures)
+            merged["page_type_summary"] = list(page_aggregate.get("page_type_summary") or [])
+            merged["document_outline"] = list(page_aggregate.get("document_outline") or [])
+            merged["section_title_paths"] = list(page_aggregate.get("section_title_paths") or [])
+            merged["scoring_rule_pages"] = list(page_aggregate.get("scoring_rule_pages") or [])
+            merged["table_constraint_rows"] = list(
+                page_aggregate.get("table_constraint_rows") or []
+            )
+            merged["table_numeric_constraints"] = list(
+                page_aggregate.get("table_numeric_constraints") or []
+            )
             merged["section_titles"] = _merge_unique_text_values(
                 merged.get("section_titles"),
                 [p.get("section_title") for p in page_structures],
                 [p.get("section_path") for p in page_structures],
+                page_aggregate.get("section_title_paths"),
                 limit=14,
             )
             merged["scoring_point_terms"] = _merge_unique_text_values(
                 merged.get("scoring_point_terms"),
                 *[p.get("scoring_terms") for p in page_structures],
+                [row.get("label") for row in (page_aggregate.get("table_constraint_rows") or [])],
                 limit=16,
             )
             merged["mandatory_clause_terms"] = _merge_unique_text_values(
@@ -1177,6 +1512,7 @@ def _augment_tender_summary_with_gpt(
             merged["top_numeric_terms"] = _merge_numeric_values(
                 merged.get("top_numeric_terms"),
                 *[p.get("numeric_constraints") for p in page_structures],
+                page_aggregate.get("table_numeric_constraints"),
                 limit=14,
             )
             merged["focused_dimensions"] = _merge_unique_text_values(
@@ -1187,6 +1523,7 @@ def _augment_tender_summary_with_gpt(
             merged["structured_terms"] = _merge_unique_text_values(
                 merged.get("structured_terms"),
                 merged.get("section_titles"),
+                merged.get("section_title_paths"),
                 merged.get("scoring_point_terms"),
                 merged.get("mandatory_clause_terms"),
                 limit=28,
@@ -1277,8 +1614,32 @@ def _augment_drawing_summary_with_gpt(
     elif ext in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
         image_bytes = content
         image_mime = f"image/{'jpeg' if ext in {'.jpg', '.jpeg'} else ext.lstrip('.')}"
+    elif ext == ".dwg":
+        dwg_binary_markers = _extract_dwg_binary_marker_terms(content, limit=18)
+        if dwg_binary_markers:
+            merged["dwg_binary_markers"] = dwg_binary_markers[:12]
+            merged["binary_marker_terms"] = _merge_unique_text_values(
+                merged.get("binary_marker_terms"),
+                dwg_binary_markers,
+                limit=14,
+            )
+            if image_bytes is None:
+                image_bytes = _render_text_preview_png(
+                    ["DWG Binary Marker Preview"] + dwg_binary_markers[:8]
+                )
+                if image_bytes:
+                    image_mime = "image/png"
     ok, payload, err = _call_gpt_material_parser(
-        _build_gpt_drawing_prompt(filename, parsed_text),
+        _build_gpt_drawing_prompt(
+            filename,
+            parsed_text
+            + (
+                "\nDWG二进制标识提取："
+                + "、".join(str(x) for x in (merged.get("dwg_binary_markers") or [])[:12])
+                if ext == ".dwg"
+                else ""
+            ),
+        ),
         image_bytes=image_bytes,
         image_mime=image_mime,
     )
@@ -1377,6 +1738,16 @@ def _augment_site_photo_summary_with_gpt(
     )
     merged["evidence_confidence"] = parse_confidence
     merged["visual_capability"] = "gpt_vision_hybrid"
+    merged["evidence_signature"] = "|".join(
+        item.lower()
+        for item in (
+            [merged.get("scene_type"), merged.get("risk_level")]
+            + _to_text_items(merged.get("visible_objects"), max_items=3)
+            + _to_text_items(merged.get("safety_findings"), max_items=2)
+            + _to_text_items(merged.get("quality_findings"), max_items=2)
+        )
+        if str(item or "").strip()
+    )[:160]
     merged["structured_quality_score"] = round(
         max(
             float(_to_float_or_none(merged.get("structured_quality_score")) or 0.0),
@@ -3106,6 +3477,10 @@ def _build_material_constraint_pack(
         material_knowledge_profile,
         available_material_types=available_material_types,
     )
+    site_photo_visual_requirements = _build_site_photo_visual_requirements(
+        project_id,
+        material_knowledge_profile,
+    )
     feedback_requirements = _build_runtime_feedback_requirements(
         project_id,
         material_knowledge_profile=material_knowledge_profile,
@@ -3120,6 +3495,7 @@ def _build_material_constraint_pack(
     all_requirements.extend(consistency_requirements)
     all_requirements.extend(material_dimension_requirements)
     all_requirements.extend(material_consensus_requirements)
+    all_requirements.extend(site_photo_visual_requirements)
     all_requirements.extend(feedback_requirements)
     all_requirements.extend(feature_requirements)
     return {
@@ -3129,6 +3505,7 @@ def _build_material_constraint_pack(
         "consistency_requirements": consistency_requirements,
         "material_dimension_requirements": material_dimension_requirements,
         "material_consensus_requirements": material_consensus_requirements,
+        "site_photo_visual_requirements": site_photo_visual_requirements,
         "feedback_requirements": feedback_requirements,
         "feature_requirements": feature_requirements,
         "available_material_types": available_material_types,
@@ -3565,6 +3942,290 @@ def _build_material_consensus_requirements(
     return reqs
 
 
+def _build_site_photo_visual_requirements(
+    project_id: str,
+    material_knowledge_profile: Optional[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    if not isinstance(material_knowledge_profile, dict):
+        return []
+    photo_summary = (
+        material_knowledge_profile.get("site_photo_evidence")
+        if isinstance(material_knowledge_profile.get("site_photo_evidence"), dict)
+        else {}
+    )
+    unique_count = int(_to_float_or_none(photo_summary.get("unique_evidence_count")) or 0)
+    avg_conf = float(_to_float_or_none(photo_summary.get("avg_evidence_confidence")) or 0.0)
+    if unique_count <= 0 or avg_conf < 0.18:
+        return []
+    scene_type_summary = (
+        photo_summary.get("scene_type_summary")
+        if isinstance(photo_summary.get("scene_type_summary"), list)
+        else []
+    )
+    top_findings = _to_text_items(photo_summary.get("top_findings"), max_items=10)
+    top_objects = _to_text_items(photo_summary.get("top_visible_objects"), max_items=10)
+    numeric_markers = _merge_numeric_values(photo_summary.get("numeric_markers"), limit=8)
+    reqs: List[Dict[str, object]] = []
+    now = _now_iso()
+    scene_to_dims = {
+        "安全": ["02", "07"],
+        "文明": ["03"],
+        "质量": ["08", "16"],
+        "进度": ["09", "15"],
+    }
+    req_index = 0
+    for scene_row in scene_type_summary[:4]:
+        if not isinstance(scene_row, dict):
+            continue
+        scene_type = str(scene_row.get("scene_type") or "").strip()
+        if not scene_type:
+            continue
+        dim_ids = next(
+            (dims for token, dims in scene_to_dims.items() if token in scene_type),
+            ["03", "08"],
+        )
+        hints = _to_text_items([scene_type] + top_findings[:4] + top_objects[:3], max_items=8)
+        if len(hints) < 2:
+            continue
+        req_index += 1
+        reqs.append(
+            {
+                "id": f"runtime-photo-{project_id[:8]}-{req_index}",
+                "project_id": project_id,
+                "dimension_id": dim_ids[0],
+                "req_label": f"现场照片视觉证据：{scene_type}",
+                "req_type": "visual_evidence",
+                "patterns": {
+                    "hints": hints,
+                    "minimum_hint_hits": 2 if unique_count >= 3 else 1,
+                    "must_hit_numbers": numeric_markers[:3],
+                    "source_mode": "site_photo_visual",
+                    "scene_type": scene_type,
+                    "avg_evidence_confidence": round(avg_conf, 4),
+                    "unique_evidence_count": unique_count,
+                },
+                "mandatory": False,
+                "weight": round(
+                    min(
+                        1.26,
+                        0.82 + min(0.16, avg_conf * 0.22) + min(0.12, unique_count * 0.03),
+                    ),
+                    2,
+                ),
+                "source_anchor_id": None,
+                "source_pack_id": "runtime_site_photo_visual",
+                "source_pack_version": "v1",
+                "priority": 88.0,
+                "override_key": f"runtime::site_photo_visual::{scene_type}",
+                "lint": {},
+                "created_at": now,
+            }
+        )
+    return reqs
+
+
+def _build_material_score_shaping(
+    report: Dict[str, object],
+    *,
+    runtime_req_meta: Optional[Dict[str, object]],
+    material_knowledge_snapshot: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+    evidence_trace = (
+        meta.get("evidence_trace") if isinstance(meta.get("evidence_trace"), dict) else {}
+    )
+    summary = (
+        material_knowledge_snapshot.get("summary")
+        if isinstance(material_knowledge_snapshot, dict)
+        and isinstance(material_knowledge_snapshot.get("summary"), dict)
+        else {}
+    )
+    runtime_meta = runtime_req_meta if isinstance(runtime_req_meta, dict) else {}
+    mandatory_hit_rate = float(
+        _to_float_or_none(
+            evidence_trace.get("mandatory_hit_rate")
+            if evidence_trace
+            else report.get("mandatory_req_hit_rate")
+        )
+        or 0.0
+    )
+    cross_score = float(_to_float_or_none(summary.get("cross_type_consensus_score")) or 0.0)
+    cross_types = int(_to_float_or_none(summary.get("cross_type_consensus_type_count")) or 0)
+    structured_quality_avg = float(_to_float_or_none(summary.get("structured_quality_avg")) or 0.0)
+    structured_quality_type_rate = float(
+        _to_float_or_none(summary.get("structured_quality_type_rate")) or 0.0
+    )
+    strong_types = int(_to_float_or_none(summary.get("strong_structured_types")) or 0)
+    parsed_ok_files = int(_to_float_or_none(summary.get("parsed_ok_files")) or 0)
+    total_files = int(_to_float_or_none(summary.get("total_files")) or 0)
+    structured_signal_total = int(_to_float_or_none(summary.get("structured_signal_total")) or 0)
+    dimension_coverage_rate = float(
+        _to_float_or_none(summary.get("dimension_coverage_rate")) or 0.0
+    )
+    mandatory_clause_signal_count = 0
+    for row in (
+        material_knowledge_snapshot.get("by_type")
+        if isinstance(material_knowledge_snapshot, dict)
+        and isinstance(material_knowledge_snapshot.get("by_type"), list)
+        else []
+    ):
+        if not isinstance(row, dict):
+            continue
+        mandatory_clause_signal_count += len(row.get("mandatory_clause_terms_preview") or [])
+    visual_req_count = int(
+        _to_float_or_none(runtime_meta.get("site_photo_visual_requirements")) or 0
+    )
+    feedback_req_count = int(
+        _to_float_or_none(runtime_meta.get("feedback_evolution_requirements")) or 0
+    )
+    feature_req_count = int(
+        _to_float_or_none(runtime_meta.get("feature_confidence_requirements")) or 0
+    )
+    consensus_req_count = int(
+        _to_float_or_none(runtime_meta.get("material_consensus_requirements")) or 0
+    )
+    dimension_req_count = int(
+        _to_float_or_none(runtime_meta.get("material_dimension_requirements")) or 0
+    )
+    retrieval_req_count = int(
+        _to_float_or_none(runtime_meta.get("material_retrieval_requirements")) or 0
+    )
+    shaping_req_count = int(
+        _to_float_or_none(
+            ((runtime_meta.get("material_constraint_pack") or {}).get("score_shaping"))
+            if isinstance(runtime_meta.get("material_constraint_pack"), dict)
+            else None
+        )
+        or 0
+    )
+    has_real_material_evidence = any(
+        (
+            parsed_ok_files > 0,
+            structured_signal_total > 0,
+            mandatory_clause_signal_count > 0,
+            cross_types > 0,
+            dimension_coverage_rate > 0.0,
+        )
+    )
+    has_runtime_shaping_signals = any(
+        (
+            visual_req_count > 0,
+            feedback_req_count > 0,
+            feature_req_count > 0,
+            consensus_req_count > 0,
+            dimension_req_count > 0,
+            retrieval_req_count > 0,
+            shaping_req_count > 0,
+        )
+    )
+    if not has_real_material_evidence and not has_runtime_shaping_signals:
+        return {
+            "enabled": False,
+            "positive_delta": 0.0,
+            "negative_delta": 0.0,
+            "net_delta": 0.0,
+            "reasons": ["insufficient_material_evidence_context"],
+            "signals": {
+                "mandatory_hit_rate": round(mandatory_hit_rate, 4),
+                "mandatory_clause_signal_count": mandatory_clause_signal_count,
+                "cross_type_consensus_score": round(cross_score, 4),
+                "cross_type_consensus_type_count": cross_types,
+                "structured_quality_avg": round(structured_quality_avg, 4),
+                "structured_quality_type_rate": round(structured_quality_type_rate, 4),
+                "strong_structured_types": strong_types,
+                "parsed_ok_files": parsed_ok_files,
+                "total_files": total_files,
+                "structured_signal_total": structured_signal_total,
+                "dimension_coverage_rate": round(dimension_coverage_rate, 4),
+                "site_photo_visual_requirements": visual_req_count,
+                "feedback_requirements": feedback_req_count,
+                "feature_requirements": feature_req_count,
+                "material_consensus_requirements": consensus_req_count,
+                "material_dimension_requirements": dimension_req_count,
+                "material_retrieval_requirements": retrieval_req_count,
+                "score_shaping_requirements": shaping_req_count,
+            },
+        }
+    positive = 0.0
+    negative = 0.0
+    reasons: List[str] = []
+    if mandatory_clause_signal_count >= 3 and mandatory_hit_rate < 0.5:
+        delta = min(3.8, (0.5 - mandatory_hit_rate) * 7.2 + mandatory_clause_signal_count * 0.08)
+        negative += delta
+        reasons.append("mandatory_clause_underhit")
+    if parsed_ok_files > 0 and structured_quality_avg < 0.28:
+        delta = min(2.4, (0.28 - structured_quality_avg) * 5.5 + 0.4)
+        negative += delta
+        reasons.append("structured_quality_weak")
+    if parsed_ok_files > 0 and structured_quality_type_rate < 0.34:
+        negative += min(1.4, (0.34 - structured_quality_type_rate) * 3.0 + 0.2)
+        reasons.append("structured_type_coverage_weak")
+    if cross_score >= 0.3 and cross_types >= 2:
+        positive += min(2.2, cross_score * 3.2 + max(0, cross_types - 1) * 0.18)
+        reasons.append("cross_material_consensus")
+    if cross_score >= 0.42 and cross_types >= 3:
+        positive += 0.65
+        reasons.append("core_material_alignment")
+    if visual_req_count > 0:
+        positive += min(0.9, visual_req_count * 0.16)
+        reasons.append("visual_evidence_support")
+    if feedback_req_count > 0 or feature_req_count > 0:
+        positive += min(0.8, feedback_req_count * 0.06 + feature_req_count * 0.04)
+        reasons.append("feedback_evolution_context")
+    if parsed_ok_files > 0 and strong_types <= 1 and mandatory_clause_signal_count <= 1:
+        negative += 0.55
+        reasons.append("weak_core_material_support")
+    net_delta = round(max(-5.0, min(3.5, positive - negative)), 2)
+    return {
+        "enabled": True,
+        "positive_delta": round(positive, 2),
+        "negative_delta": round(negative, 2),
+        "net_delta": net_delta,
+        "reasons": _limit_unique_texts(reasons, limit=8),
+        "signals": {
+            "mandatory_hit_rate": round(mandatory_hit_rate, 4),
+            "mandatory_clause_signal_count": mandatory_clause_signal_count,
+            "cross_type_consensus_score": round(cross_score, 4),
+            "cross_type_consensus_type_count": cross_types,
+            "structured_quality_avg": round(structured_quality_avg, 4),
+            "structured_quality_type_rate": round(structured_quality_type_rate, 4),
+            "strong_structured_types": strong_types,
+            "parsed_ok_files": parsed_ok_files,
+            "total_files": total_files,
+            "structured_signal_total": structured_signal_total,
+            "dimension_coverage_rate": round(dimension_coverage_rate, 4),
+            "site_photo_visual_requirements": visual_req_count,
+            "feedback_requirements": feedback_req_count,
+            "feature_requirements": feature_req_count,
+            "material_consensus_requirements": consensus_req_count,
+            "material_dimension_requirements": dimension_req_count,
+            "material_retrieval_requirements": retrieval_req_count,
+            "score_shaping_requirements": shaping_req_count,
+        },
+    }
+
+
+def _apply_material_constraint_score_shaping(
+    report: Dict[str, object],
+    *,
+    runtime_req_meta: Optional[Dict[str, object]],
+    material_knowledge_snapshot: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    shaping = _build_material_score_shaping(
+        report,
+        runtime_req_meta=runtime_req_meta,
+        material_knowledge_snapshot=material_knowledge_snapshot,
+    )
+    raw_rule_total = float(_to_float_or_none(report.get("rule_total_score")) or 0.0)
+    shaped_rule_total = _clip_score(raw_rule_total + float(shaping.get("net_delta") or 0.0))
+    report["raw_rule_total_score_100"] = raw_rule_total
+    report["rule_total_score"] = round(shaped_rule_total, 2)
+    report["total_score"] = round(shaped_rule_total, 2)
+    report.setdefault("meta", {})
+    report["meta"]["material_constraint_shaping"] = shaping
+    return shaping
+
+
 def _build_runtime_custom_requirements(
     project_id: str,
     *,
@@ -3739,6 +4400,11 @@ def _build_runtime_custom_requirements(
         if isinstance(constraint_pack.get("material_consensus_requirements"), list)
         else []
     )
+    site_photo_visual_requirements = (
+        list(constraint_pack.get("site_photo_visual_requirements") or [])
+        if isinstance(constraint_pack.get("site_photo_visual_requirements"), list)
+        else []
+    )
     feedback_requirements = (
         list(constraint_pack.get("feedback_requirements") or [])
         if isinstance(constraint_pack.get("feedback_requirements"), list)
@@ -3788,6 +4454,7 @@ def _build_runtime_custom_requirements(
         "material_consistency_requirements": len(consistency_requirements),
         "material_dimension_requirements": len(material_dimension_requirements),
         "material_consensus_requirements": len(material_consensus_requirements),
+        "site_photo_visual_requirements": len(site_photo_visual_requirements),
         "feedback_evolution_requirements": len(feedback_requirements),
         "feature_confidence_requirements": len(feature_requirements),
         "material_retrieval_top_k": retrieval_top_k,
@@ -3862,13 +4529,19 @@ def _build_runtime_custom_requirements(
             "dimension_gating": len(
                 material_dimension_requirements
                 + material_consensus_requirements
+                + site_photo_visual_requirements
                 + feedback_requirements
                 + feature_requirements
             ),
-            "score_shaping": len(feedback_requirements + feature_requirements),
+            "score_shaping": len(
+                material_consensus_requirements
+                + site_photo_visual_requirements
+                + feedback_requirements
+                + feature_requirements
+            ),
             "available_types": available_material_types[:8],
             "selected_filenames": retrieval_selected_filenames[:12],
-            "pack_version": "v3-unified-material-pack",
+            "pack_version": "v4-unified-material-pack",
         },
         "material_retrieval_preview": [
             {
@@ -3916,6 +4589,18 @@ def _build_runtime_custom_requirements(
             }
             for req in material_consensus_requirements[:6]
         ],
+        "site_photo_visual_preview": [
+            {
+                "dimension_id": req.get("dimension_id"),
+                "label": req.get("req_label"),
+                "hints": (((req.get("patterns") or {}).get("hints")) or [])[:6],
+                "scene_type": (req.get("patterns") or {}).get("scene_type"),
+                "avg_evidence_confidence": (req.get("patterns") or {}).get(
+                    "avg_evidence_confidence"
+                ),
+            }
+            for req in site_photo_visual_requirements[:6]
+        ],
         "feature_confidence_preview": [
             {
                 "dimension_id": req.get("dimension_id"),
@@ -3952,9 +4637,11 @@ def _build_current_runtime_constraint_snapshot(
         "weights_source": "unknown",
         "effective_multipliers_preview": [],
         "material_dimension_requirements": 0,
+        "site_photo_visual_requirements": 0,
         "feedback_evolution_requirements": 0,
         "feature_confidence_requirements": 0,
         "material_dimension_preview": [],
+        "site_photo_visual_preview": [],
         "feedback_evolution_preview": [],
         "feature_confidence_preview": [],
     }
@@ -3997,6 +4684,9 @@ def _build_current_runtime_constraint_snapshot(
             "material_dimension_requirements": int(
                 _to_float_or_none(runtime_meta.get("material_dimension_requirements")) or 0
             ),
+            "site_photo_visual_requirements": int(
+                _to_float_or_none(runtime_meta.get("site_photo_visual_requirements")) or 0
+            ),
             "feedback_evolution_requirements": int(
                 _to_float_or_none(runtime_meta.get("feedback_evolution_requirements")) or 0
             ),
@@ -4006,6 +4696,7 @@ def _build_current_runtime_constraint_snapshot(
             "material_dimension_preview": list(
                 runtime_meta.get("material_dimension_preview") or []
             ),
+            "site_photo_visual_preview": list(runtime_meta.get("site_photo_visual_preview") or []),
             "feedback_evolution_preview": list(
                 runtime_meta.get("feedback_evolution_preview") or []
             ),
@@ -4913,6 +5604,11 @@ def _build_submission_scoring_basis_report(
     evidence_trace = (
         meta.get("evidence_trace") if isinstance(meta.get("evidence_trace"), dict) else {}
     )
+    material_constraint_shaping = (
+        meta.get("material_constraint_shaping")
+        if isinstance(meta.get("material_constraint_shaping"), dict)
+        else {}
+    )
     if not evidence_trace:
         evidence_trace = _build_evidence_trace_summary(report)
     current_runtime_constraints = _build_current_runtime_constraint_snapshot(
@@ -4956,6 +5652,7 @@ def _build_submission_scoring_basis_report(
         "material_utilization": material_utilization,
         "material_utilization_gate": material_utilization_gate,
         "evidence_trace": evidence_trace,
+        "material_constraint_shaping": material_constraint_shaping,
         "current_runtime_constraints": current_runtime_constraints,
         "recommendations": deduped_recommendations[:16],
     }
@@ -8087,6 +8784,12 @@ def _score_submission_for_project(
             gate_obj if isinstance(gate_obj, dict) else {},
         )
         report_meta["evidence_trace"] = _build_evidence_trace_summary(report)
+        shaping_meta = _apply_material_constraint_score_shaping(
+            report,
+            runtime_req_meta=runtime_req_meta,
+            material_knowledge_snapshot=knowledge_snapshot,
+        )
+        report_meta["material_constraint_shaping"] = shaping_meta
         if bool(utilization_gate.get("blocked")):
             report_meta["score_confidence_level"] = "low"
             report_meta["score_blocked_by_material_utilization"] = True
@@ -13657,6 +14360,12 @@ def _build_drawing_structured_summary(
     layout_tags = _parse_summary_list_line(text, "布局/空间", limit=10)
     dimension_markers = _parse_summary_list_line(text, "标注值", limit=10)
     binary_marker_terms = _parse_summary_list_line(text, "二进制标识提取", limit=12)
+    if detected_format == "dwg":
+        binary_marker_terms = _merge_unique_text_values(
+            binary_marker_terms,
+            _extract_dwg_binary_marker_terms(content, limit=14),
+            limit=14,
+        )
     entity_counts = _parse_summary_count_line(text, "实体统计", limit=12)
     discipline_keywords = _collect_keyword_labels(
         f"{filename}\n{text}",
@@ -15805,6 +16514,7 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
     by_type_chars: Dict[str, int] = {}
     by_type_chunks: Dict[str, int] = {}
     total_numeric_categories: Dict[str, List[str]] = {}
+    site_photo_summaries: List[Dict[str, object]] = []
 
     by_dim_stats: Dict[str, Dict[str, object]] = {
         dim_id: {
@@ -15907,6 +16617,8 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
                 if isinstance(row.get("site_photo_structured_summary"), dict)
                 else {}
             )
+            if structured_summary:
+                site_photo_summaries.append(dict(structured_summary))
         structured_quality_score = _clip_score01(structured_summary.get("structured_quality_score"))
         if structured_quality_score is not None:
             by_type_structured_quality_sum[mat_type] = float(
@@ -16065,9 +16777,70 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         if mat_type not in all_types:
             all_types.append(mat_type)
 
+    by_type_structured_summary_preview: Dict[str, Dict[str, object]] = {}
+    for mat_type in all_types:
+        source_summaries: List[Dict[str, object]] = []
+        for row in rows:
+            if (
+                _normalize_material_type(row.get("material_type"), filename=row.get("filename"))
+                != mat_type
+            ):
+                continue
+            candidate: Dict[str, object] = {}
+            if mat_type == "tender_qa":
+                candidate = (
+                    row.get("tender_qa_structured_summary")
+                    if isinstance(row.get("tender_qa_structured_summary"), dict)
+                    else {}
+                )
+            elif mat_type == "drawing":
+                candidate = (
+                    row.get("drawing_structured_summary")
+                    if isinstance(row.get("drawing_structured_summary"), dict)
+                    else {}
+                )
+            elif mat_type == "site_photo":
+                candidate = (
+                    row.get("site_photo_structured_summary")
+                    if isinstance(row.get("site_photo_structured_summary"), dict)
+                    else {}
+                )
+            elif mat_type == "boq":
+                candidate = (
+                    row.get("boq_structured_summary")
+                    if isinstance(row.get("boq_structured_summary"), dict)
+                    else {}
+                )
+            if candidate:
+                source_summaries.append(candidate)
+        page_type_counter: Counter[str] = Counter()
+        document_outline_preview: List[Dict[str, object]] = []
+        table_constraint_rows_preview: List[Dict[str, object]] = []
+        for summary_row in source_summaries:
+            for item in summary_row.get("page_type_summary") or []:
+                if isinstance(item, dict):
+                    page_type_counter[str(item.get("page_type") or "")] += int(
+                        _to_float_or_none(item.get("count")) or 0
+                    )
+            for item in summary_row.get("document_outline") or []:
+                if isinstance(item, dict) and item not in document_outline_preview:
+                    document_outline_preview.append(item)
+            for item in summary_row.get("table_constraint_rows") or []:
+                if isinstance(item, dict) and item not in table_constraint_rows_preview:
+                    table_constraint_rows_preview.append(item)
+        by_type_structured_summary_preview[mat_type] = {
+            "page_type_summary": [
+                {"page_type": key, "count": int(value)}
+                for key, value in page_type_counter.most_common(6)
+            ],
+            "document_outline_preview": document_outline_preview[:8],
+            "table_constraint_rows_preview": table_constraint_rows_preview[:6],
+        }
+
     by_type_rows: List[Dict[str, object]] = []
     for mat_type in all_types:
         dim_hits = by_type_dim_counter.get(mat_type, Counter())
+        structured_preview = by_type_structured_summary_preview.get(mat_type) or {}
         parsed_ok_count = int(by_type_ok_files.get(mat_type, 0))
         quality_files = int(by_type_structured_quality_files.get(mat_type, 0))
         quality_avg = (
@@ -16126,6 +16899,13 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
                         mat_type, Counter()
                     ).most_common(6)
                 ],
+                "page_type_summary": list(structured_preview.get("page_type_summary") or [])[:8],
+                "document_outline_preview": list(
+                    structured_preview.get("document_outline_preview") or []
+                )[:8],
+                "table_constraint_rows_preview": list(
+                    structured_preview.get("table_constraint_rows_preview") or []
+                )[:6],
                 "structured_signal_count": int(by_type_structured_signal_count.get(mat_type, 0)),
                 "structured_quality_score": round(float(quality_avg), 4),
                 "structured_quality_max": round(
@@ -16187,6 +16967,7 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         else 0.0
     )
     cross_type_consensus = _build_cross_type_material_consensus(by_type_rows)
+    site_photo_evidence_summary = _build_site_photo_evidence_summary(site_photo_summaries)
 
     by_dimension_rows: List[Dict[str, object]] = []
     low_dims: List[Dict[str, object]] = []
@@ -16240,6 +17021,23 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         )
     if capabilities["site_photo_file_count"] > 0 and not capabilities["ocr_available"]:
         recommendations.append("已上传现场照片但 OCR 不可用，建议安装 OCR 组件后重评分。")
+    if site_photo_evidence_summary:
+        if (
+            int(_to_float_or_none(site_photo_evidence_summary.get("duplicate_evidence_count")) or 0)
+            > 0
+        ):
+            recommendations.append(
+                "现场照片存在重复证据，系统已自动去重；建议补充不同区域/工序/时段的现场照片。"
+            )
+        if (
+            float(
+                _to_float_or_none(site_photo_evidence_summary.get("avg_evidence_confidence")) or 0.0
+            )
+            < 0.32
+        ):
+            recommendations.append(
+                "现场照片视觉证据置信度偏弱，建议补充更清晰、带标识和工序特征的现场照片。"
+            )
     if capabilities["dwg_file_count"] > 0 and not capabilities["dwg_converter_available"]:
         recommendations.append("已上传 DWG 图纸但转换器不可用，建议安装 DWG 转换器后重评分。")
     if capabilities["pdf_file_count"] > 0 and not capabilities["pdf_parser_available"]:
@@ -16307,9 +17105,19 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
             "covered_dimensions": covered_dimensions,
             "dimension_coverage_rate": coverage_rate,
             "low_coverage_dimensions": len(low_dims),
+            "site_photo_unique_evidence_count": int(
+                _to_float_or_none(site_photo_evidence_summary.get("unique_evidence_count")) or 0
+            ),
+            "site_photo_duplicate_evidence_count": int(
+                _to_float_or_none(site_photo_evidence_summary.get("duplicate_evidence_count")) or 0
+            ),
+            "site_photo_avg_evidence_confidence": float(
+                _to_float_or_none(site_photo_evidence_summary.get("avg_evidence_confidence")) or 0.0
+            ),
         },
         "by_type": by_type_rows,
         "by_dimension": by_dimension_rows,
+        "site_photo_evidence": site_photo_evidence_summary,
         "recommendations": recommendations[:24],
     }
 
@@ -26123,6 +26931,7 @@ def index(
           const util = (data.material_utilization && typeof data.material_utilization === 'object') ? data.material_utilization : {};
           const gate = (data.material_utilization_gate && typeof data.material_utilization_gate === 'object') ? data.material_utilization_gate : {};
           const trace = (data.evidence_trace && typeof data.evidence_trace === 'object') ? data.evidence_trace : {};
+          const shaping = (data.material_constraint_shaping && typeof data.material_constraint_shaping === 'object') ? data.material_constraint_shaping : {};
           const runtime = (data.current_runtime_constraints && typeof data.current_runtime_constraints === 'object') ? data.current_runtime_constraints : {};
           const recommendations = Array.isArray(data.recommendations) ? data.recommendations : [];
           const feedbackEvolutionPreview = Array.isArray(retrieval.feedback_evolution_preview)
@@ -26133,6 +26942,9 @@ def index(
             : [];
           const currentMultipliersPreview = Array.isArray(runtime.effective_multipliers_preview)
             ? runtime.effective_multipliers_preview
+            : [];
+          const sitePhotoVisualPreview = Array.isArray(runtime.site_photo_visual_preview)
+            ? runtime.site_photo_visual_preview
             : [];
           let html = '<strong>评分依据审计（最新施组）</strong>';
           html += '<p style="margin:6px 0">文件：' + escapeHtmlText(data.filename || '-') + '；评分状态：' + escapeHtmlText(data.scoring_status || '-') + '</p>';
@@ -26184,6 +26996,23 @@ def index(
                 + '<td>' + escapeHtmlText(((row.feature_confidence_scores || []).map((v) => Number(v).toFixed(2)).join('、')) || '-') + '</td>'
                 + '</tr>').join('')
               + '</table></details>';
+          }
+          if (sitePhotoVisualPreview.length) {
+            html += '<details style="margin-top:6px"><summary>现场照片视觉证据约束</summary><table><tr><th>维度</th><th>场景</th><th>提示</th><th>证据置信度</th></tr>'
+              + sitePhotoVisualPreview.slice(0, 6).map((row) => '<tr>'
+                + '<td>' + escapeHtmlText((row.dimension_id || '-') + ' ' + (row.label || '')) + '</td>'
+                + '<td>' + escapeHtmlText(row.scene_type || '-') + '</td>'
+                + '<td>' + escapeHtmlText(((row.hints || []).join('、')) || '-') + '</td>'
+                + '<td>' + escapeHtmlText(row.avg_evidence_confidence != null ? String(row.avg_evidence_confidence) : '-') + '</td>'
+                + '</tr>').join('')
+              + '</table></details>';
+          }
+          if (shaping && Object.keys(shaping).length) {
+            html += '<details style="margin-top:6px"><summary>材料约束分值 shaping</summary><table><tr><th>净调整</th><th>正向</th><th>负向</th><th>原因</th></tr>'
+              + '<tr><td>' + escapeHtmlText(shaping.net_delta != null ? String(shaping.net_delta) : '-') + '</td>'
+              + '<td>' + escapeHtmlText(shaping.positive_delta != null ? String(shaping.positive_delta) : '-') + '</td>'
+              + '<td>' + escapeHtmlText(shaping.negative_delta != null ? String(shaping.negative_delta) : '-') + '</td>'
+              + '<td>' + escapeHtmlText(((shaping.reasons || []).join('、')) || '-') + '</td></tr></table></details>';
           }
           if (recommendations.length) {
             html += '<strong>建议动作</strong><ul>' + recommendations.slice(0, 8).map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('') + '</ul>';

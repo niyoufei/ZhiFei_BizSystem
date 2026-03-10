@@ -6535,3 +6535,190 @@ class TestDynamicBlendAdjustment:
         assert 0.0 < delta_scale <= 1.0
         assert meta.get("signal_state") == "material_signal_detected"
         assert any("material_gate_warned" == reason for reason in (meta.get("reasons") or []))
+
+
+class TestStructuredMaterialAdvancedParsing:
+    def test_aggregate_tender_page_structures_builds_outline_and_table_constraints(self):
+        from app.main import _aggregate_tender_page_structures
+
+        payload = _aggregate_tender_page_structures(
+            [
+                {
+                    "page_no": 1,
+                    "page_type": "toc",
+                    "section_title": "目录",
+                    "section_level": 0,
+                    "section_path": ["目录"],
+                    "scoring_terms": [],
+                    "mandatory_clauses": [],
+                    "numeric_constraints": [],
+                    "table_rows": [],
+                    "focused_dimensions": ["01"],
+                    "parse_confidence": 0.62,
+                },
+                {
+                    "page_no": 2,
+                    "page_type": "scoring_rules",
+                    "section_title": "评分办法",
+                    "section_level": 1,
+                    "section_path": ["第一章", "评分办法"],
+                    "scoring_terms": ["评分办法", "关键节点"],
+                    "mandatory_clauses": ["必须满足节点工期"],
+                    "numeric_constraints": ["90天"],
+                    "table_rows": [{"label": "工期", "value": "90天", "numbers": ["90天"]}],
+                    "focused_dimensions": ["09", "16"],
+                    "parse_confidence": 0.84,
+                },
+            ]
+        )
+
+        assert payload["scoring_rule_pages"] == [2]
+        assert payload["page_type_summary"][0]["page_type"] in {"scoring_rules", "toc"}
+        assert "第一章" in payload["section_title_paths"]
+        assert payload["table_constraint_rows"][0]["label"] == "工期"
+        assert "90" in payload["table_numeric_constraints"]
+
+    def test_build_drawing_structured_summary_extracts_dwg_binary_markers(self):
+        from app.main import _build_drawing_structured_summary
+
+        content = (
+            b"AC1032 DWG PUMP_ROOM GRID_A1 DN200 SECTION-01 HVAC_PIPE FIRE_ALARM" b" LEVEL_1 PLAN_A"
+        )
+        summary = _build_drawing_structured_summary(content, "sample.dwg", parsed_text="")
+        assert summary["detected_format"] == "dwg"
+        assert summary["binary_marker_terms"]
+        assert summary["structured_quality_score"] > 0
+
+    def test_build_site_photo_evidence_summary_deduplicates_objects(self):
+        from app.main import _build_site_photo_evidence_summary
+
+        payload = _build_site_photo_evidence_summary(
+            [
+                {
+                    "scene_type": "安全巡查",
+                    "risk_level": "high",
+                    "safety_findings": ["临边防护缺失"],
+                    "quality_findings": ["钢筋外露"],
+                    "visible_objects": ["脚手架", "临边洞口"],
+                    "numeric_markers": ["2处"],
+                    "evidence_confidence": 0.72,
+                },
+                {
+                    "scene_type": "安全巡查",
+                    "risk_level": "high",
+                    "safety_findings": ["临边防护缺失"],
+                    "quality_findings": ["钢筋外露"],
+                    "visible_objects": ["脚手架", "临边洞口"],
+                    "numeric_markers": ["2处"],
+                    "evidence_confidence": 0.7,
+                },
+                {
+                    "scene_type": "进度实景",
+                    "risk_level": "medium",
+                    "progress_findings": ["主体施工"],
+                    "visible_objects": ["塔吊", "模板"],
+                    "numeric_markers": ["3层"],
+                    "evidence_confidence": 0.65,
+                },
+            ]
+        )
+
+        assert payload["photo_count"] == 3
+        assert payload["unique_evidence_count"] == 2
+        assert payload["duplicate_evidence_count"] == 1
+        assert payload["avg_evidence_confidence"] > 0.6
+
+    def test_build_material_score_shaping_rewards_consensus_and_feedback(self):
+        from app.main import _build_material_score_shaping
+
+        report = {
+            "rule_total_score": 78.0,
+            "meta": {
+                "evidence_trace": {"mandatory_hit_rate": 0.82},
+            },
+        }
+        material_knowledge_snapshot = {
+            "summary": {
+                "cross_type_consensus_score": 0.48,
+                "cross_type_consensus_type_count": 3,
+                "structured_quality_avg": 0.63,
+                "structured_quality_type_rate": 0.67,
+                "strong_structured_types": 3,
+            },
+            "by_type": [
+                {"mandatory_clause_terms_preview": ["必须提供节点工期", "不得缺少深化设计"]},
+                {"mandatory_clause_terms_preview": ["必须满足质量验收"]},
+            ],
+        }
+        shaping = _build_material_score_shaping(
+            report,
+            runtime_req_meta={
+                "site_photo_visual_requirements": 1,
+                "feedback_evolution_requirements": 3,
+                "feature_confidence_requirements": 2,
+            },
+            material_knowledge_snapshot=material_knowledge_snapshot,
+        )
+        assert shaping["net_delta"] > 0
+        assert "cross_material_consensus" in shaping["reasons"]
+
+    def test_build_material_score_shaping_penalizes_weak_material_signals(self):
+        from app.main import _build_material_score_shaping
+
+        report = {
+            "rule_total_score": 78.0,
+            "meta": {
+                "evidence_trace": {"mandatory_hit_rate": 0.22},
+            },
+        }
+        material_knowledge_snapshot = {
+            "summary": {
+                "cross_type_consensus_score": 0.08,
+                "cross_type_consensus_type_count": 1,
+                "structured_quality_avg": 0.16,
+                "structured_quality_type_rate": 0.12,
+                "strong_structured_types": 1,
+            },
+            "by_type": [
+                {
+                    "mandatory_clause_terms_preview": [
+                        "必须满足节点工期",
+                        "不得缺少关键方案",
+                        "须提供验收表",
+                    ]
+                },
+            ],
+        }
+        shaping = _build_material_score_shaping(
+            report,
+            runtime_req_meta={"site_photo_visual_requirements": 0},
+            material_knowledge_snapshot=material_knowledge_snapshot,
+        )
+        assert shaping["net_delta"] < 0
+        assert "mandatory_clause_underhit" in shaping["reasons"]
+
+    def test_build_material_score_shaping_stays_neutral_without_evidence_context(self):
+        from app.main import _build_material_score_shaping
+
+        report = {
+            "rule_total_score": 81.2,
+            "meta": {
+                "evidence_trace": {"mandatory_hit_rate": 0.9},
+            },
+        }
+        shaping = _build_material_score_shaping(
+            report,
+            runtime_req_meta={"runtime_custom_requirements": 1},
+            material_knowledge_snapshot={
+                "summary": {
+                    "total_files": 1,
+                    "parsed_ok_files": 0,
+                    "structured_signal_total": 0,
+                    "dimension_coverage_rate": 0.0,
+                },
+                "by_type": [],
+            },
+        )
+        assert shaping["enabled"] is False
+        assert shaping["net_delta"] == 0.0
+        assert "insufficient_material_evidence_context" in shaping["reasons"]

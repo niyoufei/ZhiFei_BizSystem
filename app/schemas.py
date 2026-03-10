@@ -708,6 +708,7 @@ class ScoringBasisResponse(BaseModel):
     material_utilization: Dict[str, Any] = Field(default_factory=dict)
     material_utilization_gate: Dict[str, Any] = Field(default_factory=dict)
     evidence_trace: Dict[str, Any] = Field(default_factory=dict)
+    material_constraint_shaping: Dict[str, Any] = Field(default_factory=dict)
     current_runtime_constraints: Dict[str, Any] = Field(default_factory=dict)
     recommendations: List[str] = Field(default_factory=list)
 
