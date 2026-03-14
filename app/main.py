@@ -106,9 +106,11 @@ from app.engine.dimensions import DIMENSIONS
 from app.engine.evaluation import evaluate_project_variants
 from app.engine.evolution import build_evolution_report
 from app.engine.feature_distillation import (
+    distill_feature_from_text,
     load_feature_kb,
     select_top_logic_skeletons,
     update_feature_confidence,
+    upsert_distilled_features,
 )
 from app.engine.history import (
     analyze_trend,
@@ -420,6 +422,8 @@ DEFAULT_MATERIAL_PARSE_BACKLOG_WARN = 18
 DEFAULT_CALIBRATION_MIN_SAMPLES = 20
 DEFAULT_CALIBRATION_FRESHNESS_DAYS = 90
 DEFAULT_CALIBRATION_MIN_RECENT_RATIO = 0.6
+DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO = 0.4
+DEFAULT_FEW_SHOT_MIN_HIGH_SCORE_100 = 78.0
 PROFILE_LOCKED_STATUSES = {"submitted_to_qingtian"}
 VERSIONED_JSON_ARTIFACTS = {
     "expert_profiles": EXPERT_PROFILES_PATH,
@@ -8291,7 +8295,11 @@ def _build_calibrator_summary(
     return summary
 
 
-def _refresh_project_reflection_objects(project_id: str) -> None:
+def _refresh_project_reflection_objects(
+    project_id: str,
+    *,
+    include_guardrail_blocked: bool = False,
+) -> None:
     submissions = [s for s in load_submissions() if str(s.get("project_id")) == project_id]
     submissions_by_id = {str(s.get("id")): s for s in submissions}
     latest_reports = _latest_records_by_submission(
@@ -8300,6 +8308,14 @@ def _refresh_project_reflection_objects(project_id: str) -> None:
     projects = load_projects()
     project = next((p for p in projects if str(p.get("id")) == project_id), {})
     project_score_scale = _resolve_project_score_scale_max(project) if project else 100
+    blocked_gt_ids = {
+        str(row.get("id") or "").strip()
+        for row in _list_project_ground_truth_records(
+            project_id,
+            include_guardrail_blocked=True,
+        )
+        if _feedback_guardrail_is_blocked(row)
+    }
 
     qingtian_results = load_qingtian_results()
     qingtian_changed = False
@@ -8331,6 +8347,9 @@ def _refresh_project_reflection_objects(project_id: str) -> None:
         if merged_payload != raw_payload:
             q["raw_payload"] = merged_payload
             qingtian_changed = True
+        gt_record_id = str(merged_payload.get("ground_truth_record_id") or "").strip()
+        if not include_guardrail_blocked and gt_record_id and gt_record_id in blocked_gt_ids:
+            continue
         scoped_qt.append(q)
     if qingtian_changed:
         save_qingtian_results(qingtian_results)
@@ -8357,7 +8376,11 @@ def _refresh_project_reflection_objects(project_id: str) -> None:
     save_calibration_samples(all_samples)
 
 
-def _build_feedback_records_for_project(project_id: str) -> List[Dict[str, object]]:
+def _build_feedback_records_for_project(
+    project_id: str,
+    *,
+    include_guardrail_blocked: bool = False,
+) -> List[Dict[str, object]]:
     projects = load_projects()
     project = next((p for p in projects if str(p.get("id")) == project_id), None)
     if project is None:
@@ -8367,7 +8390,10 @@ def _build_feedback_records_for_project(project_id: str) -> List[Dict[str, objec
     submissions_by_id: Dict[str, Dict[str, object]] = {str(s.get("id")): s for s in submissions}
 
     feedback_records: List[Dict[str, object]] = []
-    ground_truth_rows = [r for r in load_ground_truth() if str(r.get("project_id")) == project_id]
+    ground_truth_rows = _list_project_ground_truth_records(
+        project_id,
+        include_guardrail_blocked=include_guardrail_blocked,
+    )
     for row in ground_truth_rows:
         if not isinstance(row, dict):
             continue
@@ -8655,13 +8681,20 @@ def _sync_feedback_weights_to_evolution(
     }
 
 
-def _refresh_evolution_report_from_ground_truth(project_id: str) -> Dict[str, object]:
+def _refresh_evolution_report_from_ground_truth(
+    project_id: str,
+    *,
+    include_guardrail_blocked: bool = False,
+) -> Dict[str, object]:
     projects = load_projects()
     project = next((p for p in projects if str(p.get("id")) == project_id), None)
     if project is None:
         return {"refreshed": False, "reason": "project_not_found"}
     project_score_scale = _resolve_project_score_scale_max(project)
-    records_raw = [r for r in load_ground_truth() if str(r.get("project_id")) == project_id]
+    records_raw = _list_project_ground_truth_records(
+        project_id,
+        include_guardrail_blocked=include_guardrail_blocked,
+    )
     records = [
         _ground_truth_record_for_learning(
             r if isinstance(r, dict) else {},
@@ -8729,7 +8762,124 @@ def _refresh_evolution_report_from_ground_truth(project_id: str) -> Dict[str, ob
     }
 
 
-def _run_feedback_closed_loop(project_id: str, *, locale: str, trigger: str) -> Dict[str, object]:
+def _normalize_dimension_id(value: object) -> str:
+    dim_id = str(value or "").strip().upper()
+    if dim_id.startswith("P") and dim_id[1:] in DIMENSION_IDS:
+        dim_id = dim_id[1:]
+    if dim_id in DIMENSION_IDS:
+        return dim_id
+    return ""
+
+
+def _extract_feedback_guardrail(payload: object) -> Dict[str, object]:
+    if not isinstance(payload, dict):
+        return {}
+    guardrail = payload.get("feedback_guardrail")
+    if isinstance(guardrail, dict):
+        return dict(guardrail)
+    return {}
+
+
+def _feedback_guardrail_is_blocked(payload: object) -> bool:
+    guardrail = _extract_feedback_guardrail(payload)
+    return bool(guardrail.get("blocked"))
+
+
+def _list_project_ground_truth_records(
+    project_id: str,
+    *,
+    include_guardrail_blocked: bool = False,
+) -> List[Dict[str, object]]:
+    rows = [r for r in load_ground_truth() if str(r.get("project_id") or "") == project_id]
+    if include_guardrail_blocked:
+        return rows
+    return [row for row in rows if not _feedback_guardrail_is_blocked(row)]
+
+
+def _collect_blocked_ground_truth_guardrails(
+    project_id: str,
+    *,
+    record_ids: Optional[List[str]] = None,
+) -> List[Dict[str, object]]:
+    target_ids = {
+        str(record_id or "").strip()
+        for record_id in (record_ids or [])
+        if str(record_id or "").strip()
+    }
+    blocked_rows: List[Dict[str, object]] = []
+    for row in _list_project_ground_truth_records(project_id, include_guardrail_blocked=True):
+        row_id = str(row.get("id") or "").strip()
+        if target_ids and row_id not in target_ids:
+            continue
+        guardrail = _extract_feedback_guardrail(row)
+        if not bool(guardrail.get("blocked")):
+            continue
+        blocked_rows.append(
+            {
+                "record_id": row_id,
+                "feedback_guardrail": guardrail,
+            }
+        )
+    return blocked_rows
+
+
+def _summarize_project_feedback_guardrail(
+    project_id: str,
+    *,
+    record_ids: Optional[List[str]] = None,
+) -> Dict[str, object]:
+    blocked_rows = _collect_blocked_ground_truth_guardrails(project_id, record_ids=record_ids)
+    if not blocked_rows:
+        return {
+            "blocked": False,
+            "blocked_record_ids": [],
+            "blocked_count": 0,
+        }
+    blocked_record_ids = [str(item.get("record_id") or "") for item in blocked_rows]
+    max_abs_delta = max(
+        float(_to_float_or_none((item.get("feedback_guardrail") or {}).get("abs_delta_100")) or 0.0)
+        for item in blocked_rows
+    )
+    warning_message = str(
+        ((blocked_rows[0].get("feedback_guardrail") or {}).get("warning_message") or "")
+    ).strip()
+    if not warning_message:
+        warning_message = (
+            f"检测到 {len(blocked_rows)} 条极端偏差样本，已暂停自动调权/自动校准。"
+            "请人工确认后再执行「学习进化」或「一键闭环执行」。"
+        )
+    return {
+        "blocked": True,
+        "blocked_record_ids": blocked_record_ids,
+        "blocked_count": len(blocked_rows),
+        "max_abs_delta_100": round(max_abs_delta, 2),
+        "requires_manual_confirmation": True,
+        "warning_message": warning_message,
+        "manual_override_hint": "confirm_extreme_sample=1",
+    }
+
+
+def _build_manual_confirmation_detail(
+    project_id: str,
+    *,
+    action_label: str,
+) -> str:
+    summary = _summarize_project_feedback_guardrail(project_id)
+    blocked_count = int(_to_float_or_none(summary.get("blocked_count")) or 0)
+    max_abs_delta = float(_to_float_or_none(summary.get("max_abs_delta_100")) or 0.0)
+    return (
+        f"检测到 {blocked_count} 条极端偏差样本（最大偏差 {max_abs_delta:.2f} 分，100分口径），"
+        f"已暂停自动纳入 {action_label}。请人工确认后重试，并附带 confirm_extreme_sample=1。"
+    )
+
+
+def _run_feedback_closed_loop(
+    project_id: str,
+    *,
+    locale: str,
+    trigger: str,
+    ground_truth_record_ids: Optional[List[str]] = None,
+) -> Dict[str, object]:
     """
     反馈信号闭环：刷新样本 -> 自动调权重 -> 自动反演校准。
     所有步骤为 best-effort，不影响主流程返回。
@@ -8743,11 +8893,41 @@ def _run_feedback_closed_loop(project_id: str, *, locale: str, trigger: str) -> 
         "auto_run": None,
         "evolution_refresh": {"refreshed": False},
     }
+    feedback_guardrail = _summarize_project_feedback_guardrail(
+        project_id,
+        record_ids=ground_truth_record_ids,
+    )
+    result["feedback_guardrail"] = feedback_guardrail
     try:
         _refresh_project_reflection_objects(project_id)
     except Exception as exc:
         result["ok"] = False
         result["refresh_error"] = str(exc)
+        return result
+
+    if bool(feedback_guardrail.get("blocked")):
+        result["guardrail_triggered"] = True
+        result["requires_manual_confirmation"] = True
+        result["auto_update_skipped"] = True
+        result["weight_update"] = {
+            "updated": False,
+            "reason": "guardrail_blocked",
+            "blocked_record_ids": feedback_guardrail.get("blocked_record_ids") or [],
+        }
+        result["weight_sync_to_evolution"] = {
+            "synced": False,
+            "reason": "guardrail_blocked",
+        }
+        result["auto_run"] = {
+            "ok": False,
+            "skipped": True,
+            "reason": "guardrail_blocked",
+            "requires_manual_confirmation": True,
+        }
+        try:
+            result["evolution_refresh"] = _refresh_evolution_report_from_ground_truth(project_id)
+        except Exception as exc:
+            result["evolution_refresh"] = {"refreshed": False, "error": str(exc)}
         return result
 
     try:
@@ -8782,12 +8962,25 @@ def _run_feedback_closed_loop_safe(
     *,
     locale: str,
     trigger: str,
+    ground_truth_record_ids: Optional[List[str]] = None,
 ) -> Dict[str, object]:
     """
     闭环执行保护层：不抛错中断主流程，但必须显式返回失败信息并记录日志。
     """
     try:
-        raw_result = _run_feedback_closed_loop(project_id, locale=locale, trigger=trigger)
+        if ground_truth_record_ids:
+            raw_result = _run_feedback_closed_loop(
+                project_id,
+                locale=locale,
+                trigger=trigger,
+                ground_truth_record_ids=ground_truth_record_ids,
+            )
+        else:
+            raw_result = _run_feedback_closed_loop(
+                project_id,
+                locale=locale,
+                trigger=trigger,
+            )
         if isinstance(raw_result, dict):
             result = dict(raw_result)
         elif hasattr(raw_result, "model_dump"):
@@ -8843,7 +9036,7 @@ def _build_evolution_health_report(
     project_score_scale = _resolve_project_score_scale_max(project)
     submissions = [s for s in load_submissions() if str(s.get("project_id")) == project_id]
     submissions_by_id = {str(s.get("id") or ""): s for s in submissions if str(s.get("id") or "")}
-    ground_truth_rows = [r for r in load_ground_truth() if str(r.get("project_id")) == project_id]
+    ground_truth_rows = _list_project_ground_truth_records(project_id)
     now_utc = datetime.now(timezone.utc)
 
     matched_rows: List[Dict[str, object]] = []
@@ -9150,7 +9343,7 @@ def _build_recent_feedback_dimension_boosts(
     *,
     recent_limit: int = 16,
 ) -> Dict[str, Dict[str, object]]:
-    rows = [row for row in load_ground_truth() if str(row.get("project_id") or "") == project_id]
+    rows = _list_project_ground_truth_records(project_id)
     rows.sort(
         key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""),
         reverse=True,
@@ -9263,17 +9456,12 @@ def _auto_update_feature_confidence_on_ground_truth(
     if actual_score_100 is None:
         return {"updated": 0, "retired": 0, "reason": "missing_actual_score"}
 
-    pred_score_100 = _to_float_or_none(report.get("pred_total_score"))
-    if pred_score_100 is None:
-        pred_score_100 = _to_float_or_none(report.get("total_score"))
-    if pred_score_100 is None:
-        pred_score_100 = _to_float_or_none(report.get("rule_total_score"))
+    pred_score_100 = _resolve_report_predicted_score_100(
+        report,
+        project_score_scale_max=project_score_scale_max,
+    )
     if pred_score_100 is None:
         return {"updated": 0, "retired": 0, "reason": "missing_predicted_score"}
-
-    # 兜底兼容：若项目为5分制且报告字段偶发为5分口径，则转回100分口径。
-    if int(project_score_scale_max) == 5 and pred_score_100 <= 5.0:
-        pred_score_100 = float(_convert_score_to_100(pred_score_100, 5) or 0.0)
 
     update_result = update_feature_confidence(
         applied_feature_ids=applied_feature_ids,
@@ -9307,7 +9495,264 @@ def _auto_update_feature_confidence_on_ground_truth(
     return update_result
 
 
-def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, object]) -> None:
+def _resolve_report_predicted_score_100(
+    report: Dict[str, object],
+    *,
+    project_score_scale_max: int,
+) -> Optional[float]:
+    pred_score_100 = _to_float_or_none(report.get("pred_total_score"))
+    if pred_score_100 is None:
+        pred_score_100 = _to_float_or_none(report.get("total_score"))
+    if pred_score_100 is None:
+        pred_score_100 = _to_float_or_none(report.get("rule_total_score"))
+    if pred_score_100 is None:
+        return None
+    if int(project_score_scale_max) == 5 and pred_score_100 <= 5.0:
+        pred_score_100 = float(_convert_score_to_100(pred_score_100, 5) or 0.0)
+    return float(pred_score_100)
+
+
+def _build_ground_truth_feedback_guardrail(
+    *,
+    report: Dict[str, object],
+    gt_record: Dict[str, object],
+    project_score_scale_max: int,
+) -> Dict[str, object]:
+    gt_for_learning = _ground_truth_record_for_learning(
+        gt_record,
+        default_score_scale_max=project_score_scale_max,
+    )
+    actual_score_100 = _to_float_or_none(gt_for_learning.get("final_score"))
+    predicted_score_100 = _resolve_report_predicted_score_100(
+        report,
+        project_score_scale_max=project_score_scale_max,
+    )
+    if actual_score_100 is None or predicted_score_100 is None:
+        return {
+            "blocked": False,
+            "status": "insufficient_score_context",
+            "requires_manual_confirmation": False,
+            "actual_score_100": round(float(actual_score_100 or 0.0), 2),
+            "predicted_score_100": (
+                round(float(predicted_score_100), 2) if predicted_score_100 is not None else None
+            ),
+            "threshold_ratio": round(float(DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO), 4),
+        }
+
+    abs_delta_100 = abs(float(actual_score_100) - float(predicted_score_100))
+    relative_delta_ratio = abs_delta_100 / 100.0
+    blocked = relative_delta_ratio > float(DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO)
+    warning_message = ""
+    if blocked:
+        warning_message = (
+            f"预测与真实总分偏差 {abs_delta_100:.2f} 分（100分口径，{relative_delta_ratio * 100:.1f}%），"
+            "已暂停自动调权/自动校准，请人工确认后再执行「学习进化」或「一键闭环执行」。"
+        )
+    return {
+        "blocked": blocked,
+        "status": "blocked" if blocked else "accepted",
+        "requires_manual_confirmation": blocked,
+        "actual_score_100": round(float(actual_score_100), 2),
+        "predicted_score_100": round(float(predicted_score_100), 2),
+        "abs_delta_100": round(float(abs_delta_100), 2),
+        "relative_delta_ratio": round(float(relative_delta_ratio), 4),
+        "threshold_ratio": round(float(DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO), 4),
+        "warning_message": warning_message or None,
+        "manual_override_hint": "confirm_extreme_sample=1" if blocked else None,
+    }
+
+
+def _flatten_ground_truth_qualitative_tags(
+    gt_record: Dict[str, object],
+    *,
+    limit: int = 8,
+) -> List[str]:
+    tags_by_judge = gt_record.get("qualitative_tags_by_judge")
+    if not isinstance(tags_by_judge, list):
+        return []
+    seen: set[str] = set()
+    out: List[str] = []
+    for judge_tags in tags_by_judge:
+        if not isinstance(judge_tags, list):
+            continue
+        for tag in judge_tags:
+            clean = str(tag or "").strip()
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            out.append(clean)
+            if len(out) >= max(1, int(limit)):
+                return out
+    return out
+
+
+def _collect_dimension_evidence_texts(
+    report: Dict[str, object],
+    *,
+    dimension_id: str,
+    limit: int = 3,
+) -> List[str]:
+    dim_scores = report.get("dimension_scores")
+    payload = dim_scores.get(dimension_id) if isinstance(dim_scores, dict) else None
+    if not isinstance(payload, dict):
+        return []
+    evidence_rows = payload.get("evidence") if isinstance(payload.get("evidence"), list) else []
+    out: List[str] = []
+    seen: set[str] = set()
+    for row in evidence_rows:
+        if not isinstance(row, dict):
+            continue
+        quote = str(row.get("quote") or row.get("snippet") or "").strip()
+        anchor = str(row.get("anchor_label") or row.get("anchor") or "").strip()
+        text = f"{anchor}：{quote}" if anchor and quote else (quote or anchor)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
+
+
+def _collect_dimension_guidance_texts(
+    report: Dict[str, object],
+    *,
+    dimension_id: str,
+    limit: int = 2,
+) -> List[str]:
+    suggestions = report.get("suggestions")
+    if not isinstance(suggestions, list):
+        return []
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in suggestions:
+        if not isinstance(item, dict):
+            continue
+        item_dim = _normalize_dimension_id(item.get("dimension_id"))
+        if item_dim != dimension_id:
+            continue
+        text = str(item.get("text") or item.get("suggestion") or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
+
+
+def _select_ground_truth_few_shot_dimensions(
+    *,
+    report: Dict[str, object],
+    feature_confidence_update: Dict[str, object],
+    max_dimensions: int = 4,
+) -> List[str]:
+    selected: List[str] = []
+    for item in feature_confidence_update.get("applied_dimension_ids") or []:
+        dim_id = _normalize_dimension_id(item)
+        if dim_id and dim_id not in selected:
+            selected.append(dim_id)
+        if len(selected) >= max(1, int(max_dimensions)):
+            return selected
+
+    dimension_scores = report.get("dimension_scores")
+    ranked: List[tuple[int, float, str]] = []
+    if isinstance(dimension_scores, dict):
+        for raw_dim_id, payload in dimension_scores.items():
+            dim_id = _normalize_dimension_id(raw_dim_id)
+            if not dim_id or not isinstance(payload, dict):
+                continue
+            evidence_count = (
+                len(payload.get("evidence") or [])
+                if isinstance(payload.get("evidence"), list)
+                else 0
+            )
+            score = float(_to_float_or_none(payload.get("score")) or 0.0)
+            ranked.append((evidence_count, score, dim_id))
+    ranked.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    for _, _, dim_id in ranked:
+        if dim_id not in selected:
+            selected.append(dim_id)
+        if len(selected) >= max(1, int(max_dimensions)):
+            break
+    return selected
+
+
+def _capture_ground_truth_few_shot_features(
+    *,
+    report: Dict[str, object],
+    gt_record: Dict[str, object],
+    project_score_scale_max: int,
+    feedback_guardrail: Dict[str, object],
+    feature_confidence_update: Dict[str, object],
+) -> Dict[str, object]:
+    if bool(feedback_guardrail.get("blocked")):
+        return {"captured": 0, "reason": "guardrail_blocked"}
+
+    gt_for_learning = _ground_truth_record_for_learning(
+        gt_record,
+        default_score_scale_max=project_score_scale_max,
+    )
+    actual_score_100 = float(_to_float_or_none(gt_for_learning.get("final_score")) or 0.0)
+    if actual_score_100 < float(DEFAULT_FEW_SHOT_MIN_HIGH_SCORE_100):
+        return {
+            "captured": 0,
+            "reason": "below_high_score_threshold",
+            "actual_score_100": round(actual_score_100, 2),
+            "min_high_score_threshold_100": round(float(DEFAULT_FEW_SHOT_MIN_HIGH_SCORE_100), 2),
+        }
+
+    candidate_dimensions = _select_ground_truth_few_shot_dimensions(
+        report=report,
+        feature_confidence_update=feature_confidence_update,
+    )
+    if not candidate_dimensions:
+        return {"captured": 0, "reason": "no_candidate_dimensions"}
+
+    tags = _flatten_ground_truth_qualitative_tags(gt_record)
+    distilled_features = []
+    feature_ids: List[str] = []
+    for dim_id in candidate_dimensions:
+        dim_name = ((DIMENSIONS.get(dim_id) or {}).get("name") or dim_id).strip()
+        evidence_texts = _collect_dimension_evidence_texts(report, dimension_id=dim_id)
+        guidance_texts = _collect_dimension_guidance_texts(report, dimension_id=dim_id)
+        source_parts: List[str] = [f"维度：{dim_name}"]
+        if tags:
+            source_parts.append("评委反馈：" + "；".join(tags[:6]))
+        if evidence_texts:
+            source_parts.append("高分证据：" + "；".join(evidence_texts[:3]))
+        if guidance_texts:
+            source_parts.append("编制提示：" + "；".join(guidance_texts[:2]))
+        source_text = "\n".join(part for part in source_parts if part.strip())
+        feature = distill_feature_from_text(
+            dimension_id=dim_id,
+            source_text=source_text,
+            confidence_score=0.7,
+        )
+        if feature is None:
+            continue
+        distilled_features.append(feature)
+        feature_ids.append(str(feature.feature_id or ""))
+
+    if not distilled_features:
+        return {"captured": 0, "reason": "feature_distillation_empty"}
+
+    upsert_result = upsert_distilled_features(distilled_features)
+    return {
+        "captured": len(distilled_features),
+        "reason": "captured",
+        "dimension_ids": candidate_dimensions,
+        "feature_ids": feature_ids,
+        "actual_score_100": round(actual_score_100, 2),
+        "min_high_score_threshold_100": round(float(DEFAULT_FEW_SHOT_MIN_HIGH_SCORE_100), 2),
+        "upsert": upsert_result,
+    }
+
+
+def _sync_ground_truth_record_to_qingtian(
+    project_id: str,
+    gt_record: Dict[str, object],
+) -> Dict[str, object]:
     projects = load_projects()
     project = _find_project(project_id, projects)
     config = load_config()
@@ -9441,13 +9886,40 @@ def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, 
         gt_record,
         default_score_scale_max=project_score_scale,
     )
+    report_for_feedback = matched_submission.get("report")
+    feedback_guardrail: Dict[str, object] = {
+        "blocked": False,
+        "status": "not_executed",
+        "requires_manual_confirmation": False,
+    }
+    if isinstance(report_for_feedback, dict):
+        try:
+            feedback_guardrail = _build_ground_truth_feedback_guardrail(
+                report=report_for_feedback,
+                gt_record=gt_record,
+                project_score_scale_max=project_score_scale,
+            )
+        except Exception as exc:
+            feedback_guardrail = {
+                "blocked": False,
+                "status": "guardrail_error",
+                "requires_manual_confirmation": False,
+                "error": str(exc),
+            }
     feature_confidence_update: Dict[str, object] = {
         "updated": 0,
         "retired": 0,
         "reason": "not_executed",
     }
-    report_for_feedback = matched_submission.get("report")
-    if isinstance(report_for_feedback, dict):
+    if bool(feedback_guardrail.get("blocked")):
+        feature_confidence_update = {
+            "updated": 0,
+            "retired": 0,
+            "reason": "guardrail_blocked",
+            "actual_score_100": feedback_guardrail.get("actual_score_100"),
+            "predicted_score_100": feedback_guardrail.get("predicted_score_100"),
+        }
+    elif isinstance(report_for_feedback, dict):
         try:
             feature_confidence_update = _auto_update_feature_confidence_on_ground_truth(
                 report=report_for_feedback,
@@ -9461,6 +9933,24 @@ def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, 
                 "reason": "feature_confidence_update_error",
                 "error": str(exc),
             }
+    few_shot_distillation: Dict[str, object] = {"captured": 0, "reason": "not_executed"}
+    if bool(feedback_guardrail.get("blocked")):
+        few_shot_distillation = {"captured": 0, "reason": "guardrail_blocked"}
+    elif isinstance(report_for_feedback, dict):
+        try:
+            few_shot_distillation = _capture_ground_truth_few_shot_features(
+                report=report_for_feedback,
+                gt_record=gt_record,
+                project_score_scale_max=project_score_scale,
+                feedback_guardrail=feedback_guardrail,
+                feature_confidence_update=feature_confidence_update,
+            )
+        except Exception as exc:
+            few_shot_distillation = {
+                "captured": 0,
+                "reason": "few_shot_distillation_error",
+                "error": str(exc),
+            }
 
     if source_gt_id:
         all_gt_records = load_ground_truth()
@@ -9468,7 +9958,9 @@ def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, 
         for row in all_gt_records:
             if str(row.get("id") or "") != source_gt_id:
                 continue
+            row["feedback_guardrail"] = feedback_guardrail
             row["feature_confidence_update"] = feature_confidence_update
+            row["few_shot_distillation"] = few_shot_distillation
             row["updated_at"] = _now_iso()
             changed_gt = True
             break
@@ -9499,7 +9991,9 @@ def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, 
                     "final_score_raw": gt_for_learning.get("final_score_raw"),
                     "final_score_100": gt_for_learning.get("final_score"),
                     "score_scale_max": gt_for_learning.get("score_scale_max"),
+                    "feedback_guardrail": feedback_guardrail,
                     "feature_confidence_update": feature_confidence_update,
+                    "few_shot_distillation": few_shot_distillation,
                 },
                 "created_at": _now_iso(),
             }
@@ -9509,7 +10003,9 @@ def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, 
         raw_payload = matched_qt.get("raw_payload")
         if not isinstance(raw_payload, dict):
             raw_payload = {}
+        raw_payload["feedback_guardrail"] = feedback_guardrail
         raw_payload["feature_confidence_update"] = feature_confidence_update
+        raw_payload["few_shot_distillation"] = few_shot_distillation
         matched_qt["raw_payload"] = raw_payload
         save_qingtian_results(qt_results)
 
@@ -9519,6 +10015,15 @@ def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, 
         save_projects(projects)
 
     _refresh_project_reflection_objects(project_id)
+    gt_record["feedback_guardrail"] = feedback_guardrail
+    gt_record["few_shot_distillation"] = few_shot_distillation
+    gt_record["feature_confidence_update"] = feature_confidence_update
+    return {
+        "feedback_guardrail": feedback_guardrail,
+        "feature_confidence_update": feature_confidence_update,
+        "few_shot_distillation": few_shot_distillation,
+        "submission_id": str(matched_submission.get("id") or ""),
+    }
 
 
 def _rebuild_project_anchors_and_requirements(
@@ -17625,8 +18130,21 @@ def rebuild_delta_cases(
     reports = [r for r in load_score_reports() if str(r.get("project_id")) == project_id]
     latest_reports = _latest_records_by_submission(reports)
     qtrs = load_qingtian_results()
+    blocked_gt_ids = {
+        str(row.get("id") or "").strip()
+        for row in _list_project_ground_truth_records(project_id, include_guardrail_blocked=True)
+        if _feedback_guardrail_is_blocked(row)
+    }
     latest_qt = _latest_records_by_submission(
-        [q for q in qtrs if str(q.get("submission_id")) in latest_reports]
+        [
+            q
+            for q in qtrs
+            if str(q.get("submission_id")) in latest_reports
+            and (
+                str(((q.get("raw_payload") or {}).get("ground_truth_record_id") or "")).strip()
+                not in blocked_gt_ids
+            )
+        ]
     )
 
     new_cases = build_delta_cases(
@@ -17682,8 +18200,21 @@ def rebuild_calibration_samples(
     latest_reports = _latest_records_by_submission(
         [r for r in load_score_reports() if str(r.get("project_id")) == project_id]
     )
+    blocked_gt_ids = {
+        str(row.get("id") or "").strip()
+        for row in _list_project_ground_truth_records(project_id, include_guardrail_blocked=True)
+        if _feedback_guardrail_is_blocked(row)
+    }
     latest_qt = _latest_records_by_submission(
-        [q for q in load_qingtian_results() if str(q.get("submission_id")) in submissions_by_id]
+        [
+            q
+            for q in load_qingtian_results()
+            if str(q.get("submission_id")) in submissions_by_id
+            and (
+                str(((q.get("raw_payload") or {}).get("ground_truth_record_id") or "")).strip()
+                not in blocked_gt_ids
+            )
+        ]
     )
 
     samples = build_calibration_samples(
@@ -17868,6 +18399,7 @@ def deploy_or_rollback_patch(
 )
 def auto_run_reflection_pipeline(
     project_id: str,
+    confirm_extreme_sample: bool = Query(False, description="人工确认纳入极端偏差样本"),
     api_key: Optional[str] = Depends(verify_api_key),
     locale: str = Depends(get_locale),
 ) -> ReflectionAutoRunResponse:
@@ -17888,7 +18420,20 @@ def auto_run_reflection_pipeline(
     if project is None:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
 
-    _refresh_project_reflection_objects(project_id)
+    blocked_guardrails = _collect_blocked_ground_truth_guardrails(project_id)
+    if blocked_guardrails and not bool(confirm_extreme_sample):
+        raise HTTPException(
+            status_code=409,
+            detail=_build_manual_confirmation_detail(
+                project_id,
+                action_label="一键闭环执行",
+            ),
+        )
+
+    _refresh_project_reflection_objects(
+        project_id,
+        include_guardrail_blocked=bool(confirm_extreme_sample),
+    )
     delta_cases = [d for d in load_delta_cases() if str(d.get("project_id")) == project_id]
     samples = [s for s in load_calibration_samples() if str(s.get("project_id")) == project_id]
 
@@ -19035,11 +19580,21 @@ def add_ground_truth(
     )
     records.append(record)
     save_ground_truth(records)
-    _sync_ground_truth_record_to_qingtian(project_id, record)
+    sync_result = _sync_ground_truth_record_to_qingtian(project_id, record)
+    sync_payload = sync_result if isinstance(sync_result, dict) else {}
+    feedback_guardrail = sync_payload.get("feedback_guardrail")
+    few_shot_distillation = sync_payload.get("few_shot_distillation")
+    record["feedback_guardrail"] = (
+        feedback_guardrail if isinstance(feedback_guardrail, dict) else {}
+    )
+    record["few_shot_distillation"] = (
+        few_shot_distillation if isinstance(few_shot_distillation, dict) else {}
+    )
     record["feedback_closed_loop"] = _run_feedback_closed_loop_safe(
         project_id,
         locale=locale,
         trigger="ground_truth_add",
+        ground_truth_record_ids=[str(record.get("id") or "")],
     )
     return GroundTruthRecord(**record)
 
@@ -19098,11 +19653,21 @@ def add_ground_truth_from_submission(
     records = load_ground_truth()
     records.append(record)
     save_ground_truth(records)
-    _sync_ground_truth_record_to_qingtian(project_id, record)
+    sync_result = _sync_ground_truth_record_to_qingtian(project_id, record)
+    sync_payload = sync_result if isinstance(sync_result, dict) else {}
+    feedback_guardrail = sync_payload.get("feedback_guardrail")
+    few_shot_distillation = sync_payload.get("few_shot_distillation")
+    record["feedback_guardrail"] = (
+        feedback_guardrail if isinstance(feedback_guardrail, dict) else {}
+    )
+    record["few_shot_distillation"] = (
+        few_shot_distillation if isinstance(few_shot_distillation, dict) else {}
+    )
     record["feedback_closed_loop"] = _run_feedback_closed_loop_safe(
         project_id,
         locale=locale,
         trigger="ground_truth_add",
+        ground_truth_record_ids=[str(record.get("id") or "")],
     )
     return GroundTruthRecord(**record)
 
@@ -19154,11 +19719,21 @@ async def add_ground_truth_from_file(
     )
     records.append(record)
     save_ground_truth(records)
-    _sync_ground_truth_record_to_qingtian(project_id, record)
+    sync_result = _sync_ground_truth_record_to_qingtian(project_id, record)
+    sync_payload = sync_result if isinstance(sync_result, dict) else {}
+    feedback_guardrail = sync_payload.get("feedback_guardrail")
+    few_shot_distillation = sync_payload.get("few_shot_distillation")
+    record["feedback_guardrail"] = (
+        feedback_guardrail if isinstance(feedback_guardrail, dict) else {}
+    )
+    record["few_shot_distillation"] = (
+        few_shot_distillation if isinstance(few_shot_distillation, dict) else {}
+    )
     record["feedback_closed_loop"] = _run_feedback_closed_loop_safe(
         project_id,
         locale=locale,
         trigger="ground_truth_add",
+        ground_truth_record_ids=[str(record.get("id") or "")],
     )
     return GroundTruthRecord(**record)
 
@@ -19232,17 +19807,29 @@ async def add_ground_truth_from_files(
         records = load_ground_truth()
         records.extend(success_records)
         save_ground_truth(records)
+        success_record_ids: List[str] = []
         for item in items:
             record = item.get("record")
             if item.get("ok") and isinstance(record, dict):
                 try:
-                    _sync_ground_truth_record_to_qingtian(project_id, record)
+                    sync_result = _sync_ground_truth_record_to_qingtian(project_id, record)
+                    sync_payload = sync_result if isinstance(sync_result, dict) else {}
+                    feedback_guardrail = sync_payload.get("feedback_guardrail")
+                    few_shot_distillation = sync_payload.get("few_shot_distillation")
+                    record["feedback_guardrail"] = (
+                        feedback_guardrail if isinstance(feedback_guardrail, dict) else {}
+                    )
+                    record["few_shot_distillation"] = (
+                        few_shot_distillation if isinstance(few_shot_distillation, dict) else {}
+                    )
+                    success_record_ids.append(str(record.get("id") or ""))
                 except Exception as e:
                     item["detail"] = f"已保存，但同步青天失败：{e}"
         closed_loop_result = _run_feedback_closed_loop_safe(
             project_id,
             locale=locale,
             trigger="ground_truth_batch_add",
+            ground_truth_record_ids=success_record_ids,
         )
         for item in items:
             if item.get("ok") and isinstance(item.get("record"), dict):
@@ -19355,6 +19942,7 @@ def delete_ground_truth(
 )
 def evolve_project(
     project_id: str,
+    confirm_extreme_sample: bool = Query(False, description="人工确认纳入极端偏差样本"),
     api_key: Optional[str] = Depends(verify_api_key),
     locale: str = Depends(get_locale),
 ) -> EvolutionReport:
@@ -19367,8 +19955,20 @@ def evolve_project(
     project = next((p for p in projects if p["id"] == project_id), None)
     if project is None:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    blocked_guardrails = _collect_blocked_ground_truth_guardrails(project_id)
+    if blocked_guardrails and not bool(confirm_extreme_sample):
+        raise HTTPException(
+            status_code=409,
+            detail=_build_manual_confirmation_detail(
+                project_id,
+                action_label="学习进化",
+            ),
+        )
     project_score_scale = _resolve_project_score_scale_max(project)
-    records_raw = [r for r in load_ground_truth() if r.get("project_id") == project_id]
+    records_raw = _list_project_ground_truth_records(
+        project_id,
+        include_guardrail_blocked=bool(confirm_extreme_sample),
+    )
     records = [
         _ground_truth_record_for_learning(
             r if isinstance(r, dict) else {},
@@ -26529,6 +27129,53 @@ def index(
           }
           if (feedInput && failCount === 0) feedInput.value = '';
         });
+        const feedbackGuardrailStates = window.__zhifeiFeedbackGuardrailStates = window.__zhifeiFeedbackGuardrailStates || {};
+        const getFeedbackGuardrailState = (projectId) => {
+          const state = feedbackGuardrailStates[projectId];
+          return (state && typeof state === 'object') ? state : {};
+        };
+        const setFeedbackGuardrailState = (projectId, patch) => {
+          if (!projectId) return;
+          feedbackGuardrailStates[projectId] = Object.assign({}, getFeedbackGuardrailState(projectId), patch || {});
+        };
+        const buildFeedbackGuardrailWarning = (guardrail) => {
+          const info = (guardrail && typeof guardrail === 'object') ? guardrail : {};
+          if (info.warning_message) return String(info.warning_message);
+          const absDelta = Number(info.abs_delta_100 || 0);
+          const ratio = Number(info.relative_delta_ratio || 0) * 100;
+          if (absDelta > 0) {
+            return '预测与真实总分偏差 ' + absDelta.toFixed(2) + ' 分（100分口径，' + ratio.toFixed(1) + '%），已暂停自动调权/自动校准，请人工确认后再执行。';
+          }
+          return '检测到极端偏差样本，已暂停自动调权/自动校准，请人工确认后再执行。';
+        };
+        const maybeConfirmExtremeSample = (projectId, actionLabel) => {
+          const state = getFeedbackGuardrailState(projectId);
+          if (!state.pending) return false;
+          if (state.manualConfirmed) return true;
+          const warning = state.warningMessage || '检测到极端偏差样本。';
+          const ok = window.confirm(warning + '\n\n是否确认将该样本纳入本次「' + actionLabel + '」？');
+          if (ok) {
+            setFeedbackGuardrailState(projectId, { manualConfirmed: true });
+            return true;
+          }
+          return null;
+        };
+        const maybeRetryWithExtremeSampleConfirm = async (projectId, actionLabel, res, data, requestFn) => {
+          const detail = data && data.detail ? String(data.detail) : '';
+          if (!res || res.status !== 409 || detail.indexOf('confirm_extreme_sample=1') < 0) {
+            return { res, data };
+          }
+          const ok = window.confirm(detail + '\n\n是否确认将该极端样本纳入本次「' + actionLabel + '」？');
+          if (!ok) return { res, data };
+          setFeedbackGuardrailState(projectId, {
+            pending: true,
+            manualConfirmed: true,
+            warningMessage: detail,
+          });
+          const retriedRes = await requestFn(true);
+          const retriedData = await retriedRes.json().catch(() => ({}));
+          return { res: retriedRes, data: retriedData };
+        };
         safeClick('btnAddGroundTruth', async () => {
           if (!ensureProjectForAction('evolveResult')) return;
           const projectId = actionProjectId();
@@ -26569,11 +27216,34 @@ def index(
           }
           const sourceName = String((submissionSelect && submissionSelect.options && submissionSelect.selectedIndex >= 0 && submissionSelect.options[submissionSelect.selectedIndex] && submissionSelect.options[submissionSelect.selectedIndex].textContent) || submissionId);
           const evolveEl = document.getElementById('evolveResult');
+          const feedbackGuardrail = (data && typeof data.feedback_guardrail === 'object') ? data.feedback_guardrail : {};
+          const closedLoop = (data && typeof data.feedback_closed_loop === 'object') ? data.feedback_closed_loop : {};
+          const closedLoopGuardrail = (closedLoop && typeof closedLoop.feedback_guardrail === 'object') ? closedLoop.feedback_guardrail : {};
+          const activeGuardrail = closedLoopGuardrail.blocked ? closedLoopGuardrail : feedbackGuardrail;
+          const guardrailBlocked = !!(feedbackGuardrail.blocked || closedLoopGuardrail.blocked || closedLoop.guardrail_triggered);
+          if (guardrailBlocked) {
+            setFeedbackGuardrailState(projectId, {
+              pending: true,
+              manualConfirmed: false,
+              warningMessage: buildFeedbackGuardrailWarning(activeGuardrail),
+            });
+          } else {
+            setFeedbackGuardrailState(projectId, {
+              pending: false,
+              manualConfirmed: false,
+              warningMessage: '',
+            });
+          }
           evolveEl.innerHTML =
             '<p class="success">真实评标录入完成：已记录 1 条。</p>' +
             '<p style="margin:6px 0 0 0"><strong>施组：</strong>' + escapeHtmlText(sourceName) + '</p>' +
             '<p style="margin:4px 0 0 0"><strong>评委人数：</strong>' + escapeHtmlText(String(judgeScores.length)) + ' 位</p>' +
-            '<p style="margin:4px 0 0 0"><strong>最终分：</strong>' + escapeHtmlText(String(data.final_score != null ? data.final_score : finalScore)) + '</p>';
+            '<p style="margin:4px 0 0 0"><strong>最终分：</strong>' + escapeHtmlText(String(data.final_score != null ? data.final_score : finalScore)) + '</p>' +
+            (
+              guardrailBlocked
+                ? '<p style="margin:8px 0 0 0;color:#9a3412"><strong>风控提示：</strong>' + escapeHtmlText(buildFeedbackGuardrailWarning(activeGuardrail)) + '</p>'
+                : '<p style="margin:8px 0 0 0;color:#166534">反馈闭环已接收该样本，未触发极端偏差拦截。</p>'
+            );
           evolveEl.style.display = 'block';
           if (submissionSelect) submissionSelect.value = '';
           refreshGroundTruth();
@@ -26581,9 +27251,19 @@ def index(
         safeClick('btnEvolve', async () => {
           if (!ensureProjectForAction('evolveResult')) return;
           const projectId = actionProjectId();
+          const preConfirmed = maybeConfirmExtremeSample(projectId, '学习进化');
+          if (preConfirmed === null) {
+            setResultError('evolveResult', '已取消纳入极端偏差样本，本次未执行学习进化。');
+            return;
+          }
           setResultLoading('evolveResult', '学习进化执行中...');
-          const res = await fetch('/api/v1/projects/' + projectId + '/evolve', { method: 'POST', headers: apiHeaders(false) });
-          const data = await res.json().catch(() => ({}));
+          const requestEvolve = async (forceConfirm) => {
+            const suffix = forceConfirm ? '?confirm_extreme_sample=1' : '';
+            return fetch('/api/v1/projects/' + projectId + '/evolve' + suffix, { method: 'POST', headers: apiHeaders(false) });
+          };
+          let res = await requestEvolve(preConfirmed === true);
+          let data = await res.json().catch(() => ({}));
+          ({ res, data } = await maybeRetryWithExtremeSampleConfirm(projectId, '学习进化', res, data, requestEvolve));
           showJson('output', formatApiOutput(res, data, '请求失败，若需认证请设置 API Key'));
           const el = document.getElementById('evolveResult');
           el.style.display = 'block';
@@ -26790,9 +27470,19 @@ def index(
         });
         safeClick('btnAutoRunReflection', async () => {
           const projectId = actionProjectId();
+          const preConfirmed = maybeConfirmExtremeSample(projectId, '一键闭环执行');
+          if (preConfirmed === null) {
+            setResultError('calibTrainResult', '已取消纳入极端偏差样本，本次未执行一键闭环。');
+            return;
+          }
           setResultLoading('calibTrainResult', '正在执行闭环流程...');
-          const res = await fetch('/api/v1/projects/' + projectId + '/reflection/auto_run', { method: 'POST', headers: apiHeaders(false) });
-          const data = await res.json().catch(() => ({}));
+          const requestAutoRun = async (forceConfirm) => {
+            const suffix = forceConfirm ? '?confirm_extreme_sample=1' : '';
+            return fetch('/api/v1/projects/' + projectId + '/reflection/auto_run' + suffix, { method: 'POST', headers: apiHeaders(false) });
+          };
+          let res = await requestAutoRun(preConfirmed === true);
+          let data = await res.json().catch(() => ({}));
+          ({ res, data } = await maybeRetryWithExtremeSampleConfirm(projectId, '一键闭环执行', res, data, requestAutoRun));
           showJson('output', formatApiOutput(res, data));
           showCalibratorSummaryBlock('calibTrainResult', res.ok, res.ok ? '一键闭环执行完成' : '一键闭环执行失败', data);
         });

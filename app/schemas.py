@@ -989,6 +989,11 @@ class GroundTruthRecord(BaseModel):
         description="每位评委的定性标签（例：[['扣了进度分'], ['重点表扬了BIM']...]）",
     )
     source: str = Field(default="青天大模型", description="来源")
+    feedback_guardrail: Dict[str, Any] = Field(default_factory=dict, description="闭环守门诊断")
+    feedback_closed_loop: Dict[str, Any] = Field(default_factory=dict, description="闭环执行结果")
+    few_shot_distillation: Dict[str, Any] = Field(
+        default_factory=dict, description="高分逻辑few-shot蒸馏结果"
+    )
     created_at: str
 
 

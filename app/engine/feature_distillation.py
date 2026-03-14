@@ -97,6 +97,69 @@ def save_feature_kb(features: Sequence[ExtractedFeature]) -> None:
     save_high_score_features(payload)
 
 
+def distill_feature_from_text(
+    *,
+    dimension_id: str,
+    source_text: str,
+    confidence_score: float = 0.62,
+) -> ExtractedFeature | None:
+    clean_text = str(source_text or "").strip()
+    if not clean_text:
+        return None
+    candidate_lines = _skeleton_lines_from_text(clean_text)
+    if clean_text not in candidate_lines:
+        candidate_lines.append(clean_text)
+    logic_skeleton = _sanitize_logic_skeleton(candidate_lines, clean_text)
+    if not logic_skeleton:
+        return None
+    now = _now_iso()
+    return ExtractedFeature(
+        feature_id=str(uuid4()),
+        dimension_id=str(dimension_id),
+        logic_skeleton=logic_skeleton,
+        confidence_score=_clip(_safe_float(confidence_score, 0.62), 0.0, 1.0),
+        usage_count=0,
+        active=True,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def upsert_distilled_features(features: Sequence[ExtractedFeature]) -> Dict[str, int]:
+    clean_features = [feature for feature in features if isinstance(feature, ExtractedFeature)]
+    if not clean_features:
+        return {"added": 0, "updated": 0, "total": len(load_feature_kb())}
+
+    existing = load_feature_kb()
+    index = {
+        (feature.dimension_id, tuple(feature.logic_skeleton)): feature
+        for feature in existing
+        if feature.active
+    }
+    added = 0
+    updated = 0
+    for feature in clean_features:
+        key = (feature.dimension_id, tuple(feature.logic_skeleton))
+        current = index.get(key)
+        if current is None:
+            existing.append(feature)
+            index[key] = feature
+            added += 1
+            continue
+        current.confidence_score = _clip(
+            max(_safe_float(current.confidence_score), _safe_float(feature.confidence_score)),
+            0.0,
+            1.0,
+        )
+        current.active = True
+        current.retired_at = None
+        current.updated_at = _now_iso()
+        updated += 1
+    if added or updated:
+        save_feature_kb(existing)
+    return {"added": added, "updated": updated, "total": len(existing)}
+
+
 def _skeleton_lines_from_text(raw_text: str) -> List[str]:
     lines = re.split(r"[\n;；]+", raw_text)
     out = [x.strip("- ").strip() for x in lines if x.strip()]

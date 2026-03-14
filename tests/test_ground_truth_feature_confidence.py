@@ -5,6 +5,8 @@ from unittest.mock import patch
 
 from app.main import (
     _auto_update_feature_confidence_on_ground_truth,
+    _build_ground_truth_feedback_guardrail,
+    _capture_ground_truth_few_shot_features,
     _collect_applied_feature_ids_from_report,
 )
 
@@ -103,3 +105,69 @@ def test_auto_update_feature_confidence_returns_reason_when_no_features() -> Non
 
     assert out["updated"] == 0
     assert out["reason"] == "no_applied_feature_ids"
+
+
+def test_build_ground_truth_feedback_guardrail_blocks_extreme_delta() -> None:
+    gt_record = {
+        "id": "gt-guardrail",
+        "final_score": 80,
+        "score_scale_max": 100,
+        "judge_scores": [78, 79, 80, 81, 82],
+    }
+    report = {"pred_total_score": 35}
+
+    out = _build_ground_truth_feedback_guardrail(
+        report=report,
+        gt_record=gt_record,
+        project_score_scale_max=100,
+    )
+
+    assert out["blocked"] is True
+    assert out["requires_manual_confirmation"] is True
+    assert out["abs_delta_100"] == 45.0
+    assert out["relative_delta_ratio"] == 0.45
+    assert "暂停自动调权" in (out["warning_message"] or "")
+
+
+def test_capture_ground_truth_few_shot_features_distills_evidence(monkeypatch) -> None:
+    report = {
+        "dimension_scores": {
+            "09": {
+                "score": 9.5,
+                "evidence": [
+                    {
+                        "anchor_label": "进度计划网",
+                        "quote": "关键线路实行周纠偏与节点验收闭环。",
+                    }
+                ],
+            }
+        },
+        "suggestions": [{"dimension_id": "09", "text": "补强关键节点纠偏闭环。"}],
+    }
+    gt_record = {
+        "id": "gt-logic",
+        "final_score": 86,
+        "score_scale_max": 100,
+        "judge_scores": [84, 85, 86, 87, 88],
+        "qualitative_tags_by_judge": [["重点表扬工期组织", "节点管控清晰"]],
+    }
+    captured = {}
+
+    def _fake_upsert(features):
+        captured["count"] = len(features)
+        return {"added": len(features), "updated": 0, "total": len(features)}
+
+    monkeypatch.setattr("app.main.upsert_distilled_features", _fake_upsert)
+
+    out = _capture_ground_truth_few_shot_features(
+        report=report,
+        gt_record=gt_record,
+        project_score_scale_max=100,
+        feedback_guardrail={"blocked": False},
+        feature_confidence_update={"applied_dimension_ids": ["09"]},
+    )
+
+    assert out["captured"] == 1
+    assert out["reason"] == "captured"
+    assert out["dimension_ids"] == ["09"]
+    assert captured["count"] == 1

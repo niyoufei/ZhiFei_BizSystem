@@ -622,4 +622,4 @@ def load_high_score_features() -> List[Dict[str, Any]]:
 
 
 def save_high_score_features(data: List[Dict[str, Any]]) -> None:
-    save_json(HIGH_SCORE_FEATURES_PATH, data)
+    save_json(HIGH_SCORE_FEATURES_PATH, data, keep_history=True)

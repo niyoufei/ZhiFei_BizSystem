@@ -77,6 +77,60 @@ def test_update_feature_confidence_retire_when_low_and_used(monkeypatch) -> None
     assert feature.usage_count == 3
 
 
+def test_distill_feature_from_text_returns_sanitized_feature() -> None:
+    feature = fd.distill_feature_from_text(
+        dimension_id="09",
+        source_text="关键线路明确；每周2次纠偏会；节点验收闭环。",
+        confidence_score=0.72,
+    )
+    assert feature is not None
+    assert feature.dimension_id == "09"
+    assert feature.logic_skeleton
+    assert all("[前置条件]" in item for item in feature.logic_skeleton)
+    assert all(not any(ch.isdigit() for ch in item) for item in feature.logic_skeleton)
+
+
+def test_upsert_distilled_features_adds_and_updates_existing(monkeypatch) -> None:
+    existing = ExtractedFeature(
+        feature_id="F-existing",
+        dimension_id="09",
+        logic_skeleton=["[前置条件] 节点明确 + [技术/动作] 计划纠偏 + [量化指标类型] 闭环验收"],
+        confidence_score=0.45,
+        usage_count=2,
+        active=True,
+    )
+    new_feature = ExtractedFeature(
+        feature_id="F-new",
+        dimension_id="09",
+        logic_skeleton=["[前置条件] 场景明确 + [技术/动作] 资源统筹 + [量化指标类型] 节点达成率"],
+        confidence_score=0.67,
+        usage_count=0,
+        active=True,
+    )
+    stronger_existing = ExtractedFeature(
+        feature_id="F-override",
+        dimension_id="09",
+        logic_skeleton=list(existing.logic_skeleton),
+        confidence_score=0.8,
+        usage_count=0,
+        active=True,
+    )
+    saved = {}
+
+    monkeypatch.setattr(fd, "load_feature_kb", lambda: [existing])
+    monkeypatch.setattr(
+        fd, "save_feature_kb", lambda features: saved.setdefault("count", len(features))
+    )
+
+    out = fd.upsert_distilled_features([new_feature, stronger_existing])
+
+    assert out["added"] == 1
+    assert out["updated"] == 1
+    assert out["total"] == 2
+    assert existing.confidence_score == 0.8
+    assert saved["count"] == 2
+
+
 def test_generate_tailored_advice_prompt_and_error_handling() -> None:
     base = fd.generate_tailored_advice(
         weak_text="弱项文本",

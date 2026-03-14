@@ -6865,6 +6865,156 @@ class TestFeedbackClosedLoopSafety:
         assert payload.get("project_id") == "p1"
         assert payload.get("trigger") == "rescore"
 
+    @patch("app.main.auto_run_reflection_pipeline")
+    @patch("app.main._sync_feedback_weights_to_evolution")
+    @patch("app.main._auto_update_project_weights_from_delta_cases")
+    @patch("app.main._refresh_evolution_report_from_ground_truth")
+    @patch("app.main._refresh_project_reflection_objects")
+    @patch("app.main.load_ground_truth")
+    def test_run_feedback_closed_loop_skips_auto_update_when_guardrail_blocked(
+        self,
+        mock_load_ground_truth,
+        mock_refresh_reflection,
+        mock_refresh_evo,
+        mock_auto_update,
+        mock_sync_weights,
+        mock_auto_run,
+    ):
+        from app.main import _run_feedback_closed_loop
+
+        mock_load_ground_truth.return_value = [
+            {
+                "id": "gt-1",
+                "project_id": "p1",
+                "feedback_guardrail": {
+                    "blocked": True,
+                    "abs_delta_100": 45.0,
+                    "warning_message": "预测与真实总分偏差过大，已暂停自动调权/自动校准。",
+                },
+            }
+        ]
+        mock_refresh_evo.return_value = {"refreshed": True, "sample_count": 0}
+
+        payload = _run_feedback_closed_loop(
+            "p1",
+            locale="zh",
+            trigger="ground_truth_add",
+            ground_truth_record_ids=["gt-1"],
+        )
+
+        assert payload["ok"] is True
+        assert payload["guardrail_triggered"] is True
+        assert payload["requires_manual_confirmation"] is True
+        assert payload["auto_update_skipped"] is True
+        assert payload["feedback_guardrail"]["blocked"] is True
+        mock_refresh_reflection.assert_called_once()
+        mock_refresh_evo.assert_called_once()
+        mock_auto_update.assert_not_called()
+        mock_sync_weights.assert_not_called()
+        mock_auto_run.assert_not_called()
+
+
+class TestGroundTruthGuardrailRoutes:
+    @patch("app.main._run_feedback_closed_loop_safe")
+    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main.save_ground_truth")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_add_ground_truth_from_submission_returns_guardrail_metadata(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_submissions,
+        mock_load_ground_truth,
+        mock_save_ground_truth,
+        mock_sync_gt,
+        mock_run_closed_loop,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 100}}]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "施组一.docx",
+                "text": "示例施组文本" * 20,
+            }
+        ]
+        mock_load_ground_truth.return_value = []
+        mock_sync_gt.return_value = {
+            "feedback_guardrail": {
+                "blocked": True,
+                "warning_message": "预测与真实总分偏差 45.00 分（100分口径，45.0%）。",
+            },
+            "few_shot_distillation": {"captured": 0, "reason": "guardrail_blocked"},
+        }
+        mock_run_closed_loop.return_value = {
+            "ok": True,
+            "guardrail_triggered": True,
+            "requires_manual_confirmation": True,
+            "feedback_guardrail": {"blocked": True},
+        }
+
+        response = client.post(
+            "/api/v1/projects/p1/ground_truth/from_submission",
+            json={
+                "submission_id": "s1",
+                "judge_scores": [80, 81, 82, 83, 84],
+                "final_score": 80,
+                "source": "青天大模型",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["feedback_guardrail"]["blocked"] is True
+        assert data["few_shot_distillation"]["reason"] == "guardrail_blocked"
+        assert data["feedback_closed_loop"]["guardrail_triggered"] is True
+        mock_run_closed_loop.assert_called_once()
+        assert mock_run_closed_loop.call_args.kwargs["ground_truth_record_ids"]
+
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main._collect_blocked_ground_truth_guardrails")
+    def test_auto_run_reflection_requires_manual_confirm_when_guardrail_blocked(
+        self,
+        mock_collect_blocked,
+        mock_ensure,
+        mock_load_projects,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1"}]
+        mock_collect_blocked.return_value = [
+            {"record_id": "gt-1", "feedback_guardrail": {"blocked": True, "abs_delta_100": 42.0}}
+        ]
+
+        response = client.post("/api/v1/projects/p1/reflection/auto_run")
+
+        assert response.status_code == 409
+        assert "confirm_extreme_sample=1" in response.json()["detail"]
+
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main._collect_blocked_ground_truth_guardrails")
+    def test_evolve_requires_manual_confirm_when_guardrail_blocked(
+        self,
+        mock_collect_blocked,
+        mock_ensure,
+        mock_load_projects,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 100}}]
+        mock_collect_blocked.return_value = [
+            {"record_id": "gt-1", "feedback_guardrail": {"blocked": True, "abs_delta_100": 42.0}}
+        ]
+
+        response = client.post("/api/v1/projects/p1/evolve")
+
+        assert response.status_code == 409
+        assert "confirm_extreme_sample=1" in response.json()["detail"]
+
 
 class TestDynamicBlendAdjustment:
     def test_resolve_dynamic_blend_adjustment_no_signal_keeps_weights(self):
