@@ -48,6 +48,82 @@ class TestAppLifespan:
         mock_stop_worker.assert_called_once()
 
 
+class TestStorageErrorHandling:
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_storage_data_error_returns_readable_json(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        client,
+    ):
+        from app.storage import StorageDataError
+
+        mock_load_projects.side_effect = StorageDataError(
+            Path("/tmp/projects.json"),
+            "json_parse_failed",
+            "数据文件 JSON 格式损坏：projects.json（第 1 行，第 3 列），请使用历史版本回滚。",
+        )
+
+        response = client.get("/api/v1/projects")
+
+        assert response.status_code == 500
+        data = response.json()
+        assert data["error_code"] == "json_parse_failed"
+        assert data["file"] == "projects.json"
+        assert "历史版本回滚" in data["detail"]
+
+
+class TestVersionedJsonHistoryRoutes:
+    @patch("app.main.list_json_versions")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_versioned_json_history(
+        self,
+        mock_ensure,
+        mock_list_versions,
+        client,
+    ):
+        mock_list_versions.return_value = [
+            {
+                "version_id": "20260314T010203000000Z",
+                "filename": "expert_profiles_v20260314T010203000000Z.json",
+                "created_at": "2026-03-14T01:02:03+00:00",
+                "size_bytes": 128,
+            }
+        ]
+
+        response = client.get("/api/v1/ops/versioned-json/expert_profiles")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["artifact"] == "expert_profiles"
+        assert data["versions"][0]["version_id"] == "20260314T010203000000Z"
+
+    @patch("app.main.restore_json_version")
+    @patch("app.main.ensure_data_dirs")
+    def test_rollback_versioned_json_history(
+        self,
+        mock_ensure,
+        mock_restore_json_version,
+        client,
+    ):
+        mock_restore_json_version.return_value = {
+            "version_id": "20260314T010203000000Z",
+            "restored_at": "2026-03-14T02:03:04+00:00",
+        }
+
+        response = client.post(
+            "/api/v1/ops/versioned-json/calibration_models/rollback",
+            json={"version_id": "20260314T010203000000Z"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["ok"] is True
+        assert data["artifact"] == "calibration_models"
+        assert data["restored_version_id"] == "20260314T010203000000Z"
+
+
 class TestMaterialParseWorkerLifecycle:
     @patch("app.main.logger.warning")
     @patch("app.main.threading.Thread")
@@ -1057,11 +1133,65 @@ class TestExpertProfileEndpoints:
         data = response.json()
         assert data["expert_profile"]["name"] == "安全偏重"
         assert data["project"]["expert_profile_id"] == data["expert_profile"]["id"]
+        assert data["project"]["meta"]["expert_profile_read_only"] is True
+        assert data["project"]["meta"]["expert_profile_lock_source"] == "manual"
         norm = data["expert_profile"]["weights_norm"]
         assert abs(sum(norm.values()) - 1.0) < 1e-6
         assert norm["02"] > norm["01"]
         mock_save_profiles.assert_called_once()
         mock_save_projects.assert_called_once()
+
+    @patch("app.main.save_projects")
+    @patch("app.main.save_expert_profiles")
+    @patch("app.main.calibrate_weights")
+    @patch("app.main._build_feedback_records_for_project")
+    @patch("app.main.load_expert_profiles")
+    @patch("app.main.load_projects")
+    def test_auto_update_project_weights_keeps_project_profile_read_only(
+        self,
+        mock_load_projects,
+        mock_load_profiles,
+        mock_build_feedback_records,
+        mock_calibrate_weights,
+        mock_save_profiles,
+        mock_save_projects,
+    ):
+        from app.main import _auto_update_project_weights_from_delta_cases
+
+        project = {
+            "id": "p1",
+            "name": "项目1",
+            "expert_profile_id": "ep1",
+            "meta": {"expert_profile_read_only": True},
+        }
+        profile = {
+            "id": "ep1",
+            "name": "默认",
+            "weights_raw": {f"{i:02d}": 5 for i in range(1, 17)},
+            "weights_norm": {f"{i:02d}": 1 / 16 for i in range(1, 17)},
+            "norm_rule_version": "v1_m=0.5+a/10_norm=sum",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        }
+        mock_load_projects.return_value = [project]
+        mock_load_profiles.return_value = [profile]
+        mock_build_feedback_records.return_value = [{"final_score": 90.0, "delta": 2.0}]
+        mock_calibrate_weights.return_value = {
+            "weights_norm": {
+                **{f"{i:02d}": 1 / 16 for i in range(1, 17)},
+                "02": 0.1,
+                "01": 0.025,
+            },
+            "stats": {"sample_count": 1},
+        }
+
+        out = _auto_update_project_weights_from_delta_cases("p1")
+
+        assert out["updated"] is True
+        assert out["project_profile_mutated"] is False
+        assert project["expert_profile_id"] == "ep1"
+        mock_save_profiles.assert_called_once()
+        mock_save_projects.assert_not_called()
 
     @patch("app.main._run_feedback_closed_loop")
     @patch("app.main._validate_material_gate_for_scoring")

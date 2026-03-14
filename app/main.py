@@ -68,7 +68,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.exception_handlers import http_exception_handler
-from fastapi.responses import RedirectResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.auth import get_auth_status, verify_api_key
@@ -227,6 +227,10 @@ from app.schemas import (
     SelfCheckResponse,
     SubmissionRecord,
     TrendAnalysis,
+    VersionedJsonHistoryResponse,
+    VersionedJsonRollbackRequest,
+    VersionedJsonRollbackResponse,
+    VersionedJsonSnapshotRecord,
     WritingGuidance,
 )
 from app.scoring_diagnostics import (
@@ -239,9 +243,15 @@ from app.scoring_diagnostics import (
     prepare_latest_submission_context,
 )
 from app.storage import (
+    CALIBRATION_MODELS_PATH,
+    EVOLUTION_REPORTS_PATH,
+    EXPERT_PROFILES_PATH,
     MATERIALS_DIR,
+    StorageDataError,
+    VersionedJsonSnapshotNotFound,
     ensure_data_dirs,
     is_secure_desktop_mode_enabled,
+    list_json_versions,
     load_calibration_models,
     load_calibration_samples,
     load_delta_cases,
@@ -264,6 +274,7 @@ from app.storage import (
     load_submissions,
     prepare_secure_runtime,
     read_bytes,
+    restore_json_version,
     save_bytes,
     save_calibration_models,
     save_calibration_samples,
@@ -409,6 +420,11 @@ DEFAULT_CALIBRATION_MIN_SAMPLES = 20
 DEFAULT_CALIBRATION_FRESHNESS_DAYS = 90
 DEFAULT_CALIBRATION_MIN_RECENT_RATIO = 0.6
 PROFILE_LOCKED_STATUSES = {"submitted_to_qingtian"}
+VERSIONED_JSON_ARTIFACTS = {
+    "expert_profiles": EXPERT_PROFILES_PATH,
+    "calibration_models": CALIBRATION_MODELS_PATH,
+    "evolution_reports": EVOLUTION_REPORTS_PATH,
+}
 SYSTEM_SELF_CHECK_REQUIRED_ITEM_NAMES = {
     "health",
     "config",
@@ -2323,6 +2339,29 @@ def _ensure_project_v2_fields(
     return changed
 
 
+def _mark_project_expert_profile_read_only(
+    project: Dict[str, object],
+    *,
+    source: str,
+    locked_at: Optional[str] = None,
+) -> bool:
+    meta = project.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+        project["meta"] = meta
+    changed = False
+    if not bool(meta.get("expert_profile_read_only")):
+        meta["expert_profile_read_only"] = True
+        changed = True
+    if not str(meta.get("expert_profile_locked_at") or "").strip():
+        meta["expert_profile_locked_at"] = locked_at or _now_iso()
+        changed = True
+    if not str(meta.get("expert_profile_lock_source") or "").strip():
+        meta["expert_profile_lock_source"] = str(source).strip()
+        changed = True
+    return changed
+
+
 def _assert_project_profile_operation_unlocked(
     project: Dict[str, object], force_unlock: bool
 ) -> None:
@@ -2348,8 +2387,17 @@ def _ensure_project_expert_profile(
     created = _new_expert_profile(profile_name, _default_weights_raw())
     all_profiles.append(created)
     project["expert_profile_id"] = created["id"]
+    _mark_project_expert_profile_read_only(project, source="auto_default")
     project["updated_at"] = _now_iso()
     return created, True
+
+
+def _resolve_versioned_json_artifact_path(artifact: str) -> Path:
+    key = str(artifact or "").strip()
+    path = VERSIONED_JSON_ARTIFACTS.get(key)
+    if path is None:
+        raise HTTPException(status_code=404, detail="历史版本配置不存在")
+    return path
 
 
 def _recover_missing_project_from_artifacts(
@@ -8483,15 +8531,12 @@ def _auto_update_from_delta_cases(project_id: str) -> Dict[str, object]:
     profiles.append(new_profile)
     save_expert_profiles(profiles)
 
-    project["expert_profile_id"] = new_profile["id"]
-    project["updated_at"] = _now_iso()
-    save_projects(projects)
-
     return {
         "updated": True,
         "sample_count": len(delta_cases),
         "changed_dims": changed_dims,
         "new_profile_id": new_profile["id"],
+        "project_profile_mutated": False,
         "strategy": "delta_case_fallback",
         "new_weights_norm": dict(new_profile.get("weights_norm") or {}),
         "new_dimension_multipliers": _weights_norm_to_dimension_multipliers(
@@ -8541,15 +8586,12 @@ def _auto_update_project_weights_from_delta_cases(project_id: str) -> Dict[str, 
             profiles.append(new_profile)
             save_expert_profiles(profiles)
 
-            project["expert_profile_id"] = new_profile["id"]
-            project["updated_at"] = _now_iso()
-            save_projects(projects)
-
             return {
                 "updated": True,
                 "strategy": "tag_guided_calibration",
                 "sample_count": len(feedback_records),
                 "new_profile_id": new_profile["id"],
+                "project_profile_mutated": False,
                 "calibration_stats": calibrated.get("stats") or {},
                 "new_weights_norm": dict(new_profile.get("weights_norm") or {}),
                 "new_dimension_multipliers": _weights_norm_to_dimension_multipliers(
@@ -8582,6 +8624,10 @@ def _sync_feedback_weights_to_evolution(
     scoring_evolution.setdefault("rationale", {})
     scoring_evolution["updated_by_feedback"] = True
     scoring_evolution["updated_by_feedback_at"] = _now_iso()
+    candidate_profile_id = str(weight_update.get("new_profile_id") or "").strip()
+    if candidate_profile_id:
+        scoring_evolution["candidate_profile_id"] = candidate_profile_id
+    scoring_evolution["project_expert_profile_read_only"] = True
     evo["scoring_evolution"] = scoring_evolution
     evo.setdefault("project_id", project_id)
     evo.setdefault("sample_count", 0)
@@ -8591,6 +8637,8 @@ def _sync_feedback_weights_to_evolution(
     return {
         "synced": True,
         "dimension_multipliers_count": len(scoring_evolution.get("dimension_multipliers") or {}),
+        "candidate_profile_id": candidate_profile_id or None,
+        "project_profile_mutated": False,
     }
 
 
@@ -9630,6 +9678,26 @@ async def _web_405_fallback_handler(request: Request, exc: StarletteHTTPExceptio
     return await http_exception_handler(request, exc)
 
 
+@app.exception_handler(StorageDataError)
+async def _storage_data_error_handler(request: Request, exc: StorageDataError):
+    logger.error(
+        "storage_data_error path=%s code=%s detail=%s request_id=%s",
+        exc.path,
+        exc.code,
+        exc.detail,
+        getattr(request.state, "request_id", ""),
+    )
+    status_code = 404 if isinstance(exc, VersionedJsonSnapshotNotFound) else 500
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "detail": exc.detail,
+            "error_code": exc.code,
+            "file": exc.path.name,
+        },
+    )
+
+
 def parse_accept_language(accept_language: str | None) -> str:
     """
     解析 Accept-Language header，返回最佳匹配的语言代码。
@@ -10491,6 +10559,12 @@ def get_project_expert_profile(
     project_changed = _ensure_project_v2_fields(project)
     profiles = load_expert_profiles()
     profile, created = _ensure_project_expert_profile(project, profiles)
+    if _mark_project_expert_profile_read_only(
+        project,
+        source="manual" if not created else "auto_default",
+        locked_at=str(profile.get("updated_at") or profile.get("created_at") or _now_iso()),
+    ):
+        project_changed = True
     if project_changed or created:
         save_projects(projects)
     if created:
@@ -10534,6 +10608,11 @@ def update_project_expert_profile(
     save_expert_profiles(profiles)
 
     project["expert_profile_id"] = profile["id"]
+    _mark_project_expert_profile_read_only(
+        project,
+        source="manual_force_unlock" if bool(payload.force_unlock) else "manual",
+        locked_at=str(profile.get("updated_at") or profile.get("created_at") or _now_iso()),
+    )
     project["updated_at"] = _now_iso()
     save_projects(projects)
 
@@ -10578,6 +10657,12 @@ def rescore_project_submissions(
         project_changed = True
     profiles = load_expert_profiles()
     profile, created = _ensure_project_expert_profile(project, profiles)
+    if _mark_project_expert_profile_read_only(
+        project,
+        source="manual" if not created else "auto_default",
+        locked_at=str(profile.get("updated_at") or profile.get("created_at") or _now_iso()),
+    ):
+        project_changed = True
     if created:
         save_expert_profiles(profiles)
     if project_changed or created:
@@ -10761,6 +10846,50 @@ def rescore_project_submissions(
         feedback_closed_loop=feedback_closed_loop,
         started_at=started_at,
         finished_at=_now_iso(),
+    )
+
+
+@router.get(
+    "/ops/versioned-json/{artifact}",
+    response_model=VersionedJsonHistoryResponse,
+    tags=["项目管理"],
+    responses={**RESPONSES_401, **RESPONSES_404},
+)
+def list_versioned_json_history(
+    artifact: str,
+    api_key: Optional[str] = Depends(verify_api_key),
+) -> VersionedJsonHistoryResponse:
+    ensure_data_dirs()
+    path = _resolve_versioned_json_artifact_path(artifact)
+    versions = [
+        VersionedJsonSnapshotRecord(artifact=artifact, **row) for row in list_json_versions(path)
+    ]
+    return VersionedJsonHistoryResponse(
+        artifact=artifact,
+        versions=versions,
+        generated_at=_now_iso(),
+    )
+
+
+@router.post(
+    "/ops/versioned-json/{artifact}/rollback",
+    response_model=VersionedJsonRollbackResponse,
+    tags=["项目管理"],
+    responses={**RESPONSES_401, **RESPONSES_404},
+)
+def rollback_versioned_json_history(
+    artifact: str,
+    payload: VersionedJsonRollbackRequest,
+    api_key: Optional[str] = Depends(verify_api_key),
+) -> VersionedJsonRollbackResponse:
+    ensure_data_dirs()
+    path = _resolve_versioned_json_artifact_path(artifact)
+    restored = restore_json_version(path, payload.version_id)
+    return VersionedJsonRollbackResponse(
+        ok=True,
+        artifact=artifact,
+        restored_version_id=str(restored.get("version_id") or payload.version_id),
+        restored_at=str(restored.get("restored_at") or _now_iso()),
     )
 
 

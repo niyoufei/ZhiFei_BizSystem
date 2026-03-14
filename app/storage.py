@@ -7,6 +7,7 @@ import logging
 import os
 import tempfile
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -65,9 +66,22 @@ PATCH_PACKAGES_PATH = DATA_DIR / "patch_packages.json"
 PATCH_DEPLOYMENTS_PATH = DATA_DIR / "patch_deployments.json"
 HIGH_SCORE_FEATURES_PATH = DATA_DIR / "high_score_features.json"
 MATERIAL_PARSE_JOBS_PATH = DATA_DIR / "material_parse_jobs.json"
+VERSIONED_JSON_DIR = DATA_DIR / "versions"
 
 _PATH_LOCKS: Dict[str, threading.RLock] = {}
 _PATH_LOCKS_GUARD = threading.Lock()
+
+
+class StorageDataError(RuntimeError):
+    def __init__(self, path: Path, code: str, detail: str):
+        super().__init__(detail)
+        self.path = path
+        self.code = code
+        self.detail = detail
+
+
+class VersionedJsonSnapshotNotFound(StorageDataError):
+    pass
 
 
 def _is_secure_blob(payload: bytes) -> bool:
@@ -77,6 +91,7 @@ def _is_secure_blob(payload: bytes) -> bool:
 def ensure_data_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     MATERIALS_DIR.mkdir(parents=True, exist_ok=True)
+    VERSIONED_JSON_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _get_path_lock(path: Path) -> threading.RLock:
@@ -225,6 +240,78 @@ def _decrypt_payload(payload: bytes) -> bytes:
     return _dpapi_crypt(payload[len(_SECURE_FILE_MAGIC) :], decrypt=True)
 
 
+def _now_version_token() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def _version_bucket_for_path(path: Path) -> Path:
+    return VERSIONED_JSON_DIR / path.stem
+
+
+def _snapshot_path_for(path: Path, version_id: str) -> Path:
+    bucket = _version_bucket_for_path(path)
+    return bucket / f"{path.stem}_v{version_id}{path.suffix}"
+
+
+def _version_id_from_name(filename: str, stem: str) -> str:
+    prefix = f"{stem}_v"
+    suffix = ".json"
+    if filename.startswith(prefix) and filename.endswith(suffix):
+        return filename[len(prefix) : -len(suffix)]
+    return ""
+
+
+def list_json_versions(path: Path) -> List[Dict[str, Any]]:
+    bucket = _version_bucket_for_path(path)
+    if not bucket.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    for item in sorted(bucket.glob(f"{path.stem}_v*{path.suffix}"), reverse=True):
+        try:
+            stat = item.stat()
+        except OSError:
+            continue
+        version_id = _version_id_from_name(item.name, path.stem)
+        rows.append(
+            {
+                "version_id": version_id or item.name,
+                "filename": item.name,
+                "path": item,
+                "size_bytes": int(stat.st_size),
+                "created_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+            }
+        )
+    return rows
+
+
+def _write_json_version_snapshot(path: Path, payload: bytes) -> str:
+    ensure_data_dirs()
+    bucket = _version_bucket_for_path(path)
+    bucket.mkdir(parents=True, exist_ok=True)
+    version_id = _now_version_token()
+    snapshot_path = _snapshot_path_for(path, version_id)
+    save_bytes(snapshot_path, payload)
+    return version_id
+
+
+def restore_json_version(path: Path, version_id: str) -> Dict[str, Any]:
+    snapshot_path = _snapshot_path_for(path, str(version_id).strip())
+    if not snapshot_path.exists():
+        raise VersionedJsonSnapshotNotFound(
+            path,
+            "snapshot_not_found",
+            f"未找到历史版本：{path.stem} / {version_id}",
+        )
+    payload = read_bytes(snapshot_path)
+    save_bytes(path, payload)
+    return {
+        "version_id": str(version_id).strip(),
+        "restored_at": datetime.now(timezone.utc).isoformat(),
+        "snapshot_path": snapshot_path,
+        "current_path": path,
+    }
+
+
 def read_bytes(path: Path) -> bytes:
     if not path.exists():
         raise FileNotFoundError(path)
@@ -246,12 +333,60 @@ def save_bytes(path: Path, payload: bytes) -> None:
 def load_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
-    return json.loads(read_bytes(path).decode("utf-8"))
+    try:
+        payload = read_bytes(path)
+    except FileNotFoundError:
+        return default
+    except OSError as exc:
+        raise StorageDataError(
+            path, "file_read_failed", f"读取文件失败：{path.name}，{exc}"
+        ) from exc
+    try:
+        decoded = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise StorageDataError(
+            path,
+            "json_decode_failed",
+            f"数据文件已损坏或编码异常：{path.name}，请检查历史版本后回滚。",
+        ) from exc
+    try:
+        parsed = json.loads(decoded)
+    except json.JSONDecodeError as exc:
+        raise StorageDataError(
+            path,
+            "json_parse_failed",
+            f"数据文件 JSON 格式损坏：{path.name}（第 {exc.lineno} 行，第 {exc.colno} 列），请使用历史版本回滚。",
+        ) from exc
+    if isinstance(default, list) and not isinstance(parsed, list):
+        raise StorageDataError(
+            path,
+            "json_shape_mismatch",
+            f"数据文件结构异常：{path.name} 应为数组，但实际为 {type(parsed).__name__}。",
+        )
+    if isinstance(default, dict) and not isinstance(parsed, dict):
+        raise StorageDataError(
+            path,
+            "json_shape_mismatch",
+            f"数据文件结构异常：{path.name} 应为对象，但实际为 {type(parsed).__name__}。",
+        )
+    return parsed
 
 
-def save_json(path: Path, data: Any) -> None:
-    payload = json.dumps(data, ensure_ascii=False, indent=2)
-    save_bytes(path, payload.encode("utf-8"))
+def save_json(path: Path, data: Any, *, keep_history: bool = False) -> None:
+    try:
+        payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise StorageDataError(
+            path, "json_serialize_failed", f"写入 JSON 失败：{path.name}，{exc}"
+        ) from exc
+    if keep_history:
+        _write_json_version_snapshot(path, payload)
+    try:
+        save_bytes(path, payload)
+    except OSError as exc:
+        raise StorageDataError(
+            path, "file_write_failed", f"写入文件失败：{path.name}，{exc}"
+        ) from exc
 
 
 def _iter_secure_candidate_files() -> List[Path]:
@@ -379,7 +514,7 @@ def load_evolution_reports() -> Dict[str, Any]:
 
 
 def save_evolution_reports(data: Dict[str, Any]) -> None:
-    save_json(EVOLUTION_REPORTS_PATH, data)
+    save_json(EVOLUTION_REPORTS_PATH, data, keep_history=True)
 
 
 def load_expert_profiles() -> List[Dict[str, Any]]:
@@ -388,7 +523,7 @@ def load_expert_profiles() -> List[Dict[str, Any]]:
 
 
 def save_expert_profiles(data: List[Dict[str, Any]]) -> None:
-    save_json(EXPERT_PROFILES_PATH, data)
+    save_json(EXPERT_PROFILES_PATH, data, keep_history=True)
 
 
 def load_score_reports() -> List[Dict[str, Any]]:
@@ -442,7 +577,7 @@ def load_calibration_models() -> List[Dict[str, Any]]:
 
 
 def save_calibration_models(data: List[Dict[str, Any]]) -> None:
-    save_json(CALIBRATION_MODELS_PATH, data)
+    save_json(CALIBRATION_MODELS_PATH, data, keep_history=True)
 
 
 def load_delta_cases() -> List[Dict[str, Any]]:

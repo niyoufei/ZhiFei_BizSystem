@@ -354,6 +354,31 @@ class RescoreResponse(BaseModel):
     finished_at: str
 
 
+class VersionedJsonSnapshotRecord(BaseModel):
+    artifact: str
+    version_id: str
+    filename: str
+    created_at: str
+    size_bytes: int
+
+
+class VersionedJsonHistoryResponse(BaseModel):
+    artifact: str
+    versions: List[VersionedJsonSnapshotRecord] = Field(default_factory=list)
+    generated_at: str
+
+
+class VersionedJsonRollbackRequest(BaseModel):
+    version_id: str = Field(..., description="要回滚到的历史版本ID")
+
+
+class VersionedJsonRollbackResponse(BaseModel):
+    ok: bool
+    artifact: str
+    restored_version_id: str
+    restored_at: str
+
+
 class ScoringReadinessResponse(BaseModel):
     project_id: str
     ready: bool = Field(..., description="是否满足评分前置条件")

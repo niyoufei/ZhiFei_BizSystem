@@ -13,11 +13,13 @@ def isolate_repo_persistent_data(tmp_path_factory: pytest.TempPathFactory):
 
     说明：
     - 仅备份 data/*.json，避免复制用户可能很大的原始资料文件。
+    - 备份并恢复 data/versions 下的版本快照，避免版本化测试污染仓库。
     - materials/ 目录只清理“测试期间新增”的文件/目录，不改动原有文件。
     """
     repo_root = Path(__file__).resolve().parents[1]
     data_dir = repo_root / "data"
     materials_dir = data_dir / "materials"
+    versions_dir = data_dir / "versions"
     backup_dir = tmp_path_factory.mktemp("repo_data_backup")
 
     original_json_relpaths: set[str] = set()
@@ -28,6 +30,15 @@ def isolate_repo_persistent_data(tmp_path_factory: pytest.TempPathFactory):
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
             original_json_relpaths.add(rel.as_posix())
+
+    original_version_relpaths: set[str] = set()
+    if versions_dir.exists():
+        for src in versions_dir.rglob("*.json"):
+            rel = src.relative_to(data_dir)
+            dst = backup_dir / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            original_version_relpaths.add(rel.as_posix())
 
     original_material_entries: set[str] = set()
     if materials_dir.exists():
@@ -45,6 +56,30 @@ def isolate_repo_persistent_data(tmp_path_factory: pytest.TempPathFactory):
             current.unlink(missing_ok=True)
 
     for rel in sorted(original_json_relpaths):
+        src = backup_dir / rel
+        dst = data_dir / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+    if versions_dir.exists():
+        current_version_entries = sorted(
+            versions_dir.rglob("*"),
+            key=lambda path: len(path.relative_to(versions_dir).parts),
+            reverse=True,
+        )
+        for path in current_version_entries:
+            rel = path.relative_to(data_dir).as_posix()
+            if rel in original_version_relpaths:
+                continue
+            if path.is_file() or path.is_symlink():
+                path.unlink(missing_ok=True)
+            elif path.is_dir():
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+
+    for rel in sorted(original_version_relpaths):
         src = backup_dir / rel
         dst = data_dir / rel
         dst.parent.mkdir(parents=True, exist_ok=True)

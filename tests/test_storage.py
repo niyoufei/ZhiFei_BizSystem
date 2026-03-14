@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 
 class TestLoadJson:
     """Tests for load_json function"""
@@ -53,6 +55,18 @@ class TestLoadJson:
 
         result = load_json(test_file, {})
         assert result == test_data
+
+    def test_raises_readable_error_when_json_is_corrupted(self, tmp_path: Path):
+        from app.storage import StorageDataError, load_json
+
+        test_file = tmp_path / "broken.json"
+        test_file.write_text('{"broken": ', encoding="utf-8")
+
+        with pytest.raises(StorageDataError) as exc_info:
+            load_json(test_file, {})
+
+        assert exc_info.value.code == "json_parse_failed"
+        assert "broken.json" in exc_info.value.detail
 
 
 class TestSaveJson:
@@ -103,6 +117,29 @@ class TestSaveJson:
 
         loaded = json.loads(test_file.read_text(encoding="utf-8"))
         assert loaded == {"new": "data"}
+
+    def test_keep_history_creates_snapshots_and_allows_restore(self, tmp_path: Path):
+        from app import storage
+
+        test_file = tmp_path / "weights.json"
+        versions_dir = tmp_path / "versions"
+
+        with (
+            mock.patch.object(storage, "DATA_DIR", tmp_path),
+            mock.patch.object(storage, "MATERIALS_DIR", tmp_path / "materials"),
+            mock.patch.object(storage, "VERSIONED_JSON_DIR", versions_dir),
+        ):
+            storage.save_json(test_file, {"version": 1}, keep_history=True)
+            storage.save_json(test_file, {"version": 2}, keep_history=True)
+
+            versions = storage.list_json_versions(test_file)
+            assert len(versions) == 2
+
+            older = versions[-1]
+            restored = storage.restore_json_version(test_file, older["version_id"])
+
+            assert restored["version_id"] == older["version_id"]
+            assert storage.load_json(test_file, {}) == {"version": 1}
 
 
 class TestSecureStorage:
