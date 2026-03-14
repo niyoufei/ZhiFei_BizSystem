@@ -1251,6 +1251,8 @@ class EvidenceSpan(BaseModel):
     start_index: int
     end_index: int
     snippet: str
+    anchor_label: Optional[str] = None
+    quote: Optional[str] = None
 
 
 class SubScore(BaseModel):

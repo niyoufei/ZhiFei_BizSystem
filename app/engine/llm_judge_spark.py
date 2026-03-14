@@ -82,15 +82,63 @@ def validate_llm_judge_json(payload: Dict[str, Any]) -> Tuple[bool, Dict[str, An
         evidence = dim.get("evidence", [])
         if not isinstance(evidence, list) or len(evidence) == 0:
             errors.append(f"invalid_evidence_type:{dim_id}")
+        elif not all(_is_valid_evidence_item(item) for item in evidence):
+            errors.append(f"invalid_evidence_item:{dim_id}")
 
     for must in ["07", "09", "02", "03"]:
         dim = dim_scores.get(must, {})
         if "weight_multiplier" not in dim:
             errors.append(f"missing_weight_multiplier:{must}")
 
+    penalties = payload.get("penalties", [])
+    if not isinstance(penalties, list):
+        errors.append("invalid_penalties_type")
+    else:
+        for idx, penalty in enumerate(penalties):
+            if not isinstance(penalty, dict):
+                errors.append(f"invalid_penalty:{idx}")
+                continue
+            evidence = penalty.get("evidence")
+            if not _is_valid_evidence_item(evidence):
+                errors.append(f"invalid_penalty_evidence:{idx}")
+
     if errors:
         return False, {"error": "llm_judge_json_invalid", "details": errors}
     return True, {}
+
+
+def _is_valid_evidence_item(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    snippet = str(item.get("snippet") or "").strip()
+    quote = str(item.get("quote") or "").strip()
+    anchor_label = str(item.get("anchor_label") or "").strip()
+    return bool(snippet and quote and anchor_label)
+
+
+def _normalize_evidence_item(item: Any) -> Dict[str, Any]:
+    if not isinstance(item, dict):
+        return _placeholder_evidence()
+    snippet = str(item.get("snippet") or item.get("quote") or "").strip()
+    if not snippet:
+        return _placeholder_evidence()
+    try:
+        start_index = int(item.get("start_index") or 0)
+    except (TypeError, ValueError):
+        start_index = 0
+    try:
+        end_index = int(item.get("end_index") or 0)
+    except (TypeError, ValueError):
+        end_index = 0
+    anchor_label = str(item.get("anchor_label") or "").strip() or "正文片段"
+    quote = str(item.get("quote") or snippet).strip()
+    return {
+        "start_index": max(0, start_index),
+        "end_index": max(0, end_index),
+        "snippet": snippet,
+        "anchor_label": anchor_label,
+        "quote": quote,
+    }
 
 
 def post_process_llm_output(payload: Dict[str, Any], rubric: Dict[str, Any]) -> Dict[str, Any]:
@@ -123,15 +171,23 @@ def post_process_llm_output(payload: Dict[str, Any], rubric: Dict[str, Any]) -> 
             default_used = True
         dim["improvements"] = improvements
 
-        evidence = dim.get("evidence") or []
-        if not isinstance(evidence, list) or len(evidence) == 0:
-            evidence = [
-                {
-                    "start_index": 0,
-                    "end_index": 0,
-                    "snippet": "未在输入文本中检索到可支撑该维度的直接证据。",
-                }
-            ]
+        evidence_raw = dim.get("evidence") or []
+        normalized_evidence = (
+            [_normalize_evidence_item(item) for item in evidence_raw]
+            if isinstance(evidence_raw, list) and evidence_raw
+            else []
+        )
+        if not normalized_evidence:
+            normalized_evidence = [_placeholder_evidence()]
+            default_used = True
+        elif any(
+            str(item.get("quote") or "").strip() == _placeholder_evidence()["quote"]
+            for item in normalized_evidence
+        ):
+            default_used = True
+        if default_used and not any("证据" in str(item) for item in defects):
+            defects.append("证据缺失或原文锚点不足，当前评分已按严格口径下调。")
+        evidence = normalized_evidence
         dim["evidence"] = evidence
 
         if default_used:
@@ -154,7 +210,21 @@ def _placeholder_evidence() -> Dict[str, Any]:
         "start_index": 0,
         "end_index": 0,
         "snippet": "未在输入文本中检索到可支撑该维度的直接证据。",
+        "anchor_label": "未定位锚点",
+        "quote": "未在输入文本中检索到可支撑该维度的直接证据。",
     }
+
+
+def _evidence_payload_from_span(span: Any, *, fallback_anchor: str) -> Dict[str, Any]:
+    if span is None:
+        return _placeholder_evidence()
+    payload = span.model_dump() if hasattr(span, "model_dump") else dict(span)
+    payload["anchor_label"] = str(payload.get("anchor_label") or "").strip() or fallback_anchor
+    payload["quote"] = (
+        str(payload.get("quote") or payload.get("snippet") or "").strip()
+        or str(payload.get("snippet") or "").strip()
+    )
+    return _normalize_evidence_item(payload)
 
 
 def _build_from_rules(report: ScoreReport, rubric: Dict[str, Any]) -> Dict[str, Any]:
@@ -166,7 +236,10 @@ def _build_from_rules(report: ScoreReport, rubric: Dict[str, Any]) -> Dict[str, 
     dimension_scores: Dict[str, Any] = {}
     for dim_id, meta in DIMENSIONS.items():
         dim = report.dimension_scores[dim_id]
-        evidence = [e.model_dump() for e in dim.evidence]
+        evidence = [
+            _evidence_payload_from_span(e, fallback_anchor=f"{meta['name']}证据片段")
+            for e in dim.evidence
+        ]
         defects: List[str] = []
         score = float(dim.score)
         if not evidence:
@@ -216,7 +289,10 @@ def _build_from_rules(report: ScoreReport, rubric: Dict[str, Any]) -> Dict[str, 
             "analysis_score_0_5": report.logic_lock.analysis_score,
             "solution_score_0_5": report.logic_lock.solution_score,
             "breaks": breaks,
-            "evidence": [e.model_dump() for e in report.logic_lock.evidence],
+            "evidence": [
+                _evidence_payload_from_span(e, fallback_anchor="逻辑锁原文片段")
+                for e in report.logic_lock.evidence
+            ],
         },
         "dimension_scores": dimension_scores,
         "penalties": [
@@ -224,9 +300,10 @@ def _build_from_rules(report: ScoreReport, rubric: Dict[str, Any]) -> Dict[str, 
                 "code": p.code,
                 "message": p.message,
                 "deduct": p.deduct or 0.0,
-                "evidence": p.evidence_span.model_dump()
-                if p.evidence_span
-                else _placeholder_evidence(),
+                "evidence": _evidence_payload_from_span(
+                    p.evidence_span,
+                    fallback_anchor="扣分原文片段",
+                ),
             }
             for p in report.penalties
         ],

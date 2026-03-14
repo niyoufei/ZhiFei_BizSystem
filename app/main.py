@@ -19,6 +19,7 @@ import unicodedata
 from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from decimal import ROUND_HALF_UP, Decimal
 
 # 加载 .env，使 SPARK_APIPASSWORD、OPENAI_API_KEY 等生效
 try:
@@ -7301,25 +7302,37 @@ def _score_scale_label(score_scale_max: int) -> str:
     return "5分制" if int(score_scale_max) == 5 else "100分制"
 
 
+def _score_scale_decimal_places(score_scale_max: int) -> int:
+    return 4 if int(_normalize_score_scale_max(score_scale_max)) == 5 else 2
+
+
+def _quantize_decimal_score(value: Decimal, *, score_scale_max: int) -> float:
+    places = _score_scale_decimal_places(score_scale_max)
+    quantizer = Decimal("1").scaleb(-places)
+    return float(value.quantize(quantizer, rounding=ROUND_HALF_UP))
+
+
 def _convert_score_from_100(score: object, score_scale_max: int) -> Optional[float]:
     value = _to_float_or_none(score)
     if value is None:
         return None
-    clipped = _clip_score(value, 0.0, 100.0)
-    factor = float(_normalize_score_scale_max(score_scale_max)) / 100.0
-    return round(clipped * factor, 2)
+    clipped = Decimal(str(_clip_score(value, 0.0, 100.0)))
+    scale = Decimal(str(_normalize_score_scale_max(score_scale_max)))
+    converted = clipped * (scale / Decimal("100"))
+    return _quantize_decimal_score(converted, score_scale_max=score_scale_max)
 
 
 def _convert_score_to_100(score: object, score_scale_max: int) -> Optional[float]:
     value = _to_float_or_none(score)
     if value is None:
         return None
-    scale = float(_normalize_score_scale_max(score_scale_max))
+    scale = Decimal(str(_normalize_score_scale_max(score_scale_max)))
     if scale <= 0:
         return None
-    clipped = _clip_score(value, 0.0, scale)
-    normalized = clipped * (100.0 / scale)
-    return round(_clip_score(normalized, 0.0, 100.0), 2)
+    clipped = Decimal(str(_clip_score(value, 0.0, float(scale))))
+    normalized = clipped * (Decimal("100") / scale)
+    clipped_normalized = Decimal(str(_clip_score(float(normalized), 0.0, 100.0)))
+    return _quantize_decimal_score(clipped_normalized, score_scale_max=100)
 
 
 def _resolve_score_blend_weights(project: Dict[str, object]) -> tuple[float, float, float]:
@@ -7885,9 +7898,9 @@ def _resolve_submission_score_fields(
     if total_display is None:
         total_display = 0.0
     return {
-        "total_score": round(float(total_display), 2),
-        "pred_total_score": round(float(pred_display), 2) if pred_display is not None else None,
-        "rule_total_score": round(float(rule_display), 2) if rule_display is not None else None,
+        "total_score": float(total_display),
+        "pred_total_score": float(pred_display) if pred_display is not None else None,
+        "rule_total_score": float(rule_display) if rule_display is not None else None,
         "score_source": "pred" if pred_total is not None else "rule",
     }
 

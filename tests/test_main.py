@@ -4458,6 +4458,14 @@ class TestSubmissionsEndpoint:
         assert data[0]["report"]["score_scale_label"] == "5分制"
         assert data[0]["report"]["raw_total_score_100"] == 70.0
 
+    def test_score_scale_round_trip_preserves_precision_for_5_scale(self):
+        from app.main import _convert_score_from_100, _convert_score_to_100
+
+        scaled = _convert_score_from_100(66.67, 5)
+
+        assert scaled == 3.3335
+        assert _convert_score_to_100(scaled, 5) == 66.67
+
 
 class TestCompareEndpoints:
     """Tests for /projects/{project_id}/compare endpoints."""

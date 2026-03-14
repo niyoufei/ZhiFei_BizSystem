@@ -84,7 +84,13 @@ class TestValidateLlmJudgeJson:
                 "definition_points": ["point1"],
                 "defects": ["defect1"],
                 "improvements": ["improvement1"],
-                "evidence": [{"snippet": "evidence"}],
+                "evidence": [
+                    {
+                        "snippet": "evidence",
+                        "quote": "evidence",
+                        "anchor_label": "正文片段",
+                    }
+                ],
             }
         return {
             "judge_mode": "spark",
@@ -156,6 +162,15 @@ class TestValidateLlmJudgeJson:
         assert ok is False
         assert "invalid_evidence_type:01" in err["details"]
 
+    def test_rejects_evidence_without_anchor_or_quote(self):
+        payload = self._make_valid_payload()
+        payload["dimension_scores"]["01"]["evidence"] = [{"snippet": "只有片段"}]
+
+        ok, err = validate_llm_judge_json(payload)
+
+        assert ok is False
+        assert "invalid_evidence_item:01" in err["details"]
+
 
 class TestPostProcessLlmOutput:
     """Tests for post_process_llm_output function."""
@@ -198,6 +213,8 @@ class TestPostProcessLlmOutput:
         result = post_process_llm_output(payload, rubric)
         assert len(result["dimension_scores"]["01"]["evidence"]) > 0
         assert result["dimension_scores"]["01"]["evidence"][0]["start_index"] == 0
+        assert result["dimension_scores"]["01"]["evidence"][0]["anchor_label"] == "未定位锚点"
+        assert "未在输入文本中检索到" in result["dimension_scores"]["01"]["evidence"][0]["quote"]
 
     def test_caps_score_when_default_used(self):
         """Score should be capped at 4.0 when defaults are used."""
@@ -410,6 +427,7 @@ class TestBuildFromRules:
         dim = result["dimension_scores"]["01"]
         assert len(dim["evidence"]) == 1
         assert dim["evidence"][0]["start_index"] == 0
+        assert dim["evidence"][0]["anchor_label"] == "未定位锚点"
         assert dim["score_0_10"] <= 4.0
 
 
@@ -589,7 +607,7 @@ class TestEdgeCases:
                 "definition_points": ["p"],
                 "defects": ["d"],
                 "improvements": ["i"],
-                "evidence": [{"snippet": "e"}],
+                "evidence": [{"snippet": "e", "quote": "e", "anchor_label": "正文片段"}],
             }
         # Add extra dimension
         dim_scores["99"] = dim_scores["01"].copy()
