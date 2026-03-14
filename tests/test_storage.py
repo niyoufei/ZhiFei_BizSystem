@@ -139,7 +139,11 @@ class TestSaveJson:
             restored = storage.restore_json_version(test_file, older["version_id"])
 
             assert restored["version_id"] == older["version_id"]
+            assert restored["backup_version_id"]
             assert storage.load_json(test_file, {}) == {"version": 1}
+            assert storage.load_json_version(test_file, restored["backup_version_id"], {}) == {
+                "version": 2
+            }
 
 
 class TestSecureStorage:

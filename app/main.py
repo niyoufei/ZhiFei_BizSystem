@@ -268,6 +268,8 @@ from app.storage import (
     load_evolution_reports,
     load_expert_profiles,
     load_ground_truth,
+    load_high_score_features,
+    load_json_version,
     load_learning_profiles,
     load_material_parse_jobs,
     load_materials,
@@ -9369,6 +9371,175 @@ def _build_evolution_health_report(
     }
 
 
+def _summarize_feature_rows_for_governance(rows: object) -> Dict[str, object]:
+    typed_rows = [row for row in (rows if isinstance(rows, list) else []) if isinstance(row, dict)]
+    active_rows = [row for row in typed_rows if bool(row.get("active", True))]
+    high_conf_rows = [
+        row
+        for row in active_rows
+        if float(_to_float_or_none(row.get("confidence_score")) or 0.0) >= 0.7
+    ]
+    dim_counter: Dict[str, int] = {}
+    for row in active_rows:
+        dim_id = (
+            _normalize_dimension_id(row.get("dimension_id"))
+            or str(row.get("dimension_id") or "").strip()
+        )
+        if not dim_id:
+            continue
+        dim_counter[dim_id] = dim_counter.get(dim_id, 0) + 1
+    top_dimensions = [
+        {"dimension_id": dim_id, "feature_count": count}
+        for dim_id, count in sorted(dim_counter.items(), key=lambda item: (-item[1], item[0]))[:4]
+    ]
+    return {
+        "summary_type": "high_score_features",
+        "primary_count": len(typed_rows),
+        "active_count": len(active_rows),
+        "high_confidence_count": len(high_conf_rows),
+        "dimension_count": len(dim_counter),
+        "top_dimensions": top_dimensions,
+    }
+
+
+def _summarize_versioned_artifact_payload(
+    artifact: str,
+    payload: object,
+    *,
+    project_id: str,
+) -> Dict[str, object]:
+    if artifact == "high_score_features":
+        return _summarize_feature_rows_for_governance(payload)
+    if artifact == "calibration_models":
+        rows = [
+            row for row in (payload if isinstance(payload, list) else []) if isinstance(row, dict)
+        ]
+        latest = max(
+            rows,
+            key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""),
+            default={},
+        )
+        return {
+            "summary_type": "calibration_models",
+            "primary_count": len(rows),
+            "latest_calibrator_version": str(latest.get("calibrator_version") or ""),
+            "latest_model_type": str(latest.get("model_type") or ""),
+            "gate_passed_count": sum(1 for row in rows if bool(row.get("gate_passed"))),
+        }
+    if artifact == "expert_profiles":
+        rows = [
+            row for row in (payload if isinstance(payload, list) else []) if isinstance(row, dict)
+        ]
+        latest = max(
+            rows,
+            key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""),
+            default={},
+        )
+        return {
+            "summary_type": "expert_profiles",
+            "primary_count": len(rows),
+            "read_only_count": sum(1 for row in rows if bool(row.get("read_only"))),
+            "latest_profile_id": str(latest.get("id") or ""),
+            "latest_profile_name": str(latest.get("name") or ""),
+        }
+    if artifact == "evolution_reports":
+        rows = payload if isinstance(payload, dict) else {}
+        project_payload = rows.get(project_id) if isinstance(rows.get(project_id), dict) else {}
+        return {
+            "summary_type": "evolution_reports",
+            "primary_count": len(rows),
+            "project_present": bool(project_payload),
+            "project_high_score_logic_count": len(project_payload.get("high_score_logic") or []),
+            "project_writing_guidance_count": len(project_payload.get("writing_guidance") or []),
+            "project_updated_at": str(
+                project_payload.get("updated_at") or project_payload.get("created_at") or ""
+            ),
+        }
+    if isinstance(payload, list):
+        return {"summary_type": "list", "primary_count": len(payload)}
+    if isinstance(payload, dict):
+        return {"summary_type": "dict", "primary_count": len(payload)}
+    return {"summary_type": type(payload).__name__, "primary_count": 0}
+
+
+def _artifact_payload_fingerprint(payload: object) -> str:
+    try:
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except TypeError:
+        return repr(payload)
+
+
+def _artifact_summary_delta(
+    current_summary: Dict[str, object],
+    latest_summary: Dict[str, object],
+) -> Dict[str, object]:
+    delta: Dict[str, object] = {}
+    for key, current_value in current_summary.items():
+        latest_value = latest_summary.get(key)
+        if not isinstance(current_value, (int, float)) or not isinstance(
+            latest_value, (int, float)
+        ):
+            continue
+        diff = float(current_value) - float(latest_value)
+        delta[key] = (
+            int(diff)
+            if isinstance(current_value, int) and isinstance(latest_value, int)
+            else round(diff, 4)
+        )
+    return delta
+
+
+def _build_governance_artifact_impacts(project_id: str) -> List[Dict[str, object]]:
+    artifact_specs = [
+        ("high_score_features", HIGH_SCORE_FEATURES_PATH, lambda: load_high_score_features(), []),
+        ("evolution_reports", EVOLUTION_REPORTS_PATH, lambda: load_evolution_reports(), {}),
+        ("calibration_models", CALIBRATION_MODELS_PATH, lambda: load_calibration_models(), []),
+        ("expert_profiles", EXPERT_PROFILES_PATH, lambda: load_expert_profiles(), []),
+    ]
+    impacts: List[Dict[str, object]] = []
+    for artifact, path, loader, default_payload in artifact_specs:
+        current_payload = loader()
+        current_summary = _summarize_versioned_artifact_payload(
+            artifact, current_payload, project_id=project_id
+        )
+        versions = list_json_versions(path)
+        latest_snapshot = versions[0] if versions else {}
+        latest_summary: Dict[str, object] = {}
+        latest_payload = None
+        latest_version_id = str(latest_snapshot.get("version_id") or "")
+        if latest_version_id:
+            try:
+                latest_payload = load_json_version(path, latest_version_id, default_payload)
+                latest_summary = _summarize_versioned_artifact_payload(
+                    artifact, latest_payload, project_id=project_id
+                )
+            except StorageDataError:
+                latest_summary = {}
+                latest_payload = None
+        matches_latest_snapshot = (
+            bool(latest_version_id)
+            and latest_payload is not None
+            and _artifact_payload_fingerprint(current_payload)
+            == _artifact_payload_fingerprint(latest_payload)
+        )
+        impacts.append(
+            {
+                "artifact": artifact,
+                "current_summary": current_summary,
+                "latest_snapshot_version_id": latest_version_id or None,
+                "latest_snapshot_created_at": str(latest_snapshot.get("created_at") or ""),
+                "latest_snapshot_summary": latest_summary,
+                "matches_latest_snapshot": matches_latest_snapshot,
+                "changed_since_latest_snapshot": bool(latest_version_id)
+                and not matches_latest_snapshot,
+                "delta_vs_latest_snapshot": _artifact_summary_delta(
+                    current_summary, latest_summary
+                ),
+            }
+        )
+    return impacts
+
+
 def _build_feedback_governance_report(
     project_id: str,
     project: Dict[str, object],
@@ -9384,6 +9555,8 @@ def _build_feedback_governance_report(
     few_shot_adopted_count = 0
     few_shot_ignored_count = 0
     few_shot_pending_review_count = 0
+    approved_samples: List[Dict[str, object]] = []
+    adopted_few_shot: List[Dict[str, object]] = []
 
     blocked_samples: List[Dict[str, object]] = []
     for item in blocked_rows[:12]:
@@ -9417,6 +9590,57 @@ def _build_feedback_governance_report(
             review_status = str(guardrail.get("manual_review_status") or "pending")
             if review_status == "approved":
                 approved_extreme_count += 1
+                if len(approved_samples) < 10:
+                    closed_loop = (
+                        row.get("feedback_closed_loop")
+                        if isinstance(row.get("feedback_closed_loop"), dict)
+                        else {}
+                    )
+                    auto_run = (
+                        closed_loop.get("auto_run")
+                        if isinstance(closed_loop.get("auto_run"), dict)
+                        else {}
+                    )
+                    evolution_refresh = (
+                        closed_loop.get("evolution_refresh")
+                        if isinstance(closed_loop.get("evolution_refresh"), dict)
+                        else {}
+                    )
+                    weight_update = (
+                        closed_loop.get("weight_update")
+                        if isinstance(closed_loop.get("weight_update"), dict)
+                        else {}
+                    )
+                    approved_samples.append(
+                        {
+                            "record_id": str(row.get("id") or ""),
+                            "source_submission_filename": str(
+                                row.get("source_submission_filename") or row.get("source") or ""
+                            ),
+                            "reviewed_at": str(guardrail.get("manual_reviewed_at") or ""),
+                            "review_note": str(guardrail.get("manual_review_note") or ""),
+                            "actual_score_100": _to_float_or_none(
+                                guardrail.get("actual_score_100")
+                            ),
+                            "predicted_score_100": _to_float_or_none(
+                                guardrail.get("predicted_score_100")
+                            ),
+                            "abs_delta_100": _to_float_or_none(guardrail.get("abs_delta_100")),
+                            "closed_loop_effect": {
+                                "weight_updated": bool(weight_update.get("updated")),
+                                "delta_case_count": int(
+                                    _to_float_or_none(auto_run.get("delta_cases")) or 0
+                                ),
+                                "calibration_sample_count": int(
+                                    _to_float_or_none(auto_run.get("calibration_samples")) or 0
+                                ),
+                                "calibrator_version": str(auto_run.get("calibrator_version") or ""),
+                                "evolution_refresh_sample_count": int(
+                                    _to_float_or_none(evolution_refresh.get("sample_count")) or 0
+                                ),
+                            },
+                        }
+                    )
             elif review_status == "rejected":
                 rejected_extreme_count += 1
             else:
@@ -9428,18 +9652,38 @@ def _build_feedback_governance_report(
     ):
         distill = _normalize_few_shot_distillation_state(row.get("few_shot_distillation"))
         captured = int(_to_float_or_none(distill.get("captured")) or 0)
+        reason_text = str(distill.get("reason") or "").strip()
         if captured > 0:
             captured_recent_count += 1
             review_status = str(distill.get("manual_review_status") or "pending")
             if review_status == "adopted":
                 few_shot_adopted_count += 1
+                if len(adopted_few_shot) < 10:
+                    adopted_few_shot.append(
+                        {
+                            "record_id": str(row.get("id") or ""),
+                            "reviewed_at": str(distill.get("manual_reviewed_at") or ""),
+                            "review_note": str(distill.get("manual_review_note") or ""),
+                            "captured": captured,
+                            "dimension_ids": [
+                                _normalize_dimension_id(item)
+                                for item in (distill.get("dimension_ids") or [])
+                                if _normalize_dimension_id(item)
+                            ],
+                            "feature_ids": [
+                                str(item or "").strip()
+                                for item in (distill.get("feature_ids") or [])
+                                if str(item or "").strip()
+                            ][:8],
+                        }
+                    )
             elif review_status == "ignored":
                 few_shot_ignored_count += 1
             else:
                 few_shot_pending_review_count += 1
         if len(few_shot_recent) >= 10:
             continue
-        if not distill:
+        if captured <= 0 and not reason_text:
             continue
         normalized_row = _ground_truth_record_for_learning(
             row if isinstance(row, dict) else {},
@@ -9451,7 +9695,7 @@ def _build_feedback_governance_report(
                 "created_at": str(row.get("updated_at") or row.get("created_at") or ""),
                 "actual_score_100": _to_float_or_none(normalized_row.get("final_score")),
                 "captured": captured,
-                "reason": str(distill.get("reason") or ""),
+                "reason": reason_text,
                 "dimension_ids": [
                     _normalize_dimension_id(item)
                     for item in (distill.get("dimension_ids") or [])
@@ -9493,6 +9737,7 @@ def _build_feedback_governance_report(
                 ],
             }
         )
+    artifact_impacts = _build_governance_artifact_impacts(project_id)
 
     recommendations: List[str] = []
     blocked_count = int(summary_guardrail.get("blocked_count") or 0)
@@ -9511,6 +9756,10 @@ def _build_feedback_governance_report(
     if blocked_count <= 0 and captured_recent_count > 0:
         recommendations.append(
             "当前闭环处于可进化状态，可继续观察 few-shot 蒸馏是否带来评分逼近提升。"
+        )
+    if any(bool(item.get("changed_since_latest_snapshot")) for item in artifact_impacts):
+        recommendations.append(
+            "检测到部分闭环产物与最近一次快照不一致；若刚执行过回滚，请结合“治理影响体检”确认差异是否符合预期。"
         )
 
     return {
@@ -9553,8 +9802,11 @@ def _build_feedback_governance_report(
             "manual_override_hint": summary_guardrail.get("manual_override_hint"),
         },
         "blocked_samples": blocked_samples,
+        "approved_samples": approved_samples,
         "few_shot_recent": few_shot_recent,
+        "adopted_few_shot": adopted_few_shot,
         "version_history": version_history,
+        "artifact_impacts": artifact_impacts,
         "recommendations": recommendations[:10],
     }
 
@@ -11729,6 +11981,7 @@ def rollback_versioned_json_history(
         artifact=artifact,
         restored_version_id=str(restored.get("version_id") or payload.version_id),
         restored_at=str(restored.get("restored_at") or _now_iso()),
+        backup_version_id=str(restored.get("backup_version_id") or "") or None,
     )
 
 
@@ -26100,8 +26353,11 @@ def index(
           const opts = (options && typeof options === 'object') ? options : {};
           const summary = (data.summary && typeof data.summary === 'object') ? data.summary : {};
           const blockedSamples = Array.isArray(data.blocked_samples) ? data.blocked_samples : [];
+          const approvedSamples = Array.isArray(data.approved_samples) ? data.approved_samples : [];
           const fewShotRecent = Array.isArray(data.few_shot_recent) ? data.few_shot_recent : [];
+          const adoptedFewShot = Array.isArray(data.adopted_few_shot) ? data.adopted_few_shot : [];
           const versions = Array.isArray(data.version_history) ? data.version_history : [];
+          const artifactImpacts = Array.isArray(data.artifact_impacts) ? data.artifact_impacts : [];
           const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
           let html = '<strong>闭环治理面板（异常样本 / few-shot / 回退快照）</strong>';
           if (opts.actionMessage) {
@@ -26159,6 +26415,33 @@ def index(
               + '</tr>').join('');
             html += '</table>';
           }
+          if (approvedSamples.length) {
+            html += '<strong>已人工放行样本影响</strong><table><tr><th>记录ID</th><th>偏差</th><th>复核时间</th><th>权重更新</th><th>DELTA_CASE</th><th>校准样本</th><th>校准版本</th></tr>';
+            html += approvedSamples.slice(0, 10).map((row) => {
+              const effect = (row && typeof row.closed_loop_effect === 'object') ? row.closed_loop_effect : {};
+              return '<tr>'
+                + '<td>' + escapeHtmlText(row.record_id || '-') + '</td>'
+                + '<td>' + escapeHtmlText(row.abs_delta_100 != null ? row.abs_delta_100 : '-') + '</td>'
+                + '<td>' + escapeHtmlText(row.reviewed_at || '-') + '</td>'
+                + '<td>' + escapeHtmlText(effect.weight_updated ? '已更新' : '未更新') + '</td>'
+                + '<td>' + escapeHtmlText(effect.delta_case_count || 0) + '</td>'
+                + '<td>' + escapeHtmlText(effect.calibration_sample_count || 0) + '</td>'
+                + '<td>' + escapeHtmlText(effect.calibrator_version || '-') + '</td>'
+                + '</tr>';
+            }).join('');
+            html += '</table>';
+          }
+          if (adoptedFewShot.length) {
+            html += '<strong>已采纳 few-shot 特征</strong><table><tr><th>记录ID</th><th>采纳时间</th><th>捕获数</th><th>维度</th><th>特征ID</th></tr>';
+            html += adoptedFewShot.slice(0, 10).map((row) => '<tr>'
+              + '<td>' + escapeHtmlText(row.record_id || '-') + '</td>'
+              + '<td>' + escapeHtmlText(row.reviewed_at || '-') + '</td>'
+              + '<td>' + escapeHtmlText(row.captured || 0) + '</td>'
+              + '<td>' + escapeHtmlText(((row.dimension_ids) || []).join('、') || '-') + '</td>'
+              + '<td>' + escapeHtmlText(((row.feature_ids) || []).join('、') || '-') + '</td>'
+              + '</tr>').join('');
+            html += '</table>';
+          }
           if (versions.length) {
             html += '<strong>版本快照</strong><table><tr><th>产物</th><th>版本数</th><th>最新版本</th><th>更新时间</th><th>回退</th></tr>';
             html += versions.map((row) => '<tr>'
@@ -26183,6 +26466,33 @@ def index(
               )
               + '</td>'
               + '</tr>').join('');
+            html += '</table>';
+          }
+          if (artifactImpacts.length) {
+            html += '<strong>治理影响体检</strong><table><tr><th>产物</th><th>当前摘要</th><th>最近快照摘要</th><th>差异</th><th>状态</th></tr>';
+            html += artifactImpacts.map((row) => {
+              const current = (row && typeof row.current_summary === 'object') ? row.current_summary : {};
+              const latest = (row && typeof row.latest_snapshot_summary === 'object') ? row.latest_snapshot_summary : {};
+              const delta = (row && typeof row.delta_vs_latest_snapshot === 'object') ? row.delta_vs_latest_snapshot : {};
+              const summarizeMap = (obj) => Object.keys(obj).map((key) => {
+                const value = obj[key];
+                const rendered = (value && typeof value === 'object') ? JSON.stringify(value) : String(value);
+                return key + '=' + rendered;
+              }).join('；');
+              const currentText = summarizeMap(current);
+              const latestText = summarizeMap(latest);
+              const deltaText = summarizeMap(delta);
+              const statusText = row.matches_latest_snapshot
+                ? '与最近快照一致'
+                : (row.changed_since_latest_snapshot ? '已偏离最近快照' : '暂无快照');
+              return '<tr>'
+                + '<td>' + escapeHtmlText(row.artifact || '-') + '</td>'
+                + '<td>' + escapeHtmlText(currentText || '-') + '</td>'
+                + '<td>' + escapeHtmlText(latestText || '-') + '</td>'
+                + '<td>' + escapeHtmlText(deltaText || '-') + '</td>'
+                + '<td>' + escapeHtmlText(statusText) + '</td>'
+                + '</tr>';
+            }).join('');
             html += '</table>';
           }
           if (recs.length) {
@@ -26341,7 +26651,7 @@ def index(
               }
               await loadFeedbackGovernancePanel(projectId, {
                 suppressLoading: true,
-                actionMessage: artifact + ' 已回滚到版本 ' + versionId + '。',
+                actionMessage: artifact + ' 已回滚到版本 ' + versionId + (data.backup_version_id ? ('；已自动备份当前状态为 ' + data.backup_version_id) : '') + '。',
               });
             };
           });

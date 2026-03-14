@@ -303,12 +303,21 @@ def restore_json_version(path: Path, version_id: str) -> Dict[str, Any]:
             f"未找到历史版本：{path.stem} / {version_id}",
         )
     payload = read_bytes(snapshot_path)
+    backup_version_id = None
+    if path.exists():
+        try:
+            current_payload = read_bytes(path)
+        except OSError:
+            current_payload = b""
+        if current_payload and current_payload != payload:
+            backup_version_id = _write_json_version_snapshot(path, current_payload)
     save_bytes(path, payload)
     return {
         "version_id": str(version_id).strip(),
         "restored_at": datetime.now(timezone.utc).isoformat(),
         "snapshot_path": snapshot_path,
         "current_path": path,
+        "backup_version_id": backup_version_id,
     }
 
 
@@ -330,17 +339,7 @@ def save_bytes(path: Path, payload: bytes) -> None:
             _atomic_write_bytes(path, stored_payload)
 
 
-def load_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
-    try:
-        payload = read_bytes(path)
-    except FileNotFoundError:
-        return default
-    except OSError as exc:
-        raise StorageDataError(
-            path, "file_read_failed", f"读取文件失败：{path.name}，{exc}"
-        ) from exc
+def _parse_json_payload(path: Path, payload: bytes, default: Any) -> Any:
     try:
         decoded = payload.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -370,6 +369,39 @@ def load_json(path: Path, default: Any) -> Any:
             f"数据文件结构异常：{path.name} 应为对象，但实际为 {type(parsed).__name__}。",
         )
     return parsed
+
+
+def load_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        payload = read_bytes(path)
+    except FileNotFoundError:
+        return default
+    except OSError as exc:
+        raise StorageDataError(
+            path, "file_read_failed", f"读取文件失败：{path.name}，{exc}"
+        ) from exc
+    return _parse_json_payload(path, payload, default)
+
+
+def load_json_version(path: Path, version_id: str, default: Any) -> Any:
+    snapshot_path = _snapshot_path_for(path, str(version_id).strip())
+    if not snapshot_path.exists():
+        raise VersionedJsonSnapshotNotFound(
+            path,
+            "snapshot_not_found",
+            f"未找到历史版本：{path.stem} / {version_id}",
+        )
+    try:
+        payload = read_bytes(snapshot_path)
+    except OSError as exc:
+        raise StorageDataError(
+            snapshot_path,
+            "file_read_failed",
+            f"读取历史版本失败：{snapshot_path.name}，{exc}",
+        ) from exc
+    return _parse_json_payload(snapshot_path, payload, default)
 
 
 def save_json(path: Path, data: Any, *, keep_history: bool = False) -> None:

@@ -111,6 +111,7 @@ class TestVersionedJsonHistoryRoutes:
         mock_restore_json_version.return_value = {
             "version_id": "20260314T010203000000Z",
             "restored_at": "2026-03-14T02:03:04+00:00",
+            "backup_version_id": "20260314T020304999999Z",
         }
 
         response = client.post(
@@ -123,6 +124,7 @@ class TestVersionedJsonHistoryRoutes:
         assert data["ok"] is True
         assert data["artifact"] == "calibration_models"
         assert data["restored_version_id"] == "20260314T010203000000Z"
+        assert data["backup_version_id"] == "20260314T020304999999Z"
 
 
 class TestMaterialParseWorkerLifecycle:
@@ -6998,6 +7000,11 @@ class TestGroundTruthGuardrailRoutes:
 
 
 class TestFeedbackGovernanceRoutes:
+    @patch("app.main.load_expert_profiles")
+    @patch("app.main.load_calibration_models")
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.load_high_score_features")
+    @patch("app.main.load_json_version")
     @patch("app.main.list_json_versions")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_projects")
@@ -7008,9 +7015,29 @@ class TestFeedbackGovernanceRoutes:
         mock_load_projects,
         mock_load_ground_truth,
         mock_list_versions,
+        mock_load_json_version,
+        mock_load_high_score_features,
+        mock_load_evolution_reports,
+        mock_load_calibration_models,
+        mock_load_expert_profiles,
         client,
     ):
         mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 100}}]
+        mock_load_high_score_features.return_value = [
+            {
+                "feature_id": "f-current-1",
+                "dimension_id": "09",
+                "confidence_score": 0.88,
+                "active": True,
+            }
+        ]
+        mock_load_evolution_reports.return_value = {"p1": {"high_score_logic": ["逻辑A"]}}
+        mock_load_calibration_models.return_value = [
+            {"calibrator_version": "calib-1", "model_type": "ridge"}
+        ]
+        mock_load_expert_profiles.return_value = [
+            {"id": "ep-1", "name": "默认画像", "read_only": True}
+        ]
         mock_load_ground_truth.return_value = [
             {
                 "id": "gt-blocked",
@@ -7022,6 +7049,7 @@ class TestFeedbackGovernanceRoutes:
                 "created_at": "2026-03-14T00:00:00+00:00",
                 "feedback_guardrail": {
                     "blocked": True,
+                    "threshold_blocked": True,
                     "actual_score_100": 80,
                     "predicted_score_100": 30,
                     "abs_delta_100": 50,
@@ -7042,6 +7070,39 @@ class TestFeedbackGovernanceRoutes:
                     "reason": "captured",
                     "dimension_ids": ["09"],
                     "feature_ids": ["F-1", "F-2"],
+                    "manual_review": {
+                        "status": "adopted",
+                        "reviewed_at": "2026-03-14T03:00:00+00:00",
+                    },
+                },
+            },
+            {
+                "id": "gt-approved",
+                "project_id": "p1",
+                "final_score": 86,
+                "score_scale_max": 100,
+                "judge_scores": [86, 86, 86, 86, 86],
+                "created_at": "2026-03-14T02:00:00+00:00",
+                "feedback_guardrail": {
+                    "blocked": False,
+                    "threshold_blocked": True,
+                    "actual_score_100": 86,
+                    "predicted_score_100": 40,
+                    "abs_delta_100": 46,
+                    "manual_review": {
+                        "status": "approved",
+                        "reviewed_at": "2026-03-14T04:00:00+00:00",
+                        "note": "人工放行",
+                    },
+                },
+                "feedback_closed_loop": {
+                    "weight_update": {"updated": True},
+                    "auto_run": {
+                        "delta_cases": 3,
+                        "calibration_samples": 5,
+                        "calibrator_version": "calib-2",
+                    },
+                    "evolution_refresh": {"sample_count": 4},
                 },
             },
         ]
@@ -7062,27 +7123,73 @@ class TestFeedbackGovernanceRoutes:
                         "created_at": "2026-03-14T02:03:04+00:00",
                     }
                 ]
+            if stem == "calibration_models":
+                return [
+                    {
+                        "version_id": "20260314T030405000000Z",
+                        "created_at": "2026-03-14T03:04:05+00:00",
+                    }
+                ]
+            if stem == "expert_profiles":
+                return [
+                    {
+                        "version_id": "20260314T040506000000Z",
+                        "created_at": "2026-03-14T04:05:06+00:00",
+                    }
+                ]
             return []
 
         mock_list_versions.side_effect = _versions
+        mock_load_json_version.side_effect = lambda path, version_id, default: (
+            [
+                {
+                    "feature_id": "f-snap-1",
+                    "dimension_id": "09",
+                    "confidence_score": 0.72,
+                    "active": True,
+                },
+                {
+                    "feature_id": "f-snap-2",
+                    "dimension_id": "08",
+                    "confidence_score": 0.66,
+                    "active": True,
+                },
+            ]
+            if getattr(path, "stem", "") == "high_score_features"
+            else (
+                {"p1": {"high_score_logic": []}}
+                if getattr(path, "stem", "") == "evolution_reports"
+                else (
+                    [{"calibrator_version": "calib-0", "model_type": "offset"}]
+                    if getattr(path, "stem", "") == "calibration_models"
+                    else [{"id": "ep-old", "name": "旧画像", "read_only": False}]
+                )
+            )
+        )
 
         response = client.get("/api/v1/projects/p1/feedback/governance")
 
         assert response.status_code == 200
         data = response.json()
-        assert data["summary"]["ground_truth_count"] == 2
-        assert data["summary"]["active_ground_truth_count"] == 1
+        assert data["summary"]["ground_truth_count"] == 3
+        assert data["summary"]["active_ground_truth_count"] == 2
         assert data["summary"]["blocked_ground_truth_count"] == 1
         assert data["summary"]["few_shot_recent_capture_count"] == 1
         assert data["summary"]["manual_confirmation_required"] is True
+        assert data["summary"]["approved_extreme_ground_truth_count"] == 1
+        assert data["summary"]["few_shot_adopted_count"] == 1
         assert data["summary"]["pending_extreme_ground_truth_count"] == 1
-        assert data["summary"]["few_shot_pending_review_count"] == 1
+        assert data["summary"]["few_shot_pending_review_count"] == 0
         assert data["blocked_samples"][0]["record_id"] == "gt-blocked"
         assert data["few_shot_recent"][0]["record_id"] == "gt-good"
+        assert data["approved_samples"][0]["record_id"] == "gt-approved"
+        assert data["adopted_few_shot"][0]["record_id"] == "gt-good"
         assert (
             data["version_history"][0]["recent_versions"][0]["version_id"]
             == "20260314T010203000000Z"
         )
+        assert data["artifact_impacts"][0]["artifact"] == "high_score_features"
+        assert data["artifact_impacts"][0]["changed_since_latest_snapshot"] is True
         assert any(row["artifact"] == "high_score_features" for row in data["version_history"])
 
     @patch("app.main._run_feedback_closed_loop_safe")

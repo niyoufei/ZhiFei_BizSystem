@@ -377,6 +377,7 @@ class VersionedJsonRollbackResponse(BaseModel):
     artifact: str
     restored_version_id: str
     restored_at: str
+    backup_version_id: Optional[str] = None
 
 
 class ScoringReadinessResponse(BaseModel):
@@ -423,8 +424,11 @@ class FeedbackGovernanceResponse(BaseModel):
     generated_at: str
     summary: Dict[str, Any] = Field(default_factory=dict)
     blocked_samples: List[Dict[str, Any]] = Field(default_factory=list)
+    approved_samples: List[Dict[str, Any]] = Field(default_factory=list)
     few_shot_recent: List[Dict[str, Any]] = Field(default_factory=list)
+    adopted_few_shot: List[Dict[str, Any]] = Field(default_factory=list)
     version_history: List[Dict[str, Any]] = Field(default_factory=list)
+    artifact_impacts: List[Dict[str, Any]] = Field(default_factory=list)
     recommendations: List[str] = Field(default_factory=list)
 
 
