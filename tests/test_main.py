@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 import tempfile
@@ -7074,9 +7075,132 @@ class TestFeedbackGovernanceRoutes:
         assert data["summary"]["blocked_ground_truth_count"] == 1
         assert data["summary"]["few_shot_recent_capture_count"] == 1
         assert data["summary"]["manual_confirmation_required"] is True
+        assert data["summary"]["pending_extreme_ground_truth_count"] == 1
+        assert data["summary"]["few_shot_pending_review_count"] == 1
         assert data["blocked_samples"][0]["record_id"] == "gt-blocked"
         assert data["few_shot_recent"][0]["record_id"] == "gt-good"
+        assert (
+            data["version_history"][0]["recent_versions"][0]["version_id"]
+            == "20260314T010203000000Z"
+        )
         assert any(row["artifact"] == "high_score_features" for row in data["version_history"])
+
+    @patch("app.main._run_feedback_closed_loop_safe")
+    @patch("app.main.save_ground_truth")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_feedback_guardrail_review_route_can_approve_and_rerun_closed_loop(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_ground_truth,
+        mock_save_ground_truth,
+        mock_run_closed_loop,
+        client,
+    ):
+        store = [
+            {
+                "id": "gt-1",
+                "project_id": "p1",
+                "feedback_guardrail": {
+                    "blocked": True,
+                    "threshold_blocked": True,
+                    "actual_score_100": 88,
+                    "predicted_score_100": 30,
+                    "abs_delta_100": 58,
+                    "relative_delta_ratio": 0.58,
+                },
+            }
+        ]
+
+        mock_load_projects.return_value = [{"id": "p1"}]
+        mock_load_ground_truth.side_effect = lambda: copy.deepcopy(store)
+
+        def _save(rows):
+            store[:] = copy.deepcopy(rows)
+
+        mock_save_ground_truth.side_effect = _save
+        mock_run_closed_loop.return_value = {"ok": True, "guardrail_triggered": False}
+
+        response = client.post(
+            "/api/v1/projects/p1/feedback/governance/guardrail/gt-1/review",
+            json={"action": "approve", "note": "人工核验后允许纳入", "rerun_closed_loop": True},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["feedback_guardrail"]["manual_review_status"] == "approved"
+        assert data["feedback_guardrail"]["blocked"] is False
+        assert data["feedback_closed_loop"]["ok"] is True
+        assert store[0]["feedback_guardrail"]["manual_review_status"] == "approved"
+        assert store[0]["feedback_closed_loop"]["ok"] is True
+        mock_run_closed_loop.assert_called_once()
+
+    @patch("app.main.save_ground_truth")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_feedback_few_shot_review_route_marks_sample_as_adopted(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_ground_truth,
+        mock_save_ground_truth,
+        client,
+    ):
+        store = [
+            {
+                "id": "gt-2",
+                "project_id": "p1",
+                "few_shot_distillation": {
+                    "captured": 2,
+                    "reason": "captured",
+                    "feature_ids": ["F-1"],
+                },
+            }
+        ]
+        mock_load_projects.return_value = [{"id": "p1"}]
+        mock_load_ground_truth.side_effect = lambda: copy.deepcopy(store)
+
+        def _save(rows):
+            store[:] = copy.deepcopy(rows)
+
+        mock_save_ground_truth.side_effect = _save
+
+        response = client.post(
+            "/api/v1/projects/p1/feedback/governance/few_shot/gt-2/review",
+            json={"action": "adopt", "note": "纳入标准样本"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["few_shot_distillation"]["manual_review_status"] == "adopted"
+        assert store[0]["few_shot_distillation"]["manual_review_status"] == "adopted"
+
+    @patch("app.main.list_json_versions")
+    @patch("app.main.ensure_data_dirs")
+    def test_versioned_json_history_supports_high_score_features(
+        self,
+        mock_ensure,
+        mock_list_versions,
+        client,
+    ):
+        mock_list_versions.return_value = [
+            {
+                "version_id": "20260314T010203000000Z",
+                "filename": "high_score_features_v20260314T010203000000Z.json",
+                "created_at": "2026-03-14T01:02:03+00:00",
+                "size_bytes": 256,
+            }
+        ]
+
+        response = client.get("/api/v1/ops/versioned-json/high_score_features")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["artifact"] == "high_score_features"
+        assert data["versions"][0]["version_id"] == "20260314T010203000000Z"
 
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")

@@ -428,6 +428,34 @@ class FeedbackGovernanceResponse(BaseModel):
     recommendations: List[str] = Field(default_factory=list)
 
 
+class FeedbackGuardrailReviewRequest(BaseModel):
+    action: str = Field(..., description="approve|reject|reset")
+    note: Optional[str] = Field(None, description="人工审核备注")
+    rerun_closed_loop: bool = Field(default=False, description="审核后是否立即重跑反馈闭环")
+
+
+class FeedbackGuardrailReviewResponse(BaseModel):
+    ok: bool
+    project_id: str
+    record_id: str
+    feedback_guardrail: Dict[str, Any] = Field(default_factory=dict)
+    feedback_closed_loop: Dict[str, Any] = Field(default_factory=dict)
+    updated_at: str
+
+
+class FewShotReviewRequest(BaseModel):
+    action: str = Field(..., description="adopt|ignore|reset")
+    note: Optional[str] = Field(None, description="人工审核备注")
+
+
+class FewShotReviewResponse(BaseModel):
+    ok: bool
+    project_id: str
+    record_id: str
+    few_shot_distillation: Dict[str, Any] = Field(default_factory=dict)
+    updated_at: str
+
+
 class QingTianResultCreate(BaseModel):
     qingtian_model_version: Optional[str] = Field(None, description="青天模型版本")
     qt_total_score: float = Field(..., description="青天总分(0..100)")

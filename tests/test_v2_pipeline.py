@@ -734,7 +734,7 @@ class TestGroundTruthAutoSync:
         data = resp.json()
         assert data["project_id"] == "p1"
         assert data["source"] == "青天大模型"
-        mock_save_records.assert_called_once()
+        assert mock_save_records.call_count >= 2
         mock_sync.assert_called_once()
 
     @patch("app.main._sync_ground_truth_record_to_qingtian")
@@ -773,7 +773,7 @@ class TestGroundTruthAutoSync:
         data = resp.json()
         assert data["judge_count"] == 7
         assert len(data["judge_scores"]) == 7
-        mock_save_records.assert_called_once()
+        assert mock_save_records.call_count >= 2
         mock_sync.assert_called_once()
 
     @patch("app.main._sync_ground_truth_record_to_qingtian")
@@ -846,7 +846,7 @@ class TestGroundTruthAutoSync:
         }
         resp = _client().post("/api/projects/p1/ground_truth/from_submission", json=payload)
         assert resp.status_code == 200
-        mock_save_records.assert_called_once()
+        assert mock_save_records.call_count >= 2
         mock_sync.assert_called_once()
 
     @patch("app.main._sync_ground_truth_record_to_qingtian")
@@ -942,7 +942,7 @@ class TestGroundTruthAutoSync:
         assert data["success_count"] == 2
         assert data["failed_count"] == 0
         assert mock_sync.call_count == 2
-        mock_save_records.assert_called_once()
+        assert mock_save_records.call_count >= 2
 
     @patch("app.main._sync_ground_truth_record_to_qingtian")
     @patch("app.main.save_ground_truth")
@@ -979,7 +979,7 @@ class TestGroundTruthAutoSync:
         assert data["success_count"] == 1
         assert data["failed_count"] == 1
         assert mock_sync.call_count == 1
-        mock_save_records.assert_called_once()
+        assert mock_save_records.call_count >= 2
 
     @patch("app.main._sync_ground_truth_record_to_qingtian")
     @patch("app.main.save_ground_truth")
@@ -1012,7 +1012,7 @@ class TestGroundTruthAutoSync:
         assert data["success_count"] == 1
         assert data["failed_count"] == 0
         assert mock_sync.call_count == 1
-        mock_save_records.assert_called_once()
+        assert mock_save_records.call_count >= 2
 
 
 class TestAutoRunReflection:
@@ -1988,7 +1988,7 @@ class TestEvolutionClosedLoop:
         assert mock_sync_qt.called
         synced_record = mock_sync_qt.call_args.args[1]
         assert float(synced_record["final_score_100"]) == 86.0
-        mock_save_ground_truth.assert_called_once()
+        assert mock_save_ground_truth.call_count >= 2
 
     @patch("app.main.save_evolution_reports")
     @patch("app.main.load_evolution_reports")

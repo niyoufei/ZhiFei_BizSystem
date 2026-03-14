@@ -183,6 +183,10 @@ from app.schemas import (
     ExpertProfileRecord,
     ExpertProfileUpdate,
     FeedbackGovernanceResponse,
+    FeedbackGuardrailReviewRequest,
+    FeedbackGuardrailReviewResponse,
+    FewShotReviewRequest,
+    FewShotReviewResponse,
     GroundTruthBatchResponse,
     GroundTruthCreate,
     GroundTruthFromSubmissionCreate,
@@ -431,6 +435,7 @@ VERSIONED_JSON_ARTIFACTS = {
     "expert_profiles": EXPERT_PROFILES_PATH,
     "calibration_models": CALIBRATION_MODELS_PATH,
     "evolution_reports": EVOLUTION_REPORTS_PATH,
+    "high_score_features": HIGH_SCORE_FEATURES_PATH,
 }
 SYSTEM_SELF_CHECK_REQUIRED_ITEM_NAMES = {
     "health",
@@ -8777,9 +8782,110 @@ def _extract_feedback_guardrail(payload: object) -> Dict[str, object]:
     if not isinstance(payload, dict):
         return {}
     guardrail = payload.get("feedback_guardrail")
-    if isinstance(guardrail, dict):
-        return dict(guardrail)
-    return {}
+    return _normalize_feedback_guardrail_state(guardrail)
+
+
+def _normalize_feedback_guardrail_state(payload: object) -> Dict[str, object]:
+    guardrail = dict(payload) if isinstance(payload, dict) else {}
+    threshold_blocked = bool(guardrail.get("threshold_blocked", guardrail.get("blocked")))
+    manual_review = (
+        dict(guardrail.get("manual_review"))
+        if isinstance(guardrail.get("manual_review"), dict)
+        else {}
+    )
+    review_status = (
+        str(manual_review.get("status") or guardrail.get("manual_review_status") or "")
+        .strip()
+        .lower()
+    )
+    if threshold_blocked:
+        if review_status not in {"pending", "approved", "rejected"}:
+            review_status = "pending"
+    else:
+        review_status = "not_required"
+    manual_review_note = str(
+        manual_review.get("note") or guardrail.get("manual_review_note") or ""
+    ).strip()
+    manual_reviewed_at = str(
+        manual_review.get("reviewed_at") or guardrail.get("manual_reviewed_at") or ""
+    ).strip()
+
+    blocked = bool(threshold_blocked and review_status != "approved")
+    if threshold_blocked and review_status == "approved":
+        status = "manually_approved"
+    elif threshold_blocked and review_status == "rejected":
+        status = "manually_rejected"
+    elif threshold_blocked:
+        status = "blocked"
+    else:
+        status = str(guardrail.get("status") or "accepted").strip() or "accepted"
+
+    normalized = dict(guardrail)
+    normalized["threshold_blocked"] = threshold_blocked
+    normalized["manual_review"] = {
+        "status": review_status,
+        "note": manual_review_note or None,
+        "reviewed_at": manual_reviewed_at or None,
+    }
+    normalized["manual_review_status"] = review_status
+    normalized["manual_review_note"] = manual_review_note or None
+    normalized["manual_reviewed_at"] = manual_reviewed_at or None
+    normalized["blocked"] = blocked
+    normalized["status"] = status
+    normalized["requires_manual_confirmation"] = bool(
+        threshold_blocked and review_status == "pending"
+    )
+    normalized["manual_override_hint"] = "confirm_extreme_sample=1" if blocked else None
+    if threshold_blocked and not str(normalized.get("warning_message") or "").strip():
+        abs_delta = float(_to_float_or_none(normalized.get("abs_delta_100")) or 0.0)
+        ratio = float(_to_float_or_none(normalized.get("relative_delta_ratio")) or 0.0) * 100.0
+        if abs_delta > 0:
+            normalized["warning_message"] = (
+                f"预测与真实总分偏差 {abs_delta:.2f} 分（100分口径，{ratio:.1f}%），"
+                "已暂停自动调权/自动校准，请人工确认后再执行「学习进化」或「一键闭环执行」。"
+            )
+        else:
+            normalized[
+                "warning_message"
+            ] = "检测到极端偏差样本，已暂停自动调权/自动校准，请人工确认后再执行。"
+    return normalized
+
+
+def _normalize_few_shot_distillation_state(payload: object) -> Dict[str, object]:
+    distillation = dict(payload) if isinstance(payload, dict) else {}
+    captured = int(_to_float_or_none(distillation.get("captured")) or 0)
+    manual_review = (
+        dict(distillation.get("manual_review"))
+        if isinstance(distillation.get("manual_review"), dict)
+        else {}
+    )
+    review_status = (
+        str(manual_review.get("status") or distillation.get("manual_review_status") or "")
+        .strip()
+        .lower()
+    )
+    if captured > 0:
+        if review_status not in {"pending", "adopted", "ignored"}:
+            review_status = "pending"
+    else:
+        review_status = "not_required"
+    manual_review_note = str(
+        manual_review.get("note") or distillation.get("manual_review_note") or ""
+    ).strip()
+    manual_reviewed_at = str(
+        manual_review.get("reviewed_at") or distillation.get("manual_reviewed_at") or ""
+    ).strip()
+    normalized = dict(distillation)
+    normalized["captured"] = captured
+    normalized["manual_review"] = {
+        "status": review_status,
+        "note": manual_review_note or None,
+        "reviewed_at": manual_reviewed_at or None,
+    }
+    normalized["manual_review_status"] = review_status
+    normalized["manual_review_note"] = manual_review_note or None
+    normalized["manual_reviewed_at"] = manual_reviewed_at or None
+    return normalized
 
 
 def _feedback_guardrail_is_blocked(payload: object) -> bool:
@@ -8836,14 +8942,27 @@ def _summarize_project_feedback_guardrail(
             "blocked": False,
             "blocked_record_ids": [],
             "blocked_count": 0,
+            "pending_blocked_count": 0,
         }
     blocked_record_ids = [str(item.get("record_id") or "") for item in blocked_rows]
+    pending_rows = [
+        item
+        for item in blocked_rows
+        if str((item.get("feedback_guardrail") or {}).get("manual_review_status") or "pending")
+        == "pending"
+    ]
     max_abs_delta = max(
         float(_to_float_or_none((item.get("feedback_guardrail") or {}).get("abs_delta_100")) or 0.0)
         for item in blocked_rows
     )
     warning_message = str(
-        ((blocked_rows[0].get("feedback_guardrail") or {}).get("warning_message") or "")
+        (
+            (
+                (pending_rows[0] if pending_rows else blocked_rows[0]).get("feedback_guardrail")
+                or {}
+            ).get("warning_message")
+            or ""
+        )
     ).strip()
     if not warning_message:
         warning_message = (
@@ -8851,13 +8970,14 @@ def _summarize_project_feedback_guardrail(
             "请人工确认后再执行「学习进化」或「一键闭环执行」。"
         )
     return {
-        "blocked": True,
+        "blocked": bool(pending_rows),
         "blocked_record_ids": blocked_record_ids,
         "blocked_count": len(blocked_rows),
+        "pending_blocked_count": len(pending_rows),
         "max_abs_delta_100": round(max_abs_delta, 2),
-        "requires_manual_confirmation": True,
+        "requires_manual_confirmation": bool(pending_rows),
         "warning_message": warning_message,
-        "manual_override_hint": "confirm_extreme_sample=1",
+        "manual_override_hint": "confirm_extreme_sample=1" if pending_rows else None,
     }
 
 
@@ -9258,14 +9378,16 @@ def _build_feedback_governance_report(
     active_rows = _list_project_ground_truth_records(project_id)
     blocked_rows = _collect_blocked_ground_truth_guardrails(project_id)
     summary_guardrail = _summarize_project_feedback_guardrail(project_id)
+    approved_extreme_count = 0
+    rejected_extreme_count = 0
+    pending_extreme_count = 0
+    few_shot_adopted_count = 0
+    few_shot_ignored_count = 0
+    few_shot_pending_review_count = 0
 
     blocked_samples: List[Dict[str, object]] = []
     for item in blocked_rows[:12]:
-        guardrail = (
-            item.get("feedback_guardrail")
-            if isinstance(item.get("feedback_guardrail"), dict)
-            else {}
-        )
+        guardrail = _normalize_feedback_guardrail_state(item.get("feedback_guardrail"))
         record_id = str(item.get("record_id") or "")
         row = next(
             (candidate for candidate in all_rows if str(candidate.get("id") or "") == record_id), {}
@@ -9281,24 +9403,40 @@ def _build_feedback_governance_report(
                 "abs_delta_100": _to_float_or_none(guardrail.get("abs_delta_100")),
                 "relative_delta_ratio": _to_float_or_none(guardrail.get("relative_delta_ratio")),
                 "warning_message": str(guardrail.get("warning_message") or ""),
+                "manual_review_status": str(guardrail.get("manual_review_status") or ""),
+                "manual_review_note": str(guardrail.get("manual_review_note") or ""),
+                "manual_reviewed_at": str(guardrail.get("manual_reviewed_at") or ""),
             }
         )
 
     few_shot_recent: List[Dict[str, object]] = []
     captured_recent_count = 0
+    for row in all_rows:
+        guardrail = _extract_feedback_guardrail(row)
+        if bool(guardrail.get("threshold_blocked")):
+            review_status = str(guardrail.get("manual_review_status") or "pending")
+            if review_status == "approved":
+                approved_extreme_count += 1
+            elif review_status == "rejected":
+                rejected_extreme_count += 1
+            else:
+                pending_extreme_count += 1
     for row in sorted(
         all_rows,
         key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""),
         reverse=True,
     ):
-        distill = (
-            row.get("few_shot_distillation")
-            if isinstance(row.get("few_shot_distillation"), dict)
-            else {}
-        )
+        distill = _normalize_few_shot_distillation_state(row.get("few_shot_distillation"))
         captured = int(_to_float_or_none(distill.get("captured")) or 0)
         if captured > 0:
             captured_recent_count += 1
+            review_status = str(distill.get("manual_review_status") or "pending")
+            if review_status == "adopted":
+                few_shot_adopted_count += 1
+            elif review_status == "ignored":
+                few_shot_ignored_count += 1
+            else:
+                few_shot_pending_review_count += 1
         if len(few_shot_recent) >= 10:
             continue
         if not distill:
@@ -9324,6 +9462,9 @@ def _build_feedback_governance_report(
                     for item in (distill.get("feature_ids") or [])
                     if str(item or "").strip()
                 ][:6],
+                "manual_review_status": str(distill.get("manual_review_status") or ""),
+                "manual_review_note": str(distill.get("manual_review_note") or ""),
+                "manual_reviewed_at": str(distill.get("manual_reviewed_at") or ""),
             }
         )
 
@@ -9343,6 +9484,13 @@ def _build_feedback_governance_report(
                 "version_count": len(versions),
                 "latest_version_id": str(latest.get("version_id") or ""),
                 "latest_created_at": str(latest.get("created_at") or ""),
+                "recent_versions": [
+                    {
+                        "version_id": str(item.get("version_id") or ""),
+                        "created_at": str(item.get("created_at") or ""),
+                    }
+                    for item in versions[:6]
+                ],
             }
         )
 
@@ -9372,8 +9520,14 @@ def _build_feedback_governance_report(
             "ground_truth_count": len(all_rows),
             "active_ground_truth_count": len(active_rows),
             "blocked_ground_truth_count": blocked_count,
+            "approved_extreme_ground_truth_count": approved_extreme_count,
+            "rejected_extreme_ground_truth_count": rejected_extreme_count,
+            "pending_extreme_ground_truth_count": pending_extreme_count,
             "manual_confirmation_required": bool(summary_guardrail.get("blocked")),
             "few_shot_recent_capture_count": captured_recent_count,
+            "few_shot_adopted_count": few_shot_adopted_count,
+            "few_shot_ignored_count": few_shot_ignored_count,
+            "few_shot_pending_review_count": few_shot_pending_review_count,
             "few_shot_feature_version_count": int(
                 next(
                     (
@@ -9686,16 +9840,20 @@ def _build_ground_truth_feedback_guardrail(
         project_score_scale_max=project_score_scale_max,
     )
     if actual_score_100 is None or predicted_score_100 is None:
-        return {
-            "blocked": False,
-            "status": "insufficient_score_context",
-            "requires_manual_confirmation": False,
-            "actual_score_100": round(float(actual_score_100 or 0.0), 2),
-            "predicted_score_100": (
-                round(float(predicted_score_100), 2) if predicted_score_100 is not None else None
-            ),
-            "threshold_ratio": round(float(DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO), 4),
-        }
+        return _normalize_feedback_guardrail_state(
+            {
+                "blocked": False,
+                "status": "insufficient_score_context",
+                "requires_manual_confirmation": False,
+                "actual_score_100": round(float(actual_score_100 or 0.0), 2),
+                "predicted_score_100": (
+                    round(float(predicted_score_100), 2)
+                    if predicted_score_100 is not None
+                    else None
+                ),
+                "threshold_ratio": round(float(DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO), 4),
+            }
+        )
 
     abs_delta_100 = abs(float(actual_score_100) - float(predicted_score_100))
     relative_delta_ratio = abs_delta_100 / 100.0
@@ -9706,18 +9864,21 @@ def _build_ground_truth_feedback_guardrail(
             f"预测与真实总分偏差 {abs_delta_100:.2f} 分（100分口径，{relative_delta_ratio * 100:.1f}%），"
             "已暂停自动调权/自动校准，请人工确认后再执行「学习进化」或「一键闭环执行」。"
         )
-    return {
-        "blocked": blocked,
-        "status": "blocked" if blocked else "accepted",
-        "requires_manual_confirmation": blocked,
-        "actual_score_100": round(float(actual_score_100), 2),
-        "predicted_score_100": round(float(predicted_score_100), 2),
-        "abs_delta_100": round(float(abs_delta_100), 2),
-        "relative_delta_ratio": round(float(relative_delta_ratio), 4),
-        "threshold_ratio": round(float(DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO), 4),
-        "warning_message": warning_message or None,
-        "manual_override_hint": "confirm_extreme_sample=1" if blocked else None,
-    }
+    return _normalize_feedback_guardrail_state(
+        {
+            "blocked": blocked,
+            "threshold_blocked": blocked,
+            "status": "blocked" if blocked else "accepted",
+            "requires_manual_confirmation": blocked,
+            "actual_score_100": round(float(actual_score_100), 2),
+            "predicted_score_100": round(float(predicted_score_100), 2),
+            "abs_delta_100": round(float(abs_delta_100), 2),
+            "relative_delta_ratio": round(float(relative_delta_ratio), 4),
+            "threshold_ratio": round(float(DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO), 4),
+            "warning_message": warning_message or None,
+            "manual_override_hint": "confirm_extreme_sample=1" if blocked else None,
+        }
+    )
 
 
 def _flatten_ground_truth_qualitative_tags(
@@ -10116,9 +10277,11 @@ def _sync_ground_truth_record_to_qingtian(
         for row in all_gt_records:
             if str(row.get("id") or "") != source_gt_id:
                 continue
-            row["feedback_guardrail"] = feedback_guardrail
+            row["feedback_guardrail"] = _normalize_feedback_guardrail_state(feedback_guardrail)
             row["feature_confidence_update"] = feature_confidence_update
-            row["few_shot_distillation"] = few_shot_distillation
+            row["few_shot_distillation"] = _normalize_few_shot_distillation_state(
+                few_shot_distillation
+            )
             row["updated_at"] = _now_iso()
             changed_gt = True
             break
@@ -12383,6 +12546,126 @@ def get_feedback_governance(
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
     payload = _build_feedback_governance_report(project_id, project)
     return FeedbackGovernanceResponse(**payload)
+
+
+@router.post(
+    "/projects/{project_id}/feedback/governance/guardrail/{record_id}/review",
+    response_model=FeedbackGuardrailReviewResponse,
+    tags=["自我学习与进化"],
+    responses={**RESPONSES_401, **RESPONSES_404, **RESPONSES_422},
+)
+def review_feedback_guardrail(
+    project_id: str,
+    record_id: str,
+    payload: FeedbackGuardrailReviewRequest,
+    api_key: Optional[str] = Depends(verify_api_key),
+    locale: str = Depends(get_locale),
+) -> FeedbackGuardrailReviewResponse:
+    """人工审核极端偏差样本，可放行、拒绝或重置。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    if not any(str(p.get("id")) == str(project_id) for p in projects):
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    records = load_ground_truth()
+    record = next(
+        (
+            row
+            for row in records
+            if str(row.get("project_id") or "") == str(project_id)
+            and str(row.get("id") or "") == str(record_id)
+        ),
+        None,
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="真实评标记录不存在")
+
+    updated_guardrail = _apply_feedback_guardrail_review(
+        record,
+        action=str(payload.action or "").strip().lower(),
+        note=str(payload.note or "").strip(),
+    )
+    updated_record = _persist_ground_truth_record_fields(
+        project_id,
+        record_id,
+        updates={"feedback_guardrail": updated_guardrail},
+    )
+    closed_loop: Dict[str, object] = {}
+    if str(updated_guardrail.get("manual_review_status") or "") == "approved" and bool(
+        payload.rerun_closed_loop
+    ):
+        closed_loop = _run_feedback_closed_loop_safe(
+            project_id,
+            locale=locale,
+            trigger="ground_truth_manual_review",
+            ground_truth_record_ids=[record_id],
+        )
+        updated_record = _persist_ground_truth_record_fields(
+            project_id,
+            record_id,
+            updates={"feedback_closed_loop": closed_loop},
+        )
+    else:
+        existing_closed_loop = updated_record.get("feedback_closed_loop")
+        closed_loop = existing_closed_loop if isinstance(existing_closed_loop, dict) else {}
+    return FeedbackGuardrailReviewResponse(
+        ok=True,
+        project_id=project_id,
+        record_id=record_id,
+        feedback_guardrail=_extract_feedback_guardrail(updated_record),
+        feedback_closed_loop=closed_loop,
+        updated_at=str(updated_record.get("updated_at") or _now_iso()),
+    )
+
+
+@router.post(
+    "/projects/{project_id}/feedback/governance/few_shot/{record_id}/review",
+    response_model=FewShotReviewResponse,
+    tags=["自我学习与进化"],
+    responses={**RESPONSES_401, **RESPONSES_404, **RESPONSES_422},
+)
+def review_feedback_few_shot(
+    project_id: str,
+    record_id: str,
+    payload: FewShotReviewRequest,
+    api_key: Optional[str] = Depends(verify_api_key),
+    locale: str = Depends(get_locale),
+) -> FewShotReviewResponse:
+    """人工登记 few-shot 样本采纳状态，不直接改写已落库特征。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    if not any(str(p.get("id")) == str(project_id) for p in projects):
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    records = load_ground_truth()
+    record = next(
+        (
+            row
+            for row in records
+            if str(row.get("project_id") or "") == str(project_id)
+            and str(row.get("id") or "") == str(record_id)
+        ),
+        None,
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="真实评标记录不存在")
+    updated_distillation = _apply_few_shot_review(
+        record,
+        action=str(payload.action or "").strip().lower(),
+        note=str(payload.note or "").strip(),
+    )
+    updated_record = _persist_ground_truth_record_fields(
+        project_id,
+        record_id,
+        updates={"few_shot_distillation": updated_distillation},
+    )
+    return FewShotReviewResponse(
+        ok=True,
+        project_id=project_id,
+        record_id=record_id,
+        few_shot_distillation=_normalize_few_shot_distillation_state(
+            updated_record.get("few_shot_distillation")
+        ),
+        updated_at=str(updated_record.get("updated_at") or _now_iso()),
+    )
 
 
 @router.get(
@@ -19718,6 +20001,88 @@ def _new_ground_truth_record(
     }
 
 
+def _persist_ground_truth_record_fields(
+    project_id: str,
+    record_id: str,
+    *,
+    updates: Dict[str, object],
+) -> Dict[str, object]:
+    records = load_ground_truth()
+    now_iso = _now_iso()
+    updated_row = None
+    for idx, row in enumerate(records):
+        if str(row.get("project_id") or "") != str(project_id):
+            continue
+        if str(row.get("id") or "") != str(record_id):
+            continue
+        merged = dict(row)
+        merged.update(updates)
+        merged["updated_at"] = now_iso
+        records[idx] = merged
+        updated_row = merged
+        break
+    if updated_row is None:
+        raise HTTPException(status_code=404, detail="真实评标记录不存在")
+    save_ground_truth(records)
+    return updated_row
+
+
+def _apply_feedback_guardrail_review(
+    record: Dict[str, object],
+    *,
+    action: str,
+    note: str,
+) -> Dict[str, object]:
+    guardrail = _extract_feedback_guardrail(record)
+    if not bool(guardrail.get("threshold_blocked")) and action != "reset":
+        raise HTTPException(status_code=422, detail="该样本未触发极端偏差拦截，无需人工放行/拒绝。")
+    if action == "approve":
+        review_status = "approved"
+    elif action == "reject":
+        review_status = "rejected"
+    elif action == "reset":
+        review_status = "pending" if bool(guardrail.get("threshold_blocked")) else "not_required"
+    else:
+        raise HTTPException(status_code=422, detail="action 仅支持 approve、reject、reset")
+    reviewed_at = _now_iso() if review_status != "pending" else None
+    guardrail["manual_review"] = {
+        "status": review_status,
+        "note": note or None,
+        "reviewed_at": reviewed_at,
+    }
+    return _normalize_feedback_guardrail_state(guardrail)
+
+
+def _apply_few_shot_review(
+    record: Dict[str, object],
+    *,
+    action: str,
+    note: str,
+) -> Dict[str, object]:
+    distillation = _normalize_few_shot_distillation_state(record.get("few_shot_distillation"))
+    if int(_to_float_or_none(distillation.get("captured")) or 0) <= 0 and action != "reset":
+        raise HTTPException(status_code=422, detail="该样本尚未捕获 few-shot 特征，无需采纳治理。")
+    if action == "adopt":
+        review_status = "adopted"
+    elif action == "ignore":
+        review_status = "ignored"
+    elif action == "reset":
+        review_status = (
+            "pending"
+            if int(_to_float_or_none(distillation.get("captured")) or 0) > 0
+            else "not_required"
+        )
+    else:
+        raise HTTPException(status_code=422, detail="action 仅支持 adopt、ignore、reset")
+    reviewed_at = _now_iso() if review_status != "pending" else None
+    distillation["manual_review"] = {
+        "status": review_status,
+        "note": note or None,
+        "reviewed_at": reviewed_at,
+    }
+    return _normalize_few_shot_distillation_state(distillation)
+
+
 @router.post(
     "/projects/{project_id}/ground_truth",
     response_model=GroundTruthRecord,
@@ -19763,17 +20128,24 @@ def add_ground_truth(
     sync_payload = sync_result if isinstance(sync_result, dict) else {}
     feedback_guardrail = sync_payload.get("feedback_guardrail")
     few_shot_distillation = sync_payload.get("few_shot_distillation")
-    record["feedback_guardrail"] = (
-        feedback_guardrail if isinstance(feedback_guardrail, dict) else {}
-    )
-    record["few_shot_distillation"] = (
-        few_shot_distillation if isinstance(few_shot_distillation, dict) else {}
-    )
+    record["feedback_guardrail"] = _normalize_feedback_guardrail_state(feedback_guardrail)
+    record["few_shot_distillation"] = _normalize_few_shot_distillation_state(few_shot_distillation)
     record["feedback_closed_loop"] = _run_feedback_closed_loop_safe(
         project_id,
         locale=locale,
         trigger="ground_truth_add",
         ground_truth_record_ids=[str(record.get("id") or "")],
+    )
+    record = _persist_ground_truth_record_fields(
+        project_id,
+        str(record.get("id") or ""),
+        updates={
+            "feedback_guardrail": _extract_feedback_guardrail(record),
+            "few_shot_distillation": _normalize_few_shot_distillation_state(
+                record.get("few_shot_distillation")
+            ),
+            "feedback_closed_loop": record.get("feedback_closed_loop") or {},
+        },
     )
     return GroundTruthRecord(**record)
 
@@ -19836,17 +20208,24 @@ def add_ground_truth_from_submission(
     sync_payload = sync_result if isinstance(sync_result, dict) else {}
     feedback_guardrail = sync_payload.get("feedback_guardrail")
     few_shot_distillation = sync_payload.get("few_shot_distillation")
-    record["feedback_guardrail"] = (
-        feedback_guardrail if isinstance(feedback_guardrail, dict) else {}
-    )
-    record["few_shot_distillation"] = (
-        few_shot_distillation if isinstance(few_shot_distillation, dict) else {}
-    )
+    record["feedback_guardrail"] = _normalize_feedback_guardrail_state(feedback_guardrail)
+    record["few_shot_distillation"] = _normalize_few_shot_distillation_state(few_shot_distillation)
     record["feedback_closed_loop"] = _run_feedback_closed_loop_safe(
         project_id,
         locale=locale,
         trigger="ground_truth_add",
         ground_truth_record_ids=[str(record.get("id") or "")],
+    )
+    record = _persist_ground_truth_record_fields(
+        project_id,
+        str(record.get("id") or ""),
+        updates={
+            "feedback_guardrail": _extract_feedback_guardrail(record),
+            "few_shot_distillation": _normalize_few_shot_distillation_state(
+                record.get("few_shot_distillation")
+            ),
+            "feedback_closed_loop": record.get("feedback_closed_loop") or {},
+        },
     )
     return GroundTruthRecord(**record)
 
@@ -19902,17 +20281,24 @@ async def add_ground_truth_from_file(
     sync_payload = sync_result if isinstance(sync_result, dict) else {}
     feedback_guardrail = sync_payload.get("feedback_guardrail")
     few_shot_distillation = sync_payload.get("few_shot_distillation")
-    record["feedback_guardrail"] = (
-        feedback_guardrail if isinstance(feedback_guardrail, dict) else {}
-    )
-    record["few_shot_distillation"] = (
-        few_shot_distillation if isinstance(few_shot_distillation, dict) else {}
-    )
+    record["feedback_guardrail"] = _normalize_feedback_guardrail_state(feedback_guardrail)
+    record["few_shot_distillation"] = _normalize_few_shot_distillation_state(few_shot_distillation)
     record["feedback_closed_loop"] = _run_feedback_closed_loop_safe(
         project_id,
         locale=locale,
         trigger="ground_truth_add",
         ground_truth_record_ids=[str(record.get("id") or "")],
+    )
+    record = _persist_ground_truth_record_fields(
+        project_id,
+        str(record.get("id") or ""),
+        updates={
+            "feedback_guardrail": _extract_feedback_guardrail(record),
+            "few_shot_distillation": _normalize_few_shot_distillation_state(
+                record.get("few_shot_distillation")
+            ),
+            "feedback_closed_loop": record.get("feedback_closed_loop") or {},
+        },
     )
     return GroundTruthRecord(**record)
 
@@ -19995,11 +20381,11 @@ async def add_ground_truth_from_files(
                     sync_payload = sync_result if isinstance(sync_result, dict) else {}
                     feedback_guardrail = sync_payload.get("feedback_guardrail")
                     few_shot_distillation = sync_payload.get("few_shot_distillation")
-                    record["feedback_guardrail"] = (
-                        feedback_guardrail if isinstance(feedback_guardrail, dict) else {}
+                    record["feedback_guardrail"] = _normalize_feedback_guardrail_state(
+                        feedback_guardrail
                     )
-                    record["few_shot_distillation"] = (
-                        few_shot_distillation if isinstance(few_shot_distillation, dict) else {}
+                    record["few_shot_distillation"] = _normalize_few_shot_distillation_state(
+                        few_shot_distillation
                     )
                     success_record_ids.append(str(record.get("id") or ""))
                 except Exception as e:
@@ -20010,9 +20396,30 @@ async def add_ground_truth_from_files(
             trigger="ground_truth_batch_add",
             ground_truth_record_ids=success_record_ids,
         )
+        persisted_records = load_ground_truth()
+        changed_records = False
         for item in items:
             if item.get("ok") and isinstance(item.get("record"), dict):
                 item["record"]["feedback_closed_loop"] = closed_loop_result
+                record_id = str(item["record"].get("id") or "")
+                for idx, stored_row in enumerate(persisted_records):
+                    if str(stored_row.get("project_id") or "") != str(project_id):
+                        continue
+                    if str(stored_row.get("id") or "") != record_id:
+                        continue
+                    merged = dict(stored_row)
+                    merged["feedback_guardrail"] = _extract_feedback_guardrail(item["record"])
+                    merged["few_shot_distillation"] = _normalize_few_shot_distillation_state(
+                        item["record"].get("few_shot_distillation")
+                    )
+                    merged["feedback_closed_loop"] = closed_loop_result
+                    merged["updated_at"] = _now_iso()
+                    persisted_records[idx] = merged
+                    item["record"] = merged
+                    changed_records = True
+                    break
+        if changed_records:
+            save_ground_truth(persisted_records)
 
     success_count = sum(1 for item in items if item.get("ok"))
     failed_count = len(items) - success_count
@@ -25686,57 +26093,95 @@ def index(
           el.style.display = 'block';
           el.innerHTML = html;
         }
-        function renderFeedbackGovernancePanel(payload) {
+        function renderFeedbackGovernancePanel(payload, options) {
           const el = document.getElementById('feedbackGovernanceResult');
           if (!el) return;
           const data = (payload && typeof payload === 'object') ? payload : {};
+          const opts = (options && typeof options === 'object') ? options : {};
           const summary = (data.summary && typeof data.summary === 'object') ? data.summary : {};
           const blockedSamples = Array.isArray(data.blocked_samples) ? data.blocked_samples : [];
           const fewShotRecent = Array.isArray(data.few_shot_recent) ? data.few_shot_recent : [];
           const versions = Array.isArray(data.version_history) ? data.version_history : [];
           const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
           let html = '<strong>闭环治理面板（异常样本 / few-shot / 回退快照）</strong>';
+          if (opts.actionMessage) {
+            html += '<p class="success" style="margin:6px 0">' + escapeHtmlText(String(opts.actionMessage || '')) + '</p>';
+          }
           html += '<table><tr><th>指标</th><th>值</th></tr>';
           html += '<tr><td>真实评分样本</td><td>' + escapeHtmlText(summary.ground_truth_count || 0) + '</td></tr>';
           html += '<tr><td>可参与闭环样本</td><td>' + escapeHtmlText(summary.active_ground_truth_count || 0) + '</td></tr>';
           html += '<tr><td>被拦截样本</td><td>' + escapeHtmlText(summary.blocked_ground_truth_count || 0) + '</td></tr>';
+          html += '<tr><td>已人工放行</td><td>' + escapeHtmlText(summary.approved_extreme_ground_truth_count || 0) + '</td></tr>';
+          html += '<tr><td>已人工拒绝</td><td>' + escapeHtmlText(summary.rejected_extreme_ground_truth_count || 0) + '</td></tr>';
+          html += '<tr><td>待人工审核</td><td>' + escapeHtmlText(summary.pending_extreme_ground_truth_count || 0) + '</td></tr>';
           html += '<tr><td>需人工确认</td><td>' + escapeHtmlText(summary.manual_confirmation_required ? '是' : '否') + '</td></tr>';
           html += '<tr><td>近期 few-shot 捕获数</td><td>' + escapeHtmlText(summary.few_shot_recent_capture_count || 0) + '</td></tr>';
+          html += '<tr><td>few-shot 已采纳</td><td>' + escapeHtmlText(summary.few_shot_adopted_count || 0) + '</td></tr>';
+          html += '<tr><td>few-shot 已忽略</td><td>' + escapeHtmlText(summary.few_shot_ignored_count || 0) + '</td></tr>';
+          html += '<tr><td>few-shot 待审核</td><td>' + escapeHtmlText(summary.few_shot_pending_review_count || 0) + '</td></tr>';
           html += '<tr><td>few-shot 版本数</td><td>' + escapeHtmlText(summary.few_shot_feature_version_count || 0) + '</td></tr>';
           html += '<tr><td>最新 few-shot 版本</td><td>' + escapeHtmlText(summary.latest_few_shot_version_id || '-') + '</td></tr>';
           html += '</table>';
           if (blockedSamples.length) {
-            html += '<strong>被拦截样本</strong><table><tr><th>记录ID</th><th>来源</th><th>真实分</th><th>预测分</th><th>偏差(100分)</th><th>说明</th></tr>';
+            html += '<strong>被拦截样本</strong><table><tr><th>记录ID</th><th>来源</th><th>真实分</th><th>预测分</th><th>偏差(100分)</th><th>审核状态</th><th>说明</th><th>操作</th></tr>';
             html += blockedSamples.slice(0, 10).map((row) => '<tr>'
               + '<td>' + escapeHtmlText(row.record_id || '-') + '</td>'
               + '<td>' + escapeHtmlText(row.source_submission_filename || row.source || '-') + '</td>'
               + '<td>' + escapeHtmlText(row.actual_score_100 != null ? row.actual_score_100 : '-') + '</td>'
               + '<td>' + escapeHtmlText(row.predicted_score_100 != null ? row.predicted_score_100 : '-') + '</td>'
               + '<td>' + escapeHtmlText(row.abs_delta_100 != null ? row.abs_delta_100 : '-') + '</td>'
+              + '<td>' + escapeHtmlText(row.manual_review_status || 'pending') + '</td>'
               + '<td>' + escapeHtmlText(row.warning_message || '-') + '</td>'
+              + '<td>'
+              + '<button type="button" class="secondary js-feedback-guardrail-review" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="approve">放行</button> '
+              + '<button type="button" class="secondary js-feedback-guardrail-review" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="reject">拒绝</button> '
+              + '<button type="button" class="secondary js-feedback-guardrail-review" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="reset">重置</button>'
+              + '</td>'
               + '</tr>').join('');
             html += '</table>';
           } else {
             html += '<p style="margin:6px 0;color:#166534">当前无被拦截的极端偏差样本。</p>';
           }
           if (fewShotRecent.length) {
-            html += '<strong>最近 few-shot 蒸馏</strong><table><tr><th>记录ID</th><th>捕获数</th><th>维度</th><th>原因</th><th>特征ID</th></tr>';
+            html += '<strong>最近 few-shot 蒸馏</strong><table><tr><th>记录ID</th><th>捕获数</th><th>维度</th><th>原因</th><th>审核状态</th><th>特征ID</th><th>操作</th></tr>';
             html += fewShotRecent.slice(0, 10).map((row) => '<tr>'
               + '<td>' + escapeHtmlText(row.record_id || '-') + '</td>'
               + '<td>' + escapeHtmlText(row.captured || 0) + '</td>'
               + '<td>' + escapeHtmlText(((row.dimension_ids) || []).join('、') || '-') + '</td>'
               + '<td>' + escapeHtmlText(row.reason || '-') + '</td>'
+              + '<td>' + escapeHtmlText(row.manual_review_status || 'pending') + '</td>'
               + '<td>' + escapeHtmlText(((row.feature_ids) || []).join('、') || '-') + '</td>'
+              + '<td>'
+              + '<button type="button" class="secondary js-feedback-few-shot-review" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="adopt">采纳</button> '
+              + '<button type="button" class="secondary js-feedback-few-shot-review" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="ignore">忽略</button> '
+              + '<button type="button" class="secondary js-feedback-few-shot-review" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="reset">重置</button>'
+              + '</td>'
               + '</tr>').join('');
             html += '</table>';
           }
           if (versions.length) {
-            html += '<strong>版本快照</strong><table><tr><th>产物</th><th>版本数</th><th>最新版本</th><th>更新时间</th></tr>';
+            html += '<strong>版本快照</strong><table><tr><th>产物</th><th>版本数</th><th>最新版本</th><th>更新时间</th><th>回退</th></tr>';
             html += versions.map((row) => '<tr>'
               + '<td>' + escapeHtmlText(row.artifact || '-') + '</td>'
               + '<td>' + escapeHtmlText(row.version_count || 0) + '</td>'
               + '<td>' + escapeHtmlText(row.latest_version_id || '-') + '</td>'
               + '<td>' + escapeHtmlText(row.latest_created_at || '-') + '</td>'
+              + '<td>'
+              + (
+                Array.isArray(row.recent_versions) && row.recent_versions.length
+                  ? (
+                      '<select class="js-feedback-version-select" data-artifact="' + escapeHtmlText(row.artifact || '') + '">'
+                      + row.recent_versions.map((version) => (
+                        '<option value="' + escapeHtmlText(version.version_id || '') + '">'
+                        + escapeHtmlText((version.version_id || '-') + ' / ' + (version.created_at || '-'))
+                        + '</option>'
+                      )).join('')
+                      + '</select> '
+                      + '<button type="button" class="secondary js-feedback-governance-rollback" data-artifact="' + escapeHtmlText(row.artifact || '') + '">回滚</button>'
+                    )
+                  : '<span style="color:#64748b">暂无快照</span>'
+              )
+              + '</td>'
               + '</tr>').join('');
             html += '</table>';
           }
@@ -25747,6 +26192,159 @@ def index(
           }
           el.style.display = 'block';
           el.innerHTML = html;
+          bindFeedbackGovernancePanelActions(String(data.project_id || pid() || ''));
+        }
+        async function loadFeedbackGovernancePanel(projectId, options) {
+          const opts = (options && typeof options === 'object') ? options : {};
+          const effectiveProjectId = String(projectId || actionProjectId() || '');
+          if (!effectiveProjectId) {
+            setResultError('feedbackGovernanceResult', '请先选择项目后再查看闭环治理。');
+            return null;
+          }
+          if (!opts.suppressLoading) {
+            setResultLoading('feedbackGovernanceResult', '闭环治理分析中...');
+          }
+          let res;
+          let data = {};
+          try {
+            res = await fetch('/api/v1/projects/' + encodeURIComponent(effectiveProjectId) + '/feedback/governance', {
+              method: 'GET',
+              headers: apiHeaders(false),
+            });
+            data = await res.json().catch(() => ({}));
+          } catch (err) {
+            setResultError('feedbackGovernanceResult', '分析失败：' + String((err && err.message) || err || '网络异常'));
+            return null;
+          }
+          showJson('output', formatApiOutput(res, data));
+          if (!res.ok) {
+            const detail = (data && data.detail) ? String(data.detail) : ('HTTP ' + String(res.status || 0));
+            setResultError('feedbackGovernanceResult', '分析失败：' + detail);
+            return null;
+          }
+          const summary = (data.summary && typeof data.summary === 'object') ? data.summary : {};
+          const blockedSamples = Array.isArray(data.blocked_samples) ? data.blocked_samples : [];
+          const firstWarning = blockedSamples.length && blockedSamples[0] && blockedSamples[0].warning_message
+            ? String(blockedSamples[0].warning_message)
+            : '';
+          setFeedbackGuardrailState(effectiveProjectId, {
+            pending: !!summary.manual_confirmation_required,
+            manualConfirmed: false,
+            warningMessage: firstWarning,
+          });
+          renderFeedbackGovernancePanel(data, opts);
+          return data;
+        }
+        function bindFeedbackGovernancePanelActions(projectId) {
+          const panel = document.getElementById('feedbackGovernanceResult');
+          if (!panel || !projectId) return;
+          panel.querySelectorAll('.js-feedback-guardrail-review').forEach((btn) => {
+            btn.onclick = async () => {
+              const recordId = String(btn.getAttribute('data-record-id') || '').trim();
+              const action = String(btn.getAttribute('data-action') || '').trim();
+              if (!recordId || !action) return;
+              const actionLabelMap = { approve: '放行', reject: '拒绝', reset: '重置' };
+              const actionLabel = actionLabelMap[action] || action;
+              if (!window.confirm('确认对样本 ' + recordId + ' 执行「' + actionLabel + '」吗？')) return;
+              const note = window.prompt('可选备注（可留空）', '') || '';
+              const rerunClosedLoop = action === 'approve'
+                ? window.confirm('是否立即把该样本纳入闭环并重跑一次反馈学习？')
+                : false;
+              let res;
+              let data = {};
+              try {
+                res = await fetch('/api/v1/projects/' + encodeURIComponent(projectId) + '/feedback/governance/guardrail/' + encodeURIComponent(recordId) + '/review', {
+                  method: 'POST',
+                  headers: apiHeaders(true),
+                  body: JSON.stringify({ action: action, note: note, rerun_closed_loop: rerunClosedLoop }),
+                });
+                data = await res.json().catch(() => ({}));
+              } catch (err) {
+                setResultError('feedbackGovernanceResult', '治理操作失败：' + String((err && err.message) || err || '网络异常'));
+                return;
+              }
+              showJson('output', formatApiOutput(res, data));
+              if (!res.ok) {
+                const detail = (data && data.detail) ? String(data.detail) : ('HTTP ' + String(res.status || 0));
+                setResultError('feedbackGovernanceResult', '治理操作失败：' + detail);
+                return;
+              }
+              await loadFeedbackGovernancePanel(projectId, {
+                suppressLoading: true,
+                actionMessage: '异常样本已完成「' + actionLabel + '」处理。',
+              });
+            };
+          });
+          panel.querySelectorAll('.js-feedback-few-shot-review').forEach((btn) => {
+            btn.onclick = async () => {
+              const recordId = String(btn.getAttribute('data-record-id') || '').trim();
+              const action = String(btn.getAttribute('data-action') || '').trim();
+              if (!recordId || !action) return;
+              const actionLabelMap = { adopt: '采纳', ignore: '忽略', reset: '重置' };
+              const actionLabel = actionLabelMap[action] || action;
+              if (!window.confirm('确认对 few-shot 样本 ' + recordId + ' 执行「' + actionLabel + '」吗？')) return;
+              const note = window.prompt('可选备注（可留空）', '') || '';
+              let res;
+              let data = {};
+              try {
+                res = await fetch('/api/v1/projects/' + encodeURIComponent(projectId) + '/feedback/governance/few_shot/' + encodeURIComponent(recordId) + '/review', {
+                  method: 'POST',
+                  headers: apiHeaders(true),
+                  body: JSON.stringify({ action: action, note: note }),
+                });
+                data = await res.json().catch(() => ({}));
+              } catch (err) {
+                setResultError('feedbackGovernanceResult', 'few-shot 治理失败：' + String((err && err.message) || err || '网络异常'));
+                return;
+              }
+              showJson('output', formatApiOutput(res, data));
+              if (!res.ok) {
+                const detail = (data && data.detail) ? String(data.detail) : ('HTTP ' + String(res.status || 0));
+                setResultError('feedbackGovernanceResult', 'few-shot 治理失败：' + detail);
+                return;
+              }
+              await loadFeedbackGovernancePanel(projectId, {
+                suppressLoading: true,
+                actionMessage: 'few-shot 样本已完成「' + actionLabel + '」登记。',
+              });
+            };
+          });
+          panel.querySelectorAll('.js-feedback-governance-rollback').forEach((btn) => {
+            btn.onclick = async () => {
+              const artifact = String(btn.getAttribute('data-artifact') || '').trim();
+              if (!artifact) return;
+              const select = panel.querySelector('.js-feedback-version-select[data-artifact="' + artifact + '"]');
+              const versionId = select ? String(select.value || '').trim() : '';
+              if (!versionId) {
+                setResultError('feedbackGovernanceResult', '请先选择要回滚的历史版本。');
+                return;
+              }
+              if (!window.confirm('确认将 ' + artifact + ' 回滚到版本 ' + versionId + ' 吗？')) return;
+              let res;
+              let data = {};
+              try {
+                res = await fetch('/api/v1/ops/versioned-json/' + encodeURIComponent(artifact) + '/rollback', {
+                  method: 'POST',
+                  headers: apiHeaders(true),
+                  body: JSON.stringify({ version_id: versionId }),
+                });
+                data = await res.json().catch(() => ({}));
+              } catch (err) {
+                setResultError('feedbackGovernanceResult', '版本回滚失败：' + String((err && err.message) || err || '网络异常'));
+                return;
+              }
+              showJson('output', formatApiOutput(res, data));
+              if (!res.ok) {
+                const detail = (data && data.detail) ? String(data.detail) : ('HTTP ' + String(res.status || 0));
+                setResultError('feedbackGovernanceResult', '版本回滚失败：' + detail);
+                return;
+              }
+              await loadFeedbackGovernancePanel(projectId, {
+                suppressLoading: true,
+                actionMessage: artifact + ' 已回滚到版本 ' + versionId + '。',
+              });
+            };
+          });
         }
         function applyScoringReadiness(payload) {
           const data = (payload && typeof payload === 'object') ? payload : {};
@@ -27586,26 +28184,7 @@ def index(
         safeClick('btnFeedbackGovernance', async () => {
           if (!ensureProjectForAction('feedbackGovernanceResult')) return;
           const projectId = actionProjectId();
-          setResultLoading('feedbackGovernanceResult', '闭环治理分析中...');
-          let res;
-          let data = {};
-          try {
-            res = await fetch('/api/v1/projects/' + encodeURIComponent(projectId) + '/feedback/governance', {
-              method: 'GET',
-              headers: apiHeaders(false),
-            });
-            data = await res.json().catch(() => ({}));
-          } catch (err) {
-            setResultError('feedbackGovernanceResult', '分析失败：' + String((err && err.message) || err || '网络异常'));
-            return;
-          }
-          showJson('output', formatApiOutput(res, data));
-          if (!res.ok) {
-            const detail = (data && data.detail) ? String(data.detail) : ('HTTP ' + String(res.status || 0));
-            setResultError('feedbackGovernanceResult', '分析失败：' + detail);
-            return;
-          }
-          renderFeedbackGovernancePanel(data);
+          await loadFeedbackGovernancePanel(projectId);
         });
         safeClick('btnWritingGuidance', async () => {
           if (!ensureProjectForAction('guidanceResult')) return;
