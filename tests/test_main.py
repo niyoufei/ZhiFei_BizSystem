@@ -6995,6 +6995,89 @@ class TestGroundTruthGuardrailRoutes:
         assert response.status_code == 409
         assert "confirm_extreme_sample=1" in response.json()["detail"]
 
+
+class TestFeedbackGovernanceRoutes:
+    @patch("app.main.list_json_versions")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_feedback_governance_route_summarizes_blocked_samples_and_few_shot(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_ground_truth,
+        mock_list_versions,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 100}}]
+        mock_load_ground_truth.return_value = [
+            {
+                "id": "gt-blocked",
+                "project_id": "p1",
+                "final_score": 80,
+                "score_scale_max": 100,
+                "judge_scores": [80, 80, 80, 80, 80],
+                "source_submission_filename": "异常样本.docx",
+                "created_at": "2026-03-14T00:00:00+00:00",
+                "feedback_guardrail": {
+                    "blocked": True,
+                    "actual_score_100": 80,
+                    "predicted_score_100": 30,
+                    "abs_delta_100": 50,
+                    "relative_delta_ratio": 0.5,
+                    "warning_message": "预测与真实总分偏差过大，已暂停自动调权/自动校准。",
+                },
+                "few_shot_distillation": {"captured": 0, "reason": "guardrail_blocked"},
+            },
+            {
+                "id": "gt-good",
+                "project_id": "p1",
+                "final_score": 88,
+                "score_scale_max": 100,
+                "judge_scores": [88, 88, 88, 88, 88],
+                "created_at": "2026-03-14T01:00:00+00:00",
+                "few_shot_distillation": {
+                    "captured": 2,
+                    "reason": "captured",
+                    "dimension_ids": ["09"],
+                    "feature_ids": ["F-1", "F-2"],
+                },
+            },
+        ]
+
+        def _versions(path):
+            stem = getattr(path, "stem", "")
+            if stem == "high_score_features":
+                return [
+                    {
+                        "version_id": "20260314T010203000000Z",
+                        "created_at": "2026-03-14T01:02:03+00:00",
+                    }
+                ]
+            if stem == "evolution_reports":
+                return [
+                    {
+                        "version_id": "20260314T020304000000Z",
+                        "created_at": "2026-03-14T02:03:04+00:00",
+                    }
+                ]
+            return []
+
+        mock_list_versions.side_effect = _versions
+
+        response = client.get("/api/v1/projects/p1/feedback/governance")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["summary"]["ground_truth_count"] == 2
+        assert data["summary"]["active_ground_truth_count"] == 1
+        assert data["summary"]["blocked_ground_truth_count"] == 1
+        assert data["summary"]["few_shot_recent_capture_count"] == 1
+        assert data["summary"]["manual_confirmation_required"] is True
+        assert data["blocked_samples"][0]["record_id"] == "gt-blocked"
+        assert data["few_shot_recent"][0]["record_id"] == "gt-good"
+        assert any(row["artifact"] == "high_score_features" for row in data["version_history"])
+
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
     @patch("app.main._collect_blocked_ground_truth_guardrails")

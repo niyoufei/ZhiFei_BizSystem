@@ -416,6 +416,18 @@ class EvolutionHealthResponse(BaseModel):
     recommendations: List[str] = Field(default_factory=list)
 
 
+class FeedbackGovernanceResponse(BaseModel):
+    """项目级反馈闭环治理报告（异常样本 / few-shot / 版本快照）"""
+
+    project_id: str
+    generated_at: str
+    summary: Dict[str, Any] = Field(default_factory=dict)
+    blocked_samples: List[Dict[str, Any]] = Field(default_factory=list)
+    few_shot_recent: List[Dict[str, Any]] = Field(default_factory=list)
+    version_history: List[Dict[str, Any]] = Field(default_factory=list)
+    recommendations: List[str] = Field(default_factory=list)
+
+
 class QingTianResultCreate(BaseModel):
     qingtian_model_version: Optional[str] = Field(None, description="青天模型版本")
     qt_total_score: float = Field(..., description="青天总分(0..100)")

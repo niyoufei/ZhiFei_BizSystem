@@ -182,6 +182,7 @@ from app.schemas import (
     EvolutionReport,
     ExpertProfileRecord,
     ExpertProfileUpdate,
+    FeedbackGovernanceResponse,
     GroundTruthBatchResponse,
     GroundTruthCreate,
     GroundTruthFromSubmissionCreate,
@@ -249,6 +250,7 @@ from app.storage import (
     CALIBRATION_MODELS_PATH,
     EVOLUTION_REPORTS_PATH,
     EXPERT_PROFILES_PATH,
+    HIGH_SCORE_FEATURES_PATH,
     MATERIALS_DIR,
     StorageDataError,
     VersionedJsonSnapshotNotFound,
@@ -9247,6 +9249,162 @@ def _build_evolution_health_report(
     }
 
 
+def _build_feedback_governance_report(
+    project_id: str,
+    project: Dict[str, object],
+) -> Dict[str, object]:
+    project_score_scale = _resolve_project_score_scale_max(project)
+    all_rows = _list_project_ground_truth_records(project_id, include_guardrail_blocked=True)
+    active_rows = _list_project_ground_truth_records(project_id)
+    blocked_rows = _collect_blocked_ground_truth_guardrails(project_id)
+    summary_guardrail = _summarize_project_feedback_guardrail(project_id)
+
+    blocked_samples: List[Dict[str, object]] = []
+    for item in blocked_rows[:12]:
+        guardrail = (
+            item.get("feedback_guardrail")
+            if isinstance(item.get("feedback_guardrail"), dict)
+            else {}
+        )
+        record_id = str(item.get("record_id") or "")
+        row = next(
+            (candidate for candidate in all_rows if str(candidate.get("id") or "") == record_id), {}
+        )
+        blocked_samples.append(
+            {
+                "record_id": record_id,
+                "created_at": str(row.get("created_at") or ""),
+                "source_submission_filename": str(row.get("source_submission_filename") or ""),
+                "source": str(row.get("source") or ""),
+                "actual_score_100": _to_float_or_none(guardrail.get("actual_score_100")),
+                "predicted_score_100": _to_float_or_none(guardrail.get("predicted_score_100")),
+                "abs_delta_100": _to_float_or_none(guardrail.get("abs_delta_100")),
+                "relative_delta_ratio": _to_float_or_none(guardrail.get("relative_delta_ratio")),
+                "warning_message": str(guardrail.get("warning_message") or ""),
+            }
+        )
+
+    few_shot_recent: List[Dict[str, object]] = []
+    captured_recent_count = 0
+    for row in sorted(
+        all_rows,
+        key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""),
+        reverse=True,
+    ):
+        distill = (
+            row.get("few_shot_distillation")
+            if isinstance(row.get("few_shot_distillation"), dict)
+            else {}
+        )
+        captured = int(_to_float_or_none(distill.get("captured")) or 0)
+        if captured > 0:
+            captured_recent_count += 1
+        if len(few_shot_recent) >= 10:
+            continue
+        if not distill:
+            continue
+        normalized_row = _ground_truth_record_for_learning(
+            row if isinstance(row, dict) else {},
+            default_score_scale_max=project_score_scale,
+        )
+        few_shot_recent.append(
+            {
+                "record_id": str(row.get("id") or ""),
+                "created_at": str(row.get("updated_at") or row.get("created_at") or ""),
+                "actual_score_100": _to_float_or_none(normalized_row.get("final_score")),
+                "captured": captured,
+                "reason": str(distill.get("reason") or ""),
+                "dimension_ids": [
+                    _normalize_dimension_id(item)
+                    for item in (distill.get("dimension_ids") or [])
+                    if _normalize_dimension_id(item)
+                ],
+                "feature_ids": [
+                    str(item or "").strip()
+                    for item in (distill.get("feature_ids") or [])
+                    if str(item or "").strip()
+                ][:6],
+            }
+        )
+
+    version_targets = [
+        ("high_score_features", HIGH_SCORE_FEATURES_PATH),
+        ("evolution_reports", EVOLUTION_REPORTS_PATH),
+        ("calibration_models", CALIBRATION_MODELS_PATH),
+        ("expert_profiles", EXPERT_PROFILES_PATH),
+    ]
+    version_history: List[Dict[str, object]] = []
+    for artifact, path in version_targets:
+        versions = list_json_versions(path)
+        latest = versions[0] if versions else {}
+        version_history.append(
+            {
+                "artifact": artifact,
+                "version_count": len(versions),
+                "latest_version_id": str(latest.get("version_id") or ""),
+                "latest_created_at": str(latest.get("created_at") or ""),
+            }
+        )
+
+    recommendations: List[str] = []
+    blocked_count = int(summary_guardrail.get("blocked_count") or 0)
+    if blocked_count > 0:
+        recommendations.append(
+            f"存在 {blocked_count} 条极端偏差样本，自动调权/自动校准已被暂停；人工确认后再执行学习进化或一键闭环。"
+        )
+    if captured_recent_count <= 0:
+        recommendations.append(
+            "近期尚未形成新的 few-shot 蒸馏样本，建议优先补录高分且证据充分的真实评标。"
+        )
+    if any(int(item.get("version_count") or 0) <= 0 for item in version_history):
+        recommendations.append(
+            "部分闭环产物尚无历史快照，建议先完成一次真实反馈学习后再观察版本回退能力。"
+        )
+    if blocked_count <= 0 and captured_recent_count > 0:
+        recommendations.append(
+            "当前闭环处于可进化状态，可继续观察 few-shot 蒸馏是否带来评分逼近提升。"
+        )
+
+    return {
+        "project_id": project_id,
+        "generated_at": _now_iso(),
+        "summary": {
+            "ground_truth_count": len(all_rows),
+            "active_ground_truth_count": len(active_rows),
+            "blocked_ground_truth_count": blocked_count,
+            "manual_confirmation_required": bool(summary_guardrail.get("blocked")),
+            "few_shot_recent_capture_count": captured_recent_count,
+            "few_shot_feature_version_count": int(
+                next(
+                    (
+                        item.get("version_count")
+                        for item in version_history
+                        if str(item.get("artifact") or "") == "high_score_features"
+                    ),
+                    0,
+                )
+                or 0
+            ),
+            "latest_few_shot_version_id": str(
+                next(
+                    (
+                        item.get("latest_version_id")
+                        for item in version_history
+                        if str(item.get("artifact") or "") == "high_score_features"
+                    ),
+                    "",
+                )
+                or ""
+            ),
+            "manual_override_hint": summary_guardrail.get("manual_override_hint"),
+        },
+        "blocked_samples": blocked_samples,
+        "few_shot_recent": few_shot_recent,
+        "version_history": version_history,
+        "recommendations": recommendations[:10],
+    }
+
+
 def _collect_applied_feature_ids_from_report(
     report: Dict[str, object],
     *,
@@ -12204,6 +12362,27 @@ def get_project_evolution_health(
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
     payload = _build_evolution_health_report(project_id, project)
     return EvolutionHealthResponse(**payload)
+
+
+@router.get(
+    "/projects/{project_id}/feedback/governance",
+    response_model=FeedbackGovernanceResponse,
+    tags=["自我学习与进化"],
+    responses=RESPONSES_404,
+)
+def get_feedback_governance(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> FeedbackGovernanceResponse:
+    """项目反馈闭环治理：异常样本、few-shot 蒸馏与版本快照。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    try:
+        project = _find_project(project_id, projects)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    payload = _build_feedback_governance_report(project_id, project)
+    return FeedbackGovernanceResponse(**payload)
 
 
 @router.get(
@@ -21342,6 +21521,7 @@ def index(
             btnRefreshGroundTruthSubmissionOptions: { resultId: 'evolveResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/submissions', loading: '施组选项刷新中...' },
             btnEvolve: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/evolve', loading: '学习进化执行中...' },
             btnEvolutionHealth: { resultId: 'evolutionHealthResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/evolution/health', loading: '进化健康度分析中...' },
+            btnFeedbackGovernance: { resultId: 'feedbackGovernanceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/feedback/governance', loading: '闭环治理分析中...' },
             btnWritingGuidance: { resultId: 'guidanceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/writing_guidance', loading: '正在生成编制指导...' },
             btnCompilationInstructions: { resultId: 'compilationInstructionsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compilation_instructions', loading: '正在生成编制系统指令...' },
             btnScoreShigong: { resultId: 'shigongActionStatus', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/rescore', loading: '施组评分中...' },
@@ -21904,6 +22084,7 @@ def index(
         <div class="action-row" style="margin-bottom:10px">
           <button type="button" id="btnEvolve" onclick="return window.__zhifeiFallbackClick(event, 'btnEvolve')">学习进化（根据已录入真实评标生成高分逻辑与编制指导）</button>
           <button type="button" id="btnEvolutionHealth" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnEvolutionHealth')">进化健康度</button>
+          <button type="button" id="btnFeedbackGovernance" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnFeedbackGovernance')">闭环治理面板</button>
           <button type="button" id="btnWritingGuidance" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnWritingGuidance')">查看编制指导</button>
           <button type="button" id="btnCompilationInstructions" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnCompilationInstructions')">编制系统指令（可导出为编制约束）</button>
         </div>
@@ -21938,6 +22119,7 @@ def index(
         </details>
         <div id="evolveResult" class="result-block" style="display:none"></div>
         <div id="evolutionHealthResult" class="result-block" style="display:none"></div>
+        <div id="feedbackGovernanceResult" class="result-block" style="display:none"></div>
         <div id="compilationInstructionsResult" class="result-block" style="display:none"></div>
         <div id="guidanceResult" class="result-block" style="display:none"></div>
         <div id="deltaResult" class="result-block" style="display:none"></div>
@@ -21994,6 +22176,7 @@ def index(
             btnAddGroundTruth: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/ground_truth/from_submission', loading: '真实评标录入中...' },
             btnEvolve: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/evolve', loading: '学习进化执行中...' },
             btnEvolutionHealth: { resultId: 'evolutionHealthResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/evolution/health', loading: '进化健康度分析中...' },
+            btnFeedbackGovernance: { resultId: 'feedbackGovernanceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/feedback/governance', loading: '闭环治理分析中...' },
             btnWritingGuidance: { resultId: 'guidanceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/writing_guidance', loading: '正在生成编制指导...' },
             btnCompilationInstructions: { resultId: 'compilationInstructionsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compilation_instructions', loading: '正在生成编制系统指令...' },
           });
@@ -22306,6 +22489,41 @@ def index(
                 + '<tr><td>进化权重样本/阈值</td><td>' + fallbackEscapeHtml(evoSamples) + ' / ' + fallbackEscapeHtml(evoMinSamples) + '</td></tr>'
                 + '<tr><td>进化权重时效(天)</td><td>' + fallbackEscapeHtml(evoAge) + '</td></tr>'
                 + '</table>'
+                + (recs.length
+                  ? '<ul style="margin:6px 0 0 18px;color:#92400e">' + recs.slice(0, 6).map((x) => '<li>' + fallbackEscapeHtml(x) + '</li>').join('') + '</ul>'
+                  : '');
+              fallbackSetResultHtml(resultId, html);
+              return true;
+            }
+            if (aid === 'btnFeedbackGovernance') {
+              const summary = (data && typeof data.summary === 'object') ? data.summary : {};
+              const blockedSamples = Array.isArray(data.blocked_samples) ? data.blocked_samples : [];
+              const fewShotRecent = Array.isArray(data.few_shot_recent) ? data.few_shot_recent : [];
+              const versions = Array.isArray(data.version_history) ? data.version_history : [];
+              const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
+              const html = '<strong>闭环治理面板</strong>'
+                + '<table><tr><th>指标</th><th>值</th></tr>'
+                + '<tr><td>真实评分样本</td><td>' + fallbackEscapeHtml((summary && summary.ground_truth_count) || 0) + '</td></tr>'
+                + '<tr><td>可参与闭环样本</td><td>' + fallbackEscapeHtml((summary && summary.active_ground_truth_count) || 0) + '</td></tr>'
+                + '<tr><td>被拦截样本</td><td>' + fallbackEscapeHtml((summary && summary.blocked_ground_truth_count) || 0) + '</td></tr>'
+                + '<tr><td>需人工确认</td><td>' + fallbackEscapeHtml(!!(summary && summary.manual_confirmation_required)) + '</td></tr>'
+                + '<tr><td>近期 few-shot 捕获数</td><td>' + fallbackEscapeHtml((summary && summary.few_shot_recent_capture_count) || 0) + '</td></tr>'
+                + '</table>'
+                + (blockedSamples.length
+                  ? '<strong>被拦截样本</strong><table><tr><th>ID</th><th>偏差(100分)</th><th>说明</th></tr>'
+                    + blockedSamples.slice(0, 6).map((row) => '<tr><td>' + fallbackEscapeHtml(row.record_id || '-') + '</td><td>' + fallbackEscapeHtml(row.abs_delta_100 || '-') + '</td><td>' + fallbackEscapeHtml(row.warning_message || '-') + '</td></tr>').join('')
+                    + '</table>'
+                  : '<p style="color:#166534">当前无被拦截的极端偏差样本。</p>')
+                + (fewShotRecent.length
+                  ? '<strong>最近 few-shot 蒸馏</strong><table><tr><th>ID</th><th>捕获</th><th>维度</th><th>原因</th></tr>'
+                    + fewShotRecent.slice(0, 6).map((row) => '<tr><td>' + fallbackEscapeHtml(row.record_id || '-') + '</td><td>' + fallbackEscapeHtml(row.captured || 0) + '</td><td>' + fallbackEscapeHtml(((row.dimension_ids) || []).join('、') || '-') + '</td><td>' + fallbackEscapeHtml(row.reason || '-') + '</td></tr>').join('')
+                    + '</table>'
+                  : '<p style="color:#64748b">暂无 few-shot 蒸馏记录。</p>')
+                + (versions.length
+                  ? '<strong>版本快照</strong><table><tr><th>产物</th><th>版本数</th><th>最新版本</th></tr>'
+                    + versions.map((row) => '<tr><td>' + fallbackEscapeHtml(row.artifact || '-') + '</td><td>' + fallbackEscapeHtml(row.version_count || 0) + '</td><td>' + fallbackEscapeHtml(row.latest_version_id || '-') + '</td></tr>').join('')
+                    + '</table>'
+                  : '')
                 + (recs.length
                   ? '<ul style="margin:6px 0 0 18px;color:#92400e">' + recs.slice(0, 6).map((x) => '<li>' + fallbackEscapeHtml(x) + '</li>').join('') + '</ul>'
                   : '');
@@ -23216,7 +23434,7 @@ def index(
           'btnMaterialDepthReport', 'btnMaterialDepthReportDownload', 'btnMaterialKnowledgeProfile', 'btnMaterialKnowledgeProfileDownload',
           'btnScoringDiagnostic',
           'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
-          'btnEvolve', 'btnEvolutionHealth', 'btnWritingGuidance', 'btnCompilationInstructions',
+          'btnEvolve', 'btnEvolutionHealth', 'btnFeedbackGovernance', 'btnWritingGuidance', 'btnCompilationInstructions',
           'btnRebuildDelta', 'btnRebuildSamples', 'btnTrainCalibratorV2', 'btnApplyCalibPredict',
           'btnAutoRunReflection', 'btnEvalMetricsV2', 'btnEvalSummaryV2',
           'btnMinePatchV2', 'btnShadowPatchV2', 'btnDeployPatchV2', 'btnRollbackPatchV2',
@@ -23227,7 +23445,7 @@ def index(
           'btnEvidenceTrace', 'btnScoringBasis',
           'btnAdaptive', 'btnAdaptivePatch', 'btnAdaptiveValidate', 'btnAdaptiveApply',
           'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
-          'btnEvolve', 'btnEvolutionHealth', 'btnWritingGuidance', 'btnCompilationInstructions',
+          'btnEvolve', 'btnEvolutionHealth', 'btnFeedbackGovernance', 'btnWritingGuidance', 'btnCompilationInstructions',
           'btnRebuildDelta', 'btnRebuildSamples', 'btnTrainCalibratorV2', 'btnApplyCalibPredict',
           'btnAutoRunReflection', 'btnEvalMetricsV2', 'btnEvalSummaryV2',
           'btnMinePatchV2', 'btnShadowPatchV2', 'btnDeployPatchV2', 'btnRollbackPatchV2',
@@ -25468,6 +25686,68 @@ def index(
           el.style.display = 'block';
           el.innerHTML = html;
         }
+        function renderFeedbackGovernancePanel(payload) {
+          const el = document.getElementById('feedbackGovernanceResult');
+          if (!el) return;
+          const data = (payload && typeof payload === 'object') ? payload : {};
+          const summary = (data.summary && typeof data.summary === 'object') ? data.summary : {};
+          const blockedSamples = Array.isArray(data.blocked_samples) ? data.blocked_samples : [];
+          const fewShotRecent = Array.isArray(data.few_shot_recent) ? data.few_shot_recent : [];
+          const versions = Array.isArray(data.version_history) ? data.version_history : [];
+          const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
+          let html = '<strong>闭环治理面板（异常样本 / few-shot / 回退快照）</strong>';
+          html += '<table><tr><th>指标</th><th>值</th></tr>';
+          html += '<tr><td>真实评分样本</td><td>' + escapeHtmlText(summary.ground_truth_count || 0) + '</td></tr>';
+          html += '<tr><td>可参与闭环样本</td><td>' + escapeHtmlText(summary.active_ground_truth_count || 0) + '</td></tr>';
+          html += '<tr><td>被拦截样本</td><td>' + escapeHtmlText(summary.blocked_ground_truth_count || 0) + '</td></tr>';
+          html += '<tr><td>需人工确认</td><td>' + escapeHtmlText(summary.manual_confirmation_required ? '是' : '否') + '</td></tr>';
+          html += '<tr><td>近期 few-shot 捕获数</td><td>' + escapeHtmlText(summary.few_shot_recent_capture_count || 0) + '</td></tr>';
+          html += '<tr><td>few-shot 版本数</td><td>' + escapeHtmlText(summary.few_shot_feature_version_count || 0) + '</td></tr>';
+          html += '<tr><td>最新 few-shot 版本</td><td>' + escapeHtmlText(summary.latest_few_shot_version_id || '-') + '</td></tr>';
+          html += '</table>';
+          if (blockedSamples.length) {
+            html += '<strong>被拦截样本</strong><table><tr><th>记录ID</th><th>来源</th><th>真实分</th><th>预测分</th><th>偏差(100分)</th><th>说明</th></tr>';
+            html += blockedSamples.slice(0, 10).map((row) => '<tr>'
+              + '<td>' + escapeHtmlText(row.record_id || '-') + '</td>'
+              + '<td>' + escapeHtmlText(row.source_submission_filename || row.source || '-') + '</td>'
+              + '<td>' + escapeHtmlText(row.actual_score_100 != null ? row.actual_score_100 : '-') + '</td>'
+              + '<td>' + escapeHtmlText(row.predicted_score_100 != null ? row.predicted_score_100 : '-') + '</td>'
+              + '<td>' + escapeHtmlText(row.abs_delta_100 != null ? row.abs_delta_100 : '-') + '</td>'
+              + '<td>' + escapeHtmlText(row.warning_message || '-') + '</td>'
+              + '</tr>').join('');
+            html += '</table>';
+          } else {
+            html += '<p style="margin:6px 0;color:#166534">当前无被拦截的极端偏差样本。</p>';
+          }
+          if (fewShotRecent.length) {
+            html += '<strong>最近 few-shot 蒸馏</strong><table><tr><th>记录ID</th><th>捕获数</th><th>维度</th><th>原因</th><th>特征ID</th></tr>';
+            html += fewShotRecent.slice(0, 10).map((row) => '<tr>'
+              + '<td>' + escapeHtmlText(row.record_id || '-') + '</td>'
+              + '<td>' + escapeHtmlText(row.captured || 0) + '</td>'
+              + '<td>' + escapeHtmlText(((row.dimension_ids) || []).join('、') || '-') + '</td>'
+              + '<td>' + escapeHtmlText(row.reason || '-') + '</td>'
+              + '<td>' + escapeHtmlText(((row.feature_ids) || []).join('、') || '-') + '</td>'
+              + '</tr>').join('');
+            html += '</table>';
+          }
+          if (versions.length) {
+            html += '<strong>版本快照</strong><table><tr><th>产物</th><th>版本数</th><th>最新版本</th><th>更新时间</th></tr>';
+            html += versions.map((row) => '<tr>'
+              + '<td>' + escapeHtmlText(row.artifact || '-') + '</td>'
+              + '<td>' + escapeHtmlText(row.version_count || 0) + '</td>'
+              + '<td>' + escapeHtmlText(row.latest_version_id || '-') + '</td>'
+              + '<td>' + escapeHtmlText(row.latest_created_at || '-') + '</td>'
+              + '</tr>').join('');
+            html += '</table>';
+          }
+          if (recs.length) {
+            html += '<ul style="margin:6px 0 0 18px;color:#92400e">'
+              + recs.slice(0, 8).map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('')
+              + '</ul>';
+          }
+          el.style.display = 'block';
+          el.innerHTML = html;
+        }
         function applyScoringReadiness(payload) {
           const data = (payload && typeof payload === 'object') ? payload : {};
           const currentProjectId = pid();
@@ -27302,6 +27582,30 @@ def index(
             return;
           }
           renderEvolutionHealthPanel(data);
+        });
+        safeClick('btnFeedbackGovernance', async () => {
+          if (!ensureProjectForAction('feedbackGovernanceResult')) return;
+          const projectId = actionProjectId();
+          setResultLoading('feedbackGovernanceResult', '闭环治理分析中...');
+          let res;
+          let data = {};
+          try {
+            res = await fetch('/api/v1/projects/' + encodeURIComponent(projectId) + '/feedback/governance', {
+              method: 'GET',
+              headers: apiHeaders(false),
+            });
+            data = await res.json().catch(() => ({}));
+          } catch (err) {
+            setResultError('feedbackGovernanceResult', '分析失败：' + String((err && err.message) || err || '网络异常'));
+            return;
+          }
+          showJson('output', formatApiOutput(res, data));
+          if (!res.ok) {
+            const detail = (data && data.detail) ? String(data.detail) : ('HTTP ' + String(res.status || 0));
+            setResultError('feedbackGovernanceResult', '分析失败：' + detail);
+            return;
+          }
+          renderFeedbackGovernancePanel(data);
         });
         safeClick('btnWritingGuidance', async () => {
           if (!ensureProjectForAction('guidanceResult')) return;
