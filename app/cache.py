@@ -23,7 +23,7 @@ from app.metrics import (
     record_cache_miss,
     update_cache_size,
 )
-from app.storage import DATA_DIR, ensure_data_dirs
+from app.storage import DATA_DIR, ensure_data_dirs, load_json, save_json
 
 CACHE_PATH = DATA_DIR / "score_cache.json"
 DEFAULT_TTL = 3600  # 1 小时
@@ -290,7 +290,7 @@ class ScoreCache:
         try:
             ensure_data_dirs()
             data = {k: v.to_dict() for k, v in self._cache.items()}
-            CACHE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            save_json(CACHE_PATH, data)
         except Exception:
             pass  # 静默失败，缓存丢失不影响核心功能
 
@@ -299,7 +299,7 @@ class ScoreCache:
         if not self.persist or not CACHE_PATH.exists():
             return
         try:
-            data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+            data = load_json(CACHE_PATH, {})
             for key, entry_data in data.items():
                 entry = CacheEntry.from_dict(entry_data)
                 if not entry.is_expired():

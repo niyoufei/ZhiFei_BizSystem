@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -9,7 +11,38 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 BASE_DIR = Path(__file__).resolve().parents[1]
-DATA_DIR = BASE_DIR / "data"
+logger = logging.getLogger(__name__)
+
+_SECURE_FILE_MAGIC = b"ZHIFEI_SECURE_V1\0"
+_SECURE_RUNTIME_LOCK = threading.Lock()
+_SECURE_RUNTIME_PREPARED = False
+_DPAPI_OPTIONAL_ENTROPY = b"ZhifeiBizSystem::SecureDesktop"
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = str(raw).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def is_secure_desktop_mode_enabled() -> bool:
+    return _env_flag("ZHIFEI_SECURE_DESKTOP", default=False)
+
+
+def _resolve_data_dir() -> Path:
+    override = str(os.environ.get("ZHIFEI_DATA_DIR") or "").strip()
+    if override:
+        return Path(override).expanduser()
+    if is_secure_desktop_mode_enabled() and os.name == "nt":
+        local_appdata = str(os.environ.get("LOCALAPPDATA") or "").strip()
+        if local_appdata:
+            return Path(local_appdata) / "QingtianBidSystem" / "data"
+    return BASE_DIR / "data"
+
+
+DATA_DIR = _resolve_data_dir()
 MATERIALS_DIR = DATA_DIR / "materials"
 PROJECTS_PATH = DATA_DIR / "projects.json"
 SUBMISSIONS_PATH = DATA_DIR / "submissions.json"
@@ -35,6 +68,10 @@ MATERIAL_PARSE_JOBS_PATH = DATA_DIR / "material_parse_jobs.json"
 
 _PATH_LOCKS: Dict[str, threading.RLock] = {}
 _PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _is_secure_blob(payload: bytes) -> bool:
+    return payload.startswith(_SECURE_FILE_MAGIC)
 
 
 def ensure_data_dirs() -> None:
@@ -94,16 +131,16 @@ def _fsync_parent_dir(path: Path) -> None:
                 pass
 
 
-def _atomic_write_text(path: Path, payload: str) -> None:
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_path = tempfile.mkstemp(
         prefix=f".{path.name}.",
         suffix=".tmp",
         dir=str(path.parent),
-        text=True,
+        text=False,
     )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        with os.fdopen(fd, "wb") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
@@ -117,21 +154,143 @@ def _atomic_write_text(path: Path, payload: str) -> None:
                 pass
 
 
+def _atomic_write_text(path: Path, payload: str) -> None:
+    _atomic_write_bytes(path, payload.encode("utf-8"))
+
+
+def _require_windows_dpapi() -> None:
+    if os.name != "nt" or not hasattr(ctypes, "windll"):
+        raise RuntimeError("secure_desktop_requires_windows_dpapi")
+
+
+def _blob_from_bytes(payload: bytes):
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [
+            ("cbData", ctypes.c_uint32),
+            ("pbData", ctypes.POINTER(ctypes.c_ubyte)),
+        ]
+
+    if payload:
+        buffer = ctypes.create_string_buffer(payload)
+        blob = DATA_BLOB(
+            cbData=len(payload),
+            pbData=ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte)),
+        )
+        return blob, buffer, DATA_BLOB
+    blob = DATA_BLOB(cbData=0, pbData=None)
+    return blob, None, DATA_BLOB
+
+
+def _dpapi_crypt(payload: bytes, *, decrypt: bool) -> bytes:
+    _require_windows_dpapi()
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    in_blob, in_buffer, blob_type = _blob_from_bytes(payload)
+    entropy_blob, entropy_buffer, _ = _blob_from_bytes(_DPAPI_OPTIONAL_ENTROPY)
+    out_blob = blob_type()
+    crypt_fn = crypt32.CryptUnprotectData if decrypt else crypt32.CryptProtectData
+    entropy_ptr = ctypes.byref(entropy_blob) if _DPAPI_OPTIONAL_ENTROPY else None
+    ok = crypt_fn(
+        ctypes.byref(in_blob),
+        None,
+        entropy_ptr,
+        None,
+        None,
+        0x01,
+        ctypes.byref(out_blob),
+    )
+    if not ok:
+        raise ctypes.WinError()
+    try:
+        if not out_blob.cbData:
+            return b""
+        return ctypes.string_at(out_blob.pbData, out_blob.cbData)
+    finally:
+        if out_blob.pbData:
+            kernel32.LocalFree(out_blob.pbData)
+        del in_buffer
+        del entropy_buffer
+
+
+def _encrypt_payload(payload: bytes) -> bytes:
+    if not is_secure_desktop_mode_enabled():
+        return payload
+    encrypted = _dpapi_crypt(payload, decrypt=False)
+    return _SECURE_FILE_MAGIC + encrypted
+
+
+def _decrypt_payload(payload: bytes) -> bytes:
+    if not _is_secure_blob(payload):
+        return payload
+    return _dpapi_crypt(payload[len(_SECURE_FILE_MAGIC) :], decrypt=True)
+
+
+def read_bytes(path: Path) -> bytes:
+    if not path.exists():
+        raise FileNotFoundError(path)
+    lock = _get_path_lock(path)
+    with lock:
+        with _exclusive_file_lock(path):
+            payload = path.read_bytes()
+    return _decrypt_payload(payload)
+
+
+def save_bytes(path: Path, payload: bytes) -> None:
+    lock = _get_path_lock(path)
+    stored_payload = _encrypt_payload(payload)
+    with lock:
+        with _exclusive_file_lock(path):
+            _atomic_write_bytes(path, stored_payload)
+
+
 def load_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
-    lock = _get_path_lock(path)
-    with lock:
-        with _exclusive_file_lock(path):
-            return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(read_bytes(path).decode("utf-8"))
 
 
 def save_json(path: Path, data: Any) -> None:
-    lock = _get_path_lock(path)
     payload = json.dumps(data, ensure_ascii=False, indent=2)
-    with lock:
-        with _exclusive_file_lock(path):
-            _atomic_write_text(path, payload)
+    save_bytes(path, payload.encode("utf-8"))
+
+
+def _iter_secure_candidate_files() -> List[Path]:
+    if not DATA_DIR.exists():
+        return []
+    rows: List[Path] = []
+    for path in DATA_DIR.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.name.endswith(".lock") or path.name.endswith(".tmp"):
+            continue
+        if path.name.startswith(".") and path.suffix == ".tmp":
+            continue
+        rows.append(path)
+    return rows
+
+
+def prepare_secure_runtime() -> None:
+    global _SECURE_RUNTIME_PREPARED
+    if not is_secure_desktop_mode_enabled():
+        return
+    _require_windows_dpapi()
+    with _SECURE_RUNTIME_LOCK:
+        if _SECURE_RUNTIME_PREPARED:
+            return
+        ensure_data_dirs()
+        migrated = 0
+        for path in _iter_secure_candidate_files():
+            try:
+                payload = path.read_bytes()
+            except OSError:
+                continue
+            if _is_secure_blob(payload):
+                continue
+            save_bytes(path, payload)
+            migrated += 1
+        _SECURE_RUNTIME_PREPARED = True
+        if migrated:
+            logger.info("secure desktop runtime encrypted %s existing data files", migrated)
 
 
 def load_projects() -> List[Dict[str, Any]]:

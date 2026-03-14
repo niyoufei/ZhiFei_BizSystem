@@ -17,6 +17,7 @@ import threading
 import time
 import unicodedata
 from collections import Counter
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 # 加载 .env，使 SPARK_APIPASSWORD、OPENAI_API_KEY 等生效
@@ -134,7 +135,16 @@ from app.engine.surrogate_learning import calibrate_weights, compute_time_decay_
 from app.engine.v2_scorer import compute_v2_rule_total, score_text_v2
 from app.i18n import DEFAULT_LOCALE, SUPPORTED_LOCALES, t
 from app.metrics import get_metrics, record_score, update_project_stats
+from app.observability import configure_observability
 from app.rate_limit import get_rate_limit_status, setup_rate_limiting
+from app.runtime_security import (
+    SECURE_DESKTOP_NOTICE,
+    assert_secure_desktop_allows_export,
+    build_fastapi_runtime_kwargs,
+    configure_runtime_security,
+    get_runtime_security_status,
+    validate_runtime_security_settings,
+)
 from app.schemas import (
     RESPONSES_401,
     RESPONSES_404,
@@ -219,9 +229,19 @@ from app.schemas import (
     TrendAnalysis,
     WritingGuidance,
 )
+from app.scoring_diagnostics import (
+    LatestSubmissionContext,
+    MaterialCardContext,
+    build_dimension_support_cards,
+    build_material_type_cards,
+    build_project_scoring_summary,
+    collect_project_scoring_recommendations,
+    prepare_latest_submission_context,
+)
 from app.storage import (
     MATERIALS_DIR,
     ensure_data_dirs,
+    is_secure_desktop_mode_enabled,
     load_calibration_models,
     load_calibration_samples,
     load_delta_cases,
@@ -242,6 +262,9 @@ from app.storage import (
     load_score_history,
     load_score_reports,
     load_submissions,
+    prepare_secure_runtime,
+    read_bytes,
+    save_bytes,
     save_calibration_models,
     save_calibration_samples,
     save_delta_cases,
@@ -262,6 +285,21 @@ from app.storage import (
     save_score_history,
     save_score_reports,
     save_submissions,
+)
+from app.submission_diagnostics import (
+    SubmissionEvidenceTraceContext,
+    SubmissionScoringBasisContext,
+)
+from app.submission_diagnostics import (
+    build_submission_evidence_trace_report as build_submission_evidence_trace_payload,
+)
+from app.submission_diagnostics import (
+    build_submission_scoring_basis_report as build_submission_scoring_basis_payload,
+)
+from app.system_health import (
+    SystemSelfCheckContext,
+    build_readiness_status,
+    run_system_self_check,
 )
 
 logger = logging.getLogger(__name__)
@@ -865,7 +903,7 @@ def _build_project_material_index(project_id: str) -> Dict[str, object]:
             total_lexical_terms += len(lexical_terms)
         elif legacy_sync_parse:
             try:
-                content = p.read_bytes()
+                content = read_bytes(p)
                 text = _read_uploaded_file_content(content, p.name)
                 text_value = str(text or "")
                 chars = len(text_value.strip())
@@ -1762,7 +1800,7 @@ def _parse_material_record_payload(row: Dict[str, object]) -> Dict[str, object]:
     path = Path(str(row.get("path") or "").strip())
     if not path.exists():
         raise FileNotFoundError("path_not_exists")
-    content = path.read_bytes()
+    content = read_bytes(path)
     filename = path.name
     material_type = _normalize_material_type(row.get("material_type"), filename=filename)
     parsed_text = _read_uploaded_file_content(content, filename)
@@ -2038,6 +2076,8 @@ def _start_material_parse_worker() -> None:
     global _MATERIAL_PARSE_WORKER
     if _MATERIAL_PARSE_WORKER and _MATERIAL_PARSE_WORKER.is_alive():
         return
+    if _MATERIAL_PARSE_WORKER and not _MATERIAL_PARSE_WORKER.is_alive():
+        _MATERIAL_PARSE_WORKER = None
     _MATERIAL_PARSE_STOP_EVENT.clear()
     _bootstrap_material_parse_state()
     worker = threading.Thread(
@@ -2052,8 +2092,14 @@ def _start_material_parse_worker() -> None:
 def _stop_material_parse_worker() -> None:
     global _MATERIAL_PARSE_WORKER
     _MATERIAL_PARSE_STOP_EVENT.set()
-    if _MATERIAL_PARSE_WORKER and _MATERIAL_PARSE_WORKER.is_alive():
-        _MATERIAL_PARSE_WORKER.join(timeout=2.0)
+    worker = _MATERIAL_PARSE_WORKER
+    if worker and worker.is_alive():
+        worker.join(timeout=2.0)
+        if worker.is_alive():
+            logger.warning(
+                "material parse worker did not stop within timeout; keeping reference to avoid duplicate workers"
+            )
+            return
     _MATERIAL_PARSE_WORKER = None
 
 
@@ -2943,6 +2989,8 @@ def _build_material_query_features(
             section_terms_limit = 4 if row_quality >= 0.5 else 2
             scoring_terms_limit = 4 if row_quality >= 0.5 else 2
             mandatory_terms_limit = 3 if row_quality >= 0.4 else 1
+            outline_terms_limit = 4 if row_quality >= 0.5 else 2
+            table_terms_limit = 4 if row_quality >= 0.5 else 2
             _append_unique(
                 _filter_profile_terms(
                     row.get("top_terms"),
@@ -2977,6 +3025,24 @@ def _build_material_query_features(
                 _filter_profile_terms(
                     row.get("section_titles_preview"),
                     limit=section_terms_limit,
+                    material_type=normalized_type,
+                ),
+                material_profile_query_terms,
+                limit=36,
+            )
+            _append_unique(
+                _filter_profile_terms(
+                    row.get("outline_terms_preview"),
+                    limit=outline_terms_limit,
+                    material_type=normalized_type,
+                ),
+                material_profile_query_terms,
+                limit=36,
+            )
+            _append_unique(
+                _filter_profile_terms(
+                    row.get("table_constraint_terms_preview"),
+                    limit=table_terms_limit,
                     material_type=normalized_type,
                 ),
                 material_profile_query_terms,
@@ -3114,6 +3180,8 @@ def _build_material_dimension_requirements(
         numeric_terms: List[str] = []
         structured_terms: List[str] = []
         section_titles: List[str] = []
+        outline_terms: List[str] = []
+        table_constraint_terms: List[str] = []
         scoring_point_terms: List[str] = []
         mandatory_clause_terms: List[str] = []
         numeric_category_summary: List[str] = []
@@ -3157,6 +3225,20 @@ def _build_material_dimension_requirements(
                 if term not in section_titles:
                     section_titles.append(term)
             for term in _collect_terms(
+                row.get("outline_terms_preview"),
+                limit=4,
+                material_type=mat_type,
+            ):
+                if term not in outline_terms:
+                    outline_terms.append(term)
+            for term in _collect_terms(
+                row.get("table_constraint_terms_preview"),
+                limit=4,
+                material_type=mat_type,
+            ):
+                if term not in table_constraint_terms:
+                    table_constraint_terms.append(term)
+            for term in _collect_terms(
                 row.get("scoring_point_terms_preview"),
                 limit=3,
                 material_type=mat_type,
@@ -3185,6 +3267,8 @@ def _build_material_dimension_requirements(
                 structured_alignment_hits += 1
         merged_hints = _to_text_items(
             hints
+            + outline_terms
+            + table_constraint_terms
             + section_titles
             + scoring_point_terms
             + mandatory_clause_terms
@@ -3206,6 +3290,8 @@ def _build_material_dimension_requirements(
             minimum_hint_hits = max(minimum_hint_hits, 3)
         if strongest_structured_quality >= 0.6:
             minimum_hint_hits = max(minimum_hint_hits, 3)
+        if (outline_terms or table_constraint_terms) and strongest_structured_quality >= 0.45:
+            minimum_hint_hits = max(minimum_hint_hits, 3)
         weight = round(
             min(
                 1.2,
@@ -3215,6 +3301,8 @@ def _build_material_dimension_requirements(
                 + min(0.12, structured_alignment_hits * 0.06)
                 + min(0.12, strongest_structured_quality * 0.16)
                 + min(0.08, strong_quality_sources * 0.03)
+                + min(0.08, len(outline_terms) * 0.02)
+                + min(0.08, len(table_constraint_terms) * 0.02)
                 + min(0.08, len(section_titles) * 0.02)
                 + min(0.08, len(scoring_point_terms) * 0.025)
                 + min(0.1, len(mandatory_clause_terms) * 0.04)
@@ -3238,6 +3326,8 @@ def _build_material_dimension_requirements(
                     "minimum_hint_hits": minimum_hint_hits,
                     "structured_terms": structured_terms[:6],
                     "section_titles": section_titles[:4],
+                    "outline_terms": outline_terms[:4],
+                    "table_constraint_terms": table_constraint_terms[:4],
                     "scoring_point_terms": scoring_point_terms[:4],
                     "mandatory_clause_terms": mandatory_clause_terms[:3],
                     "source_types": source_types,
@@ -3255,7 +3345,7 @@ def _build_material_dimension_requirements(
                 "weight": weight,
                 "source_anchor_id": None,
                 "source_pack_id": "runtime_material_dimension",
-                "source_pack_version": "v2-material-dimension-3",
+                "source_pack_version": "v2-material-dimension-4",
                 "priority": 89.0,
                 "override_key": f"runtime::material_dimension::{dim_id}",
                 "lint": {},
@@ -4553,6 +4643,8 @@ def _build_runtime_custom_requirements(
                 "file_structured_quality": c.get("file_structured_quality"),
                 "matched_terms": c.get("matched_terms"),
                 "matched_numeric_terms": c.get("matched_numeric_terms"),
+                "matched_file_anchor_terms": c.get("matched_file_anchor_terms"),
+                "matched_file_numeric_terms": c.get("matched_file_numeric_terms"),
                 "selected_via": c.get("selected_via"),
             }
             for c in retrieval_chunks[:8]
@@ -5442,133 +5534,18 @@ def _build_submission_evidence_trace_report(
     project_id: str,
     submission: Dict[str, object],
 ) -> Dict[str, object]:
-    submission_id = str(submission.get("id") or "")
-    filename = str(submission.get("filename") or "")
-    report = submission.get("report") if isinstance(submission.get("report"), dict) else {}
-    report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
-    summary = (
-        report_meta.get("evidence_trace")
-        if isinstance(report_meta.get("evidence_trace"), dict)
-        else _build_evidence_trace_summary(report)
-    )
-    req_hits = (
-        report.get("requirement_hits") if isinstance(report.get("requirement_hits"), list) else []
-    )
-
-    by_dim_map: Dict[str, Dict[str, object]] = {}
-    requirement_rows: List[Dict[str, object]] = []
-    for item in req_hits:
-        if not isinstance(item, dict):
-            continue
-        dim_id = str(item.get("dimension_id") or "")
-        if dim_id:
-            bucket = by_dim_map.setdefault(
-                dim_id,
-                {
-                    "dimension_id": dim_id,
-                    "dimension_name": str((DIMENSIONS.get(dim_id) or {}).get("name") or dim_id),
-                    "total": 0,
-                    "hit": 0,
-                    "mandatory_total": 0,
-                    "mandatory_hit": 0,
-                },
-            )
-            bucket["total"] = int(bucket.get("total", 0)) + 1
-            if bool(item.get("hit")):
-                bucket["hit"] = int(bucket.get("hit", 0)) + 1
-            if bool(item.get("mandatory")):
-                bucket["mandatory_total"] = int(bucket.get("mandatory_total", 0)) + 1
-                if bool(item.get("hit")):
-                    bucket["mandatory_hit"] = int(bucket.get("mandatory_hit", 0)) + 1
-        requirement_rows.append(
-            {
-                "dimension_id": dim_id,
-                "dimension_name": str((DIMENSIONS.get(dim_id) or {}).get("name") or dim_id),
-                "label": str(item.get("label") or ""),
-                "hit": bool(item.get("hit")),
-                "mandatory": bool(item.get("mandatory")),
-                "reason": str(item.get("reason") or ""),
-                "source_pack_id": str(item.get("source_pack_id") or ""),
-                "material_type": str(item.get("material_type") or ""),
-                "source_filename": str(item.get("source_filename") or ""),
-                "chunk_id": str(item.get("chunk_id") or ""),
-                "source_mode": str(item.get("source_mode") or ""),
-            }
-        )
-
-    by_dimension_rows: List[Dict[str, object]] = []
-    for dim_id, row in by_dim_map.items():
-        total = int(row.get("total", 0))
-        hit = int(row.get("hit", 0))
-        mandatory_total = int(row.get("mandatory_total", 0))
-        mandatory_hit = int(row.get("mandatory_hit", 0))
-        by_dimension_rows.append(
-            {
-                **row,
-                "hit_rate": round(float(hit) / float(total), 4) if total > 0 else None,
-                "mandatory_hit_rate": round(float(mandatory_hit) / float(mandatory_total), 4)
-                if mandatory_total > 0
-                else None,
-            }
-        )
-    by_dimension_rows.sort(key=lambda x: str(x.get("dimension_id") or ""))
-
-    evidence_units_rows: List[Dict[str, object]] = []
-    for unit in load_evidence_units():
-        if str(unit.get("submission_id") or "") != submission_id:
-            continue
-        evidence_units_rows.append(
-            {
-                "id": str(unit.get("id") or ""),
-                "dimension_id": str(unit.get("dimension_id") or ""),
-                "dimension_name": str(
-                    (DIMENSIONS.get(str(unit.get("dimension_id") or "")) or {}).get("name")
-                    or str(unit.get("dimension_id") or "")
-                ),
-                "source_locator": str(
-                    unit.get("source_locator")
-                    or unit.get("locator")
-                    or unit.get("anchor_locator")
-                    or ""
-                ),
-                "source_filename": str(unit.get("source_filename") or ""),
-                "confidence": _to_float_or_none(unit.get("confidence")),
-                "text_snippet": str(
-                    unit.get("text_snippet") or unit.get("text") or unit.get("unit_text") or ""
-                )[:220],
-            }
-        )
-    evidence_units_rows.sort(
-        key=lambda x: float(_to_float_or_none(x.get("confidence")) or 0.0),
-        reverse=True,
-    )
-
-    material_conflicts = _build_submission_material_conflicts(
+    return build_submission_evidence_trace_payload(
         project_id=project_id,
         submission=submission,
+        context=SubmissionEvidenceTraceContext(
+            dimensions=DIMENSIONS,
+            build_evidence_trace_summary=_build_evidence_trace_summary,
+            load_evidence_units=load_evidence_units,
+            build_submission_material_conflicts=_build_submission_material_conflicts,
+            to_float_or_none=_to_float_or_none,
+            now_iso=_now_iso,
+        ),
     )
-    recommendations: List[str] = []
-    total_hits = int(_to_float_or_none(summary.get("total_hits")) or 0)
-    total_reqs = int(_to_float_or_none(summary.get("total_requirements")) or 0)
-    if total_reqs > 0 and total_hits <= 0:
-        recommendations.append("当前评分未命中有效证据锚点，建议补充与资料一致的可检索表述。")
-    if bool(material_conflicts.get("has_conflicts")):
-        recommendations.extend(
-            [str(x) for x in (material_conflicts.get("recommendations") or []) if str(x).strip()]
-        )
-
-    return {
-        "project_id": project_id,
-        "submission_id": submission_id,
-        "filename": filename,
-        "generated_at": _now_iso(),
-        "summary": summary,
-        "by_dimension": by_dimension_rows,
-        "requirement_hits": requirement_rows[:180],
-        "evidence_units": evidence_units_rows[:120],
-        "material_conflicts": material_conflicts,
-        "recommendations": recommendations[:16],
-    }
 
 
 def _build_submission_scoring_basis_report(
@@ -5577,85 +5554,19 @@ def _build_submission_scoring_basis_report(
     submission: Dict[str, object],
 ) -> Dict[str, object]:
     """构建评分依据审计：展示评分时注入的输入与资料命中链路。"""
-    submission_id = str(submission.get("id") or "")
-    filename = str(submission.get("filename") or "")
-    report = submission.get("report") if isinstance(submission.get("report"), dict) else {}
-    _ensure_report_material_usage_metadata(report)
-    meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
-    input_injection = (
-        meta.get("input_injection") if isinstance(meta.get("input_injection"), dict) else {}
+    return build_submission_scoring_basis_payload(
+        project_id=project_id,
+        submission=submission,
+        context=SubmissionScoringBasisContext(
+            ensure_report_material_usage_metadata=_ensure_report_material_usage_metadata,
+            build_material_quality_snapshot=_build_material_quality_snapshot,
+            normalize_material_retrieval_meta=_normalize_material_retrieval_meta,
+            build_evidence_trace_summary=_build_evidence_trace_summary,
+            build_current_runtime_constraint_snapshot=_build_current_runtime_constraint_snapshot,
+            to_float_or_none=_to_float_or_none,
+            now_iso=_now_iso,
+        ),
     )
-    material_quality = (
-        meta.get("material_quality") if isinstance(meta.get("material_quality"), dict) else {}
-    )
-    if not material_quality:
-        material_quality = _build_material_quality_snapshot(project_id)
-    material_retrieval = _normalize_material_retrieval_meta(meta.get("material_retrieval"))
-    material_utilization = (
-        meta.get("material_utilization")
-        if isinstance(meta.get("material_utilization"), dict)
-        else {}
-    )
-    material_utilization_gate = (
-        meta.get("material_utilization_gate")
-        if isinstance(meta.get("material_utilization_gate"), dict)
-        else {}
-    )
-    evidence_trace = (
-        meta.get("evidence_trace") if isinstance(meta.get("evidence_trace"), dict) else {}
-    )
-    material_constraint_shaping = (
-        meta.get("material_constraint_shaping")
-        if isinstance(meta.get("material_constraint_shaping"), dict)
-        else {}
-    )
-    if not evidence_trace:
-        evidence_trace = _build_evidence_trace_summary(report)
-    current_runtime_constraints = _build_current_runtime_constraint_snapshot(
-        project_id,
-        submission_text=str(submission.get("text") or ""),
-    )
-
-    recommendations: List[str] = []
-    mece_inputs = (
-        input_injection.get("mece_inputs")
-        if isinstance(input_injection.get("mece_inputs"), dict)
-        else {}
-    )
-    if mece_inputs and not bool(mece_inputs.get("materials_quality_gate_passed", True)):
-        recommendations.append("资料门禁未通过：建议先完成“3) 项目资料”整改后再评分。")
-    if material_utilization_gate:
-        for reason in material_utilization_gate.get("reasons") or []:
-            reason_text = str(reason).strip()
-            if reason_text:
-                recommendations.append(reason_text)
-    if (_to_float_or_none(evidence_trace.get("total_requirements")) or 0) > 0 and (
-        _to_float_or_none(evidence_trace.get("total_hits")) or 0
-    ) <= 0:
-        recommendations.append("评分未命中任何资料证据：请补充与清单/图纸/答疑一致的量化约束。")
-
-    deduped_recommendations: List[str] = []
-    for item in recommendations:
-        text = str(item or "").strip()
-        if text and text not in deduped_recommendations:
-            deduped_recommendations.append(text)
-
-    return {
-        "project_id": project_id,
-        "submission_id": submission_id,
-        "filename": filename,
-        "generated_at": _now_iso(),
-        "scoring_status": str(report.get("scoring_status") or "unknown"),
-        "mece_inputs": mece_inputs,
-        "material_quality": material_quality,
-        "material_retrieval": material_retrieval,
-        "material_utilization": material_utilization,
-        "material_utilization_gate": material_utilization_gate,
-        "evidence_trace": evidence_trace,
-        "material_constraint_shaping": material_constraint_shaping,
-        "current_runtime_constraints": current_runtime_constraints,
-        "recommendations": deduped_recommendations[:16],
-    }
 
 
 def _build_project_scoring_diagnostic(
@@ -5675,49 +5586,17 @@ def _build_project_scoring_diagnostic(
 
     submissions = load_submissions()
     latest = _latest_project_submission(project_id, submissions, prefer_scored=True)
-    latest_submission: Dict[str, object] = {
-        "exists": False,
-        "submission_id": None,
-        "filename": None,
-        "created_at": None,
-        "scoring_status": None,
-        "is_scored": False,
-    }
-    evidence_trace: Optional[Dict[str, object]] = None
-    scoring_basis: Optional[Dict[str, object]] = None
-
-    if isinstance(latest, dict):
-        report = latest.get("report") if isinstance(latest.get("report"), dict) else {}
-        _ensure_report_material_usage_metadata(report)
-        _ensure_report_score_self_awareness(
-            report,
-            project_id=project_id,
-            material_knowledge_snapshot=material_knowledge,
-        )
-        scoring_status = str(report.get("scoring_status") or "unknown")
-        report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
-        latest_submission = {
-            "exists": True,
-            "submission_id": str(latest.get("id") or ""),
-            "filename": str(latest.get("filename") or ""),
-            "created_at": str(latest.get("created_at") or ""),
-            "scoring_status": scoring_status,
-            "is_scored": scoring_status not in {"pending", "blocked", "unknown"},
-            "score_self_awareness": (
-                report_meta.get("score_self_awareness")
-                if isinstance(report_meta.get("score_self_awareness"), dict)
-                else {}
-            ),
-            "score_confidence_level": str(report_meta.get("score_confidence_level") or ""),
-        }
-        evidence_trace = _build_submission_evidence_trace_report(
-            project_id=project_id,
-            submission=latest,
-        )
-        scoring_basis = _build_submission_scoring_basis_report(
-            project_id=project_id,
-            submission=latest,
-        )
+    latest_submission, evidence_trace, scoring_basis = prepare_latest_submission_context(
+        project_id=project_id,
+        latest=latest,
+        material_knowledge=material_knowledge,
+        context=LatestSubmissionContext(
+            ensure_report_material_usage_metadata=_ensure_report_material_usage_metadata,
+            ensure_report_score_self_awareness=_ensure_report_score_self_awareness,
+            build_submission_evidence_trace_report=_build_submission_evidence_trace_report,
+            build_submission_scoring_basis_report=_build_submission_scoring_basis_report,
+        ),
+    )
 
     trace_summary = evidence_trace.get("summary") if isinstance(evidence_trace, dict) else {}
     basis_util = (
@@ -5750,523 +5629,41 @@ def _build_project_scoring_diagnostic(
         if isinstance(material_knowledge.get("by_dimension"), list)
         else []
     )
-    depth_gate = (
-        material_depth.get("depth_gate")
-        if isinstance(material_depth.get("depth_gate"), dict)
-        else {}
-    )
-    material_gate = (
-        readiness.get("material_gate") if isinstance(readiness.get("material_gate"), dict) else {}
-    )
-    depth_rows = (
-        material_depth.get("by_type") if isinstance(material_depth.get("by_type"), list) else []
-    )
-    depth_by_type: Dict[str, Dict[str, object]] = {}
-    for row in depth_rows:
-        if not isinstance(row, dict):
-            continue
-        mat_type = _normalize_material_type(row.get("material_type"))
-        if mat_type:
-            depth_by_type[mat_type] = row
-    knowledge_rows = (
-        material_knowledge.get("by_type")
-        if isinstance(material_knowledge.get("by_type"), list)
-        else []
-    )
-    knowledge_numeric_terms_by_type: Dict[str, List[str]] = {}
-    knowledge_numeric_summary_by_type: Dict[str, List[str]] = {}
-    for row in knowledge_rows:
-        if not isinstance(row, dict):
-            continue
-        mat_type = _normalize_material_type(row.get("material_type"))
-        if not mat_type:
-            continue
-        top_numeric_terms = [
-            _normalize_numeric_token(item)
-            for item in (row.get("top_numeric_terms") or [])
-            if _normalize_numeric_token(item)
-        ]
-        knowledge_numeric_terms_by_type[mat_type] = top_numeric_terms[:12]
-        category_buckets: Dict[str, List[str]] = {}
-        top_terms = row.get("top_terms") if isinstance(row.get("top_terms"), list) else []
-        top_dimensions = (
-            row.get("top_dimensions") if isinstance(row.get("top_dimensions"), list) else []
-        )
-        first_dim = ""
-        if top_dimensions and isinstance(top_dimensions[0], dict):
-            first_dim = str(top_dimensions[0].get("dimension_id") or "")
-        for token in top_numeric_terms:
-            category = _classify_numeric_anchor_category(
-                terms=top_terms[:8],
-                material_type=mat_type,
-                dimension_id=first_dim,
-                label=row.get("material_type_label"),
-            )
-            _append_numeric_anchor_bucket(category_buckets, category, token)
-        knowledge_numeric_summary_by_type[mat_type] = _build_numeric_anchor_category_summary(
-            category_buckets
-        )
-    knowledge_by_type_map = {
-        _normalize_material_type(row.get("material_type")): row
-        for row in knowledge_rows
-        if isinstance(row, dict) and _normalize_material_type(row.get("material_type"))
-    }
-    util_by_type = basis_util.get("by_type") if isinstance(basis_util.get("by_type"), dict) else {}
     requirement_hits = (
         evidence_trace.get("requirement_hits") if isinstance(evidence_trace, dict) else []
     )
-    required_types = (
-        material_gate.get("required_types")
-        if isinstance(material_gate.get("required_types"), list)
-        else []
+    dimension_support_cards = build_dimension_support_cards(
+        knowledge_by_dimension,
+        to_float_or_none=_to_float_or_none,
+        normalize_material_type=_normalize_material_type,
     )
-    available_types = (
-        basis_util.get("available_types")
-        if isinstance(basis_util.get("available_types"), list)
-        else []
+    material_type_cards = build_material_type_cards(
+        material_rows=material_rows,
+        material_depth=material_depth,
+        material_knowledge=material_knowledge,
+        readiness=readiness,
+        basis_util=basis_util,
+        basis_retrieval=basis_retrieval,
+        conflict_summary=conflict_summary,
+        requirement_hits=requirement_hits,
+        context=MaterialCardContext(
+            normalize_material_type=_normalize_material_type,
+            normalize_numeric_token=_normalize_numeric_token,
+            classify_numeric_anchor_category=_classify_numeric_anchor_category,
+            append_numeric_anchor_bucket=_append_numeric_anchor_bucket,
+            build_numeric_anchor_category_summary=_build_numeric_anchor_category_summary,
+            material_type_label=_material_type_label,
+            to_float_or_none=_to_float_or_none,
+        ),
     )
-    all_types: List[str] = []
-    for src in (
-        ["tender_qa", "boq", "drawing", "site_photo"],
-        required_types,
-        available_types,
-        list(depth_by_type.keys()),
-        list(util_by_type.keys()),
-    ):
-        for item in src:
-            key = _normalize_material_type(item)
-            if key and key not in all_types:
-                all_types.append(key)
-
-    uploaded_filenames_by_type: Dict[str, List[str]] = {}
-    for row in material_rows:
-        mat_type = _normalize_material_type(row.get("material_type"), filename=row.get("filename"))
-        filename = str(row.get("filename") or "").strip()
-        if not mat_type or not filename:
-            continue
-        bucket = uploaded_filenames_by_type.setdefault(mat_type, [])
-        if filename not in bucket:
-            bucket.append(filename)
-
-    hit_filenames_by_type: Dict[str, List[str]] = {}
-    hit_requirement_labels_by_type: Dict[str, List[str]] = {}
-    miss_requirement_labels_by_type: Dict[str, List[str]] = {}
-    hit_evidence_preview_by_type: Dict[str, List[Dict[str, str]]] = {}
-    miss_evidence_preview_by_type: Dict[str, List[Dict[str, str]]] = {}
-    if isinstance(requirement_hits, list):
-        for item in requirement_hits:
-            if not isinstance(item, dict):
-                continue
-            mat_type = _normalize_material_type(item.get("material_type"))
-            label = str(item.get("label") or "").strip()
-            source_filename = str(item.get("source_filename") or "").strip()
-            if not source_filename:
-                chunk_id = str(item.get("chunk_id") or "").strip()
-                if "#c" in chunk_id:
-                    source_filename = chunk_id.split("#c", 1)[0].strip()
-            preview_row = {
-                "label": label,
-                "source_filename": source_filename,
-                "source_mode": str(item.get("source_mode") or "").strip(),
-                "reason": str(item.get("reason") or "").strip()[:120],
-            }
-            if mat_type and label:
-                label_bucket = (
-                    hit_requirement_labels_by_type.setdefault(mat_type, [])
-                    if bool(item.get("hit"))
-                    else miss_requirement_labels_by_type.setdefault(mat_type, [])
-                )
-                if label not in label_bucket:
-                    label_bucket.append(label)
-                preview_bucket = (
-                    hit_evidence_preview_by_type.setdefault(mat_type, [])
-                    if bool(item.get("hit"))
-                    else miss_evidence_preview_by_type.setdefault(mat_type, [])
-                )
-                if preview_row not in preview_bucket:
-                    preview_bucket.append(preview_row)
-            if not bool(item.get("hit")):
-                continue
-            filename = source_filename
-            if not mat_type or not filename:
-                continue
-            bucket = hit_filenames_by_type.setdefault(mat_type, [])
-            if filename not in bucket:
-                bucket.append(filename)
-
-    retrieval_preview = (
-        basis_retrieval.get("preview") if isinstance(basis_retrieval.get("preview"), list) else []
-    )
-    consistency_preview = (
-        basis_retrieval.get("consistency_preview")
-        if isinstance(basis_retrieval.get("consistency_preview"), list)
-        else []
-    )
-    hit_numeric_terms_by_type: Dict[str, List[str]] = {}
-    expected_numeric_terms_by_type: Dict[str, List[str]] = {}
-    hit_numeric_categories_by_type: Dict[str, Dict[str, List[str]]] = {}
-    expected_numeric_categories_by_type: Dict[str, Dict[str, List[str]]] = {}
-    for row in retrieval_preview:
-        if not isinstance(row, dict):
-            continue
-        mat_type = _normalize_material_type(row.get("material_type"))
-        if not mat_type:
-            continue
-        bucket = hit_numeric_terms_by_type.setdefault(mat_type, [])
-        category = _classify_numeric_anchor_category(
-            terms=row.get("matched_terms") if isinstance(row.get("matched_terms"), list) else [],
-            material_type=mat_type,
-            dimension_id=row.get("dimension_id"),
-            label=row.get("filename"),
-        )
-        for raw in row.get("matched_numeric_terms") or []:
-            token = _normalize_numeric_token(raw)
-            if token and token not in bucket:
-                bucket.append(token)
-            _append_numeric_anchor_bucket(
-                hit_numeric_categories_by_type.setdefault(mat_type, {}),
-                category,
-                token,
-            )
-    for row in consistency_preview:
-        if not isinstance(row, dict):
-            continue
-        mat_type = _normalize_material_type(row.get("material_type"))
-        if not mat_type:
-            continue
-        bucket = expected_numeric_terms_by_type.setdefault(mat_type, [])
-        category = _classify_numeric_anchor_category(
-            terms=row.get("terms") if isinstance(row.get("terms"), list) else [],
-            material_type=mat_type,
-            dimension_id=row.get("dimension_id"),
-            label=row.get("label"),
-        )
-        for raw in row.get("numbers") or []:
-            token = _normalize_numeric_token(raw)
-            if token and token not in bucket:
-                bucket.append(token)
-            _append_numeric_anchor_bucket(
-                expected_numeric_categories_by_type.setdefault(mat_type, {}),
-                category,
-                token,
-            )
-
-    conflict_labels_by_type: Dict[str, List[str]] = {}
-    conflict_rows = (
-        conflict_summary.get("conflicts")
-        if isinstance(conflict_summary.get("conflicts"), list)
-        else []
-    )
-    for row in conflict_rows:
-        if not isinstance(row, dict):
-            continue
-        mat_type = _normalize_material_type(row.get("material_type"))
-        label = str(row.get("label") or row.get("conflict_kind") or "").strip()
-        if not mat_type or not label:
-            continue
-        bucket = conflict_labels_by_type.setdefault(mat_type, [])
-        if label not in bucket:
-            bucket.append(label)
-
-    dimension_support_cards: List[Dict[str, object]] = []
-    for row in knowledge_by_dimension:
-        if not isinstance(row, dict):
-            continue
-        dimension_support_cards.append(
-            {
-                "dimension_id": str(row.get("dimension_id") or ""),
-                "dimension_name": str(row.get("dimension_name") or ""),
-                "coverage_score": _to_float_or_none(row.get("coverage_score")) or 0.0,
-                "coverage_level": str(row.get("coverage_level") or "low"),
-                "keyword_hits": int(_to_float_or_none(row.get("keyword_hits")) or 0),
-                "numeric_signal_hits": int(_to_float_or_none(row.get("numeric_signal_hits")) or 0),
-                "source_types": [
-                    _normalize_material_type(item) or str(item or "").strip()
-                    for item in (row.get("source_types") or [])
-                    if str(item or "").strip()
-                ][:6],
-                "source_file_count": int(_to_float_or_none(row.get("source_file_count")) or 0),
-                "source_files_preview": [
-                    str(item or "").strip()
-                    for item in (row.get("source_files_preview") or [])
-                    if str(item or "").strip()
-                ][:6],
-                "suggested_keywords": [
-                    str(item or "").strip()
-                    for item in (row.get("suggested_keywords") or [])
-                    if str(item or "").strip()
-                ][:4],
-            }
-        )
-    dimension_support_cards.sort(
-        key=lambda item: (
-            -float(_to_float_or_none(item.get("coverage_score")) or 0.0),
-            str(item.get("dimension_id") or ""),
-        )
-    )
-
-    material_type_cards: List[Dict[str, object]] = []
-    for mat_type in all_types:
-        parse_rows = [
-            row
-            for row in material_rows
-            if _normalize_material_type(row.get("material_type"), filename=row.get("filename"))
-            == mat_type
-        ]
-        parse_status_counts: Dict[str, int] = {}
-        parse_backend_counts: Dict[str, int] = {}
-        parse_error_preview: List[str] = []
-        parse_confidence_values: List[float] = []
-        queued_count = 0
-        processing_count = 0
-        failed_count = 0
-        parsed_count = 0
-        for parse_row in parse_rows:
-            parse_status = str(parse_row.get("parse_status") or "queued").strip().lower()
-            parse_status_counts[parse_status] = parse_status_counts.get(parse_status, 0) + 1
-            if parse_status == "queued":
-                queued_count += 1
-            elif parse_status == "processing":
-                processing_count += 1
-            elif parse_status == "failed":
-                failed_count += 1
-            elif parse_status == "parsed":
-                parsed_count += 1
-            backend_key = str(parse_row.get("parse_backend") or "").strip()
-            if backend_key:
-                parse_backend_counts[backend_key] = parse_backend_counts.get(backend_key, 0) + 1
-            conf = _to_float_or_none(parse_row.get("parse_confidence"))
-            if conf is not None:
-                parse_confidence_values.append(float(conf))
-            error_text = str(
-                parse_row.get("parse_error_message") or parse_row.get("parse_error_class") or ""
-            ).strip()
-            if error_text and error_text not in parse_error_preview:
-                parse_error_preview.append(error_text[:120])
-        depth_row = (
-            depth_by_type.get(mat_type) if isinstance(depth_by_type.get(mat_type), dict) else {}
-        )
-        util_row = (
-            util_by_type.get(mat_type) if isinstance(util_by_type.get(mat_type), dict) else {}
-        )
-        files = int(_to_float_or_none(depth_row.get("files")) or 0)
-        parsed_chars = int(_to_float_or_none(depth_row.get("parsed_chars")) or 0)
-        parsed_chunks = int(_to_float_or_none(depth_row.get("parsed_chunks")) or 0)
-        numeric_terms = int(_to_float_or_none(depth_row.get("numeric_terms")) or 0)
-        retrieval_total = int(_to_float_or_none(util_row.get("retrieval_total")) or 0)
-        retrieval_hit = int(_to_float_or_none(util_row.get("retrieval_hit")) or 0)
-        consistency_total = int(_to_float_or_none(util_row.get("consistency_total")) or 0)
-        consistency_hit = int(_to_float_or_none(util_row.get("consistency_hit")) or 0)
-        fallback_total = int(_to_float_or_none(util_row.get("fallback_total")) or 0)
-        fallback_hit = int(_to_float_or_none(util_row.get("fallback_hit")) or 0)
-        has_evidence = (retrieval_hit + consistency_hit + fallback_hit) > 0
-        required = mat_type in [_normalize_material_type(x) for x in required_types]
-        in_scope = (
-            mat_type in [_normalize_material_type(x) for x in available_types]
-            or files > 0
-            or required
-        )
-        uploaded_filenames = list(uploaded_filenames_by_type.get(mat_type) or [])
-        hit_filenames = list(hit_filenames_by_type.get(mat_type) or [])
-        hit_requirement_labels = list(hit_requirement_labels_by_type.get(mat_type) or [])
-        miss_requirement_labels = list(miss_requirement_labels_by_type.get(mat_type) or [])
-        hit_evidence_preview = list(hit_evidence_preview_by_type.get(mat_type) or [])
-        miss_evidence_preview = list(miss_evidence_preview_by_type.get(mat_type) or [])
-        conflict_labels = list(conflict_labels_by_type.get(mat_type) or [])
-        project_numeric_terms = list(knowledge_numeric_terms_by_type.get(mat_type) or [])
-        project_numeric_category_summary = list(
-            knowledge_numeric_summary_by_type.get(mat_type) or []
-        )
-        hit_numeric_terms = list(hit_numeric_terms_by_type.get(mat_type) or [])
-        expected_numeric_terms = list(expected_numeric_terms_by_type.get(mat_type) or [])
-        missing_numeric_terms = [
-            token for token in expected_numeric_terms if token not in hit_numeric_terms
-        ]
-        hit_numeric_categories = {
-            key: list(value)
-            for key, value in (hit_numeric_categories_by_type.get(mat_type) or {}).items()
-        }
-        expected_numeric_categories = {
-            key: list(value)
-            for key, value in (expected_numeric_categories_by_type.get(mat_type) or {}).items()
-        }
-        missing_numeric_categories: Dict[str, List[str]] = {}
-        for category, tokens in expected_numeric_categories.items():
-            hit_tokens = set(hit_numeric_categories.get(category) or [])
-            for token in tokens:
-                if token not in hit_tokens:
-                    _append_numeric_anchor_bucket(missing_numeric_categories, category, token)
-        meets_chars = bool(depth_row.get("meets_chars")) if depth_row else False
-        meets_chunks = bool(depth_row.get("meets_chunks")) if depth_row else False
-        meets_numeric_terms = bool(depth_row.get("meets_numeric_terms")) if depth_row else False
-
-        guidance: List[str] = []
-        knowledge_row = (
-            knowledge_by_type_map.get(mat_type)
-            if isinstance(knowledge_by_type_map.get(mat_type), dict)
-            else {}
-        )
-        structured_quality_score = float(
-            _to_float_or_none(knowledge_row.get("structured_quality_score")) or 0.0
-        )
-        structured_quality_max = float(
-            _to_float_or_none(knowledge_row.get("structured_quality_max")) or 0.0
-        )
-        structured_quality_signal_coverage = float(
-            _to_float_or_none(knowledge_row.get("structured_quality_signal_coverage")) or 0.0
-        )
-        if files <= 0 and required:
-            status = "missing"
-            status_label = "缺失"
-            guidance.append(f"缺少{_material_type_label(mat_type)}，当前不能形成完整评分依据。")
-        elif processing_count > 0:
-            status = "processing"
-            status_label = "解析中"
-            guidance.append(f"{_material_type_label(mat_type)}正在后台深读，完成后才会进入评分。")
-        elif queued_count > 0:
-            status = "queued"
-            status_label = "排队中"
-            guidance.append(f"{_material_type_label(mat_type)}已进入深读队列，请等待解析完成。")
-        elif parsed_count <= 0 and failed_count > 0:
-            status = "failed"
-            status_label = "解析失败"
-            guidance.append(
-                f"{_material_type_label(mat_type)}解析失败，请重试或更换更清晰的源文件。"
-            )
-        elif files <= 0:
-            status = "idle"
-            status_label = "未上传"
-            guidance.append(f"{_material_type_label(mat_type)}未上传，当前按可选资料处理。")
-        elif parsed_chunks <= 0 or parsed_chars <= 0:
-            status = "uploaded_unparsed"
-            status_label = "已上传未解析"
-            guidance.append(f"{_material_type_label(mat_type)}已上传，但尚未形成可检索文本。")
-        elif has_evidence:
-            status = "active"
-            status_label = "已参与评分"
-            guidance.append(f"{_material_type_label(mat_type)}已进入评分证据链。")
-        else:
-            status = "parsed_not_used"
-            status_label = "已解析未命中"
-            guidance.append(
-                f"{_material_type_label(mat_type)}已解析，但本次评分尚未命中到有效证据。"
-            )
-
-        if files > 0 and not meets_chars and required:
-            guidance.append(
-                f"{_material_type_label(mat_type)}解析字数不足，建议补齐关键章节或提升可解析版本。"
-            )
-        if files > 0 and not meets_chunks and bool(depth_gate.get("enforce")):
-            guidance.append(
-                f"{_material_type_label(mat_type)}分块不足，建议补充更多结构化约束内容。"
-            )
-        if files > 0 and not meets_numeric_terms and mat_type in {"tender_qa", "boq", "drawing"}:
-            guidance.append(
-                f"{_material_type_label(mat_type)}中的数值约束不足，建议补充工期、规格、阈值、清单量等硬参数。"
-            )
-        if files > 0 and structured_quality_score < 0.35:
-            guidance.append(
-                f"{_material_type_label(mat_type)}已形成结构化解析，但质量偏弱，建议补充章节标题、评分点、强制条款或更清晰的硬参数。"
-            )
-
-        material_type_cards.append(
-            {
-                "material_type": mat_type,
-                "material_type_label": _material_type_label(mat_type),
-                "required": required,
-                "in_scope": in_scope,
-                "status": status,
-                "status_label": status_label,
-                "files": files,
-                "uploaded_filenames": uploaded_filenames[:20],
-                "uploaded_filename_count": len(uploaded_filenames),
-                "parsed_chars": parsed_chars,
-                "parsed_chunks": parsed_chunks,
-                "numeric_terms": numeric_terms,
-                "hit_requirement_labels": hit_requirement_labels[:12],
-                "hit_requirement_count": len(hit_requirement_labels),
-                "miss_requirement_labels": miss_requirement_labels[:12],
-                "miss_requirement_count": len(miss_requirement_labels),
-                "hit_evidence_preview": hit_evidence_preview[:6],
-                "miss_evidence_preview": miss_evidence_preview[:6],
-                "conflict_labels": conflict_labels[:12],
-                "conflict_label_count": len(conflict_labels),
-                "project_numeric_terms": project_numeric_terms[:12],
-                "project_numeric_term_count": len(project_numeric_terms),
-                "project_numeric_category_summary": project_numeric_category_summary[:8],
-                "structured_quality_score": round(structured_quality_score, 4),
-                "structured_quality_max": round(structured_quality_max, 4),
-                "structured_quality_signal_coverage": round(structured_quality_signal_coverage, 4),
-                "parse_status_counts": parse_status_counts,
-                "queued_count": queued_count,
-                "processing_count": processing_count,
-                "parsed_count": parsed_count,
-                "failed_count": failed_count,
-                "parse_backend_summary": [
-                    (("GPT-5.4" if str(key).startswith("gpt") else str(key)) + "×" + str(value))
-                    for key, value in sorted(
-                        parse_backend_counts.items(),
-                        key=lambda item: (-item[1], item[0]),
-                    )
-                ][:6],
-                "parse_confidence_avg": round(
-                    sum(parse_confidence_values) / max(1, len(parse_confidence_values)),
-                    4,
-                )
-                if parse_confidence_values
-                else 0.0,
-                "parse_confidence_max": round(max(parse_confidence_values), 4)
-                if parse_confidence_values
-                else 0.0,
-                "parse_error_preview": parse_error_preview[:4],
-                "hit_numeric_terms": hit_numeric_terms[:12],
-                "hit_numeric_term_count": len(hit_numeric_terms),
-                "expected_numeric_terms": expected_numeric_terms[:12],
-                "expected_numeric_term_count": len(expected_numeric_terms),
-                "missing_numeric_terms": missing_numeric_terms[:12],
-                "missing_numeric_term_count": len(missing_numeric_terms),
-                "hit_numeric_category_summary": _build_numeric_anchor_category_summary(
-                    hit_numeric_categories
-                ),
-                "expected_numeric_category_summary": _build_numeric_anchor_category_summary(
-                    expected_numeric_categories
-                ),
-                "missing_numeric_category_summary": _build_numeric_anchor_category_summary(
-                    missing_numeric_categories
-                ),
-                "meets_chars": meets_chars,
-                "meets_chunks": meets_chunks,
-                "meets_numeric_terms": meets_numeric_terms,
-                "retrieval_hit": retrieval_hit,
-                "retrieval_total": retrieval_total,
-                "consistency_hit": consistency_hit,
-                "consistency_total": consistency_total,
-                "fallback_hit": fallback_hit,
-                "fallback_total": fallback_total,
-                "has_evidence": has_evidence,
-                "hit_filenames": hit_filenames[:20],
-                "hit_filename_count": len(hit_filenames),
-                "guidance": guidance[:3],
-            }
-        )
-
-    recommendations: List[str] = []
-    for bucket in (
+    recommendations = collect_project_scoring_recommendations(
         readiness.get("issues") or [],
         readiness.get("warnings") or [],
         material_depth.get("recommendations") or [],
         (evidence_trace or {}).get("recommendations") or [],
         (scoring_basis or {}).get("recommendations") or [],
-    ):
-        if not isinstance(bucket, list):
-            continue
-        for item in bucket:
-            text = str(item or "").strip()
-            if text and text not in recommendations:
-                recommendations.append(text)
-
-    if not bool(latest_submission.get("exists")):
-        recommendations.insert(0, "暂无施组评分证据链，请先上传并评分至少 1 份施组。")
+        latest_submission_exists=bool(latest_submission.get("exists")),
+    )
 
     return {
         "project_id": project_id,
@@ -6278,149 +5675,21 @@ def _build_project_scoring_diagnostic(
         "scoring_basis": scoring_basis,
         "material_type_cards": material_type_cards,
         "dimension_support_cards": dimension_support_cards,
-        "summary": {
-            "ready_to_score": bool(readiness.get("ready")),
-            "material_gate_passed": bool(readiness.get("gate_passed")),
-            "parse_job_summary": parse_job_summary,
-            "parse_total_jobs": int(_to_float_or_none(parse_job_summary.get("total_jobs")) or 0),
-            "parse_backlog": int(_to_float_or_none(parse_job_summary.get("backlog")) or 0),
-            "parse_failed_jobs": int(_to_float_or_none(parse_job_summary.get("failed_jobs")) or 0),
-            "parse_gpt_ratio": _to_float_or_none(parse_job_summary.get("gpt_ratio")),
-            "parsed_materials": sum(
-                1 for row in material_rows if str(row.get("parse_status") or "") == "parsed"
-            ),
-            "queued_materials": sum(
-                1 for row in material_rows if str(row.get("parse_status") or "") == "queued"
-            ),
-            "processing_materials": sum(
-                1 for row in material_rows if str(row.get("parse_status") or "") == "processing"
-            ),
-            "failed_materials": sum(
-                1 for row in material_rows if str(row.get("parse_status") or "") == "failed"
-            ),
-            "material_files": int(_to_float_or_none(quality_summary.get("total_files")) or 0),
-            "material_parsed_chars": int(
-                _to_float_or_none(quality_summary.get("total_parsed_chars")) or 0
-            ),
-            "material_parsed_chunks": int(
-                _to_float_or_none(quality_summary.get("total_parsed_chunks")) or 0
-            ),
-            "latest_submission_exists": bool(latest_submission.get("exists")),
-            "latest_submission_scored": bool(latest_submission.get("is_scored")),
-            "evidence_total_requirements": int(
-                _to_float_or_none(trace_summary.get("total_requirements")) or 0
-            ),
-            "evidence_total_hits": int(_to_float_or_none(trace_summary.get("total_hits")) or 0),
-            "evidence_mandatory_hit_rate": _to_float_or_none(
-                trace_summary.get("mandatory_hit_rate")
-            ),
-            "evidence_source_files_hit_count": int(
-                _to_float_or_none(trace_summary.get("source_files_hit_count")) or 0
-            ),
-            "retrieval_hit_rate": _to_float_or_none(basis_util.get("retrieval_hit_rate")),
-            "retrieval_file_coverage_rate": _to_float_or_none(
-                basis_util.get("retrieval_file_coverage_rate")
-            ),
-            "material_dimension_hit_rate": _to_float_or_none(
-                basis_util.get("material_dimension_hit_rate")
-            ),
-            "material_dimension_hit": int(
-                _to_float_or_none(basis_util.get("material_dimension_hit")) or 0
-            ),
-            "material_dimension_total": int(
-                _to_float_or_none(basis_util.get("material_dimension_total")) or 0
-            ),
-            "material_profile_query_terms_count": int(
-                _to_float_or_none(basis_util.get("material_profile_query_terms_count")) or 0
-            ),
-            "material_profile_query_numeric_terms_count": int(
-                _to_float_or_none(basis_util.get("material_profile_query_numeric_terms_count")) or 0
-            ),
-            "material_profile_focus_dimensions": [
-                str(item or "").strip()
-                for item in (basis_util.get("material_profile_focus_dimensions") or [])
-                if str(item or "").strip()
-            ][:8],
-            "material_utilization_gate_blocked": bool(basis_gate.get("blocked")),
-            "material_conflict_count": int(
-                _to_float_or_none(conflict_summary.get("conflict_count")) or 0
-            ),
-            "material_conflict_high_severity_count": int(
-                _to_float_or_none(conflict_summary.get("high_severity_count")) or 0
-            ),
-            "material_dimension_coverage_rate": _to_float_or_none(
-                knowledge_summary.get("dimension_coverage_rate")
-            ),
-            "material_structured_signal_total": int(
-                _to_float_or_none(knowledge_summary.get("structured_signal_total")) or 0
-            ),
-            "material_structured_quality_avg": _to_float_or_none(
-                knowledge_summary.get("structured_quality_avg")
-            ),
-            "material_structured_quality_max": _to_float_or_none(
-                knowledge_summary.get("structured_quality_max")
-            ),
-            "material_structured_quality_type_rate": _to_float_or_none(
-                knowledge_summary.get("structured_quality_type_rate")
-            ),
-            "material_strong_structured_types": int(
-                _to_float_or_none(knowledge_summary.get("strong_structured_types")) or 0
-            ),
-            "material_low_coverage_dimensions": int(
-                _to_float_or_none(knowledge_summary.get("low_coverage_dimensions")) or 0
-            ),
-            "material_covered_dimensions": int(
-                _to_float_or_none(knowledge_summary.get("covered_dimensions")) or 0
-            ),
-            "material_numeric_category_summary": [
-                str(item or "").strip()
-                for item in (knowledge_summary.get("numeric_category_summary") or [])
-                if str(item or "").strip()
-            ][:8],
-            "current_weights_source": str(
-                (basis_runtime_constraints or {}).get("weights_source") or "-"
-            ),
-            "current_effective_multipliers_preview": list(
-                ((basis_runtime_constraints or {}).get("effective_multipliers_preview") or [])[:6]
-            ),
-            "current_feedback_evolution_requirements": int(
-                _to_float_or_none(
-                    (basis_runtime_constraints or {}).get("feedback_evolution_requirements")
-                )
-                or 0
-            ),
-            "current_feature_confidence_requirements": int(
-                _to_float_or_none(
-                    (basis_runtime_constraints or {}).get("feature_confidence_requirements")
-                )
-                or 0
-            ),
-            "recent_feedback_context_active": bool(
-                (
-                    _to_float_or_none(
-                        (basis_runtime_constraints or {}).get("feedback_evolution_requirements")
-                    )
-                    or 0
-                )
-                > 0
-                or (
-                    _to_float_or_none(
-                        (basis_runtime_constraints or {}).get("feature_confidence_requirements")
-                    )
-                    or 0
-                )
-                > 0
-            ),
-            "latest_score_self_awareness": (
-                latest_submission.get("score_self_awareness")
-                if isinstance(latest_submission.get("score_self_awareness"), dict)
-                else {}
-            ),
-            "latest_score_confidence_level": str(
-                latest_submission.get("score_confidence_level") or ""
-            ),
-        },
-        "recommendations": recommendations[:20],
+        "summary": build_project_scoring_summary(
+            readiness=readiness,
+            parse_job_summary=parse_job_summary,
+            material_rows=material_rows,
+            quality_summary=quality_summary,
+            latest_submission=latest_submission,
+            trace_summary=trace_summary,
+            basis_util=basis_util,
+            basis_gate=basis_gate,
+            conflict_summary=conflict_summary,
+            knowledge_summary=knowledge_summary,
+            basis_runtime_constraints=basis_runtime_constraints,
+            to_float_or_none=_to_float_or_none,
+        ),
+        "recommendations": recommendations,
     }
 
 
@@ -10277,6 +9546,18 @@ def _build_constraint_pack(project_id: str) -> Dict[str, object]:
     }
 
 
+@asynccontextmanager
+async def _app_lifespan(_app: FastAPI):
+    ensure_data_dirs()
+    prepare_secure_runtime()
+    validate_runtime_security_settings()
+    _start_material_parse_worker()
+    try:
+        yield
+    finally:
+        _stop_material_parse_worker()
+
+
 app = FastAPI(
     title="青天评标系统 API",
     version="1.0.0",
@@ -10317,20 +9598,15 @@ app = FastAPI(
         "name": "MIT License",
         "url": "https://opensource.org/licenses/MIT",
     },
+    lifespan=_app_lifespan,
+    **build_fastapi_runtime_kwargs(),
 )
+
+configure_runtime_security(app)
+configure_observability(app, logger)
 
 # Setup rate limiting (infrastructure ready, decorators disabled due to compatibility)
 setup_rate_limiting(app)
-
-
-@app.on_event("startup")
-async def _startup_material_parse_worker() -> None:
-    _start_material_parse_worker()
-
-
-@app.on_event("shutdown")
-async def _shutdown_material_parse_worker() -> None:
-    _stop_material_parse_worker()
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -10679,368 +9955,40 @@ def _build_data_hygiene_report(*, apply: bool) -> Dict[str, object]:
     }
 
 
+def _build_system_self_check_context() -> SystemSelfCheckContext:
+    return SystemSelfCheckContext(
+        required_item_names=SYSTEM_SELF_CHECK_REQUIRED_ITEM_NAMES,
+        load_config=load_config,
+        ensure_data_dirs=ensure_data_dirs,
+        storage_probe_dir="data",
+        get_auth_status=get_auth_status,
+        get_rate_limit_status=get_rate_limit_status,
+        get_runtime_security_status=get_runtime_security_status,
+        is_secure_desktop_mode_enabled=is_secure_desktop_mode_enabled,
+        get_openai_api_key=get_openai_api_key,
+        get_openai_model=get_openai_model,
+        pdf_backend_name=_pdf_backend_name,
+        document_class=Document,
+        pytesseract_module=pytesseract,
+        image_module=Image,
+        resolve_dwg_converter_binaries=_resolve_dwg_converter_binaries,
+        build_material_parse_jobs_summary=_build_material_parse_jobs_summary,
+        to_float_or_none=_to_float_or_none,
+        material_parse_worker=_MATERIAL_PARSE_WORKER,
+        material_parse_backlog_warn=DEFAULT_MATERIAL_PARSE_BACKLOG_WARN,
+        load_materials=load_materials,
+        normalize_material_row_for_parse=_normalize_material_row_for_parse,
+        build_data_hygiene_report=_build_data_hygiene_report,
+        load_projects=load_projects,
+        load_submissions=load_submissions,
+        build_scoring_readiness=_build_scoring_readiness,
+        material_type_label=_material_type_label,
+        now_iso=_now_iso,
+    )
+
+
 def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
-    items: List[Dict[str, object]] = []
-
-    def add(
-        name: str,
-        ok: bool,
-        detail: str = "",
-        *,
-        category: str = "runtime",
-        required: Optional[bool] = None,
-    ) -> None:
-        is_required = (
-            bool(required)
-            if required is not None
-            else str(name) in SYSTEM_SELF_CHECK_REQUIRED_ITEM_NAMES
-        )
-        items.append(
-            {
-                "name": name,
-                "ok": bool(ok),
-                "detail": detail or None,
-                "category": category,
-                "required": is_required,
-            }
-        )
-
-    auth_enabled: Optional[bool] = None
-    rate_limit_enabled: Optional[bool] = None
-    pdf_backend = "none"
-    ocr_available = False
-    dwg_converter_found = False
-    data_hygiene_orphan_count = 0
-    data_hygiene_impacted = 0
-    project_name: Optional[str] = None
-    project_material_count: Optional[int] = None
-    project_submission_count: Optional[int] = None
-    project_ready: Optional[bool] = None
-    project_gate_passed: Optional[bool] = None
-    project_issue_count: Optional[int] = None
-    project_warning_count: Optional[int] = None
-    project_missing_required_types: List[str] = []
-    project_issues_preview = "-"
-    project_warnings_preview = "-"
-    parse_job_summary: Dict[str, object] = {}
-    openai_api_available = False
-    structured_summary_schema_ok = True
-
-    # health (always true if request reaches server)
-    add("health", True, "service reachable", category="service")
-
-    # config
-    try:
-        load_config()
-        add("config", True, "rubric/lexicon loaded", category="config")
-    except Exception as e:
-        add("config", False, str(e), category="config")
-
-    # data dirs + writable test
-    try:
-        ensure_data_dirs()
-        with tempfile.NamedTemporaryFile(
-            prefix="selfcheck_", suffix=".tmp", dir="data", delete=True
-        ) as _:
-            pass
-        add("data_dirs_writable", True, "data directory writable", category="storage")
-    except Exception as e:
-        add("data_dirs_writable", False, str(e), category="storage")
-
-    # status providers
-    try:
-        s = get_auth_status()
-        auth_enabled = bool(s.get("auth_enabled", s.get("enabled", False)))
-        add("auth_status", True, f"enabled={auth_enabled}", category="security", required=False)
-    except Exception as e:
-        add("auth_status", False, str(e), category="security", required=False)
-    try:
-        s = get_rate_limit_status()
-        rate_limit_enabled = bool(s.get("enabled"))
-        add(
-            "rate_limit_status",
-            True,
-            f"enabled={rate_limit_enabled}",
-            category="security",
-            required=False,
-        )
-    except Exception as e:
-        add("rate_limit_status", False, str(e), category="security", required=False)
-
-    openai_api_available = bool(get_openai_api_key())
-    add(
-        "openai_api_available",
-        openai_api_available,
-        f"model={get_openai_model()}" if openai_api_available else "OPENAI_API_KEY missing",
-        category="llm",
-        required=False,
-    )
-
-    # parser/runtime capability checks
-    pdf_backend = _pdf_backend_name()
-    add(
-        "parser_pdf",
-        pdf_backend != "none",
-        (f"backend={pdf_backend}" if pdf_backend != "none" else "PyMuPDF/pypdf missing"),
-        category="parser",
-        required=False,
-    )
-    add(
-        "parser_docx",
-        Document is not None,
-        "python-docx available" if Document is not None else "python-docx missing",
-        category="parser",
-        required=False,
-    )
-    ocr_available = bool(pytesseract is not None and Image is not None)
-    if ocr_available:
-        try:
-            version = str(pytesseract.get_tesseract_version()) if pytesseract is not None else ""
-            add("parser_ocr", True, f"tesseract={version}", category="parser", required=False)
-        except Exception:
-            add("parser_ocr", True, "pytesseract available", category="parser", required=False)
-    else:
-        add("parser_ocr", False, "pytesseract or PIL missing", category="parser", required=False)
-    try:
-        dwg_bins = _resolve_dwg_converter_binaries()
-        dwg_converter_found = bool(dwg_bins)
-        add(
-            "parser_dwg_converter",
-            dwg_converter_found,
-            f"found={','.join(Path(p).name for p in dwg_bins)}" if dwg_bins else "not_found",
-            category="parser",
-            required=False,
-        )
-    except Exception as e:
-        add("parser_dwg_converter", False, str(e), category="parser", required=False)
-    try:
-        jobs, parse_job_summary = _build_material_parse_jobs_summary(project_id)
-        backlog = int(_to_float_or_none(parse_job_summary.get("backlog")) or 0)
-        failed_jobs = int(_to_float_or_none(parse_job_summary.get("failed_jobs")) or 0)
-        total_jobs = int(_to_float_or_none(parse_job_summary.get("total_jobs")) or 0)
-        failure_rate = float(failed_jobs) / float(total_jobs) if total_jobs > 0 else 0.0
-        worker_ok = bool(_MATERIAL_PARSE_WORKER and _MATERIAL_PARSE_WORKER.is_alive())
-        add(
-            "vision_parse_queue_healthy",
-            worker_ok and backlog <= DEFAULT_MATERIAL_PARSE_BACKLOG_WARN,
-            f"worker={worker_ok}, backlog={backlog}",
-            category="async_parse",
-            required=False,
-        )
-        add(
-            "material_parse_backlog_ok",
-            backlog <= DEFAULT_MATERIAL_PARSE_BACKLOG_WARN,
-            f"backlog={backlog}",
-            category="async_parse",
-            required=False,
-        )
-        add(
-            "gpt_parse_failure_rate_ok",
-            failure_rate <= 0.35,
-            f"failed_jobs={failed_jobs}, total_jobs={total_jobs}, rate={failure_rate:.1%}",
-            category="async_parse",
-            required=False,
-        )
-        parsed_rows = [
-            row
-            for row in (
-                _normalize_material_row_for_parse(dict(m))[0]
-                for m in load_materials()
-                if (not project_id or str(m.get("project_id") or "") == str(project_id))
-            )
-            if str(row.get("parse_status") or "") == "parsed"
-        ]
-        if parsed_rows:
-            structured_summary_schema_ok = all(
-                isinstance(row.get("structured_summary"), dict) for row in parsed_rows[:20]
-            )
-        add(
-            "structured_summary_schema_ok",
-            structured_summary_schema_ok,
-            f"parsed_rows={len(parsed_rows)}",
-            category="async_parse",
-            required=False,
-        )
-    except Exception as e:
-        add("vision_parse_queue_healthy", False, str(e), category="async_parse", required=False)
-        add("material_parse_backlog_ok", False, str(e), category="async_parse", required=False)
-        add("gpt_parse_failure_rate_ok", False, str(e), category="async_parse", required=False)
-        add("structured_summary_schema_ok", False, str(e), category="async_parse", required=False)
-
-    # data hygiene (non-blocking): 用于识别孤儿项目数据，避免统计/审计偏差
-    try:
-        hygiene = _build_data_hygiene_report(apply=False)
-        data_hygiene_orphan_count = int(_to_float_or_none(hygiene.get("orphan_records_total")) or 0)
-        data_hygiene_impacted = sum(
-            1
-            for row in (hygiene.get("datasets") or [])
-            if int(_to_float_or_none((row or {}).get("orphan_count")) or 0) > 0
-        )
-        add(
-            "data_hygiene",
-            data_hygiene_orphan_count == 0,
-            (
-                f"orphan_records={data_hygiene_orphan_count}, "
-                f"impacted_datasets={data_hygiene_impacted}"
-            ),
-            category="data",
-            required=False,
-        )
-    except Exception as e:
-        add("data_hygiene", False, str(e), category="data", required=False)
-
-    # project-specific checks
-    if project_id:
-        try:
-            projects = load_projects()
-            target = next((p for p in projects if str(p.get("id")) == project_id), None)
-            if target is None:
-                add(
-                    "project_exists",
-                    False,
-                    f"project not found: {project_id}",
-                    category="project",
-                )
-            else:
-                project_name = str(target.get("name") or project_id)
-                add("project_exists", True, project_name, category="project")
-                try:
-                    project_material_count = len(
-                        [m for m in load_materials() if str(m.get("project_id")) == project_id]
-                    )
-                    add(
-                        "project_materials_listable",
-                        True,
-                        f"count={project_material_count}",
-                        category="project",
-                    )
-                except Exception as e:
-                    add("project_materials_listable", False, str(e), category="project")
-                try:
-                    project_submission_count = len(
-                        [s for s in load_submissions() if str(s.get("project_id")) == project_id]
-                    )
-                    add(
-                        "project_submissions_listable",
-                        True,
-                        f"count={project_submission_count}",
-                        category="project",
-                    )
-                except Exception as e:
-                    add("project_submissions_listable", False, str(e), category="project")
-                try:
-                    readiness = _build_scoring_readiness(project_id, target)
-                    project_ready = bool(readiness.get("ready"))
-                    project_gate_passed = bool(readiness.get("gate_passed"))
-                    issues = (
-                        readiness.get("issues") if isinstance(readiness.get("issues"), list) else []
-                    )
-                    warnings = (
-                        readiness.get("warnings")
-                        if isinstance(readiness.get("warnings"), list)
-                        else []
-                    )
-                    material_gate = (
-                        readiness.get("material_gate")
-                        if isinstance(readiness.get("material_gate"), dict)
-                        else {}
-                    )
-                    project_issue_count = len(issues)
-                    project_warning_count = len(warnings)
-                    project_missing_required_types = [
-                        str(x)
-                        for x in (material_gate.get("missing_required_types") or [])
-                        if str(x).strip()
-                    ]
-                    project_issues_preview = (
-                        "；".join(str(x) for x in issues[:2]) if issues else "-"
-                    )
-                    project_warnings_preview = (
-                        "；".join(str(x) for x in warnings[:2]) if warnings else "-"
-                    )
-                    add(
-                        "project_scoring_readiness",
-                        True,
-                        (
-                            f"ready={project_ready}, gate_passed={project_gate_passed}, "
-                            f"issues={project_issues_preview}"
-                        ),
-                        category="project",
-                    )
-                except Exception as e:
-                    add("project_scoring_readiness", False, str(e), category="project")
-        except Exception as e:
-            add("project_exists", False, str(e), category="project")
-
-    # `parser_ocr` / `parser_dwg_converter` 属于增强能力，不应阻断系统基础可用性判断。
-    required_items = [
-        x for x in items if str(x.get("name")) in SYSTEM_SELF_CHECK_REQUIRED_ITEM_NAMES
-    ]
-    required_failures = [x for x in required_items if not bool(x.get("ok"))]
-    optional_failures = [
-        x
-        for x in items
-        if str(x.get("name")) not in SYSTEM_SELF_CHECK_REQUIRED_ITEM_NAMES and not bool(x.get("ok"))
-    ]
-    all_ok = bool(required_items) and not required_failures
-    checks = {str(x.get("name")): bool(x.get("ok")) for x in items if str(x.get("name")).strip()}
-    parser_checks = {
-        name: bool(checks.get(name))
-        for name in ("parser_pdf", "parser_docx", "parser_ocr", "parser_dwg_converter")
-    }
-    passed_count = sum(1 for row in items if bool(row.get("ok")))
-    missing_required_labels = [
-        _material_type_label(row) for row in project_missing_required_types if str(row).strip()
-    ]
-    summary = {
-        "total_items": len(items),
-        "passed_items": passed_count,
-        "failed_items": len(items) - passed_count,
-        "required_items": len(required_items),
-        "optional_items": max(0, len(items) - len(required_items)),
-        "failed_required_items": [
-            str(x.get("name")) for x in required_failures if str(x.get("name")).strip()
-        ],
-        "failed_optional_items": [
-            str(x.get("name")) for x in optional_failures if str(x.get("name")).strip()
-        ],
-        "parser_capabilities": parser_checks,
-        "parser_capability_count": sum(1 for ok in parser_checks.values() if ok),
-        "parser_capability_total": len(parser_checks),
-        "auth_enabled": auth_enabled,
-        "rate_limit_enabled": rate_limit_enabled,
-        "pdf_backend": pdf_backend,
-        "ocr_available": ocr_available,
-        "dwg_converter_found": dwg_converter_found,
-        "openai_api_available": openai_api_available,
-        "parse_job_summary": parse_job_summary,
-        "structured_summary_schema_ok": structured_summary_schema_ok,
-        "data_hygiene_orphan_records": data_hygiene_orphan_count,
-        "data_hygiene_impacted_datasets": data_hygiene_impacted,
-        "project_id": project_id,
-        "project_name": project_name,
-        "project_material_count": project_material_count,
-        "project_submission_count": project_submission_count,
-        "project_ready": project_ready,
-        "project_gate_passed": project_gate_passed,
-        "project_issue_count": project_issue_count,
-        "project_warning_count": project_warning_count,
-        "project_missing_required_types": project_missing_required_types,
-        "project_missing_required_labels": missing_required_labels,
-        "project_issues_preview": project_issues_preview,
-        "project_warnings_preview": project_warnings_preview,
-    }
-    return {
-        "ok": all_ok,
-        "required_ok": all_ok,
-        "degraded": bool(optional_failures),
-        "failed_required_count": len(required_failures),
-        "failed_optional_count": len(optional_failures),
-        "checked_at": _now_iso(),
-        "checks": checks,
-        "summary": summary,
-        "items": items,
-    }
+    return run_system_self_check(project_id, context=_build_system_self_check_context())
 
 
 # ==================== 健康检查端点（根路径，便于容器编排系统访问） ====================
@@ -11100,27 +10048,13 @@ def readiness_check() -> ReadyResponse:
     - config: 配置文件是否可加载
     - data_dirs: 数据目录是否存在且可访问
     """
-    checks = {}
-
-    # 检查配置是否可加载
-    try:
-        load_config()
-        checks["config"] = True
-    except Exception:
-        checks["config"] = False
-
-    # 检查数据目录是否可用
-    try:
-        ensure_data_dirs()
-        checks["data_dirs"] = True
-    except Exception:
-        checks["data_dirs"] = False
-
-    # 所有检查通过则就绪
-    all_ready = all(checks.values())
-    status = "ready" if all_ready else "not_ready"
-
-    return ReadyResponse(status=status, checks=checks)
+    return ReadyResponse(
+        **build_readiness_status(
+            load_config=load_config,
+            ensure_data_dirs=ensure_data_dirs,
+            validate_runtime_security_settings=validate_runtime_security_settings,
+        )
+    )
 
 
 @app.get("/__ping__", include_in_schema=False)
@@ -11271,6 +10205,7 @@ def scoring_factors_markdown(
     locale: str = Depends(get_locale),
 ) -> ScoringFactorsMarkdownResponse:
     """导出评分体系总览 Markdown 文本，便于外部模型或文档系统直接使用。"""
+    assert_secure_desktop_allows_export("scoring_factors_markdown")
     ensure_data_dirs()
     if project_id:
         projects = load_projects()
@@ -11298,6 +10233,7 @@ def project_analysis_bundle(
     - 项目级 V1/V2/V2+Calib 指标
     - 当前评分体系与章节要求
     """
+    assert_secure_desktop_allows_export("project_analysis_bundle")
     ensure_data_dirs()
     projects = load_projects()
     project = next((p for p in projects if str(p.get("id")) == project_id), None)
@@ -11333,6 +10269,7 @@ def project_analysis_bundle_markdown_file(
     locale: str = Depends(get_locale),
 ) -> Response:
     """下载项目分析包 Markdown 文件。"""
+    assert_secure_desktop_allows_export("project_analysis_bundle_markdown_file")
     bundle = project_analysis_bundle(project_id=project_id, locale=locale)
     if isinstance(bundle, dict):
         markdown = str(bundle.get("markdown") or "")
@@ -12374,7 +11311,7 @@ def upload_material(
     project_dir.mkdir(parents=True, exist_ok=True)
     target = project_dir / normalized_name
     content = file.file.read()
-    target.write_bytes(content)
+    save_bytes(target, content)
 
     materials = load_materials()
     existing_ids = [
@@ -12652,6 +11589,7 @@ def get_material_depth_report_markdown(
     project_id: str, locale: str = Depends(get_locale)
 ) -> MaterialDepthReportMarkdownResponse:
     """项目资料深读体检报告（Markdown 文本）。"""
+    assert_secure_desktop_allows_export("material_depth_report_markdown")
     ensure_data_dirs()
     projects = load_projects()
     try:
@@ -12676,6 +11614,7 @@ def download_material_depth_report_markdown(
     project_id: str, locale: str = Depends(get_locale)
 ) -> Response:
     """下载项目资料深读体检 Markdown 文件。"""
+    assert_secure_desktop_allows_export("material_depth_report_markdown_file")
     result = get_material_depth_report_markdown(project_id=project_id, locale=locale)
     markdown = str(result.markdown or "")
     filename = f"material_depth_report_{project_id}.md"
@@ -12716,6 +11655,7 @@ def get_material_knowledge_profile_markdown(
     project_id: str, locale: str = Depends(get_locale)
 ) -> MaterialKnowledgeProfileMarkdownResponse:
     """项目资料知识画像（Markdown 文本）。"""
+    assert_secure_desktop_allows_export("material_knowledge_profile_markdown")
     ensure_data_dirs()
     projects = load_projects()
     try:
@@ -12740,6 +11680,7 @@ def download_material_knowledge_profile_markdown(
     project_id: str, locale: str = Depends(get_locale)
 ) -> Response:
     """下载项目资料知识画像 Markdown 文件。"""
+    assert_secure_desktop_allows_export("material_knowledge_profile_markdown_file")
     result = get_material_knowledge_profile_markdown(project_id=project_id, locale=locale)
     markdown = str(result.markdown or "")
     filename = f"material_knowledge_profile_{project_id}.md"
@@ -13674,6 +12615,99 @@ def _filter_structured_signal_terms(
     return out
 
 
+STRUCTURED_PAGE_TYPE_LABELS = {
+    "cover": "封面",
+    "toc": "目录",
+    "chapter": "章节",
+    "scoring_rules": "评分规则",
+    "table": "约束表格",
+    "attachment": "附件",
+    "drawing_like": "图纸页",
+    "narrative": "正文",
+}
+
+
+def _collect_structured_outline_terms(
+    structured_summary: object,
+    *,
+    material_type: str = "",
+    limit: int = 12,
+) -> List[str]:
+    summary = structured_summary if isinstance(structured_summary, dict) else {}
+    raw_terms: List[object] = []
+    raw_terms.extend(_to_text_items(summary.get("section_title_paths"), max_items=12))
+    for row in summary.get("document_outline") or []:
+        if not isinstance(row, dict):
+            continue
+        raw_terms.append(row.get("section_title"))
+        raw_terms.extend(_to_text_items(row.get("section_path"), max_items=4))
+        page_type = str(row.get("page_type") or "").strip().lower()
+        if page_type in {"scoring_rules", "table", "drawing_like"}:
+            raw_terms.append(STRUCTURED_PAGE_TYPE_LABELS.get(page_type, page_type))
+    for row in summary.get("page_type_summary") or []:
+        if not isinstance(row, dict):
+            continue
+        page_type = str(row.get("page_type") or "").strip().lower()
+        if page_type in {"scoring_rules", "table", "drawing_like"}:
+            raw_terms.append(STRUCTURED_PAGE_TYPE_LABELS.get(page_type, page_type))
+    return _filter_structured_signal_terms(
+        raw_terms,
+        limit=limit,
+        material_type=material_type,
+    )
+
+
+def _collect_structured_table_terms(
+    structured_summary: object,
+    *,
+    material_type: str = "",
+    limit: int = 12,
+) -> List[str]:
+    summary = structured_summary if isinstance(structured_summary, dict) else {}
+    raw_terms: List[object] = []
+    for row in summary.get("table_constraint_rows") or []:
+        if not isinstance(row, dict):
+            continue
+        raw_terms.append(row.get("label"))
+        value_text = str(row.get("value") or "").strip()
+        if value_text:
+            raw_terms.extend(_extract_terms(value_text, max_terms=6))
+    if summary.get("scoring_rule_pages"):
+        raw_terms.append("评分规则")
+    return _filter_structured_signal_terms(
+        raw_terms,
+        limit=limit,
+        material_type=material_type,
+    )
+
+
+def _collect_structured_anchor_numeric_terms(
+    structured_summary: object,
+    *,
+    limit: int = 10,
+) -> List[str]:
+    summary = structured_summary if isinstance(structured_summary, dict) else {}
+    numeric_terms: List[str] = []
+    numeric_terms.extend(
+        _merge_numeric_values(
+            summary.get("top_numeric_terms"),
+            summary.get("table_numeric_constraints"),
+            limit=limit * 2,
+        )
+    )
+    for row in summary.get("table_constraint_rows") or []:
+        if not isinstance(row, dict):
+            continue
+        numeric_terms.extend(
+            _merge_numeric_values(
+                row.get("numbers"),
+                row.get("value"),
+                limit=6,
+            )
+        )
+    return _limit_unique_numeric_tokens(numeric_terms, limit=limit)
+
+
 def _collect_keyword_labels(
     text: str,
     mapping: Dict[str, List[str]],
@@ -13823,6 +12857,8 @@ def _build_cross_type_material_consensus(
         term_candidates = (
             _to_text_items(row.get("structured_terms_preview"), max_items=8)
             + _to_text_items(row.get("section_titles_preview"), max_items=4)
+            + _to_text_items(row.get("outline_terms_preview"), max_items=4)
+            + _to_text_items(row.get("table_constraint_terms_preview"), max_items=4)
             + _to_text_items(row.get("scoring_point_terms_preview"), max_items=4)
             + _to_text_items(row.get("mandatory_clause_terms_preview"), max_items=3)
         )
@@ -15124,6 +14160,14 @@ def _select_material_retrieval_chunks(
         numeric_terms.update(
             _normalize_numeric_token(x) for x in query_numeric_terms if _normalize_numeric_token(x)
         )
+    ordered_query_terms = sorted(
+        [str(token) for token in query_terms if str(token).strip()],
+        key=lambda token: (-len(token), token),
+    )
+    ordered_numeric_terms = sorted(
+        [str(token) for token in numeric_terms if str(token).strip()],
+        key=lambda token: (-len(token), token),
+    )
 
     index = (
         material_index
@@ -15143,13 +14187,30 @@ def _select_material_retrieval_chunks(
         mat_type = str(file_entry.get("material_type") or "").strip()
         structured_summary = _get_material_file_structured_summary(file_entry)
         file_structured_quality = _get_material_file_structured_quality(file_entry)
+        file_outline_terms = _collect_structured_outline_terms(
+            structured_summary,
+            material_type=mat_type,
+            limit=8,
+        )
+        file_table_terms = _collect_structured_table_terms(
+            structured_summary,
+            material_type=mat_type,
+            limit=8,
+        )
         file_structured_terms = _filter_structured_signal_terms(
             _to_text_items(structured_summary.get("structured_terms"), max_items=12)
             + _to_text_items(structured_summary.get("section_titles"), max_items=6)
+            + file_outline_terms
             + _to_text_items(structured_summary.get("scoring_point_terms"), max_items=6)
+            + file_table_terms
             + _to_text_items(structured_summary.get("mandatory_clause_terms"), max_items=4),
-            limit=12,
+            limit=16,
             material_type=mat_type,
+        )
+        file_anchor_terms = _limit_unique_texts(file_outline_terms + file_table_terms, limit=10)
+        file_anchor_numeric_terms = _collect_structured_anchor_numeric_terms(
+            structured_summary,
+            limit=10,
         )
         chunks = file_entry.get("chunks") if isinstance(file_entry.get("chunks"), list) else []
         if not chunks:
@@ -15159,17 +14220,31 @@ def _select_material_retrieval_chunks(
         for idx, chunk in enumerate(chunks, start=1):
             chunk_text = str(chunk or "")
             lower = chunk_text.lower()
-            matched_terms = [t for t in query_terms if t and t in lower][:8]
+            matched_terms = [t for t in ordered_query_terms if t and t in lower][:8]
             structured_term_hits = [
                 term.lower()
                 for term in file_structured_terms
                 if str(term or "").strip() and str(term).lower() in lower
             ][:4]
+            matched_file_anchor_terms = [
+                str(term).lower()
+                for term in file_anchor_terms
+                if str(term).strip()
+                and any(
+                    query_term in str(term).lower() or str(term).lower() in query_term
+                    for query_term in ordered_query_terms
+                )
+            ][:4]
             chunk_numeric_terms = _extract_numeric_terms(chunk_text, max_terms=30)
             chunk_numeric_set = {str(x) for x in chunk_numeric_terms}
             matched_numeric_terms = [
-                token for token in numeric_terms if token and token in chunk_numeric_set
+                token for token in ordered_numeric_terms if token and token in chunk_numeric_set
             ][:8]
+            matched_file_numeric_terms = [
+                token
+                for token in ordered_numeric_terms
+                if token and token in file_anchor_numeric_terms
+            ][:4]
             type_keyword_hits = [
                 kw.lower() for kw in MATERIAL_TYPE_KEYWORDS.get(mat_type, []) if kw.lower() in lower
             ][:6]
@@ -15178,6 +14253,18 @@ def _select_material_retrieval_chunks(
                     if term not in matched_terms:
                         matched_terms.append(term)
                     if len(matched_terms) >= 8:
+                        break
+            if matched_file_anchor_terms:
+                for term in matched_file_anchor_terms:
+                    if term not in matched_terms:
+                        matched_terms.append(term)
+                    if len(matched_terms) >= 8:
+                        break
+            if matched_file_numeric_terms:
+                for token in matched_file_numeric_terms:
+                    if token not in matched_numeric_terms:
+                        matched_numeric_terms.append(token)
+                    if len(matched_numeric_terms) >= 8:
                         break
             if not matched_terms:
                 # 兜底：若命中该类型关键词也纳入候选
@@ -15212,9 +14299,12 @@ def _select_material_retrieval_chunks(
                         "dimension_id": _infer_chunk_dimension_id(mat_type, chunk),
                         "score": fallback_score,
                         "matched_terms": structured_term_hits
+                        or matched_file_anchor_terms
                         or type_keyword_hits
                         or lexical_terms[:6],
                         "matched_numeric_terms": chunk_numeric_norm[:6],
+                        "matched_file_anchor_terms": matched_file_anchor_terms,
+                        "matched_file_numeric_terms": matched_file_numeric_terms,
                         "chunk_preview": chunk_text[:220],
                         "is_backfill": True,
                         "file_structured_quality": round(file_structured_quality, 4),
@@ -15224,10 +14314,13 @@ def _select_material_retrieval_chunks(
             dimension_id = _infer_chunk_dimension_id(mat_type, chunk)
             score = len(matched_terms) + (2 if mat_type in {"boq", "drawing"} else 1)
             score += min(3, len(structured_term_hits))
+            score += min(3, len(matched_file_anchor_terms))
             if matched_numeric_terms:
                 score += min(4, len(matched_numeric_terms))
                 if mat_type in {"tender_qa", "boq", "drawing"}:
                     score += 1
+            if matched_file_numeric_terms and not chunk_numeric_terms:
+                score += min(2, len(matched_file_numeric_terms))
             score += min(4, file_structured_quality * 4.0)
             candidates.append(
                 {
@@ -15238,6 +14331,8 @@ def _select_material_retrieval_chunks(
                     "score": score,
                     "matched_terms": matched_terms,
                     "matched_numeric_terms": matched_numeric_terms,
+                    "matched_file_anchor_terms": matched_file_anchor_terms,
+                    "matched_file_numeric_terms": matched_file_numeric_terms,
                     "chunk_preview": chunk_text[:220],
                     "file_structured_quality": round(file_structured_quality, 4),
                 }
@@ -16502,6 +15597,8 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
     by_type_structured_term_counter: Dict[str, Counter[str]] = {}
     by_type_structured_dim_counter: Dict[str, Counter[str]] = {}
     by_type_section_title_counter: Dict[str, Counter[str]] = {}
+    by_type_outline_term_counter: Dict[str, Counter[str]] = {}
+    by_type_table_term_counter: Dict[str, Counter[str]] = {}
     by_type_scoring_point_counter: Dict[str, Counter[str]] = {}
     by_type_mandatory_clause_counter: Dict[str, Counter[str]] = {}
     by_type_numeric_categories: Dict[str, Dict[str, List[str]]] = {}
@@ -16544,6 +15641,8 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         by_type_structured_term_counter.setdefault(mat_type, Counter())
         by_type_structured_dim_counter.setdefault(mat_type, Counter())
         by_type_section_title_counter.setdefault(mat_type, Counter())
+        by_type_outline_term_counter.setdefault(mat_type, Counter())
+        by_type_table_term_counter.setdefault(mat_type, Counter())
         by_type_scoring_point_counter.setdefault(mat_type, Counter())
         by_type_mandatory_clause_counter.setdefault(mat_type, Counter())
         by_type_numeric_categories.setdefault(mat_type, {})
@@ -16640,6 +15739,14 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         if section_titles:
             by_type_term_counter[mat_type].update(section_titles)
             by_type_section_title_counter[mat_type].update(section_titles)
+        outline_terms = _collect_structured_outline_terms(
+            structured_summary,
+            material_type=mat_type,
+            limit=12,
+        )
+        if outline_terms:
+            by_type_term_counter[mat_type].update(outline_terms)
+            by_type_outline_term_counter[mat_type].update(outline_terms)
         scoring_point_terms = _to_text_items(
             structured_summary.get("scoring_point_terms"),
             max_items=12,
@@ -16647,6 +15754,14 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         if scoring_point_terms:
             by_type_term_counter[mat_type].update(scoring_point_terms)
             by_type_scoring_point_counter[mat_type].update(scoring_point_terms)
+        table_constraint_terms = _collect_structured_table_terms(
+            structured_summary,
+            material_type=mat_type,
+            limit=12,
+        )
+        if table_constraint_terms:
+            by_type_term_counter[mat_type].update(table_constraint_terms)
+            by_type_table_term_counter[mat_type].update(table_constraint_terms)
         mandatory_clause_terms = _to_text_items(
             structured_summary.get("mandatory_clause_terms"),
             max_items=10,
@@ -16667,8 +15782,8 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
                 )
                 if token
             ]
-        structured_numeric_terms = _limit_unique_numeric_tokens(
-            list(structured_summary.get("top_numeric_terms") or []),
+        structured_numeric_terms = _collect_structured_anchor_numeric_terms(
+            structured_summary,
             limit=10,
         )
         combined_numeric_terms = _limit_unique_numeric_tokens(
@@ -16686,7 +15801,14 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
         file_name = filename
         structured_signal_strength = max(
             0,
-            len(structured_terms) + len(structured_numeric_terms) + len(structured_dims),
+            len(structured_terms)
+            + len(structured_numeric_terms)
+            + len(structured_dims)
+            + min(3, len(section_titles))
+            + min(3, len(outline_terms))
+            + min(3, len(table_constraint_terms))
+            + min(3, len(scoring_point_terms))
+            + min(2, len(mandatory_clause_terms)),
         )
         by_type_structured_signal_count[mat_type] = (
             int(by_type_structured_signal_count.get(mat_type, 0)) + structured_signal_strength
@@ -16886,6 +16008,18 @@ def _build_material_knowledge_profile(project_id: str) -> Dict[str, object]:
                     for term, _ in by_type_section_title_counter.get(
                         mat_type, Counter()
                     ).most_common(8)
+                ],
+                "outline_terms_preview": [
+                    term
+                    for term, _ in by_type_outline_term_counter.get(
+                        mat_type, Counter()
+                    ).most_common(8)
+                ],
+                "table_constraint_terms_preview": [
+                    term
+                    for term, _ in by_type_table_term_counter.get(mat_type, Counter()).most_common(
+                        8
+                    )
                 ],
                 "scoring_point_terms_preview": [
                     term
@@ -17799,6 +16933,7 @@ def get_submission_evidence_trace_markdown(
     locale: str = Depends(get_locale),
 ) -> EvidenceTraceMarkdownResponse:
     """获取单份施组证据追溯的 Markdown 文本。"""
+    assert_secure_desktop_allows_export("submission_evidence_trace_markdown")
     payload = get_submission_evidence_trace(
         project_id=project_id,
         submission_id=submission_id,
@@ -17824,6 +16959,7 @@ def download_submission_evidence_trace_markdown(
     locale: str = Depends(get_locale),
 ) -> Response:
     """下载单份施组证据追溯 Markdown 文件。"""
+    assert_secure_desktop_allows_export("submission_evidence_trace_markdown_file")
     payload = get_submission_evidence_trace_markdown(
         project_id=project_id,
         submission_id=submission_id,
@@ -20989,6 +20125,14 @@ def index(
             + html_lib.escape(msg)
             + "</div>"
         )
+    if is_secure_desktop_mode_enabled():
+        secure_notice_html = (
+            '<div style="margin:0 0 16px 0;padding:10px 12px;border-radius:8px;'
+            'background:#fff7ed;color:#9a3412;font-size:13px;border:1px solid #fdba74">'
+            + html_lib.escape(SECURE_DESKTOP_NOTICE)
+            + "</div>"
+        )
+        global_notice_html = secure_notice_html + global_notice_html
 
     ui_dimension_labels = {
         "01": "01 总体部署与信息化管理",
@@ -21375,9 +20519,10 @@ def index(
         .weight-row input[type="range"] { width:100%; }
         .weight-row .raw-value { font-weight:600; color:#0f172a; text-align:right; }
         .weight-row .norm-value { color:#334155; text-align:right; font-size:12px; }
+        .secure-desktop .result-block, .secure-desktop #output { user-select: none; }
       </style>
     </head>
-    <body>
+    <body class="__SECURE_DESKTOP_BODY_CLASS__">
       <h1>青天评标系统 - 上传与对比 (v2)</h1>
       <p style="margin:-8px 0 16px 0;padding:10px;background:#e0f2fe;border-radius:6px;font-size:14px;">
         <strong>首次使用：</strong>① 创建项目 → ② 刷新并选择项目 → ③ 上传施组文件 → ④ 点击“评分施组”出分。数据保存在本机，无需额外配置。
@@ -22069,6 +21214,8 @@ def index(
 
       <script>
         (function () {
+          const SECURE_DESKTOP_MODE = __SECURE_DESKTOP_JSON__;
+          window.__ZHIFEI_SECURE_DESKTOP = SECURE_DESKTOP_MODE;
           const BOOTSTRAP_SCORE_SCALE_MAX = "__PROJECT_SCORE_SCALE_MAX__";
           const bootScoreScaleEl = document.getElementById('scoreScaleSelect');
           if (bootScoreScaleEl) {
@@ -22109,6 +21256,51 @@ def index(
             btnCompilationInstructions: { resultId: 'compilationInstructionsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compilation_instructions', loading: '正在生成编制系统指令...' },
           });
           window.__ZHIFEI_FALLBACK_ACTIONS = FALLBACK_ACTIONS;
+          const SECURE_DESKTOP_BLOCKED_BUTTON_IDS = [
+            'btnScoringFactorsMd',
+            'btnAnalysisBundle',
+            'btnAnalysisBundleDownload',
+            'btnMaterialDepthReportDownload',
+            'btnMaterialKnowledgeProfileDownload',
+          ];
+          function secureDesktopNoticeText() {
+            return '保密模式已启用：当前版本禁用 Markdown 导出、下载与复制。';
+          }
+          function secureDesktopBlockResult(resultId, fallbackText) {
+            const message = fallbackText || secureDesktopNoticeText();
+            const el = resultId ? document.getElementById(resultId) : null;
+            if (el) {
+              el.style.display = 'block';
+              el.innerHTML = '<span class="error">' + message + '</span>';
+            }
+            const out = document.getElementById('output');
+            if (out) out.textContent = message;
+          }
+          function applySecureDesktopUiGuards() {
+            if (!SECURE_DESKTOP_MODE) return;
+            document.documentElement.classList.add('secure-desktop');
+            SECURE_DESKTOP_BLOCKED_BUTTON_IDS.forEach((id) => {
+              const el = document.getElementById(id);
+              if (!el) return;
+              el.disabled = true;
+              el.title = secureDesktopNoticeText();
+            });
+            window.addEventListener('copy', (ev) => {
+              const target = ev.target;
+              if (target && /^(INPUT|TEXTAREA)$/i.test(String(target.tagName || ''))) return;
+              ev.preventDefault();
+            });
+            window.addEventListener('cut', (ev) => {
+              const target = ev.target;
+              if (target && /^(INPUT|TEXTAREA)$/i.test(String(target.tagName || ''))) return;
+              ev.preventDefault();
+            });
+            window.addEventListener('dragstart', (ev) => {
+              const target = ev.target;
+              if (target && /^(INPUT|TEXTAREA)$/i.test(String(target.tagName || ''))) return;
+              ev.preventDefault();
+            });
+          }
           const FALLBACK_MATERIAL_UPLOAD_ACTIONS = {
             btnUploadMaterials: {
               formId: 'uploadMaterial',
@@ -24039,6 +23231,10 @@ def index(
           if (out) out.textContent = details;
         }
         async function loadScoringFactorsMarkdown() {
+          if (SECURE_DESKTOP_MODE) {
+            secureDesktopBlockResult('scoringFactorsResult');
+            return;
+          }
           const currentId = pid();
           const url = currentId
             ? ('/api/v1/scoring/factors/markdown?project_id=' + encodeURIComponent(currentId))
@@ -24064,6 +23260,10 @@ def index(
           if (out) out.textContent = markdown;
         }
         async function loadProjectAnalysisBundle() {
+          if (SECURE_DESKTOP_MODE) {
+            secureDesktopBlockResult('scoringFactorsResult');
+            return;
+          }
           const currentId = pid();
           if (!currentId) {
             setScoringFactorsResult('请先选择项目', '项目分析包需要 project_id', true);
@@ -24091,6 +23291,10 @@ def index(
           if (out) out.textContent = markdown;
         }
         async function downloadProjectAnalysisBundle() {
+          if (SECURE_DESKTOP_MODE) {
+            secureDesktopBlockResult('scoringFactorsResult');
+            return;
+          }
           const currentId = pid();
           if (!currentId) {
             setScoringFactorsResult('请先选择项目', '下载分析包需要 project_id', true);
@@ -25129,6 +24333,10 @@ def index(
           if (out) out.textContent = JSON.stringify(data, null, 2);
         });
         safeClick('btnMaterialDepthReportDownload', async () => {
+          if (SECURE_DESKTOP_MODE) {
+            secureDesktopBlockResult('materialDepthReportResult');
+            return;
+          }
           if (!ensureProjectForAction('materialDepthReportResult')) return;
           const id = pid();
           const url = '/api/v1/projects/' + encodeURIComponent(id) + '/materials/depth_report.md';
@@ -25166,6 +24374,10 @@ def index(
           if (out) out.textContent = JSON.stringify(data, null, 2);
         });
         safeClick('btnMaterialKnowledgeProfileDownload', async () => {
+          if (SECURE_DESKTOP_MODE) {
+            secureDesktopBlockResult('materialKnowledgeProfileResult');
+            return;
+          }
           if (!ensureProjectForAction('materialKnowledgeProfileResult')) return;
           const id = pid();
           const url = '/api/v1/projects/' + encodeURIComponent(id) + '/materials/knowledge_profile.md';
@@ -26896,11 +26108,19 @@ def index(
           if (recommendations.length) {
             html += '<strong>建议动作</strong><ul>' + recommendations.slice(0, 8).map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('') + '</ul>';
           }
-          html += '<div style="margin-top:8px"><button type="button" class="secondary" id="btnEvidenceTraceDownload">下载 Markdown</button></div>';
+          if (!SECURE_DESKTOP_MODE) {
+            html += '<div style="margin-top:8px"><button type="button" class="secondary" id="btnEvidenceTraceDownload">下载 Markdown</button></div>';
+          } else {
+            html += '<p style="font-size:12px;margin-top:8px;color:#9a3412">保密模式下已禁用 Markdown 下载。</p>';
+          }
           el.innerHTML = html;
           const dlBtn = document.getElementById('btnEvidenceTraceDownload');
           if (dlBtn) {
             dlBtn.onclick = () => {
+              if (SECURE_DESKTOP_MODE) {
+                secureDesktopBlockResult('evidenceTraceResult');
+                return;
+              }
               const sid = String(data.submission_id || '').trim();
               if (!sid) return;
               const a = document.createElement('a');
@@ -27293,9 +26513,17 @@ def index(
             if ((data.mandatory_elements || []).length) html += '<p><b>必备要素：</b>' + data.mandatory_elements.join('；') + '</p>';
             if ((data.forbidden_patterns || []).length) html += '<p><b>禁止表述：</b>' + data.forbidden_patterns.join('；') + '</p>';
             if ((data.guidance_items || []).length) html += '<p><b>编制指导：</b><ul>' + data.guidance_items.map(l => '<li>' + l + '</li>').join('') + '</ul></p>';
-            html += '<button type="button" class="secondary" id="btnExportInstructions" style="margin-top:8px">导出为文本（复制到剪贴板）</button>';
+            if (!SECURE_DESKTOP_MODE) {
+              html += '<button type="button" class="secondary" id="btnExportInstructions" style="margin-top:8px">导出为文本（复制到剪贴板）</button>';
+            } else {
+              html += '<p style="font-size:12px;margin-top:8px;color:#9a3412">保密模式下已禁用复制导出。</p>';
+            }
             el.innerHTML = html;
             (document.getElementById('btnExportInstructions')||{}).onclick = () => {
+              if (SECURE_DESKTOP_MODE) {
+                secureDesktopBlockResult('compilationInstructionsResult');
+                return;
+              }
               const L = (arr, prefix) => (arr || []).map(s => prefix + s).join(String.fromCharCode(10));
               const lines = ['# 施组编制系统指令', '', '## 必备章节', L(data.required_sections || [], '- '), '', '## 必备图表/图片', L(data.required_charts_images || [], '- '), '', '## 必备要素', L(data.mandatory_elements || [], '- '), '', '## 禁止表述', L(data.forbidden_patterns || [], '- '), '', '## 编制指导', L(data.guidance_items || [], '- ')];
               const plain = lines.join(String.fromCharCode(10));
@@ -27497,6 +26725,7 @@ def index(
         initWeightsSection();
         syncGroundTruthJudgeInputs();
         updateProjectBoundControlsState();
+        applySecureDesktopUiGuards();
         refreshProjects();
 
       </script>
@@ -27515,6 +26744,14 @@ def index(
     html = html.replace("__SUBMISSION_ROWS__", initial_submission_rows_html)
     html = html.replace("__SUBMISSIONS_EMPTY_DISPLAY__", initial_submissions_empty_display)
     html = html.replace("__PROJECT_SCORE_SCALE_MAX__", str(score_scale_initial))
+    html = html.replace(
+        "__SECURE_DESKTOP_BODY_CLASS__",
+        "secure-desktop" if is_secure_desktop_mode_enabled() else "",
+    )
+    html = html.replace(
+        "__SECURE_DESKTOP_JSON__",
+        "true" if is_secure_desktop_mode_enabled() else "false",
+    )
     return Response(
         content=html.encode("utf-8"),
         media_type="text/html; charset=utf-8",
@@ -27539,6 +26776,11 @@ if __name__ == "__main__":
     import webbrowser
 
     port = int(os.environ.get("PORT", "8000"))
+    host = (
+        "127.0.0.1"
+        if is_secure_desktop_mode_enabled()
+        else str(os.environ.get("HOST") or "0.0.0.0")
+    )
 
     def _open_browser() -> None:
         time.sleep(2.5)
@@ -27554,4 +26796,4 @@ if __name__ == "__main__":
 
     import uvicorn
 
-    uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("app.main:app", host=host, port=port, reload=False)

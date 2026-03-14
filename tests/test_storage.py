@@ -105,6 +105,59 @@ class TestSaveJson:
         assert loaded == {"new": "data"}
 
 
+class TestSecureStorage:
+    def test_save_json_encrypts_when_secure_mode_enabled(self, tmp_path: Path):
+        from app import storage
+
+        test_file = tmp_path / "secure.json"
+        test_data = {"名称": "测试"}
+
+        with (
+            mock.patch.object(storage, "is_secure_desktop_mode_enabled", return_value=True),
+            mock.patch.object(
+                storage,
+                "_dpapi_crypt",
+                side_effect=lambda payload, decrypt=False: payload[::-1],
+            ),
+        ):
+            storage.save_json(test_file, test_data)
+
+            raw = test_file.read_bytes()
+            assert raw.startswith(storage._SECURE_FILE_MAGIC)
+            assert b"\xe6\xb5\x8b\xe8\xaf\x95" not in raw
+            assert storage.load_json(test_file, {}) == test_data
+
+    def test_prepare_secure_runtime_migrates_plaintext_files(self, tmp_path: Path):
+        from app import storage
+
+        legacy_file = tmp_path / "legacy.json"
+        legacy_file.write_text('{"migrated": true}', encoding="utf-8")
+
+        original_prepared = storage._SECURE_RUNTIME_PREPARED
+        storage._SECURE_RUNTIME_PREPARED = False
+        try:
+            with (
+                mock.patch.object(storage, "DATA_DIR", tmp_path),
+                mock.patch.object(storage, "MATERIALS_DIR", tmp_path / "materials"),
+                mock.patch.object(storage, "is_secure_desktop_mode_enabled", return_value=True),
+                mock.patch.object(storage, "_require_windows_dpapi"),
+                mock.patch.object(
+                    storage, "_iter_secure_candidate_files", return_value=[legacy_file]
+                ),
+                mock.patch.object(
+                    storage,
+                    "_dpapi_crypt",
+                    side_effect=lambda payload, decrypt=False: payload[::-1],
+                ),
+            ):
+                storage.prepare_secure_runtime()
+                raw = legacy_file.read_bytes()
+                assert raw.startswith(storage._SECURE_FILE_MAGIC)
+                assert storage.load_json(legacy_file, {}) == {"migrated": True}
+        finally:
+            storage._SECURE_RUNTIME_PREPARED = original_prepared
+
+
 class TestEnsureDataDirs:
     """Tests for ensure_data_dirs function"""
 

@@ -1,0 +1,20 @@
+[Unit]
+Description=Qingtian Bid System
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/zhifei/ZhiFei_BizSystem
+Environment=PYTHONUNBUFFERED=1
+Environment=HOST=127.0.0.1
+Environment=PORT=8000
+ExecStart=/opt/zhifei/ZhiFei_BizSystem/.venv/bin/python -m app.main --no-browser
+Restart=always
+RestartSec=3
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

@@ -33,6 +33,84 @@ class TestCreateApp:
         assert result is app
 
 
+class TestAppLifespan:
+    @patch("app.main._stop_material_parse_worker")
+    @patch("app.main._start_material_parse_worker")
+    def test_app_lifespan_starts_and_stops_parse_worker(
+        self,
+        mock_start_worker,
+        mock_stop_worker,
+    ):
+        with TestClient(app):
+            pass
+
+        mock_start_worker.assert_called_once()
+        mock_stop_worker.assert_called_once()
+
+
+class TestMaterialParseWorkerLifecycle:
+    @patch("app.main.logger.warning")
+    @patch("app.main.threading.Thread")
+    def test_stop_timeout_keeps_worker_reference_to_avoid_duplicate_worker(
+        self,
+        mock_thread_cls,
+        mock_logger_warning,
+    ):
+        from app import main as main_module
+
+        worker = MagicMock()
+        worker.is_alive.side_effect = [True, True, True]
+        original_worker = main_module._MATERIAL_PARSE_WORKER
+        original_event_state = main_module._MATERIAL_PARSE_STOP_EVENT.is_set()
+        main_module._MATERIAL_PARSE_WORKER = worker
+        try:
+            main_module._stop_material_parse_worker()
+            assert main_module._MATERIAL_PARSE_WORKER is worker
+
+            main_module._start_material_parse_worker()
+
+            worker.join.assert_called_once_with(timeout=2.0)
+            mock_thread_cls.assert_not_called()
+            mock_logger_warning.assert_called_once()
+            assert main_module._MATERIAL_PARSE_WORKER is worker
+        finally:
+            main_module._MATERIAL_PARSE_WORKER = original_worker
+            if original_event_state:
+                main_module._MATERIAL_PARSE_STOP_EVENT.set()
+            else:
+                main_module._MATERIAL_PARSE_STOP_EVENT.clear()
+
+
+class TestSecureDesktopExportBlock:
+    def test_scoring_factors_markdown_returns_403_in_secure_mode(self, client):
+        with patch("app.runtime_security.is_secure_desktop_mode_enabled", return_value=True):
+            response = client.get("/api/v1/scoring/factors/markdown")
+
+        assert response.status_code == 403
+        assert "保密模式已启用" in response.json()["detail"]
+
+    def test_project_analysis_bundle_returns_403_in_secure_mode(self, client):
+        with patch("app.runtime_security.is_secure_desktop_mode_enabled", return_value=True):
+            response = client.get("/api/v1/projects/p1/analysis_bundle")
+
+        assert response.status_code == 403
+        assert "保密模式已启用" in response.json()["detail"]
+
+    def test_material_depth_report_markdown_returns_403_in_secure_mode(self, client):
+        with patch("app.runtime_security.is_secure_desktop_mode_enabled", return_value=True):
+            response = client.get("/api/v1/projects/p1/materials/depth_report/markdown")
+
+        assert response.status_code == 403
+        assert "保密模式已启用" in response.json()["detail"]
+
+    def test_submission_evidence_trace_download_returns_403_in_secure_mode(self, client):
+        with patch("app.runtime_security.is_secure_desktop_mode_enabled", return_value=True):
+            response = client.get("/api/v1/projects/p1/submissions/s1/evidence_trace.md")
+
+        assert response.status_code == 403
+        assert "保密模式已启用" in response.json()["detail"]
+
+
 class TestScoreSelfAwareness:
     def test_build_score_self_awareness_high_when_evidence_and_dimension_support_are_strong(
         self,
@@ -641,6 +719,16 @@ class TestMetricsEndpoint:
         content = response.text
         assert "qingtian_projects_total" in content
         assert "qingtian_submissions_total" in content
+
+    def test_metrics_reflect_previous_http_requests(self, client):
+        client.get("/health")
+        response = client.get("/metrics")
+
+        assert response.status_code == 200
+        assert (
+            'qingtian_http_requests_total{endpoint="/health",method="GET",status_code="200"}'
+            in response.text
+        )
 
     @patch("app.main.load_projects")
     @patch("app.main.load_submissions")
@@ -2343,6 +2431,69 @@ class TestMaterialsEndpoint:
         by_dimension = {row["dimension_id"]: row for row in payload["by_dimension"]}
         assert by_dimension["09"]["structured_signal_hits"] > 0
 
+    @patch("app.main._now_iso", return_value="2026-02-27T00:00:00+00:00")
+    @patch("app.main._build_project_material_index")
+    def test_build_material_knowledge_profile_includes_outline_and_table_anchor_previews(
+        self,
+        mock_build_material_index,
+        mock_now_iso,
+    ):
+        from app.main import _build_material_knowledge_profile
+
+        mock_build_material_index.return_value = {
+            "project_id": "p1",
+            "available_types": ["tender_qa"],
+            "files": [
+                {
+                    "material_type": "tender_qa",
+                    "filename": "招标答疑.pdf",
+                    "parsed_ok": True,
+                    "text": "危大工程专项方案必须逐项响应，关键节点需闭环。",
+                    "chunks": ["危大工程专项方案必须逐项响应。", "关键节点需闭环。"],
+                    "created_at": "2026-02-26T00:00:01+00:00",
+                    "lexical_terms": ["危大工程", "专项方案", "关键节点"],
+                    "numeric_terms_norm": ["3", "120"],
+                    "tender_qa_structured_summary": {
+                        "structured_quality_score": 0.86,
+                        "structured_terms": ["危大工程", "专项方案"],
+                        "section_titles": ["评分办法", "专项方案要求"],
+                        "scoring_point_terms": ["节点闭环"],
+                        "mandatory_clause_terms": ["必须逐项响应"],
+                        "focused_dimensions": ["09", "16"],
+                        "top_numeric_terms": ["120"],
+                        "section_title_paths": ["第一章", "危大工程专项方案"],
+                        "document_outline": [
+                            {
+                                "page_no": 2,
+                                "page_type": "scoring_rules",
+                                "section_title": "危大工程专项方案",
+                                "section_level": 1,
+                                "section_path": ["第一章", "危大工程专项方案"],
+                                "parse_confidence": 0.91,
+                            }
+                        ],
+                        "table_constraint_rows": [
+                            {
+                                "page_no": 3,
+                                "label": "专项方案响应表",
+                                "value": "危大工程需逐项响应",
+                                "numbers": ["3"],
+                            }
+                        ],
+                        "table_numeric_constraints": ["3"],
+                        "page_type_summary": [{"page_type": "scoring_rules", "count": 1}],
+                    },
+                }
+            ],
+            "quality_snapshot": {},
+        }
+
+        payload = _build_material_knowledge_profile("p1")
+        by_type = {row["material_type"]: row for row in payload["by_type"]}
+        assert "危大工程专项方案" in (by_type["tender_qa"]["outline_terms_preview"] or [])
+        assert "专项方案响应表" in (by_type["tender_qa"]["table_constraint_terms_preview"] or [])
+        assert by_type["tender_qa"]["structured_signal_count"] >= 8
+
     @patch("app.main.save_materials")
     @patch("app.main.load_materials")
     @patch("app.main.load_projects")
@@ -2634,6 +2785,8 @@ class TestMaterialAdvancedParsing:
                     "material_type": "boq",
                     "top_terms": ["工程量", "综合单价", "措施费", "项目"],
                     "top_numeric_terms": ["120", "30", "580"],
+                    "outline_terms_preview": ["资源配置章节", "机械投入计划"],
+                    "table_constraint_terms_preview": ["主要机械投入表", "劳动力峰值计划"],
                 }
             ],
             "by_dimension": [
@@ -2661,6 +2814,7 @@ class TestMaterialAdvancedParsing:
         assert out["material_profile_query_numeric_terms_count"] >= 1
         assert "15" in out["material_profile_focus_dimensions"]
         assert "工程量" in out["query_terms"]
+        assert "主要机械投入表" in out["query_terms"]
         assert "120" in out["query_numeric_terms"]
 
     def test_build_material_dimension_requirements_from_knowledge_profile(self):
@@ -2674,6 +2828,8 @@ class TestMaterialAdvancedParsing:
                     "top_numeric_terms": ["120", "30"],
                     "structured_terms_preview": ["里程碑", "总控计划"],
                     "section_titles_preview": ["施工组织设计总体部署"],
+                    "outline_terms_preview": ["施工部署章节", "危大工程专项方案"],
+                    "table_constraint_terms_preview": ["关键节点响应表", "危大工程清单响应表"],
                     "scoring_point_terms_preview": ["bim", "深化"],
                     "mandatory_clause_terms_preview": ["投标文件必须响应关键节点"],
                     "structured_quality_score": 0.78,
@@ -2718,12 +2874,14 @@ class TestMaterialAdvancedParsing:
         dim09 = next(r for r in reqs if r.get("dimension_id") == "09")
         patterns = dim09.get("patterns") or {}
         assert dim09.get("source_pack_id") == "runtime_material_dimension"
-        assert dim09.get("source_pack_version") == "v2-material-dimension-3"
+        assert dim09.get("source_pack_version") == "v2-material-dimension-4"
         assert patterns.get("source_mode") == "material_knowledge_profile"
         assert "tender_qa" in (patterns.get("source_types") or [])
-        assert "120" in (patterns.get("hints") or [])
+        assert "120" in (patterns.get("top_numeric_terms") or [])
         assert "里程碑" in (patterns.get("structured_terms") or [])
         assert "施工组织设计总体部署" in (patterns.get("section_titles") or [])
+        assert "危大工程专项方案" in (patterns.get("outline_terms") or [])
+        assert "关键节点响应表" in (patterns.get("table_constraint_terms") or [])
         assert "bim" in [str(x).lower() for x in (patterns.get("scoring_point_terms") or [])]
         assert patterns.get("mandatory_clause_terms")
         assert int(patterns.get("minimum_hint_hits") or 0) >= 3
@@ -3529,6 +3687,69 @@ class TestMaterialAdvancedParsing:
         assert chunks
         assert chunks[0]["filename"] == "high_quality.dwg"
         assert float(chunks[0].get("file_structured_quality") or 0.0) >= 0.88
+
+    def test_select_material_retrieval_chunks_uses_file_level_deep_read_anchors(self):
+        from app.main import _select_material_retrieval_chunks
+
+        material_index = {
+            "available_types": ["tender_qa"],
+            "files": [
+                {
+                    "material_type": "tender_qa",
+                    "filename": "generic.pdf",
+                    "parsed_ok": True,
+                    "chunks": ["详见附件执行。"],
+                    "tender_qa_structured_summary": {
+                        "structured_quality_score": 0.72,
+                        "structured_terms": ["一般要求"],
+                    },
+                },
+                {
+                    "material_type": "tender_qa",
+                    "filename": "anchor.pdf",
+                    "parsed_ok": True,
+                    "chunks": ["详见附表执行。"],
+                    "tender_qa_structured_summary": {
+                        "structured_quality_score": 0.9,
+                        "structured_terms": ["专项方案"],
+                        "section_title_paths": ["第一章", "危大工程专项方案"],
+                        "document_outline": [
+                            {
+                                "page_no": 2,
+                                "page_type": "scoring_rules",
+                                "section_title": "危大工程专项方案",
+                                "section_level": 1,
+                                "section_path": ["第一章", "危大工程专项方案"],
+                            }
+                        ],
+                        "table_constraint_rows": [
+                            {
+                                "page_no": 3,
+                                "label": "专项方案响应表",
+                                "value": "危大工程需逐项响应",
+                                "numbers": ["3"],
+                            }
+                        ],
+                        "table_numeric_constraints": ["3"],
+                        "page_type_summary": [{"page_type": "scoring_rules", "count": 1}],
+                    },
+                },
+            ],
+        }
+
+        chunks = _select_material_retrieval_chunks(
+            "p1",
+            "危大工程专项方案 响应表",
+            top_k=1,
+            per_type_quota=1,
+            per_file_quota=1,
+            material_index=material_index,
+        )
+
+        assert chunks
+        assert chunks[0]["filename"] == "anchor.pdf"
+        assert "危大工程专项方案" in " ".join(chunks[0].get("matched_terms") or [])
+        assert chunks[0].get("matched_file_anchor_terms")
 
     def test_build_material_utilization_summary_reports_uncovered_types(self):
         from app.main import _build_material_utilization_summary

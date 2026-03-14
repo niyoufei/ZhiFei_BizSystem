@@ -35,8 +35,12 @@ dev = [
   "pytest-cov",
   "ruff",
 ]
+windows-build = [
+  "pyinstaller>=6",
+]
 [project.scripts]
 zhifei-score = "app.cli:app"
+zhifei-secure-desktop = "app.windows_desktop:main"
 
 [tool.ruff]
 line-length = 100
