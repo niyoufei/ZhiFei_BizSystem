@@ -9540,6 +9540,214 @@ def _build_governance_artifact_impacts(project_id: str) -> List[Dict[str, object
     return impacts
 
 
+def _resolve_qingtian_total_score_100(
+    row: Dict[str, object],
+    *,
+    default_score_scale_max: int,
+) -> Optional[float]:
+    qt_total = _to_float_or_none(row.get("qt_total_score"))
+    if qt_total is not None:
+        return round(float(qt_total), 2)
+    raw_payload = row.get("raw_payload") if isinstance(row.get("raw_payload"), dict) else {}
+    if not raw_payload:
+        return None
+    normalized = _ground_truth_record_for_learning(
+        {
+            "final_score": raw_payload.get("final_score"),
+            "final_score_raw": raw_payload.get("final_score_raw"),
+            "final_score_100": raw_payload.get("final_score_100"),
+            "score_scale_max": raw_payload.get("score_scale_max"),
+            "judge_scores": raw_payload.get("judge_scores") or [],
+        },
+        default_score_scale_max=default_score_scale_max,
+    )
+    return _to_float_or_none(normalized.get("final_score"))
+
+
+def _build_governance_score_preview(
+    project_id: str,
+    project: Dict[str, object],
+    artifact_impacts: List[Dict[str, object]],
+) -> Dict[str, object]:
+    project_score_scale = _resolve_project_score_scale_max(project)
+    preview_limit = 8
+    calibrator = _select_calibrator_model(project) or {}
+    current_calibrator_version = str(calibrator.get("calibrator_version") or "")
+    submissions = [s for s in load_submissions() if str(s.get("project_id") or "") == project_id]
+    submissions_by_id = {
+        str(item.get("id") or ""): item for item in submissions if str(item.get("id") or "").strip()
+    }
+    latest_reports = _latest_records_by_submission(
+        [
+            row
+            for row in load_score_reports()
+            if str(row.get("project_id") or "") == project_id
+            and str(row.get("submission_id") or "") in submissions_by_id
+        ]
+    )
+    blocked_gt_ids = {
+        str(row.get("id") or "").strip()
+        for row in _list_project_ground_truth_records(project_id, include_guardrail_blocked=True)
+        if _feedback_guardrail_is_blocked(row)
+    }
+    latest_qingtian = _latest_records_by_submission(
+        [
+            row
+            for row in load_qingtian_results()
+            if str(row.get("submission_id") or "") in latest_reports
+            and str(row.get("submission_id") or "") in submissions_by_id
+            and (
+                str(((row.get("raw_payload") or {}).get("ground_truth_record_id") or "")).strip()
+                not in blocked_gt_ids
+            )
+        ]
+    )
+    requires_rule_rescore = any(
+        bool(item.get("changed_since_latest_snapshot"))
+        for item in artifact_impacts
+        if str(item.get("artifact") or "")
+        in {"high_score_features", "evolution_reports", "expert_profiles"}
+    )
+    calibrator_changed_since_latest_snapshot = any(
+        bool(item.get("changed_since_latest_snapshot"))
+        for item in artifact_impacts
+        if str(item.get("artifact") or "") == "calibration_models"
+    )
+
+    all_rows: List[Dict[str, object]] = []
+    sorted_qingtian = sorted(
+        latest_qingtian.items(),
+        key=lambda item: (
+            str((item[1] or {}).get("created_at") or ""),
+            str(item[0] or ""),
+        ),
+        reverse=True,
+    )
+    for submission_id, qt_row in sorted_qingtian:
+        submission = submissions_by_id.get(submission_id)
+        stored_report = latest_reports.get(submission_id)
+        if not isinstance(submission, dict) or not isinstance(stored_report, dict):
+            continue
+        qt_total_score = _resolve_qingtian_total_score_100(
+            qt_row,
+            default_score_scale_max=project_score_scale,
+        )
+        rule_total_score = _to_float_or_none(stored_report.get("rule_total_score"))
+        if qt_total_score is None or rule_total_score is None:
+            continue
+        preview_report = copy.deepcopy(stored_report)
+        preview_submission = dict(submission)
+        _apply_prediction_to_report(
+            preview_report,
+            submission_like=preview_submission,
+            project=project,
+        )
+        stored_pred_total_score = _to_float_or_none(stored_report.get("pred_total_score"))
+        stored_total_score = (
+            stored_pred_total_score if stored_pred_total_score is not None else rule_total_score
+        )
+        preview_pred_total_score = _to_float_or_none(preview_report.get("pred_total_score"))
+        preview_rule_total_score = _to_float_or_none(preview_report.get("rule_total_score"))
+        preview_total_score = (
+            preview_pred_total_score
+            if preview_pred_total_score is not None
+            else preview_rule_total_score
+        )
+        stored_signed_delta = (
+            round(float(stored_total_score) - float(qt_total_score), 2)
+            if stored_total_score is not None
+            else None
+        )
+        preview_signed_delta = (
+            round(float(preview_total_score) - float(qt_total_score), 2)
+            if preview_total_score is not None
+            else None
+        )
+        stored_abs_delta = (
+            round(abs(float(stored_signed_delta)), 2) if stored_signed_delta is not None else None
+        )
+        preview_abs_delta = (
+            round(abs(float(preview_signed_delta)), 2) if preview_signed_delta is not None else None
+        )
+        abs_delta_improvement = (
+            round(float(stored_abs_delta) - float(preview_abs_delta), 2)
+            if stored_abs_delta is not None and preview_abs_delta is not None
+            else None
+        )
+        raw_payload = (
+            qt_row.get("raw_payload") if isinstance(qt_row.get("raw_payload"), dict) else {}
+        )
+        all_rows.append(
+            {
+                "submission_id": submission_id,
+                "filename": str(
+                    submission.get("filename")
+                    or raw_payload.get("source_submission_filename")
+                    or ""
+                ),
+                "report_created_at": str(stored_report.get("created_at") or ""),
+                "qingtian_created_at": str(qt_row.get("created_at") or ""),
+                "source_ground_truth_id": str(raw_payload.get("ground_truth_record_id") or ""),
+                "rule_total_score": round(float(rule_total_score), 2),
+                "stored_pred_total_score": (
+                    round(float(stored_pred_total_score), 2)
+                    if stored_pred_total_score is not None
+                    else None
+                ),
+                "stored_total_score": (
+                    round(float(stored_total_score), 2) if stored_total_score is not None else None
+                ),
+                "preview_pred_total_score": (
+                    round(float(preview_pred_total_score), 2)
+                    if preview_pred_total_score is not None
+                    else None
+                ),
+                "preview_total_score": (
+                    round(float(preview_total_score), 2)
+                    if preview_total_score is not None
+                    else None
+                ),
+                "qt_total_score": round(float(qt_total_score), 2),
+                "stored_signed_delta_100": stored_signed_delta,
+                "preview_signed_delta_100": preview_signed_delta,
+                "stored_abs_delta_100": stored_abs_delta,
+                "preview_abs_delta_100": preview_abs_delta,
+                "abs_delta_improvement": abs_delta_improvement,
+            }
+        )
+
+    def _avg_numeric(key: str) -> Optional[float]:
+        values = [float(row.get(key)) for row in all_rows if isinstance(row.get(key), (int, float))]
+        if not values:
+            return None
+        return round(sum(values) / len(values), 2)
+
+    improved_row_count = sum(
+        1 for row in all_rows if (_to_float_or_none(row.get("abs_delta_improvement")) or 0.0) > 0.01
+    )
+    worsened_row_count = sum(
+        1
+        for row in all_rows
+        if (_to_float_or_none(row.get("abs_delta_improvement")) or 0.0) < -0.01
+    )
+
+    return {
+        "scope": "calibrator_only_preview",
+        "matched_submission_count": len(all_rows),
+        "preview_limit": preview_limit,
+        "current_calibrator_version": current_calibrator_version or None,
+        "calibrator_changed_since_latest_snapshot": calibrator_changed_since_latest_snapshot,
+        "requires_rule_rescore": requires_rule_rescore,
+        "dimension_preview_supported": False,
+        "avg_abs_delta_stored": _avg_numeric("stored_abs_delta_100"),
+        "avg_abs_delta_preview": _avg_numeric("preview_abs_delta_100"),
+        "avg_abs_delta_improvement": _avg_numeric("abs_delta_improvement"),
+        "improved_row_count": improved_row_count,
+        "worsened_row_count": worsened_row_count,
+        "rows": all_rows[:preview_limit],
+    }
+
+
 def _build_feedback_governance_report(
     project_id: str,
     project: Dict[str, object],
@@ -9738,6 +9946,7 @@ def _build_feedback_governance_report(
             }
         )
     artifact_impacts = _build_governance_artifact_impacts(project_id)
+    score_preview = _build_governance_score_preview(project_id, project, artifact_impacts)
 
     recommendations: List[str] = []
     blocked_count = int(summary_guardrail.get("blocked_count") or 0)
@@ -9760,6 +9969,26 @@ def _build_feedback_governance_report(
     if any(bool(item.get("changed_since_latest_snapshot")) for item in artifact_impacts):
         recommendations.append(
             "检测到部分闭环产物与最近一次快照不一致；若刚执行过回滚，请结合“治理影响体检”确认差异是否符合预期。"
+        )
+    preview_match_count = int(score_preview.get("matched_submission_count") or 0)
+    avg_abs_delta_stored = _to_float_or_none(score_preview.get("avg_abs_delta_stored"))
+    avg_abs_delta_preview = _to_float_or_none(score_preview.get("avg_abs_delta_preview"))
+    if preview_match_count <= 0:
+        recommendations.append(
+            "当前暂无可同时关联最新评分报告与青天结果的样本，治理面板暂不能执行评分偏差试算。"
+        )
+    elif avg_abs_delta_stored is not None and avg_abs_delta_preview is not None:
+        if avg_abs_delta_preview + 1e-6 < avg_abs_delta_stored:
+            recommendations.append(
+                f"只读试算显示当前校准器可将平均绝对偏差从 {avg_abs_delta_stored:.2f} 分收敛到 {avg_abs_delta_preview:.2f} 分，可在确认后再执行正式重评分。"
+            )
+        elif avg_abs_delta_preview > avg_abs_delta_stored + 1e-6:
+            recommendations.append(
+                f"只读试算显示当前校准器可能使平均绝对偏差从 {avg_abs_delta_stored:.2f} 分扩大到 {avg_abs_delta_preview:.2f} 分，建议先回看样本与版本快照。"
+            )
+    if bool(score_preview.get("requires_rule_rescore")):
+        recommendations.append(
+            "评分偏差试算当前仅覆盖校准总分层；由于权重、画像或进化逻辑已变化，维度分与完整总分仍需重评分后确认。"
         )
 
     return {
@@ -9807,6 +10036,7 @@ def _build_feedback_governance_report(
         "adopted_few_shot": adopted_few_shot,
         "version_history": version_history,
         "artifact_impacts": artifact_impacts,
+        "score_preview": score_preview,
         "recommendations": recommendations[:10],
     }
 
@@ -26358,6 +26588,8 @@ def index(
           const adoptedFewShot = Array.isArray(data.adopted_few_shot) ? data.adopted_few_shot : [];
           const versions = Array.isArray(data.version_history) ? data.version_history : [];
           const artifactImpacts = Array.isArray(data.artifact_impacts) ? data.artifact_impacts : [];
+          const scorePreview = (data.score_preview && typeof data.score_preview === 'object') ? data.score_preview : {};
+          const scorePreviewRows = Array.isArray(scorePreview.rows) ? scorePreview.rows : [];
           const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
           let html = '<strong>闭环治理面板（异常样本 / few-shot / 回退快照）</strong>';
           if (opts.actionMessage) {
@@ -26494,6 +26726,51 @@ def index(
                 + '</tr>';
             }).join('');
             html += '</table>';
+          }
+          if (scorePreviewRows.length || scorePreview.matched_submission_count) {
+            const previewSummaryParts = [];
+            previewSummaryParts.push('匹配样本=' + escapeHtmlText(scorePreview.matched_submission_count || 0));
+            if (scorePreview.current_calibrator_version) {
+              previewSummaryParts.push('当前校准器=' + escapeHtmlText(scorePreview.current_calibrator_version));
+            }
+            if (scorePreview.avg_abs_delta_stored != null) {
+              previewSummaryParts.push('已落库平均绝对偏差=' + escapeHtmlText(scorePreview.avg_abs_delta_stored));
+            }
+            if (scorePreview.avg_abs_delta_preview != null) {
+              previewSummaryParts.push('试算平均绝对偏差=' + escapeHtmlText(scorePreview.avg_abs_delta_preview));
+            }
+            if (scorePreview.avg_abs_delta_improvement != null) {
+              previewSummaryParts.push('平均改善值=' + escapeHtmlText(scorePreview.avg_abs_delta_improvement));
+            }
+            if (scorePreview.calibrator_changed_since_latest_snapshot) {
+              previewSummaryParts.push('校准器已偏离最近快照');
+            }
+            if (scorePreview.requires_rule_rescore) {
+              previewSummaryParts.push('仅覆盖校准层，权重/画像/进化差异需重评分后确认');
+            }
+            if (scorePreview.dimension_preview_supported === false) {
+              previewSummaryParts.push('维度分试算暂不支持');
+            }
+            html += '<strong>评分偏差试算</strong>';
+            if (previewSummaryParts.length) {
+              html += '<p style="margin:6px 0;color:#1f2937">' + previewSummaryParts.join('；') + '</p>';
+            }
+            if (scorePreviewRows.length) {
+              html += '<table><tr><th>施组</th><th>规则分</th><th>已落库总分</th><th>试算总分</th><th>青天分</th><th>已落库偏差</th><th>试算偏差</th><th>改善值</th></tr>';
+              html += scorePreviewRows.map((row) => '<tr>'
+                + '<td>' + escapeHtmlText(row.filename || row.submission_id || '-') + '</td>'
+                + '<td>' + escapeHtmlText(row.rule_total_score != null ? row.rule_total_score : '-') + '</td>'
+                + '<td>' + escapeHtmlText(row.stored_total_score != null ? row.stored_total_score : '-') + '</td>'
+                + '<td>' + escapeHtmlText(row.preview_total_score != null ? row.preview_total_score : '-') + '</td>'
+                + '<td>' + escapeHtmlText(row.qt_total_score != null ? row.qt_total_score : '-') + '</td>'
+                + '<td>' + escapeHtmlText(row.stored_abs_delta_100 != null ? row.stored_abs_delta_100 : '-') + '</td>'
+                + '<td>' + escapeHtmlText(row.preview_abs_delta_100 != null ? row.preview_abs_delta_100 : '-') + '</td>'
+                + '<td>' + escapeHtmlText(row.abs_delta_improvement != null ? row.abs_delta_improvement : '-') + '</td>'
+                + '</tr>').join('');
+              html += '</table>';
+            } else {
+              html += '<p style="margin:6px 0;color:#64748b">当前暂无可试算的最新评分样本。</p>';
+            }
           }
           if (recs.length) {
             html += '<ul style="margin:6px 0 0 18px;color:#92400e">'

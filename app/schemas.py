@@ -429,6 +429,7 @@ class FeedbackGovernanceResponse(BaseModel):
     adopted_few_shot: List[Dict[str, Any]] = Field(default_factory=list)
     version_history: List[Dict[str, Any]] = Field(default_factory=list)
     artifact_impacts: List[Dict[str, Any]] = Field(default_factory=list)
+    score_preview: Dict[str, Any] = Field(default_factory=dict)
     recommendations: List[str] = Field(default_factory=list)
 
 

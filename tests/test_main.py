@@ -7167,7 +7167,10 @@ class TestFeedbackGovernanceRoutes:
             )
         )
 
-        response = client.get("/api/v1/projects/p1/feedback/governance")
+        with patch("app.main.load_submissions", return_value=[]), patch(
+            "app.main.load_score_reports", return_value=[]
+        ), patch("app.main.load_qingtian_results", return_value=[]):
+            response = client.get("/api/v1/projects/p1/feedback/governance")
 
         assert response.status_code == 200
         data = response.json()
@@ -7190,7 +7193,138 @@ class TestFeedbackGovernanceRoutes:
         )
         assert data["artifact_impacts"][0]["artifact"] == "high_score_features"
         assert data["artifact_impacts"][0]["changed_since_latest_snapshot"] is True
+        assert data["score_preview"]["matched_submission_count"] == 0
         assert any(row["artifact"] == "high_score_features" for row in data["version_history"])
+
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_feedback_governance_route_includes_score_preview(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 100}}]
+
+        def _apply_preview(report, *, submission_like, project):
+            report["pred_total_score"] = 78.0
+            report["total_score"] = 78.0
+            report["llm_total_score"] = 78.0
+            report["pred_confidence"] = {"sigma": 1.0}
+            return "calib-9"
+
+        with patch(
+            "app.main.load_ground_truth",
+            return_value=[
+                {
+                    "id": "gt-1",
+                    "project_id": "p1",
+                    "final_score": 84,
+                    "score_scale_max": 100,
+                    "judge_scores": [84, 84, 84, 84, 84],
+                    "created_at": "2026-03-15T01:00:00+00:00",
+                    "source_submission_filename": "投标文件A.docx",
+                }
+            ],
+        ), patch("app.main.load_high_score_features", return_value=[]), patch(
+            "app.main.load_evolution_reports", return_value={}
+        ), patch(
+            "app.main.load_calibration_models",
+            return_value=[
+                {
+                    "calibrator_version": "calib-9",
+                    "model_type": "ridge",
+                    "deployed": True,
+                    "train_filter": {"project_id": "p1"},
+                    "updated_at": "2026-03-15T06:00:00+00:00",
+                }
+            ],
+        ), patch("app.main.load_expert_profiles", return_value=[]), patch(
+            "app.main.list_json_versions",
+            side_effect=lambda path: (
+                [
+                    {
+                        "version_id": "20260315T050000000000Z",
+                        "created_at": "2026-03-15T05:00:00+00:00",
+                    }
+                ]
+                if getattr(path, "stem", "") == "calibration_models"
+                else []
+            ),
+        ), patch(
+            "app.main.load_json_version",
+            side_effect=lambda path, version_id, default: (
+                [{"calibrator_version": "calib-8", "model_type": "offset"}]
+                if getattr(path, "stem", "") == "calibration_models"
+                else default
+            ),
+        ), patch(
+            "app.main.load_submissions",
+            return_value=[
+                {
+                    "id": "s1",
+                    "project_id": "p1",
+                    "filename": "投标文件A.docx",
+                    "text": "测试内容",
+                    "total_score": 72.0,
+                }
+            ],
+        ), patch(
+            "app.main.load_score_reports",
+            return_value=[
+                {
+                    "id": "r1",
+                    "project_id": "p1",
+                    "submission_id": "s1",
+                    "created_at": "2026-03-15T02:00:00+00:00",
+                    "rule_total_score": 70.0,
+                    "pred_total_score": 72.0,
+                }
+            ],
+        ), patch(
+            "app.main.load_qingtian_results",
+            return_value=[
+                {
+                    "submission_id": "s1",
+                    "qt_total_score": 84.0,
+                    "created_at": "2026-03-15T03:00:00+00:00",
+                    "raw_payload": {
+                        "ground_truth_record_id": "gt-1",
+                        "final_score_100": 84.0,
+                    },
+                }
+            ],
+        ), patch(
+            "app.main._apply_prediction_to_report",
+            side_effect=_apply_preview,
+        ):
+            response = client.get("/api/v1/projects/p1/feedback/governance")
+
+        assert response.status_code == 200
+        data = response.json()
+        preview = data["score_preview"]
+        assert preview["matched_submission_count"] == 1
+        assert preview["current_calibrator_version"] == "calib-9"
+        assert preview["calibrator_changed_since_latest_snapshot"] is True
+        assert preview["requires_rule_rescore"] is False
+        assert preview["dimension_preview_supported"] is False
+        assert preview["avg_abs_delta_stored"] == 12.0
+        assert preview["avg_abs_delta_preview"] == 6.0
+        assert preview["avg_abs_delta_improvement"] == 6.0
+        assert preview["improved_row_count"] == 1
+        row = preview["rows"][0]
+        assert row["submission_id"] == "s1"
+        assert row["filename"] == "投标文件A.docx"
+        assert row["rule_total_score"] == 70.0
+        assert row["stored_total_score"] == 72.0
+        assert row["preview_total_score"] == 78.0
+        assert row["qt_total_score"] == 84.0
+        assert row["stored_abs_delta_100"] == 12.0
+        assert row["preview_abs_delta_100"] == 6.0
+        assert row["abs_delta_improvement"] == 6.0
+        assert any(
+            "平均绝对偏差从 12.00 分收敛到 6.00 分" in item for item in data["recommendations"]
+        )
 
     @patch("app.main._run_feedback_closed_loop_safe")
     @patch("app.main.save_ground_truth")
