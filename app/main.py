@@ -9564,15 +9564,11 @@ def _resolve_qingtian_total_score_100(
     return _to_float_or_none(normalized.get("final_score"))
 
 
-def _build_governance_score_preview(
+def _list_governance_comparable_submission_snapshots(
     project_id: str,
     project: Dict[str, object],
-    artifact_impacts: List[Dict[str, object]],
-) -> Dict[str, object]:
+) -> List[Dict[str, object]]:
     project_score_scale = _resolve_project_score_scale_max(project)
-    preview_limit = 8
-    calibrator = _select_calibrator_model(project) or {}
-    current_calibrator_version = str(calibrator.get("calibrator_version") or "")
     submissions = [s for s in load_submissions() if str(s.get("project_id") or "") == project_id]
     submissions_by_id = {
         str(item.get("id") or ""): item for item in submissions if str(item.get("id") or "").strip()
@@ -9602,6 +9598,46 @@ def _build_governance_score_preview(
             )
         ]
     )
+    comparable_rows: List[Dict[str, object]] = []
+    for submission_id, qt_row in latest_qingtian.items():
+        submission = submissions_by_id.get(submission_id)
+        stored_report = latest_reports.get(submission_id)
+        if not isinstance(submission, dict) or not isinstance(stored_report, dict):
+            continue
+        qt_total_score = _resolve_qingtian_total_score_100(
+            qt_row,
+            default_score_scale_max=project_score_scale,
+        )
+        if qt_total_score is None:
+            continue
+        comparable_rows.append(
+            {
+                "submission_id": submission_id,
+                "submission": submission,
+                "stored_report": stored_report,
+                "qingtian_row": qt_row,
+                "qt_total_score": round(float(qt_total_score), 2),
+            }
+        )
+    return sorted(
+        comparable_rows,
+        key=lambda item: (
+            str(((item.get("qingtian_row") or {}).get("created_at") or "")),
+            str(item.get("submission_id") or ""),
+        ),
+        reverse=True,
+    )
+
+
+def _build_governance_score_preview(
+    project_id: str,
+    project: Dict[str, object],
+    artifact_impacts: List[Dict[str, object]],
+) -> Dict[str, object]:
+    preview_limit = 8
+    comparable_rows = _list_governance_comparable_submission_snapshots(project_id, project)
+    calibrator = _select_calibrator_model(project) or {}
+    current_calibrator_version = str(calibrator.get("calibrator_version") or "")
     requires_rule_rescore = any(
         bool(item.get("changed_since_latest_snapshot"))
         for item in artifact_impacts
@@ -9615,25 +9651,24 @@ def _build_governance_score_preview(
     )
 
     all_rows: List[Dict[str, object]] = []
-    sorted_qingtian = sorted(
-        latest_qingtian.items(),
-        key=lambda item: (
-            str((item[1] or {}).get("created_at") or ""),
-            str(item[0] or ""),
-        ),
-        reverse=True,
-    )
-    for submission_id, qt_row in sorted_qingtian:
-        submission = submissions_by_id.get(submission_id)
-        stored_report = latest_reports.get(submission_id)
-        if not isinstance(submission, dict) or not isinstance(stored_report, dict):
-            continue
-        qt_total_score = _resolve_qingtian_total_score_100(
-            qt_row,
-            default_score_scale_max=project_score_scale,
+    for candidate in comparable_rows:
+        submission_id = str(candidate.get("submission_id") or "")
+        submission = candidate.get("submission")
+        stored_report = candidate.get("stored_report")
+        qt_row = candidate.get("qingtian_row")
+        qt_total_score = _to_float_or_none(candidate.get("qt_total_score"))
+        rule_total_score = (
+            _to_float_or_none(stored_report.get("rule_total_score"))
+            if isinstance(stored_report, dict)
+            else None
         )
-        rule_total_score = _to_float_or_none(stored_report.get("rule_total_score"))
-        if qt_total_score is None or rule_total_score is None:
+        if (
+            qt_total_score is None
+            or rule_total_score is None
+            or not isinstance(submission, dict)
+            or not isinstance(stored_report, dict)
+            or not isinstance(qt_row, dict)
+        ):
             continue
         preview_report = copy.deepcopy(stored_report)
         preview_submission = dict(submission)
@@ -9746,6 +9781,264 @@ def _build_governance_score_preview(
         "worsened_row_count": worsened_row_count,
         "rows": all_rows[:preview_limit],
     }
+
+
+def _extract_rule_dimension_score_map(report: Dict[str, object]) -> Dict[str, float]:
+    scores: Dict[str, float] = {}
+    rule_dim_scores = (
+        report.get("rule_dim_scores") if isinstance(report.get("rule_dim_scores"), dict) else {}
+    )
+    for dim_id, payload in rule_dim_scores.items():
+        normalized_dim_id = _normalize_dimension_id(str(dim_id))
+        if not normalized_dim_id or not isinstance(payload, dict):
+            continue
+        score_value = _to_float_or_none(payload.get("dim_score"))
+        if score_value is None:
+            continue
+        scores[normalized_dim_id] = round(float(score_value), 2)
+    if scores:
+        return scores
+    dimension_scores = (
+        report.get("dimension_scores") if isinstance(report.get("dimension_scores"), dict) else {}
+    )
+    for dim_id, payload in dimension_scores.items():
+        normalized_dim_id = _normalize_dimension_id(str(dim_id))
+        if not normalized_dim_id or not isinstance(payload, dict):
+            continue
+        score_value = _to_float_or_none(payload.get("score"))
+        if score_value is None:
+            continue
+        scores[normalized_dim_id] = round(float(score_value), 2)
+    return scores
+
+
+def _build_submission_sandbox_report(
+    *,
+    project_id: str,
+    project: Dict[str, object],
+    submission: Dict[str, object],
+    config: object,
+    multipliers: Dict[str, float],
+    profile_snapshot: Optional[Dict[str, object]],
+    scoring_engine_version: str,
+    anchors: Optional[List[Dict[str, object]]] = None,
+    requirements: Optional[List[Dict[str, object]]] = None,
+    material_quality_snapshot: Optional[Dict[str, object]] = None,
+    material_knowledge_snapshot: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    text = str(submission.get("text") or "")
+    if not text.strip():
+        raise ValueError("施组文本为空，无法执行沙箱重评分。")
+    report, _ = _score_submission_for_project(
+        submission_id=str(submission.get("id") or "sandbox"),
+        text=text,
+        project_id=project_id,
+        project=project,
+        config=config,
+        multipliers=multipliers,
+        profile_snapshot=profile_snapshot,
+        scoring_engine_version=scoring_engine_version,
+        anchors=anchors,
+        requirements=requirements,
+        material_quality_snapshot=material_quality_snapshot,
+        material_knowledge_snapshot=material_knowledge_snapshot,
+    )
+    _apply_evolution_total_scale(project_id, report)
+    return report
+
+
+def _build_governance_sandbox_preview(
+    project_id: str,
+    project: Dict[str, object],
+) -> Dict[str, object]:
+    preview_limit = 3
+    comparable_rows = _list_governance_comparable_submission_snapshots(project_id, project)
+    scoring_engine_version = str(project.get("scoring_engine_version_locked") or "v1")
+    engine_version = _determine_engine_version(project, scoring_engine_version)
+    base_payload: Dict[str, object] = {
+        "scope": "sandbox_rescore_preview",
+        "matched_submission_count": len(comparable_rows),
+        "preview_limit": preview_limit,
+        "scoring_engine_version": scoring_engine_version,
+        "engine_version": engine_version,
+        "weights_source": "",
+        "expert_profile_id": None,
+        "constraints_ready": True,
+        "constraints_warning": "",
+        "executed_row_count": 0,
+        "failed_row_count": 0,
+        "dimension_preview_supported": True,
+        "avg_abs_delta_stored": None,
+        "avg_abs_delta_sandbox": None,
+        "avg_abs_delta_improvement": None,
+        "improved_row_count": 0,
+        "worsened_row_count": 0,
+        "rows": [],
+        "errors": [],
+    }
+    if not comparable_rows:
+        return base_payload
+
+    multipliers, profile_snapshot, _ = _resolve_project_scoring_context(project_id)
+    base_payload["weights_source"] = _infer_weights_source(
+        project_id,
+        profile_snapshot,
+        project=project,
+    )
+    base_payload["expert_profile_id"] = (
+        str(profile_snapshot.get("id") or "") if isinstance(profile_snapshot, dict) else None
+    )
+    config = load_config()
+    material_knowledge_snapshot = _build_material_knowledge_profile(project_id)
+    material_quality_snapshot = _build_material_quality_snapshot(project_id)
+    anchors: Optional[List[Dict[str, object]]] = None
+    requirements: Optional[List[Dict[str, object]]] = None
+    if engine_version == "v2":
+        stored_anchors = [
+            a for a in load_project_anchors() if str(a.get("project_id") or "") == project_id
+        ]
+        stored_requirements = [
+            r for r in load_project_requirements() if str(r.get("project_id") or "") == project_id
+        ]
+        if stored_anchors and stored_requirements:
+            anchors = stored_anchors
+            requirements = stored_requirements
+        else:
+            base_payload["constraints_ready"] = False
+            base_payload[
+                "constraints_warning"
+            ] = "当前项目尚无已固化的目录锚点/要求约束，沙箱重评分暂不执行，以避免治理面板触发写入式重建。"
+            return base_payload
+
+    rows: List[Dict[str, object]] = []
+    errors: List[Dict[str, object]] = []
+    for candidate in comparable_rows[:preview_limit]:
+        submission_id = str(candidate.get("submission_id") or "")
+        submission = candidate.get("submission")
+        stored_report = candidate.get("stored_report")
+        qt_total_score = _to_float_or_none(candidate.get("qt_total_score"))
+        if (
+            not isinstance(submission, dict)
+            or not isinstance(stored_report, dict)
+            or qt_total_score is None
+        ):
+            continue
+        try:
+            sandbox_report = _build_submission_sandbox_report(
+                project_id=project_id,
+                project=project,
+                submission=submission,
+                config=config,
+                multipliers=multipliers,
+                profile_snapshot=profile_snapshot,
+                scoring_engine_version=scoring_engine_version,
+                anchors=anchors,
+                requirements=requirements,
+                material_quality_snapshot=material_quality_snapshot,
+                material_knowledge_snapshot=material_knowledge_snapshot,
+            )
+        except Exception as exc:
+            errors.append(
+                {
+                    "submission_id": submission_id,
+                    "filename": str(submission.get("filename") or ""),
+                    "message": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            continue
+
+        stored_rule_total_score = _to_float_or_none(stored_report.get("rule_total_score"))
+        stored_pred_total_score = _to_float_or_none(stored_report.get("pred_total_score"))
+        stored_total_score = (
+            stored_pred_total_score
+            if stored_pred_total_score is not None
+            else stored_rule_total_score
+        )
+        sandbox_rule_total_score = _to_float_or_none(sandbox_report.get("rule_total_score"))
+        sandbox_pred_total_score = _to_float_or_none(sandbox_report.get("pred_total_score"))
+        sandbox_total_score = (
+            sandbox_pred_total_score
+            if sandbox_pred_total_score is not None
+            else sandbox_rule_total_score
+        )
+        stored_abs_delta = (
+            round(abs(float(stored_total_score) - float(qt_total_score)), 2)
+            if stored_total_score is not None
+            else None
+        )
+        sandbox_abs_delta = (
+            round(abs(float(sandbox_total_score) - float(qt_total_score)), 2)
+            if sandbox_total_score is not None
+            else None
+        )
+        abs_delta_improvement = (
+            round(float(stored_abs_delta) - float(sandbox_abs_delta), 2)
+            if stored_abs_delta is not None and sandbox_abs_delta is not None
+            else None
+        )
+        stored_dim_scores = _extract_rule_dimension_score_map(stored_report)
+        sandbox_dim_scores = _extract_rule_dimension_score_map(sandbox_report)
+        changed_dimensions: List[Dict[str, object]] = []
+        for dim_id in sorted(set(stored_dim_scores) | set(sandbox_dim_scores)):
+            stored_dim_score = float(stored_dim_scores.get(dim_id, 0.0))
+            sandbox_dim_score = float(sandbox_dim_scores.get(dim_id, 0.0))
+            delta_value = round(sandbox_dim_score - stored_dim_score, 2)
+            if abs(delta_value) <= 0.01:
+                continue
+            changed_dimensions.append(
+                {
+                    "dimension_id": dim_id,
+                    "stored_rule_score": round(stored_dim_score, 2),
+                    "sandbox_rule_score": round(sandbox_dim_score, 2),
+                    "delta": delta_value,
+                }
+            )
+        changed_dimensions.sort(
+            key=lambda item: abs(float(item.get("delta") or 0.0)),
+            reverse=True,
+        )
+        rows.append(
+            {
+                "submission_id": submission_id,
+                "filename": str(submission.get("filename") or ""),
+                "stored_total_score": (
+                    round(float(stored_total_score), 2) if stored_total_score is not None else None
+                ),
+                "sandbox_total_score": (
+                    round(float(sandbox_total_score), 2)
+                    if sandbox_total_score is not None
+                    else None
+                ),
+                "qt_total_score": round(float(qt_total_score), 2),
+                "stored_abs_delta_100": stored_abs_delta,
+                "sandbox_abs_delta_100": sandbox_abs_delta,
+                "abs_delta_improvement": abs_delta_improvement,
+                "changed_dimension_count": len(changed_dimensions),
+                "top_changed_dimensions": changed_dimensions[:4],
+                "sandbox_scoring_status": str(sandbox_report.get("scoring_status") or ""),
+            }
+        )
+
+    def _avg_numeric(key: str) -> Optional[float]:
+        values = [float(row.get(key)) for row in rows if isinstance(row.get(key), (int, float))]
+        if not values:
+            return None
+        return round(sum(values) / len(values), 2)
+
+    base_payload["executed_row_count"] = len(rows)
+    base_payload["failed_row_count"] = len(errors)
+    base_payload["avg_abs_delta_stored"] = _avg_numeric("stored_abs_delta_100")
+    base_payload["avg_abs_delta_sandbox"] = _avg_numeric("sandbox_abs_delta_100")
+    base_payload["avg_abs_delta_improvement"] = _avg_numeric("abs_delta_improvement")
+    base_payload["improved_row_count"] = sum(
+        1 for row in rows if (_to_float_or_none(row.get("abs_delta_improvement")) or 0.0) > 0.01
+    )
+    base_payload["worsened_row_count"] = sum(
+        1 for row in rows if (_to_float_or_none(row.get("abs_delta_improvement")) or 0.0) < -0.01
+    )
+    base_payload["rows"] = rows
+    base_payload["errors"] = errors[:6]
+    return base_payload
 
 
 def _build_feedback_governance_report(
@@ -9947,6 +10240,7 @@ def _build_feedback_governance_report(
         )
     artifact_impacts = _build_governance_artifact_impacts(project_id)
     score_preview = _build_governance_score_preview(project_id, project, artifact_impacts)
+    sandbox_preview = _build_governance_sandbox_preview(project_id, project)
 
     recommendations: List[str] = []
     blocked_count = int(summary_guardrail.get("blocked_count") or 0)
@@ -9989,6 +10283,29 @@ def _build_feedback_governance_report(
     if bool(score_preview.get("requires_rule_rescore")):
         recommendations.append(
             "评分偏差试算当前仅覆盖校准总分层；由于权重、画像或进化逻辑已变化，维度分与完整总分仍需重评分后确认。"
+        )
+    sandbox_executed_count = int(sandbox_preview.get("executed_row_count") or 0)
+    sandbox_avg_abs_delta_stored = _to_float_or_none(sandbox_preview.get("avg_abs_delta_stored"))
+    sandbox_avg_abs_delta = _to_float_or_none(sandbox_preview.get("avg_abs_delta_sandbox"))
+    sandbox_warning = str(sandbox_preview.get("constraints_warning") or "").strip()
+    if sandbox_warning:
+        recommendations.append(sandbox_warning)
+    elif (
+        sandbox_executed_count > 0
+        and sandbox_avg_abs_delta_stored is not None
+        and sandbox_avg_abs_delta is not None
+    ):
+        if sandbox_avg_abs_delta + 1e-6 < sandbox_avg_abs_delta_stored:
+            recommendations.append(
+                f"沙箱重评分显示当前完整体系可将平均绝对偏差从 {sandbox_avg_abs_delta_stored:.2f} 分收敛到 {sandbox_avg_abs_delta:.2f} 分，说明权重/画像/进化逻辑调整具有正向作用。"
+            )
+        elif sandbox_avg_abs_delta > sandbox_avg_abs_delta_stored + 1e-6:
+            recommendations.append(
+                f"沙箱重评分显示当前完整体系可能使平均绝对偏差从 {sandbox_avg_abs_delta_stored:.2f} 分扩大到 {sandbox_avg_abs_delta:.2f} 分，建议暂缓落库并先检查治理动作影响。"
+            )
+    if int(sandbox_preview.get("failed_row_count") or 0) > 0:
+        recommendations.append(
+            "部分沙箱重评分样本执行失败，请先查看错误明细后再决定是否继续治理操作。"
         )
 
     return {
@@ -10037,6 +10354,7 @@ def _build_feedback_governance_report(
         "version_history": version_history,
         "artifact_impacts": artifact_impacts,
         "score_preview": score_preview,
+        "sandbox_preview": sandbox_preview,
         "recommendations": recommendations[:10],
     }
 
@@ -26590,6 +26908,9 @@ def index(
           const artifactImpacts = Array.isArray(data.artifact_impacts) ? data.artifact_impacts : [];
           const scorePreview = (data.score_preview && typeof data.score_preview === 'object') ? data.score_preview : {};
           const scorePreviewRows = Array.isArray(scorePreview.rows) ? scorePreview.rows : [];
+          const sandboxPreview = (data.sandbox_preview && typeof data.sandbox_preview === 'object') ? data.sandbox_preview : {};
+          const sandboxRows = Array.isArray(sandboxPreview.rows) ? sandboxPreview.rows : [];
+          const sandboxErrors = Array.isArray(sandboxPreview.errors) ? sandboxPreview.errors : [];
           const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
           let html = '<strong>闭环治理面板（异常样本 / few-shot / 回退快照）</strong>';
           if (opts.actionMessage) {
@@ -26770,6 +27091,64 @@ def index(
               html += '</table>';
             } else {
               html += '<p style="margin:6px 0;color:#64748b">当前暂无可试算的最新评分样本。</p>';
+            }
+          }
+          if (sandboxRows.length || sandboxPreview.matched_submission_count || sandboxErrors.length) {
+            const sandboxSummaryParts = [];
+            sandboxSummaryParts.push('匹配样本=' + escapeHtmlText(sandboxPreview.matched_submission_count || 0));
+            sandboxSummaryParts.push('已执行=' + escapeHtmlText(sandboxPreview.executed_row_count || 0));
+            if (sandboxPreview.scoring_engine_version) {
+              sandboxSummaryParts.push('评分引擎=' + escapeHtmlText(sandboxPreview.scoring_engine_version));
+            }
+            if (sandboxPreview.weights_source) {
+              sandboxSummaryParts.push('权重来源=' + escapeHtmlText(sandboxPreview.weights_source));
+            }
+            if (sandboxPreview.avg_abs_delta_stored != null) {
+              sandboxSummaryParts.push('已落库平均绝对偏差=' + escapeHtmlText(sandboxPreview.avg_abs_delta_stored));
+            }
+            if (sandboxPreview.avg_abs_delta_sandbox != null) {
+              sandboxSummaryParts.push('沙箱平均绝对偏差=' + escapeHtmlText(sandboxPreview.avg_abs_delta_sandbox));
+            }
+            if (sandboxPreview.avg_abs_delta_improvement != null) {
+              sandboxSummaryParts.push('平均改善值=' + escapeHtmlText(sandboxPreview.avg_abs_delta_improvement));
+            }
+            if (sandboxPreview.constraints_warning) {
+              sandboxSummaryParts.push(escapeHtmlText(sandboxPreview.constraints_warning));
+            }
+            html += '<strong>沙箱重评分对照</strong>';
+            if (sandboxSummaryParts.length) {
+              html += '<p style="margin:6px 0;color:#1f2937">' + sandboxSummaryParts.join('；') + '</p>';
+            }
+            if (sandboxRows.length) {
+              html += '<table><tr><th>施组</th><th>已落库总分</th><th>沙箱总分</th><th>青天分</th><th>已落库偏差</th><th>沙箱偏差</th><th>维度变更数</th><th>主要变化维度</th></tr>';
+              html += sandboxRows.map((row) => {
+                const changedDims = Array.isArray(row.top_changed_dimensions) ? row.top_changed_dimensions : [];
+                const changedText = changedDims.map((item) => {
+                  const dimId = String((item && item.dimension_id) || '');
+                  const delta = (item && item.delta != null) ? String(item.delta) : '-';
+                  return dimId ? (dimId + ':' + delta) : '';
+                }).filter(Boolean).join('、');
+                return '<tr>'
+                  + '<td>' + escapeHtmlText(row.filename || row.submission_id || '-') + '</td>'
+                  + '<td>' + escapeHtmlText(row.stored_total_score != null ? row.stored_total_score : '-') + '</td>'
+                  + '<td>' + escapeHtmlText(row.sandbox_total_score != null ? row.sandbox_total_score : '-') + '</td>'
+                  + '<td>' + escapeHtmlText(row.qt_total_score != null ? row.qt_total_score : '-') + '</td>'
+                  + '<td>' + escapeHtmlText(row.stored_abs_delta_100 != null ? row.stored_abs_delta_100 : '-') + '</td>'
+                  + '<td>' + escapeHtmlText(row.sandbox_abs_delta_100 != null ? row.sandbox_abs_delta_100 : '-') + '</td>'
+                  + '<td>' + escapeHtmlText(row.changed_dimension_count != null ? row.changed_dimension_count : 0) + '</td>'
+                  + '<td>' + escapeHtmlText(changedText || '-') + '</td>'
+                  + '</tr>';
+              }).join('');
+              html += '</table>';
+            } else {
+              html += '<p style="margin:6px 0;color:#64748b">当前暂无可执行的沙箱重评分样本。</p>';
+            }
+            if (sandboxErrors.length) {
+              html += '<ul style="margin:6px 0 0 18px;color:#991b1b">'
+                + sandboxErrors.slice(0, 6).map((row) => (
+                  '<li>' + escapeHtmlText((row.filename || row.submission_id || '-') + '：' + (row.message || '执行失败')) + '</li>'
+                )).join('')
+                + '</ul>';
             }
           }
           if (recs.length) {

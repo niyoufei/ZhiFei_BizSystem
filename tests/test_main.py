@@ -7279,6 +7279,10 @@ class TestFeedbackGovernanceRoutes:
                     "created_at": "2026-03-15T02:00:00+00:00",
                     "rule_total_score": 70.0,
                     "pred_total_score": 72.0,
+                    "rule_dim_scores": {
+                        "09": {"dim_score": 4.0},
+                        "10": {"dim_score": 5.0},
+                    },
                 }
             ],
         ), patch(
@@ -7297,6 +7301,36 @@ class TestFeedbackGovernanceRoutes:
         ), patch(
             "app.main._apply_prediction_to_report",
             side_effect=_apply_preview,
+        ), patch(
+            "app.main._resolve_project_scoring_context",
+            return_value=(
+                {"09": 1.1},
+                {"id": "ep-1"},
+                {"id": "p1", "meta": {"score_scale_max": 100}},
+            ),
+        ), patch(
+            "app.main._infer_weights_source",
+            return_value="expert_profile",
+        ), patch(
+            "app.main.load_config",
+            return_value=MagicMock(rubric={}, lexicon={}),
+        ), patch(
+            "app.main._build_material_knowledge_profile",
+            return_value={},
+        ), patch(
+            "app.main._build_material_quality_snapshot",
+            return_value={},
+        ), patch(
+            "app.main._build_submission_sandbox_report",
+            return_value={
+                "rule_total_score": 74.0,
+                "pred_total_score": 79.0,
+                "rule_dim_scores": {
+                    "09": {"dim_score": 6.5},
+                    "10": {"dim_score": 5.0},
+                },
+                "scoring_status": "scored",
+            },
         ):
             response = client.get("/api/v1/projects/p1/feedback/governance")
 
@@ -7322,8 +7356,24 @@ class TestFeedbackGovernanceRoutes:
         assert row["stored_abs_delta_100"] == 12.0
         assert row["preview_abs_delta_100"] == 6.0
         assert row["abs_delta_improvement"] == 6.0
+        sandbox = data["sandbox_preview"]
+        assert sandbox["matched_submission_count"] == 1
+        assert sandbox["executed_row_count"] == 1
+        assert sandbox["weights_source"] == "expert_profile"
+        assert sandbox["avg_abs_delta_stored"] == 12.0
+        assert sandbox["avg_abs_delta_sandbox"] == 5.0
+        assert sandbox["avg_abs_delta_improvement"] == 7.0
+        sandbox_row = sandbox["rows"][0]
+        assert sandbox_row["sandbox_total_score"] == 79.0
+        assert sandbox_row["changed_dimension_count"] == 1
+        assert sandbox_row["top_changed_dimensions"][0]["dimension_id"] == "09"
+        assert sandbox_row["top_changed_dimensions"][0]["delta"] == 2.5
         assert any(
             "平均绝对偏差从 12.00 分收敛到 6.00 分" in item for item in data["recommendations"]
+        )
+        assert any(
+            "沙箱重评分显示当前完整体系可将平均绝对偏差从 12.00 分收敛到 5.00 分" in item
+            for item in data["recommendations"]
         )
 
     @patch("app.main._run_feedback_closed_loop_safe")
