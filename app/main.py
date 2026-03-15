@@ -183,6 +183,8 @@ from app.schemas import (
     ExpertProfileRecord,
     ExpertProfileUpdate,
     FeedbackGovernanceResponse,
+    FeedbackGovernanceVersionPreviewRequest,
+    FeedbackGovernanceVersionPreviewResponse,
     FeedbackGuardrailReviewRequest,
     FeedbackGuardrailReviewResponse,
     FewShotReviewRequest,
@@ -7063,31 +7065,7 @@ def _build_v2_report_payload(
 
 
 def _select_calibrator_model(project: Dict[str, object]) -> Optional[Dict[str, object]]:
-    models = sorted(
-        load_calibration_models(), key=lambda x: str(x.get("created_at", "")), reverse=True
-    )
-    if not models:
-        return None
-    project_id = str(project.get("id") or "")
-    locked_version = str(project.get("calibrator_version_locked") or "")
-
-    def _scope_project_id(model: Dict[str, object]) -> str:
-        return str(((model.get("train_filter") or {}).get("project_id") or "")).strip()
-
-    def _compatible(model: Dict[str, object]) -> bool:
-        # 仅允许同项目训练出的校准器生效，避免跨项目污染总分。
-        return _scope_project_id(model) == project_id
-
-    if locked_version:
-        for model in models:
-            if str(model.get("calibrator_version") or "") == locked_version:
-                return model if _compatible(model) else None
-        return None
-
-    for model in models:
-        if bool(model.get("deployed")) and _compatible(model):
-            return model
-    return None
+    return _select_calibrator_model_from_rows(project, load_calibration_models())
 
 
 def _select_deployed_patch(project_id: str) -> Optional[Dict[str, object]]:
@@ -7796,13 +7774,16 @@ def _fuse_rule_and_llm_scores(
     return round(fused, 2), round(llm_bounded, 2), blend_info
 
 
-def _apply_prediction_to_report(
+def _apply_prediction_to_report_with_model(
     report: Dict[str, object],
     *,
     submission_like: Dict[str, object],
     project: Dict[str, object],
+    model_override: Optional[Dict[str, object]] = None,
 ) -> Optional[str]:
-    model = _select_calibrator_model(project)
+    model = (
+        model_override if isinstance(model_override, dict) else _select_calibrator_model(project)
+    )
     if not model:
         report["pred_total_score"] = None
         report["llm_total_score"] = None
@@ -7874,6 +7855,19 @@ def _apply_prediction_to_report(
     report.setdefault("meta", {})
     report["meta"]["calibrator_version"] = model.get("calibrator_version")
     return str(model.get("calibrator_version") or "")
+
+
+def _apply_prediction_to_report(
+    report: Dict[str, object],
+    *,
+    submission_like: Dict[str, object],
+    project: Dict[str, object],
+) -> Optional[str]:
+    return _apply_prediction_to_report_with_model(
+        report,
+        submission_like=submission_like,
+        project=project,
+    )
 
 
 def _to_float_or_none(value: Any) -> Optional[float]:
@@ -9489,16 +9483,135 @@ def _artifact_summary_delta(
     return delta
 
 
-def _build_governance_artifact_impacts(project_id: str) -> List[Dict[str, object]]:
-    artifact_specs = [
-        ("high_score_features", HIGH_SCORE_FEATURES_PATH, lambda: load_high_score_features(), []),
-        ("evolution_reports", EVOLUTION_REPORTS_PATH, lambda: load_evolution_reports(), {}),
-        ("calibration_models", CALIBRATION_MODELS_PATH, lambda: load_calibration_models(), []),
-        ("expert_profiles", EXPERT_PROFILES_PATH, lambda: load_expert_profiles(), []),
-    ]
+def _governance_artifact_specs() -> Dict[str, Dict[str, object]]:
+    return {
+        "high_score_features": {
+            "path": HIGH_SCORE_FEATURES_PATH,
+            "loader": load_high_score_features,
+            "default_payload": [],
+        },
+        "evolution_reports": {
+            "path": EVOLUTION_REPORTS_PATH,
+            "loader": load_evolution_reports,
+            "default_payload": {},
+        },
+        "calibration_models": {
+            "path": CALIBRATION_MODELS_PATH,
+            "loader": load_calibration_models,
+            "default_payload": [],
+        },
+        "expert_profiles": {
+            "path": EXPERT_PROFILES_PATH,
+            "loader": load_expert_profiles,
+            "default_payload": [],
+        },
+    }
+
+
+def _resolve_governance_artifact_spec(artifact: str) -> Dict[str, object]:
+    key = str(artifact or "").strip()
+    spec = _governance_artifact_specs().get(key)
+    if not isinstance(spec, dict):
+        raise HTTPException(status_code=404, detail="历史版本配置不存在")
+    return spec
+
+
+def _load_governance_artifact_payload(
+    artifact: str,
+    *,
+    artifact_payload_overrides: Optional[Dict[str, object]] = None,
+) -> object:
+    if isinstance(artifact_payload_overrides, dict) and artifact in artifact_payload_overrides:
+        return copy.deepcopy(artifact_payload_overrides.get(artifact))
+    spec = _resolve_governance_artifact_spec(artifact)
+    loader = spec.get("loader")
+    if not callable(loader):
+        raise HTTPException(status_code=500, detail="治理产物加载器不可用")
+    return loader()
+
+
+def _select_calibrator_model_from_rows(
+    project: Dict[str, object],
+    rows: List[Dict[str, object]],
+) -> Optional[Dict[str, object]]:
+    models = sorted(rows, key=lambda x: str(x.get("created_at", "")), reverse=True)
+    if not models:
+        return None
+    project_id = str(project.get("id") or "")
+    locked_version = str(project.get("calibrator_version_locked") or "")
+
+    def _scope_project_id(model: Dict[str, object]) -> str:
+        return str(((model.get("train_filter") or {}).get("project_id") or "")).strip()
+
+    def _compatible(model: Dict[str, object]) -> bool:
+        return _scope_project_id(model) == project_id
+
+    if locked_version:
+        for model in models:
+            if str(model.get("calibrator_version") or "") == locked_version:
+                return model if _compatible(model) else None
+        return None
+
+    for model in models:
+        if bool(model.get("deployed")) and _compatible(model):
+            return model
+    return None
+
+
+def _resolve_project_scoring_context_for_governance(
+    project_id: str,
+    project: Dict[str, object],
+    *,
+    artifact_payload_overrides: Optional[Dict[str, object]] = None,
+) -> tuple[Dict[str, float], Optional[Dict[str, object]], str]:
+    profiles = _load_governance_artifact_payload(
+        "expert_profiles",
+        artifact_payload_overrides=artifact_payload_overrides,
+    )
+    profile = None
+    if project.get("expert_profile_id"):
+        for item in profiles if isinstance(profiles, list) else []:
+            if isinstance(item, dict) and item.get("id") == project.get("expert_profile_id"):
+                profile = item
+                break
+
+    evo_reports = _load_governance_artifact_payload(
+        "evolution_reports",
+        artifact_payload_overrides=artifact_payload_overrides,
+    )
+    project_evo = evo_reports.get(project_id) if isinstance(evo_reports, dict) else {}
+    evo_status = _evaluate_evolution_weight_status(project_id, project=project, evo=project_evo)
+    if bool(evo_status.get("usable")):
+        return dict(evo_status.get("dimension_multipliers") or {}), None, "evolution"
+    if profile and isinstance(profile.get("weights_norm"), dict):
+        multipliers = _weights_norm_to_dimension_multipliers(profile.get("weights_norm", {}))
+        return multipliers, profile, "expert_profile"
+    if bool(evo_status.get("stored")):
+        return {}, None, "evolution_stored_inactive"
+    for learning_profile in load_learning_profiles():
+        if learning_profile.get("project_id") == project_id:
+            return (
+                dict(learning_profile.get("dimension_multipliers") or {}),
+                None,
+                "learning_profile",
+            )
+    return {}, None, "default_uniform"
+
+
+def _build_governance_artifact_impacts(
+    project_id: str,
+    *,
+    artifact_payload_overrides: Optional[Dict[str, object]] = None,
+) -> List[Dict[str, object]]:
+    artifact_specs = _governance_artifact_specs()
     impacts: List[Dict[str, object]] = []
-    for artifact, path, loader, default_payload in artifact_specs:
-        current_payload = loader()
+    for artifact, spec in artifact_specs.items():
+        path = spec.get("path")
+        default_payload = copy.deepcopy(spec.get("default_payload"))
+        current_payload = _load_governance_artifact_payload(
+            artifact,
+            artifact_payload_overrides=artifact_payload_overrides,
+        )
         current_summary = _summarize_versioned_artifact_payload(
             artifact, current_payload, project_id=project_id
         )
@@ -9633,10 +9746,22 @@ def _build_governance_score_preview(
     project_id: str,
     project: Dict[str, object],
     artifact_impacts: List[Dict[str, object]],
+    *,
+    artifact_payload_overrides: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     preview_limit = 8
     comparable_rows = _list_governance_comparable_submission_snapshots(project_id, project)
-    calibrator = _select_calibrator_model(project) or {}
+    calibrator_rows = _load_governance_artifact_payload(
+        "calibration_models",
+        artifact_payload_overrides=artifact_payload_overrides,
+    )
+    calibrator = (
+        _select_calibrator_model_from_rows(
+            project,
+            calibrator_rows if isinstance(calibrator_rows, list) else [],
+        )
+        or {}
+    )
     current_calibrator_version = str(calibrator.get("calibrator_version") or "")
     requires_rule_rescore = any(
         bool(item.get("changed_since_latest_snapshot"))
@@ -9672,10 +9797,11 @@ def _build_governance_score_preview(
             continue
         preview_report = copy.deepcopy(stored_report)
         preview_submission = dict(submission)
-        _apply_prediction_to_report(
+        _apply_prediction_to_report_with_model(
             preview_report,
             submission_like=preview_submission,
             project=project,
+            model_override=calibrator if calibrator else None,
         )
         stored_pred_total_score = _to_float_or_none(stored_report.get("pred_total_score"))
         stored_total_score = (
@@ -9825,6 +9951,7 @@ def _build_submission_sandbox_report(
     requirements: Optional[List[Dict[str, object]]] = None,
     material_quality_snapshot: Optional[Dict[str, object]] = None,
     material_knowledge_snapshot: Optional[Dict[str, object]] = None,
+    calibrator_model_override: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     text = str(submission.get("text") or "")
     if not text.strip():
@@ -9843,6 +9970,14 @@ def _build_submission_sandbox_report(
         material_quality_snapshot=material_quality_snapshot,
         material_knowledge_snapshot=material_knowledge_snapshot,
     )
+    if calibrator_model_override:
+        submission_like = dict(submission)
+        _apply_prediction_to_report_with_model(
+            report,
+            submission_like=submission_like,
+            project=project,
+            model_override=calibrator_model_override,
+        )
     _apply_evolution_total_scale(project_id, report)
     return report
 
@@ -9850,6 +9985,8 @@ def _build_submission_sandbox_report(
 def _build_governance_sandbox_preview(
     project_id: str,
     project: Dict[str, object],
+    *,
+    artifact_payload_overrides: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     preview_limit = 3
     comparable_rows = _list_governance_comparable_submission_snapshots(project_id, project)
@@ -9879,12 +10016,20 @@ def _build_governance_sandbox_preview(
     if not comparable_rows:
         return base_payload
 
-    multipliers, profile_snapshot, _ = _resolve_project_scoring_context(project_id)
-    base_payload["weights_source"] = _infer_weights_source(
+    multipliers, profile_snapshot, weights_source = _resolve_project_scoring_context_for_governance(
         project_id,
-        profile_snapshot,
-        project=project,
+        project,
+        artifact_payload_overrides=artifact_payload_overrides,
     )
+    calibrator_rows = _load_governance_artifact_payload(
+        "calibration_models",
+        artifact_payload_overrides=artifact_payload_overrides,
+    )
+    calibrator_model = _select_calibrator_model_from_rows(
+        project,
+        calibrator_rows if isinstance(calibrator_rows, list) else [],
+    )
+    base_payload["weights_source"] = weights_source
     base_payload["expert_profile_id"] = (
         str(profile_snapshot.get("id") or "") if isinstance(profile_snapshot, dict) else None
     )
@@ -9936,6 +10081,7 @@ def _build_governance_sandbox_preview(
                 requirements=requirements,
                 material_quality_snapshot=material_quality_snapshot,
                 material_knowledge_snapshot=material_knowledge_snapshot,
+                calibrator_model_override=calibrator_model,
             )
         except Exception as exc:
             errors.append(
@@ -10044,6 +10190,8 @@ def _build_governance_sandbox_preview(
 def _build_feedback_governance_report(
     project_id: str,
     project: Dict[str, object],
+    *,
+    artifact_payload_overrides: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     project_score_scale = _resolve_project_score_scale_max(project)
     all_rows = _list_project_ground_truth_records(project_id, include_guardrail_blocked=True)
@@ -10238,9 +10386,21 @@ def _build_feedback_governance_report(
                 ],
             }
         )
-    artifact_impacts = _build_governance_artifact_impacts(project_id)
-    score_preview = _build_governance_score_preview(project_id, project, artifact_impacts)
-    sandbox_preview = _build_governance_sandbox_preview(project_id, project)
+    artifact_impacts = _build_governance_artifact_impacts(
+        project_id,
+        artifact_payload_overrides=artifact_payload_overrides,
+    )
+    score_preview = _build_governance_score_preview(
+        project_id,
+        project,
+        artifact_impacts,
+        artifact_payload_overrides=artifact_payload_overrides,
+    )
+    sandbox_preview = _build_governance_sandbox_preview(
+        project_id,
+        project,
+        artifact_payload_overrides=artifact_payload_overrides,
+    )
 
     recommendations: List[str] = []
     blocked_count = int(summary_guardrail.get("blocked_count") or 0)
@@ -10356,6 +10516,76 @@ def _build_feedback_governance_report(
         "score_preview": score_preview,
         "sandbox_preview": sandbox_preview,
         "recommendations": recommendations[:10],
+    }
+
+
+def _build_feedback_governance_version_preview(
+    project_id: str,
+    project: Dict[str, object],
+    *,
+    artifact: str,
+    version_id: str,
+) -> Dict[str, object]:
+    spec = _resolve_governance_artifact_spec(artifact)
+    path = spec.get("path")
+    default_payload = copy.deepcopy(spec.get("default_payload"))
+    current_payload = _load_governance_artifact_payload(artifact)
+    preview_payload = load_json_version(path, version_id, default_payload)
+    current_summary = _summarize_versioned_artifact_payload(
+        artifact,
+        current_payload,
+        project_id=project_id,
+    )
+    preview_summary = _summarize_versioned_artifact_payload(
+        artifact,
+        preview_payload,
+        project_id=project_id,
+    )
+    versions = list_json_versions(path)
+    version_meta = next(
+        (row for row in versions if str(row.get("version_id") or "") == str(version_id)),
+        {},
+    )
+    governance_payload = _build_feedback_governance_report(
+        project_id,
+        project,
+        artifact_payload_overrides={artifact: preview_payload},
+    )
+    delta_vs_current = _artifact_summary_delta(preview_summary, current_summary)
+    matches_current = _artifact_payload_fingerprint(
+        current_payload
+    ) == _artifact_payload_fingerprint(preview_payload)
+    recommendations: List[str] = []
+    if matches_current:
+        recommendations.append("所选历史版本与当前在线产物一致，本次只读预演不会引入变化。")
+    else:
+        recommendations.append(
+            f"当前为只读预演：若把 {artifact} 切换到版本 {version_id}，下方治理面板将展示对应的评分和治理影响。"
+        )
+    sandbox_preview = (
+        governance_payload.get("sandbox_preview")
+        if isinstance(governance_payload.get("sandbox_preview"), dict)
+        else {}
+    )
+    if int(_to_float_or_none(sandbox_preview.get("executed_row_count")) or 0) <= 0:
+        recommendations.append(
+            "本次预演未形成有效沙箱重评分样本，请结合当前版本快照和治理影响体检一起判断。"
+        )
+    if bool(sandbox_preview.get("constraints_warning")):
+        recommendations.append(str(sandbox_preview.get("constraints_warning") or ""))
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "artifact": artifact,
+        "version_id": version_id,
+        "version_created_at": str(version_meta.get("created_at") or "") or None,
+        "generated_at": _now_iso(),
+        "current_summary": current_summary,
+        "preview_summary": preview_summary,
+        "delta_vs_current": delta_vs_current,
+        "matches_current": matches_current,
+        "governance": governance_payload,
+        "recommendations": recommendations[:8],
     }
 
 
@@ -13347,6 +13577,34 @@ def get_feedback_governance(
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
     payload = _build_feedback_governance_report(project_id, project)
     return FeedbackGovernanceResponse(**payload)
+
+
+@router.post(
+    "/projects/{project_id}/feedback/governance/version_preview",
+    response_model=FeedbackGovernanceVersionPreviewResponse,
+    tags=["自我学习与进化"],
+    responses={**RESPONSES_401, **RESPONSES_404},
+)
+def preview_feedback_governance_version(
+    project_id: str,
+    payload: FeedbackGovernanceVersionPreviewRequest,
+    api_key: Optional[str] = Depends(verify_api_key),
+    locale: str = Depends(get_locale),
+) -> FeedbackGovernanceVersionPreviewResponse:
+    """对历史版本执行只读治理预演，不写入任何当前产物。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    try:
+        project = _find_project(project_id, projects)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    preview_payload = _build_feedback_governance_version_preview(
+        project_id,
+        project,
+        artifact=str(payload.artifact or "").strip(),
+        version_id=str(payload.version_id or "").strip(),
+    )
+    return FeedbackGovernanceVersionPreviewResponse(**preview_payload)
 
 
 @router.post(
@@ -26899,6 +27157,7 @@ def index(
           if (!el) return;
           const data = (payload && typeof payload === 'object') ? payload : {};
           const opts = (options && typeof options === 'object') ? options : {};
+          const previewMeta = (opts.previewMeta && typeof opts.previewMeta === 'object') ? opts.previewMeta : {};
           const summary = (data.summary && typeof data.summary === 'object') ? data.summary : {};
           const blockedSamples = Array.isArray(data.blocked_samples) ? data.blocked_samples : [];
           const approvedSamples = Array.isArray(data.approved_samples) ? data.approved_samples : [];
@@ -26915,6 +27174,31 @@ def index(
           let html = '<strong>闭环治理面板（异常样本 / few-shot / 回退快照）</strong>';
           if (opts.actionMessage) {
             html += '<p class="success" style="margin:6px 0">' + escapeHtmlText(String(opts.actionMessage || '')) + '</p>';
+          }
+          if (previewMeta && previewMeta.artifact) {
+            const previewRecs = Array.isArray(previewMeta.recommendations) ? previewMeta.recommendations : [];
+            const currentSummary = (previewMeta.current_summary && typeof previewMeta.current_summary === 'object') ? previewMeta.current_summary : {};
+            const previewSummary = (previewMeta.preview_summary && typeof previewMeta.preview_summary === 'object') ? previewMeta.preview_summary : {};
+            const summarizeMap = (obj) => Object.keys(obj).map((key) => {
+              const value = obj[key];
+              const rendered = (value && typeof value === 'object') ? JSON.stringify(value) : String(value);
+              return key + '=' + rendered;
+            }).join('；');
+            html += '<div style="margin:8px 0;padding:10px;border:1px solid #f59e0b;background:#fffbeb;border-radius:8px">'
+              + '<strong>只读版本预演</strong>'
+              + '<p style="margin:6px 0 0 0">产物=' + escapeHtmlText(previewMeta.artifact || '-')
+              + '；版本=' + escapeHtmlText(previewMeta.version_id || '-')
+              + '；快照时间=' + escapeHtmlText(previewMeta.version_created_at || '-')
+              + '；是否与当前一致=' + escapeHtmlText(previewMeta.matches_current ? '是' : '否') + '</p>'
+              + '<p style="margin:6px 0 0 0;color:#334155">当前摘要：' + escapeHtmlText(summarizeMap(currentSummary) || '-') + '</p>'
+              + '<p style="margin:6px 0 0 0;color:#334155">预演摘要：' + escapeHtmlText(summarizeMap(previewSummary) || '-') + '</p>'
+              + '<p style="margin:6px 0 0 0"><button type="button" class="secondary js-feedback-governance-reload-current">恢复当前治理视图</button></p>'
+              + (
+                previewRecs.length
+                  ? ('<ul style="margin:6px 0 0 18px;color:#92400e">' + previewRecs.slice(0, 5).map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('') + '</ul>')
+                  : ''
+              )
+              + '</div>';
           }
           html += '<table><tr><th>指标</th><th>值</th></tr>';
           html += '<tr><td>真实评分样本</td><td>' + escapeHtmlText(summary.ground_truth_count || 0) + '</td></tr>';
@@ -27013,6 +27297,7 @@ def index(
                         + '</option>'
                       )).join('')
                       + '</select> '
+                      + '<button type="button" class="secondary js-feedback-governance-version-preview" data-artifact="' + escapeHtmlText(row.artifact || '') + '">预演</button> '
                       + '<button type="button" class="secondary js-feedback-governance-rollback" data-artifact="' + escapeHtmlText(row.artifact || '') + '">回滚</button>'
                     )
                   : '<span style="color:#64748b">暂无快照</span>'
@@ -27204,6 +27489,11 @@ def index(
         function bindFeedbackGovernancePanelActions(projectId) {
           const panel = document.getElementById('feedbackGovernanceResult');
           if (!panel || !projectId) return;
+          panel.querySelectorAll('.js-feedback-governance-reload-current').forEach((btn) => {
+            btn.onclick = async () => {
+              await loadFeedbackGovernancePanel(projectId);
+            };
+          });
           panel.querySelectorAll('.js-feedback-guardrail-review').forEach((btn) => {
             btn.onclick = async () => {
               const recordId = String(btn.getAttribute('data-record-id') || '').trim();
@@ -27272,6 +27562,54 @@ def index(
               await loadFeedbackGovernancePanel(projectId, {
                 suppressLoading: true,
                 actionMessage: 'few-shot 样本已完成「' + actionLabel + '」登记。',
+              });
+            };
+          });
+          panel.querySelectorAll('.js-feedback-governance-version-preview').forEach((btn) => {
+            btn.onclick = async () => {
+              const artifact = String(btn.getAttribute('data-artifact') || '').trim();
+              if (!artifact) return;
+              const select = panel.querySelector('.js-feedback-version-select[data-artifact="' + artifact + '"]');
+              const versionId = select ? String(select.value || '').trim() : '';
+              if (!versionId) {
+                setResultError('feedbackGovernanceResult', '请先选择要预演的历史版本。');
+                return;
+              }
+              setResultLoading('feedbackGovernanceResult', '版本预演中...');
+              let res;
+              let data = {};
+              try {
+                res = await fetch('/api/v1/projects/' + encodeURIComponent(projectId) + '/feedback/governance/version_preview', {
+                  method: 'POST',
+                  headers: apiHeaders(true),
+                  body: JSON.stringify({ artifact: artifact, version_id: versionId }),
+                });
+                data = await res.json().catch(() => ({}));
+              } catch (err) {
+                setResultError('feedbackGovernanceResult', '版本预演失败：' + String((err && err.message) || err || '网络异常'));
+                return;
+              }
+              showJson('output', formatApiOutput(res, data));
+              if (!res.ok) {
+                const detail = (data && data.detail) ? String(data.detail) : ('HTTP ' + String(res.status || 0));
+                setResultError('feedbackGovernanceResult', '版本预演失败：' + detail);
+                return;
+              }
+              const governance = (data.governance && typeof data.governance === 'object') ? data.governance : {};
+              const summary = (governance.summary && typeof governance.summary === 'object') ? governance.summary : {};
+              const blockedSamples = Array.isArray(governance.blocked_samples) ? governance.blocked_samples : [];
+              const firstWarning = blockedSamples.length && blockedSamples[0] && blockedSamples[0].warning_message
+                ? String(blockedSamples[0].warning_message)
+                : '';
+              setFeedbackGuardrailState(projectId, {
+                pending: !!summary.manual_confirmation_required,
+                manualConfirmed: false,
+                warningMessage: firstWarning,
+              });
+              renderFeedbackGovernancePanel(governance, {
+                suppressLoading: true,
+                actionMessage: '已加载只读版本预演：' + artifact + ' -> ' + versionId + '（未写入）。',
+                previewMeta: data,
               });
             };
           });

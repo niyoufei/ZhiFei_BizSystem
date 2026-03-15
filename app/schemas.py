@@ -434,6 +434,28 @@ class FeedbackGovernanceResponse(BaseModel):
     recommendations: List[str] = Field(default_factory=list)
 
 
+class FeedbackGovernanceVersionPreviewRequest(BaseModel):
+    artifact: str = Field(
+        ..., description="high_score_features|evolution_reports|calibration_models|expert_profiles"
+    )
+    version_id: str = Field(..., description="要只读预演的历史版本ID")
+
+
+class FeedbackGovernanceVersionPreviewResponse(BaseModel):
+    ok: bool
+    project_id: str
+    artifact: str
+    version_id: str
+    version_created_at: Optional[str] = None
+    generated_at: str
+    current_summary: Dict[str, Any] = Field(default_factory=dict)
+    preview_summary: Dict[str, Any] = Field(default_factory=dict)
+    delta_vs_current: Dict[str, Any] = Field(default_factory=dict)
+    matches_current: bool = False
+    governance: Dict[str, Any] = Field(default_factory=dict)
+    recommendations: List[str] = Field(default_factory=list)
+
+
 class FeedbackGuardrailReviewRequest(BaseModel):
     action: str = Field(..., description="approve|reject|reset")
     note: Optional[str] = Field(None, description="人工审核备注")
