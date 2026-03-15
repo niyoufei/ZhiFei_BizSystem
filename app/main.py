@@ -182,6 +182,7 @@ from app.schemas import (
     EvolutionReport,
     ExpertProfileRecord,
     ExpertProfileUpdate,
+    FeedbackGovernanceActionPreviewResponse,
     FeedbackGovernanceResponse,
     FeedbackGovernanceVersionPreviewRequest,
     FeedbackGovernanceVersionPreviewResponse,
@@ -8893,8 +8894,10 @@ def _list_project_ground_truth_records(
     project_id: str,
     *,
     include_guardrail_blocked: bool = False,
+    rows_override: Optional[List[Dict[str, object]]] = None,
 ) -> List[Dict[str, object]]:
-    rows = [r for r in load_ground_truth() if str(r.get("project_id") or "") == project_id]
+    source_rows = rows_override if isinstance(rows_override, list) else load_ground_truth()
+    rows = [r for r in source_rows if str(r.get("project_id") or "") == project_id]
     if include_guardrail_blocked:
         return rows
     return [row for row in rows if not _feedback_guardrail_is_blocked(row)]
@@ -8904,6 +8907,7 @@ def _collect_blocked_ground_truth_guardrails(
     project_id: str,
     *,
     record_ids: Optional[List[str]] = None,
+    rows_override: Optional[List[Dict[str, object]]] = None,
 ) -> List[Dict[str, object]]:
     target_ids = {
         str(record_id or "").strip()
@@ -8911,7 +8915,11 @@ def _collect_blocked_ground_truth_guardrails(
         if str(record_id or "").strip()
     }
     blocked_rows: List[Dict[str, object]] = []
-    for row in _list_project_ground_truth_records(project_id, include_guardrail_blocked=True):
+    for row in _list_project_ground_truth_records(
+        project_id,
+        include_guardrail_blocked=True,
+        rows_override=rows_override,
+    ):
         row_id = str(row.get("id") or "").strip()
         if target_ids and row_id not in target_ids:
             continue
@@ -8931,8 +8939,13 @@ def _summarize_project_feedback_guardrail(
     project_id: str,
     *,
     record_ids: Optional[List[str]] = None,
+    rows_override: Optional[List[Dict[str, object]]] = None,
 ) -> Dict[str, object]:
-    blocked_rows = _collect_blocked_ground_truth_guardrails(project_id, record_ids=record_ids)
+    blocked_rows = _collect_blocked_ground_truth_guardrails(
+        project_id,
+        record_ids=record_ids,
+        rows_override=rows_override,
+    )
     if not blocked_rows:
         return {
             "blocked": False,
@@ -9680,6 +9693,8 @@ def _resolve_qingtian_total_score_100(
 def _list_governance_comparable_submission_snapshots(
     project_id: str,
     project: Dict[str, object],
+    *,
+    ground_truth_rows_override: Optional[List[Dict[str, object]]] = None,
 ) -> List[Dict[str, object]]:
     project_score_scale = _resolve_project_score_scale_max(project)
     submissions = [s for s in load_submissions() if str(s.get("project_id") or "") == project_id]
@@ -9696,7 +9711,11 @@ def _list_governance_comparable_submission_snapshots(
     )
     blocked_gt_ids = {
         str(row.get("id") or "").strip()
-        for row in _list_project_ground_truth_records(project_id, include_guardrail_blocked=True)
+        for row in _list_project_ground_truth_records(
+            project_id,
+            include_guardrail_blocked=True,
+            rows_override=ground_truth_rows_override,
+        )
         if _feedback_guardrail_is_blocked(row)
     }
     latest_qingtian = _latest_records_by_submission(
@@ -9748,9 +9767,14 @@ def _build_governance_score_preview(
     artifact_impacts: List[Dict[str, object]],
     *,
     artifact_payload_overrides: Optional[Dict[str, object]] = None,
+    ground_truth_rows_override: Optional[List[Dict[str, object]]] = None,
 ) -> Dict[str, object]:
     preview_limit = 8
-    comparable_rows = _list_governance_comparable_submission_snapshots(project_id, project)
+    comparable_rows = _list_governance_comparable_submission_snapshots(
+        project_id,
+        project,
+        ground_truth_rows_override=ground_truth_rows_override,
+    )
     calibrator_rows = _load_governance_artifact_payload(
         "calibration_models",
         artifact_payload_overrides=artifact_payload_overrides,
@@ -9987,9 +10011,14 @@ def _build_governance_sandbox_preview(
     project: Dict[str, object],
     *,
     artifact_payload_overrides: Optional[Dict[str, object]] = None,
+    ground_truth_rows_override: Optional[List[Dict[str, object]]] = None,
 ) -> Dict[str, object]:
     preview_limit = 3
-    comparable_rows = _list_governance_comparable_submission_snapshots(project_id, project)
+    comparable_rows = _list_governance_comparable_submission_snapshots(
+        project_id,
+        project,
+        ground_truth_rows_override=ground_truth_rows_override,
+    )
     scoring_engine_version = str(project.get("scoring_engine_version_locked") or "v1")
     engine_version = _determine_engine_version(project, scoring_engine_version)
     base_payload: Dict[str, object] = {
@@ -10192,12 +10221,26 @@ def _build_feedback_governance_report(
     project: Dict[str, object],
     *,
     artifact_payload_overrides: Optional[Dict[str, object]] = None,
+    ground_truth_rows_override: Optional[List[Dict[str, object]]] = None,
 ) -> Dict[str, object]:
     project_score_scale = _resolve_project_score_scale_max(project)
-    all_rows = _list_project_ground_truth_records(project_id, include_guardrail_blocked=True)
-    active_rows = _list_project_ground_truth_records(project_id)
-    blocked_rows = _collect_blocked_ground_truth_guardrails(project_id)
-    summary_guardrail = _summarize_project_feedback_guardrail(project_id)
+    all_rows = _list_project_ground_truth_records(
+        project_id,
+        include_guardrail_blocked=True,
+        rows_override=ground_truth_rows_override,
+    )
+    active_rows = _list_project_ground_truth_records(
+        project_id,
+        rows_override=ground_truth_rows_override,
+    )
+    blocked_rows = _collect_blocked_ground_truth_guardrails(
+        project_id,
+        rows_override=ground_truth_rows_override,
+    )
+    summary_guardrail = _summarize_project_feedback_guardrail(
+        project_id,
+        rows_override=ground_truth_rows_override,
+    )
     approved_extreme_count = 0
     rejected_extreme_count = 0
     pending_extreme_count = 0
@@ -10395,11 +10438,13 @@ def _build_feedback_governance_report(
         project,
         artifact_impacts,
         artifact_payload_overrides=artifact_payload_overrides,
+        ground_truth_rows_override=ground_truth_rows_override,
     )
     sandbox_preview = _build_governance_sandbox_preview(
         project_id,
         project,
         artifact_payload_overrides=artifact_payload_overrides,
+        ground_truth_rows_override=ground_truth_rows_override,
     )
 
     recommendations: List[str] = []
@@ -10585,6 +10630,103 @@ def _build_feedback_governance_version_preview(
         "delta_vs_current": delta_vs_current,
         "matches_current": matches_current,
         "governance": governance_payload,
+        "recommendations": recommendations[:8],
+    }
+
+
+def _build_feedback_governance_action_preview(
+    project_id: str,
+    project: Dict[str, object],
+    *,
+    record_id: str,
+    preview_type: str,
+    action: str,
+    note: str,
+    rerun_closed_loop: bool = False,
+) -> Dict[str, object]:
+    records = copy.deepcopy(load_ground_truth())
+    target_record = next(
+        (
+            row
+            for row in records
+            if str(row.get("project_id") or "") == str(project_id)
+            and str(row.get("id") or "") == str(record_id)
+        ),
+        None,
+    )
+    if target_record is None:
+        raise HTTPException(status_code=404, detail="真实评标记录不存在")
+
+    action_text = str(action or "").strip().lower()
+    note_text = str(note or "").strip()
+    if preview_type == "guardrail":
+        current_state = _extract_feedback_guardrail(target_record)
+        preview_state = _apply_feedback_guardrail_review(
+            target_record,
+            action=action_text,
+            note=note_text,
+        )
+        target_record["feedback_guardrail"] = preview_state
+        preview_kind = "guardrail"
+    elif preview_type == "few_shot":
+        current_state = _normalize_few_shot_distillation_state(
+            target_record.get("few_shot_distillation")
+        )
+        preview_state = _apply_few_shot_review(
+            target_record,
+            action=action_text,
+            note=note_text,
+        )
+        target_record["few_shot_distillation"] = preview_state
+        preview_kind = "few_shot"
+    else:
+        raise HTTPException(status_code=422, detail="preview_type 仅支持 guardrail 或 few_shot")
+
+    governance = _build_feedback_governance_report(
+        project_id,
+        project,
+        ground_truth_rows_override=records,
+    )
+    recommendations: List[str] = []
+    if preview_kind == "guardrail":
+        if action_text == "approve":
+            recommendations.append(
+                "本次仅为只读预演：正式提交前不会执行真实闭环，也不会写入权重、校准器或 few-shot 特征。"
+            )
+            if bool(rerun_closed_loop):
+                recommendations.append(
+                    "即使你勾选了重跑闭环，本次预演也只展示放行后的治理状态；正式执行后才会触发学习进化。"
+                )
+        else:
+            recommendations.append("极端偏差审核预演只会改变治理状态，不会直接改写当前评分产物。")
+    else:
+        recommendations.append(
+            "few-shot 采纳预演只改变治理登记状态，不会直接改写当前 high_score_features；如需评分变化，仍需正式闭环刷新。"
+        )
+    score_preview = governance.get("score_preview") if isinstance(governance, dict) else {}
+    sandbox_preview = governance.get("sandbox_preview") if isinstance(governance, dict) else {}
+    if (
+        isinstance(score_preview, dict)
+        and int(score_preview.get("matched_submission_count") or 0) <= 0
+    ):
+        recommendations.append(
+            "当前预演没有关联到可试算的评分样本，建议结合治理摘要与版本快照一起判断。"
+        )
+    if (
+        isinstance(sandbox_preview, dict)
+        and str(sandbox_preview.get("constraints_warning") or "").strip()
+    ):
+        recommendations.append(str(sandbox_preview.get("constraints_warning") or ""))
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "record_id": record_id,
+        "preview_type": preview_kind,
+        "requested_action": action_text,
+        "generated_at": _now_iso(),
+        "current_state": current_state,
+        "preview_state": preview_state,
+        "governance": governance,
         "recommendations": recommendations[:8],
     }
 
@@ -13608,6 +13750,38 @@ def preview_feedback_governance_version(
 
 
 @router.post(
+    "/projects/{project_id}/feedback/governance/guardrail/{record_id}/preview",
+    response_model=FeedbackGovernanceActionPreviewResponse,
+    tags=["自我学习与进化"],
+    responses={**RESPONSES_401, **RESPONSES_404, **RESPONSES_422},
+)
+def preview_feedback_guardrail_review(
+    project_id: str,
+    record_id: str,
+    payload: FeedbackGuardrailReviewRequest,
+    api_key: Optional[str] = Depends(verify_api_key),
+    locale: str = Depends(get_locale),
+) -> FeedbackGovernanceActionPreviewResponse:
+    """只读预演极端偏差样本的人工审核动作。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    try:
+        project = _find_project(project_id, projects)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    preview_payload = _build_feedback_governance_action_preview(
+        project_id,
+        project,
+        record_id=record_id,
+        preview_type="guardrail",
+        action=str(payload.action or "").strip().lower(),
+        note=str(payload.note or "").strip(),
+        rerun_closed_loop=bool(payload.rerun_closed_loop),
+    )
+    return FeedbackGovernanceActionPreviewResponse(**preview_payload)
+
+
+@router.post(
     "/projects/{project_id}/feedback/governance/guardrail/{record_id}/review",
     response_model=FeedbackGuardrailReviewResponse,
     tags=["自我学习与进化"],
@@ -13674,6 +13848,37 @@ def review_feedback_guardrail(
         feedback_closed_loop=closed_loop,
         updated_at=str(updated_record.get("updated_at") or _now_iso()),
     )
+
+
+@router.post(
+    "/projects/{project_id}/feedback/governance/few_shot/{record_id}/preview",
+    response_model=FeedbackGovernanceActionPreviewResponse,
+    tags=["自我学习与进化"],
+    responses={**RESPONSES_401, **RESPONSES_404, **RESPONSES_422},
+)
+def preview_feedback_few_shot_review(
+    project_id: str,
+    record_id: str,
+    payload: FewShotReviewRequest,
+    api_key: Optional[str] = Depends(verify_api_key),
+    locale: str = Depends(get_locale),
+) -> FeedbackGovernanceActionPreviewResponse:
+    """只读预演 few-shot 样本的采纳治理动作。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    try:
+        project = _find_project(project_id, projects)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    preview_payload = _build_feedback_governance_action_preview(
+        project_id,
+        project,
+        record_id=record_id,
+        preview_type="few_shot",
+        action=str(payload.action or "").strip().lower(),
+        note=str(payload.note or "").strip(),
+    )
+    return FeedbackGovernanceActionPreviewResponse(**preview_payload)
 
 
 @router.post(
@@ -27158,6 +27363,14 @@ def index(
           const data = (payload && typeof payload === 'object') ? payload : {};
           const opts = (options && typeof options === 'object') ? options : {};
           const previewMeta = (opts.previewMeta && typeof opts.previewMeta === 'object') ? opts.previewMeta : {};
+          const summarizeMap = (obj) => {
+            const source = (obj && typeof obj === 'object') ? obj : {};
+            return Object.keys(source).map((key) => {
+              const value = source[key];
+              const rendered = (value && typeof value === 'object') ? JSON.stringify(value) : String(value);
+              return key + '=' + rendered;
+            }).join('；');
+          };
           const summary = (data.summary && typeof data.summary === 'object') ? data.summary : {};
           const blockedSamples = Array.isArray(data.blocked_samples) ? data.blocked_samples : [];
           const approvedSamples = Array.isArray(data.approved_samples) ? data.approved_samples : [];
@@ -27179,11 +27392,6 @@ def index(
             const previewRecs = Array.isArray(previewMeta.recommendations) ? previewMeta.recommendations : [];
             const currentSummary = (previewMeta.current_summary && typeof previewMeta.current_summary === 'object') ? previewMeta.current_summary : {};
             const previewSummary = (previewMeta.preview_summary && typeof previewMeta.preview_summary === 'object') ? previewMeta.preview_summary : {};
-            const summarizeMap = (obj) => Object.keys(obj).map((key) => {
-              const value = obj[key];
-              const rendered = (value && typeof value === 'object') ? JSON.stringify(value) : String(value);
-              return key + '=' + rendered;
-            }).join('；');
             html += '<div style="margin:8px 0;padding:10px;border:1px solid #f59e0b;background:#fffbeb;border-radius:8px">'
               + '<strong>只读版本预演</strong>'
               + '<p style="margin:6px 0 0 0">产物=' + escapeHtmlText(previewMeta.artifact || '-')
@@ -27192,6 +27400,29 @@ def index(
               + '；是否与当前一致=' + escapeHtmlText(previewMeta.matches_current ? '是' : '否') + '</p>'
               + '<p style="margin:6px 0 0 0;color:#334155">当前摘要：' + escapeHtmlText(summarizeMap(currentSummary) || '-') + '</p>'
               + '<p style="margin:6px 0 0 0;color:#334155">预演摘要：' + escapeHtmlText(summarizeMap(previewSummary) || '-') + '</p>'
+              + '<p style="margin:6px 0 0 0"><button type="button" class="secondary js-feedback-governance-reload-current">恢复当前治理视图</button></p>'
+              + (
+                previewRecs.length
+                  ? ('<ul style="margin:6px 0 0 18px;color:#92400e">' + previewRecs.slice(0, 5).map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('') + '</ul>')
+                  : ''
+              )
+              + '</div>';
+          } else if (previewMeta && previewMeta.preview_type) {
+            const previewRecs = Array.isArray(previewMeta.recommendations) ? previewMeta.recommendations : [];
+            const currentState = (previewMeta.current_state && typeof previewMeta.current_state === 'object') ? previewMeta.current_state : {};
+            const previewState = (previewMeta.preview_state && typeof previewMeta.preview_state === 'object') ? previewMeta.preview_state : {};
+            const previewLabelMap = {
+              guardrail: '极端偏差样本',
+              few_shot: 'few-shot 样本',
+            };
+            html += '<div style="margin:8px 0;padding:10px;border:1px solid #f59e0b;background:#fffbeb;border-radius:8px">'
+              + '<strong>只读动作预演</strong>'
+              + '<p style="margin:6px 0 0 0">类型=' + escapeHtmlText(previewLabelMap[previewMeta.preview_type] || previewMeta.preview_type || '-')
+              + '；记录=' + escapeHtmlText(previewMeta.record_id || '-')
+              + '；动作=' + escapeHtmlText(previewMeta.requested_action || '-')
+              + '；生成时间=' + escapeHtmlText(previewMeta.generated_at || '-') + '</p>'
+              + '<p style="margin:6px 0 0 0;color:#334155">当前状态：' + escapeHtmlText(summarizeMap(currentState) || '-') + '</p>'
+              + '<p style="margin:6px 0 0 0;color:#334155">预演状态：' + escapeHtmlText(summarizeMap(previewState) || '-') + '</p>'
               + '<p style="margin:6px 0 0 0"><button type="button" class="secondary js-feedback-governance-reload-current">恢复当前治理视图</button></p>'
               + (
                 previewRecs.length
@@ -27226,9 +27457,12 @@ def index(
               + '<td>' + escapeHtmlText(row.manual_review_status || 'pending') + '</td>'
               + '<td>' + escapeHtmlText(row.warning_message || '-') + '</td>'
               + '<td>'
-              + '<button type="button" class="secondary js-feedback-guardrail-review" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="approve">放行</button> '
-              + '<button type="button" class="secondary js-feedback-guardrail-review" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="reject">拒绝</button> '
-              + '<button type="button" class="secondary js-feedback-guardrail-review" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="reset">重置</button>'
+              + '<button type="button" class="secondary js-feedback-guardrail-preview" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="approve">预演放行</button> '
+              + '<button type="button" class="secondary js-feedback-guardrail-preview" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="reject">预演拒绝</button> '
+              + '<button type="button" class="secondary js-feedback-guardrail-preview" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="reset">预演重置</button> '
+              + '<button type="button" class="secondary js-feedback-guardrail-review" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="approve">正式放行</button> '
+              + '<button type="button" class="secondary js-feedback-guardrail-review" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="reject">正式拒绝</button> '
+              + '<button type="button" class="secondary js-feedback-guardrail-review" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="reset">正式重置</button>'
               + '</td>'
               + '</tr>').join('');
             html += '</table>';
@@ -27245,9 +27479,12 @@ def index(
               + '<td>' + escapeHtmlText(row.manual_review_status || 'pending') + '</td>'
               + '<td>' + escapeHtmlText(((row.feature_ids) || []).join('、') || '-') + '</td>'
               + '<td>'
-              + '<button type="button" class="secondary js-feedback-few-shot-review" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="adopt">采纳</button> '
-              + '<button type="button" class="secondary js-feedback-few-shot-review" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="ignore">忽略</button> '
-              + '<button type="button" class="secondary js-feedback-few-shot-review" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="reset">重置</button>'
+              + '<button type="button" class="secondary js-feedback-few-shot-preview" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="adopt">预演采纳</button> '
+              + '<button type="button" class="secondary js-feedback-few-shot-preview" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="ignore">预演忽略</button> '
+              + '<button type="button" class="secondary js-feedback-few-shot-preview" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="reset">预演重置</button> '
+              + '<button type="button" class="secondary js-feedback-few-shot-review" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="adopt">正式采纳</button> '
+              + '<button type="button" class="secondary js-feedback-few-shot-review" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="ignore">正式忽略</button> '
+              + '<button type="button" class="secondary js-feedback-few-shot-review" data-record-id="' + escapeHtmlText(row.record_id || '') + '" data-action="reset">正式重置</button>'
               + '</td>'
               + '</tr>').join('');
             html += '</table>';
@@ -27494,6 +27731,52 @@ def index(
               await loadFeedbackGovernancePanel(projectId);
             };
           });
+          panel.querySelectorAll('.js-feedback-guardrail-preview').forEach((btn) => {
+            btn.onclick = async () => {
+              const recordId = String(btn.getAttribute('data-record-id') || '').trim();
+              const action = String(btn.getAttribute('data-action') || '').trim();
+              if (!recordId || !action) return;
+              const actionLabelMap = { approve: '放行', reject: '拒绝', reset: '重置' };
+              const actionLabel = actionLabelMap[action] || action;
+              const note = window.prompt('可选预演备注（不会写入）', '') || '';
+              setResultLoading('feedbackGovernanceResult', '动作预演中...');
+              let res;
+              let data = {};
+              try {
+                res = await fetch('/api/v1/projects/' + encodeURIComponent(projectId) + '/feedback/governance/guardrail/' + encodeURIComponent(recordId) + '/preview', {
+                  method: 'POST',
+                  headers: apiHeaders(true),
+                  body: JSON.stringify({ action: action, note: note, rerun_closed_loop: false }),
+                });
+                data = await res.json().catch(() => ({}));
+              } catch (err) {
+                setResultError('feedbackGovernanceResult', '动作预演失败：' + String((err && err.message) || err || '网络异常'));
+                return;
+              }
+              showJson('output', formatApiOutput(res, data));
+              if (!res.ok) {
+                const detail = (data && data.detail) ? String(data.detail) : ('HTTP ' + String(res.status || 0));
+                setResultError('feedbackGovernanceResult', '动作预演失败：' + detail);
+                return;
+              }
+              const governance = (data.governance && typeof data.governance === 'object') ? data.governance : {};
+              const summary = (governance.summary && typeof governance.summary === 'object') ? governance.summary : {};
+              const blockedSamples = Array.isArray(governance.blocked_samples) ? governance.blocked_samples : [];
+              const firstWarning = blockedSamples.length && blockedSamples[0] && blockedSamples[0].warning_message
+                ? String(blockedSamples[0].warning_message)
+                : '';
+              setFeedbackGuardrailState(projectId, {
+                pending: !!summary.manual_confirmation_required,
+                manualConfirmed: false,
+                warningMessage: firstWarning,
+              });
+              renderFeedbackGovernancePanel(governance, {
+                suppressLoading: true,
+                actionMessage: '已加载只读动作预演：异常样本 ' + recordId + ' -> ' + actionLabel + '（未写入）。',
+                previewMeta: data,
+              });
+            };
+          });
           panel.querySelectorAll('.js-feedback-guardrail-review').forEach((btn) => {
             btn.onclick = async () => {
               const recordId = String(btn.getAttribute('data-record-id') || '').trim();
@@ -27528,6 +27811,52 @@ def index(
               await loadFeedbackGovernancePanel(projectId, {
                 suppressLoading: true,
                 actionMessage: '异常样本已完成「' + actionLabel + '」处理。',
+              });
+            };
+          });
+          panel.querySelectorAll('.js-feedback-few-shot-preview').forEach((btn) => {
+            btn.onclick = async () => {
+              const recordId = String(btn.getAttribute('data-record-id') || '').trim();
+              const action = String(btn.getAttribute('data-action') || '').trim();
+              if (!recordId || !action) return;
+              const actionLabelMap = { adopt: '采纳', ignore: '忽略', reset: '重置' };
+              const actionLabel = actionLabelMap[action] || action;
+              const note = window.prompt('可选预演备注（不会写入）', '') || '';
+              setResultLoading('feedbackGovernanceResult', 'few-shot 预演中...');
+              let res;
+              let data = {};
+              try {
+                res = await fetch('/api/v1/projects/' + encodeURIComponent(projectId) + '/feedback/governance/few_shot/' + encodeURIComponent(recordId) + '/preview', {
+                  method: 'POST',
+                  headers: apiHeaders(true),
+                  body: JSON.stringify({ action: action, note: note }),
+                });
+                data = await res.json().catch(() => ({}));
+              } catch (err) {
+                setResultError('feedbackGovernanceResult', 'few-shot 预演失败：' + String((err && err.message) || err || '网络异常'));
+                return;
+              }
+              showJson('output', formatApiOutput(res, data));
+              if (!res.ok) {
+                const detail = (data && data.detail) ? String(data.detail) : ('HTTP ' + String(res.status || 0));
+                setResultError('feedbackGovernanceResult', 'few-shot 预演失败：' + detail);
+                return;
+              }
+              const governance = (data.governance && typeof data.governance === 'object') ? data.governance : {};
+              const summary = (governance.summary && typeof governance.summary === 'object') ? governance.summary : {};
+              const blockedSamples = Array.isArray(governance.blocked_samples) ? governance.blocked_samples : [];
+              const firstWarning = blockedSamples.length && blockedSamples[0] && blockedSamples[0].warning_message
+                ? String(blockedSamples[0].warning_message)
+                : '';
+              setFeedbackGuardrailState(projectId, {
+                pending: !!summary.manual_confirmation_required,
+                manualConfirmed: false,
+                warningMessage: firstWarning,
+              });
+              renderFeedbackGovernancePanel(governance, {
+                suppressLoading: true,
+                actionMessage: '已加载只读动作预演：few-shot 样本 ' + recordId + ' -> ' + actionLabel + '（未写入）。',
+                previewMeta: data,
               });
             };
           });

@@ -456,6 +456,19 @@ class FeedbackGovernanceVersionPreviewResponse(BaseModel):
     recommendations: List[str] = Field(default_factory=list)
 
 
+class FeedbackGovernanceActionPreviewResponse(BaseModel):
+    ok: bool
+    project_id: str
+    record_id: str
+    preview_type: str
+    requested_action: str
+    generated_at: str
+    current_state: Dict[str, Any] = Field(default_factory=dict)
+    preview_state: Dict[str, Any] = Field(default_factory=dict)
+    governance: Dict[str, Any] = Field(default_factory=dict)
+    recommendations: List[str] = Field(default_factory=list)
+
+
 class FeedbackGuardrailReviewRequest(BaseModel):
     action: str = Field(..., description="approve|reject|reset")
     note: Optional[str] = Field(None, description="人工审核备注")

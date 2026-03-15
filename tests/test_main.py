@@ -7545,6 +7545,185 @@ class TestFeedbackGovernanceRoutes:
 
     @patch("app.main._run_feedback_closed_loop_safe")
     @patch("app.main.save_ground_truth")
+    @patch("app.main._build_feedback_governance_report")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_feedback_guardrail_preview_route_is_read_only(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_ground_truth,
+        mock_build_governance_report,
+        mock_save_ground_truth,
+        mock_run_closed_loop,
+        client,
+    ):
+        store = [
+            {
+                "id": "gt-1",
+                "project_id": "p1",
+                "feedback_guardrail": {
+                    "blocked": True,
+                    "threshold_blocked": True,
+                    "actual_score_100": 81,
+                    "predicted_score_100": 33,
+                    "abs_delta_100": 48,
+                    "warning_message": "预测与真实总分偏差过大",
+                },
+            }
+        ]
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 100}}]
+        mock_load_ground_truth.return_value = store
+
+        def _build_report(project_id, project, **kwargs):
+            rows = kwargs.get("ground_truth_rows_override") or []
+            blocked_count = sum(
+                1 for row in rows if bool(((row.get("feedback_guardrail") or {}).get("blocked")))
+            )
+            return {
+                "project_id": project_id,
+                "summary": {
+                    "ground_truth_count": len(rows),
+                    "blocked_ground_truth_count": blocked_count,
+                    "manual_confirmation_required": blocked_count > 0,
+                },
+                "blocked_samples": [
+                    {"record_id": str(row.get("id") or "")}
+                    for row in rows
+                    if bool(((row.get("feedback_guardrail") or {}).get("blocked")))
+                ],
+                "few_shot_recent": [],
+                "approved_samples": [],
+                "adopted_few_shot": [],
+                "version_history": [],
+                "artifact_impacts": [],
+                "score_preview": {},
+                "sandbox_preview": {},
+                "recommendations": [],
+            }
+
+        mock_build_governance_report.side_effect = _build_report
+
+        response = client.post(
+            "/api/v1/projects/p1/feedback/governance/guardrail/gt-1/preview",
+            json={
+                "action": "approve",
+                "note": "预演放行",
+                "rerun_closed_loop": True,
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["preview_type"] == "guardrail"
+        assert data["requested_action"] == "approve"
+        assert data["current_state"]["blocked"] is True
+        assert data["preview_state"]["blocked"] is False
+        assert data["preview_state"]["manual_review_status"] == "approved"
+        assert data["governance"]["summary"]["blocked_ground_truth_count"] == 0
+        assert any("不会执行真实闭环" in item for item in data["recommendations"])
+        assert store[0]["feedback_guardrail"]["blocked"] is True
+        mock_save_ground_truth.assert_not_called()
+        mock_run_closed_loop.assert_not_called()
+
+    @patch("app.main.save_ground_truth")
+    @patch("app.main._build_feedback_governance_report")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_feedback_few_shot_preview_route_is_read_only(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_ground_truth,
+        mock_build_governance_report,
+        mock_save_ground_truth,
+        client,
+    ):
+        store = [
+            {
+                "id": "gt-2",
+                "project_id": "p1",
+                "few_shot_distillation": {
+                    "captured": 2,
+                    "reason": "captured",
+                    "dimension_ids": ["09"],
+                    "feature_ids": ["F-1"],
+                },
+            }
+        ]
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 100}}]
+        mock_load_ground_truth.return_value = store
+
+        def _build_report(project_id, project, **kwargs):
+            rows = kwargs.get("ground_truth_rows_override") or []
+            adopted_count = sum(
+                1
+                for row in rows
+                if str(
+                    ((row.get("few_shot_distillation") or {}).get("manual_review_status") or "")
+                ).lower()
+                == "adopted"
+            )
+            recent_rows = []
+            adopted_rows = []
+            for row in rows:
+                distillation = row.get("few_shot_distillation") or {}
+                recent_rows.append(
+                    {
+                        "record_id": str(row.get("id") or ""),
+                        "captured": distillation.get("captured") or 0,
+                        "manual_review_status": distillation.get("manual_review_status")
+                        or "pending",
+                    }
+                )
+                if str(distillation.get("manual_review_status") or "").lower() == "adopted":
+                    adopted_rows.append({"record_id": str(row.get("id") or "")})
+            return {
+                "project_id": project_id,
+                "summary": {
+                    "ground_truth_count": len(rows),
+                    "few_shot_recent_capture_count": len(recent_rows),
+                    "few_shot_adopted_count": adopted_count,
+                    "manual_confirmation_required": False,
+                },
+                "blocked_samples": [],
+                "few_shot_recent": recent_rows,
+                "approved_samples": [],
+                "adopted_few_shot": adopted_rows,
+                "version_history": [],
+                "artifact_impacts": [],
+                "score_preview": {},
+                "sandbox_preview": {},
+                "recommendations": [],
+            }
+
+        mock_build_governance_report.side_effect = _build_report
+
+        response = client.post(
+            "/api/v1/projects/p1/feedback/governance/few_shot/gt-2/preview",
+            json={
+                "action": "adopt",
+                "note": "预演采纳",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["preview_type"] == "few_shot"
+        assert data["requested_action"] == "adopt"
+        assert data["current_state"]["manual_review_status"] == "pending"
+        assert data["preview_state"]["manual_review_status"] == "adopted"
+        assert data["governance"]["summary"]["few_shot_adopted_count"] == 1
+        assert any(
+            "不会直接改写当前 high_score_features" in item for item in data["recommendations"]
+        )
+        assert store[0]["few_shot_distillation"].get("manual_review_status") is None
+        mock_save_ground_truth.assert_not_called()
+
+    @patch("app.main._run_feedback_closed_loop_safe")
+    @patch("app.main.save_ground_truth")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
