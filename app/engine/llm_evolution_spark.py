@@ -1,5 +1,5 @@
 """
-进化报告星火增强：用讯飞星火 API 在规则版报告基础上生成更丰富的高分逻辑与编制指导。
+历史 spark 兼容模块：保留旧入口名，但当前实际调用 OpenAI 兼容层。
 """
 from __future__ import annotations
 
@@ -21,8 +21,7 @@ def enhance_evolution_report_spark(
     project_context: str = "",
 ) -> Optional[Dict[str, Any]]:
     """
-    使用讯飞星火增强进化报告。成功时返回完整报告 dict（含 project_id, high_score_logic,
-    writing_guidance, sample_count, updated_at）；失败或未配置时返回 None。
+    历史 spark 兼容入口。成功时返回完整报告 dict；审计字段 enhanced_by 会记录真实 provider。
     """
     if not _get_spark_bearer_token():
         return None
@@ -39,5 +38,5 @@ def enhance_evolution_report_spark(
         "writing_guidance": enhanced["writing_guidance"],
         "sample_count": report.get("sample_count", 0),
         "updated_at": datetime.now(timezone.utc).isoformat(),
-        "enhanced_by": "spark",
+        "enhanced_by": "openai",
     }

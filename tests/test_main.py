@@ -6637,6 +6637,34 @@ class TestSystemSelfCheckCapabilities:
         assert pdf_item.get("ok") is True
 
 
+class TestLlmStatusEndpoint:
+    @patch("app.main.get_llm_backend_status")
+    def test_llm_status_reports_real_backend_and_legacy_alias(self, mock_get_status, client):
+        mock_get_status.return_value = {
+            "evolution_backend": "openai",
+            "requested_backend": "spark",
+            "backend_alias_applied": True,
+            "spark_configured": True,
+            "legacy_spark_env_keys": ["SPARK_MODEL"],
+            "openai_configured": True,
+            "openai_model": "gpt-5.4",
+            "gemini_configured": False,
+        }
+
+        response = client.get("/api/v1/config/llm_status")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["evolution_backend"] == "openai"
+        assert payload["requested_backend"] == "spark"
+        assert payload["backend_alias_applied"] is True
+        assert payload["spark_configured"] is True
+        assert payload["legacy_spark_env_keys"] == ["SPARK_MODEL"]
+        assert payload["openai_configured"] is True
+        assert payload["openai_model"] == "gpt-5.4"
+        assert payload["gemini_configured"] is False
+
+
 class TestDataHygieneEndpoints:
     @patch("app.main._build_data_hygiene_report")
     def test_system_data_hygiene_audit(self, mock_hygiene, client):

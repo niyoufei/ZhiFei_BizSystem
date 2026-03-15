@@ -9,6 +9,7 @@ from app.engine.llm_evolution import (
     EVOLUTION_LLM_BACKEND_ENV,
     enhance_evolution_report_with_llm,
     get_evolution_llm_backend,
+    get_llm_backend_status,
 )
 from app.engine.openai_compat import resolve_openai_model
 
@@ -22,9 +23,9 @@ class TestGetEvolutionLlmBackend:
         with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True):
             assert get_evolution_llm_backend() == "openai"
 
-    def test_env_spark(self):
+    def test_env_spark_alias_maps_to_openai(self):
         with patch.dict(os.environ, {EVOLUTION_LLM_BACKEND_ENV: "spark"}):
-            assert get_evolution_llm_backend() == "spark"
+            assert get_evolution_llm_backend() == "openai"
 
     def test_env_openai_gemini(self):
         with patch.dict(os.environ, {EVOLUTION_LLM_BACKEND_ENV: "openai"}):
@@ -53,9 +54,9 @@ class TestEnhanceEvolutionReportWithLlm:
             out = enhance_evolution_report_with_llm("p1", report, [], "")
             assert out is None
 
-    def test_spark_without_credentials_returns_none(self):
+    def test_spark_alias_without_openai_credentials_returns_none(self):
         with patch.dict(os.environ, {EVOLUTION_LLM_BACKEND_ENV: "spark"}):
-            save = os.environ.pop("SPARK_APIPASSWORD", None)
+            save = os.environ.pop("OPENAI_API_KEY", None)
             try:
                 report = {
                     "project_id": "p1",
@@ -68,7 +69,26 @@ class TestEnhanceEvolutionReportWithLlm:
                 assert out is None
             finally:
                 if save is not None:
-                    os.environ["SPARK_APIPASSWORD"] = save
+                    os.environ["OPENAI_API_KEY"] = save
+
+    def test_llm_backend_status_reports_legacy_spark_alias(self):
+        with patch.dict(
+            os.environ,
+            {
+                EVOLUTION_LLM_BACKEND_ENV: "spark",
+                "SPARK_MODEL": "gpt-5.4",
+                "OPENAI_API_KEY": "test-key",
+            },
+            clear=True,
+        ):
+            status = get_llm_backend_status()
+
+        assert status["evolution_backend"] == "openai"
+        assert status["requested_backend"] == "spark"
+        assert status["backend_alias_applied"] is True
+        assert status["spark_configured"] is True
+        assert status["legacy_spark_env_keys"] == ["SPARK_MODEL"]
+        assert status["openai_configured"] is True
 
     def test_openai_stub_returns_none(self):
         with patch.dict(os.environ, {EVOLUTION_LLM_BACKEND_ENV: "openai"}):

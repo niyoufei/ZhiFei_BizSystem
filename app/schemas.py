@@ -66,8 +66,19 @@ class ConfigStatusResponse(BaseModel):
 class LLMBackendStatus(BaseModel):
     """进化 LLM 后端配置状态（不暴露密钥）"""
 
-    evolution_backend: str = Field(..., description="当前进化后端：rules | spark | openai | gemini")
-    spark_configured: bool = Field(..., description="是否仍保留历史 SPARK_APIPASSWORD 配置")
+    evolution_backend: str = Field(..., description="当前真实进化后端：rules | openai | gemini")
+    requested_backend: Optional[str] = Field(
+        None, description="环境变量中请求的原始后端；spark 会作为兼容别名映射到 openai"
+    )
+    backend_alias_applied: bool = Field(
+        False, description="是否应用了历史 spark -> openai 的兼容映射"
+    )
+    spark_configured: bool = Field(
+        ..., description="是否检测到历史 Spark 兼容配置；仅提示迁移，不代表真实 provider 为 Spark"
+    )
+    legacy_spark_env_keys: List[str] = Field(
+        default_factory=list, description="检测到的历史 Spark 兼容环境变量键名"
+    )
     openai_configured: bool = Field(..., description="是否已配置 OPENAI_API_KEY")
     openai_model: Optional[str] = Field(None, description="当前 OpenAI 模型")
     gemini_configured: bool = Field(..., description="是否已配置 GEMINI_API_KEY")
@@ -1195,7 +1206,7 @@ class EvolutionReport(BaseModel):
     )
     enhanced_by: Optional[str] = Field(
         None,
-        description="若由 LLM 增强则标识后端：spark | openai | gemini；仅规则时为 None",
+        description="若由 LLM 增强则标识真实后端：openai | gemini；仅规则时为 None",
     )
 
 

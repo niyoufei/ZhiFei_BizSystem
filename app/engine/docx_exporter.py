@@ -170,7 +170,9 @@ def export_report_to_docx(report: Dict[str, Any], output_path: str | Path) -> Pa
     # E. 附录
     doc.add_heading("E. 附录：证据索引说明", level=1)
     doc.add_paragraph("• start_index/end_index/snippet 表示原文区间与片段引用。")
-    doc.add_paragraph("• 如配置 Spark 凭证即可获得「青天Spark Judge 真评」并替换高优维度诊断内容。")
+    doc.add_paragraph(
+        "• 如配置 OpenAI 凭证与 gpt-5.4，即可获得「青天 ChatGPT Judge 真评」并替换高优维度诊断内容。"
+    )
 
     # 保存
     doc.save(str(output_path))

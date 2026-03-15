@@ -12,6 +12,7 @@ from app.schemas import ScoreReport
 
 # 兼容保留：历史文件名/函数名不变，但实际 provider 已切到 OpenAI GPT-5.4。
 SPARK_DEFAULT_MODEL = "gpt-5.4"
+LEGACY_SPARK_ENV_KEYS = ("SPARK_APIPASSWORD", "SPARK_APP_ID", "SPARK_API_KEY", "SPARK_API_SECRET")
 
 
 def _get_spark_model() -> str:
@@ -28,8 +29,12 @@ def _get_spark_model() -> str:
 
 
 def _get_spark_bearer_token() -> str | None:
-    """历史兼容入口，实际读取 OpenAI API Key。"""
+    """历史兼容入口，实际仅读取 OPENAI_API_KEY。"""
     return get_openai_api_key()
+
+
+def _list_legacy_spark_env_keys() -> List[str]:
+    return [key for key in LEGACY_SPARK_ENV_KEYS if str(os.getenv(key) or "").strip()]
 
 
 def load_prompt(prompt_name: str) -> str:
@@ -366,12 +371,20 @@ def run_spark_judge(
     但 judge_mode / model / judge_source 会写入 OpenAI 语义。
     """
     token = _get_spark_bearer_token()
-    required_env = ["SPARK_APP_ID", "SPARK_API_KEY", "SPARK_API_SECRET"]
-    if not token and not all(os.getenv(k) for k in required_env):
-        return {
+    legacy_spark_env_keys = _list_legacy_spark_env_keys()
+    if not token:
+        payload: Dict[str, Any] = {
             "called_spark_api": False,
-            "reason": "missing_credentials",
+            "called_openai_api": False,
+            "reason": "missing_openai_api_key",
         }
+        if legacy_spark_env_keys:
+            payload["legacy_spark_env_keys"] = legacy_spark_env_keys
+            payload["migration_hint"] = (
+                "当前评分兼容层已迁移到 OpenAI；请配置 OPENAI_API_KEY，"
+                "旧 Spark 凭证不会再作为真实评分凭证使用。"
+            )
+        return payload
 
     prompt_template = load_prompt(prompt_name)
     user_message = f"{prompt_template}\n\n---\n输入文本：\n{text[:12000]}"
@@ -398,22 +411,6 @@ def run_spark_judge(
         payload["reason"] = "api_error" if ok else "request_failed"
         if err_msg:
             payload["fallback_reason"] = err_msg
+        if legacy_spark_env_keys:
+            payload["legacy_spark_env_keys"] = legacy_spark_env_keys
         return payload
-
-    # 未配置 HTTP 令牌：沿用原有逻辑（仅规则，用于兼容测试/旧配置）
-    payload = _build_from_rules(rules_report, rubric)
-    payload = post_process_llm_output(payload, rubric)
-    ok, err = validate_llm_judge_json(payload)
-    if not ok:
-        return {
-            "called_spark_api": False,
-            "called_openai_api": False,
-            "reason": "api_error",
-            "error": err,
-        }
-    payload["called_spark_api"] = True
-    payload["called_openai_api"] = True
-    payload["judge_mode"] = "openai"
-    payload["model"] = _get_spark_model()
-    payload["judge_source"] = "openai_api"
-    return payload

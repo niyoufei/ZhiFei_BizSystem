@@ -93,8 +93,8 @@ class TestValidateLlmJudgeJson:
                 ],
             }
         return {
-            "judge_mode": "spark",
-            "model": "spark",
+            "judge_mode": "openai",
+            "model": "gpt-5.4",
             "prompt_version": "v1",
             "weights": {
                 "high_priority_dims": ["07", "09"],
@@ -523,56 +523,66 @@ class TestRunSparkJudge:
             result = run_spark_judge("test text", {}, "prompt", report)
 
             assert result["called_spark_api"] is False
-            assert result["reason"] == "missing_credentials"
+            assert result["called_openai_api"] is False
+            assert result["reason"] == "missing_openai_api_key"
 
-    def test_returns_missing_credentials_with_partial_env(self):
-        """run_spark_judge should fail with only partial credentials."""
+    def test_returns_missing_openai_credentials_with_legacy_spark_env(self):
+        """仅有旧 Spark 环境变量时，应明确提示迁移到 OPENAI_API_KEY。"""
         with patch.dict(os.environ, {"SPARK_APP_ID": "test"}, clear=True):
             report = self._make_score_report()
             result = run_spark_judge("test text", {}, "prompt", report)
 
             assert result["called_spark_api"] is False
-            assert result["reason"] == "missing_credentials"
+            assert result["called_openai_api"] is False
+            assert result["reason"] == "missing_openai_api_key"
+            assert result["legacy_spark_env_keys"] == ["SPARK_APP_ID"]
+            assert "OPENAI_API_KEY" in result["migration_hint"]
 
     @patch("app.engine.llm_judge_spark.load_prompt")
-    def test_loads_prompt_when_credentials_present(self, mock_load):
-        """run_spark_judge should load prompt when credentials are set."""
+    @patch("app.engine.llm_judge_spark._call_spark_http")
+    def test_loads_prompt_when_openai_credentials_present(self, mock_call_http, mock_load):
+        """run_spark_judge should load prompt when OPENAI_API_KEY is set."""
         mock_load.return_value = "test prompt content"
+        mock_call_http.return_value = (False, None, "upstream_failed")
 
         with patch.dict(
             os.environ,
             {
-                "SPARK_APP_ID": "id",
-                "SPARK_API_KEY": "key",
-                "SPARK_API_SECRET": "secret",
+                "OPENAI_API_KEY": "sk-test",
             },
         ):
             report = self._make_score_report()
             result = run_spark_judge("test text", {}, "test_prompt", report)
 
             mock_load.assert_called_once_with("test_prompt")
-            # Should succeed and return payload
-            assert result.get("called_spark_api") is True or "reason" in result
+            assert result["called_spark_api"] is False
+            assert result["reason"] == "request_failed"
 
     @patch("app.engine.llm_judge_spark.load_prompt")
-    def test_returns_payload_with_credentials(self, mock_load):
-        """run_spark_judge should return valid payload when credentials present."""
+    @patch("app.engine.llm_judge_spark._call_spark_http")
+    def test_returns_payload_with_openai_credentials(self, mock_call_http, mock_load):
+        """run_spark_judge should return valid payload when OPENAI_API_KEY is present."""
         mock_load.return_value = "test prompt"
+        report = self._make_score_report()
+        payload = build_spark_payload_from_rules(report, {})
+        payload["judge_mode"] = "openai"
+        payload["model"] = "gpt-5.4"
+        payload["judge_source"] = "openai_api"
+        mock_call_http.return_value = (True, payload, "")
 
         with patch.dict(
             os.environ,
             {
-                "SPARK_APP_ID": "id",
-                "SPARK_API_KEY": "key",
-                "SPARK_API_SECRET": "secret",
+                "OPENAI_API_KEY": "sk-test",
             },
         ):
-            report = self._make_score_report()
             result = run_spark_judge("test text", {}, "prompt", report)
 
-            # If validation passes, called_spark_api should be True
-            if result.get("called_spark_api"):
-                assert "dimension_scores" in result
+            assert result["called_spark_api"] is True
+            assert result["called_openai_api"] is True
+            assert result["judge_mode"] == "openai"
+            assert result["judge_source"] == "openai_api"
+            assert "dimension_scores" in result
 
 
 class TestEdgeCases:
@@ -613,8 +623,8 @@ class TestEdgeCases:
         dim_scores["99"] = dim_scores["01"].copy()
 
         payload = {
-            "judge_mode": "spark",
-            "model": "spark",
+            "judge_mode": "openai",
+            "model": "gpt-5.4",
             "prompt_version": "v1",
             "weights": {
                 "high_priority_dims": [],

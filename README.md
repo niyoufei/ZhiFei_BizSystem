@@ -175,8 +175,9 @@ curl http://localhost:8000/auth/status
 # 可选：API 认证（多个 key 用逗号分隔）
 API_KEYS=your-secret-key
 
-# 可选：讯飞星火 HTTP 接口 APIPassword（用于 --mode spark / hybrid）
-SPARK_APIPASSWORD=your-spark-apipassword
+# 可选：OpenAI 评分/进化凭证
+OPENAI_API_KEY=your-openai-key
+OPENAI_MODEL=gpt-5.4
 ```
 
 **注意**：
@@ -202,28 +203,32 @@ export RATE_LIMIT_UPLOAD=20/minute  # 上传端点限制
 curl http://localhost:8000/rate_limit/status
 ```
 
-### 5. 讯飞星火（Spark）评分模式
+### 5. OpenAI 评分模式（兼容 spark 别名）
 
-CLI 支持使用讯飞星火大模型进行评分或与规则混合评分：
+CLI 当前实际使用 OpenAI GPT-5.4 进行评分或与规则混合评分。历史 `spark` 模式仍可继续输入，但只作为 `openai` 的兼容别名存在：
 
 ```bash
 # 仅规则评分（默认）
 python3 -m app.cli score --input sample_shigong.txt
 
-# 星火评分（需配置 SPARK_APIPASSWORD，否则回退为规则）
+# OpenAI 评分（推荐）
+python3 -m app.cli score --input sample_shigong.txt --mode openai
+
+# 历史 spark 别名（等价于 --mode openai）
 python3 -m app.cli score --input sample_shigong.txt --mode spark
 
-# 混合模式：规则分 + 星火微调
+# 混合模式：规则分 + OpenAI 微调
 python3 -m app.cli score --input sample_shigong.txt --mode hybrid
 ```
 
-**配置**：在讯飞开放平台获取 HTTP 接口的 **APIPassword**，设置环境变量：
+**配置**：设置 OpenAI 凭证：
 
 ```bash
-export SPARK_APIPASSWORD=你的APIPassword
+export OPENAI_API_KEY=你的OpenAIKey
+export OPENAI_MODEL=gpt-5.4
 ```
 
-未设置时，`--mode spark` / `--mode hybrid` 会回退为规则结果，并在输出中注明 `fallback_reason`。
+未设置时，`--mode openai` / `--mode spark` / `--mode hybrid` 会回退为规则结果，并在输出中注明 `fallback_reason`。旧 Spark 凭证不再作为真实评分凭证使用。
 
 ### 6. Web UI（推荐）
 

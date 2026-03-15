@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 
-# 加载 .env，使 SPARK_APIPASSWORD、OPENAI_API_KEY 等生效
+# 加载 .env，使 OPENAI_API_KEY、GEMINI_API_KEY 等生效
 try:
     from dotenv import load_dotenv
 
@@ -12242,7 +12242,10 @@ def llm_status() -> LLMBackendStatus:
     s = get_llm_backend_status()
     return LLMBackendStatus(
         evolution_backend=s["evolution_backend"],
+        requested_backend=s.get("requested_backend"),
+        backend_alias_applied=bool(s.get("backend_alias_applied")),
         spark_configured=s["spark_configured"],
+        legacy_spark_env_keys=list(s.get("legacy_spark_env_keys") or []),
         openai_configured=s["openai_configured"],
         openai_model=s.get("openai_model"),
         gemini_configured=s["gemini_configured"],
@@ -21840,7 +21843,9 @@ def evolve_project(
         report["writing_guidance"] = enhanced.get("writing_guidance", report["writing_guidance"])
         report["sample_count"] = enhanced.get("sample_count", report["sample_count"])
         report["updated_at"] = enhanced.get("updated_at", report["updated_at"])
-        report["enhanced_by"] = enhanced.get("enhanced_by")  # 可追溯：spark | openai | gemini
+        report["enhanced_by"] = enhanced.get(
+            "enhanced_by"
+        )  # 可追溯：真实 provider（当前为 openai | gemini）
         # 保留规则版产出的 scoring_evolution、compilation_instructions（LLM 仅增强文字部分）
     reports = load_evolution_reports()
     reports[project_id] = report
