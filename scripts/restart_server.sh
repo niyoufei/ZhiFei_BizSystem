@@ -12,6 +12,7 @@ PID_FILE="build/server.pid"
 LOG_FILE="build/server.log"
 LOCK_DIR="build/.restart.lock"
 SCREEN_SESSION="zhifei_server_${PORT}"
+LOG_KEEP="${LOG_KEEP:-12}"
 
 if [[ -x ".venv/bin/python" ]]; then
   PYTHON_BIN=".venv/bin/python"
@@ -201,6 +202,9 @@ stop_by_port
 preflight_python_runtime
 
 START_MODE="unknown"
+if ! "$PYTHON_BIN" "$ROOT_DIR/scripts/rotate_runtime_logs.py" --keep "$LOG_KEEP" "$ROOT_DIR/$LOG_FILE" >/dev/null 2>&1; then
+  echo "Warning: runtime log rotation failed; continuing with existing files."
+fi
 start_server_process
 
 if wait_until_ready; then

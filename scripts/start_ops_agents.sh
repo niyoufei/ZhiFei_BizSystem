@@ -11,6 +11,9 @@ BASE_URL="${BASE_URL:-http://127.0.0.1:8000}"
 LOG_FILE="${LOG_FILE:-$ROOT_DIR/build/ops_agents.log}"
 PID_FILE="${PID_FILE:-$ROOT_DIR/build/ops_agents.pid}"
 SCREEN_SESSION="${SCREEN_SESSION:-zhifei_ops_agents}"
+STATUS_JSON="${STATUS_JSON:-$ROOT_DIR/build/ops_agents_status.json}"
+STATUS_MD="${STATUS_MD:-$ROOT_DIR/build/ops_agents_status.md}"
+LOG_KEEP="${LOG_KEEP:-12}"
 
 mkdir -p "$ROOT_DIR/build"
 
@@ -23,6 +26,25 @@ fi
 if command -v screen >/dev/null 2>&1; then
   screen -S "$SCREEN_SESSION" -X quit >/dev/null 2>&1 || true
   screen -wipe >/dev/null 2>&1 || true
+fi
+
+if [[ -f "$PID_FILE" ]]; then
+  old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [[ -n "${old_pid:-}" ]] && kill -0 "$old_pid" >/dev/null 2>&1; then
+    kill "$old_pid" >/dev/null 2>&1 || true
+    sleep 1
+    if kill -0 "$old_pid" >/dev/null 2>&1; then
+      kill -9 "$old_pid" >/dev/null 2>&1 || true
+    fi
+  fi
+  rm -f "$PID_FILE"
+fi
+
+if ! "$PYTHON_BIN" "$ROOT_DIR/scripts/rotate_runtime_logs.py" --keep "$LOG_KEEP" "$LOG_FILE" "$STATUS_JSON" "$STATUS_MD" >/dev/null 2>&1; then
+  echo "Warning: runtime log rotation failed; continuing with existing files." >&2
+fi
+
+if command -v screen >/dev/null 2>&1; then
   echo "Starting ops-agents in detached screen session: $SCREEN_SESSION"
   screen -dmS "$SCREEN_SESSION" env \
     ROOT_DIR="$ROOT_DIR" \

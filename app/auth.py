@@ -3,8 +3,10 @@
 支持通过环境变量配置 API Key，实现简单的 API 访问控制。
 
 环境变量:
-    API_KEYS: 逗号分隔的 API Key 列表，如 "key1,key2,key3"
-             如果未设置，则跳过认证（开发模式）
+    API_KEYS: 逗号分隔的 API Key 列表。
+        - 兼容旧格式: "key1,key2,key3"（默认视为 admin）
+        - 角色格式: "admin:key1,ops:key2,readonly:key3"
+        - 如果未设置，则跳过认证（开发模式）
 
 使用方式:
     # Header 认证
@@ -17,7 +19,7 @@
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Dict, Optional
 
 from fastapi import HTTPException, Security, status
 from fastapi.security import APIKeyHeader, APIKeyQuery
@@ -26,10 +28,48 @@ from fastapi.security import APIKeyHeader, APIKeyQuery
 API_KEYS_ENV = "API_KEYS"
 API_KEY_HEADER_NAME = "X-API-Key"
 API_KEY_QUERY_NAME = "api_key"
+DEFAULT_API_KEY_ROLE = "admin"
+OPS_API_KEY_ROLE = "ops"
+READONLY_API_KEY_ROLE = "readonly"
+API_KEY_ROLES = (DEFAULT_API_KEY_ROLE, OPS_API_KEY_ROLE, READONLY_API_KEY_ROLE)
 
 # Security schemes
 api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
 api_key_query = APIKeyQuery(name=API_KEY_QUERY_NAME, auto_error=False)
+
+
+def _normalize_api_key_role(role: object) -> str:
+    normalized = str(role or "").strip().lower()
+    return normalized if normalized in API_KEY_ROLES else ""
+
+
+def _parse_api_key_bindings() -> list[Dict[str, object]]:
+    """解析 API_KEYS，兼容旧格式与 role:key 格式。"""
+    keys_str = os.environ.get(API_KEYS_ENV, "")
+    if not keys_str.strip():
+        return []
+
+    bindings_by_key: Dict[str, Dict[str, object]] = {}
+    for raw_entry in keys_str.split(","):
+        token = raw_entry.strip()
+        if not token:
+            continue
+        role = DEFAULT_API_KEY_ROLE
+        key = token
+        explicit_role = False
+        if ":" in token:
+            prefix, maybe_key = token.split(":", 1)
+            normalized_role = _normalize_api_key_role(prefix)
+            if normalized_role and maybe_key.strip():
+                role = normalized_role
+                key = maybe_key.strip()
+                explicit_role = True
+        bindings_by_key[key] = {
+            "key": key,
+            "role": role,
+            "explicit_role": explicit_role,
+        }
+    return list(bindings_by_key.values())
 
 
 def get_valid_api_keys() -> list[str]:
@@ -38,10 +78,7 @@ def get_valid_api_keys() -> list[str]:
     Returns:
         有效的 API Key 列表，如果未配置则返回空列表
     """
-    keys_str = os.environ.get(API_KEYS_ENV, "")
-    if not keys_str.strip():
-        return []
-    return [k.strip() for k in keys_str.split(",") if k.strip()]
+    return [str(binding["key"]) for binding in _parse_api_key_bindings()]
 
 
 def is_auth_enabled() -> bool:
@@ -53,32 +90,18 @@ def is_auth_enabled() -> bool:
     return len(get_valid_api_keys()) > 0
 
 
-def verify_api_key(
+def _verify_api_key_for_roles(
+    *,
+    required_roles: tuple[str, ...],
     api_key_header: Optional[str] = Security(api_key_header),
     api_key_query: Optional[str] = Security(api_key_query),
 ) -> Optional[str]:
-    """验证 API Key（FastAPI 依赖）。
+    """验证 API Key，并校验角色权限。"""
+    bindings = _parse_api_key_bindings()
 
-    优先检查 Header，然后检查 Query 参数。
-    如果未配置任何 API Key，则跳过认证（开发模式）。
-
-    Args:
-        api_key_header: 从请求 Header 中提取的 API Key
-        api_key_query: 从 Query 参数中提取的 API Key
-
-    Returns:
-        验证通过的 API Key，或 None（开发模式）
-
-    Raises:
-        HTTPException: 401 如果认证失败
-    """
-    valid_keys = get_valid_api_keys()
-
-    # 如果未配置 API Key，跳过认证（开发模式）
-    if not valid_keys:
+    if not bindings:
         return None
 
-    # 优先使用 Header 中的 Key
     api_key = api_key_header or api_key_query
 
     if not api_key:
@@ -87,13 +110,45 @@ def verify_api_key(
             detail="缺少 API Key。请在 Header 中添加 X-API-Key 或在 URL 中添加 api_key 参数。",
         )
 
-    if api_key not in valid_keys:
+    binding = next((row for row in bindings if str(row.get("key")) == api_key), None)
+    if binding is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="无效的 API Key。",
         )
 
+    role = str(binding.get("role") or DEFAULT_API_KEY_ROLE)
+    if required_roles and role not in required_roles:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"API Key 权限不足，需要角色：{'/'.join(required_roles)}。",
+        )
+
     return api_key
+
+
+def verify_api_key(
+    api_key_header: Optional[str] = Security(api_key_header),
+    api_key_query: Optional[str] = Security(api_key_query),
+) -> Optional[str]:
+    """验证 API Key（默认 admin 权限）。"""
+    return _verify_api_key_for_roles(
+        required_roles=(DEFAULT_API_KEY_ROLE,),
+        api_key_header=api_key_header,
+        api_key_query=api_key_query,
+    )
+
+
+def verify_ops_api_key(
+    api_key_header: Optional[str] = Security(api_key_header),
+    api_key_query: Optional[str] = Security(api_key_query),
+) -> Optional[str]:
+    """验证 API Key（允许 admin / ops）。"""
+    return _verify_api_key_for_roles(
+        required_roles=(DEFAULT_API_KEY_ROLE, OPS_API_KEY_ROLE),
+        api_key_header=api_key_header,
+        api_key_query=api_key_query,
+    )
 
 
 def get_auth_status() -> dict:
@@ -103,9 +158,20 @@ def get_auth_status() -> dict:
         包含认证状态的字典
     """
     enabled = is_auth_enabled()
-    keys = get_valid_api_keys()
+    bindings = _parse_api_key_bindings()
+    role_key_counts: Dict[str, int] = {}
+    explicit_role_entries = 0
+    for binding in bindings:
+        role = str(binding.get("role") or DEFAULT_API_KEY_ROLE)
+        role_key_counts[role] = role_key_counts.get(role, 0) + 1
+        if bool(binding.get("explicit_role")):
+            explicit_role_entries += 1
     return {
         "auth_enabled": enabled,
-        "configured_keys_count": len(keys),
+        "configured_keys_count": len(bindings),
         "auth_methods": ["X-API-Key header", "api_key query param"] if enabled else [],
+        "role_mode_enabled": explicit_role_entries > 0,
+        "default_role": DEFAULT_API_KEY_ROLE,
+        "configured_roles": sorted(role_key_counts.keys()),
+        "role_key_counts": role_key_counts,
     }

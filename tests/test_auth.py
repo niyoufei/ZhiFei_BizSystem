@@ -14,6 +14,7 @@ from app.auth import (
     get_valid_api_keys,
     is_auth_enabled,
     verify_api_key,
+    verify_ops_api_key,
 )
 
 
@@ -61,6 +62,12 @@ class TestGetValidApiKeys:
     def test_empty_keys_filtered(self):
         """Should filter out empty keys."""
         with patch.dict(os.environ, {API_KEYS_ENV: "key1,,key2,  ,key3"}):
+            result = get_valid_api_keys()
+            assert result == ["key1", "key2", "key3"]
+
+    def test_role_prefixed_keys_are_supported(self):
+        """Should accept role:key syntax and expose raw keys only."""
+        with patch.dict(os.environ, {API_KEYS_ENV: "admin:key1,ops:key2,readonly:key3"}):
             result = get_valid_api_keys()
             assert result == ["key1", "key2", "key3"]
 
@@ -131,6 +138,20 @@ class TestVerifyApiKey:
             assert verify_api_key(api_key_header="key2", api_key_query=None) == "key2"
             assert verify_api_key(api_key_header="key3", api_key_query=None) == "key3"
 
+    def test_admin_dependency_rejects_ops_role(self):
+        """默认受保护接口只允许 admin key。"""
+        with patch.dict(os.environ, {API_KEYS_ENV: "admin:admin-key,ops:ops-key"}):
+            with pytest.raises(HTTPException) as exc_info:
+                verify_api_key(api_key_header="ops-key", api_key_query=None)
+            assert exc_info.value.status_code == 403
+            assert "admin" in exc_info.value.detail
+
+    def test_ops_dependency_accepts_ops_role(self):
+        """运维接口允许 ops key。"""
+        with patch.dict(os.environ, {API_KEYS_ENV: "admin:admin-key,ops:ops-key"}):
+            assert verify_ops_api_key(api_key_header="ops-key", api_key_query=None) == "ops-key"
+            assert verify_ops_api_key(api_key_header="admin-key", api_key_query=None) == "admin-key"
+
 
 class TestGetAuthStatus:
     """Tests for get_auth_status function."""
@@ -153,6 +174,14 @@ class TestGetAuthStatus:
             assert len(result["auth_methods"]) == 2
             assert "X-API-Key header" in result["auth_methods"]
             assert "api_key query param" in result["auth_methods"]
+
+    def test_status_reports_roles_when_enabled(self):
+        with patch.dict(os.environ, {API_KEYS_ENV: "admin:key1,ops:key2,readonly:key3"}):
+            result = get_auth_status()
+            assert result["role_mode_enabled"] is True
+            assert result["default_role"] == "admin"
+            assert result["configured_roles"] == ["admin", "ops", "readonly"]
+            assert result["role_key_counts"] == {"admin": 1, "ops": 1, "readonly": 1}
 
 
 class TestIntegrationWithFastAPI:
@@ -318,3 +347,42 @@ class TestIntegrationWithFastAPI:
             )
             assert response.status_code == 401
             assert "无效的 API Key" in response.json()["detail"]
+
+    def test_ops_key_cannot_call_admin_only_score_endpoint(self):
+        from fastapi.testclient import TestClient
+
+        from app.main import app
+
+        with patch.dict(os.environ, {API_KEYS_ENV: "admin:admin-key,ops:ops-key"}):
+            client = TestClient(app)
+            response = client.post(
+                "/api/v1/score",
+                json={"text": "测试文本"},
+                headers={"X-API-Key": "ops-key"},
+            )
+            assert response.status_code == 403
+            assert "admin" in response.json()["detail"]
+
+    def test_ops_key_can_call_ops_write_endpoint(self):
+        from fastapi.testclient import TestClient
+
+        from app.main import app
+
+        with patch.dict(os.environ, {API_KEYS_ENV: "admin:admin-key,ops:ops-key"}):
+            client = TestClient(app)
+            with patch("app.main._build_data_hygiene_report") as mock_report:
+                mock_report.return_value = {
+                    "generated_at": "2026-03-16T00:00:00Z",
+                    "apply_mode": True,
+                    "valid_project_count": 1,
+                    "orphan_records_total": 0,
+                    "cleaned_records_total": 0,
+                    "datasets": [],
+                    "recommendations": [],
+                }
+                response = client.post(
+                    "/api/v1/system/data_hygiene/repair",
+                    headers={"X-API-Key": "ops-key"},
+                )
+            assert response.status_code == 200
+            assert response.json()["apply_mode"] is True

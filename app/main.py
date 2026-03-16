@@ -72,7 +72,7 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.auth import get_auth_status, verify_api_key
+from app.auth import get_auth_status, verify_api_key, verify_ops_api_key
 from app.cache import (
     cache_score_result,
     clear_score_cache,
@@ -12432,7 +12432,7 @@ def system_data_hygiene() -> DataHygieneResponse:
     responses={**RESPONSES_401},
 )
 def repair_system_data_hygiene(
-    api_key: Optional[str] = Depends(verify_api_key),
+    api_key: Optional[str] = Depends(verify_ops_api_key),
 ) -> DataHygieneResponse:
     """
     数据卫生修复（写操作）。
@@ -21800,7 +21800,7 @@ def delete_ground_truth(
 def evolve_project(
     project_id: str,
     confirm_extreme_sample: bool = Query(False, description="人工确认纳入极端偏差样本"),
-    api_key: Optional[str] = Depends(verify_api_key),
+    api_key: Optional[str] = Depends(verify_ops_api_key),
     locale: str = Depends(get_locale),
 ) -> EvolutionReport:
     """

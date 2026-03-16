@@ -10,6 +10,7 @@ RUNNER="$ROOT_DIR/scripts/run_server_launchd.sh"
 LOG_FILE="$ROOT_DIR/build/server.log"
 MODE_FILE="$ROOT_DIR/build/daemon_mode.txt"
 FORCE_LAUNCHD="${FORCE_LAUNCHD:-0}"
+LOG_KEEP="${LOG_KEEP:-12}"
 
 if ! command -v launchctl >/dev/null 2>&1; then
   echo "launchctl not found; this script is for macOS launchd."
@@ -17,11 +18,6 @@ if ! command -v launchctl >/dev/null 2>&1; then
 fi
 
 mkdir -p "$ROOT_DIR/build"
-if [[ -f "$LOG_FILE" ]]; then
-  log_lines_before="$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)"
-else
-  log_lines_before=0
-fi
 
 if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
   PY_BIN="$ROOT_DIR/.venv/bin/python"
@@ -37,6 +33,16 @@ fi
 echo "Starting launchd service: $LABEL (port=$PORT)"
 launchctl remove "$LABEL" >/dev/null 2>&1 || true
 PORT="$PORT" ./scripts/stop_server.sh >/dev/null 2>&1 || true
+
+if ! "$PY_BIN" "$ROOT_DIR/scripts/rotate_runtime_logs.py" --keep "$LOG_KEEP" "$LOG_FILE" >/dev/null 2>&1; then
+  echo "Warning: runtime log rotation failed; continuing with existing files."
+fi
+
+if [[ -f "$LOG_FILE" ]]; then
+  log_lines_before="$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)"
+else
+  log_lines_before=0
+fi
 
 # Prefer true launchd daemon mode first. If launchd cannot access workspace
 # (common with macOS privacy restrictions), fallback to regular background mode.
