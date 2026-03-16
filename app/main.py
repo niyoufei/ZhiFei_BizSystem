@@ -7917,6 +7917,316 @@ def _resolve_submission_score_fields(
     }
 
 
+def _build_submission_dual_track_summary(
+    submission: Dict[str, object],
+    *,
+    latest_qingtian_by_submission: Optional[Dict[str, Dict[str, object]]] = None,
+    allow_pred_score: bool = True,
+    score_scale_max: int = DEFAULT_SCORE_SCALE_MAX,
+) -> Dict[str, object]:
+    report = submission.get("report") if isinstance(submission.get("report"), dict) else {}
+    raw_rule_total = _to_float_or_none(report.get("rule_total_score"))
+    if raw_rule_total is None:
+        raw_rule_total = _to_float_or_none(report.get("total_score"))
+    raw_pred_total = _to_float_or_none(report.get("pred_total_score"))
+    if not allow_pred_score:
+        raw_pred_total = None
+
+    display_fields = _resolve_submission_score_fields(
+        submission,
+        allow_pred_score=allow_pred_score,
+        score_scale_max=score_scale_max,
+    )
+    submission_id = str(submission.get("id") or "")
+    qingtian_row = (
+        (latest_qingtian_by_submission or {}).get(submission_id)
+        if isinstance(latest_qingtian_by_submission, dict)
+        else None
+    )
+    qingtian_score_100 = (
+        _resolve_qingtian_total_score_100(
+            qingtian_row if isinstance(qingtian_row, dict) else {},
+            default_score_scale_max=score_scale_max,
+        )
+        if isinstance(qingtian_row, dict)
+        else None
+    )
+    qingtian_score = _convert_score_from_100(qingtian_score_100, score_scale_max)
+
+    independent_delta_100 = (
+        round(float(raw_rule_total) - float(qingtian_score_100), 2)
+        if raw_rule_total is not None and qingtian_score_100 is not None
+        else None
+    )
+    approximation_delta_100 = (
+        round(float(raw_pred_total) - float(qingtian_score_100), 2)
+        if raw_pred_total is not None and qingtian_score_100 is not None
+        else None
+    )
+    independent_abs_delta_100 = (
+        round(abs(float(independent_delta_100)), 2) if independent_delta_100 is not None else None
+    )
+    approximation_abs_delta_100 = (
+        round(abs(float(approximation_delta_100)), 2)
+        if approximation_delta_100 is not None
+        else None
+    )
+    abs_delta_improvement_100 = (
+        round(float(independent_abs_delta_100) - float(approximation_abs_delta_100), 2)
+        if independent_abs_delta_100 is not None and approximation_abs_delta_100 is not None
+        else None
+    )
+
+    alignment_status = "independent_only"
+    governance_hint = "当前仅有独立评分，可继续录入真实评标并训练逼近层。"
+    if qingtian_score_100 is not None and raw_pred_total is not None:
+        if abs_delta_improvement_100 is not None and abs_delta_improvement_100 > 0:
+            alignment_status = "approximation_better"
+            governance_hint = "逼近层当前更接近青天，可继续沉淀校准样本和 few-shot。"
+        elif abs_delta_improvement_100 is not None and abs_delta_improvement_100 < 0:
+            alignment_status = "independent_better"
+            governance_hint = "独立层当前更接近青天，建议优先查看闭环治理面板。"
+        else:
+            alignment_status = "tracks_tied"
+            governance_hint = "独立层与逼近层当前和青天偏差相当，可继续观察。"
+    elif qingtian_score_100 is not None:
+        alignment_status = "await_approximation"
+        governance_hint = "已录入青天对照，但当前尚未形成逼近分，建议继续闭环进化。"
+    elif raw_pred_total is not None:
+        alignment_status = "await_ground_truth"
+        governance_hint = "已生成逼近分，需录入青天结果后才能验证逼近效果。"
+
+    return {
+        "display_score_source": str(display_fields.get("score_source") or "rule"),
+        "display_score_label": "逼近分" if raw_pred_total is not None else "独立分",
+        "display_total_score": display_fields.get("total_score"),
+        "independent_score": display_fields.get("rule_total_score"),
+        "approximation_score": display_fields.get("pred_total_score"),
+        "qingtian_score": float(qingtian_score) if qingtian_score is not None else None,
+        "scale_max": int(score_scale_max),
+        "scale_label": _score_scale_label(score_scale_max),
+        "has_approximation_score": raw_pred_total is not None,
+        "has_ground_truth": qingtian_score_100 is not None,
+        "independent_delta_100": independent_delta_100,
+        "approximation_delta_100": approximation_delta_100,
+        "independent_abs_delta_100": independent_abs_delta_100,
+        "approximation_abs_delta_100": approximation_abs_delta_100,
+        "abs_delta_improvement_100": abs_delta_improvement_100,
+        "alignment_status": alignment_status,
+        "governance_hint": governance_hint,
+    }
+
+
+def _build_submission_dual_track_overview(
+    summaries: List[Dict[str, object]],
+) -> Dict[str, object]:
+    rows = [row for row in summaries if isinstance(row, dict)]
+    if not rows:
+        return {
+            "submission_count": 0,
+            "dual_track_count": 0,
+            "ground_truth_count": 0,
+            "independent_avg": None,
+            "approximation_avg": None,
+            "qingtian_avg": None,
+            "independent_abs_delta_avg_100": None,
+            "approximation_abs_delta_avg_100": None,
+            "abs_delta_improvement_avg_100": None,
+            "headline": "当前暂无已评分施组。",
+        }
+
+    def _avg(values: List[Optional[float]]) -> Optional[float]:
+        nums = [float(v) for v in values if v is not None]
+        if not nums:
+            return None
+        return round(sum(nums) / len(nums), 2)
+
+    independent_rows = [row for row in rows if row.get("independent_score") is not None]
+    approximation_rows = [row for row in rows if bool(row.get("has_approximation_score"))]
+    qingtian_rows = [row for row in rows if bool(row.get("has_ground_truth"))]
+    improvement_avg = _avg(
+        [_to_float_or_none(row.get("abs_delta_improvement_100")) for row in rows]
+    )
+
+    headline = "当前默认展示独立分。"
+    if approximation_rows:
+        headline = "当前默认展示逼近分，并保留独立分作审计基线。"
+    if improvement_avg is not None:
+        if improvement_avg > 0:
+            headline = "逼近层整体上更接近青天，建议继续用治理面板稳态收敛。"
+        elif improvement_avg < 0:
+            headline = "独立层整体上更接近青天，建议先检查闭环样本和校准版本。"
+
+    return {
+        "submission_count": len(rows),
+        "dual_track_count": len(approximation_rows),
+        "ground_truth_count": len(qingtian_rows),
+        "independent_avg": _avg(
+            [_to_float_or_none(row.get("independent_score")) for row in independent_rows]
+        ),
+        "approximation_avg": _avg(
+            [_to_float_or_none(row.get("approximation_score")) for row in approximation_rows]
+        ),
+        "qingtian_avg": _avg(
+            [_to_float_or_none(row.get("qingtian_score")) for row in qingtian_rows]
+        ),
+        "independent_abs_delta_avg_100": _avg(
+            [_to_float_or_none(row.get("independent_abs_delta_100")) for row in qingtian_rows]
+        ),
+        "approximation_abs_delta_avg_100": _avg(
+            [_to_float_or_none(row.get("approximation_abs_delta_100")) for row in qingtian_rows]
+        ),
+        "abs_delta_improvement_avg_100": improvement_avg,
+        "headline": headline,
+    }
+
+
+def _render_submission_dual_track_score_html(
+    summary: Dict[str, object],
+    *,
+    is_pending: bool = False,
+    is_blocked: bool = False,
+) -> str:
+    if is_pending:
+        return '<span class="note">待评分</span>'
+    if is_blocked:
+        return '<span class="error">待补资料后重评分</span>'
+    display_label = str(summary.get("display_score_label") or "独立分")
+    display_total = summary.get("display_total_score")
+    detail_tokens: List[str] = []
+    independent_score = summary.get("independent_score")
+    approximation_score = summary.get("approximation_score")
+    qingtian_score = summary.get("qingtian_score")
+    if independent_score is not None:
+        detail_tokens.append(f"独立: {independent_score}")
+    if approximation_score is not None:
+        detail_tokens.append(f"逼近: {approximation_score}")
+    if qingtian_score is not None:
+        detail_tokens.append(f"青天: {qingtian_score}")
+    scale_label = str(summary.get("scale_label") or "").strip()
+    if scale_label:
+        detail_tokens.append(scale_label)
+    lines: List[str] = []
+    if display_total is not None:
+        lines.append(
+            "<div><strong>"
+            + html_lib.escape(f"{display_label}: {display_total}")
+            + "</strong></div>"
+        )
+    elif detail_tokens:
+        lines.append("<div><strong>" + html_lib.escape(display_label) + "</strong></div>")
+    if detail_tokens:
+        lines.append('<div class="note">' + html_lib.escape(" / ".join(detail_tokens)) + "</div>")
+    return "".join(lines) or "-"
+
+
+def _render_submission_dual_track_diagnostic_html(
+    summary: Dict[str, object],
+    *,
+    project_id: str,
+    is_pending: bool = False,
+    is_blocked: bool = False,
+) -> str:
+    if is_pending:
+        return '<span class="note">待评分后生成双轨诊断。</span>'
+    if is_blocked:
+        return '<span class="error">资料门禁未通过，建议先补齐资料再查看偏差诊断。</span>'
+
+    alignment_status = str(summary.get("alignment_status") or "").strip()
+    alignment_label_map = {
+        "approximation_better": "逼近层更接近青天",
+        "independent_better": "独立层更接近青天",
+        "tracks_tied": "双轨与青天偏差相当",
+        "await_approximation": "已录入青天，等待逼近层收敛",
+        "await_ground_truth": "等待青天结果验证",
+        "independent_only": "当前仅有独立评分",
+    }
+    delta_tokens: List[str] = []
+    independent_delta = summary.get("independent_delta_100")
+    approximation_delta = summary.get("approximation_delta_100")
+    improvement = summary.get("abs_delta_improvement_100")
+    if independent_delta is not None:
+        delta_tokens.append(f"独立偏差 {independent_delta}")
+    if approximation_delta is not None:
+        delta_tokens.append(f"逼近偏差 {approximation_delta}")
+    if improvement is not None:
+        delta_tokens.append(f"改善 {improvement}")
+
+    lines: List[str] = []
+    if delta_tokens:
+        lines.append(
+            "<div><strong>"
+            + html_lib.escape(" / ".join(delta_tokens))
+            + '</strong><span class="note">（100分口径）</span></div>'
+        )
+    else:
+        lines.append('<div class="note">暂无青天对照偏差。</div>')
+    if alignment_status:
+        lines.append(
+            '<div class="note">'
+            + html_lib.escape(alignment_label_map.get(alignment_status, alignment_status))
+            + "</div>"
+        )
+    governance_hint = str(summary.get("governance_hint") or "").strip()
+    if governance_hint:
+        lines.append('<div class="note">' + html_lib.escape(governance_hint) + "</div>")
+    if project_id:
+        lines.append(
+            '<div style="margin-top:6px"><button type="button" class="secondary '
+            'js-open-feedback-governance" data-project-id="'
+            + html_lib.escape(project_id)
+            + '">查看闭环治理</button></div>'
+        )
+    return "".join(lines)
+
+
+def _render_submission_dual_track_overview_html(
+    overview: Dict[str, object],
+    *,
+    project_id: str,
+) -> str:
+    if not overview or int(_to_float_or_none(overview.get("submission_count")) or 0) <= 0:
+        return ""
+
+    metric_tokens: List[str] = [
+        f"已评分施组 {int(_to_float_or_none(overview.get('submission_count')) or 0)} 份",
+        f"双轨样本 {int(_to_float_or_none(overview.get('dual_track_count')) or 0)} 份",
+        f"青天对照 {int(_to_float_or_none(overview.get('ground_truth_count')) or 0)} 份",
+    ]
+    optional_metrics = [
+        ("independent_avg", "独立均分"),
+        ("approximation_avg", "逼近均分"),
+        ("qingtian_avg", "青天均分"),
+        ("independent_abs_delta_avg_100", "独立平均绝对偏差"),
+        ("approximation_abs_delta_avg_100", "逼近平均绝对偏差"),
+        ("abs_delta_improvement_avg_100", "平均改善"),
+    ]
+    for key, label in optional_metrics:
+        value = _to_float_or_none(overview.get(key))
+        if value is None:
+            continue
+        suffix = "（100分口径）" if "delta" in key or "improvement" in key else ""
+        metric_tokens.append(f"{label} {value}{suffix}")
+
+    html = "<strong>双轨总览</strong>"
+    headline = str(overview.get("headline") or "").strip()
+    if headline:
+        html += '<p style="margin:6px 0 0 0;color:#1f2937">' + html_lib.escape(headline) + "</p>"
+    html += (
+        '<p style="margin:6px 0 0 0;font-size:12px;color:#475569">'
+        + html_lib.escape("；".join(metric_tokens))
+        + "</p>"
+    )
+    if project_id:
+        html += (
+            '<div style="margin-top:8px"><button type="button" class="secondary '
+            'js-open-feedback-governance" data-project-id="'
+            + html_lib.escape(project_id)
+            + '">打开闭环治理面板</button></div>'
+        )
+    return html
+
+
 def _report_is_blocked(report: Optional[Dict[str, object]]) -> bool:
     if not isinstance(report, dict):
         return False
@@ -18990,18 +19300,36 @@ def list_submissions(
     project = next((p for p in projects if str(p.get("id")) == project_id), {"id": project_id})
     allow_pred_score = _select_calibrator_model(project) is not None
     score_scale_max = _resolve_project_score_scale_max(project)
-    score_scale_max = _resolve_project_score_scale_max(project)
-
     submissions = [s for s in load_submissions() if s["project_id"] == project_id]
+    submission_ids = {
+        str(item.get("id") or "").strip()
+        for item in submissions
+        if str(item.get("id") or "").strip()
+    }
+    qingtian_results = load_qingtian_results()
+    latest_qingtian_by_submission = _latest_records_by_submission(
+        [
+            row
+            for row in qingtian_results
+            if str(row.get("submission_id") or "").strip() in submission_ids
+        ]
+    )
     material_knowledge_snapshot = _build_material_knowledge_profile(project_id)
 
     def _view_submission(item: Dict[str, object]) -> Dict[str, object]:
         view = dict(item)
+        dual_track_summary = _build_submission_dual_track_summary(
+            item,
+            latest_qingtian_by_submission=latest_qingtian_by_submission,
+            allow_pred_score=allow_pred_score,
+            score_scale_max=score_scale_max,
+        )
         report_obj = item.get("report")
         if not isinstance(report_obj, dict):
             total_display = _convert_score_from_100(item.get("total_score"), score_scale_max)
             if total_display is not None:
                 view["total_score"] = total_display
+            view["report"] = {"dual_track_summary": dual_track_summary}
             return view
         report = dict(report_obj)
         _ensure_report_score_self_awareness(
@@ -19043,6 +19371,7 @@ def list_submissions(
         report["rule_total_score"] = display_rule
         report["llm_total_score"] = display_llm
         report["total_score"] = display_total
+        report["dual_track_summary"] = dual_track_summary
         if display_total is not None:
             view["total_score"] = display_total
         view["report"] = report
@@ -22832,6 +23161,8 @@ def index(
     )
     initial_material_rows: List[str] = []
     initial_submission_rows: List[str] = []
+    initial_submission_dual_track_overview_html = ""
+    initial_submission_dual_track_overview_display = "none"
     initial_material_knowledge = (
         _build_material_knowledge_profile(selected_project_id) if selected_project_id else {}
     )
@@ -22882,6 +23213,19 @@ def index(
                 s for s in submissions_all if str(s.get("project_id", "")) == selected_project_id
             ]
             selected_submissions.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
+            submission_ids = {
+                str(item.get("id") or "").strip()
+                for item in selected_submissions
+                if str(item.get("id") or "").strip()
+            }
+            latest_qingtian_by_submission = _latest_records_by_submission(
+                [
+                    row
+                    for row in load_qingtian_results()
+                    if str(row.get("submission_id") or "").strip() in submission_ids
+                ]
+            )
+            dual_track_overview_rows: List[Dict[str, object]] = []
             for s in selected_submissions:
                 submission_id = html_lib.escape(str(s.get("id", "")))
                 filename_raw = str(s.get("filename", ""))
@@ -22893,14 +23237,6 @@ def index(
                     project_id=selected_project_id,
                     material_knowledge_snapshot=initial_material_knowledge,
                 )
-                pred_total_raw = report.get("pred_total_score")
-                rule_total_raw = report.get("rule_total_score")
-                if not allow_pred_initial:
-                    pred_total_raw = None
-                llm_total_raw = report.get("llm_total_score")
-                pred_total = _convert_score_from_100(pred_total_raw, score_scale_initial)
-                rule_total = _convert_score_from_100(rule_total_raw, score_scale_initial)
-                llm_total = _convert_score_from_100(llm_total_raw, score_scale_initial)
                 scoring_status = str(report.get("scoring_status") or "").strip().lower()
                 is_pending = scoring_status == "pending"
                 is_blocked = scoring_status == "blocked"
@@ -22921,27 +23257,31 @@ def index(
                     if isinstance(report_meta.get("score_self_awareness"), dict)
                     else {}
                 )
-                primary_total = (
-                    pred_total
-                    if pred_total is not None
-                    else _convert_score_from_100(s.get("total_score"), score_scale_initial)
+                dual_track_summary = _build_submission_dual_track_summary(
+                    s,
+                    latest_qingtian_by_submission=latest_qingtian_by_submission,
+                    allow_pred_score=allow_pred_initial,
+                    score_scale_max=score_scale_initial,
+                )
+                report["dual_track_summary"] = dual_track_summary
+                is_scored = not is_pending and not is_blocked
+                if is_scored:
+                    dual_track_overview_rows.append(dual_track_summary)
+                score_cell = _render_submission_dual_track_score_html(
+                    dual_track_summary,
+                    is_pending=is_pending,
+                    is_blocked=is_blocked,
                 )
                 if is_pending:
-                    score_cell = '<span class="note">待评分</span>'
+                    diagnostic_cell = '<span class="note">待评分后生成双轨诊断。</span>'
                 elif is_blocked:
-                    score_cell = '<span class="error">待补资料后重评分</span>'
-                elif pred_total is not None:
-                    score_cell = html_lib.escape(str(pred_total))
-                    note_items: List[str] = []
-                    if rule_total is not None:
-                        note_items.append("规则: " + html_lib.escape(str(rule_total)))
-                    if llm_total is not None:
-                        note_items.append("LLM: " + html_lib.escape(str(llm_total)))
-                    if note_items:
-                        score_cell += '<div class="note">' + " / ".join(note_items) + "</div>"
+                    diagnostic_cell = (
+                        '<span class="error">资料门禁未通过，建议先补齐资料后重评分。</span>'
+                    )
                 else:
-                    score_cell = (
-                        "-" if primary_total is None else html_lib.escape(str(primary_total))
+                    diagnostic_cell = _render_submission_dual_track_diagnostic_html(
+                        dual_track_summary,
+                        project_id=selected_project_id,
                     )
                 evidence_hits = int(_to_float_or_none(evidence_trace.get("total_hits")) or 0)
                 evidence_file_hits = int(
@@ -23053,6 +23393,7 @@ def index(
                     "<tr>"
                     + f"<td>{filename}</td>"
                     + f"<td>{score_cell}</td>"
+                    + f"<td>{diagnostic_cell}</td>"
                     + f"<td>{created_at}</td>"
                     + (
                         "<td>"
@@ -23061,8 +23402,20 @@ def index(
                     )
                     + "</tr>"
                 )
+            if dual_track_overview_rows:
+                initial_submission_dual_track_overview_html = (
+                    _render_submission_dual_track_overview_html(
+                        _build_submission_dual_track_overview(dual_track_overview_rows),
+                        project_id=selected_project_id,
+                    )
+                )
+                initial_submission_dual_track_overview_display = (
+                    "block" if initial_submission_dual_track_overview_html else "none"
+                )
         except Exception:
             initial_submission_rows = []
+            initial_submission_dual_track_overview_html = ""
+            initial_submission_dual_track_overview_display = "none"
     initial_material_rows_html = "".join(initial_material_rows)
     initial_submission_rows_html = "".join(initial_submission_rows)
     initial_materials_empty_display = "none" if initial_material_rows else "block"
@@ -23636,7 +23989,8 @@ def index(
           <strong>本项目施组列表</strong>
           <button type="button" id="btnRefreshSubmissions" class="secondary" style="margin-left:8px">刷新</button>
         </div>
-        <table id="submissionsTable"><thead><tr><th>文件名</th><th>总分</th><th>上传时间</th><th>操作</th></tr></thead><tbody>__SUBMISSION_ROWS__</tbody></table>
+        <div id="submissionDualTrackOverview" class="result-block" style="display:__SUBMISSION_DUAL_TRACK_OVERVIEW_DISPLAY__">__SUBMISSION_DUAL_TRACK_OVERVIEW_HTML__</div>
+        <table id="submissionsTable"><thead><tr><th>文件名</th><th>双轨分数</th><th>偏差诊断</th><th>上传时间</th><th>操作</th></tr></thead><tbody>__SUBMISSION_ROWS__</tbody></table>
         <p id="submissionsEmpty" style="font-size:13px;color:#64748b;margin:6px 0 0 0;display:__SUBMISSIONS_EMPTY_DISPLAY__">暂无施组，请下方添加。</p>
         <div class="upload-box">
           <form id="uploadShigong" method="post" action="/web/upload_shigong" enctype="multipart/form-data" class="inline-form">
@@ -24408,6 +24762,7 @@ def index(
             const tbody = table ? table.querySelector('tbody') : null;
             const emptyEl = document.getElementById('submissionsEmpty');
             if (tbody) tbody.innerHTML = '';
+            clearSubmissionDualTrackOverview();
             let res;
             let text = '';
             let rows = [];
@@ -24431,6 +24786,7 @@ def index(
                 emptyEl.textContent = '施组列表加载失败（HTTP ' + String((res && res.status) || 0) + '）';
                 emptyEl.style.display = 'block';
               }
+              clearSubmissionDualTrackOverview();
               await fallbackFetchScoringReadiness(pid);
               return;
             }
@@ -24442,97 +24798,17 @@ def index(
               if (window.renderMaterialUtilizationPanel && typeof window.renderMaterialUtilizationPanel === 'function') {
                 window.renderMaterialUtilizationPanel(null);
               }
+              clearSubmissionDualTrackOverview();
               await fallbackFetchScoringReadiness(pid);
               return;
             }
             if (emptyEl) emptyEl.style.display = 'none';
             rows.forEach((s) => {
               const tr = document.createElement('tr');
-              const sid = fallbackEscapeHtml(String((s && s.id) || ''));
-              const fn = fallbackEscapeHtml(String((s && s.filename) || ''));
-              const createdAt = fallbackEscapeHtml(String((s && s.created_at) || '').slice(0, 19));
-              const report = (s && s.report) || {};
-              const pred = report && report.pred_total_score != null ? report.pred_total_score : null;
-              const rule = report && report.rule_total_score != null ? report.rule_total_score : null;
-              const llm = report && report.llm_total_score != null ? report.llm_total_score : null;
-              const scoringStatus = String((report && report.scoring_status) || '').toLowerCase();
-              const isPending = scoringStatus === 'pending';
-              const isBlocked = scoringStatus === 'blocked';
-              const reportMeta = (report && typeof report.meta === 'object') ? report.meta : {};
-              const utilGate = (reportMeta && typeof reportMeta.material_utilization_gate === 'object')
-                ? reportMeta.material_utilization_gate
-                : {};
-              const evidenceTrace = (reportMeta && typeof reportMeta.evidence_trace === 'object')
-                ? reportMeta.evidence_trace
-                : {};
-              const utilBlocked = !!(utilGate && utilGate.blocked);
-              let scoreHtml = '-';
-              if (isPending) {
-                scoreHtml = '<span class="note">待评分</span>';
-              } else if (isBlocked) {
-                scoreHtml = '<span class="error">待补资料后重评分</span>';
-              } else if (pred != null) {
-                scoreHtml = fallbackEscapeHtml(String(pred));
-                const notes = [];
-                if (rule != null) notes.push('规则: ' + fallbackEscapeHtml(String(rule)));
-                if (llm != null) notes.push('LLM: ' + fallbackEscapeHtml(String(llm)));
-                if (notes.length) scoreHtml += '<div class="note">' + notes.join(' / ') + '</div>';
-              } else if (s && s.total_score != null) {
-                scoreHtml = fallbackEscapeHtml(String(s.total_score));
-              }
-              const evidenceCount = Number(evidenceTrace.total_hits || 0);
-              const evidenceFileCount = Number(evidenceTrace.source_files_hit_count || 0);
-              if (!isPending && evidenceCount > 0) {
-                scoreHtml += '<div class="note">证据命中: '
-                  + fallbackEscapeHtml(String(evidenceCount))
-                  + ' 条 / 文件覆盖: '
-                  + fallbackEscapeHtml(String(evidenceFileCount))
-                  + ' 份</div>';
-              }
-              const utilSummary = (reportMeta && typeof reportMeta.material_utilization === 'object')
-                ? reportMeta.material_utilization
-                : {};
-              const utilByType = (utilSummary && typeof utilSummary.by_type === 'object')
-                ? utilSummary.by_type
-                : {};
-              const utilAvailableTypes = Array.isArray(utilSummary.available_types) ? utilSummary.available_types : [];
-              const typeLabelShort = (t) => {
-                const key = String(t || '').trim();
-                if (key === 'tender_qa') return '招答';
-                if (key === 'boq') return '清单';
-                if (key === 'drawing') return '图纸';
-                if (key === 'site_photo') return '照片';
-                return key || '-';
-              };
-              const hasTypeEvidence = (t) => {
-                const row = (utilByType && typeof utilByType[t] === 'object') ? utilByType[t] : {};
-                const retrievalHit = Number((row && row.retrieval_hit) || 0);
-                const consistencyHit = Number((row && row.consistency_hit) || 0);
-                return (retrievalHit + consistencyHit) > 0;
-              };
-              const orderedTypes = ['tender_qa', 'boq', 'drawing', 'site_photo'];
-              const coverageTokens = orderedTypes.map((t) => {
-                const inScope = utilAvailableTypes.includes(t);
-                if (!inScope) return typeLabelShort(t) + '·';
-                return typeLabelShort(t) + (hasTypeEvidence(t) ? '✓' : '×');
-              });
-              if (!isPending && coverageTokens.length) {
-                scoreHtml += '<div class="note">类型覆盖: ' + fallbackEscapeHtml(coverageTokens.join(' / ')) + '</div>';
-              }
-              const evidenceFiles = Array.isArray(evidenceTrace.source_files_hit) ? evidenceTrace.source_files_hit : [];
-              if (!isPending && evidenceFiles.length) {
-                scoreHtml += '<div class="note">命中文件: ' + fallbackEscapeHtml(evidenceFiles.slice(0, 2).join('；')) + (evidenceFiles.length > 2 ? ' 等' : '') + '</div>';
-              }
-              if (utilBlocked) {
-                scoreHtml += '<div class="error">资料利用门禁未达标（建议补齐资料后重评分）</div>';
-              }
-              tr.innerHTML =
-                '<td>' + fn + '</td>'
-                + '<td>' + scoreHtml + '</td>'
-                + '<td>' + createdAt + '</td>'
-                + '<td><button type="button" class="btn-danger js-delete-submission" data-submission-id="' + sid + '" data-project-id="' + fallbackEscapeHtml(pid) + '" data-filename="' + fn + '">删除</button></td>';
+              tr.innerHTML = buildSubmissionTableRowHtml(s, pid, fallbackEscapeHtml);
               if (tbody) tbody.appendChild(tr);
             });
+            renderSubmissionDualTrackOverview(rows, pid, fallbackEscapeHtml);
             if (window.renderMaterialUtilizationPanel && typeof window.renderMaterialUtilizationPanel === 'function') {
               let utilPayload = null;
               for (const s of rows) {
@@ -26557,6 +26833,7 @@ def index(
           }
           if (rowEl) rowEl.remove();
           updateTableEmptyState('submissionsTable', 'submissionsEmpty');
+          if (typeof refreshSubmissions === 'function') await refreshSubmissions(id);
           if (typeof refreshScoringReadiness === 'function') refreshScoringReadiness();
           if (typeof refreshGroundTruthSubmissionOptions === 'function') refreshGroundTruthSubmissionOptions();
           if (typeof refreshScoringDiagnostic === 'function') refreshScoringDiagnostic();
@@ -26599,6 +26876,17 @@ def index(
           if (submissionsTable && !submissionsTable.dataset.deleteBound) {
             submissionsTable.dataset.deleteBound = '1';
             submissionsTable.addEventListener('click', (ev) => {
+              const govBtn = ev.target && ev.target.closest ? ev.target.closest('.js-open-feedback-governance') : null;
+              if (govBtn) {
+                ev.preventDefault();
+                const projectId = govBtn.getAttribute('data-project-id') || resolveProjectId();
+                loadFeedbackGovernancePanel(projectId);
+                const panel = document.getElementById('feedbackGovernanceResult');
+                if (panel && typeof panel.scrollIntoView === 'function') {
+                  panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }
+                return;
+              }
               const btn = ev.target && ev.target.closest ? ev.target.closest('.js-delete-submission') : null;
               if (!btn) return;
               ev.preventDefault();
@@ -26608,6 +26896,21 @@ def index(
                 btn.getAttribute('data-filename') || '',
                 btn.getAttribute('data-project-id') || ''
               );
+            });
+          }
+          const overviewEl = document.getElementById('submissionDualTrackOverview');
+          if (overviewEl && !overviewEl.dataset.govBound) {
+            overviewEl.dataset.govBound = '1';
+            overviewEl.addEventListener('click', (ev) => {
+              const govBtn = ev.target && ev.target.closest ? ev.target.closest('.js-open-feedback-governance') : null;
+              if (!govBtn) return;
+              ev.preventDefault();
+              const projectId = govBtn.getAttribute('data-project-id') || resolveProjectId();
+              loadFeedbackGovernancePanel(projectId);
+              const panel = document.getElementById('feedbackGovernanceResult');
+              if (panel && typeof panel.scrollIntoView === 'function') {
+                panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+              }
             });
           }
           const materialsTable = document.getElementById('materialsTable');
@@ -26632,6 +26935,7 @@ def index(
           const tbody = tbl ? tbl.querySelector('tbody') : null;
           const emptyEl = document.getElementById('submissionsEmpty');
           if (tbody) tbody.innerHTML = '';
+          clearSubmissionDualTrackOverview();
           if (!id) {
             if (emptyEl) {
               emptyEl.textContent = '暂无施组，请先选择项目。';
@@ -26640,6 +26944,7 @@ def index(
             if (typeof clearMaterialUtilizationPanel === 'function') clearMaterialUtilizationPanel();
             if (typeof clearScoringReadinessPanel === 'function') clearScoringReadinessPanel();
             if (typeof clearScoringDiagnosticPanel === 'function') clearScoringDiagnosticPanel();
+            clearSubmissionDualTrackOverview();
             return;
           }
           let res;
@@ -26651,6 +26956,7 @@ def index(
               emptyEl.textContent = '施组列表加载失败，请稍后重试。';
               emptyEl.style.display = 'block';
             }
+            clearSubmissionDualTrackOverview();
             return;
           }
           if (isStaleProjectResponse(id, switchSeq)) return;
@@ -26661,6 +26967,7 @@ def index(
               emptyEl.style.display = 'block';
             }
             if (typeof clearMaterialUtilizationPanel === 'function') clearMaterialUtilizationPanel();
+            clearSubmissionDualTrackOverview();
             if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             return;
           }
@@ -26670,110 +26977,17 @@ def index(
               emptyEl.style.display = 'block';
             }
             if (typeof clearMaterialUtilizationPanel === 'function') clearMaterialUtilizationPanel();
+            clearSubmissionDualTrackOverview();
             if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             return;
           }
           if (emptyEl) emptyEl.style.display = 'none';
           subs.forEach(s => {
             const tr = document.createElement('tr');
-            const rep = (s && typeof s === 'object') ? (s.report || {}) : {};
-            const pred = (rep && rep.pred_total_score != null) ? rep.pred_total_score : null;
-            const rule = (rep && rep.rule_total_score != null) ? rep.rule_total_score : null;
-            const llm = (rep && rep.llm_total_score != null) ? rep.llm_total_score : null;
-            const scoringStatus = String((rep && rep.scoring_status) || '').toLowerCase();
-            const isPending = scoringStatus === 'pending';
-            const isBlocked = scoringStatus === 'blocked';
-            const repMeta = (rep && typeof rep.meta === 'object') ? rep.meta : {};
-            const utilGate = (repMeta && typeof repMeta.material_utilization_gate === 'object')
-              ? repMeta.material_utilization_gate
-              : {};
-            const utilBlocked = !!(utilGate && utilGate.blocked);
-            const evidenceTrace = (repMeta && typeof repMeta.evidence_trace === 'object')
-              ? repMeta.evidence_trace
-              : {};
-            const scoreSelfAwareness = (repMeta && typeof repMeta.score_self_awareness === 'object')
-              ? repMeta.score_self_awareness
-              : {};
-            let scoreHtml = '-';
-            if (isPending) {
-              scoreHtml = '<span class="note">待评分</span>';
-            } else if (isBlocked) {
-              scoreHtml = '<span class="error">待补资料后重评分</span>';
-            } else if (pred != null) {
-              scoreHtml = escapeHtmlText(String(pred));
-              const notes = [];
-              if (rule != null) notes.push('规则: ' + escapeHtmlText(String(rule)));
-              if (llm != null) notes.push('LLM: ' + escapeHtmlText(String(llm)));
-              if (notes.length) scoreHtml += '<div class="note">' + notes.join(' / ') + '</div>';
-            } else if (s && s.total_score != null) {
-              scoreHtml = escapeHtmlText(String(s.total_score));
-            }
-            const evidenceCount = Number(evidenceTrace.total_hits || 0);
-            const evidenceFileCount = Number(evidenceTrace.source_files_hit_count || 0);
-            if (!isPending && evidenceCount > 0) {
-              scoreHtml += '<div class="note">证据命中: ' + escapeHtmlText(evidenceCount) + ' 条 / 文件覆盖: ' + escapeHtmlText(evidenceFileCount) + ' 份</div>';
-            }
-            const utilSummary = (repMeta && typeof repMeta.material_utilization === 'object')
-              ? repMeta.material_utilization
-              : {};
-            const utilByType = (utilSummary && typeof utilSummary.by_type === 'object')
-              ? utilSummary.by_type
-              : {};
-            const utilAvailableTypes = Array.isArray(utilSummary.available_types) ? utilSummary.available_types : [];
-            const typeLabelShort = (t) => {
-              const key = String(t || '').trim();
-              if (key === 'tender_qa') return '招答';
-              if (key === 'boq') return '清单';
-              if (key === 'drawing') return '图纸';
-              if (key === 'site_photo') return '照片';
-              return key || '-';
-            };
-            const hasTypeEvidence = (t) => {
-              const row = (utilByType && typeof utilByType[t] === 'object') ? utilByType[t] : {};
-              const retrievalHit = Number((row && row.retrieval_hit) || 0);
-              const consistencyHit = Number((row && row.consistency_hit) || 0);
-              return (retrievalHit + consistencyHit) > 0;
-            };
-            const orderedTypes = ['tender_qa', 'boq', 'drawing', 'site_photo'];
-            const coverageTokens = orderedTypes.map((t) => {
-              const inScope = utilAvailableTypes.includes(t);
-              if (!inScope) return typeLabelShort(t) + '·';
-              return typeLabelShort(t) + (hasTypeEvidence(t) ? '✓' : '×');
-            });
-            if (!isPending && coverageTokens.length) {
-              scoreHtml += '<div class="note">类型覆盖: ' + escapeHtmlText(coverageTokens.join(' / ')) + '</div>';
-            }
-            const evidenceFiles = Array.isArray(evidenceTrace.source_files_hit) ? evidenceTrace.source_files_hit : [];
-            if (!isPending && evidenceFiles.length) {
-              scoreHtml += '<div class="note">命中文件: ' + escapeHtmlText(evidenceFiles.slice(0, 2).join('；')) + (evidenceFiles.length > 2 ? ' 等' : '') + '</div>';
-            }
-            const awarenessScore = Number(scoreSelfAwareness.score_0_100);
-            const awarenessLevel = String(scoreSelfAwareness.level || '').trim();
-            const awarenessReasons = Array.isArray(scoreSelfAwareness.reasons) ? scoreSelfAwareness.reasons : [];
-            if (!isPending && awarenessLevel) {
-              const awarenessLabel = awarenessLevel === 'high'
-                ? '高'
-                : (awarenessLevel === 'medium' ? '中' : '低');
-              const awarenessText = Number.isFinite(awarenessScore)
-                ? '（' + awarenessScore.toFixed(1) + '）'
-                : '';
-              const reasonPreview = awarenessReasons
-                .map((item) => String(item || '').trim())
-                .filter((item) => !!item)
-                .slice(0, 1)
-                .join('；');
-              scoreHtml += '<div class="note">评分置信度: ' + escapeHtmlText(awarenessLabel + awarenessText + (reasonPreview ? ' / ' + reasonPreview : '')) + '</div>';
-            }
-            if (utilBlocked) {
-              scoreHtml += '<div class="error">资料利用门禁未达标（建议补齐资料后重评分）</div>';
-            }
-            tr.innerHTML =
-              '<td>' + escapeHtmlText(s.filename || '') + '</td>' +
-              '<td>' + scoreHtml + '</td>' +
-              '<td>' + escapeHtmlText((s.created_at || '').slice(0,19)) + '</td>' +
-              '<td><button type="button" class="btn-danger js-delete-submission" data-submission-id="' + escapeHtmlText(String(s.id || '')) + '" data-project-id="' + escapeHtmlText(String(id || '')) + '" data-filename="' + escapeHtmlText(String(s.filename || '')) + '">删除</button></td>';
+            tr.innerHTML = buildSubmissionTableRowHtml(s, id, escapeHtmlText);
             if (tbody) tbody.appendChild(tr);
           });
+          renderSubmissionDualTrackOverview(subs, id, escapeHtmlText);
           let utilPayload = null;
           for (const s of subs) {
             const rep = (s && typeof s === 'object') ? (s.report || {}) : {};
@@ -27208,6 +27422,262 @@ def index(
             .replace(/>/g, '&gt;')
             .replace(/\"/g, '&quot;')
             .replace(/'/g, '&#39;');
+        }
+        function toFiniteNumber(v) {
+          const n = Number(v);
+          return Number.isFinite(n) ? n : null;
+        }
+        function getSubmissionReport(submission) {
+          return (submission && typeof submission.report === 'object') ? submission.report : {};
+        }
+        function getSubmissionScoringFlags(submission) {
+          const report = getSubmissionReport(submission);
+          const scoringStatus = String((report && report.scoring_status) || '').toLowerCase();
+          return {
+            report: report,
+            isPending: scoringStatus === 'pending',
+            isBlocked: scoringStatus === 'blocked',
+          };
+        }
+        function getSubmissionDualTrackSummary(submission) {
+          const report = getSubmissionReport(submission);
+          return (report && typeof report.dual_track_summary === 'object')
+            ? report.dual_track_summary
+            : {};
+        }
+        function submissionAlignmentStatusLabel(status) {
+          const raw = String(status || '').trim();
+          if (raw === 'approximation_better') return '逼近层更接近青天';
+          if (raw === 'independent_better') return '独立层更接近青天';
+          if (raw === 'tracks_tied') return '双轨与青天偏差相当';
+          if (raw === 'await_approximation') return '已录入青天，等待逼近层收敛';
+          if (raw === 'await_ground_truth') return '等待青天结果验证';
+          if (raw === 'independent_only') return '当前仅有独立评分';
+          return raw || '待生成';
+        }
+        function buildSubmissionDualTrackScoreHtml(submission, escapeFn) {
+          const esc = typeof escapeFn === 'function' ? escapeFn : ((v) => String(v == null ? '' : v));
+          const flags = getSubmissionScoringFlags(submission);
+          if (flags.isPending) return '<span class="note">待评分</span>';
+          if (flags.isBlocked) return '<span class="error">待补资料后重评分</span>';
+          const summary = getSubmissionDualTrackSummary(submission);
+          const detailTokens = [];
+          const independentScore = toFiniteNumber(summary.independent_score);
+          const approximationScore = toFiniteNumber(summary.approximation_score);
+          const qingtianScore = toFiniteNumber(summary.qingtian_score);
+          if (independentScore != null) detailTokens.push('独立: ' + independentScore);
+          if (approximationScore != null) detailTokens.push('逼近: ' + approximationScore);
+          if (qingtianScore != null) detailTokens.push('青天: ' + qingtianScore);
+          const scaleLabel = String(summary.scale_label || '').trim();
+          if (scaleLabel) detailTokens.push(scaleLabel);
+          const displayLabel = String(summary.display_score_label || (approximationScore != null ? '逼近分' : '独立分'));
+          const displayTotal = summary.display_total_score != null
+            ? summary.display_total_score
+            : ((submission && submission.total_score != null) ? submission.total_score : null);
+          let html = '-';
+          if (displayTotal != null) {
+            html = '<div><strong>' + esc(displayLabel + ': ' + displayTotal) + '</strong></div>';
+          } else if (detailTokens.length) {
+            html = '<div><strong>' + esc(displayLabel) + '</strong></div>';
+          }
+          if (detailTokens.length) {
+            html += '<div class="note">' + esc(detailTokens.join(' / ')) + '</div>';
+          }
+          return html;
+        }
+        function buildSubmissionDualTrackDiagnosticHtml(submission, projectId, escapeFn) {
+          const esc = typeof escapeFn === 'function' ? escapeFn : ((v) => String(v == null ? '' : v));
+          const flags = getSubmissionScoringFlags(submission);
+          if (flags.isPending) return '<span class="note">待评分后生成双轨诊断。</span>';
+          if (flags.isBlocked) return '<span class="error">资料门禁未通过，建议先补齐资料后重评分。</span>';
+          const summary = getSubmissionDualTrackSummary(submission);
+          const deltaTokens = [];
+          const independentDelta = toFiniteNumber(summary.independent_delta_100);
+          const approximationDelta = toFiniteNumber(summary.approximation_delta_100);
+          const improvement = toFiniteNumber(summary.abs_delta_improvement_100);
+          if (independentDelta != null) deltaTokens.push('独立偏差 ' + independentDelta);
+          if (approximationDelta != null) deltaTokens.push('逼近偏差 ' + approximationDelta);
+          if (improvement != null) deltaTokens.push('改善 ' + improvement);
+          let html = '';
+          if (deltaTokens.length) {
+            html += '<div><strong>' + esc(deltaTokens.join(' / ')) + '</strong><span class="note">（100分口径）</span></div>';
+          } else {
+            html += '<div class="note">暂无青天对照偏差。</div>';
+          }
+          const alignmentLabel = submissionAlignmentStatusLabel(summary.alignment_status);
+          if (alignmentLabel) {
+            html += '<div class="note">' + esc(alignmentLabel) + '</div>';
+          }
+          const governanceHint = String(summary.governance_hint || '').trim();
+          if (governanceHint) {
+            html += '<div class="note">' + esc(governanceHint) + '</div>';
+          }
+          if (projectId) {
+            html += '<div style="margin-top:6px"><button type="button" class="secondary js-open-feedback-governance" data-project-id="' + esc(String(projectId || '')) + '">查看闭环治理</button></div>';
+          }
+          return html;
+        }
+        function buildSubmissionTableRowHtml(submission, projectId, escapeFn) {
+          const esc = typeof escapeFn === 'function' ? escapeFn : ((v) => String(v == null ? '' : v));
+          const row = (submission && typeof submission === 'object') ? submission : {};
+          const flags = getSubmissionScoringFlags(row);
+          const report = flags.report;
+          const repMeta = (report && typeof report.meta === 'object') ? report.meta : {};
+          const utilGate = (repMeta && typeof repMeta.material_utilization_gate === 'object')
+            ? repMeta.material_utilization_gate
+            : {};
+          const utilBlocked = !!(utilGate && utilGate.blocked);
+          const evidenceTrace = (repMeta && typeof repMeta.evidence_trace === 'object')
+            ? repMeta.evidence_trace
+            : {};
+          const scoreSelfAwareness = (repMeta && typeof repMeta.score_self_awareness === 'object')
+            ? repMeta.score_self_awareness
+            : {};
+          let scoreHtml = buildSubmissionDualTrackScoreHtml(row, esc);
+          let diagnosticHtml = buildSubmissionDualTrackDiagnosticHtml(row, projectId, esc);
+          const evidenceCount = Number(evidenceTrace.total_hits || 0);
+          const evidenceFileCount = Number(evidenceTrace.source_files_hit_count || 0);
+          if (!flags.isPending && evidenceCount > 0) {
+            scoreHtml += '<div class="note">证据命中: ' + esc(evidenceCount) + ' 条 / 文件覆盖: ' + esc(evidenceFileCount) + ' 份</div>';
+          }
+          const utilSummary = (repMeta && typeof repMeta.material_utilization === 'object')
+            ? repMeta.material_utilization
+            : {};
+          const utilByType = (utilSummary && typeof utilSummary.by_type === 'object')
+            ? utilSummary.by_type
+            : {};
+          const utilAvailableTypes = Array.isArray(utilSummary.available_types) ? utilSummary.available_types : [];
+          const typeLabelShort = (t) => {
+            const key = String(t || '').trim();
+            if (key === 'tender_qa') return '招答';
+            if (key === 'boq') return '清单';
+            if (key === 'drawing') return '图纸';
+            if (key === 'site_photo') return '照片';
+            return key || '-';
+          };
+          const hasTypeEvidence = (t) => {
+            const utilRow = (utilByType && typeof utilByType[t] === 'object') ? utilByType[t] : {};
+            const retrievalHit = Number((utilRow && utilRow.retrieval_hit) || 0);
+            const consistencyHit = Number((utilRow && utilRow.consistency_hit) || 0);
+            return (retrievalHit + consistencyHit) > 0;
+          };
+          const orderedTypes = ['tender_qa', 'boq', 'drawing', 'site_photo'];
+          const coverageTokens = orderedTypes.map((t) => {
+            const inScope = utilAvailableTypes.includes(t);
+            if (!inScope) return typeLabelShort(t) + '·';
+            return typeLabelShort(t) + (hasTypeEvidence(t) ? '✓' : '×');
+          });
+          if (!flags.isPending && coverageTokens.length) {
+            scoreHtml += '<div class="note">类型覆盖: ' + esc(coverageTokens.join(' / ')) + '</div>';
+          }
+          const evidenceFiles = Array.isArray(evidenceTrace.source_files_hit) ? evidenceTrace.source_files_hit : [];
+          if (!flags.isPending && evidenceFiles.length) {
+            scoreHtml += '<div class="note">命中文件: ' + esc(evidenceFiles.slice(0, 2).join('；')) + (evidenceFiles.length > 2 ? ' 等' : '') + '</div>';
+          }
+          const awarenessScore = Number(scoreSelfAwareness.score_0_100);
+          const awarenessLevel = String(scoreSelfAwareness.level || '').trim();
+          const awarenessReasons = Array.isArray(scoreSelfAwareness.reasons) ? scoreSelfAwareness.reasons : [];
+          if (!flags.isPending && awarenessLevel) {
+            const awarenessLabel = awarenessLevel === 'high'
+              ? '高'
+              : (awarenessLevel === 'medium' ? '中' : '低');
+            const awarenessText = Number.isFinite(awarenessScore)
+              ? '（' + awarenessScore.toFixed(1) + '）'
+              : '';
+            const reasonPreview = awarenessReasons
+              .map((item) => String(item || '').trim())
+              .filter((item) => !!item)
+              .slice(0, 1)
+              .join('；');
+            scoreHtml += '<div class="note">评分置信度: ' + esc(awarenessLabel + awarenessText + (reasonPreview ? ' / ' + reasonPreview : '')) + '</div>';
+          }
+          if (utilBlocked) {
+            scoreHtml += '<div class="error">资料利用门禁未达标（建议补齐资料后重评分）</div>';
+          }
+          return ''
+            + '<td>' + esc(row.filename || '') + '</td>'
+            + '<td>' + scoreHtml + '</td>'
+            + '<td>' + diagnosticHtml + '</td>'
+            + '<td>' + esc(String(row.created_at || '').slice(0, 19)) + '</td>'
+            + '<td><button type="button" class="btn-danger js-delete-submission" data-submission-id="' + esc(String(row.id || '')) + '" data-project-id="' + esc(String(projectId || '')) + '" data-filename="' + esc(String(row.filename || '')) + '">删除</button></td>';
+        }
+        function buildSubmissionDualTrackOverviewHtml(submissions, projectId, escapeFn) {
+          const esc = typeof escapeFn === 'function' ? escapeFn : ((v) => String(v == null ? '' : v));
+          const rows = Array.isArray(submissions) ? submissions : [];
+          if (!rows.length) return '';
+          const scoredSummaries = rows
+            .filter((row) => {
+              const flags = getSubmissionScoringFlags(row);
+              return !flags.isPending && !flags.isBlocked;
+            })
+            .map((row) => getSubmissionDualTrackSummary(row))
+            .filter((summary) => summary && typeof summary === 'object');
+          const avg = (values) => {
+            const nums = values
+              .map((value) => toFiniteNumber(value))
+              .filter((value) => value != null);
+            if (!nums.length) return null;
+            return Number((nums.reduce((sum, value) => sum + value, 0) / nums.length).toFixed(2));
+          };
+          const independentRows = scoredSummaries.filter((row) => toFiniteNumber(row.independent_score) != null);
+          const approximationRows = scoredSummaries.filter((row) => !!row.has_approximation_score);
+          const qingtianRows = scoredSummaries.filter((row) => !!row.has_ground_truth);
+          const improvementAvg = avg(scoredSummaries.map((row) => row.abs_delta_improvement_100));
+          let headline = '当前暂无已评分施组。';
+          if (scoredSummaries.length) {
+            headline = approximationRows.length
+              ? '当前默认展示逼近分，并保留独立分作审计基线。'
+              : '当前默认展示独立分。';
+          }
+          if (improvementAvg != null) {
+            if (improvementAvg > 0) {
+              headline = '逼近层整体上更接近青天，建议继续用治理面板稳态收敛。';
+            } else if (improvementAvg < 0) {
+              headline = '独立层整体上更接近青天，建议先检查闭环样本和校准版本。';
+            }
+          }
+          const metricTokens = [
+            '已评分施组 ' + scoredSummaries.length + ' 份',
+            '双轨样本 ' + approximationRows.length + ' 份',
+            '青天对照 ' + qingtianRows.length + ' 份',
+          ];
+          const metricSpecs = [
+            ['independent_avg', '独立均分', avg(independentRows.map((row) => row.independent_score)), false],
+            ['approximation_avg', '逼近均分', avg(approximationRows.map((row) => row.approximation_score)), false],
+            ['qingtian_avg', '青天均分', avg(qingtianRows.map((row) => row.qingtian_score)), false],
+            ['independent_abs_delta_avg_100', '独立平均绝对偏差', avg(qingtianRows.map((row) => row.independent_abs_delta_100)), true],
+            ['approximation_abs_delta_avg_100', '逼近平均绝对偏差', avg(qingtianRows.map((row) => row.approximation_abs_delta_100)), true],
+            ['abs_delta_improvement_avg_100', '平均改善', improvementAvg, true],
+          ];
+          metricSpecs.forEach((spec) => {
+            const value = spec[2];
+            if (value == null) return;
+            metricTokens.push(spec[1] + ' ' + value + (spec[3] ? '（100分口径）' : ''));
+          });
+          let html = '<strong>双轨总览</strong>';
+          html += '<p style="margin:6px 0 0 0;color:#1f2937">' + esc(headline) + '</p>';
+          html += '<p style="margin:6px 0 0 0;font-size:12px;color:#475569">' + esc(metricTokens.join('；')) + '</p>';
+          if (projectId) {
+            html += '<div style="margin-top:8px"><button type="button" class="secondary js-open-feedback-governance" data-project-id="' + esc(String(projectId || '')) + '">打开闭环治理面板</button></div>';
+          }
+          return html;
+        }
+        function clearSubmissionDualTrackOverview() {
+          const el = document.getElementById('submissionDualTrackOverview');
+          if (!el) return;
+          el.style.display = 'none';
+          el.innerHTML = '';
+        }
+        function renderSubmissionDualTrackOverview(submissions, projectId, escapeFn) {
+          const el = document.getElementById('submissionDualTrackOverview');
+          if (!el) return;
+          const html = buildSubmissionDualTrackOverviewHtml(submissions, projectId, escapeFn);
+          if (!html) {
+            clearSubmissionDualTrackOverview();
+            return;
+          }
+          el.style.display = 'block';
+          el.innerHTML = html;
         }
         function materialTypeDisplayName(materialType) {
           const t = String(materialType || '').trim();
@@ -30099,6 +30569,13 @@ def index(
     html = html.replace("__MATERIAL_ROWS__", initial_material_rows_html)
     html = html.replace("__MATERIALS_EMPTY_DISPLAY__", initial_materials_empty_display)
     html = html.replace("__SUBMISSION_ROWS__", initial_submission_rows_html)
+    html = html.replace(
+        "__SUBMISSION_DUAL_TRACK_OVERVIEW_HTML__", initial_submission_dual_track_overview_html
+    )
+    html = html.replace(
+        "__SUBMISSION_DUAL_TRACK_OVERVIEW_DISPLAY__",
+        initial_submission_dual_track_overview_display,
+    )
     html = html.replace("__SUBMISSIONS_EMPTY_DISPLAY__", initial_submissions_empty_display)
     html = html.replace("__PROJECT_SCORE_SCALE_MAX__", str(score_scale_initial))
     html = html.replace(

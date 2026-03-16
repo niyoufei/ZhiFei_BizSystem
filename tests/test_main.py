@@ -412,10 +412,13 @@ class TestIndexEndpoint:
         assert 'id="btnEvidenceTrace"' in response.text
         assert 'id="btnScoringBasis"' in response.text
         assert 'id="btnScoringDiagnostic"' in response.text
+        assert 'id="submissionDualTrackOverview"' in response.text
         assert 'id="shigongGateSummary"' in response.text
         assert 'id="scoringBasisResult"' in response.text
         assert 'id="scoringDiagnosticResult"' in response.text
         assert "解析状态" in response.text
+        assert "双轨分数" in response.text
+        assert "偏差诊断" in response.text
         assert 'id="groundTruthSubmissionSelect"' in response.text
         assert 'id="groundTruthFile"' not in response.text
         assert "/ground_truth/from_submission" in response.text
@@ -433,7 +436,55 @@ class TestIndexEndpoint:
         assert "__EXPERT_WEIGHTS_SUMMARY__" not in response.text
         assert "__GLOBAL_NOTICE_HTML__" not in response.text
         assert "__SELECTED_PROJECT_ID__" not in response.text
+        assert "__SUBMISSION_DUAL_TRACK_OVERVIEW_HTML__" not in response.text
+        assert "__SUBMISSION_DUAL_TRACK_OVERVIEW_DISPLAY__" not in response.text
         assert "__PROJECT_SCORE_SCALE_MAX__" not in response.text
+
+    def test_index_renders_dual_track_submission_overview_for_selected_project(self, client):
+        submission = {
+            "id": "s1",
+            "project_id": "p1",
+            "filename": "施工组织设计A.docx",
+            "total_score": 82.0,
+            "report": {
+                "scoring_status": "scored",
+                "total_score": 82.0,
+                "rule_total_score": 78.0,
+                "pred_total_score": 82.0,
+                "llm_total_score": 81.2,
+                "meta": {},
+            },
+            "text": "t1",
+            "created_at": "2026-03-16T08:00:00+00:00",
+        }
+        with (
+            patch("app.main.load_projects", return_value=[{"id": "p1", "name": "测试项目"}]),
+            patch("app.main.load_materials", return_value=[]),
+            patch("app.main.load_submissions", return_value=[submission]),
+            patch(
+                "app.main.load_qingtian_results",
+                return_value=[{"submission_id": "s1", "qt_total_score": 84.0}],
+            ),
+            patch("app.main.load_expert_profiles", return_value=[]),
+            patch(
+                "app.main._select_calibrator_model",
+                return_value={"calibrator_version": "calib_v1"},
+            ),
+            patch("app.main._build_material_knowledge_profile", return_value={}),
+            patch("app.main._ensure_report_score_self_awareness"),
+        ):
+            response = client.get("/?project_id=p1")
+
+        assert response.status_code == 200
+        page = response.text
+        assert 'id="submissionDualTrackOverview"' in page
+        assert "双轨总览" in page
+        assert "双轨分数" in page
+        assert "偏差诊断" in page
+        assert "逼近层整体上更接近青天" in page
+        assert "独立: 78.0 / 逼近: 82.0 / 青天: 84.0 / 100分制" in page
+        assert "独立偏差 -6.0 / 逼近偏差 -2.0 / 改善 4.0" in page
+        assert "打开闭环治理面板" in page
 
     def test_index_renders_16_dimension_weight_sliders(self, client):
         """Index page should render 16-dimension focus sliders on first paint."""
@@ -4475,6 +4526,54 @@ class TestSubmissionsEndpoint:
         assert data[0]["report"]["score_scale_max"] == 5
         assert data[0]["report"]["score_scale_label"] == "5分制"
         assert data[0]["report"]["raw_total_score_100"] == 70.0
+
+    def test_list_submissions_includes_dual_track_summary(self, client):
+        submission = {
+            "id": "s1",
+            "project_id": "p1",
+            "filename": "f1.txt",
+            "total_score": 82.0,
+            "report": {
+                "scoring_status": "scored",
+                "total_score": 82.0,
+                "rule_total_score": 78.0,
+                "pred_total_score": 82.0,
+                "llm_total_score": 81.5,
+                "meta": {},
+            },
+            "text": "t1",
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+        with (
+            patch("app.main.ensure_data_dirs"),
+            patch("app.main.load_projects", return_value=[{"id": "p1"}]),
+            patch("app.main.load_submissions", return_value=[submission]),
+            patch(
+                "app.main.load_qingtian_results",
+                return_value=[{"submission_id": "s1", "qt_total_score": 84.0}],
+            ),
+            patch(
+                "app.main._select_calibrator_model",
+                return_value={"calibrator_version": "calib_v1"},
+            ),
+            patch("app.main._build_material_knowledge_profile", return_value={}),
+            patch("app.main._ensure_report_score_self_awareness"),
+        ):
+            response = client.get("/api/v1/projects/p1/submissions")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        summary = data[0]["report"]["dual_track_summary"]
+        assert summary["display_score_label"] == "逼近分"
+        assert summary["independent_score"] == 78.0
+        assert summary["approximation_score"] == 82.0
+        assert summary["qingtian_score"] == 84.0
+        assert summary["independent_abs_delta_100"] == 6.0
+        assert summary["approximation_abs_delta_100"] == 2.0
+        assert summary["abs_delta_improvement_100"] == 4.0
+        assert summary["alignment_status"] == "approximation_better"
+        assert "逼近层当前更接近青天" in summary["governance_hint"]
 
     def test_score_scale_round_trip_preserves_precision_for_5_scale(self):
         from app.main import _convert_score_from_100, _convert_score_to_100
