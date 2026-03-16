@@ -10,9 +10,11 @@ from fastapi import HTTPException
 
 from app.auth import (
     API_KEYS_ENV,
+    DEFAULT_API_KEY_ROLE,
     get_auth_status,
     get_valid_api_keys,
     is_auth_enabled,
+    resolve_api_key_for_role,
     verify_api_key,
     verify_ops_api_key,
 )
@@ -85,6 +87,49 @@ class TestIsAuthEnabled:
         """Should return True when API keys are configured."""
         with patch.dict(os.environ, {API_KEYS_ENV: "test-key"}):
             assert is_auth_enabled() is True
+
+
+class TestResolveApiKeyForRole:
+    def test_returns_none_when_no_keys(self):
+        assert resolve_api_key_for_role("ops", api_keys_value="") is None
+
+    def test_prefers_explicit_role(self):
+        assert (
+            resolve_api_key_for_role(
+                "ops",
+                api_keys_value="admin:admin-key,ops:ops-key,readonly:ro-key",
+                fallback_roles=("admin",),
+            )
+            == "ops-key"
+        )
+
+    def test_falls_back_to_admin_when_ops_missing(self):
+        assert (
+            resolve_api_key_for_role(
+                "ops",
+                api_keys_value="admin:admin-key,readonly:ro-key",
+                fallback_roles=("admin",),
+            )
+            == "admin-key"
+        )
+
+    def test_legacy_format_defaults_to_admin(self):
+        assert (
+            resolve_api_key_for_role(
+                DEFAULT_API_KEY_ROLE,
+                api_keys_value="legacy-key-1,legacy-key-2",
+            )
+            == "legacy-key-1"
+        )
+
+    def test_returns_first_key_when_requested_role_missing_and_no_fallback(self):
+        assert (
+            resolve_api_key_for_role(
+                "readonly",
+                api_keys_value="admin:admin-key,ops:ops-key",
+            )
+            == "admin-key"
+        )
 
 
 class TestVerifyApiKey:

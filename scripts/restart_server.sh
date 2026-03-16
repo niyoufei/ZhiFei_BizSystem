@@ -20,6 +20,10 @@ else
   PYTHON_BIN="python3"
 fi
 
+if [[ -z "$API_KEY" ]]; then
+  API_KEY="$("$PYTHON_BIN" "$ROOT_DIR/scripts/resolve_api_key.py" --preferred-role ops --fallback-role admin 2>/dev/null || true)"
+fi
+
 mkdir -p build
 
 preflight_python_runtime() {

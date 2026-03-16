@@ -13,6 +13,15 @@ FAIL_ON_ORPHAN="${FAIL_ON_ORPHAN:-0}"
 OUT_JSON="${OUT_JSON:-$ROOT_DIR/build/data_hygiene_latest.json}"
 OUT_MD="${OUT_MD:-$ROOT_DIR/build/data_hygiene_latest.md}"
 
+if [[ -z "$API_KEY" ]]; then
+  if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+    PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
+  else
+    PYTHON_BIN="python3"
+  fi
+  API_KEY="$("$PYTHON_BIN" "$ROOT_DIR/scripts/resolve_api_key.py" --preferred-role ops --fallback-role admin 2>/dev/null || true)"
+fi
+
 curl_with_auth() {
   if [[ -n "$API_KEY" ]]; then
     curl -fsS -H "X-API-Key: $API_KEY" "$@"

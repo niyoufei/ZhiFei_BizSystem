@@ -43,9 +43,7 @@ def _normalize_api_key_role(role: object) -> str:
     return normalized if normalized in API_KEY_ROLES else ""
 
 
-def _parse_api_key_bindings() -> list[Dict[str, object]]:
-    """解析 API_KEYS，兼容旧格式与 role:key 格式。"""
-    keys_str = os.environ.get(API_KEYS_ENV, "")
+def _parse_api_key_bindings_from_text(keys_str: str) -> list[Dict[str, object]]:
     if not keys_str.strip():
         return []
 
@@ -70,6 +68,41 @@ def _parse_api_key_bindings() -> list[Dict[str, object]]:
             "explicit_role": explicit_role,
         }
     return list(bindings_by_key.values())
+
+
+def _parse_api_key_bindings() -> list[Dict[str, object]]:
+    """解析 API_KEYS，兼容旧格式与 role:key 格式。"""
+    keys_str = os.environ.get(API_KEYS_ENV, "")
+    return _parse_api_key_bindings_from_text(keys_str)
+
+
+def resolve_api_key_for_role(
+    preferred_role: str,
+    *,
+    api_keys_value: Optional[str] = None,
+    fallback_roles: tuple[str, ...] = (),
+) -> Optional[str]:
+    """按角色解析可用 API key。
+
+    兼容旧格式：
+    - `key1,key2` 会被视为 admin key 集合
+    - `admin:key1,ops:key2` 则按显式角色选择
+    """
+    normalized_role = _normalize_api_key_role(preferred_role) or DEFAULT_API_KEY_ROLE
+    if api_keys_value is None:
+        api_keys_value = os.environ.get(API_KEYS_ENV, "")
+    bindings = _parse_api_key_bindings_from_text(str(api_keys_value or ""))
+    if not bindings:
+        return None
+
+    search_roles = (normalized_role,) + tuple(
+        role for role in fallback_roles if _normalize_api_key_role(role)
+    )
+    for role in search_roles:
+        match = next((row for row in bindings if str(row.get("role")) == role), None)
+        if match is not None:
+            return str(match.get("key") or "")
+    return str(bindings[0].get("key") or "") or None
 
 
 def get_valid_api_keys() -> list[str]:

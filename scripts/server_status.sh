@@ -10,6 +10,15 @@ API_KEY="${API_KEY:-}"
 HEALTH_URL="http://127.0.0.1:${PORT}/health"
 SCREEN_SESSION="zhifei_server_${PORT}"
 
+if [[ -z "$API_KEY" ]]; then
+  if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+    PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
+  else
+    PYTHON_BIN="python3"
+  fi
+  API_KEY="$("$PYTHON_BIN" "$ROOT_DIR/scripts/resolve_api_key.py" --preferred-role ops --fallback-role admin 2>/dev/null || true)"
+fi
+
 curl_with_auth() {
   if [[ -n "$API_KEY" ]]; then
     curl -fsS -H "X-API-Key: $API_KEY" "$@"

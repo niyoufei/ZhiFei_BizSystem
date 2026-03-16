@@ -23,6 +23,10 @@ else
   PYTHON_BIN="python3"
 fi
 
+if [[ -z "$API_KEY" ]]; then
+  API_KEY="$("$PYTHON_BIN" "$ROOT_DIR/scripts/resolve_api_key.py" --preferred-role ops --fallback-role admin 2>/dev/null || true)"
+fi
+
 if command -v screen >/dev/null 2>&1; then
   screen -S "$SCREEN_SESSION" -X quit >/dev/null 2>&1 || true
   screen -wipe >/dev/null 2>&1 || true
