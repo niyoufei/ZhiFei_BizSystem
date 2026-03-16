@@ -1013,6 +1013,21 @@ class TestProjectsEndpoints:
         data = response.json()
         assert len(data) == 1
         assert data[0]["id"] == "p1"
+
+    @patch("app.main.save_projects")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_projects_backfills_missing_name(self, mock_ensure, mock_load, mock_save, client):
+        """List projects should tolerate legacy records without name."""
+        mock_load.return_value = [{"id": "p1", "meta": {}, "created_at": "2026-01-01T00:00:00Z"}]
+
+        response = client.get("/api/v1/projects")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["name"] == "恢复项目_p1"
+        mock_save.assert_called_once()
         assert data[0]["created_at"]
         mock_save.assert_called_once()
 

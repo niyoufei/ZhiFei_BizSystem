@@ -2198,6 +2198,10 @@ def _ensure_project_v2_fields(
     project: Dict[str, object], *, include_engine_defaults: bool = True
 ) -> bool:
     changed = False
+    if not str(project.get("name") or "").strip():
+        project_id = str(project.get("id") or "").strip()
+        project["name"] = f"恢复项目_{project_id[:8]}" if project_id else "恢复项目"
+        changed = True
     if not project.get("created_at"):
         project["created_at"] = _now_iso()
         changed = True

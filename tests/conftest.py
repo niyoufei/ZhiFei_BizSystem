@@ -102,3 +102,10 @@ def isolate_repo_persistent_data(tmp_path_factory: pytest.TempPathFactory):
                     path.rmdir()
                 except OSError:
                     pass
+
+
+@pytest.fixture(autouse=True)
+def isolate_auth_env(monkeypatch: pytest.MonkeyPatch):
+    """避免本机 .env 中的 API_KEYS/ZHIFEI_REQUIRE_API_KEYS 污染测试默认行为。"""
+    monkeypatch.delenv("API_KEYS", raising=False)
+    monkeypatch.delenv("ZHIFEI_REQUIRE_API_KEYS", raising=False)
