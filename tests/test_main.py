@@ -4591,6 +4591,75 @@ class TestSubmissionsEndpoint:
         assert summary["alignment_status"] == "approximation_better"
         assert "逼近层当前更接近青天" in summary["governance_hint"]
 
+    def test_list_submissions_with_latest_report_returns_ranked_rows(self, client):
+        submissions = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "A.docx",
+                "total_score": 82.0,
+                "report": {"scoring_status": "scored", "total_score": 82.0, "meta": {}},
+                "text": "t1",
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            {
+                "id": "s2",
+                "project_id": "p1",
+                "filename": "B.docx",
+                "total_score": 79.0,
+                "report": {"scoring_status": "scored", "total_score": 79.0, "meta": {}},
+                "text": "t2",
+                "created_at": "2026-01-02T00:00:00Z",
+            },
+        ]
+        latest_reports = [
+            {
+                "id": "r1",
+                "project_id": "p1",
+                "submission_id": "s1",
+                "created_at": "2026-01-03T00:00:00Z",
+                "rule_total_score": 78.0,
+                "pred_total_score": 83.0,
+                "suggestions": [{"expected_gain": 3.0}],
+            },
+            {
+                "id": "r2",
+                "project_id": "p1",
+                "submission_id": "s2",
+                "created_at": "2026-01-04T00:00:00Z",
+                "rule_total_score": 80.0,
+                "pred_total_score": 81.0,
+                "suggestions": [{"expected_gain": 1.0}],
+            },
+        ]
+
+        with (
+            patch("app.main.ensure_data_dirs"),
+            patch("app.main.load_projects", return_value=[{"id": "p1"}]),
+            patch("app.main.load_submissions", return_value=submissions),
+            patch("app.main.load_score_reports", return_value=latest_reports),
+            patch("app.main.load_qingtian_results", return_value=[]),
+            patch(
+                "app.main._select_calibrator_model",
+                return_value={"calibrator_version": "calib_v1"},
+            ),
+            patch("app.main._build_material_knowledge_profile", return_value={}),
+            patch("app.main._ensure_report_score_self_awareness"),
+        ):
+            response = client.get("/api/v1/projects/p1/submissions?with=latest_report")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert len(data["submissions"]) == 2
+        first = next(row for row in data["submissions"] if row["submission_id"] == "s1")
+        second = next(row for row in data["submissions"] if row["submission_id"] == "s2")
+        assert first["latest_report"]["rank_by_pred"] == 1
+        assert second["latest_report"]["rank_by_pred"] == 2
+        assert first["latest_report"]["rank_by_rule"] == 2
+        assert second["latest_report"]["rank_by_rule"] == 1
+        assert first["latest_report"]["top_expected_gain"] == 3.0
+
     def test_score_scale_round_trip_preserves_precision_for_5_scale(self):
         from app.main import _convert_score_from_100, _convert_score_to_100
 

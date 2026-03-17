@@ -346,3 +346,67 @@ def build_selected_project_submission_render_context(
         "overview_html": overview_html,
         "overview_display": overview_display,
     }
+
+
+def build_project_pre_score_rows(
+    project_id: str,
+    submissions_view: List[Dict[str, object]],
+    *,
+    allow_pred_score: bool,
+    score_scale_max: int,
+) -> List[Dict[str, object]]:
+    main = _main()
+    latest_reports = main._latest_records_by_submission(
+        [row for row in main.load_score_reports() if str(row.get("project_id")) == project_id]
+    )
+    rows: List[Dict[str, object]] = []
+    for submission in submissions_view:
+        submission_id = str(submission.get("id"))
+        latest = latest_reports.get(submission_id, {})
+        suggestions = latest.get("suggestions") or []
+        top_gain = 0.0
+        if suggestions and isinstance(suggestions[0], dict):
+            top_gain = float(suggestions[0].get("expected_gain", 0.0))
+        pred_total_raw = latest.get("pred_total_score")
+        if not allow_pred_score:
+            pred_total_raw = None
+        rule_total_raw = float(latest.get("rule_total_score", submission.get("total_score", 0.0)))
+        pred_total = main._convert_score_from_100(pred_total_raw, score_scale_max)
+        rule_total = main._convert_score_from_100(rule_total_raw, score_scale_max)
+        top_gain_display = main._convert_score_from_100(top_gain, score_scale_max)
+        rows.append(
+            {
+                "submission_id": submission_id,
+                "bidder_name": submission.get("bidder_name")
+                or submission.get("filename")
+                or submission_id,
+                "latest_report": {
+                    "report_id": latest.get("id"),
+                    "rule_total_score": float(rule_total if rule_total is not None else 0.0),
+                    "pred_total_score": pred_total,
+                    "rank_by_pred": None,
+                    "rank_by_rule": None,
+                    "top_expected_gain": round(
+                        float(top_gain_display if top_gain_display is not None else 0.0), 2
+                    ),
+                    "updated_at": latest.get("created_at") or submission.get("created_at"),
+                },
+            }
+        )
+
+    pred_sorted = sorted(
+        rows,
+        key=lambda row: (
+            -float(row["latest_report"]["pred_total_score"])
+            if row["latest_report"]["pred_total_score"] is not None
+            else float("inf")
+        ),
+    )
+    for idx, row in enumerate(pred_sorted, start=1):
+        if row["latest_report"]["pred_total_score"] is not None:
+            row["latest_report"]["rank_by_pred"] = idx
+
+    rule_sorted = sorted(rows, key=lambda row: -float(row["latest_report"]["rule_total_score"]))
+    for idx, row in enumerate(rule_sorted, start=1):
+        row["latest_report"]["rank_by_rule"] = idx
+    return rows

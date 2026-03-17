@@ -18158,63 +18158,15 @@ def list_submissions(
     if with_ != "latest_report":
         return [SubmissionRecord(**s) for s in submissions_view]
 
-    latest_reports = _latest_records_by_submission(
-        [r for r in load_score_reports() if str(r.get("project_id")) == project_id]
-    )
-
-    rows: List[Dict[str, object]] = []
-    for s in submissions_view:
-        sid = str(s.get("id"))
-        latest = latest_reports.get(sid, {})
-        suggestions = latest.get("suggestions") or []
-        top_gain = 0.0
-        if suggestions and isinstance(suggestions[0], dict):
-            top_gain = float(suggestions[0].get("expected_gain", 0.0))
-        pred_total_raw = latest.get("pred_total_score")
-        if not allow_pred_score:
-            pred_total_raw = None
-        rule_total_raw = float(latest.get("rule_total_score", s.get("total_score", 0.0)))
-        pred_total = _convert_score_from_100(pred_total_raw, score_scale_max)
-        rule_total = _convert_score_from_100(rule_total_raw, score_scale_max)
-        top_gain_display = _convert_score_from_100(top_gain, score_scale_max)
-        rows.append(
-            {
-                "submission_id": sid,
-                "bidder_name": s.get("bidder_name") or s.get("filename") or sid,
-                "latest_report": {
-                    "report_id": latest.get("id"),
-                    "rule_total_score": float(rule_total if rule_total is not None else 0.0),
-                    "pred_total_score": pred_total,
-                    "rank_by_pred": None,
-                    "rank_by_rule": None,
-                    "top_expected_gain": round(
-                        float(top_gain_display if top_gain_display is not None else 0.0), 2
-                    ),
-                    "updated_at": latest.get("created_at") or s.get("created_at"),
-                },
-            }
-        )
-
-    pred_sorted = sorted(
-        rows,
-        key=lambda x: (
-            -float(x["latest_report"]["pred_total_score"])
-            if x["latest_report"]["pred_total_score"] is not None
-            else float("inf")
-        ),
-    )
-    for idx, row in enumerate(pred_sorted, start=1):
-        if row["latest_report"]["pred_total_score"] is not None:
-            row["latest_report"]["rank_by_pred"] = idx
-
-    rule_sorted = sorted(rows, key=lambda x: -float(x["latest_report"]["rule_total_score"]))
-    for idx, row in enumerate(rule_sorted, start=1):
-        row["latest_report"]["rank_by_rule"] = idx
-
     return ProjectPreScoreListResponse(
         project_id=project_id,
         expert_profile_id=project.get("expert_profile_id"),
-        submissions=rows,
+        submissions=submission_dual_track_views_module.build_project_pre_score_rows(
+            project_id,
+            submissions_view,
+            allow_pred_score=allow_pred_score,
+            score_scale_max=score_scale_max,
+        ),
     )
 
 
