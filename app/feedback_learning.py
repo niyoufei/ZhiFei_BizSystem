@@ -681,3 +681,66 @@ def finalize_ground_truth_learning_record(
             "feedback_closed_loop": record.get("feedback_closed_loop") or {},
         },
     )
+
+
+def finalize_ground_truth_batch_learning_records(
+    project_id: str,
+    items: List[Dict[str, object]],
+    *,
+    locale: str,
+    trigger: str,
+) -> List[Dict[str, object]]:
+    main = _main()
+    success_record_ids: List[str] = []
+    for item in items:
+        record = item.get("record")
+        if not item.get("ok") or not isinstance(record, dict):
+            continue
+        try:
+            sync_result = main._sync_ground_truth_record_to_qingtian(project_id, record)
+            sync_payload = sync_result if isinstance(sync_result, dict) else {}
+            feedback_guardrail = sync_payload.get("feedback_guardrail")
+            few_shot_distillation = sync_payload.get("few_shot_distillation")
+            record["feedback_guardrail"] = main._normalize_feedback_guardrail_state(
+                feedback_guardrail
+            )
+            record["few_shot_distillation"] = main._normalize_few_shot_distillation_state(
+                few_shot_distillation
+            )
+            success_record_ids.append(str(record.get("id") or ""))
+        except Exception as exc:
+            item["detail"] = f"已保存，但同步青天失败：{exc}"
+
+    closed_loop_result = main._run_feedback_closed_loop_safe(
+        project_id,
+        locale=locale,
+        trigger=trigger,
+        ground_truth_record_ids=success_record_ids,
+    )
+    persisted_records = main.load_ground_truth()
+    changed_records = False
+    for item in items:
+        record = item.get("record")
+        if not item.get("ok") or not isinstance(record, dict):
+            continue
+        record["feedback_closed_loop"] = closed_loop_result
+        record_id = str(record.get("id") or "")
+        for idx, stored_row in enumerate(persisted_records):
+            if str(stored_row.get("project_id") or "") != str(project_id):
+                continue
+            if str(stored_row.get("id") or "") != record_id:
+                continue
+            merged = dict(stored_row)
+            merged["feedback_guardrail"] = main._extract_feedback_guardrail(record)
+            merged["few_shot_distillation"] = main._normalize_few_shot_distillation_state(
+                record.get("few_shot_distillation")
+            )
+            merged["feedback_closed_loop"] = closed_loop_result
+            merged["updated_at"] = main._now_iso()
+            persisted_records[idx] = merged
+            item["record"] = merged
+            changed_records = True
+            break
+    if changed_records:
+        main.save_ground_truth(persisted_records)
+    return items

@@ -10879,6 +10879,21 @@ def _finalize_ground_truth_learning_record(
     )
 
 
+def _finalize_ground_truth_batch_learning_records(
+    project_id: str,
+    items: List[Dict[str, object]],
+    *,
+    locale: str,
+    trigger: str = "ground_truth_batch_add",
+) -> List[Dict[str, object]]:
+    return feedback_learning_module.finalize_ground_truth_batch_learning_records(
+        project_id,
+        items,
+        locale=locale,
+        trigger=trigger,
+    )
+
+
 def _rebuild_project_anchors_and_requirements(
     project_id: str,
 ) -> tuple[List[Dict[str, object]], List[Dict[str, object]]]:
@@ -20903,54 +20918,12 @@ async def add_ground_truth_from_files(
         records = load_ground_truth()
         records.extend(success_records)
         save_ground_truth(records)
-        success_record_ids: List[str] = []
-        for item in items:
-            record = item.get("record")
-            if item.get("ok") and isinstance(record, dict):
-                try:
-                    sync_result = _sync_ground_truth_record_to_qingtian(project_id, record)
-                    sync_payload = sync_result if isinstance(sync_result, dict) else {}
-                    feedback_guardrail = sync_payload.get("feedback_guardrail")
-                    few_shot_distillation = sync_payload.get("few_shot_distillation")
-                    record["feedback_guardrail"] = _normalize_feedback_guardrail_state(
-                        feedback_guardrail
-                    )
-                    record["few_shot_distillation"] = _normalize_few_shot_distillation_state(
-                        few_shot_distillation
-                    )
-                    success_record_ids.append(str(record.get("id") or ""))
-                except Exception as e:
-                    item["detail"] = f"已保存，但同步青天失败：{e}"
-        closed_loop_result = _run_feedback_closed_loop_safe(
+        items = _finalize_ground_truth_batch_learning_records(
             project_id,
+            items,
             locale=locale,
             trigger="ground_truth_batch_add",
-            ground_truth_record_ids=success_record_ids,
         )
-        persisted_records = load_ground_truth()
-        changed_records = False
-        for item in items:
-            if item.get("ok") and isinstance(item.get("record"), dict):
-                item["record"]["feedback_closed_loop"] = closed_loop_result
-                record_id = str(item["record"].get("id") or "")
-                for idx, stored_row in enumerate(persisted_records):
-                    if str(stored_row.get("project_id") or "") != str(project_id):
-                        continue
-                    if str(stored_row.get("id") or "") != record_id:
-                        continue
-                    merged = dict(stored_row)
-                    merged["feedback_guardrail"] = _extract_feedback_guardrail(item["record"])
-                    merged["few_shot_distillation"] = _normalize_few_shot_distillation_state(
-                        item["record"].get("few_shot_distillation")
-                    )
-                    merged["feedback_closed_loop"] = closed_loop_result
-                    merged["updated_at"] = _now_iso()
-                    persisted_records[idx] = merged
-                    item["record"] = merged
-                    changed_records = True
-                    break
-        if changed_records:
-            save_ground_truth(persisted_records)
 
     success_count = sum(1 for item in items if item.get("ok"))
     failed_count = len(items) - success_count
