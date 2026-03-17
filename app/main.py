@@ -74,6 +74,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app import feedback_governance as feedback_governance_module
 from app import feedback_learning as feedback_learning_module
+from app import ground_truth_intake as ground_truth_intake_module
 from app.auth import get_auth_status, verify_api_key, verify_ops_api_key
 from app.cache import (
     cache_score_result,
@@ -10894,6 +10895,90 @@ def _finalize_ground_truth_batch_learning_records(
     )
 
 
+def _build_ground_truth_record(
+    project_id: str,
+    *,
+    shigong_text: str,
+    judge_scores: List[float],
+    final_score: float,
+    source: str,
+    locale: str,
+    judge_weights: Optional[List[float]] = None,
+    qualitative_tags_by_judge: Optional[List[List[str]]] = None,
+) -> Dict[str, object]:
+    return ground_truth_intake_module.build_ground_truth_record(
+        project_id,
+        shigong_text=shigong_text,
+        judge_scores=judge_scores,
+        final_score=final_score,
+        source=source,
+        locale=locale,
+        judge_weights=judge_weights,
+        qualitative_tags_by_judge=qualitative_tags_by_judge,
+    )
+
+
+def _build_ground_truth_record_from_submission(
+    project_id: str,
+    *,
+    submission_id: str,
+    judge_scores: List[float],
+    final_score: float,
+    source: str,
+    qualitative_tags_by_judge: Optional[List[List[str]]],
+    locale: str,
+) -> Dict[str, object]:
+    return ground_truth_intake_module.build_ground_truth_record_from_submission(
+        project_id,
+        submission_id=submission_id,
+        judge_scores=judge_scores,
+        final_score=final_score,
+        source=source,
+        qualitative_tags_by_judge=qualitative_tags_by_judge,
+        locale=locale,
+    )
+
+
+def _build_ground_truth_record_from_uploaded_file(
+    project_id: str,
+    *,
+    filename: str,
+    content: bytes,
+    judge_scores_form: str,
+    final_score: float,
+    source: str,
+    locale: str,
+) -> Dict[str, object]:
+    return ground_truth_intake_module.build_ground_truth_record_from_uploaded_file(
+        project_id,
+        filename=filename,
+        content=content,
+        judge_scores_form=judge_scores_form,
+        final_score=final_score,
+        source=source,
+        locale=locale,
+    )
+
+
+def _build_ground_truth_batch_items_from_uploaded_files(
+    project_id: str,
+    *,
+    uploads: List[tuple[str, bytes]],
+    judge_scores_form: str,
+    final_score: float,
+    source: str,
+    locale: str,
+) -> tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    return ground_truth_intake_module.build_ground_truth_batch_items_from_uploaded_files(
+        project_id,
+        uploads=uploads,
+        judge_scores_form=judge_scores_form,
+        final_score=final_score,
+        source=source,
+        locale=locale,
+    )
+
+
 def _rebuild_project_anchors_and_requirements(
     project_id: str,
 ) -> tuple[List[Dict[str, object]], List[Dict[str, object]]]:
@@ -20697,28 +20782,17 @@ def add_ground_truth(
     用于系统学习高分逻辑并进化。
     """
     ensure_data_dirs()
-    if len((payload.shigong_text or "").strip()) < 50:
-        raise HTTPException(
-            status_code=422,
-            detail="施组全文过短，至少 50 字以便学习分析。",
-        )
-    projects = load_projects()
-    project = next((p for p in projects if p["id"] == project_id), None)
-    if project is None:
-        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    score_scale_max = _resolve_project_score_scale_max(project)
-    _assert_valid_final_score(payload.final_score, score_scale_max=score_scale_max)
-    records = load_ground_truth()
-    record = _new_ground_truth_record(
+    record = _build_ground_truth_record(
         project_id=project_id,
         shigong_text=payload.shigong_text,
         judge_scores=payload.judge_scores,
         final_score=payload.final_score,
         source=payload.source,
-        score_scale_max=score_scale_max,
+        locale=locale,
         judge_weights=payload.judge_weights,
         qualitative_tags_by_judge=payload.qualitative_tags_by_judge,
     )
+    records = load_ground_truth()
     records.append(record)
     save_ground_truth(records)
     record = _finalize_ground_truth_learning_record(
@@ -20744,43 +20818,15 @@ def add_ground_truth_from_submission(
 ) -> GroundTruthRecord:
     """从“步骤4已上传施组”中选择一份文件录入真实评标结果，避免重复上传。"""
     ensure_data_dirs()
-    projects = load_projects()
-    project = next((p for p in projects if p["id"] == project_id), None)
-    if project is None:
-        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    score_scale_max = _resolve_project_score_scale_max(project)
-    _assert_valid_final_score(payload.final_score, score_scale_max=score_scale_max)
-
-    submission_id = str(payload.submission_id or "").strip()
-    submissions = load_submissions()
-    submission = next(
-        (
-            s
-            for s in submissions
-            if str(s.get("id")) == submission_id and str(s.get("project_id")) == project_id
-        ),
-        None,
-    )
-    if not submission:
-        raise HTTPException(status_code=404, detail="未找到对应施组，请先在步骤4上传施组。")
-
-    shigong_text = str(submission.get("text") or "").strip()
-    if len(shigong_text) < 50:
-        raise HTTPException(status_code=422, detail="该施组文本过短，暂不支持录入真实评标。")
-
-    record = _new_ground_truth_record(
-        project_id=project_id,
-        shigong_text=shigong_text,
-        judge_scores=[float(x) for x in payload.judge_scores],
-        final_score=float(payload.final_score),
+    record = _build_ground_truth_record_from_submission(
+        project_id,
+        submission_id=payload.submission_id,
+        judge_scores=payload.judge_scores,
+        final_score=payload.final_score,
         source=payload.source,
-        score_scale_max=score_scale_max,
-        judge_weights=None,
         qualitative_tags_by_judge=payload.qualitative_tags_by_judge,
+        locale=locale,
     )
-    record["source_submission_id"] = submission_id
-    record["source_submission_filename"] = submission.get("filename")
-
     records = load_ground_truth()
     records.append(record)
     save_ground_truth(records)
@@ -20813,31 +20859,17 @@ async def add_ground_truth_from_file(
     用于界面简洁录入：选文件 + 评委分 + 最终分即可。
     """
     ensure_data_dirs()
-    projects = load_projects()
-    project = next((p for p in projects if p["id"] == project_id), None)
-    if project is None:
-        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    score_scale_max = _resolve_project_score_scale_max(project)
-    judge_scores_list = _parse_judge_scores_form(judge_scores)
-    _assert_valid_final_score(final_score, score_scale_max=score_scale_max)
     content = await file.read()
-    try:
-        shigong_text = _read_uploaded_file_content(content, file.filename or "")
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    if len(shigong_text.strip()) < 50:
-        raise HTTPException(status_code=422, detail="施组全文过短，至少 50 字以便学习分析。")
-    records = load_ground_truth()
-    record = _new_ground_truth_record(
-        project_id=project_id,
-        shigong_text=shigong_text,
-        judge_scores=judge_scores_list,
+    record = _build_ground_truth_record_from_uploaded_file(
+        project_id,
+        filename=file.filename or "",
+        content=content,
+        judge_scores_form=judge_scores,
         final_score=final_score,
         source=source,
-        score_scale_max=score_scale_max,
-        judge_weights=None,
-        qualitative_tags_by_judge=None,
+        locale=locale,
     )
+    records = load_ground_truth()
     records.append(record)
     save_ground_truth(records)
     record = _finalize_ground_truth_learning_record(
@@ -20868,51 +20900,15 @@ async def add_ground_truth_from_files(
     通过上传多个施组文件批量录入真实评标。后端将逐个解析并保存。
     """
     ensure_data_dirs()
-    projects = load_projects()
-    project = next((p for p in projects if p["id"] == project_id), None)
-    if project is None:
-        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    score_scale_max = _resolve_project_score_scale_max(project)
-    judge_scores_list = _parse_judge_scores_form(judge_scores)
-    _assert_valid_final_score(final_score, score_scale_max=score_scale_max)
-
-    items: List[Dict[str, object]] = []
-    success_records: List[Dict[str, object]] = []
-    for file in files:
-        filename = file.filename or "unknown"
-        content = await file.read()
-        try:
-            shigong_text = _read_uploaded_file_content(content, filename)
-            if len(shigong_text.strip()) < 50:
-                raise ValueError("施组全文过短，至少 50 字以便学习分析。")
-            record = _new_ground_truth_record(
-                project_id=project_id,
-                shigong_text=shigong_text,
-                judge_scores=judge_scores_list,
-                final_score=final_score,
-                source=source,
-                score_scale_max=score_scale_max,
-                judge_weights=None,
-                qualitative_tags_by_judge=None,
-            )
-            success_records.append(record)
-            items.append(
-                {
-                    "filename": filename,
-                    "ok": True,
-                    "record": record,
-                    "detail": None,
-                }
-            )
-        except Exception as e:
-            items.append(
-                {
-                    "filename": filename,
-                    "ok": False,
-                    "record": None,
-                    "detail": str(e),
-                }
-            )
+    uploads = [(file.filename or "unknown", await file.read()) for file in files]
+    items, success_records = _build_ground_truth_batch_items_from_uploaded_files(
+        project_id,
+        uploads=uploads,
+        judge_scores_form=judge_scores,
+        final_score=final_score,
+        source=source,
+        locale=locale,
+    )
 
     if success_records:
         records = load_ground_truth()
