@@ -7965,37 +7965,11 @@ def _render_submission_dual_track_score_html(
     is_pending: bool = False,
     is_blocked: bool = False,
 ) -> str:
-    if is_pending:
-        return '<span class="note">待评分</span>'
-    if is_blocked:
-        return '<span class="error">待补资料后重评分</span>'
-    display_label = str(summary.get("display_score_label") or "独立分")
-    display_total = summary.get("display_total_score")
-    detail_tokens: List[str] = []
-    independent_score = summary.get("independent_score")
-    approximation_score = summary.get("approximation_score")
-    qingtian_score = summary.get("qingtian_score")
-    if independent_score is not None:
-        detail_tokens.append(f"独立: {independent_score}")
-    if approximation_score is not None:
-        detail_tokens.append(f"逼近: {approximation_score}")
-    if qingtian_score is not None:
-        detail_tokens.append(f"青天: {qingtian_score}")
-    scale_label = str(summary.get("scale_label") or "").strip()
-    if scale_label:
-        detail_tokens.append(scale_label)
-    lines: List[str] = []
-    if display_total is not None:
-        lines.append(
-            "<div><strong>"
-            + html_lib.escape(f"{display_label}: {display_total}")
-            + "</strong></div>"
-        )
-    elif detail_tokens:
-        lines.append("<div><strong>" + html_lib.escape(display_label) + "</strong></div>")
-    if detail_tokens:
-        lines.append('<div class="note">' + html_lib.escape(" / ".join(detail_tokens)) + "</div>")
-    return "".join(lines) or "-"
+    return qingtian_dual_track_module.render_submission_dual_track_score_html(
+        summary,
+        is_pending=is_pending,
+        is_blocked=is_blocked,
+    )
 
 
 def _render_submission_dual_track_diagnostic_html(
@@ -8005,57 +7979,12 @@ def _render_submission_dual_track_diagnostic_html(
     is_pending: bool = False,
     is_blocked: bool = False,
 ) -> str:
-    if is_pending:
-        return '<span class="note">待评分后生成双轨诊断。</span>'
-    if is_blocked:
-        return '<span class="error">资料门禁未通过，建议先补齐资料再查看偏差诊断。</span>'
-
-    alignment_status = str(summary.get("alignment_status") or "").strip()
-    alignment_label_map = {
-        "approximation_better": "逼近层更接近青天",
-        "independent_better": "独立层更接近青天",
-        "tracks_tied": "双轨与青天偏差相当",
-        "await_approximation": "已录入青天，等待逼近层收敛",
-        "await_ground_truth": "等待青天结果验证",
-        "independent_only": "当前仅有独立评分",
-    }
-    delta_tokens: List[str] = []
-    independent_delta = summary.get("independent_delta_100")
-    approximation_delta = summary.get("approximation_delta_100")
-    improvement = summary.get("abs_delta_improvement_100")
-    if independent_delta is not None:
-        delta_tokens.append(f"独立偏差 {independent_delta}")
-    if approximation_delta is not None:
-        delta_tokens.append(f"逼近偏差 {approximation_delta}")
-    if improvement is not None:
-        delta_tokens.append(f"改善 {improvement}")
-
-    lines: List[str] = []
-    if delta_tokens:
-        lines.append(
-            "<div><strong>"
-            + html_lib.escape(" / ".join(delta_tokens))
-            + '</strong><span class="note">（100分口径）</span></div>'
-        )
-    else:
-        lines.append('<div class="note">暂无青天对照偏差。</div>')
-    if alignment_status:
-        lines.append(
-            '<div class="note">'
-            + html_lib.escape(alignment_label_map.get(alignment_status, alignment_status))
-            + "</div>"
-        )
-    governance_hint = str(summary.get("governance_hint") or "").strip()
-    if governance_hint:
-        lines.append('<div class="note">' + html_lib.escape(governance_hint) + "</div>")
-    if project_id:
-        lines.append(
-            '<div style="margin-top:6px"><button type="button" class="secondary '
-            'js-open-feedback-governance" data-project-id="'
-            + html_lib.escape(project_id)
-            + '">查看闭环治理</button></div>'
-        )
-    return "".join(lines)
+    return qingtian_dual_track_module.render_submission_dual_track_diagnostic_html(
+        summary,
+        project_id=project_id,
+        is_pending=is_pending,
+        is_blocked=is_blocked,
+    )
 
 
 def _render_submission_dual_track_overview_html(
@@ -8063,46 +7992,10 @@ def _render_submission_dual_track_overview_html(
     *,
     project_id: str,
 ) -> str:
-    if not overview or int(_to_float_or_none(overview.get("submission_count")) or 0) <= 0:
-        return ""
-
-    metric_tokens: List[str] = [
-        f"已评分施组 {int(_to_float_or_none(overview.get('submission_count')) or 0)} 份",
-        f"双轨样本 {int(_to_float_or_none(overview.get('dual_track_count')) or 0)} 份",
-        f"青天对照 {int(_to_float_or_none(overview.get('ground_truth_count')) or 0)} 份",
-    ]
-    optional_metrics = [
-        ("independent_avg", "独立均分"),
-        ("approximation_avg", "逼近均分"),
-        ("qingtian_avg", "青天均分"),
-        ("independent_abs_delta_avg_100", "独立平均绝对偏差"),
-        ("approximation_abs_delta_avg_100", "逼近平均绝对偏差"),
-        ("abs_delta_improvement_avg_100", "平均改善"),
-    ]
-    for key, label in optional_metrics:
-        value = _to_float_or_none(overview.get(key))
-        if value is None:
-            continue
-        suffix = "（100分口径）" if "delta" in key or "improvement" in key else ""
-        metric_tokens.append(f"{label} {value}{suffix}")
-
-    html = "<strong>双轨总览</strong>"
-    headline = str(overview.get("headline") or "").strip()
-    if headline:
-        html += '<p style="margin:6px 0 0 0;color:#1f2937">' + html_lib.escape(headline) + "</p>"
-    html += (
-        '<p style="margin:6px 0 0 0;font-size:12px;color:#475569">'
-        + html_lib.escape("；".join(metric_tokens))
-        + "</p>"
+    return qingtian_dual_track_module.render_submission_dual_track_overview_html(
+        overview,
+        project_id=project_id,
     )
-    if project_id:
-        html += (
-            '<div style="margin-top:8px"><button type="button" class="secondary '
-            'js-open-feedback-governance" data-project-id="'
-            + html_lib.escape(project_id)
-            + '">打开闭环治理面板</button></div>'
-        )
-    return html
 
 
 def _report_is_blocked(report: Optional[Dict[str, object]]) -> bool:
