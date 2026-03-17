@@ -76,6 +76,7 @@ from app import feedback_governance as feedback_governance_module
 from app import feedback_learning as feedback_learning_module
 from app import ground_truth_intake as ground_truth_intake_module
 from app import qingtian_dual_track as qingtian_dual_track_module
+from app import submission_dual_track_views as submission_dual_track_views_module
 from app.auth import get_auth_status, verify_api_key, verify_ops_api_key
 from app.cache import (
     cache_score_result,
@@ -18145,86 +18146,15 @@ def list_submissions(
     ensure_data_dirs()
     projects = load_projects()
     project = next((p for p in projects if str(p.get("id")) == project_id), {"id": project_id})
-    allow_pred_score = _select_calibrator_model(project) is not None
-    score_scale_max = _resolve_project_score_scale_max(project)
     submissions = [s for s in load_submissions() if s["project_id"] == project_id]
-    submission_ids = {
-        str(item.get("id") or "").strip()
-        for item in submissions
-        if str(item.get("id") or "").strip()
-    }
-    qingtian_results = load_qingtian_results()
-    latest_qingtian_by_submission = _latest_records_by_submission(
-        [
-            row
-            for row in qingtian_results
-            if str(row.get("submission_id") or "").strip() in submission_ids
-        ]
+    bundle = submission_dual_track_views_module.build_project_submission_views(
+        project_id,
+        submissions,
+        project=project,
     )
-    material_knowledge_snapshot = _build_material_knowledge_profile(project_id)
-
-    def _view_submission(item: Dict[str, object]) -> Dict[str, object]:
-        view = dict(item)
-        dual_track_summary = _build_submission_dual_track_summary(
-            item,
-            latest_qingtian_by_submission=latest_qingtian_by_submission,
-            allow_pred_score=allow_pred_score,
-            score_scale_max=score_scale_max,
-        )
-        report_obj = item.get("report")
-        if not isinstance(report_obj, dict):
-            total_display = _convert_score_from_100(item.get("total_score"), score_scale_max)
-            if total_display is not None:
-                view["total_score"] = total_display
-            view["report"] = {"dual_track_summary": dual_track_summary}
-            return view
-        report = dict(report_obj)
-        _ensure_report_score_self_awareness(
-            report,
-            project_id=project_id,
-            material_knowledge_snapshot=material_knowledge_snapshot,
-        )
-        rule_total = _to_float_or_none(report.get("rule_total_score"))
-        if rule_total is None:
-            rule_total = _to_float_or_none(report.get("total_score"))
-        if rule_total is None:
-            rule_total = _to_float_or_none(item.get("total_score"))
-        if rule_total is None:
-            rule_total = 0.0
-        if not allow_pred_score:
-            report["pred_total_score"] = None
-            report["llm_total_score"] = None
-            report["pred_confidence"] = None
-            report["score_blend"] = None
-            report["total_score"] = round(float(rule_total), 2)
-            view["total_score"] = round(float(rule_total), 2)
-        raw_total = _to_float_or_none(report.get("total_score"))
-        raw_rule = _to_float_or_none(report.get("rule_total_score"))
-        raw_pred = _to_float_or_none(report.get("pred_total_score"))
-        raw_llm = _to_float_or_none(report.get("llm_total_score"))
-        report["raw_total_score_100"] = raw_total
-        report["raw_rule_total_score_100"] = raw_rule
-        report["raw_pred_total_score_100"] = raw_pred
-        report["raw_llm_total_score_100"] = raw_llm
-        report["score_scale_max"] = score_scale_max
-        report["score_scale_label"] = _score_scale_label(score_scale_max)
-        display_pred = _convert_score_from_100(raw_pred, score_scale_max)
-        display_rule = _convert_score_from_100(raw_rule, score_scale_max)
-        display_llm = _convert_score_from_100(raw_llm, score_scale_max)
-        display_total = _convert_score_from_100(raw_total, score_scale_max)
-        if display_total is None:
-            display_total = _convert_score_from_100(item.get("total_score"), score_scale_max)
-        report["pred_total_score"] = display_pred
-        report["rule_total_score"] = display_rule
-        report["llm_total_score"] = display_llm
-        report["total_score"] = display_total
-        report["dual_track_summary"] = dual_track_summary
-        if display_total is not None:
-            view["total_score"] = display_total
-        view["report"] = report
-        return view
-
-    submissions_view = [_view_submission(s) for s in submissions]
+    submissions_view = bundle["submissions_view"]
+    allow_pred_score = bool(bundle["allow_pred_score"])
+    score_scale_max = int(bundle["score_scale_max"])
     if with_ != "latest_report":
         return [SubmissionRecord(**s) for s in submissions_view]
 
@@ -21788,6 +21718,7 @@ def index(
     )
     initial_material_rows: List[str] = []
     initial_submission_rows: List[str] = []
+    initial_submission_rows_html = ""
     initial_submission_dual_track_overview_html = ""
     initial_submission_dual_track_overview_display = "none"
     initial_material_knowledge = (
@@ -21840,213 +21771,27 @@ def index(
                 s for s in submissions_all if str(s.get("project_id", "")) == selected_project_id
             ]
             selected_submissions.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
-            submission_ids = {
-                str(item.get("id") or "").strip()
-                for item in selected_submissions
-                if str(item.get("id") or "").strip()
-            }
-            latest_qingtian_by_submission = _latest_records_by_submission(
-                [
-                    row
-                    for row in load_qingtian_results()
-                    if str(row.get("submission_id") or "").strip() in submission_ids
-                ]
-            )
-            dual_track_overview_rows: List[Dict[str, object]] = []
-            for s in selected_submissions:
-                submission_id = html_lib.escape(str(s.get("id", "")))
-                filename_raw = str(s.get("filename", ""))
-                filename = html_lib.escape(filename_raw)
-                report_obj = s.get("report")
-                report = report_obj if isinstance(report_obj, dict) else {}
-                _ensure_report_score_self_awareness(
-                    report,
-                    project_id=selected_project_id,
-                    material_knowledge_snapshot=initial_material_knowledge,
-                )
-                scoring_status = str(report.get("scoring_status") or "").strip().lower()
-                is_pending = scoring_status == "pending"
-                is_blocked = scoring_status == "blocked"
-                report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
-                util_gate = (
-                    report_meta.get("material_utilization_gate")
-                    if isinstance(report_meta.get("material_utilization_gate"), dict)
-                    else {}
-                )
-                util_blocked = bool(util_gate.get("blocked"))
-                evidence_trace = (
-                    report_meta.get("evidence_trace")
-                    if isinstance(report_meta.get("evidence_trace"), dict)
-                    else {}
-                )
-                score_self_awareness = (
-                    report_meta.get("score_self_awareness")
-                    if isinstance(report_meta.get("score_self_awareness"), dict)
-                    else {}
-                )
-                dual_track_summary = _build_submission_dual_track_summary(
-                    s,
-                    latest_qingtian_by_submission=latest_qingtian_by_submission,
+            render_context = (
+                submission_dual_track_views_module.build_selected_project_submission_render_context(
+                    selected_project_id,
+                    selected_submissions,
                     allow_pred_score=allow_pred_initial,
                     score_scale_max=score_scale_initial,
+                    material_knowledge_snapshot=initial_material_knowledge,
                 )
-                report["dual_track_summary"] = dual_track_summary
-                is_scored = not is_pending and not is_blocked
-                if is_scored:
-                    dual_track_overview_rows.append(dual_track_summary)
-                score_cell = _render_submission_dual_track_score_html(
-                    dual_track_summary,
-                    is_pending=is_pending,
-                    is_blocked=is_blocked,
-                )
-                if is_pending:
-                    diagnostic_cell = '<span class="note">待评分后生成双轨诊断。</span>'
-                elif is_blocked:
-                    diagnostic_cell = (
-                        '<span class="error">资料门禁未通过，建议先补齐资料后重评分。</span>'
-                    )
-                else:
-                    diagnostic_cell = _render_submission_dual_track_diagnostic_html(
-                        dual_track_summary,
-                        project_id=selected_project_id,
-                    )
-                evidence_hits = int(_to_float_or_none(evidence_trace.get("total_hits")) or 0)
-                evidence_file_hits = int(
-                    _to_float_or_none(evidence_trace.get("source_files_hit_count")) or 0
-                )
-                if not is_pending and evidence_hits > 0:
-                    score_cell += (
-                        '<div class="note">证据命中: '
-                        + html_lib.escape(str(evidence_hits))
-                        + " 条 / 文件覆盖: "
-                        + html_lib.escape(str(evidence_file_hits))
-                        + " 份</div>"
-                    )
-                util_summary = (
-                    report_meta.get("material_utilization")
-                    if isinstance(report_meta.get("material_utilization"), dict)
-                    else {}
-                )
-                util_by_type = (
-                    util_summary.get("by_type")
-                    if isinstance(util_summary.get("by_type"), dict)
-                    else {}
-                )
-                util_available_types = (
-                    util_summary.get("available_types")
-                    if isinstance(util_summary.get("available_types"), list)
-                    else []
-                )
-
-                def _type_short(t: str) -> str:
-                    if t == "tender_qa":
-                        return "招答"
-                    if t == "boq":
-                        return "清单"
-                    if t == "drawing":
-                        return "图纸"
-                    if t == "site_photo":
-                        return "照片"
-                    return t or "-"
-
-                coverage_tokens: List[str] = []
-                for type_key in ["tender_qa", "boq", "drawing", "site_photo"]:
-                    in_scope = type_key in util_available_types
-                    if not in_scope:
-                        coverage_tokens.append(_type_short(type_key) + "·")
-                        continue
-                    row = util_by_type.get(type_key) if isinstance(util_by_type, dict) else {}
-                    row = row if isinstance(row, dict) else {}
-                    retrieval_hit = int(_to_float_or_none(row.get("retrieval_hit")) or 0)
-                    consistency_hit = int(_to_float_or_none(row.get("consistency_hit")) or 0)
-                    coverage_tokens.append(
-                        _type_short(type_key)
-                        + ("✓" if (retrieval_hit + consistency_hit) > 0 else "×")
-                    )
-                if not is_pending and coverage_tokens:
-                    score_cell += (
-                        '<div class="note">类型覆盖: '
-                        + html_lib.escape(" / ".join(coverage_tokens))
-                        + "</div>"
-                    )
-                evidence_files = (
-                    evidence_trace.get("source_files_hit")
-                    if isinstance(evidence_trace.get("source_files_hit"), list)
-                    else []
-                )
-                evidence_files = [str(x).strip() for x in evidence_files if str(x).strip()]
-                if not is_pending and evidence_files:
-                    preview = "；".join(evidence_files[:2])
-                    suffix = " 等" if len(evidence_files) > 2 else ""
-                    score_cell += (
-                        '<div class="note">命中文件: '
-                        + html_lib.escape(preview)
-                        + suffix
-                        + "</div>"
-                    )
-                awareness_score = _to_float_or_none(score_self_awareness.get("score_0_100"))
-                awareness_level = str(score_self_awareness.get("level") or "").strip()
-                awareness_reasons = (
-                    score_self_awareness.get("reasons")
-                    if isinstance(score_self_awareness.get("reasons"), list)
-                    else []
-                )
-                if not is_pending and awareness_level:
-                    awareness_label = (
-                        "高"
-                        if awareness_level == "high"
-                        else ("中" if awareness_level == "medium" else "低")
-                    )
-                    reason_preview = "；".join(
-                        str(x).strip() for x in awareness_reasons[:1] if str(x).strip()
-                    )
-                    score_cell += (
-                        '<div class="note">评分置信度: '
-                        + html_lib.escape(awareness_label)
-                        + (
-                            ""
-                            if awareness_score is None
-                            else "（" + html_lib.escape(f"{awareness_score:.1f}") + "）"
-                        )
-                        + ("" if not reason_preview else " / " + html_lib.escape(reason_preview))
-                        + "</div>"
-                    )
-                if util_blocked:
-                    score_cell += (
-                        '<div class="error">资料利用门禁未达标（建议补齐资料后重评分）</div>'
-                    )
-                created_at = html_lib.escape(str(s.get("created_at", ""))[:19])
-                initial_submission_rows.append(
-                    "<tr>"
-                    + f"<td>{filename}</td>"
-                    + f"<td>{score_cell}</td>"
-                    + f"<td>{diagnostic_cell}</td>"
-                    + f"<td>{created_at}</td>"
-                    + (
-                        "<td>"
-                        + f'<button type="button" class="btn-danger js-delete-submission" data-submission-id="{submission_id}" data-project-id="{html_lib.escape(str(s.get("project_id") or ""))}" data-filename="{html_lib.escape(filename_raw)}" onclick="return window.__zhifeiFallbackDelete(event, \'submission\', this.getAttribute(\'data-submission-id\'), this.getAttribute(\'data-filename\'), this.getAttribute(\'data-project-id\'))">删除</button>'
-                        + "</td>"
-                    )
-                    + "</tr>"
-                )
-            if dual_track_overview_rows:
-                initial_submission_dual_track_overview_html = (
-                    _render_submission_dual_track_overview_html(
-                        _build_submission_dual_track_overview(dual_track_overview_rows),
-                        project_id=selected_project_id,
-                    )
-                )
-                initial_submission_dual_track_overview_display = (
-                    "block" if initial_submission_dual_track_overview_html else "none"
-                )
+            )
+            initial_submission_rows_html = render_context["rows_html"]
+            initial_submission_dual_track_overview_html = render_context["overview_html"]
+            initial_submission_dual_track_overview_display = render_context["overview_display"]
         except Exception:
-            initial_submission_rows = []
+            initial_submission_rows_html = ""
             initial_submission_dual_track_overview_html = ""
             initial_submission_dual_track_overview_display = "none"
     initial_material_rows_html = "".join(initial_material_rows)
-    initial_submission_rows_html = "".join(initial_submission_rows)
+    if not initial_submission_rows_html:
+        initial_submission_rows_html = "".join(initial_submission_rows)
     initial_materials_empty_display = "none" if initial_material_rows else "block"
-    initial_submissions_empty_display = "none" if initial_submission_rows else "block"
+    initial_submissions_empty_display = "none" if initial_submission_rows_html else "block"
     html = """
     <html>
     <head>
