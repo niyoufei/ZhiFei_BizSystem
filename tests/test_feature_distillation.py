@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from app.engine import feature_distillation as fd
 from app.schemas import ExtractedFeature
+from app.storage import StorageDataError
 
 
 def test_extract_logic_skeleton_prompt_has_hard_antiplagiarism_guard() -> None:
@@ -129,6 +131,28 @@ def test_upsert_distilled_features_adds_and_updates_existing(monkeypatch) -> Non
     assert out["total"] == 2
     assert existing.confidence_score == 0.8
     assert saved["count"] == 2
+
+
+def test_load_feature_kb_falls_back_to_bootstrap_when_storage_is_corrupted(monkeypatch) -> None:
+    bootstrap_feature = ExtractedFeature(
+        feature_id="F-bootstrap",
+        dimension_id="09",
+        logic_skeleton=["[前置条件] 场景明确 + [技术/动作] 资源统筹 + [量化指标类型] 达成率"],
+        confidence_score=0.67,
+        usage_count=0,
+        active=True,
+    )
+
+    def _raise_storage_error():
+        raise StorageDataError(Path("/tmp/high_score_features.json"), "json_parse_failed", "boom")
+
+    monkeypatch.setattr(fd, "load_high_score_features", _raise_storage_error)
+    monkeypatch.setattr(fd, "_load_bootstrap_features", lambda: [bootstrap_feature])
+
+    out = fd.load_feature_kb()
+
+    assert len(out) == 1
+    assert out[0].feature_id == "F-bootstrap"
 
 
 def test_generate_tailored_advice_prompt_and_error_handling() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 from datetime import datetime, timezone
@@ -11,9 +12,10 @@ from pydantic import ValidationError
 
 from app.config import RESOURCES_DIR
 from app.schemas import ExtractedFeature
-from app.storage import load_high_score_features, save_high_score_features
+from app.storage import StorageDataError, load_high_score_features, save_high_score_features
 
 FEATURE_BOOTSTRAP_PATH = RESOURCES_DIR / "high_score_templates.json"
+logger = logging.getLogger(__name__)
 
 DEFAULT_SKELETON = (
     "[前置条件] 适用场景与风险边界清晰 + "
@@ -79,7 +81,11 @@ def _load_bootstrap_features() -> List[ExtractedFeature]:
 
 
 def load_feature_kb() -> List[ExtractedFeature]:
-    rows = load_high_score_features()
+    try:
+        rows = load_high_score_features()
+    except StorageDataError as exc:
+        logger.warning("feature_kb_storage_fallback error=%s", exc)
+        return _load_bootstrap_features()
     out: List[ExtractedFeature] = []
     if isinstance(rows, list) and rows:
         for row in rows:

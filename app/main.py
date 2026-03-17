@@ -75,6 +75,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app import feedback_governance as feedback_governance_module
 from app import feedback_learning as feedback_learning_module
 from app import ground_truth_intake as ground_truth_intake_module
+from app import qingtian_dual_track as qingtian_dual_track_module
 from app.auth import get_auth_status, verify_api_key, verify_ops_api_key
 from app.cache import (
     cache_score_result,
@@ -7888,6 +7889,20 @@ def _to_float_or_none(value: Any) -> Optional[float]:
         return None
 
 
+def _load_evidence_units_safe() -> List[Dict[str, object]]:
+    try:
+        rows = load_evidence_units()
+    except StorageDataError as exc:
+        logger.warning(
+            "evidence_units_storage_fallback path=%s code=%s detail=%s",
+            exc.path,
+            exc.code,
+            exc.detail,
+        )
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
 def _resolve_submission_score_fields(
     submission: Dict[str, object],
     *,
@@ -7930,161 +7945,18 @@ def _build_submission_dual_track_summary(
     allow_pred_score: bool = True,
     score_scale_max: int = DEFAULT_SCORE_SCALE_MAX,
 ) -> Dict[str, object]:
-    report = submission.get("report") if isinstance(submission.get("report"), dict) else {}
-    raw_rule_total = _to_float_or_none(report.get("rule_total_score"))
-    if raw_rule_total is None:
-        raw_rule_total = _to_float_or_none(report.get("total_score"))
-    raw_pred_total = _to_float_or_none(report.get("pred_total_score"))
-    if not allow_pred_score:
-        raw_pred_total = None
-
-    display_fields = _resolve_submission_score_fields(
+    return qingtian_dual_track_module.build_submission_dual_track_summary(
         submission,
+        latest_qingtian_by_submission=latest_qingtian_by_submission,
         allow_pred_score=allow_pred_score,
         score_scale_max=score_scale_max,
     )
-    submission_id = str(submission.get("id") or "")
-    qingtian_row = (
-        (latest_qingtian_by_submission or {}).get(submission_id)
-        if isinstance(latest_qingtian_by_submission, dict)
-        else None
-    )
-    qingtian_score_100 = (
-        _resolve_qingtian_total_score_100(
-            qingtian_row if isinstance(qingtian_row, dict) else {},
-            default_score_scale_max=score_scale_max,
-        )
-        if isinstance(qingtian_row, dict)
-        else None
-    )
-    qingtian_score = _convert_score_from_100(qingtian_score_100, score_scale_max)
-
-    independent_delta_100 = (
-        round(float(raw_rule_total) - float(qingtian_score_100), 2)
-        if raw_rule_total is not None and qingtian_score_100 is not None
-        else None
-    )
-    approximation_delta_100 = (
-        round(float(raw_pred_total) - float(qingtian_score_100), 2)
-        if raw_pred_total is not None and qingtian_score_100 is not None
-        else None
-    )
-    independent_abs_delta_100 = (
-        round(abs(float(independent_delta_100)), 2) if independent_delta_100 is not None else None
-    )
-    approximation_abs_delta_100 = (
-        round(abs(float(approximation_delta_100)), 2)
-        if approximation_delta_100 is not None
-        else None
-    )
-    abs_delta_improvement_100 = (
-        round(float(independent_abs_delta_100) - float(approximation_abs_delta_100), 2)
-        if independent_abs_delta_100 is not None and approximation_abs_delta_100 is not None
-        else None
-    )
-
-    alignment_status = "independent_only"
-    governance_hint = "当前仅有独立评分，可继续录入真实评标并训练逼近层。"
-    if qingtian_score_100 is not None and raw_pred_total is not None:
-        if abs_delta_improvement_100 is not None and abs_delta_improvement_100 > 0:
-            alignment_status = "approximation_better"
-            governance_hint = "逼近层当前更接近青天，可继续沉淀校准样本和 few-shot。"
-        elif abs_delta_improvement_100 is not None and abs_delta_improvement_100 < 0:
-            alignment_status = "independent_better"
-            governance_hint = "独立层当前更接近青天，建议优先查看闭环治理面板。"
-        else:
-            alignment_status = "tracks_tied"
-            governance_hint = "独立层与逼近层当前和青天偏差相当，可继续观察。"
-    elif qingtian_score_100 is not None:
-        alignment_status = "await_approximation"
-        governance_hint = "已录入青天对照，但当前尚未形成逼近分，建议继续闭环进化。"
-    elif raw_pred_total is not None:
-        alignment_status = "await_ground_truth"
-        governance_hint = "已生成逼近分，需录入青天结果后才能验证逼近效果。"
-
-    return {
-        "display_score_source": str(display_fields.get("score_source") or "rule"),
-        "display_score_label": "逼近分" if raw_pred_total is not None else "独立分",
-        "display_total_score": display_fields.get("total_score"),
-        "independent_score": display_fields.get("rule_total_score"),
-        "approximation_score": display_fields.get("pred_total_score"),
-        "qingtian_score": float(qingtian_score) if qingtian_score is not None else None,
-        "scale_max": int(score_scale_max),
-        "scale_label": _score_scale_label(score_scale_max),
-        "has_approximation_score": raw_pred_total is not None,
-        "has_ground_truth": qingtian_score_100 is not None,
-        "independent_delta_100": independent_delta_100,
-        "approximation_delta_100": approximation_delta_100,
-        "independent_abs_delta_100": independent_abs_delta_100,
-        "approximation_abs_delta_100": approximation_abs_delta_100,
-        "abs_delta_improvement_100": abs_delta_improvement_100,
-        "alignment_status": alignment_status,
-        "governance_hint": governance_hint,
-    }
 
 
 def _build_submission_dual_track_overview(
     summaries: List[Dict[str, object]],
 ) -> Dict[str, object]:
-    rows = [row for row in summaries if isinstance(row, dict)]
-    if not rows:
-        return {
-            "submission_count": 0,
-            "dual_track_count": 0,
-            "ground_truth_count": 0,
-            "independent_avg": None,
-            "approximation_avg": None,
-            "qingtian_avg": None,
-            "independent_abs_delta_avg_100": None,
-            "approximation_abs_delta_avg_100": None,
-            "abs_delta_improvement_avg_100": None,
-            "headline": "当前暂无已评分施组。",
-        }
-
-    def _avg(values: List[Optional[float]]) -> Optional[float]:
-        nums = [float(v) for v in values if v is not None]
-        if not nums:
-            return None
-        return round(sum(nums) / len(nums), 2)
-
-    independent_rows = [row for row in rows if row.get("independent_score") is not None]
-    approximation_rows = [row for row in rows if bool(row.get("has_approximation_score"))]
-    qingtian_rows = [row for row in rows if bool(row.get("has_ground_truth"))]
-    improvement_avg = _avg(
-        [_to_float_or_none(row.get("abs_delta_improvement_100")) for row in rows]
-    )
-
-    headline = "当前默认展示独立分。"
-    if approximation_rows:
-        headline = "当前默认展示逼近分，并保留独立分作审计基线。"
-    if improvement_avg is not None:
-        if improvement_avg > 0:
-            headline = "逼近层整体上更接近青天，建议继续用治理面板稳态收敛。"
-        elif improvement_avg < 0:
-            headline = "独立层整体上更接近青天，建议先检查闭环样本和校准版本。"
-
-    return {
-        "submission_count": len(rows),
-        "dual_track_count": len(approximation_rows),
-        "ground_truth_count": len(qingtian_rows),
-        "independent_avg": _avg(
-            [_to_float_or_none(row.get("independent_score")) for row in independent_rows]
-        ),
-        "approximation_avg": _avg(
-            [_to_float_or_none(row.get("approximation_score")) for row in approximation_rows]
-        ),
-        "qingtian_avg": _avg(
-            [_to_float_or_none(row.get("qingtian_score")) for row in qingtian_rows]
-        ),
-        "independent_abs_delta_avg_100": _avg(
-            [_to_float_or_none(row.get("independent_abs_delta_100")) for row in qingtian_rows]
-        ),
-        "approximation_abs_delta_avg_100": _avg(
-            [_to_float_or_none(row.get("approximation_abs_delta_100")) for row in qingtian_rows]
-        ),
-        "abs_delta_improvement_avg_100": improvement_avg,
-        "headline": headline,
-    }
+    return qingtian_dual_track_module.build_submission_dual_track_overview(summaries)
 
 
 def _render_submission_dual_track_score_html(
@@ -12182,7 +12054,7 @@ def rescore_project_submissions(
     material_knowledge_snapshot = _build_material_knowledge_profile(project_id)
 
     score_reports = load_score_reports()
-    all_evidence_units = load_evidence_units()
+    all_evidence_units = _load_evidence_units_safe()
     generated = 0
     material_utilization_summaries: List[Dict[str, object]] = []
     material_utilization_by_submission: List[Dict[str, object]] = []
@@ -12442,7 +12314,7 @@ def _delete_project_cascade(project_id: str, *, locale: str = "zh") -> Dict[str,
         1 for r in score_reports if r.get("project_id") == project_id
     )
     save_score_reports([r for r in score_reports if r.get("project_id") != project_id])
-    evidence_units = load_evidence_units()
+    evidence_units = _load_evidence_units_safe()
     save_evidence_units(
         [u for u in evidence_units if str(u.get("submission_id")) not in project_submission_ids]
     )
@@ -18338,7 +18210,7 @@ def score_text_for_project(
     )
     save_score_reports(snapshots)
     if evidence_units:
-        all_units = load_evidence_units()
+        all_units = _load_evidence_units_safe()
         all_units = _replace_submission_evidence_units(
             all_units,
             submission_id=submission_id,
@@ -18557,7 +18429,7 @@ def _delete_submission_record(project_id: str, submission_id: str, locale: str) 
         if not (r.get("submission_id") == submission_id and r.get("project_id") == project_id)
     ]
     save_score_reports(snapshots)
-    evidence_units = load_evidence_units()
+    evidence_units = _load_evidence_units_safe()
     evidence_units = [u for u in evidence_units if str(u.get("submission_id")) != submission_id]
     save_evidence_units(evidence_units)
     qingtian_results = load_qingtian_results()
@@ -18879,39 +18751,7 @@ def ingest_qingtian_result(
     payload: QingTianResultCreate,
     api_key: Optional[str] = Depends(verify_api_key),
 ) -> QingTianResultRecord:
-    """写入青天真实评标结果。"""
-    ensure_data_dirs()
-    submissions = load_submissions()
-    submission = _find_submission(submission_id, submissions)
-    project_id = str(submission.get("project_id") or "")
-    projects = load_projects()
-    project = _find_project(project_id, projects)
-
-    model_version = str(
-        payload.qingtian_model_version
-        or project.get("qingtian_model_version")
-        or DEFAULT_QINGTIAN_MODEL_VERSION
-    )
-    record = {
-        "id": str(uuid4()),
-        "submission_id": submission_id,
-        "qingtian_model_version": model_version,
-        "qt_total_score": float(payload.qt_total_score),
-        "qt_dim_scores": payload.qt_dim_scores,
-        "qt_reasons": payload.qt_reasons,
-        "raw_payload": payload.raw_payload,
-        "created_at": _now_iso(),
-    }
-    results = load_qingtian_results()
-    results.append(record)
-    save_qingtian_results(results)
-
-    if str(project.get("status") or "") == "scoring_preparation":
-        project["status"] = "submitted_to_qingtian"
-        project["updated_at"] = _now_iso()
-        save_projects(projects)
-
-    return QingTianResultRecord(**record)
+    return qingtian_dual_track_module.ingest_qingtian_result(submission_id, payload)
 
 
 @router.get(
@@ -18921,13 +18761,7 @@ def ingest_qingtian_result(
     responses={**RESPONSES_404},
 )
 def get_latest_qingtian_result(submission_id: str) -> QingTianResultRecord:
-    """获取某个提交最新的青天真实评标结果。"""
-    ensure_data_dirs()
-    results = [r for r in load_qingtian_results() if str(r.get("submission_id")) == submission_id]
-    if not results:
-        raise HTTPException(status_code=404, detail="暂无青天评标结果")
-    latest = sorted(results, key=lambda x: str(x.get("created_at", "")), reverse=True)[0]
-    return QingTianResultRecord(**latest)
+    return qingtian_dual_track_module.get_latest_qingtian_result(submission_id)
 
 
 @router.post(
@@ -21012,7 +20846,7 @@ def delete_ground_truth(
                 r for r in reports if str(r.get("submission_id") or "") not in remove_submission_ids
             ]
             save_score_reports(reports)
-            units = load_evidence_units()
+            units = _load_evidence_units_safe()
             units = [
                 u for u in units if str(u.get("submission_id") or "") not in remove_submission_ids
             ]

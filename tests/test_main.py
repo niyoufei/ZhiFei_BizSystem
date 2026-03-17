@@ -74,6 +74,22 @@ class TestStorageErrorHandling:
         assert data["file"] == "projects.json"
         assert "历史版本回滚" in data["detail"]
 
+    @patch("app.main.load_evidence_units")
+    def test_load_evidence_units_safe_falls_back_on_corrupted_storage(
+        self,
+        mock_load_evidence_units,
+    ):
+        from app.main import _load_evidence_units_safe
+        from app.storage import StorageDataError
+
+        mock_load_evidence_units.side_effect = StorageDataError(
+            Path("/tmp/evidence_units.json"),
+            "json_parse_failed",
+            "数据文件 JSON 格式损坏：evidence_units.json（第 1 行，第 1 列），请使用历史版本回滚。",
+        )
+
+        assert _load_evidence_units_safe() == []
+
 
 class TestVersionedJsonHistoryRoutes:
     @patch("app.main.list_json_versions")
