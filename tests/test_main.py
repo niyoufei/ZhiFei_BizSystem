@@ -502,6 +502,33 @@ class TestIndexEndpoint:
         assert "独立偏差 -6.0 / 逼近偏差 -2.0 / 改善 4.0" in page
         assert "打开闭环治理面板" in page
 
+    def test_index_renders_selected_project_material_rows(self, client):
+        materials = [
+            {
+                "id": "m1",
+                "project_id": "p1",
+                "filename": "招标文件.docx",
+                "material_type": "tender_qa",
+                "parse_status": "parsed",
+                "parse_backend": "gpt-5.4",
+                "created_at": "2026-03-17T08:00:00+00:00",
+            }
+        ]
+        with (
+            patch("app.main.load_projects", return_value=[{"id": "p1", "name": "测试项目"}]),
+            patch("app.main.load_materials", return_value=materials),
+            patch("app.main.load_submissions", return_value=[]),
+            patch("app.main.load_expert_profiles", return_value=[]),
+        ):
+            response = client.get("/?project_id=p1")
+
+        assert response.status_code == 200
+        page = response.text
+        assert "招标文件.docx" in page
+        assert "招标文件和答疑" in page
+        assert "已解析（GPT-5.4）" in page
+        assert 'data-material-id="m1"' in page
+
     def test_index_renders_16_dimension_weight_sliders(self, client):
         """Index page should render 16-dimension focus sliders on first paint."""
         response = client.get("/")

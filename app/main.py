@@ -75,6 +75,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app import feedback_governance as feedback_governance_module
 from app import feedback_learning as feedback_learning_module
 from app import ground_truth_intake as ground_truth_intake_module
+from app import index_project_views as index_project_views_module
 from app import qingtian_dual_track as qingtian_dual_track_module
 from app import submission_dual_track_views as submission_dual_track_views_module
 from app.auth import get_auth_status, verify_api_key, verify_ops_api_key
@@ -21655,95 +21656,27 @@ def index(
             for dim_id in DIMENSION_IDS
         ]
     )
-    selected_project_for_view = (
-        next((p for p in projects if str(p.get("id", "")) == selected_project_id), {})
-        if selected_project_id
-        else {}
+    selected_project_index_context = (
+        index_project_views_module.build_selected_project_index_context(
+            selected_project_id,
+            projects=projects,
+        )
     )
-    score_scale_initial = (
-        _resolve_project_score_scale_max(selected_project_for_view)
-        if selected_project_for_view
-        else DEFAULT_SCORE_SCALE_MAX
+    score_scale_initial = int(selected_project_index_context["score_scale_max"])
+    initial_material_rows_html = str(selected_project_index_context["material_rows_html"] or "")
+    initial_materials_empty_display = str(
+        selected_project_index_context["materials_empty_display"] or "block"
     )
-    allow_pred_initial = bool(selected_project_for_view) and (
-        _select_calibrator_model(selected_project_for_view) is not None
+    initial_submission_rows_html = str(selected_project_index_context["submission_rows_html"] or "")
+    initial_submissions_empty_display = str(
+        selected_project_index_context["submissions_empty_display"] or "block"
     )
-    initial_material_rows: List[str] = []
-    initial_submission_rows: List[str] = []
-    initial_submission_rows_html = ""
-    initial_submission_dual_track_overview_html = ""
-    initial_submission_dual_track_overview_display = "none"
-    initial_material_knowledge = (
-        _build_material_knowledge_profile(selected_project_id) if selected_project_id else {}
+    initial_submission_dual_track_overview_html = str(
+        selected_project_index_context["submission_dual_track_overview_html"] or ""
     )
-    if selected_project_id:
-        try:
-            materials_all = load_materials()
-            selected_materials = [
-                m for m in materials_all if str(m.get("project_id", "")) == selected_project_id
-            ]
-            selected_materials.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
-            for m in selected_materials:
-                normalized_m, _ = _normalize_material_row_for_parse(dict(m))
-                material_id = html_lib.escape(str(m.get("id", "")))
-                filename_raw = str(normalized_m.get("filename", ""))
-                filename = html_lib.escape(filename_raw)
-                material_type_label = html_lib.escape(
-                    _material_type_label(
-                        normalized_m.get("material_type"),
-                        filename=normalized_m.get("filename"),
-                    )
-                )
-                created_at = html_lib.escape(str(normalized_m.get("created_at", ""))[:19])
-                parse_status_label = html_lib.escape(
-                    _material_parse_status_label(
-                        normalized_m.get("parse_status"),
-                        parse_backend=normalized_m.get("parse_backend"),
-                        parse_error_message=normalized_m.get("parse_error_message"),
-                    )
-                )
-                initial_material_rows.append(
-                    "<tr>"
-                    + f"<td>{material_type_label}</td>"
-                    + f"<td>{filename}</td>"
-                    + f"<td>{parse_status_label}</td>"
-                    + f"<td>{created_at}</td>"
-                    + (
-                        "<td>"
-                        + f'<button type="button" class="btn-danger js-delete-material" data-material-id="{material_id}" data-project-id="{html_lib.escape(str(normalized_m.get("project_id") or ""))}" data-filename="{html_lib.escape(filename_raw)}" onclick="return window.__zhifeiFallbackDelete(event, \'material\', this.getAttribute(\'data-material-id\'), this.getAttribute(\'data-filename\'), this.getAttribute(\'data-project-id\'))">删除</button>'
-                        + "</td>"
-                    )
-                    + "</tr>"
-                )
-        except Exception:
-            initial_material_rows = []
-        try:
-            submissions_all = load_submissions()
-            selected_submissions = [
-                s for s in submissions_all if str(s.get("project_id", "")) == selected_project_id
-            ]
-            selected_submissions.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
-            render_context = (
-                submission_dual_track_views_module.build_selected_project_submission_render_context(
-                    selected_project_id,
-                    selected_submissions,
-                    allow_pred_score=allow_pred_initial,
-                    score_scale_max=score_scale_initial,
-                    material_knowledge_snapshot=initial_material_knowledge,
-                )
-            )
-            initial_submission_rows_html = render_context["rows_html"]
-            initial_submission_dual_track_overview_html = render_context["overview_html"]
-            initial_submission_dual_track_overview_display = render_context["overview_display"]
-        except Exception:
-            initial_submission_rows_html = ""
-            initial_submission_dual_track_overview_html = ""
-            initial_submission_dual_track_overview_display = "none"
-    initial_material_rows_html = "".join(initial_material_rows)
-    if not initial_submission_rows_html:
-        initial_submission_rows_html = "".join(initial_submission_rows)
-    initial_materials_empty_display = "none" if initial_material_rows else "block"
-    initial_submissions_empty_display = "none" if initial_submission_rows_html else "block"
+    initial_submission_dual_track_overview_display = str(
+        selected_project_index_context["submission_dual_track_overview_display"] or "none"
+    )
     html = """
     <html>
     <head>
