@@ -2256,6 +2256,83 @@ class TestMaterialsEndpoint:
         assert payload["windows"]["all"]["count"] == 1
         assert payload["drift"]["level"] in {"insufficient_data", "watch", "low", "medium", "high"}
 
+    @patch("app.main._resolve_project_scoring_context")
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_submissions")
+    def test_build_evolution_health_report_excludes_learning_quality_blocked_samples(
+        self,
+        mock_load_submissions,
+        mock_load_ground_truth,
+        mock_load_evo_reports,
+        mock_resolve_scoring_context,
+    ):
+        from app.main import _build_evolution_health_report
+
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "report": {"pred_total_score": 70.0, "score_scale_max": 100},
+            }
+        ]
+        mock_load_ground_truth.return_value = [
+            {
+                "id": "gt-good",
+                "project_id": "p1",
+                "source_submission_id": "s1",
+                "judge_scores": [75, 76, 77, 78, 79],
+                "final_score": 78.0,
+                "score_scale_max": 100,
+                "created_at": "2026-02-26T00:00:00+00:00",
+            },
+            {
+                "id": "gt-low-quality",
+                "project_id": "p1",
+                "source_submission_id": "s1",
+                "judge_scores": [80, 80, 80, 80, 80],
+                "final_score": 80.0,
+                "score_scale_max": 100,
+                "created_at": "2026-02-27T00:00:00+00:00",
+                "learning_quality_gate": {
+                    "blocked": True,
+                    "reasons": ["missing_evidence_hits"],
+                },
+            },
+            {
+                "id": "gt-guardrail",
+                "project_id": "p1",
+                "source_submission_id": "s1",
+                "judge_scores": [82, 82, 82, 82, 82],
+                "final_score": 82.0,
+                "score_scale_max": 100,
+                "created_at": "2026-02-28T00:00:00+00:00",
+                "feedback_guardrail": {"blocked": True, "threshold_blocked": True},
+            },
+        ]
+        mock_load_evo_reports.return_value = {"p1": {}}
+        mock_resolve_scoring_context.return_value = (
+            {"01": 1.0},
+            None,
+            {"id": "p1", "meta": {"score_scale_max": 100}},
+        )
+
+        payload = _build_evolution_health_report(
+            "p1",
+            {"id": "p1", "meta": {"score_scale_max": 100}},
+        )
+
+        summary = payload["summary"]
+        assert summary["ground_truth_count"] == 3
+        assert summary["eligible_learning_ground_truth_count"] == 1
+        assert summary["matched_prediction_count"] == 1
+        assert summary["guardrail_blocked_count"] == 1
+        assert summary["learning_quality_blocked_count"] == 1
+        assert any(
+            "可纳入自动学习的真实评标样本不足" in str(item) for item in payload["recommendations"]
+        )
+        assert any("被排除在自动学习之外" in str(item) for item in payload["recommendations"])
+
     @patch("app.main.load_projects")
     @patch("app.main._resolve_project_scoring_context")
     @patch("app.main.load_evolution_reports")
@@ -7112,6 +7189,52 @@ class TestScoringContextEvolutionGuard:
 
 
 class TestFeedbackClosedLoopSafety:
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_projects")
+    def test_build_feedback_records_for_project_skips_learning_quality_blocked(
+        self,
+        mock_load_projects,
+        mock_load_submissions,
+        mock_load_ground_truth,
+    ):
+        from app.main import _build_feedback_records_for_project
+
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 100}}]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "report": {"pred_total_score": 72.0, "score_scale_max": 100},
+            }
+        ]
+        mock_load_ground_truth.return_value = [
+            {
+                "id": "gt-good",
+                "project_id": "p1",
+                "source_submission_id": "s1",
+                "judge_scores": [80, 80, 80, 80, 80],
+                "final_score": 78.0,
+                "score_scale_max": 100,
+            },
+            {
+                "id": "gt-low-quality",
+                "project_id": "p1",
+                "source_submission_id": "s1",
+                "judge_scores": [82, 82, 82, 82, 82],
+                "final_score": 82.0,
+                "score_scale_max": 100,
+                "learning_quality_gate": {
+                    "blocked": True,
+                    "reasons": ["missing_evidence_hits"],
+                },
+            },
+        ]
+
+        rows = _build_feedback_records_for_project("p1")
+
+        assert [row["id"] for row in rows] == ["gt-good"]
+
     @patch("app.main._run_feedback_closed_loop")
     def test_run_feedback_closed_loop_safe_coerces_non_dict(self, mock_run):
         from app.main import _run_feedback_closed_loop_safe
@@ -7205,6 +7328,11 @@ class TestGroundTruthGuardrailRoutes:
                 "blocked": True,
                 "warning_message": "预测与真实总分偏差 45.00 分（100分口径，45.0%）。",
             },
+            "learning_quality_gate": {
+                "blocked": True,
+                "reasons": ["missing_evidence_hits"],
+                "warning_message": "当前真实评分样本未纳入自动学习。",
+            },
             "few_shot_distillation": {"captured": 0, "reason": "guardrail_blocked"},
         }
         mock_run_closed_loop.return_value = {
@@ -7227,6 +7355,7 @@ class TestGroundTruthGuardrailRoutes:
         assert response.status_code == 200
         data = response.json()
         assert data["feedback_guardrail"]["blocked"] is True
+        assert data["learning_quality_gate"]["blocked"] is True
         assert data["few_shot_distillation"]["reason"] == "guardrail_blocked"
         assert data["feedback_closed_loop"]["guardrail_triggered"] is True
         mock_run_closed_loop.assert_called_once()

@@ -6,6 +6,7 @@ from unittest.mock import patch
 from app.main import (
     _auto_update_feature_confidence_on_ground_truth,
     _build_ground_truth_feedback_guardrail,
+    _build_ground_truth_learning_quality_gate,
     _capture_ground_truth_few_shot_features,
     _collect_applied_feature_ids_from_report,
 )
@@ -129,6 +130,36 @@ def test_build_ground_truth_feedback_guardrail_blocks_extreme_delta() -> None:
     assert "暂停自动调权" in (out["warning_message"] or "")
 
 
+def test_build_ground_truth_learning_quality_gate_blocks_low_quality_sample() -> None:
+    gt_record = {
+        "id": "gt-quality",
+        "final_score": 80,
+        "score_scale_max": 100,
+        "judge_scores": [78, 79, 80, 81, 82],
+    }
+    report = {
+        "pred_total_score": 79,
+        "meta": {
+            "material_utilization_gate": {"blocked": True},
+            "evidence_trace": {"total_hits": 0},
+            "score_self_awareness": {"level": "low", "score_0_100": 24.0},
+            "material_quality": {"total_parsed_chars": 1200},
+        },
+    }
+
+    out = _build_ground_truth_learning_quality_gate(
+        report=report,
+        gt_record=gt_record,
+        project_score_scale_max=100,
+    )
+
+    assert out["blocked"] is True
+    assert "material_gate_blocked" in out["reasons"]
+    assert "missing_evidence_hits" in out["reasons"]
+    assert "low_score_self_awareness" in out["reasons"]
+    assert "未纳入自动学习" in (out["warning_message"] or "")
+
+
 def test_capture_ground_truth_few_shot_features_distills_evidence(monkeypatch) -> None:
     report = {
         "dimension_scores": {
@@ -164,6 +195,7 @@ def test_capture_ground_truth_few_shot_features_distills_evidence(monkeypatch) -
         gt_record=gt_record,
         project_score_scale_max=100,
         feedback_guardrail={"blocked": False},
+        learning_quality_gate={"blocked": False},
         feature_confidence_update={"applied_dimension_ids": ["09"]},
     )
 
@@ -171,3 +203,22 @@ def test_capture_ground_truth_few_shot_features_distills_evidence(monkeypatch) -
     assert out["reason"] == "captured"
     assert out["dimension_ids"] == ["09"]
     assert captured["count"] == 1
+
+
+def test_capture_ground_truth_few_shot_features_skips_learning_quality_blocked() -> None:
+    out = _capture_ground_truth_few_shot_features(
+        report={"dimension_scores": {"09": {"score": 9.0}}},
+        gt_record={
+            "id": "gt-low-quality",
+            "final_score": 88,
+            "score_scale_max": 100,
+            "judge_scores": [88, 88, 88, 88, 88],
+        },
+        project_score_scale_max=100,
+        feedback_guardrail={"blocked": False},
+        learning_quality_gate={"blocked": True, "reasons": ["missing_evidence_hits"]},
+        feature_confidence_update={"applied_dimension_ids": ["09"]},
+    )
+
+    assert out["captured"] == 0
+    assert out["reason"] == "learning_quality_blocked"

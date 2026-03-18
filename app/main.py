@@ -444,6 +444,8 @@ DEFAULT_CALIBRATION_FRESHNESS_DAYS = 90
 DEFAULT_CALIBRATION_MIN_RECENT_RATIO = 0.6
 DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO = 0.4
 DEFAULT_FEW_SHOT_MIN_HIGH_SCORE_100 = 78.0
+DEFAULT_LEARNING_MIN_AWARENESS_SCORE = 45.0
+DEFAULT_LEARNING_MIN_EVIDENCE_HITS = 1
 PROFILE_LOCKED_STATUSES = {"submitted_to_qingtian"}
 VERSIONED_JSON_ARTIFACTS = {
     "expert_profiles": EXPERT_PROFILES_PATH,
@@ -8399,13 +8401,21 @@ def _refresh_project_reflection_objects(
     projects = load_projects()
     project = next((p for p in projects if str(p.get("id")) == project_id), {})
     project_score_scale = _resolve_project_score_scale_max(project) if project else 100
-    blocked_gt_ids = {
+    guardrail_blocked_gt_ids = {
         str(row.get("id") or "").strip()
         for row in _list_project_ground_truth_records(
             project_id,
             include_guardrail_blocked=True,
         )
         if _feedback_guardrail_is_blocked(row)
+    }
+    learning_quality_blocked_gt_ids = {
+        str(row.get("id") or "").strip()
+        for row in _list_project_ground_truth_records(
+            project_id,
+            include_guardrail_blocked=True,
+        )
+        if _learning_quality_gate_is_blocked(row)
     }
 
     qingtian_results = load_qingtian_results()
@@ -8439,7 +8449,13 @@ def _refresh_project_reflection_objects(
             q["raw_payload"] = merged_payload
             qingtian_changed = True
         gt_record_id = str(merged_payload.get("ground_truth_record_id") or "").strip()
-        if not include_guardrail_blocked and gt_record_id and gt_record_id in blocked_gt_ids:
+        if gt_record_id and gt_record_id in learning_quality_blocked_gt_ids:
+            continue
+        if (
+            not include_guardrail_blocked
+            and gt_record_id
+            and gt_record_id in guardrail_blocked_gt_ids
+        ):
             continue
         scoped_qt.append(q)
     if qingtian_changed:
@@ -8487,6 +8503,8 @@ def _build_feedback_records_for_project(
     )
     for row in ground_truth_rows:
         if not isinstance(row, dict):
+            continue
+        if _learning_quality_gate_is_blocked(row):
             continue
         judge_scores = row.get("judge_scores")
         if not isinstance(judge_scores, list) or len(judge_scores) not in (5, 7):
@@ -8786,6 +8804,7 @@ def _refresh_evolution_report_from_ground_truth(
         project_id,
         include_guardrail_blocked=include_guardrail_blocked,
     )
+    records_raw = [row for row in records_raw if not _learning_quality_gate_is_blocked(row)]
     records = [
         _ground_truth_record_for_learning(
             r if isinstance(r, dict) else {},
@@ -8972,9 +8991,61 @@ def _normalize_few_shot_distillation_state(payload: object) -> Dict[str, object]
     return normalized
 
 
+def _extract_learning_quality_gate(payload: object) -> Dict[str, object]:
+    if not isinstance(payload, dict):
+        return {}
+    gate = payload.get("learning_quality_gate")
+    return _normalize_learning_quality_gate_state(gate)
+
+
+def _normalize_learning_quality_gate_state(payload: object) -> Dict[str, object]:
+    gate = dict(payload) if isinstance(payload, dict) else {}
+    reasons = [str(item).strip() for item in (gate.get("reasons") or []) if str(item).strip()]
+    blocked = bool(gate.get("blocked"))
+    status = str(gate.get("status") or "").strip()
+    if not status:
+        status = "blocked" if blocked else "accepted"
+    warning_message = str(gate.get("warning_message") or "").strip()
+    score_self_awareness_score = _to_float_or_none(gate.get("score_self_awareness_score"))
+    evidence_hits = int(_to_float_or_none(gate.get("evidence_hits")) or 0)
+    total_parsed_chars = int(_to_float_or_none(gate.get("total_parsed_chars")) or 0)
+    normalized = dict(gate)
+    normalized["blocked"] = blocked
+    normalized["status"] = status
+    normalized["reasons"] = reasons
+    normalized["score_self_awareness_score"] = (
+        round(float(score_self_awareness_score), 2)
+        if score_self_awareness_score is not None
+        else None
+    )
+    normalized["score_self_awareness_level"] = (
+        str(gate.get("score_self_awareness_level") or "").strip() or None
+    )
+    normalized["evidence_hits"] = evidence_hits
+    normalized["material_gate_blocked"] = bool(gate.get("material_gate_blocked"))
+    normalized["total_parsed_chars"] = total_parsed_chars
+    normalized["min_awareness_score"] = round(
+        float(
+            _to_float_or_none(gate.get("min_awareness_score"))
+            or DEFAULT_LEARNING_MIN_AWARENESS_SCORE
+        ),
+        2,
+    )
+    normalized["min_evidence_hits"] = int(
+        _to_float_or_none(gate.get("min_evidence_hits")) or DEFAULT_LEARNING_MIN_EVIDENCE_HITS
+    )
+    normalized["warning_message"] = warning_message or None
+    return normalized
+
+
 def _feedback_guardrail_is_blocked(payload: object) -> bool:
     guardrail = _extract_feedback_guardrail(payload)
     return bool(guardrail.get("blocked"))
+
+
+def _learning_quality_gate_is_blocked(payload: object) -> bool:
+    gate = _extract_learning_quality_gate(payload)
+    return bool(gate.get("blocked"))
 
 
 def _list_project_ground_truth_records(
@@ -9133,12 +9204,24 @@ def _build_evolution_health_report(
     project_score_scale = _resolve_project_score_scale_max(project)
     submissions = [s for s in load_submissions() if str(s.get("project_id")) == project_id]
     submissions_by_id = {str(s.get("id") or ""): s for s in submissions if str(s.get("id") or "")}
+    all_ground_truth_rows = [
+        row for row in load_ground_truth() if str(row.get("project_id") or "") == project_id
+    ]
     ground_truth_rows = _list_project_ground_truth_records(project_id)
+    learning_quality_blocked_count = sum(
+        1 for row in all_ground_truth_rows if _learning_quality_gate_is_blocked(row)
+    )
+    guardrail_blocked_count = sum(
+        1 for row in all_ground_truth_rows if _feedback_guardrail_is_blocked(row)
+    )
+    eligible_ground_truth_rows = [
+        row for row in ground_truth_rows if not _learning_quality_gate_is_blocked(row)
+    ]
     now_utc = datetime.now(timezone.utc)
 
     matched_rows: List[Dict[str, object]] = []
     unmatched_ground_truth = 0
-    for row in ground_truth_rows:
+    for row in eligible_ground_truth_rows:
         if not isinstance(row, dict):
             continue
         normalized = _ground_truth_record_for_learning(
@@ -9271,8 +9354,14 @@ def _build_evolution_health_report(
     has_evolved_multipliers = bool(evo_status.get("usable"))
     stored_evolved_multipliers = bool(evo_status.get("stored"))
     recommendations: List[str] = []
-    if len(ground_truth_rows) < 3:
-        recommendations.append("真实评标样本不足，建议至少录入 3 条以上再观察进化稳定性。")
+    if len(eligible_ground_truth_rows) < 3:
+        recommendations.append(
+            "可纳入自动学习的真实评标样本不足，建议至少保留 3 条以上有效样本后再观察进化稳定性。"
+        )
+    if learning_quality_blocked_count > 0:
+        recommendations.append(
+            f"有 {learning_quality_blocked_count} 条真实评分因证据/自感知质量不足被排除在自动学习之外，建议先重评分或补齐资料后再纳入。"
+        )
     if int(metrics_recent_30.get("count") or 0) <= 0:
         recommendations.append("近30天无真实反馈，建议补录最新项目评分以避免概念漂移。")
     if drift_level in {"high", "medium"}:
@@ -9300,9 +9389,12 @@ def _build_evolution_health_report(
         "project_id": project_id,
         "generated_at": _now_iso(),
         "summary": {
-            "ground_truth_count": len(ground_truth_rows),
+            "ground_truth_count": len(all_ground_truth_rows),
+            "eligible_learning_ground_truth_count": len(eligible_ground_truth_rows),
             "matched_prediction_count": len(matched_rows),
             "unmatched_ground_truth_count": unmatched_ground_truth,
+            "guardrail_blocked_count": guardrail_blocked_count,
+            "learning_quality_blocked_count": learning_quality_blocked_count,
             "current_weights_source": _infer_weights_source(
                 project_id,
                 profile_snapshot,
@@ -10492,6 +10584,19 @@ def _build_ground_truth_feedback_guardrail(
     )
 
 
+def _build_ground_truth_learning_quality_gate(
+    *,
+    report: Dict[str, object],
+    gt_record: Dict[str, object],
+    project_score_scale_max: int,
+) -> Dict[str, object]:
+    return feedback_learning_module.build_ground_truth_learning_quality_gate(
+        report=report,
+        gt_record=gt_record,
+        project_score_scale_max=project_score_scale_max,
+    )
+
+
 def _flatten_ground_truth_qualitative_tags(
     gt_record: Dict[str, object],
     *,
@@ -10614,6 +10719,7 @@ def _capture_ground_truth_few_shot_features(
     gt_record: Dict[str, object],
     project_score_scale_max: int,
     feedback_guardrail: Dict[str, object],
+    learning_quality_gate: Dict[str, object],
     feature_confidence_update: Dict[str, object],
 ) -> Dict[str, object]:
     return feedback_learning_module.capture_ground_truth_few_shot_features(
@@ -10621,6 +10727,7 @@ def _capture_ground_truth_few_shot_features(
         gt_record=gt_record,
         project_score_scale_max=project_score_scale_max,
         feedback_guardrail=feedback_guardrail,
+        learning_quality_gate=learning_quality_gate,
         feature_confidence_update=feature_confidence_update,
     )
 
@@ -20665,6 +20772,7 @@ def evolve_project(
         project_id,
         include_guardrail_blocked=bool(confirm_extreme_sample),
     )
+    records_raw = [row for row in records_raw if not _learning_quality_gate_is_blocked(row)]
     records = [
         _ground_truth_record_for_learning(
             r if isinstance(r, dict) else {},

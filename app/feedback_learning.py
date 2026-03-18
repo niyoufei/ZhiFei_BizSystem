@@ -143,17 +143,107 @@ def build_ground_truth_feedback_guardrail(
     )
 
 
+def build_ground_truth_learning_quality_gate(
+    *,
+    report: Dict[str, object],
+    gt_record: Dict[str, object],
+    project_score_scale_max: int,
+) -> Dict[str, object]:
+    del gt_record, project_score_scale_max
+    main = _main()
+    report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+    material_gate = (
+        report_meta.get("material_utilization_gate")
+        if isinstance(report_meta.get("material_utilization_gate"), dict)
+        else {}
+    )
+    evidence_trace = (
+        report_meta.get("evidence_trace")
+        if isinstance(report_meta.get("evidence_trace"), dict)
+        else {}
+    )
+    score_self_awareness = (
+        report_meta.get("score_self_awareness")
+        if isinstance(report_meta.get("score_self_awareness"), dict)
+        else {}
+    )
+    material_quality = (
+        report_meta.get("material_quality")
+        if isinstance(report_meta.get("material_quality"), dict)
+        else {}
+    )
+    awareness_score = main._to_float_or_none(score_self_awareness.get("score_0_100"))
+    awareness_level = str(score_self_awareness.get("level") or "").strip()
+    evidence_hits = int(main._to_float_or_none(evidence_trace.get("total_hits")) or 0)
+    material_gate_blocked = bool(material_gate.get("blocked"))
+    total_parsed_chars = int(
+        main._to_float_or_none(material_quality.get("total_parsed_chars")) or 0
+    )
+
+    reasons: List[str] = []
+    reason_labels: List[str] = []
+    if material_gate_blocked:
+        reasons.append("material_gate_blocked")
+        reason_labels.append("资料利用门禁未通过")
+    if awareness_score is not None and awareness_score < float(
+        main.DEFAULT_LEARNING_MIN_AWARENESS_SCORE
+    ):
+        reasons.append("low_score_self_awareness")
+        reason_labels.append(
+            f"评分自感知过低（{awareness_score:.1f} < {float(main.DEFAULT_LEARNING_MIN_AWARENESS_SCORE):.1f}）"
+        )
+    if evidence_hits < int(main.DEFAULT_LEARNING_MIN_EVIDENCE_HITS):
+        reasons.append("missing_evidence_hits")
+        reason_labels.append(
+            f"证据命中不足（{evidence_hits} < {int(main.DEFAULT_LEARNING_MIN_EVIDENCE_HITS)}）"
+        )
+    blocked = bool(reasons)
+    warning_message = None
+    if blocked and reason_labels:
+        warning_message = (
+            "当前真实评分样本未纳入自动学习："
+            + "；".join(reason_labels)
+            + "。建议先补齐资料、重评分或修复证据链后再学习。"
+        )
+    return main._normalize_learning_quality_gate_state(
+        {
+            "blocked": blocked,
+            "status": "blocked" if blocked else "accepted",
+            "reasons": reasons,
+            "score_self_awareness_score": (
+                round(float(awareness_score), 2) if awareness_score is not None else None
+            ),
+            "score_self_awareness_level": awareness_level or None,
+            "evidence_hits": evidence_hits,
+            "material_gate_blocked": material_gate_blocked,
+            "total_parsed_chars": total_parsed_chars,
+            "min_awareness_score": round(float(main.DEFAULT_LEARNING_MIN_AWARENESS_SCORE), 2),
+            "min_evidence_hits": int(main.DEFAULT_LEARNING_MIN_EVIDENCE_HITS),
+            "warning_message": warning_message,
+        }
+    )
+
+
 def capture_ground_truth_few_shot_features(
     *,
     report: Dict[str, object],
     gt_record: Dict[str, object],
     project_score_scale_max: int,
     feedback_guardrail: Dict[str, object],
+    learning_quality_gate: Dict[str, object],
     feature_confidence_update: Dict[str, object],
 ) -> Dict[str, object]:
     main = _main()
     if bool(feedback_guardrail.get("blocked")):
         return {"captured": 0, "reason": "guardrail_blocked"}
+    if bool(learning_quality_gate.get("blocked")):
+        return {
+            "captured": 0,
+            "reason": "learning_quality_blocked",
+            "learning_quality_gate": main._normalize_learning_quality_gate_state(
+                learning_quality_gate
+            ),
+        }
 
     gt_for_learning = main._ground_truth_record_for_learning(
         gt_record,
@@ -376,6 +466,20 @@ def sync_ground_truth_record_to_qingtian(
                 "requires_manual_confirmation": False,
                 "error": str(exc),
             }
+    learning_quality_gate: Dict[str, object] = {"blocked": False, "status": "not_executed"}
+    if isinstance(report_for_feedback, dict):
+        try:
+            learning_quality_gate = build_ground_truth_learning_quality_gate(
+                report=report_for_feedback,
+                gt_record=gt_record,
+                project_score_scale_max=project_score_scale,
+            )
+        except Exception as exc:
+            learning_quality_gate = {
+                "blocked": False,
+                "status": "learning_quality_gate_error",
+                "warning_message": str(exc),
+            }
     feature_confidence_update: Dict[str, object] = {
         "updated": 0,
         "retired": 0,
@@ -388,6 +492,15 @@ def sync_ground_truth_record_to_qingtian(
             "reason": "guardrail_blocked",
             "actual_score_100": feedback_guardrail.get("actual_score_100"),
             "predicted_score_100": feedback_guardrail.get("predicted_score_100"),
+        }
+    elif bool(learning_quality_gate.get("blocked")):
+        feature_confidence_update = {
+            "updated": 0,
+            "retired": 0,
+            "reason": "learning_quality_blocked",
+            "learning_quality_gate": main._normalize_learning_quality_gate_state(
+                learning_quality_gate
+            ),
         }
     elif isinstance(report_for_feedback, dict):
         try:
@@ -406,6 +519,14 @@ def sync_ground_truth_record_to_qingtian(
     few_shot_distillation: Dict[str, object] = {"captured": 0, "reason": "not_executed"}
     if bool(feedback_guardrail.get("blocked")):
         few_shot_distillation = {"captured": 0, "reason": "guardrail_blocked"}
+    elif bool(learning_quality_gate.get("blocked")):
+        few_shot_distillation = {
+            "captured": 0,
+            "reason": "learning_quality_blocked",
+            "learning_quality_gate": main._normalize_learning_quality_gate_state(
+                learning_quality_gate
+            ),
+        }
     elif isinstance(report_for_feedback, dict):
         try:
             few_shot_distillation = capture_ground_truth_few_shot_features(
@@ -413,6 +534,7 @@ def sync_ground_truth_record_to_qingtian(
                 gt_record=gt_record,
                 project_score_scale_max=project_score_scale,
                 feedback_guardrail=feedback_guardrail,
+                learning_quality_gate=learning_quality_gate,
                 feature_confidence_update=feature_confidence_update,
             )
         except Exception as exc:
@@ -429,6 +551,9 @@ def sync_ground_truth_record_to_qingtian(
             if str(row.get("id") or "") != source_gt_id:
                 continue
             row["feedback_guardrail"] = main._normalize_feedback_guardrail_state(feedback_guardrail)
+            row["learning_quality_gate"] = main._normalize_learning_quality_gate_state(
+                learning_quality_gate
+            )
             row["feature_confidence_update"] = feature_confidence_update
             row["few_shot_distillation"] = main._normalize_few_shot_distillation_state(
                 few_shot_distillation
@@ -464,6 +589,7 @@ def sync_ground_truth_record_to_qingtian(
                     "final_score_100": gt_for_learning.get("final_score"),
                     "score_scale_max": gt_for_learning.get("score_scale_max"),
                     "feedback_guardrail": feedback_guardrail,
+                    "learning_quality_gate": learning_quality_gate,
                     "feature_confidence_update": feature_confidence_update,
                     "few_shot_distillation": few_shot_distillation,
                 },
@@ -476,6 +602,7 @@ def sync_ground_truth_record_to_qingtian(
         if not isinstance(raw_payload, dict):
             raw_payload = {}
         raw_payload["feedback_guardrail"] = feedback_guardrail
+        raw_payload["learning_quality_gate"] = learning_quality_gate
         raw_payload["feature_confidence_update"] = feature_confidence_update
         raw_payload["few_shot_distillation"] = few_shot_distillation
         matched_qt["raw_payload"] = raw_payload
@@ -488,10 +615,12 @@ def sync_ground_truth_record_to_qingtian(
 
     main._refresh_project_reflection_objects(project_id)
     gt_record["feedback_guardrail"] = feedback_guardrail
+    gt_record["learning_quality_gate"] = learning_quality_gate
     gt_record["few_shot_distillation"] = few_shot_distillation
     gt_record["feature_confidence_update"] = feature_confidence_update
     return {
         "feedback_guardrail": feedback_guardrail,
+        "learning_quality_gate": learning_quality_gate,
         "feature_confidence_update": feature_confidence_update,
         "few_shot_distillation": few_shot_distillation,
         "submission_id": str(matched_submission.get("id") or ""),
@@ -659,8 +788,12 @@ def finalize_ground_truth_learning_record(
     sync_result = main._sync_ground_truth_record_to_qingtian(project_id, record)
     sync_payload = sync_result if isinstance(sync_result, dict) else {}
     feedback_guardrail = sync_payload.get("feedback_guardrail")
+    learning_quality_gate = sync_payload.get("learning_quality_gate")
     few_shot_distillation = sync_payload.get("few_shot_distillation")
     record["feedback_guardrail"] = main._normalize_feedback_guardrail_state(feedback_guardrail)
+    record["learning_quality_gate"] = main._normalize_learning_quality_gate_state(
+        learning_quality_gate
+    )
     record["few_shot_distillation"] = main._normalize_few_shot_distillation_state(
         few_shot_distillation
     )
@@ -675,6 +808,7 @@ def finalize_ground_truth_learning_record(
         str(record.get("id") or ""),
         updates={
             "feedback_guardrail": main._extract_feedback_guardrail(record),
+            "learning_quality_gate": main._extract_learning_quality_gate(record),
             "few_shot_distillation": main._normalize_few_shot_distillation_state(
                 record.get("few_shot_distillation")
             ),
@@ -700,9 +834,13 @@ def finalize_ground_truth_batch_learning_records(
             sync_result = main._sync_ground_truth_record_to_qingtian(project_id, record)
             sync_payload = sync_result if isinstance(sync_result, dict) else {}
             feedback_guardrail = sync_payload.get("feedback_guardrail")
+            learning_quality_gate = sync_payload.get("learning_quality_gate")
             few_shot_distillation = sync_payload.get("few_shot_distillation")
             record["feedback_guardrail"] = main._normalize_feedback_guardrail_state(
                 feedback_guardrail
+            )
+            record["learning_quality_gate"] = main._normalize_learning_quality_gate_state(
+                learning_quality_gate
             )
             record["few_shot_distillation"] = main._normalize_few_shot_distillation_state(
                 few_shot_distillation
@@ -732,6 +870,7 @@ def finalize_ground_truth_batch_learning_records(
                 continue
             merged = dict(stored_row)
             merged["feedback_guardrail"] = main._extract_feedback_guardrail(record)
+            merged["learning_quality_gate"] = main._extract_learning_quality_gate(record)
             merged["few_shot_distillation"] = main._normalize_few_shot_distillation_state(
                 record.get("few_shot_distillation")
             )

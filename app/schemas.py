@@ -1082,6 +1082,9 @@ class GroundTruthRecord(BaseModel):
     )
     source: str = Field(default="青天大模型", description="来源")
     feedback_guardrail: Dict[str, Any] = Field(default_factory=dict, description="闭环守门诊断")
+    learning_quality_gate: Dict[str, Any] = Field(
+        default_factory=dict, description="学习样本质量闸门诊断"
+    )
     feedback_closed_loop: Dict[str, Any] = Field(default_factory=dict, description="闭环执行结果")
     few_shot_distillation: Dict[str, Any] = Field(
         default_factory=dict, description="高分逻辑few-shot蒸馏结果"
