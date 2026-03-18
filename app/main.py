@@ -736,6 +736,7 @@ def _build_material_parse_jobs_summary(
     backlog = 0
     failure_count = 0
     gpt_jobs = 0
+    gpt_failed_jobs = 0
     for job in jobs:
         normalized, _ = _normalize_material_parse_job(job)
         if project_id and str(normalized.get("project_id") or "") != str(project_id):
@@ -749,6 +750,8 @@ def _build_material_parse_jobs_summary(
             failure_count += 1
         if str(normalized.get("parse_backend") or "").startswith("gpt"):
             gpt_jobs += 1
+            if status == "failed":
+                gpt_failed_jobs += 1
     total_jobs = len(filtered)
     return filtered, {
         "total_jobs": total_jobs,
@@ -756,6 +759,7 @@ def _build_material_parse_jobs_summary(
         "backlog": backlog,
         "failed_jobs": failure_count,
         "gpt_jobs": gpt_jobs,
+        "gpt_failed_jobs": gpt_failed_jobs,
         "gpt_ratio": round(float(gpt_jobs) / float(total_jobs), 4) if total_jobs > 0 else 0.0,
     }
 

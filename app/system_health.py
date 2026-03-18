@@ -250,7 +250,11 @@ def run_system_self_check(
         backlog = int(context.to_float_or_none(parse_job_summary.get("backlog")) or 0)
         failed_jobs = int(context.to_float_or_none(parse_job_summary.get("failed_jobs")) or 0)
         total_jobs = int(context.to_float_or_none(parse_job_summary.get("total_jobs")) or 0)
-        failure_rate = float(failed_jobs) / float(total_jobs) if total_jobs > 0 else 0.0
+        gpt_jobs = int(context.to_float_or_none(parse_job_summary.get("gpt_jobs")) or 0)
+        gpt_failed_jobs = int(
+            context.to_float_or_none(parse_job_summary.get("gpt_failed_jobs")) or 0
+        )
+        failure_rate = float(gpt_failed_jobs) / float(gpt_jobs) if gpt_jobs > 0 else 0.0
         worker_ok = bool(context.material_parse_worker and context.material_parse_worker.is_alive())
         add(
             "vision_parse_queue_healthy",
@@ -269,7 +273,10 @@ def run_system_self_check(
         add(
             "gpt_parse_failure_rate_ok",
             failure_rate <= 0.35,
-            f"failed_jobs={failed_jobs}, total_jobs={total_jobs}, rate={failure_rate:.1%}",
+            (
+                f"gpt_failed_jobs={gpt_failed_jobs}, gpt_jobs={gpt_jobs}, "
+                f"failed_jobs={failed_jobs}, total_jobs={total_jobs}, rate={failure_rate:.1%}"
+            ),
             category="async_parse",
             required=False,
         )

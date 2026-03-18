@@ -23,22 +23,30 @@ if command -v screen >/dev/null 2>&1; then
   fi
 fi
 
+snapshot_stale="no"
+if [[ "$running" != "yes" && -f "$STATUS_JSON" ]]; then
+  snapshot_stale="yes"
+fi
+
 echo "ops_agents_running=$running"
 if [[ -n "${pid_value}" ]]; then
   echo "ops_agents_pid=$pid_value"
 fi
+echo "status_snapshot_stale=$snapshot_stale"
 
 if [[ -f "$STATUS_JSON" ]]; then
-  python3 - "$STATUS_JSON" <<'PY'
+  python3 - "$STATUS_JSON" "$snapshot_stale" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
+snapshot_stale = sys.argv[2] == "yes"
 data = json.loads(path.read_text(encoding="utf-8"))
 overall = data.get("overall") or {}
 print(f"generated_at={data.get('generated_at')}")
 print(f"overall_status={overall.get('status')}")
+print(f"effective_overall_status={'stopped' if snapshot_stale else overall.get('status')}")
 print(f"overall_duration_ms={overall.get('duration_ms')}")
 for key in ("sre_watchdog", "data_hygiene", "scoring_quality", "evolution"):
     row = (data.get("agents") or {}).get(key) or {}
@@ -46,4 +54,7 @@ for key in ("sre_watchdog", "data_hygiene", "scoring_quality", "evolution"):
 PY
 else
   echo "status_file_missing=$STATUS_JSON"
+  if [[ "$running" != "yes" ]]; then
+    echo "effective_overall_status=stopped"
+  fi
 fi

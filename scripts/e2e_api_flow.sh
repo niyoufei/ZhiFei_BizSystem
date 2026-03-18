@@ -24,6 +24,9 @@ if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
 else
   PYTHON_BIN="python3"
 fi
+if [[ -z "$API_KEY" ]]; then
+  API_KEY="$("$PYTHON_BIN" "$ROOT_DIR/scripts/resolve_api_key.py" --preferred-role admin 2>/dev/null || true)"
+fi
 TMP_SERVER_PID=""
 TMP_SERVER_LOG="$BUILD_DIR/e2e_temp_server.log"
 
@@ -457,7 +460,37 @@ fi
 mv "$gt_tmp" "$BUILD_DIR/ground_truth_from_files.json"
 
 echo "[e2e] evolve"
-curl_with_auth -X POST "$BASE_URL/api/v1/projects/$project_id/evolve" > "$BUILD_DIR/evolve.json"
+confirm_extreme_sample="$("$PYTHON_BIN" - "$BUILD_DIR/ground_truth_from_files.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+blocked = False
+if isinstance(payload, dict):
+    guardrail = payload.get("feedback_guardrail")
+    if isinstance(guardrail, dict) and bool(guardrail.get("blocked")):
+        blocked = True
+    items = payload.get("items")
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            record = item.get("record")
+            if not isinstance(record, dict):
+                continue
+            guardrail = record.get("feedback_guardrail")
+            if isinstance(guardrail, dict) and bool(guardrail.get("blocked")):
+                blocked = True
+                break
+print("1" if blocked else "0")
+PY
+)"
+evolve_url="$BASE_URL/api/v1/projects/$project_id/evolve"
+if [[ "$confirm_extreme_sample" == "1" ]]; then
+  evolve_url="${evolve_url}?confirm_extreme_sample=1"
+fi
+curl_with_auth -X POST "$evolve_url" > "$BUILD_DIR/evolve.json"
 
 echo "[e2e] scoring factors + markdown"
 fetch_best_effort_json "$BUILD_DIR/scoring_factors.json" \

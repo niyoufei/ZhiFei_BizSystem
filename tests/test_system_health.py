@@ -100,3 +100,74 @@ def test_run_system_self_check_builds_summary_from_explicit_context(tmp_path):
     assert payload["summary"]["parser_capability_total"] == 4
     assert payload["summary"]["data_hygiene_orphan_records"] == 0
     assert payload["summary"]["openai_api_available"] is True
+
+
+def test_run_system_self_check_ignores_non_gpt_failures_for_gpt_failure_metric(tmp_path):
+    class DummyWorker:
+        def is_alive(self) -> bool:
+            return True
+
+    probe_dir = tmp_path / "data"
+    probe_dir.mkdir()
+    context = SystemSelfCheckContext(
+        required_item_names={
+            "health",
+            "config",
+            "data_dirs_writable",
+            "auth_status",
+            "rate_limit_status",
+            "parser_pdf",
+            "parser_docx",
+        },
+        load_config=lambda: {"rubric": {}, "lexicon": {}},
+        ensure_data_dirs=lambda: None,
+        storage_probe_dir=str(probe_dir),
+        get_auth_status=lambda: {"enabled": True},
+        get_rate_limit_status=lambda: {"enabled": True},
+        get_runtime_security_status=lambda: {
+            "production_mode": False,
+            "allowed_hosts_configured": False,
+            "upload_limit_enabled": False,
+            "api_docs_enabled": True,
+            "require_api_keys": True,
+        },
+        is_secure_desktop_mode_enabled=lambda: False,
+        get_openai_api_key=lambda: "sk-test",
+        get_openai_model=lambda: "gpt-5.4",
+        pdf_backend_name=lambda: "pymupdf",
+        document_class=object(),
+        pytesseract_module=None,
+        image_module=None,
+        resolve_dwg_converter_binaries=lambda: [],
+        build_material_parse_jobs_summary=lambda project_id: (
+            [],
+            {
+                "backlog": 0,
+                "failed_jobs": 12,
+                "total_jobs": 12,
+                "gpt_jobs": 0,
+                "gpt_failed_jobs": 0,
+            },
+        ),
+        to_float_or_none=lambda value: float(value) if value is not None else None,
+        material_parse_worker=DummyWorker(),
+        material_parse_backlog_warn=18,
+        load_materials=lambda: [],
+        normalize_material_row_for_parse=lambda row: (row, False),
+        build_data_hygiene_report=lambda **kwargs: {
+            "orphan_records_total": 0,
+            "datasets": [],
+        },
+        load_projects=lambda: [],
+        load_submissions=lambda: [],
+        build_scoring_readiness=lambda project_id, project: {},
+        material_type_label=lambda material_type: str(material_type),
+        now_iso=lambda: "2026-03-18T00:00:00+00:00",
+    )
+
+    payload = run_system_self_check(None, context=context)
+
+    assert payload["checks"]["gpt_parse_failure_rate_ok"] is True
+    metric = next(item for item in payload["items"] if item["name"] == "gpt_parse_failure_rate_ok")
+    assert "gpt_jobs=0" in str(metric["detail"])
+    assert "rate=0.0%" in str(metric["detail"])

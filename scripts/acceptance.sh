@@ -9,6 +9,15 @@ PORT="${PORT:-8000}"
 RUN_TESTS="${RUN_TESTS:-1}"
 SUMMARY_FILE="${SUMMARY_FILE:-$ROOT_DIR/build/acceptance_summary.json}"
 
+if [[ -z "$API_KEY" ]]; then
+  if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+    PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
+  else
+    PYTHON_BIN="python3"
+  fi
+  API_KEY="$("$PYTHON_BIN" "$ROOT_DIR/scripts/resolve_api_key.py" --preferred-role admin 2>/dev/null || true)"
+fi
+
 started_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 step_doctor=0
 step_e2e=0
