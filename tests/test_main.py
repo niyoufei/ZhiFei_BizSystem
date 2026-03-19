@@ -422,12 +422,15 @@ class TestIndexEndpoint:
         assert 'id="uploadMaterialDrawingFile"' in response.text
         assert 'id="uploadMaterialPhotoFile"' in response.text
         assert 'id="uploadShigongFile"' in response.text
+        assert 'id="feedFile"' in response.text
         assert 'id="uploadMaterialFileName"' in response.text
         assert 'id="uploadMaterialBoqFileName"' in response.text
         assert 'id="uploadMaterialDrawingFileName"' in response.text
         assert 'id="uploadMaterialPhotoFileName"' in response.text
         assert 'id="uploadShigongFileName"' in response.text
+        assert 'id="feedFileName"' in response.text
         assert 'class="file-picker-btn" data-file-input-id="uploadMaterialFile"' in response.text
+        assert 'class="file-picker-btn" data-file-input-id="feedFile"' in response.text
         assert "uploadShigong" in response.text
         assert 'id="projectDeleteSelect"' in response.text
         assert 'id="deleteSelectedProjects"' in response.text
@@ -860,6 +863,7 @@ class TestIndexEndpoint:
         assert "document.querySelectorAll('[data-file-input-id]').forEach((button) => {" in page
         assert "bindFilePicker('uploadMaterialFile', 'uploadMaterialFileName');" in page
         assert "bindFilePicker('uploadShigongFile', 'uploadShigongFileName');" in page
+        assert "['feedFile', 'feedFileName']," in page
         assert "refreshAllFilePickerTexts();" in page
         assert (
             "const isScoreSubmit = sid === 'btnScoreShigong' || shigongSubmitIntent === 'score';"

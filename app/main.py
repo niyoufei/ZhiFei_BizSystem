@@ -22630,7 +22630,9 @@ def index(
         </div>
         <div class="field-group">
           <label>上传文件：</label>
-          <input type="file" id="feedFile" accept=".txt,.pdf,.doc,.docx,.json,.xlsx,.xls,.dxf" multiple style="margin-left:8px" />
+          <input type="file" id="feedFile" class="visually-hidden-file" accept=".txt,.pdf,.doc,.docx,.json,.xlsx,.xls,.dxf" multiple />
+          <button type="button" class="file-picker-btn" data-file-input-id="feedFile">选择文件</button>
+          <span id="feedFileName" class="file-picker-name">未选择任何文件</span>
           <button type="button" id="btnUploadFeed" onclick="return window.__zhifeiFallbackClick(event, 'btnUploadFeed')">上传并保存投喂包</button>
           <span class="note">支持一次选择多个文件。</span>
           <p id="feedActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
@@ -25377,6 +25379,7 @@ def index(
             ['uploadMaterialDrawingFile', 'uploadMaterialDrawingFileName'],
             ['uploadMaterialPhotoFile', 'uploadMaterialPhotoFileName'],
             ['uploadShigongFile', 'uploadShigongFileName'],
+            ['feedFile', 'feedFileName'],
           ].forEach(([inputId, textId]) => updateFilePickerText(inputId, textId));
         }
 
@@ -29019,6 +29022,7 @@ def index(
             evolveEl.style.display = 'block';
           }
           if (feedInput && failCount === 0) feedInput.value = '';
+          updateFilePickerText('feedFile', 'feedFileName');
         });
         const feedbackGuardrailStates = window.__zhifeiFeedbackGuardrailStates = window.__zhifeiFeedbackGuardrailStates || {};
         const getFeedbackGuardrailState = (projectId) => {
