@@ -22181,7 +22181,7 @@ def index(
         .upload-zone-state { margin:8px 0 0 0; font-size:12px; color:#64748b; min-height:1.2em; line-height:1.5; }
         .upload-zone .inline-form { width:100%; }
         .visually-hidden-file { position:absolute; left:-9999px; width:1px; height:1px; opacity:0; pointer-events:none; }
-        .file-picker-btn { display:inline-flex; align-items:center; justify-content:center; min-height:38px; padding:0 14px; border:1px solid #94a3b8; border-radius:8px; background:#fff; color:#0f172a; cursor:pointer; font-weight:600; }
+        .file-picker-btn { display:inline-flex; align-items:center; justify-content:center; min-height:38px; padding:0 14px; border:1px solid #94a3b8; border-radius:8px; background:#fff; color:#0f172a; cursor:pointer; font-weight:600; text-decoration:none; user-select:none; }
         .file-picker-btn:hover { background:#f8fafc; border-color:#64748b; }
         .file-picker-name { color:#475569; font-size:14px; line-height:1.5; word-break:break-word; }
         .upload-zone .note { display:block; width:100%; }
@@ -22601,7 +22601,7 @@ def index(
           <input type="hidden" name="api_key" id="createProjectFromTenderApiKey" value="" />
           <span style="color:#475569">或上传招标文件自动识别项目名：</span>
           <input id="createProjectFromTenderFile" class="visually-hidden-file" type="file" name="file" accept=".txt,.md,.pdf,.doc,.docx,.docm,.json" />
-          <button type="button" class="file-picker-btn" data-file-input-id="createProjectFromTenderFile">选择招标文件</button>
+          <label for="createProjectFromTenderFile" class="file-picker-btn" data-file-input-id="createProjectFromTenderFile">选择招标文件</label>
           <span id="createProjectFromTenderFileName" class="file-picker-name">未选择任何文件</span>
           <button type="submit" id="btnCreateProjectFromTender" class="secondary">自动创建</button>
         </form>
@@ -22684,7 +22684,7 @@ def index(
                 <input type="hidden" name="api_key" id="uploadMaterialApiKey" value="" />
                 <input type="hidden" name="material_type" value="tender_qa" />
                 <input id="uploadMaterialFile" class="visually-hidden-file" type="file" name="file" accept=".txt,.md,.pdf,.doc,.docx,.docm,.json" multiple />
-                <button type="button" class="file-picker-btn" data-file-input-id="uploadMaterialFile">选择文件</button>
+                <label for="uploadMaterialFile" class="file-picker-btn" data-file-input-id="uploadMaterialFile">选择文件</label>
                 <span id="uploadMaterialFileName" class="file-picker-name">未选择任何文件</span>
                 <button type="submit" id="btnUploadMaterials" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadMaterials'); } return true;">上传资料</button>
                 <span class="note">支持：TXT/MD/PDF/DOC/DOCX/DOCM/JSON，支持一次选择多个文件。</span>
@@ -22699,7 +22699,7 @@ def index(
                 <input type="hidden" name="api_key" id="uploadMaterialBoqApiKey" value="" />
                 <input type="hidden" name="material_type" value="boq" />
                 <input id="uploadMaterialBoqFile" class="visually-hidden-file" type="file" name="file" accept=".xlsx,.xls,.xlsm,.csv,.pdf,.doc,.docx,.txt,.json" multiple />
-                <button type="button" class="file-picker-btn" data-file-input-id="uploadMaterialBoqFile">选择文件</button>
+                <label for="uploadMaterialBoqFile" class="file-picker-btn" data-file-input-id="uploadMaterialBoqFile">选择文件</label>
                 <span id="uploadMaterialBoqFileName" class="file-picker-name">未选择任何文件</span>
                 <button type="submit" id="btnUploadBoq" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadBoq'); } return true;">上传清单</button>
                 <span class="note">支持：XLSX/XLS/XLSM/CSV/PDF/DOC/DOCX/TXT/JSON，支持一次选择多个文件。</span>
@@ -22714,7 +22714,7 @@ def index(
                 <input type="hidden" name="api_key" id="uploadMaterialDrawingApiKey" value="" />
                 <input type="hidden" name="material_type" value="drawing" />
                 <input id="uploadMaterialDrawingFile" class="visually-hidden-file" type="file" name="file" accept=".pdf,.doc,.docx,.xlsx,.xls,.dxf,.dwg,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff,.json,.txt" multiple />
-                <button type="button" class="file-picker-btn" data-file-input-id="uploadMaterialDrawingFile">选择文件</button>
+                <label for="uploadMaterialDrawingFile" class="file-picker-btn" data-file-input-id="uploadMaterialDrawingFile">选择文件</label>
                 <span id="uploadMaterialDrawingFileName" class="file-picker-name">未选择任何文件</span>
                 <button type="submit" id="btnUploadDrawing" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadDrawing'); } return true;">上传图纸</button>
                 <span class="note">支持：PDF/DOC/DOCX/XLSX/XLS/DXF/DWG/图片/JSON/TXT，支持一次选择多个文件。</span>
@@ -22729,7 +22729,7 @@ def index(
                 <input type="hidden" name="api_key" id="uploadMaterialPhotoApiKey" value="" />
                 <input type="hidden" name="material_type" value="site_photo" />
                 <input id="uploadMaterialPhotoFile" class="visually-hidden-file" type="file" name="file" accept=".png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff" multiple />
-                <button type="button" class="file-picker-btn" data-file-input-id="uploadMaterialPhotoFile">选择文件</button>
+                <label for="uploadMaterialPhotoFile" class="file-picker-btn" data-file-input-id="uploadMaterialPhotoFile">选择文件</label>
                 <span id="uploadMaterialPhotoFileName" class="file-picker-name">未选择任何文件</span>
                 <button type="submit" id="btnUploadSitePhotos" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadSitePhotos'); } return true;">上传照片</button>
                 <span class="note">支持：PNG/JPG/JPEG/WEBP/BMP/TIF/TIFF，支持一次选择多个文件。</span>
@@ -22772,7 +22772,7 @@ def index(
             <input type="hidden" name="project_id" id="uploadShigongProjectId" value="__SELECTED_PROJECT_ID__" />
             <input type="hidden" name="api_key" id="uploadShigongApiKey" value="" />
             <input id="uploadShigongFile" class="visually-hidden-file" type="file" name="file" accept=".txt,.docx,.pdf,.json,.xlsx,.xls,.dxf" multiple />
-            <button type="button" class="file-picker-btn" data-file-input-id="uploadShigongFile">选择文件</button>
+            <label for="uploadShigongFile" class="file-picker-btn" data-file-input-id="uploadShigongFile">选择文件</label>
             <span id="uploadShigongFileName" class="file-picker-name">未选择任何文件</span>
             <button type="submit" id="btnUploadShigong" name="submit_action" value="upload" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadShigong'); } return true;">上传施组</button>
             <button type="submit" id="btnScoreShigong" class="secondary" formaction="/web/score_shigong" name="submit_action" value="score" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnScoreShigong'); } return true;">评分施组</button>
@@ -22852,7 +22852,7 @@ def index(
         <div class="field-group">
           <label>上传文件：</label>
           <input type="file" id="feedFile" class="visually-hidden-file" accept=".txt,.pdf,.doc,.docx,.json,.xlsx,.xls,.dxf" multiple />
-          <button type="button" class="file-picker-btn" data-file-input-id="feedFile">选择文件</button>
+          <label for="feedFile" class="file-picker-btn" data-file-input-id="feedFile">选择文件</label>
           <span id="feedFileName" class="file-picker-name">未选择任何文件</span>
           <button type="button" id="btnUploadFeed" onclick="return window.__zhifeiFallbackClick(event, 'btnUploadFeed')">上传并保存投喂包</button>
           <span class="note">支持一次选择多个文件。</span>
@@ -23076,6 +23076,7 @@ def index(
             if (t === 'site_photo') return '现场照片';
             return '招标文件和答疑';
           }
+          window.materialTypeLabel = materialTypeLabel;
 
           function fallbackGetProjectId() {
             const sel = document.getElementById('projectSelect');
@@ -24554,8 +24555,11 @@ def index(
         function buildMaterialTableRowHtml(material, projectId) {
           const row = (material && typeof material === 'object') ? material : {};
           const parseMeta = materialParseStatusMeta(row);
+          const materialTypeText = typeof window.materialTypeLabel === 'function'
+            ? window.materialTypeLabel(row.material_type || 'tender_qa')
+            : '招标文件和答疑';
           return ''
-            + '<td>' + escapeHtmlText(materialTypeLabel(row.material_type || 'tender_qa')) + '</td>'
+            + '<td>' + escapeHtmlText(materialTypeText) + '</td>'
             + '<td>' + escapeHtmlText(row.filename || '') + '</td>'
             + '<td><span style="color:' + escapeHtmlText(parseMeta.tone || '#475569') + '">' + escapeHtmlText(parseMeta.label || '-') + '</span></td>'
             + '<td>' + escapeHtmlText(String(row.created_at || '').slice(0, 19)) + '</td>'
