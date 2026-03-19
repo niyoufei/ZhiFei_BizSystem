@@ -417,6 +417,17 @@ class TestIndexEndpoint:
         assert 'id="uploadZoneStateBoq"' in response.text
         assert 'id="uploadZoneStateDrawing"' in response.text
         assert 'id="uploadZoneStateSitePhoto"' in response.text
+        assert 'id="uploadMaterialFile"' in response.text
+        assert 'id="uploadMaterialBoqFile"' in response.text
+        assert 'id="uploadMaterialDrawingFile"' in response.text
+        assert 'id="uploadMaterialPhotoFile"' in response.text
+        assert 'id="uploadShigongFile"' in response.text
+        assert 'id="uploadMaterialFileName"' in response.text
+        assert 'id="uploadMaterialBoqFileName"' in response.text
+        assert 'id="uploadMaterialDrawingFileName"' in response.text
+        assert 'id="uploadMaterialPhotoFileName"' in response.text
+        assert 'id="uploadShigongFileName"' in response.text
+        assert 'class="file-picker-btn" data-file-input-id="uploadMaterialFile"' in response.text
         assert "uploadShigong" in response.text
         assert 'id="projectDeleteSelect"' in response.text
         assert 'id="deleteSelectedProjects"' in response.text
@@ -841,6 +852,15 @@ class TestIndexEndpoint:
         assert "let uploadShigongInFlight = false;" in page
         assert "let scoreShigongInFlight = false;" in page
         assert "let shigongSubmitIntent = 'upload';" in page
+        assert "function describeSelectedFiles(files, emptyText = '未选择任何文件')" in page
+        assert (
+            "function updateFilePickerText(inputId, textId, emptyText = '未选择任何文件')" in page
+        )
+        assert "function refreshAllFilePickerTexts()" in page
+        assert "document.querySelectorAll('[data-file-input-id]').forEach((button) => {" in page
+        assert "bindFilePicker('uploadMaterialFile', 'uploadMaterialFileName');" in page
+        assert "bindFilePicker('uploadShigongFile', 'uploadShigongFileName');" in page
+        assert "refreshAllFilePickerTexts();" in page
         assert (
             "const isScoreSubmit = sid === 'btnScoreShigong' || shigongSubmitIntent === 'score';"
             in page
