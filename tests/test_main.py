@@ -7256,6 +7256,70 @@ class TestDataHygieneEndpoints:
         mock_hygiene.assert_called_once_with(apply=True)
 
 
+def test_build_data_hygiene_report_repairs_legacy_project_schema(monkeypatch):
+    import app.main as main_mod
+
+    projects = [{"id": "legacy-p1"}]
+    saved: dict[str, object] = {}
+
+    monkeypatch.setattr(main_mod, "ensure_data_dirs", lambda: None)
+    monkeypatch.setattr(main_mod, "load_projects", lambda: projects)
+    monkeypatch.setattr(
+        main_mod,
+        "save_projects",
+        lambda rows: saved.__setitem__("projects", copy.deepcopy(rows)),
+    )
+
+    for loader_name in (
+        "load_submissions",
+        "load_materials",
+        "load_learning_profiles",
+        "load_score_history",
+        "load_ground_truth",
+        "load_project_anchors",
+        "load_project_requirements",
+        "load_delta_cases",
+        "load_calibration_samples",
+        "load_patch_packages",
+        "load_patch_deployments",
+        "load_score_reports",
+        "load_evidence_units",
+        "load_qingtian_results",
+    ):
+        monkeypatch.setattr(main_mod, loader_name, lambda: [])
+
+    for saver_name in (
+        "save_submissions",
+        "save_materials",
+        "save_learning_profiles",
+        "save_score_history",
+        "save_ground_truth",
+        "save_project_anchors",
+        "save_project_requirements",
+        "save_delta_cases",
+        "save_calibration_samples",
+        "save_patch_packages",
+        "save_patch_deployments",
+        "save_score_reports",
+        "save_evidence_units",
+        "save_qingtian_results",
+    ):
+        monkeypatch.setattr(main_mod, saver_name, lambda payload: None)
+
+    for loader_name in ("load_project_context", "load_evolution_reports"):
+        monkeypatch.setattr(main_mod, loader_name, lambda: {})
+    for saver_name in ("save_project_context", "save_evolution_reports"):
+        monkeypatch.setattr(main_mod, saver_name, lambda payload: None)
+
+    payload = main_mod._build_data_hygiene_report(apply=True)
+
+    dataset = next(row for row in payload["datasets"] if row["name"] == "projects_schema")
+    assert dataset["orphan_count"] == 1
+    assert dataset["cleaned_count"] == 1
+    assert saved["projects"][0]["name"] == "恢复项目_legacy-p"
+    assert any("项目记录结构异常" in str(text) for text in payload["recommendations"])
+
+
 class TestComputeMultipliersHash:
     """Tests for _compute_multipliers_hash helper function."""
 

@@ -11128,6 +11128,21 @@ def _build_data_hygiene_report(*, apply: bool) -> Dict[str, object]:
     """
     ensure_data_dirs()
     projects = load_projects()
+    malformed_project_count = 0
+    cleaned_project_count = 0
+    projects_changed = False
+    for idx, project in enumerate(projects):
+        if not isinstance(project, dict):
+            continue
+        project_shadow = copy.deepcopy(project)
+        if _ensure_project_v2_fields(project_shadow):
+            malformed_project_count += 1
+            if apply:
+                projects[idx] = project_shadow
+                cleaned_project_count += 1
+                projects_changed = True
+    if apply and projects_changed:
+        save_projects(projects)
     valid_project_ids = {str(p.get("id") or "").strip() for p in projects if str(p.get("id") or "")}
     datasets: List[Dict[str, object]] = []
     orphan_records_total = 0
@@ -11153,6 +11168,14 @@ def _build_data_hygiene_report(*, apply: bool) -> Dict[str, object]:
                 "mode": mode,
             }
         )
+
+    _append_dataset(
+        name="projects_schema",
+        total=len([p for p in projects if isinstance(p, dict)]),
+        orphan_count=malformed_project_count,
+        cleaned_count=cleaned_project_count,
+        mode="project_schema",
+    )
 
     def _scan_project_scoped_rows(
         *,
@@ -11367,6 +11390,15 @@ def _build_data_hygiene_report(*, apply: bool) -> Dict[str, object]:
         recommendations.append(
             "建议在批量删除项目后执行数据卫生巡检，避免历史孤儿记录影响统计与审计。"
         )
+    if malformed_project_count > 0:
+        if apply:
+            recommendations.append(
+                f"已自愈项目记录结构异常 {cleaned_project_count} 条，项目创建/选择链路已自动加固。"
+            )
+        else:
+            recommendations.append(
+                f"发现项目记录结构异常 {malformed_project_count} 条，建议执行数据卫生修复。"
+            )
 
     return {
         "generated_at": _now_iso(),

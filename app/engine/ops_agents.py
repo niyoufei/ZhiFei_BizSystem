@@ -257,6 +257,129 @@ def _run_data_hygiene_agent(
     }
 
 
+def _run_project_flow_agent(
+    *,
+    base_url: str,
+    api_key: Optional[str],
+    timeout: float,
+    requester: Callable[..., Dict[str, Any]],
+) -> Dict[str, Any]:
+    started = time.monotonic()
+    checks: Dict[str, Any] = {}
+    actions: Dict[str, Any] = {"create": {}, "delete": {}}
+    smoke_name = f"OPS_SMOKE_{int(time.time() * 1000)}"
+
+    projects_before = requester(
+        method="GET",
+        url=f"{base_url}/api/v1/projects",
+        api_key=api_key,
+        timeout=timeout,
+    )
+    checks["projects_before"] = projects_before
+    if int(projects_before.get("status_code") or 0) != 200:
+        return {
+            "name": "project_flow",
+            "status": "fail",
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "checks": checks,
+            "actions": actions,
+            "metrics": {},
+            "recommendations": ["无法读取项目列表，项目主链 smoke 中断。"],
+        }
+
+    create_resp = requester(
+        method="POST",
+        url=f"{base_url}/api/v1/projects",
+        api_key=api_key,
+        timeout=max(10.0, timeout),
+        payload={"name": smoke_name},
+    )
+    checks["create"] = create_resp
+    actions["create"] = {
+        "project_name": smoke_name,
+        "ok": int(create_resp.get("status_code") or 0) == 200,
+        "status_code": int(create_resp.get("status_code") or 0),
+    }
+
+    project_id = str((create_resp.get("json") or {}).get("id") or "").strip()
+    created_ok = bool(project_id) and int(create_resp.get("status_code") or 0) == 200
+    listed_after_create = False
+    removed_after_delete = False
+
+    if created_ok:
+        projects_after_create = requester(
+            method="GET",
+            url=f"{base_url}/api/v1/projects",
+            api_key=api_key,
+            timeout=timeout,
+        )
+        checks["projects_after_create"] = projects_after_create
+        projects_rows = _normalize_projects(projects_after_create.get("json"))
+        listed_after_create = any(
+            str(row.get("id") or "").strip() == project_id for row in projects_rows
+        )
+
+        delete_resp = requester(
+            method="DELETE",
+            url=f"{base_url}/api/v1/projects/{project_id}",
+            api_key=api_key,
+            timeout=max(10.0, timeout),
+        )
+        checks["delete"] = delete_resp
+        delete_ok = int(delete_resp.get("status_code") or 0) in {200, 204}
+        actions["delete"] = {
+            "project_id": project_id,
+            "ok": delete_ok,
+            "status_code": int(delete_resp.get("status_code") or 0),
+        }
+        if delete_ok:
+            projects_after_delete = requester(
+                method="GET",
+                url=f"{base_url}/api/v1/projects",
+                api_key=api_key,
+                timeout=timeout,
+            )
+            checks["projects_after_delete"] = projects_after_delete
+            projects_rows = _normalize_projects(projects_after_delete.get("json"))
+            removed_after_delete = not any(
+                str(row.get("id") or "").strip() == project_id for row in projects_rows
+            )
+    else:
+        delete_ok = False
+
+    pass_flag = created_ok and listed_after_create and delete_ok and removed_after_delete
+    recommendations: List[str] = []
+    if not pass_flag:
+        create_status = int(create_resp.get("status_code") or 0)
+        if create_status in {401, 403}:
+            recommendations.append("项目主链 smoke 缺少足够权限，请使用本机可信请求或 admin 权限。")
+        elif create_status >= 400:
+            recommendations.append("项目创建主链 smoke 失败，说明创建项目链路未通过自动巡检。")
+        elif created_ok and not listed_after_create:
+            recommendations.append("项目创建后未能在列表中回显，项目选择链路存在异常。")
+        elif created_ok and delete_ok and not removed_after_delete:
+            recommendations.append("项目 smoke 删除后仍残留在列表中，项目清理链路存在异常。")
+        else:
+            recommendations.append("项目主链 smoke 失败，请检查项目创建/删除接口和历史数据。")
+    else:
+        recommendations.append("项目创建/删除主链 smoke 正常。")
+
+    return {
+        "name": "project_flow",
+        "status": _status(pass_flag),
+        "duration_ms": int((time.monotonic() - started) * 1000),
+        "checks": checks,
+        "actions": actions,
+        "metrics": {
+            "created_ok": int(created_ok),
+            "listed_after_create": int(listed_after_create),
+            "delete_ok": int(delete_ok),
+            "removed_after_delete": int(removed_after_delete),
+        },
+        "recommendations": recommendations,
+    }
+
+
 def _run_scoring_quality_agent(
     *,
     base_url: str,
@@ -494,6 +617,7 @@ def run_ops_agents_cycle(
     运行一轮“多智能体运维闭环”。
     - sre_watchdog
     - data_hygiene
+    - project_flow
     - scoring_quality
     - evolution
     """
@@ -521,6 +645,15 @@ def run_ops_agents_cycle(
             "metrics": {},
             "recommendations": ["SRE未恢复服务，跳过本轮执行。"],
         }
+        agents["project_flow"] = {
+            "name": "project_flow",
+            "status": "fail",
+            "duration_ms": 0,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": ["SRE未恢复服务，跳过本轮执行。"],
+        }
         agents["scoring_quality"] = {
             "name": "scoring_quality",
             "status": "fail",
@@ -540,18 +673,24 @@ def run_ops_agents_cycle(
             "recommendations": ["SRE未恢复服务，跳过本轮执行。"],
         }
     else:
+        agents["data_hygiene"] = _run_data_hygiene_agent(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout,
+            auto_repair=auto_repair,
+            requester=requester,
+        )
         futures = {}
         with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as executor:
             futures[
                 executor.submit(
-                    _run_data_hygiene_agent,
+                    _run_project_flow_agent,
                     base_url=base_url,
                     api_key=api_key,
                     timeout=timeout,
-                    auto_repair=auto_repair,
                     requester=requester,
                 )
-            ] = "data_hygiene"
+            ] = "project_flow"
             futures[
                 executor.submit(
                     _run_scoring_quality_agent,
@@ -608,7 +747,7 @@ def run_ops_agents_cycle(
     return {
         "generated_at": _now_iso(),
         "base_url": base_url,
-        "agent_count": 4,
+        "agent_count": 5,
         "settings": {
             "auto_repair": bool(auto_repair),
             "auto_evolve": bool(auto_evolve),
