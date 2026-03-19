@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+from starlette.requests import Request
 
 from app.auth import (
     API_KEYS_ENV,
@@ -14,11 +15,28 @@ from app.auth import (
     get_auth_status,
     get_valid_api_keys,
     is_auth_enabled,
+    is_trusted_local_request,
     resolve_api_key_for_role,
     verify_api_key,
     verify_explicit_api_key,
     verify_ops_api_key,
 )
+
+
+def _build_request(host: str = "testserver", *, path: str = "/") -> Request:
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("utf-8"),
+        "query_string": b"",
+        "headers": [(b"host", host.encode("utf-8"))],
+        "client": (host.split(":", 1)[0], 12345),
+        "server": ("127.0.0.1", 8000),
+    }
+    return Request(scope)
 
 
 class TestGetValidApiKeys:
@@ -140,32 +158,48 @@ class TestVerifyApiKey:
         """Should return None (pass) when auth is disabled."""
         with patch.dict(os.environ, {}, clear=True):
             os.environ.pop(API_KEYS_ENV, None)
-            result = verify_api_key(api_key_header=None, api_key_query=None)
+            result = verify_api_key(
+                request=_build_request(),
+                api_key_header=None,
+                api_key_query=None,
+            )
             assert result is None
 
     def test_header_key_accepted(self):
         """Should accept valid API key from header."""
         with patch.dict(os.environ, {API_KEYS_ENV: "valid-key"}):
-            result = verify_api_key(api_key_header="valid-key", api_key_query=None)
+            result = verify_api_key(
+                request=_build_request(),
+                api_key_header="valid-key",
+                api_key_query=None,
+            )
             assert result == "valid-key"
 
     def test_query_key_accepted(self):
         """Should accept valid API key from query param."""
         with patch.dict(os.environ, {API_KEYS_ENV: "valid-key"}):
-            result = verify_api_key(api_key_header=None, api_key_query="valid-key")
+            result = verify_api_key(
+                request=_build_request(),
+                api_key_header=None,
+                api_key_query="valid-key",
+            )
             assert result == "valid-key"
 
     def test_header_takes_precedence(self):
         """Should use header key when both header and query provided."""
         with patch.dict(os.environ, {API_KEYS_ENV: "header-key,query-key"}):
-            result = verify_api_key(api_key_header="header-key", api_key_query="query-key")
+            result = verify_api_key(
+                request=_build_request(),
+                api_key_header="header-key",
+                api_key_query="query-key",
+            )
             assert result == "header-key"
 
     def test_missing_key_raises_401(self):
         """Should raise 401 when key is missing and auth enabled."""
         with patch.dict(os.environ, {API_KEYS_ENV: "valid-key"}):
             with pytest.raises(HTTPException) as exc_info:
-                verify_api_key(api_key_header=None, api_key_query=None)
+                verify_api_key(request=_build_request(), api_key_header=None, api_key_query=None)
             assert exc_info.value.status_code == 401
             assert "缺少 API Key" in exc_info.value.detail
 
@@ -173,30 +207,84 @@ class TestVerifyApiKey:
         """Should raise 401 when key is invalid."""
         with patch.dict(os.environ, {API_KEYS_ENV: "valid-key"}):
             with pytest.raises(HTTPException) as exc_info:
-                verify_api_key(api_key_header="invalid-key", api_key_query=None)
+                verify_api_key(
+                    request=_build_request(),
+                    api_key_header="invalid-key",
+                    api_key_query=None,
+                )
             assert exc_info.value.status_code == 401
             assert "无效的 API Key" in exc_info.value.detail
 
     def test_any_valid_key_accepted(self):
         """Should accept any key from the configured list."""
         with patch.dict(os.environ, {API_KEYS_ENV: "key1,key2,key3"}):
-            assert verify_api_key(api_key_header="key1", api_key_query=None) == "key1"
-            assert verify_api_key(api_key_header="key2", api_key_query=None) == "key2"
-            assert verify_api_key(api_key_header="key3", api_key_query=None) == "key3"
+            assert (
+                verify_api_key(request=_build_request(), api_key_header="key1", api_key_query=None)
+                == "key1"
+            )
+            assert (
+                verify_api_key(request=_build_request(), api_key_header="key2", api_key_query=None)
+                == "key2"
+            )
+            assert (
+                verify_api_key(request=_build_request(), api_key_header="key3", api_key_query=None)
+                == "key3"
+            )
 
     def test_admin_dependency_rejects_ops_role(self):
         """默认受保护接口只允许 admin key。"""
         with patch.dict(os.environ, {API_KEYS_ENV: "admin:admin-key,ops:ops-key"}):
             with pytest.raises(HTTPException) as exc_info:
-                verify_api_key(api_key_header="ops-key", api_key_query=None)
+                verify_api_key(
+                    request=_build_request(),
+                    api_key_header="ops-key",
+                    api_key_query=None,
+                )
             assert exc_info.value.status_code == 403
             assert "admin" in exc_info.value.detail
+
+    def test_localhost_request_bypasses_auth_when_non_production(self):
+        with patch.dict(os.environ, {API_KEYS_ENV: "admin:admin-key"}, clear=False):
+            result = verify_api_key(
+                request=_build_request("127.0.0.1:8000"),
+                api_key_header=None,
+                api_key_query=None,
+            )
+            assert result is None
+
+    def test_localhost_bypass_disabled_in_production_mode(self):
+        with patch.dict(
+            os.environ,
+            {API_KEYS_ENV: "admin:admin-key", "ZHIFEI_PRODUCTION_MODE": "1"},
+            clear=False,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                verify_api_key(
+                    request=_build_request("127.0.0.1:8000"),
+                    api_key_header=None,
+                    api_key_query=None,
+                )
+            assert exc_info.value.status_code == 401
 
     def test_ops_dependency_accepts_ops_role(self):
         """运维接口允许 ops key。"""
         with patch.dict(os.environ, {API_KEYS_ENV: "admin:admin-key,ops:ops-key"}):
-            assert verify_ops_api_key(api_key_header="ops-key", api_key_query=None) == "ops-key"
-            assert verify_ops_api_key(api_key_header="admin-key", api_key_query=None) == "admin-key"
+            assert (
+                verify_ops_api_key(
+                    request=_build_request(),
+                    api_key_header="ops-key",
+                    api_key_query=None,
+                )
+                == "ops-key"
+            )
+            assert (
+                verify_ops_api_key(
+                    request=_build_request(),
+                    api_key_header="admin-key",
+                    api_key_query=None,
+                )
+                == "admin-key"
+            )
 
     def test_verify_explicit_api_key_accepts_valid_admin_key(self):
         with patch.dict(os.environ, {API_KEYS_ENV: "admin:admin-key,ops:ops-key"}):
@@ -247,6 +335,25 @@ class TestGetAuthStatus:
             assert result["configured_roles"] == ["admin", "ops", "readonly"]
             assert result["role_key_counts"] == {"admin": 1, "ops": 1, "readonly": 1}
 
+    def test_status_reports_localhost_bypass_for_local_request(self):
+        with patch.dict(os.environ, {API_KEYS_ENV: "admin:key1"}, clear=False):
+            result = get_auth_status(request=_build_request("127.0.0.1:8000"))
+            assert result["auth_enabled"] is True
+            assert result["trusted_local_bypass_active"] is True
+            assert result["ui_auth_required"] is False
+            assert result["write_auth_required"] is False
+
+
+class TestTrustedLocalRequest:
+    def test_localhost_is_trusted_when_not_in_production(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert is_trusted_local_request(_build_request("localhost:8000")) is True
+            assert is_trusted_local_request(_build_request("127.0.0.1:8000")) is True
+
+    def test_testclient_host_is_not_treated_as_trusted_local(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert is_trusted_local_request(_build_request("testserver")) is False
+
 
 class TestIntegrationWithFastAPI:
     """Integration tests with FastAPI TestClient."""
@@ -263,6 +370,20 @@ class TestIntegrationWithFastAPI:
         data = response.json()
         assert "auth_enabled" in data
         assert "configured_keys_count" in data
+
+    def test_auth_status_endpoint_reports_localhost_bypass(self):
+        from fastapi.testclient import TestClient
+
+        from app.main import app
+
+        with patch.dict(os.environ, {API_KEYS_ENV: "admin:admin-key"}, clear=False):
+            client = TestClient(app)
+            response = client.get("/api/v1/auth/status", headers={"host": "127.0.0.1:8000"})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["auth_enabled"] is True
+        assert data["trusted_local_bypass_active"] is True
+        assert data["ui_auth_required"] is False
 
     def test_auth_verify_endpoint_accepts_admin_key(self):
         from fastapi.testclient import TestClient

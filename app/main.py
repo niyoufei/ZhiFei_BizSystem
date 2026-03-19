@@ -81,6 +81,7 @@ from app import submission_dual_track_views as submission_dual_track_views_modul
 from app.auth import (
     DEFAULT_API_KEY_ROLE,
     get_auth_status,
+    is_trusted_local_request,
     verify_api_key,
     verify_explicit_api_key,
     verify_ops_api_key,
@@ -11490,13 +11491,13 @@ router = APIRouter(prefix="/api/v1")
 
 
 @router.get("/auth/status", tags=["系统状态"])
-def auth_status() -> dict:
+def auth_status(request: Request) -> dict:
     """
     获取 API 认证状态。
 
     返回当前系统的认证配置状态，包括是否启用认证、认证方式等信息。
     """
-    return get_auth_status()
+    return get_auth_status(request=request)
 
 
 @router.get(
@@ -21359,6 +21360,8 @@ def _verify_web_form_api_key_or_redirect(
     api_key_form_value: object = "",
     redirect_url: str,
 ) -> tuple[Optional[str], Optional[RedirectResponse]]:
+    if is_trusted_local_request(request):
+        return None, None
     try:
         verified = verify_explicit_api_key(
             _resolve_web_api_key(request, api_key_form_value),
@@ -21710,6 +21713,7 @@ def index_head() -> Response:
 
 @app.get("/", tags=["系统状态"], include_in_schema=False)
 def index(
+    request: Request,
     create_ok: Optional[str] = Query(None),
     create_error: Optional[str] = Query(None),
     project_id: Optional[str] = Query(None),
@@ -21781,6 +21785,11 @@ def index(
             + "</div>"
         )
         global_notice_html = secure_notice_html + global_notice_html
+
+    initial_auth_status = get_auth_status(request=request)
+    initial_auth_panel_display = (
+        "block" if bool(initial_auth_status.get("ui_auth_required")) else "none"
+    )
 
     ui_dimension_labels = {
         "01": "01 总体部署与信息化管理",
@@ -21948,7 +21957,7 @@ def index(
         <strong>主流程：</strong>创建项目 → 选择项目 → 调整16维权重 → 上传资料 → 上传施组 → 评分 → 录入真实评标 → 学习进化。页面已默认隐藏高级诊断与维护按钮，聚焦试车操作。
       </p>
       __GLOBAL_NOTICE_HTML__
-      <div class="section card" id="authPanel" style="display:none">
+      <div class="section card" id="authPanel" style="display:__AUTH_PANEL_DISPLAY__">
         <h2>0) API Key 认证</h2>
         <p style="font-size:13px;color:#64748b;margin:-8px 0 8px 0">当前系统已启用写入保护。首次使用前，请先输入并保存 API Key，后续创建、上传、评分、学习进化都会自动复用。</p>
         <div class="toolbar">
@@ -23775,7 +23784,7 @@ def index(
           try { localStorage.removeItem(key); } catch (_) {}
           if (key === 'api_key') syncApiKeyHiddenInputs();
         }
-        let authStatusState = { auth_enabled: false, configured_keys_count: 0 };
+        let authStatusState = __INITIAL_AUTH_STATUS_JSON__;
         let verifiedApiKeyState = { key: '', ok: false };
         const WEB_FORM_API_KEY_INPUT_IDS = [
           'createProjectApiKey',
@@ -23800,7 +23809,11 @@ def index(
           el.style.color = isError ? '#b91c1c' : '#15803d';
         }
         function isAuthRequired() {
-          return !!(authStatusState && authStatusState.auth_enabled);
+          if (!authStatusState || typeof authStatusState !== 'object') return false;
+          if (Object.prototype.hasOwnProperty.call(authStatusState, 'ui_auth_required')) {
+            return !!authStatusState.ui_auth_required;
+          }
+          return !!authStatusState.auth_enabled;
         }
         async function verifyApiKeyValue(raw) {
           try {
@@ -29248,6 +29261,11 @@ def index(
     html = html.replace("__PROJECT_OPTIONS__", project_options_html)
     html = html.replace("__CREATE_NOTICE_HTML__", create_notice_html)
     html = html.replace("__GLOBAL_NOTICE_HTML__", global_notice_html)
+    html = html.replace(
+        "__INITIAL_AUTH_STATUS_JSON__",
+        json.dumps(initial_auth_status, ensure_ascii=False),
+    )
+    html = html.replace("__AUTH_PANEL_DISPLAY__", initial_auth_panel_display)
     html = html.replace("__SELECTED_PROJECT_ID__", html_lib.escape(selected_project_id))
     html = html.replace("__EXPERT_PROFILE_STATUS__", initial_profile_status)
     html = html.replace("__EXPERT_WEIGHTS_ROWS__", initial_weights_rows_html)

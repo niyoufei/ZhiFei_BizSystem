@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 from typing import Dict, Optional
 
-from fastapi import HTTPException, Security, status
+from fastapi import HTTPException, Request, Security, status
 from fastapi.security import APIKeyHeader, APIKeyQuery
 
 # API Key 配置
@@ -32,6 +32,8 @@ DEFAULT_API_KEY_ROLE = "admin"
 OPS_API_KEY_ROLE = "ops"
 READONLY_API_KEY_ROLE = "readonly"
 API_KEY_ROLES = (DEFAULT_API_KEY_ROLE, OPS_API_KEY_ROLE, READONLY_API_KEY_ROLE)
+PRODUCTION_MODE_ENV = "ZHIFEI_PRODUCTION_MODE"
+TRUSTED_LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 # Security schemes
 api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
@@ -41,6 +43,37 @@ api_key_query = APIKeyQuery(name=API_KEY_QUERY_NAME, auto_error=False)
 def _normalize_api_key_role(role: object) -> str:
     normalized = str(role or "").strip().lower()
     return normalized if normalized in API_KEY_ROLES else ""
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = str(raw).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _normalize_host_value(host_value: object) -> str:
+    raw = str(host_value or "").strip().lower().rstrip(".")
+    if not raw:
+        return ""
+    if raw.startswith("[") and "]" in raw:
+        return raw[1 : raw.index("]")]
+    if raw.count(":") == 1:
+        return raw.split(":", 1)[0].strip()
+    return raw
+
+
+def is_trusted_local_request(request: Optional[Request]) -> bool:
+    if request is None or _env_flag(PRODUCTION_MODE_ENV, default=False):
+        return False
+
+    host_candidates = {
+        _normalize_host_value(getattr(getattr(request, "url", None), "hostname", "")),
+        _normalize_host_value(getattr(getattr(request, "client", None), "host", "")),
+        _normalize_host_value(request.headers.get("host", "")),
+    }
+    return any(candidate in TRUSTED_LOCAL_HOSTS for candidate in host_candidates if candidate)
 
 
 def _parse_api_key_bindings_from_text(keys_str: str) -> list[Dict[str, object]]:
@@ -164,12 +197,15 @@ def verify_explicit_api_key(
 def _verify_api_key_for_roles(
     *,
     required_roles: tuple[str, ...],
+    request: Request,
     api_key_header: Optional[str] = Security(api_key_header),
     api_key_query: Optional[str] = Security(api_key_query),
 ) -> Optional[str]:
     """验证 API Key，并校验角色权限。"""
     bindings = _parse_api_key_bindings()
     if not bindings:
+        return None
+    if is_trusted_local_request(request):
         return None
 
     api_key = api_key_header or api_key_query
@@ -182,30 +218,34 @@ def _verify_api_key_for_roles(
 
 
 def verify_api_key(
+    request: Request,
     api_key_header: Optional[str] = Security(api_key_header),
     api_key_query: Optional[str] = Security(api_key_query),
 ) -> Optional[str]:
     """验证 API Key（默认 admin 权限）。"""
     return _verify_api_key_for_roles(
         required_roles=(DEFAULT_API_KEY_ROLE,),
+        request=request,
         api_key_header=api_key_header,
         api_key_query=api_key_query,
     )
 
 
 def verify_ops_api_key(
+    request: Request,
     api_key_header: Optional[str] = Security(api_key_header),
     api_key_query: Optional[str] = Security(api_key_query),
 ) -> Optional[str]:
     """验证 API Key（允许 admin / ops）。"""
     return _verify_api_key_for_roles(
         required_roles=(DEFAULT_API_KEY_ROLE, OPS_API_KEY_ROLE),
+        request=request,
         api_key_header=api_key_header,
         api_key_query=api_key_query,
     )
 
 
-def get_auth_status() -> dict:
+def get_auth_status(*, request: Optional[Request] = None) -> dict:
     """获取当前认证状态信息。
 
     Returns:
@@ -213,6 +253,7 @@ def get_auth_status() -> dict:
     """
     enabled = is_auth_enabled()
     bindings = _parse_api_key_bindings()
+    trusted_local_bypass_active = enabled and is_trusted_local_request(request)
     role_key_counts: Dict[str, int] = {}
     explicit_role_entries = 0
     for binding in bindings:
@@ -228,4 +269,7 @@ def get_auth_status() -> dict:
         "default_role": DEFAULT_API_KEY_ROLE,
         "configured_roles": sorted(role_key_counts.keys()),
         "role_key_counts": role_key_counts,
+        "trusted_local_bypass_active": trusted_local_bypass_active,
+        "ui_auth_required": enabled and not trusted_local_bypass_active,
+        "write_auth_required": enabled and not trusted_local_bypass_active,
     }

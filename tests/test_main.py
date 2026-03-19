@@ -581,11 +581,12 @@ class TestIndexEndpoint:
             assert hidden_fragment in page
 
     def test_index_renders_auth_panel_and_api_key_hidden_inputs(self, client):
-        response = client.get("/")
+        with patch.dict(os.environ, {"API_KEYS": "admin:test-admin-key"}, clear=False):
+            response = client.get("/")
         assert response.status_code == 200
         page = response.text
         for fragment in (
-            'id="authPanel"',
+            'id="authPanel" style="display:block"',
             'id="apiKeyInput"',
             'id="btnSaveApiKey"',
             'id="btnClearApiKey"',
@@ -601,8 +602,19 @@ class TestIndexEndpoint:
             "window.applySecureDesktopUiGuards = applySecureDesktopUiGuards;",
             "if (typeof window.applySecureDesktopUiGuards === 'function') {",
             "refreshAuthStatusUi().finally(() => refreshProjects());",
+            "Object.prototype.hasOwnProperty.call(authStatusState, 'ui_auth_required')",
+            'let authStatusState = {"auth_enabled": true,',
         ):
             assert fragment in page
+
+    def test_index_hides_auth_panel_for_trusted_localhost_request(self, client):
+        with patch.dict(os.environ, {"API_KEYS": "admin:test-admin-key"}, clear=False):
+            response = client.get("/", headers={"host": "127.0.0.1:8000"})
+        assert response.status_code == 200
+        page = response.text
+        assert 'id="authPanel" style="display:none"' in page
+        assert '"trusted_local_bypass_active": true' in page
+        assert '"ui_auth_required": false' in page
 
     def test_index_renders_16_dimension_weight_sliders(self, client):
         """Index page should render 16-dimension focus sliders on first paint."""
@@ -844,6 +856,22 @@ class TestWebCreateProjectFallback:
         assert "create_ok=" in response.headers.get("location", "")
         assert mock_create_project.called
         assert mock_create_project.call_args.kwargs["api_key"] == "test-admin-key"
+
+    @patch("app.main.create_project")
+    def test_web_create_project_localhost_bypasses_api_key_when_auth_enabled(
+        self, mock_create_project, client
+    ):
+        with patch.dict(os.environ, {"API_KEYS": "admin:test-admin-key"}, clear=False):
+            response = client.post(
+                "/web/create_project",
+                data={"name": "测试项目"},
+                headers={"host": "127.0.0.1:8000"},
+                follow_redirects=False,
+            )
+        assert response.status_code == 303
+        assert "create_ok=" in response.headers.get("location", "")
+        assert mock_create_project.called
+        assert mock_create_project.call_args.kwargs["api_key"] is None
 
 
 class TestWebFallbackOps:
