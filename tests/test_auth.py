@@ -16,6 +16,7 @@ from app.auth import (
     is_auth_enabled,
     resolve_api_key_for_role,
     verify_api_key,
+    verify_explicit_api_key,
     verify_ops_api_key,
 )
 
@@ -197,6 +198,24 @@ class TestVerifyApiKey:
             assert verify_ops_api_key(api_key_header="ops-key", api_key_query=None) == "ops-key"
             assert verify_ops_api_key(api_key_header="admin-key", api_key_query=None) == "admin-key"
 
+    def test_verify_explicit_api_key_accepts_valid_admin_key(self):
+        with patch.dict(os.environ, {API_KEYS_ENV: "admin:admin-key,ops:ops-key"}):
+            assert verify_explicit_api_key("admin-key") == "admin-key"
+
+    def test_verify_explicit_api_key_rejects_missing_key(self):
+        with patch.dict(os.environ, {API_KEYS_ENV: "admin:admin-key"}):
+            with pytest.raises(HTTPException) as exc_info:
+                verify_explicit_api_key("")
+            assert exc_info.value.status_code == 401
+            assert "请先填写并保存 API Key" in exc_info.value.detail
+
+    def test_verify_explicit_api_key_rejects_insufficient_role(self):
+        with patch.dict(os.environ, {API_KEYS_ENV: "admin:admin-key,ops:ops-key"}):
+            with pytest.raises(HTTPException) as exc_info:
+                verify_explicit_api_key("ops-key", required_roles=(DEFAULT_API_KEY_ROLE,))
+            assert exc_info.value.status_code == 403
+            assert "admin" in exc_info.value.detail
+
 
 class TestGetAuthStatus:
     """Tests for get_auth_status function."""
@@ -244,6 +263,27 @@ class TestIntegrationWithFastAPI:
         data = response.json()
         assert "auth_enabled" in data
         assert "configured_keys_count" in data
+
+    def test_auth_verify_endpoint_accepts_admin_key(self):
+        from fastapi.testclient import TestClient
+
+        from app.main import app
+
+        with patch.dict(os.environ, {API_KEYS_ENV: "admin:admin-key,ops:ops-key"}):
+            client = TestClient(app)
+            response = client.get("/api/v1/auth/verify", headers={"X-API-Key": "admin-key"})
+        assert response.status_code == 200
+        assert response.json()["ok"] is True
+
+    def test_auth_verify_endpoint_rejects_ops_key(self):
+        from fastapi.testclient import TestClient
+
+        from app.main import app
+
+        with patch.dict(os.environ, {API_KEYS_ENV: "admin:admin-key,ops:ops-key"}):
+            client = TestClient(app)
+            response = client.get("/api/v1/auth/verify", headers={"X-API-Key": "ops-key"})
+        assert response.status_code == 403
 
     def test_protected_endpoint_without_auth(self):
         """Protected endpoint should work without key when auth disabled."""

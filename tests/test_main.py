@@ -580,6 +580,30 @@ class TestIndexEndpoint:
         ):
             assert hidden_fragment in page
 
+    def test_index_renders_auth_panel_and_api_key_hidden_inputs(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        for fragment in (
+            'id="authPanel"',
+            'id="apiKeyInput"',
+            'id="btnSaveApiKey"',
+            'id="btnClearApiKey"',
+            'id="createProjectApiKey"',
+            'id="deleteProjectApiKey"',
+            'id="uploadMaterialApiKey"',
+            'id="uploadMaterialBoqApiKey"',
+            'id="uploadMaterialDrawingApiKey"',
+            'id="uploadMaterialPhotoApiKey"',
+            'id="uploadShigongApiKey"',
+            "async function refreshAuthStatusUi()",
+            "async function ensureVerifiedApiKeyForAction(",
+            "window.applySecureDesktopUiGuards = applySecureDesktopUiGuards;",
+            "if (typeof window.applySecureDesktopUiGuards === 'function') {",
+            "refreshAuthStatusUi().finally(() => refreshProjects());",
+        ):
+            assert fragment in page
+
     def test_index_renders_16_dimension_weight_sliders(self, client):
         """Index page should render 16-dimension focus sliders on first paint."""
         response = client.get("/")
@@ -665,6 +689,27 @@ class TestIndexEndpoint:
         page = response.text
         assert re.search(r"replace\(/\s*\n\s*/g", page) is None
         assert "replace(/\\n/g" in page
+
+    def test_index_frontend_does_not_embed_raw_multiline_confirm_string(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert (
+            "window.confirm(warning + '\\n\\n是否确认将该样本纳入本次「' + actionLabel + '」？');"
+            in page
+        )
+        assert (
+            "window.confirm(warning + '\n\n是否确认将该样本纳入本次「' + actionLabel + '」？');"
+            not in page
+        )
+        assert (
+            "window.confirm(detail + '\\n\\n是否确认将该极端样本纳入本次「' + actionLabel + '」？');"
+            in page
+        )
+        assert (
+            "window.confirm(detail + '\n\n是否确认将该极端样本纳入本次「' + actionLabel + '」？');"
+            not in page
+        )
 
     def test_index_frontend_binds_core_buttons_for_sections_5_6_7(self, client):
         """Core buttons in sections 5/6/7 should have safeClick bindings in generated page."""
@@ -771,6 +816,35 @@ class TestWebCreateProjectFallback:
         assert "create_ok=" in response.headers.get("location", "")
         assert mock_create_project.called
 
+    def test_web_create_project_redirects_readable_error_when_auth_enabled_without_key(
+        self, client
+    ):
+        with patch.dict(os.environ, {"API_KEYS": "admin:test-admin-key"}, clear=False):
+            response = client.post(
+                "/web/create_project",
+                data={"name": "测试项目"},
+                follow_redirects=False,
+            )
+        assert response.status_code == 303
+        location = response.headers.get("location", "")
+        assert "create_error=" in location
+        assert "%E8%AF%B7%E5%85%88%E5%A1%AB%E5%86%99%E5%B9%B6%E4%BF%9D%E5%AD%98+API+Key" in location
+
+    @patch("app.main.create_project")
+    def test_web_create_project_accepts_form_api_key_when_auth_enabled(
+        self, mock_create_project, client
+    ):
+        with patch.dict(os.environ, {"API_KEYS": "admin:test-admin-key"}, clear=False):
+            response = client.post(
+                "/web/create_project",
+                data={"name": "测试项目", "api_key": "test-admin-key"},
+                follow_redirects=False,
+            )
+        assert response.status_code == 303
+        assert "create_ok=" in response.headers.get("location", "")
+        assert mock_create_project.called
+        assert mock_create_project.call_args.kwargs["api_key"] == "test-admin-key"
+
 
 class TestWebFallbackOps:
     """Tests for non-JS fallback operation endpoints."""
@@ -800,6 +874,21 @@ class TestWebFallbackOps:
         )
         assert response.status_code == 303
         assert "msg_type=error" in response.headers.get("location", "")
+
+    def test_web_upload_materials_redirects_readable_error_when_auth_enabled_without_key(
+        self, client
+    ):
+        with patch.dict(os.environ, {"API_KEYS": "admin:test-admin-key"}, clear=False):
+            response = client.post(
+                "/web/upload_materials",
+                data={"project_id": "p1"},
+                files=[("file", ("a.txt", BytesIO(b"demo"), "text/plain"))],
+                follow_redirects=False,
+            )
+        assert response.status_code == 303
+        location = response.headers.get("location", "")
+        assert "msg_type=error" in location
+        assert "%E8%AF%B7%E5%85%88%E5%A1%AB%E5%86%99%E5%B9%B6%E4%BF%9D%E5%AD%98+API+Key" in location
 
     def test_web_upload_materials_get_fallback_redirects(self, client):
         response = client.get("/web/upload_materials", follow_redirects=False)
@@ -881,6 +970,18 @@ class TestWebFallbackOps:
         assert "msg_type=success" in location
         assert "%E5%B7%B2%E9%87%8D%E7%AE%97+3+%E4%BB%BD" in location
         assert "#section-shigong" in location
+
+    def test_web_score_shigong_redirects_readable_error_when_auth_enabled_without_key(self, client):
+        with patch.dict(os.environ, {"API_KEYS": "admin:test-admin-key"}, clear=False):
+            response = client.post(
+                "/web/score_shigong",
+                data={"project_id": "p1"},
+                follow_redirects=False,
+            )
+        assert response.status_code == 303
+        location = response.headers.get("location", "")
+        assert "msg_type=error" in location
+        assert "%E8%AF%B7%E5%85%88%E5%A1%AB%E5%86%99%E5%B9%B6%E4%BF%9D%E5%AD%98+API+Key" in location
 
 
 class TestCleanupE2EEndpoint:

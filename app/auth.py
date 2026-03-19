@@ -123,27 +123,28 @@ def is_auth_enabled() -> bool:
     return len(get_valid_api_keys()) > 0
 
 
-def _verify_api_key_for_roles(
+def verify_explicit_api_key(
+    api_key: Optional[str],
     *,
-    required_roles: tuple[str, ...],
-    api_key_header: Optional[str] = Security(api_key_header),
-    api_key_query: Optional[str] = Security(api_key_query),
+    required_roles: tuple[str, ...] = (DEFAULT_API_KEY_ROLE,),
 ) -> Optional[str]:
-    """验证 API Key，并校验角色权限。"""
+    """验证显式传入的 API Key。
+
+    用于 Web 表单回退等无法直接复用 FastAPI Security 依赖的场景。
+    """
     bindings = _parse_api_key_bindings()
 
     if not bindings:
         return None
 
-    api_key = api_key_header or api_key_query
-
-    if not api_key:
+    normalized_key = str(api_key or "").strip()
+    if not normalized_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="缺少 API Key。请在 Header 中添加 X-API-Key 或在 URL 中添加 api_key 参数。",
+            detail="缺少 API Key。请先填写并保存 API Key。",
         )
 
-    binding = next((row for row in bindings if str(row.get("key")) == api_key), None)
+    binding = next((row for row in bindings if str(row.get("key")) == normalized_key), None)
     if binding is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -157,7 +158,27 @@ def _verify_api_key_for_roles(
             detail=f"API Key 权限不足，需要角色：{'/'.join(required_roles)}。",
         )
 
-    return api_key
+    return normalized_key
+
+
+def _verify_api_key_for_roles(
+    *,
+    required_roles: tuple[str, ...],
+    api_key_header: Optional[str] = Security(api_key_header),
+    api_key_query: Optional[str] = Security(api_key_query),
+) -> Optional[str]:
+    """验证 API Key，并校验角色权限。"""
+    bindings = _parse_api_key_bindings()
+    if not bindings:
+        return None
+
+    api_key = api_key_header or api_key_query
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="缺少 API Key。请在 Header 中添加 X-API-Key 或在 URL 中添加 api_key 参数。",
+        )
+    return verify_explicit_api_key(api_key, required_roles=required_roles)
 
 
 def verify_api_key(

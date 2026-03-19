@@ -78,7 +78,13 @@ from app import ground_truth_intake as ground_truth_intake_module
 from app import index_project_views as index_project_views_module
 from app import qingtian_dual_track as qingtian_dual_track_module
 from app import submission_dual_track_views as submission_dual_track_views_module
-from app.auth import get_auth_status, verify_api_key, verify_ops_api_key
+from app.auth import (
+    DEFAULT_API_KEY_ROLE,
+    get_auth_status,
+    verify_api_key,
+    verify_explicit_api_key,
+    verify_ops_api_key,
+)
 from app.cache import (
     cache_score_result,
     clear_score_cache,
@@ -11493,6 +11499,16 @@ def auth_status() -> dict:
     return get_auth_status()
 
 
+@router.get(
+    "/auth/verify",
+    tags=["系统状态"],
+    responses={**RESPONSES_401},
+)
+def auth_verify(api_key: Optional[str] = Depends(verify_api_key)) -> dict:
+    """验证当前 API Key 是否可用于默认受保护操作。"""
+    return {"ok": True, "role": DEFAULT_API_KEY_ROLE}
+
+
 @router.get("/rate_limit/status", tags=["系统状态"])
 def rate_limit_status() -> dict:
     """
@@ -21329,18 +21345,51 @@ async def apple_touch_icon_alt():
     return Response(status_code=204)
 
 
+def _resolve_web_api_key(request: Request, api_key_form_value: object = "") -> str:
+    explicit = str(api_key_form_value or "").strip()
+    if explicit:
+        return explicit
+    query_value = str(request.query_params.get("api_key") or "").strip()
+    return query_value
+
+
+def _verify_web_form_api_key_or_redirect(
+    *,
+    request: Request,
+    api_key_form_value: object = "",
+    redirect_url: str,
+) -> tuple[Optional[str], Optional[RedirectResponse]]:
+    try:
+        verified = verify_explicit_api_key(
+            _resolve_web_api_key(request, api_key_form_value),
+            required_roles=(DEFAULT_API_KEY_ROLE,),
+        )
+    except HTTPException as exc:
+        logger.warning("web_form_api_key_rejected detail=%s", str(getattr(exc, "detail", "")))
+        return None, RedirectResponse(url=redirect_url, status_code=303)
+    return verified, None
+
+
 @app.post("/web/create_project", include_in_schema=False)
 def web_create_project(
+    request: Request,
     name: str = Form(...),
-    api_key: Optional[str] = Depends(verify_api_key),
+    api_key: str = Form(""),
 ):
     clean_name = (name or "").strip()
     if not clean_name:
         return RedirectResponse(
             url="/?create_error=" + quote_plus("项目名称不能为空"), status_code=303
         )
+    verified_api_key, redirect = _verify_web_form_api_key_or_redirect(
+        request=request,
+        api_key_form_value=api_key,
+        redirect_url="/?create_error=" + quote_plus("请先填写并保存 API Key"),
+    )
+    if redirect is not None:
+        return redirect
     try:
-        rec = create_project(ProjectCreate(name=clean_name), api_key=api_key)
+        rec = create_project(ProjectCreate(name=clean_name), api_key=verified_api_key)
     except HTTPException as exc:
         detail = str(getattr(exc, "detail", "创建失败"))
         return RedirectResponse(url="/?create_error=" + quote_plus(detail), status_code=303)
@@ -21353,8 +21402,9 @@ def web_create_project(
 
 @app.post("/web/delete_project", include_in_schema=False)
 def web_delete_project(
+    request: Request,
     project_id: str = Form(""),
-    api_key: Optional[str] = Depends(verify_api_key),
+    api_key: str = Form(""),
 ):
     pid = (project_id or "").strip()
     if not pid:
@@ -21362,6 +21412,16 @@ def web_delete_project(
             url="/?msg_type=error&msg=" + quote_plus("删除失败：请先选择项目"),
             status_code=303,
         )
+    verified_api_key, redirect = _verify_web_form_api_key_or_redirect(
+        request=request,
+        api_key_form_value=api_key,
+        redirect_url="/?project_id="
+        + quote_plus(pid)
+        + "&msg_type=error&msg="
+        + quote_plus("删除失败：请先填写并保存 API Key"),
+    )
+    if redirect is not None:
+        return redirect
     try:
         result = _delete_project_cascade(pid, locale="zh")
     except HTTPException as exc:
@@ -21379,10 +21439,11 @@ def web_delete_project(
 
 @app.post("/web/upload_materials", include_in_schema=False)
 def web_upload_materials(
+    request: Request,
     project_id: str = Form(""),
     material_type: str = Form(MATERIAL_TYPE_DEFAULT),
     file: List[UploadFile] = File(default=[]),
-    api_key: Optional[str] = Depends(verify_api_key),
+    api_key: str = Form(""),
 ):
     pid = (project_id or "").strip()
     files = file or []
@@ -21402,6 +21463,17 @@ def web_upload_materials(
             + "#section-materials",
             status_code=303,
         )
+    verified_api_key, redirect = _verify_web_form_api_key_or_redirect(
+        request=request,
+        api_key_form_value=api_key,
+        redirect_url="/?project_id="
+        + quote_plus(pid)
+        + "&msg_type=error&msg="
+        + quote_plus("上传资料失败：请先填写并保存 API Key")
+        + "#section-materials",
+    )
+    if redirect is not None:
+        return redirect
     ok_count = 0
     fail_count = 0
     first_error = ""
@@ -21411,7 +21483,7 @@ def web_upload_materials(
                 project_id=pid,
                 file=f,
                 material_type=material_type,
-                api_key=api_key,
+                api_key=verified_api_key,
                 locale="zh",
             )
             ok_count += 1
@@ -21464,9 +21536,10 @@ def web_upload_materials_get_fallback(project_id: str = ""):
 
 @app.post("/web/upload_shigong", include_in_schema=False)
 def web_upload_shigong(
+    request: Request,
     project_id: str = Form(""),
     file: List[UploadFile] = File(default=[]),
-    api_key: Optional[str] = Depends(verify_api_key),
+    api_key: str = Form(""),
 ):
     pid = (project_id or "").strip()
     files = file or []
@@ -21486,12 +21559,23 @@ def web_upload_shigong(
             + "#section-shigong",
             status_code=303,
         )
+    verified_api_key, redirect = _verify_web_form_api_key_or_redirect(
+        request=request,
+        api_key_form_value=api_key,
+        redirect_url="/?project_id="
+        + quote_plus(pid)
+        + "&msg_type=error&msg="
+        + quote_plus("上传施组失败：请先填写并保存 API Key")
+        + "#section-shigong",
+    )
+    if redirect is not None:
+        return redirect
     ok_count = 0
     fail_count = 0
     first_error = ""
     for f in files:
         try:
-            upload_shigong(project_id=pid, file=f, api_key=api_key, locale="zh")
+            upload_shigong(project_id=pid, file=f, api_key=verified_api_key, locale="zh")
             ok_count += 1
         except Exception as exc:  # noqa: BLE001 - web fallback should keep processing
             fail_count += 1
@@ -21514,9 +21598,10 @@ def web_upload_shigong(
 
 @app.post("/web/score_shigong", include_in_schema=False)
 def web_score_shigong(
+    request: Request,
     project_id: str = Form(""),
     score_scale_max: int = Form(DEFAULT_SCORE_SCALE_MAX),
-    api_key: Optional[str] = Depends(verify_api_key),
+    api_key: str = Form(""),
     locale: str = Depends(get_locale),
 ):
     pid = (project_id or "").strip()
@@ -21527,6 +21612,17 @@ def web_score_shigong(
             + "#section-shigong",
             status_code=303,
         )
+    verified_api_key, redirect = _verify_web_form_api_key_or_redirect(
+        request=request,
+        api_key_form_value=api_key,
+        redirect_url="/?project_id="
+        + quote_plus(pid)
+        + "&msg_type=error&msg="
+        + quote_plus("施组评分失败：请先填写并保存 API Key")
+        + "#section-shigong",
+    )
+    if redirect is not None:
+        return redirect
     try:
         result = rescore_project_submissions(
             project_id=pid,
@@ -21539,7 +21635,7 @@ def web_score_shigong(
                 retrain_calibrator=False,
                 force_unlock=False,
             ),
-            api_key=api_key,
+            api_key=verified_api_key,
             locale=locale,
         )
         updated = int(
@@ -21852,6 +21948,16 @@ def index(
         <strong>主流程：</strong>创建项目 → 选择项目 → 调整16维权重 → 上传资料 → 上传施组 → 评分 → 录入真实评标 → 学习进化。页面已默认隐藏高级诊断与维护按钮，聚焦试车操作。
       </p>
       __GLOBAL_NOTICE_HTML__
+      <div class="section card" id="authPanel" style="display:none">
+        <h2>0) API Key 认证</h2>
+        <p style="font-size:13px;color:#64748b;margin:-8px 0 8px 0">当前系统已启用写入保护。首次使用前，请先输入并保存 API Key，后续创建、上传、评分、学习进化都会自动复用。</p>
+        <div class="toolbar">
+          <input type="password" id="apiKeyInput" placeholder="请输入 API Key" autocomplete="off" style="min-width:320px" />
+          <button type="button" id="btnSaveApiKey">保存 API Key</button>
+          <button type="button" id="btnClearApiKey" class="secondary">清空</button>
+          <span id="authStatusTag" style="font-size:13px;color:#475569"></span>
+        </div>
+      </div>
       <script>
         (function () {
           // Early fallback shim: guarantees visible response even if later scripts crash.
@@ -22222,6 +22328,7 @@ def index(
       <div class="section card">
         <h2>1) 创建项目</h2>
         <form id="createProject" method="post" action="/web/create_project">
+          <input type="hidden" name="api_key" id="createProjectApiKey" value="" />
           项目名称：<input name="name" placeholder="例如：XX标段施组评审" />
           <button type="submit" id="btnCreateProject">创建</button>
         </form>
@@ -22242,6 +22349,7 @@ def index(
           <span id="currentProjectTag" style="margin-left:4px;font-size:12px;color:#475569"></span>
           <form id="deleteProjectForm" method="post" action="/web/delete_project" class="inline-form">
             <input type="hidden" name="project_id" id="deleteProjectId" value="__SELECTED_PROJECT_ID__" />
+            <input type="hidden" name="api_key" id="deleteProjectApiKey" value="" />
             <button type="submit" id="deleteCurrentProject" class="secondary" style="background:#dc2626">删除当前项目</button>
           </form>
           <div class="inline-form compact-hidden" style="align-items:center;gap:6px">
@@ -22289,6 +22397,7 @@ def index(
               <h4>招标文件和答疑（可多选）</h4>
               <form id="uploadMaterial" method="post" action="/web/upload_materials" enctype="multipart/form-data" class="inline-form">
                 <input type="hidden" name="project_id" id="uploadMaterialProjectId" value="__SELECTED_PROJECT_ID__" />
+                <input type="hidden" name="api_key" id="uploadMaterialApiKey" value="" />
                 <input type="hidden" name="material_type" value="tender_qa" />
                 <input type="file" name="file" accept=".txt,.md,.pdf,.doc,.docx,.docm,.json" multiple />
                 <button type="submit" id="btnUploadMaterials" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadMaterials'); } return true;">上传资料</button>
@@ -22301,6 +22410,7 @@ def index(
               <h4>清单（可多选）</h4>
               <form id="uploadMaterialBoq" method="post" action="/web/upload_materials" enctype="multipart/form-data" class="inline-form">
                 <input type="hidden" name="project_id" id="uploadMaterialBoqProjectId" value="__SELECTED_PROJECT_ID__" />
+                <input type="hidden" name="api_key" id="uploadMaterialBoqApiKey" value="" />
                 <input type="hidden" name="material_type" value="boq" />
                 <input type="file" name="file" accept=".xlsx,.xls,.xlsm,.csv,.pdf,.doc,.docx,.txt,.json" multiple />
                 <button type="submit" id="btnUploadBoq" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadBoq'); } return true;">上传清单</button>
@@ -22313,6 +22423,7 @@ def index(
               <h4>图纸（可多选，支持 DXF ASCII）</h4>
               <form id="uploadMaterialDrawing" method="post" action="/web/upload_materials" enctype="multipart/form-data" class="inline-form">
                 <input type="hidden" name="project_id" id="uploadMaterialDrawingProjectId" value="__SELECTED_PROJECT_ID__" />
+                <input type="hidden" name="api_key" id="uploadMaterialDrawingApiKey" value="" />
                 <input type="hidden" name="material_type" value="drawing" />
                 <input type="file" name="file" accept=".pdf,.doc,.docx,.xlsx,.xls,.dxf,.dwg,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff,.json,.txt" multiple />
                 <button type="submit" id="btnUploadDrawing" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadDrawing'); } return true;">上传图纸</button>
@@ -22325,6 +22436,7 @@ def index(
               <h4>现场照片（可多选）</h4>
               <form id="uploadMaterialPhoto" method="post" action="/web/upload_materials" enctype="multipart/form-data" class="inline-form">
                 <input type="hidden" name="project_id" id="uploadMaterialPhotoProjectId" value="__SELECTED_PROJECT_ID__" />
+                <input type="hidden" name="api_key" id="uploadMaterialPhotoApiKey" value="" />
                 <input type="hidden" name="material_type" value="site_photo" />
                 <input type="file" name="file" accept=".png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff" multiple />
                 <button type="submit" id="btnUploadSitePhotos" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadSitePhotos'); } return true;">上传照片</button>
@@ -22366,6 +22478,7 @@ def index(
           <form id="uploadShigong" method="post" action="/web/upload_shigong" enctype="multipart/form-data" class="inline-form">
             <strong>添加施组：</strong>
             <input type="hidden" name="project_id" id="uploadShigongProjectId" value="__SELECTED_PROJECT_ID__" />
+            <input type="hidden" name="api_key" id="uploadShigongApiKey" value="" />
             <input type="file" name="file" accept=".txt,.docx,.pdf,.json,.xlsx,.xls,.dxf" multiple />
             <button type="submit" id="btnUploadShigong" name="submit_action" value="upload" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadShigong'); } return true;">上传施组</button>
             <button type="submit" id="btnScoreShigong" class="secondary" formaction="/web/score_shigong" name="submit_action" value="score" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnScoreShigong'); } return true;">评分施组</button>
@@ -22630,6 +22743,7 @@ def index(
               ev.preventDefault();
             });
           }
+          window.applySecureDesktopUiGuards = applySecureDesktopUiGuards;
           const FALLBACK_MATERIAL_UPLOAD_ACTIONS = {
             btnUploadMaterials: {
               formId: 'uploadMaterial',
@@ -23590,12 +23704,34 @@ def index(
           reportClientError('前端异步错误', e && (e.reason || e));
         });
         const SAFE_CLICK_HANDLERS = {};
+        const AUTH_PROTECTED_ACTION_IDS = new Set([
+          'btnWeightsSave', 'btnWeightsApply', 'btnCleanupE2EProjects',
+          'btnMaterialDepthReport', 'btnMaterialDepthReportDownload',
+          'btnMaterialKnowledgeProfile', 'btnMaterialKnowledgeProfileDownload',
+          'btnScoringDiagnostic', 'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions',
+          'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
+          'btnEvolve', 'btnEvolutionHealth', 'btnFeedbackGovernance',
+          'btnWritingGuidance', 'btnCompilationInstructions',
+          'btnRebuildDelta', 'btnRebuildSamples', 'btnTrainCalibratorV2',
+          'btnApplyCalibPredict', 'btnAutoRunReflection', 'btnEvalMetricsV2',
+          'btnEvalSummaryV2', 'btnMinePatchV2', 'btnShadowPatchV2',
+          'btnDeployPatchV2', 'btnRollbackPatchV2',
+        ]);
         function safeClick(id, fn) {
           const el = document.getElementById(id);
           if (!el) return;
           const wrapped = async (ev) => {
             if (ev) ev.preventDefault();
             try {
+              if (
+                AUTH_PROTECTED_ACTION_IDS.has(id)
+                && !(await ensureVerifiedApiKeyForAction(id, (msg) => {
+                  const cfg = (window.__ZHIFEI_FALLBACK_ACTIONS && window.__ZHIFEI_FALLBACK_ACTIONS[id]) || {};
+                  if (cfg.resultId && typeof setResultError === 'function') setResultError(cfg.resultId, msg);
+                }))
+              ) {
+                return;
+              }
               await fn(ev);
             } catch (err) {
               const cfg = (window.__ZHIFEI_FALLBACK_ACTIONS && window.__ZHIFEI_FALLBACK_ACTIONS[id]) || {};
@@ -23633,9 +23769,168 @@ def index(
         }
         function storageSet(key, value) {
           try { localStorage.setItem(key, value); } catch (_) {}
+          if (key === 'api_key') syncApiKeyHiddenInputs();
         }
         function storageRemove(key) {
           try { localStorage.removeItem(key); } catch (_) {}
+          if (key === 'api_key') syncApiKeyHiddenInputs();
+        }
+        let authStatusState = { auth_enabled: false, configured_keys_count: 0 };
+        let verifiedApiKeyState = { key: '', ok: false };
+        const WEB_FORM_API_KEY_INPUT_IDS = [
+          'createProjectApiKey',
+          'deleteProjectApiKey',
+          'uploadMaterialApiKey',
+          'uploadMaterialBoqApiKey',
+          'uploadMaterialDrawingApiKey',
+          'uploadMaterialPhotoApiKey',
+          'uploadShigongApiKey',
+        ];
+        function syncApiKeyHiddenInputs() {
+          const value = storageGet('api_key');
+          WEB_FORM_API_KEY_INPUT_IDS.forEach((id) => {
+            const el = document.getElementById(id);
+            if (el) el.value = value;
+          });
+        }
+        function setAuthStatusTag(msg, isError=false) {
+          const el = document.getElementById('authStatusTag');
+          if (!el) return;
+          el.textContent = msg || '';
+          el.style.color = isError ? '#b91c1c' : '#15803d';
+        }
+        function isAuthRequired() {
+          return !!(authStatusState && authStatusState.auth_enabled);
+        }
+        async function verifyApiKeyValue(raw) {
+          try {
+            const res = await fetch('/api/v1/auth/verify', {
+              method: 'GET',
+              headers: { 'X-API-Key': raw },
+            });
+            const data = await res.json().catch(() => ({}));
+            if (res.ok) {
+              return { ok: true, detail: '', data };
+            }
+            return {
+              ok: false,
+              detail: (data && data.detail) ? String(data.detail) : ('HTTP ' + String(res.status || 0)),
+              data,
+            };
+          } catch (err) {
+            return { ok: false, detail: String((err && err.message) || err || '网络异常') };
+          }
+        }
+        function showMissingApiKeyForAction(actionLabel='', onError=null) {
+          if (!isAuthRequired()) return true;
+          const key = storageGet('api_key').trim();
+          if (key) return true;
+          const panel = document.getElementById('authPanel');
+          if (panel) panel.style.display = 'block';
+          const input = document.getElementById('apiKeyInput');
+          if (input) input.focus();
+          const msg = '当前系统已启用写入认证，请先在顶部输入并保存 API Key。';
+          setAuthStatusTag(msg, true);
+          if (typeof onError === 'function') onError(msg);
+          const out = document.getElementById('output');
+          if (out) out.textContent = msg + (actionLabel ? (' 触发点: ' + String(actionLabel)) : '');
+          return false;
+        }
+        async function ensureVerifiedApiKeyForAction(actionLabel='', onError=null) {
+          if (!isAuthRequired()) return true;
+          const key = storageGet('api_key').trim();
+          if (!key) {
+            return showMissingApiKeyForAction(actionLabel, onError);
+          }
+          if (verifiedApiKeyState.ok && verifiedApiKeyState.key === key) {
+            return true;
+          }
+          const panel = document.getElementById('authPanel');
+          if (panel) panel.style.display = 'block';
+          const verification = await verifyApiKeyValue(key);
+          if (verification.ok) {
+            verifiedApiKeyState = { key, ok: true };
+            setAuthStatusTag('API Key 已保存，本页写操作将自动携带。', false);
+            return true;
+          }
+          const input = document.getElementById('apiKeyInput');
+          if (input) input.value = key;
+          storageRemove('api_key');
+          verifiedApiKeyState = { key: '', ok: false };
+          const msg = '已保存的 API Key 无效，请重新输入并保存。' + (verification.detail ? (' 原因：' + verification.detail) : '');
+          setAuthStatusTag(msg, true);
+          if (input) input.focus();
+          if (typeof onError === 'function') onError(msg);
+          const out = document.getElementById('output');
+          if (out) out.textContent = msg + (actionLabel ? (' 触发点: ' + String(actionLabel)) : '');
+          return false;
+        }
+        async function refreshAuthStatusUi() {
+          const panel = document.getElementById('authPanel');
+          const input = document.getElementById('apiKeyInput');
+          syncApiKeyHiddenInputs();
+          if (input && !input.value) input.value = storageGet('api_key');
+          try {
+            const res = await fetch('/api/v1/auth/status', { cache: 'no-store' });
+            const data = await res.json().catch(() => ({}));
+            authStatusState = (data && typeof data === 'object') ? data : { auth_enabled: false };
+          } catch (_) {
+            authStatusState = { auth_enabled: false };
+          }
+          if (!panel) return;
+          if (!isAuthRequired()) {
+            panel.style.display = 'none';
+            verifiedApiKeyState = { key: '', ok: false };
+            return;
+          }
+          panel.style.display = 'block';
+          const storedKey = storageGet('api_key').trim();
+          if (!storedKey) {
+            verifiedApiKeyState = { key: '', ok: false };
+            setAuthStatusTag('请先输入并保存 API Key，否则创建、上传、评分会被阻止。', true);
+            return;
+          }
+          const verification = await verifyApiKeyValue(storedKey);
+          if (verification.ok) {
+            verifiedApiKeyState = { key: storedKey, ok: true };
+            setAuthStatusTag('API Key 已保存，本页写操作将自动携带。', false);
+            return;
+          }
+          verifiedApiKeyState = { key: '', ok: false };
+          if (input) input.value = storedKey;
+          storageRemove('api_key');
+          setAuthStatusTag('已保存的 API Key 无效，请重新输入并保存。', true);
+        }
+        async function saveApiKeyFromInput() {
+          const input = document.getElementById('apiKeyInput');
+          const raw = input ? String(input.value || '').trim() : '';
+          if (!raw) {
+            setAuthStatusTag('请输入 API Key。', true);
+            return;
+          }
+          setAuthStatusTag('正在验证 API Key…', false);
+          const verification = await verifyApiKeyValue(raw);
+          if (!verification.ok) {
+            const detail = verification.detail || '网络异常';
+            setAuthStatusTag('API Key 无效：' + detail, true);
+            return;
+          }
+          storageSet('api_key', raw);
+          verifiedApiKeyState = { key: raw, ok: true };
+          syncApiKeyHiddenInputs();
+          setAuthStatusTag('API Key 校验通过，已保存。', false);
+        }
+        function clearStoredApiKey() {
+          storageRemove('api_key');
+          verifiedApiKeyState = { key: '', ok: false };
+          syncApiKeyHiddenInputs();
+          const input = document.getElementById('apiKeyInput');
+          if (input) input.value = '';
+          if (isAuthRequired()) {
+            setAuthStatusTag('已清空 API Key。后续写操作会先要求重新输入。', true);
+          } else {
+            setAuthStatusTag('', false);
+          }
         }
         function pickProjectFromSelect(sel) {
           if (!sel) return '';
@@ -24722,6 +25017,7 @@ def index(
         if (deleteProjectForm) {
           deleteProjectForm.onsubmit = async (e) => {
             e.preventDefault();
+            if (!(await ensureVerifiedApiKeyForAction('deleteCurrentProject', (msg) => setSelectMsg(msg, true)))) return;
             const id = pid();
             if (!id) { setSelectMsg('请先选择要删除的项目', true); return; }
             const sel = document.getElementById('projectSelect');
@@ -24757,6 +25053,7 @@ def index(
         const deleteSelectedProjectsBtn = document.getElementById('deleteSelectedProjects');
         if (deleteSelectedProjectsBtn) {
           deleteSelectedProjectsBtn.onclick = async () => {
+            if (!(await ensureVerifiedApiKeyForAction('deleteSelectedProjects', (msg) => setSelectMsg(msg, true)))) return;
             const delSel = document.getElementById('projectDeleteSelect');
             const selectedOptions = delSel ? Array.from(delSel.selectedOptions || []) : [];
             const ids = selectedOptions.map((o) => String(o.value || '')).filter(Boolean);
@@ -24833,6 +25130,7 @@ def index(
         if (formCreate) {
           formCreate.onsubmit = async (e) => {
             e.preventDefault();
+            if (!(await ensureVerifiedApiKeyForAction('btnCreateProject', (msg) => setCreateMsg(msg, true)))) return;
             const name = (formCreate.elements.name && formCreate.elements.name.value || '').trim();
             if (!name) { setCreateMsg('请填写项目名称', true); return; }
             setCreateMsg('正在创建…', false);
@@ -24904,6 +25202,9 @@ def index(
           const cfg = MATERIAL_UPLOAD_CONFIGS[materialType] || MATERIAL_UPLOAD_CONFIGS.tender_qa;
           if (uploadMaterialsInFlightByType[materialType]) {
             setActionStatus(cfg.statusId, cfg.typeLabel + '上传进行中，请稍候…', false);
+            return;
+          }
+          if (!(await ensureVerifiedApiKeyForAction(cfg.formId, (msg) => setActionStatus(cfg.statusId, msg, true)))) {
             return;
           }
           uploadMaterialsInFlightByType[materialType] = true;
@@ -25009,6 +25310,9 @@ def index(
             setActionStatus('shigongActionStatus', '施组上传进行中，请稍候…', false);
             return;
           }
+          if (!(await ensureVerifiedApiKeyForAction('btnUploadShigong', (msg) => setActionStatus('shigongActionStatus', msg, true)))) {
+            return;
+          }
           uploadShigongInFlight = true;
           try {
             const projectId = pid();
@@ -25074,6 +25378,9 @@ def index(
         async function scoreShigongAction() {
           if (scoreShigongInFlight) {
             setActionStatus('shigongActionStatus', '施组评分进行中，请稍候…', false);
+            return;
+          }
+          if (!(await ensureVerifiedApiKeyForAction('btnScoreShigong', (msg) => setActionStatus('shigongActionStatus', msg, true)))) {
             return;
           }
           scoreShigongInFlight = true;
@@ -25179,6 +25486,7 @@ def index(
           return '删除失败：HTTP ' + String(status || 0) + (detail ? (' ' + detail) : '');
         }
         async function deleteSubmissionRow(submissionId, rowEl, filename, projectIdOverride='') {
+          if (!(await ensureVerifiedApiKeyForAction('deleteSubmissionRow', (msg) => alert(msg)))) return;
           const id = resolveProjectId(projectIdOverride);
           if (!id) { alert('删除失败：请先选择项目'); return; }
           if (!submissionId) { alert('删除失败：记录ID为空'); return; }
@@ -25211,6 +25519,7 @@ def index(
           if (out) out.textContent = JSON.stringify({ ok: true, id: submissionId, filename: filename || '' }, null, 2);
         }
         async function deleteMaterialRow(materialId, rowEl, filename, projectIdOverride='') {
+          if (!(await ensureVerifiedApiKeyForAction('deleteMaterialRow', (msg) => alert(msg)))) return;
           const id = resolveProjectId(projectIdOverride);
           if (!id) { alert('删除失败：请先选择项目'); return; }
           if (!materialId) { alert('删除失败：记录ID为空'); return; }
@@ -28513,7 +28822,7 @@ def index(
           if (!state.pending) return false;
           if (state.manualConfirmed) return true;
           const warning = state.warningMessage || '检测到极端偏差样本。';
-          const ok = window.confirm(warning + '\n\n是否确认将该样本纳入本次「' + actionLabel + '」？');
+          const ok = window.confirm(warning + '\\n\\n是否确认将该样本纳入本次「' + actionLabel + '」？');
           if (ok) {
             setFeedbackGuardrailState(projectId, { manualConfirmed: true });
             return true;
@@ -28525,7 +28834,7 @@ def index(
           if (!res || res.status !== 409 || detail.indexOf('confirm_extreme_sample=1') < 0) {
             return { res, data };
           }
-          const ok = window.confirm(detail + '\n\n是否确认将该极端样本纳入本次「' + actionLabel + '」？');
+          const ok = window.confirm(detail + '\\n\\n是否确认将该极端样本纳入本次「' + actionLabel + '」？');
           if (!ok) return { res, data };
           setFeedbackGuardrailState(projectId, {
             pending: true,
@@ -28919,11 +29228,18 @@ def index(
         });
 
         // 关闭“硬接管”兜底，避免覆盖 safeClick 的详细渲染结果。
+        const btnSaveApiKey = document.getElementById('btnSaveApiKey');
+        if (btnSaveApiKey) btnSaveApiKey.onclick = saveApiKeyFromInput;
+        const btnClearApiKey = document.getElementById('btnClearApiKey');
+        if (btnClearApiKey) btnClearApiKey.onclick = clearStoredApiKey;
         initWeightsSection();
         syncGroundTruthJudgeInputs();
+        syncApiKeyHiddenInputs();
         updateProjectBoundControlsState();
-        applySecureDesktopUiGuards();
-        refreshProjects();
+        if (typeof window.applySecureDesktopUiGuards === 'function') {
+          window.applySecureDesktopUiGuards();
+        }
+        refreshAuthStatusUi().finally(() => refreshProjects());
 
       </script>
     </body>
