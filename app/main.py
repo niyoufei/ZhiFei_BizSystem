@@ -21829,6 +21829,7 @@ def index(
         .note { font-size:12px; color:#64748b; }
         .muted { margin:4px 0 0 0; font-size:13px; color:#64748b; }
         .result-block { margin-top: 10px; padding: 12px; background: #f8fafc; border-radius: 8px; border-left: 3px solid var(--primary); overflow-x:auto; }
+        .compact-hidden { display:none !important; }
         table { border-collapse: collapse; width: 100%; font-size: 14px; margin-top: 6px; }
         th, td { border: 1px solid var(--border); padding: 10px 12px; text-align: left; vertical-align: top; }
         th { background: #e2e8f0; }
@@ -21846,9 +21847,9 @@ def index(
       </style>
     </head>
     <body class="__SECURE_DESKTOP_BODY_CLASS__">
-      <h1>青天评标系统 - 上传与对比 (v2)</h1>
+      <h1>青天评标系统</h1>
       <p style="margin:-8px 0 16px 0;padding:10px;background:#e0f2fe;border-radius:6px;font-size:14px;">
-        <strong>首次使用：</strong>① 创建项目 → ② 刷新并选择项目 → ③ 上传施组文件 → ④ 点击“评分施组”出分。数据保存在本机，无需额外配置。
+        <strong>主流程：</strong>创建项目 → 选择项目 → 上传资料 → 上传施组 → 评分 → 录入真实评标 → 学习进化。页面已默认隐藏高级诊断与维护按钮，聚焦试车操作。
       </p>
       __GLOBAL_NOTICE_HTML__
       <script>
@@ -22232,10 +22233,10 @@ def index(
       <div class="section card">
         <h2>2) 选择项目</h2>
         <div class="toolbar">
-          <button type="button" id="refreshProjects">刷新项目列表</button>
+          <button type="button" id="refreshProjects" class="compact-hidden">刷新项目列表</button>
           <span style="margin-left:4px">项目：</span>
           <select id="projectSelect">
-            <option value="">-- 请先刷新并选择项目 --</option>
+            <option value="">-- 请选择项目 --</option>
             __PROJECT_OPTIONS__
           </select>
           <span id="currentProjectTag" style="margin-left:4px;font-size:12px;color:#475569"></span>
@@ -22243,13 +22244,13 @@ def index(
             <input type="hidden" name="project_id" id="deleteProjectId" value="__SELECTED_PROJECT_ID__" />
             <button type="submit" id="deleteCurrentProject" class="secondary" style="background:#dc2626">删除当前项目</button>
           </form>
-          <div class="inline-form" style="align-items:center;gap:6px">
+          <div class="inline-form compact-hidden" style="align-items:center;gap:6px">
             <span style="margin-left:4px;font-size:12px;color:#475569">批量删除：</span>
             <select id="projectDeleteSelect" multiple size="3" style="min-width:260px;max-width:420px"></select>
             <button type="button" id="deleteSelectedProjects" class="secondary" style="background:#b91c1c">删除所选项目</button>
           </div>
         </div>
-        <details style="margin-top:8px">
+        <details class="compact-hidden" style="margin-top:8px">
           <summary style="cursor:pointer;color:#334155;font-size:13px">高级工具（系统诊断 / 评分体系 / 分析包）</summary>
           <div class="toolbar" style="margin-top:8px">
             <button type="button" id="btnSelfCheck" class="secondary">系统自检</button>
@@ -22271,11 +22272,11 @@ def index(
         <p style="font-size:13px;color:#64748b;margin:-8px 0 8px 0">评分会读取本区资料并注入到锚点/要求矩阵中，作为后续施组打分依据。请按资料类型上传，避免混投。</p>
         <div style="margin-bottom:10px">
           <strong>本项目资料列表</strong>
-          <button type="button" id="btnRefreshMaterials" class="secondary" style="margin-left:8px">刷新</button>
-          <button type="button" id="btnMaterialDepthReport" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialDepthReport')">深读体检</button>
-          <button type="button" id="btnMaterialDepthReportDownload" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialDepthReportDownload')">下载体检报告(.md)</button>
-          <button type="button" id="btnMaterialKnowledgeProfile" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialKnowledgeProfile')">知识画像</button>
-          <button type="button" id="btnMaterialKnowledgeProfileDownload" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialKnowledgeProfileDownload')">下载知识画像(.md)</button>
+          <button type="button" id="btnRefreshMaterials" class="secondary compact-hidden" style="margin-left:8px">刷新</button>
+          <button type="button" id="btnMaterialDepthReport" class="secondary compact-hidden" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialDepthReport')">深读体检</button>
+          <button type="button" id="btnMaterialDepthReportDownload" class="secondary compact-hidden" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialDepthReportDownload')">下载体检报告(.md)</button>
+          <button type="button" id="btnMaterialKnowledgeProfile" class="secondary compact-hidden" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialKnowledgeProfile')">知识画像</button>
+          <button type="button" id="btnMaterialKnowledgeProfileDownload" class="secondary compact-hidden" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialKnowledgeProfileDownload')">下载知识画像(.md)</button>
         </div>
         <table id="materialsTable"><thead><tr><th>资料类型</th><th>文件名</th><th>解析状态</th><th>上传时间</th><th>操作</th></tr></thead><tbody>__MATERIAL_ROWS__</tbody></table>
         <p id="materialsEmpty" style="font-size:13px;color:#64748b;margin:6px 0 0 0;display:__MATERIALS_EMPTY_DISPLAY__">暂无资料，请下方添加。</p>
@@ -22336,7 +22337,7 @@ def index(
         </div>
       </div>
 
-      <div class="section card">
+      <div class="section card compact-hidden">
         <h2>2.5) 青天评标关注度（16维）</h2>
         <p style="font-size:12px;color:#64748b;margin:-4px 0 10px 0">先设置16维关注度，再点击“应用到本项目并重算”。同一项目内所有施组将统一按该配置重算，历史快照会保留。</p>
         <div id="expertProfileStatus" style="font-size:13px;color:#334155;margin-bottom:8px">__EXPERT_PROFILE_STATUS__</div>
@@ -22353,10 +22354,10 @@ def index(
 
       <div class="section card" id="section-shigong">
         <h2>4) 项目施组</h2>
-        <p style="font-size:13px;color:#64748b;margin:-8px 0 8px 0">每份施组单独打分。支持 .txt、.docx、.pdf、.json、.xlsx/.xls、.dxf。基于下方列表进行对比与洞察。</p>
+        <p style="font-size:13px;color:#64748b;margin:-8px 0 8px 0">每份施组单独打分。支持 .txt、.docx、.pdf、.json、.xlsx/.xls、.dxf。上传后直接评分即可。</p>
         <div style="margin-bottom:10px">
           <strong>本项目施组列表</strong>
-          <button type="button" id="btnRefreshSubmissions" class="secondary" style="margin-left:8px">刷新</button>
+          <button type="button" id="btnRefreshSubmissions" class="secondary compact-hidden" style="margin-left:8px">刷新</button>
         </div>
         <div id="submissionDualTrackOverview" class="result-block" style="display:__SUBMISSION_DUAL_TRACK_OVERVIEW_DISPLAY__">__SUBMISSION_DUAL_TRACK_OVERVIEW_HTML__</div>
         <table id="submissionsTable"><thead><tr><th>文件名</th><th>双轨分数</th><th>偏差诊断</th><th>上传时间</th><th>操作</th></tr></thead><tbody>__SUBMISSION_ROWS__</tbody></table>
@@ -22373,7 +22374,7 @@ def index(
               <option value="100">100分制</option>
               <option value="5">5分制</option>
             </select>
-            <button type="button" id="btnScoringDiagnostic" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnScoringDiagnostic')">评分证据链诊断</button>
+            <button type="button" id="btnScoringDiagnostic" class="secondary compact-hidden" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnScoringDiagnostic')">评分证据链诊断</button>
             <span class="note">支持一次选择多个文件（Mac 按 Command，Windows 按 Ctrl）。</span>
           </form>
           <p id="shigongGateSummary" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
@@ -22384,7 +22385,7 @@ def index(
         </div>
       </div>
 
-      <div class="section card">
+      <div class="section card compact-hidden">
         <h2>5) 对比与洞察</h2>
         <p style="font-size:12px;color:#64748b;margin:-4px 0 8px 0">对比排名：看多份施组分数排序；对比报告：看叙述性差异；洞察：看弱项与扣分建议；学习画像：生成维度权重供后续评分参考。</p>
         <div class="action-row">
@@ -22403,7 +22404,7 @@ def index(
         <div id="scoringBasisResult" class="result-block" style="display:none"></div>
       </div>
 
-      <div class="section card" id="section-adaptive" style="display:none">
+      <div class="section card compact-hidden" id="section-adaptive" style="display:none">
         <h2>6) 自适应优化（高级维护）</h2>
         <p style="font-size:12px;color:#64748b;margin:-4px 0 8px 0">基于本项目施组扣分统计给出词库/规则优化建议 → 生成补丁 → 验证效果 → 应用补丁（需 API Key）。</p>
         <div class="action-row" style="margin-bottom:6px">
@@ -22421,20 +22422,20 @@ def index(
       </div>
 
       <div class="section card">
-        <h2>7) 自我学习与进化</h2>
+        <h2>5) 自我学习与进化</h2>
         <p style="font-size:13px;color:#64748b;margin:0 0 6px 0">上传项目投喂包（招标/清单/图纸等合并文本），录入交易中心真实评标结果（5/7评委+最终得分），系统学习高分逻辑并生成编制指导。</p>
-        <p style="font-size:12px;color:#475569;margin:0 0 10px 0">系统会将学习到的高分逻辑与编制指导持久保存，并用于本项目的预评分权重与编制系统指令；再次执行学习进化可基于新录入的真实评标升级这些经验。</p>
+        <p style="font-size:12px;color:#475569;margin:0 0 10px 0">系统会将学习到的高分逻辑与编制指导持久保存，并用于本项目后续评分；再次执行学习进化可基于新录入的真实评标升级这些经验。</p>
         <div style="margin-bottom:10px">
           <strong>真实评标列表（本项目 / 其它项目）</strong>
-          <span style="margin-left:8px">查看范围：</span>
-          <select id="groundTruthScope">
+          <span class="compact-hidden" style="margin-left:8px">查看范围：</span>
+          <select id="groundTruthScope" class="compact-hidden">
             <option value="current">本项目</option>
             <option value="other">其它项目</option>
           </select>
-          <select id="groundTruthOtherProject" style="margin-left:8px;display:none">
+          <select id="groundTruthOtherProject" class="compact-hidden" style="margin-left:8px;display:none">
             <option value="">-- 选择要查看的项目 --</option>
           </select>
-          <button type="button" id="btnRefreshGroundTruth" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnRefreshGroundTruth')">刷新</button>
+          <button type="button" id="btnRefreshGroundTruth" class="secondary compact-hidden" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnRefreshGroundTruth')">刷新</button>
         </div>
         <table id="groundTruthTable"><thead><tr><th>序号</th><th>施组摘要</th><th>评委分（5/7）</th><th>最终分</th><th>来源</th><th>操作</th></tr></thead><tbody></tbody></table>
         <p id="groundTruthEmpty" style="font-size:13px;color:#64748b;margin:6px 0 10px 0;display:none">暂无真实评标，请下方录入。</p>
@@ -22450,7 +22451,7 @@ def index(
         </div>
         <div style="margin-bottom:10px">
           <strong>已上传投喂包（项目资料）</strong>
-          <button type="button" id="btnRefreshFeedMaterials" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnRefreshFeedMaterials')">刷新</button>
+          <button type="button" id="btnRefreshFeedMaterials" class="secondary compact-hidden" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnRefreshFeedMaterials')">刷新</button>
         </div>
         <table id="feedMaterialsTable"><thead><tr><th>文件名</th><th>上传时间</th><th>操作</th></tr></thead><tbody></tbody></table>
         <p id="feedMaterialsEmpty" style="font-size:13px;color:#64748b;margin:6px 0 10px 0;display:none">暂无投喂包，请在上方或「3) 项目资料」上传。</p>
@@ -22463,7 +22464,7 @@ def index(
           <select id="groundTruthSubmissionSelect" style="margin-left:8px;min-width:360px">
             <option value="">-- 请选择步骤4已上传施组文件 --</option>
           </select>
-          <button type="button" id="btnRefreshGroundTruthSubmissionOptions" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnRefreshGroundTruthSubmissionOptions')">刷新施组选项</button>
+          <button type="button" id="btnRefreshGroundTruthSubmissionOptions" class="secondary compact-hidden" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnRefreshGroundTruthSubmissionOptions')">刷新施组选项</button>
           <span class="note">无需重复上传，直接复用「4) 项目施组」已上传文件。</span>
         </div>
         <div class="field-group">
@@ -22487,11 +22488,11 @@ def index(
         <div class="action-row" style="margin-bottom:10px">
           <button type="button" id="btnEvolve" onclick="return window.__zhifeiFallbackClick(event, 'btnEvolve')">学习进化（根据已录入真实评标生成高分逻辑与编制指导）</button>
           <button type="button" id="btnEvolutionHealth" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnEvolutionHealth')">进化健康度</button>
-          <button type="button" id="btnFeedbackGovernance" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnFeedbackGovernance')">闭环治理面板</button>
+          <button type="button" id="btnFeedbackGovernance" class="secondary compact-hidden" onclick="return window.__zhifeiFallbackClick(event, 'btnFeedbackGovernance')">闭环治理面板</button>
           <button type="button" id="btnWritingGuidance" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnWritingGuidance')">查看编制指导</button>
-          <button type="button" id="btnCompilationInstructions" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnCompilationInstructions')">编制系统指令（可导出为编制约束）</button>
+          <button type="button" id="btnCompilationInstructions" class="secondary compact-hidden" onclick="return window.__zhifeiFallbackClick(event, 'btnCompilationInstructions')">编制系统指令（可导出为编制约束）</button>
         </div>
-        <details open style="margin:12px 0 8px 0;padding:10px;border:2px solid #f59e0b;border-radius:8px;background:#fff7ed">
+        <details open class="compact-hidden" style="margin:12px 0 8px 0;padding:10px;border:2px solid #f59e0b;border-radius:8px;background:#fff7ed">
           <summary style="cursor:pointer;color:#9a3412"><strong>V2 反演校准闭环（核心能力，强烈建议执行）</strong></summary>
           <p style="margin:8px 0 10px 0;color:#7c2d12;font-size:13px">
             该闭环会自动训练并部署校准器（CV闸门）、回填预测分，并联动补丁影子评估/发布。

@@ -529,6 +529,52 @@ class TestIndexEndpoint:
         assert "已解析（GPT-5.4）" in page
         assert 'data-material-id="m1"' in page
 
+    def test_index_compact_ui_keeps_core_workflow_buttons_visible(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        for button_id in (
+            "btnCreateProject",
+            "deleteCurrentProject",
+            "btnUploadMaterials",
+            "btnUploadBoq",
+            "btnUploadDrawing",
+            "btnUploadSitePhotos",
+            "btnUploadShigong",
+            "btnScoreShigong",
+            "btnUploadFeed",
+            "btnAddGroundTruth",
+            "btnEvolve",
+            "btnEvolutionHealth",
+            "btnWritingGuidance",
+        ):
+            assert f'id="{button_id}"' in page
+            assert f'id="{button_id}" class="secondary compact-hidden"' not in page
+            assert f'id="{button_id}" class="compact-hidden"' not in page
+
+    def test_index_compact_ui_hides_advanced_controls_by_default(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert ".compact-hidden { display:none !important; }" in page
+        assert '<details class="compact-hidden"' in page
+        for hidden_fragment in (
+            'id="refreshProjects" class="compact-hidden"',
+            'id="btnRefreshMaterials" class="secondary compact-hidden"',
+            'id="btnMaterialDepthReport" class="secondary compact-hidden"',
+            'id="btnMaterialKnowledgeProfile" class="secondary compact-hidden"',
+            'id="btnRefreshSubmissions" class="secondary compact-hidden"',
+            'id="btnScoringDiagnostic" class="secondary compact-hidden"',
+            'id="btnRefreshGroundTruth" class="secondary compact-hidden"',
+            'id="btnRefreshFeedMaterials" class="secondary compact-hidden"',
+            'id="btnRefreshGroundTruthSubmissionOptions" class="secondary compact-hidden"',
+            'id="btnFeedbackGovernance" class="secondary compact-hidden"',
+            'id="btnCompilationInstructions" class="secondary compact-hidden"',
+            '<div class="section card compact-hidden">',
+            '<div class="section card compact-hidden" id="section-adaptive"',
+        ):
+            assert hidden_fragment in page
+
     def test_index_renders_16_dimension_weight_sliders(self, client):
         """Index page should render 16-dimension focus sliders on first paint."""
         response = client.get("/")
