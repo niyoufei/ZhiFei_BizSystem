@@ -226,6 +226,7 @@ from app.schemas import (
     ProjectContextIn,
     ProjectContextOut,
     ProjectCreate,
+    ProjectCreateFromTenderResponse,
     ProjectEvaluationResponse,
     ProjectExpertProfileResponse,
     ProjectMeceAuditResponse,
@@ -2380,6 +2381,111 @@ def _ensure_project_v2_fields(
         )
         _set_min_rate("min_required_type_coverage_rate", DEFAULT_MIN_REQUIRED_TYPE_COVERAGE_RATE)
     return changed
+
+
+def _normalize_project_name_key(name: object) -> str:
+    raw = unicodedata.normalize("NFKC", str(name or "")).replace("\u3000", " ")
+    return re.sub(r"\s+", " ", raw).strip()
+
+
+def _find_project_by_name(
+    projects: List[Dict[str, object]], name: object
+) -> Optional[Dict[str, object]]:
+    target = _normalize_project_name_key(name)
+    if not target:
+        return None
+    for project in projects:
+        if _normalize_project_name_key(project.get("name")) == target:
+            return project
+    return None
+
+
+def _build_project_record(name: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, object]:
+    record = {
+        "id": str(uuid4()),
+        "name": name,
+        "meta": meta or {},
+        "region": DEFAULT_REGION,
+        "expert_profile_id": None,
+        "qingtian_model_version": DEFAULT_QINGTIAN_MODEL_VERSION,
+        "scoring_engine_version_locked": DEFAULT_SCORING_ENGINE_LOCKED,
+        "calibrator_version_locked": DEFAULT_CALIBRATOR_LOCKED,
+        "status": "scoring_preparation",
+        "created_at": _now_iso(),
+        "updated_at": _now_iso(),
+    }
+    _ensure_project_v2_fields(record)
+    return record
+
+
+_PROJECT_NAME_FIELD_PATTERNS = [
+    re.compile(
+        r"(?:招标项目名称|项目名称|工程名称|标段名称|项目名|工程名|标段名)\s*[:：]\s*([^\n\r]{2,120})"
+    ),
+    re.compile(r"(?:项目概况|工程概况)\s*[:：]\s*([^\n\r]{6,120}(?:工程|项目|标段)[^\n\r]{0,80})"),
+]
+_PROJECT_NAME_FILENAME_SUFFIX_RE = re.compile(
+    r"(?:招标文件(?:及答疑)?|招标答疑|答疑澄清|答疑|澄清|补遗|招标公告|公开招标|施工招标|文件)$"
+)
+
+
+def _clean_project_name_candidate(name: object) -> str:
+    text = _normalize_project_name_key(name).strip("：:;；,，。.()（）[]【】")
+    text = re.sub(
+        r"[，。；;]\s*(?:招标编号|项目编号|建设地点|建设单位|招标人|招标范围|工期|质量标准).*$",
+        "",
+        text,
+    )
+    return text[:120].rstrip()
+
+
+def _is_valid_project_name_candidate(name: str) -> bool:
+    text = _clean_project_name_candidate(name)
+    if len(text) < 4:
+        return False
+    if not any("\u4e00" <= ch <= "\u9fff" or ch.isalnum() for ch in text):
+        return False
+    if text in {"项目名称", "工程名称", "标段名称", "项目概况", "工程概况", "本项目", "本工程"}:
+        return False
+    if text.endswith(("项目名称", "工程名称", "标段名称")):
+        return False
+    return any(token in text for token in ("工程", "项目", "标段"))
+
+
+def _infer_project_name_from_filename(filename: str) -> str:
+    stem = Path(_normalize_uploaded_filename(filename)).stem
+    candidate = re.sub(r"[_\-]+", " ", stem)
+    candidate = _PROJECT_NAME_FILENAME_SUFFIX_RE.sub("", candidate).strip()
+    candidate = _clean_project_name_candidate(candidate)
+    if _is_valid_project_name_candidate(candidate):
+        return candidate
+    return ""
+
+
+def _infer_project_name_from_tender_text(text: str, filename: str) -> str:
+    normalized_text = unicodedata.normalize("NFKC", str(text or "")).replace("\u3000", " ")
+    scan_text = normalized_text[:40000]
+    for pattern in _PROJECT_NAME_FIELD_PATTERNS:
+        for match in pattern.finditer(scan_text):
+            candidate = _clean_project_name_candidate(match.group(1))
+            if _is_valid_project_name_candidate(candidate):
+                return candidate
+    for raw_line in normalized_text.splitlines()[:120]:
+        if not any(marker in raw_line for marker in ("项目名称", "工程名称", "标段名称")):
+            continue
+        candidate = _clean_project_name_candidate(raw_line.split("：", 1)[-1].split(":", 1)[-1])
+        if _is_valid_project_name_candidate(candidate):
+            return candidate
+    fallback = _infer_project_name_from_filename(filename)
+    if fallback:
+        return fallback
+    raise HTTPException(
+        status_code=422,
+        detail=(
+            "无法从招标文件中识别项目名称。请上传包含“项目名称/工程名称/标段名称”的招标文件，"
+            "或改用手动输入项目名称创建。"
+        ),
+    )
 
 
 def _mark_project_expert_profile_read_only(
@@ -7092,7 +7198,7 @@ def _build_v2_report_payload(
 
 
 def _select_calibrator_model(project: Dict[str, object]) -> Optional[Dict[str, object]]:
-    return _select_calibrator_model_from_rows(project, load_calibration_models())
+    return _select_calibrator_model_from_rows(project, _load_calibration_models_safe())
 
 
 def _select_deployed_patch(project_id: str) -> Optional[Dict[str, object]]:
@@ -7910,6 +8016,20 @@ def _load_evidence_units_safe() -> List[Dict[str, object]]:
     except StorageDataError as exc:
         logger.warning(
             "evidence_units_storage_fallback path=%s code=%s detail=%s",
+            exc.path,
+            exc.code,
+            exc.detail,
+        )
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _load_calibration_models_safe() -> List[Dict[str, object]]:
+    try:
+        rows = load_calibration_models()
+    except StorageDataError as exc:
+        logger.warning(
+            "calibration_models_storage_fallback path=%s code=%s detail=%s",
             exc.path,
             exc.code,
             exc.detail,
@@ -11897,26 +12017,85 @@ def create_project(
             changed = _ensure_project_v2_fields(p) or changed
     if changed:
         save_projects(projects)
-    if any(str(p.get("name") or "").strip() == payload.name for p in projects):
+    clean_name = _normalize_project_name_key(payload.name)
+    if not clean_name:
+        raise HTTPException(status_code=422, detail="项目名称不能为空")
+    if _find_project_by_name(projects, clean_name) is not None:
         raise HTTPException(status_code=422, detail="项目名称已存在，请更换名称")
-    project_id = str(uuid4())
-    record = {
-        "id": project_id,
-        "name": payload.name,
-        "meta": payload.meta or {},
-        "region": DEFAULT_REGION,
-        "expert_profile_id": None,
-        "qingtian_model_version": DEFAULT_QINGTIAN_MODEL_VERSION,
-        "scoring_engine_version_locked": DEFAULT_SCORING_ENGINE_LOCKED,
-        "calibrator_version_locked": DEFAULT_CALIBRATOR_LOCKED,
-        "status": "scoring_preparation",
-        "created_at": _now_iso(),
-        "updated_at": _now_iso(),
-    }
-    _ensure_project_v2_fields(record)
+    record = _build_project_record(clean_name, payload.meta or {})
     projects.append(record)
     save_projects(projects)
     return ProjectRecord(**record)
+
+
+@router.post(
+    "/projects/create_from_tender",
+    response_model=ProjectCreateFromTenderResponse,
+    tags=["项目管理"],
+    responses={**RESPONSES_401, **RESPONSES_422},
+)
+def create_project_from_tender(
+    file: UploadFile = File(...),
+    api_key: Optional[str] = Depends(verify_api_key),
+    locale: str = Depends(get_locale),
+) -> ProjectCreateFromTenderResponse:
+    """上传招标文件并自动识别项目名称，创建或复用项目后归档资料。"""
+    ensure_data_dirs()
+    raw_filename = file.filename or ""
+    normalized_filename = _normalize_uploaded_filename(raw_filename)
+    if not normalized_filename:
+        raise HTTPException(status_code=422, detail="招标文件名为空，请重试或重命名后上传。")
+    if not _is_allowed_material_upload(normalized_filename, file.content_type or "", "tender_qa"):
+        raise HTTPException(
+            status_code=422,
+            detail="招标文件和答疑支持：" + _material_type_ext_hint("tender_qa"),
+        )
+    content = file.file.read()
+    if not content:
+        raise HTTPException(status_code=422, detail="招标文件为空，请重新选择文件。")
+    try:
+        parsed_text = _read_uploaded_file_content(content, normalized_filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    inferred_name = _infer_project_name_from_tender_text(parsed_text, normalized_filename)
+
+    projects = load_projects()
+    changed = False
+    for project in projects:
+        if isinstance(project, dict):
+            changed = _ensure_project_v2_fields(project) or changed
+    if changed:
+        save_projects(projects)
+
+    existing = _find_project_by_name(projects, inferred_name)
+    created = False
+    if existing is None:
+        project_row = _build_project_record(inferred_name, {})
+        projects.append(project_row)
+        save_projects(projects)
+        created = True
+    else:
+        project_row = existing
+
+    try:
+        file.file.seek(0)
+    except Exception:
+        file.file = io.BytesIO(content)
+    upload_result = upload_material(
+        project_id=str(project_row.get("id") or ""),
+        file=file,
+        material_type="tender_qa",
+        api_key=api_key,
+        locale=locale,
+    )
+    material_row = dict(upload_result.get("material") or {})
+    return ProjectCreateFromTenderResponse(
+        project=ProjectRecord(**project_row),
+        material=MaterialRecord(**material_row),
+        inferred_name=inferred_name,
+        created=created,
+        reused_existing=not created,
+    )
 
 
 @router.get("/projects", response_model=list[ProjectRecord], tags=["项目管理"])
@@ -21441,6 +21620,40 @@ def web_create_project(
     )
 
 
+@app.post("/web/create_project_from_tender", include_in_schema=False)
+def web_create_project_from_tender(
+    request: Request,
+    file: UploadFile = File(...),
+    api_key: str = Form(""),
+):
+    if not str(getattr(file, "filename", "") or "").strip():
+        return RedirectResponse(
+            url="/?create_error=" + quote_plus("请先选择招标文件"), status_code=303
+        )
+    verified_api_key, redirect = _verify_web_form_api_key_or_redirect(
+        request=request,
+        api_key_form_value=api_key,
+        redirect_url="/?create_error=" + quote_plus("请先填写并保存 API Key"),
+    )
+    if redirect is not None:
+        return redirect
+    try:
+        result = create_project_from_tender(file=file, api_key=verified_api_key, locale="zh")
+    except HTTPException as exc:
+        detail = str(getattr(exc, "detail", "自动创建失败"))
+        return RedirectResponse(url="/?create_error=" + quote_plus(detail), status_code=303)
+    project = result.project
+    notice = (
+        "已自动创建项目：" + str(project.name)
+        if result.created
+        else "已定位现有项目并补充招标文件：" + str(project.name)
+    )
+    return RedirectResponse(
+        url="/?create_ok=" + quote_plus(notice) + "&project_id=" + quote_plus(str(project.id)),
+        status_code=303,
+    )
+
+
 @app.post("/web/delete_project", include_in_schema=False)
 def web_delete_project(
     request: Request,
@@ -22384,9 +22597,17 @@ def index(
           项目名称：<input id="createProjectNameInput" name="name" placeholder="例如：XX标段施组评审" autocomplete="off" />
           <button type="submit" id="btnCreateProject">创建</button>
         </form>
+        <form id="createProjectFromTender" method="post" action="/web/create_project_from_tender" enctype="multipart/form-data" class="inline-form" style="margin-top:10px;gap:8px;flex-wrap:wrap">
+          <input type="hidden" name="api_key" id="createProjectFromTenderApiKey" value="" />
+          <span style="color:#475569">或上传招标文件自动识别项目名：</span>
+          <input id="createProjectFromTenderFile" class="visually-hidden-file" type="file" name="file" accept=".txt,.md,.pdf,.doc,.docx,.docm,.json" />
+          <button type="button" class="file-picker-btn" data-file-input-id="createProjectFromTenderFile">选择招标文件</button>
+          <span id="createProjectFromTenderFileName" class="file-picker-name">未选择任何文件</span>
+          <button type="submit" id="btnCreateProjectFromTender" class="secondary">自动创建</button>
+        </form>
         __CREATE_NOTICE_HTML__
         <p id="createProjectMessage" style="margin:8px 0 0 0;font-size:13px;min-height:1.2em"></p>
-        <p style="margin:4px 0 0 0;font-size:13px;color:#64748b">创建后会自动切换到新项目。项目较多时，可在下方输入名称快速定位。</p>
+        <p style="margin:4px 0 0 0;font-size:13px;color:#64748b">可手动输入项目名称，或直接上传招标文件自动识别创建。若识别到同名项目，系统会直接切换到现有项目并把招标文件归档进去。</p>
       </div>
 
       <div class="section card">
@@ -23854,6 +24075,7 @@ def index(
         let verifiedApiKeyState = { key: '', ok: false };
         const WEB_FORM_API_KEY_INPUT_IDS = [
           'createProjectApiKey',
+          'createProjectFromTenderApiKey',
           'deleteProjectApiKey',
           'uploadMaterialApiKey',
           'uploadMaterialBoqApiKey',
@@ -25331,6 +25553,61 @@ def index(
         } else {
           console.error('createProject form not found');
         }
+        const formCreateFromTender = document.getElementById('createProjectFromTender');
+        if (formCreateFromTender) {
+          formCreateFromTender.onsubmit = async (e) => {
+            e.preventDefault();
+            if (!(await ensureVerifiedApiKeyForAction('btnCreateProjectFromTender', (msg) => setCreateMsg(msg, true)))) return;
+            const fileInput = document.getElementById('createProjectFromTenderFile');
+            const files = fileInput && fileInput.files ? Array.from(fileInput.files) : [];
+            if (!files.length) { setCreateMsg('请先选择招标文件', true); return; }
+            setCreateMsg('正在解析招标文件并自动创建项目…', false);
+            let res, text;
+            try {
+              const formData = new FormData(formCreateFromTender);
+              res = await fetch('/api/v1/projects/create_from_tender', {
+                method: 'POST',
+                headers: apiHeaders(false),
+                body: formData,
+              });
+              text = await res.text();
+            } catch (err) {
+              setCreateMsg('网络错误: ' + (err.message || err), true);
+              const out = document.getElementById('output');
+              if (out) { out.textContent = '请求失败: ' + (err.message || err); out.scrollIntoView({ behavior: 'smooth' }); }
+              return;
+            }
+            const outEl = document.getElementById('output');
+            if (outEl) outEl.textContent = text;
+            if (res && res.ok) {
+              let result = {};
+              try {
+                result = JSON.parse(text || '{}');
+              } catch (_) {}
+              const project = result && result.project ? result.project : {};
+              const projectId = String((project && project.id) || '').trim();
+              const projectName = String((project && project.name) || '').trim();
+              if (projectId) storageSet('selected_project_id', projectId);
+              if (fileInput) fileInput.value = '';
+              updateFilePickerText('createProjectFromTenderFile', 'createProjectFromTenderFileName');
+              const searchInput = document.getElementById('projectSearchInput');
+              if (searchInput) searchInput.value = '';
+              const successMsg = result && result.created
+                ? ('已自动创建项目：' + projectName)
+                : ('已定位现有项目并补充招标文件：' + projectName);
+              setCreateMsg(successMsg, false);
+              await refreshProjects(projectId);
+            } else {
+              let detail = text;
+              try { const j = JSON.parse(text); detail = (j && j.detail) || text; } catch (_) {}
+              setCreateMsg('自动创建失败: ' + res.status + ' ' + (detail || '').slice(0, 120), true);
+              const outSc = document.getElementById('output');
+              if (outSc) outSc.scrollIntoView({ behavior: 'smooth' });
+            }
+          };
+        } else {
+          console.error('createProjectFromTender form not found');
+        }
 
         function setFormPid(form) {
           const fid = form.querySelector('input[name="project_id"]');
@@ -25374,6 +25651,7 @@ def index(
 
         function refreshAllFilePickerTexts() {
           [
+            ['createProjectFromTenderFile', 'createProjectFromTenderFileName'],
             ['uploadMaterialFile', 'uploadMaterialFileName'],
             ['uploadMaterialBoqFile', 'uploadMaterialBoqFileName'],
             ['uploadMaterialDrawingFile', 'uploadMaterialDrawingFileName'],
@@ -25397,6 +25675,7 @@ def index(
         bindFilePicker('uploadMaterialDrawingFile', 'uploadMaterialDrawingFileName');
         bindFilePicker('uploadMaterialPhotoFile', 'uploadMaterialPhotoFileName');
         bindFilePicker('uploadShigongFile', 'uploadShigongFileName');
+        bindFilePicker('createProjectFromTenderFile', 'createProjectFromTenderFileName');
 
         const MATERIAL_UPLOAD_CONFIGS = {
           tender_qa: { formId: 'uploadMaterial', statusId: 'materialsActionStatus', typeLabel: '招标文件和答疑' },

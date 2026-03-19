@@ -276,6 +276,16 @@ class MaterialRecord(BaseModel):
     job_id: Optional[str] = None
 
 
+class ProjectCreateFromTenderResponse(BaseModel):
+    """上传招标文件自动创建项目响应"""
+
+    project: ProjectRecord = Field(..., description="自动创建或复用的项目")
+    material: MaterialRecord = Field(..., description="已归档到项目下的招标资料")
+    inferred_name: str = Field(..., description="从招标文件识别出的项目名称")
+    created: bool = Field(..., description="是否创建了新项目")
+    reused_existing: bool = Field(..., description="是否复用了已存在项目")
+
+
 class MaterialParseJobRecord(BaseModel):
     id: str
     material_id: str

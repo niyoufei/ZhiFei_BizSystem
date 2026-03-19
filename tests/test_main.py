@@ -90,6 +90,22 @@ class TestStorageErrorHandling:
 
         assert _load_evidence_units_safe() == []
 
+    @patch("app.main.load_calibration_models")
+    def test_load_calibration_models_safe_falls_back_on_corrupted_storage(
+        self,
+        mock_load_calibration_models,
+    ):
+        from app.main import _load_calibration_models_safe
+        from app.storage import StorageDataError
+
+        mock_load_calibration_models.side_effect = StorageDataError(
+            Path("/tmp/calibration_models.json"),
+            "json_parse_failed",
+            "数据文件 JSON 格式损坏：calibration_models.json（第 1 行，第 1 列），请使用历史版本回滚。",
+        )
+
+        assert _load_calibration_models_safe() == []
+
 
 class TestVersionedJsonHistoryRoutes:
     @patch("app.main.list_json_versions")
@@ -574,6 +590,7 @@ class TestIndexEndpoint:
         page = response.text
         for button_id in (
             "btnCreateProject",
+            "btnCreateProjectFromTender",
             "deleteCurrentProject",
             "btnUploadMaterials",
             "btnUploadBoq",
@@ -630,6 +647,7 @@ class TestIndexEndpoint:
             'id="btnSaveApiKey"',
             'id="btnClearApiKey"',
             'id="createProjectApiKey"',
+            'id="createProjectFromTenderApiKey"',
             'id="deleteProjectApiKey"',
             'id="uploadMaterialApiKey"',
             'id="uploadMaterialBoqApiKey"',
@@ -681,6 +699,8 @@ class TestIndexEndpoint:
         assert response.status_code == 200
         assert 'id="deleteProjectForm"' in response.text
         assert 'action="/web/delete_project"' in response.text
+        assert 'id="createProjectFromTender"' in response.text
+        assert 'action="/web/create_project_from_tender"' in response.text
         assert 'action="/web/upload_materials"' in response.text
         assert 'action="/web/upload_shigong"' in response.text
 
@@ -861,8 +881,17 @@ class TestIndexEndpoint:
         )
         assert "function refreshAllFilePickerTexts()" in page
         assert "document.querySelectorAll('[data-file-input-id]').forEach((button) => {" in page
+        assert (
+            "bindFilePicker('createProjectFromTenderFile', 'createProjectFromTenderFileName');"
+            in page
+        )
         assert "bindFilePicker('uploadMaterialFile', 'uploadMaterialFileName');" in page
         assert "bindFilePicker('uploadShigongFile', 'uploadShigongFileName');" in page
+        assert (
+            "const formCreateFromTender = document.getElementById('createProjectFromTender');"
+            in page
+        )
+        assert "/api/v1/projects/create_from_tender" in page
         assert "['feedFile', 'feedFileName']," in page
         assert "refreshAllFilePickerTexts();" in page
         assert (
@@ -933,6 +962,50 @@ class TestWebCreateProjectFallback:
         assert "create_ok=" in response.headers.get("location", "")
         assert mock_create_project.called
         assert mock_create_project.call_args.kwargs["api_key"] is None
+
+    @patch("app.main.create_project_from_tender")
+    def test_web_create_project_from_tender_success_redirects_ok(
+        self, mock_create_from_tender, client
+    ):
+        from app.schemas import MaterialRecord, ProjectCreateFromTenderResponse, ProjectRecord
+
+        mock_create_from_tender.return_value = ProjectCreateFromTenderResponse(
+            project=ProjectRecord(
+                id="p1",
+                name="合肥轨道TOD甘棠路一期B地块公共区域精装修工程招标",
+                meta={},
+                created_at="2026-03-19T00:00:00+00:00",
+            ),
+            material=MaterialRecord(
+                id="m1",
+                project_id="p1",
+                material_type="tender_qa",
+                filename="招标文件.txt",
+                path="/tmp/materials/p1/tender_qa/招标文件.txt",
+                created_at="2026-03-19T00:00:00+00:00",
+            ),
+            inferred_name="合肥轨道TOD甘棠路一期B地块公共区域精装修工程招标",
+            created=True,
+            reused_existing=False,
+        )
+
+        response = client.post(
+            "/web/create_project_from_tender",
+            files={
+                "file": (
+                    "招标文件.txt",
+                    "项目名称：合肥轨道TOD甘棠路一期B地块公共区域精装修工程招标".encode("utf-8"),
+                    "text/plain",
+                )
+            },
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 303
+        location = response.headers.get("location", "")
+        assert "create_ok=" in location
+        assert "project_id=p1" in location
+        assert mock_create_from_tender.called
 
 
 class TestWebFallbackOps:
@@ -1323,6 +1396,115 @@ class TestProjectsEndpoints:
         assert mock_save.call_count == 2
         repaired_projects = mock_save.call_args_list[0].args[0]
         assert repaired_projects[0]["name"] == "恢复项目_legacy-p"
+
+    @patch("app.main.upload_material")
+    @patch("app.main.save_projects")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_create_project_from_tender_creates_new_project(
+        self,
+        mock_ensure,
+        mock_load,
+        mock_save,
+        mock_upload_material,
+        client,
+    ):
+        mock_load.return_value = []
+
+        def _fake_upload_material(project_id, file, material_type, api_key, locale):
+            return {
+                "material": {
+                    "id": "m1",
+                    "project_id": project_id,
+                    "material_type": material_type,
+                    "filename": "招标文件.txt",
+                    "path": f"/tmp/materials/{project_id}/tender_qa/招标文件.txt",
+                    "created_at": "2026-03-19T00:00:00+00:00",
+                }
+            }
+
+        mock_upload_material.side_effect = _fake_upload_material
+
+        response = client.post(
+            "/api/v1/projects/create_from_tender",
+            files={
+                "file": (
+                    "招标文件.txt",
+                    "项目名称：合肥轨道TOD甘棠路一期B地块公共区域精装修工程招标".encode("utf-8"),
+                    "text/plain",
+                )
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["created"] is True
+        assert data["reused_existing"] is False
+        assert data["inferred_name"] == "合肥轨道TOD甘棠路一期B地块公共区域精装修工程招标"
+        assert data["project"]["name"] == "合肥轨道TOD甘棠路一期B地块公共区域精装修工程招标"
+        assert data["material"]["material_type"] == "tender_qa"
+        mock_save.assert_called_once()
+
+    @patch("app.main.upload_material")
+    @patch("app.main.save_projects")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_create_project_from_tender_reuses_existing_project(
+        self,
+        mock_ensure,
+        mock_load,
+        mock_save,
+        mock_upload_material,
+        client,
+    ):
+        mock_load.return_value = [
+            {
+                "id": "p1",
+                "name": "合肥轨道TOD甘棠路一期B地块公共区域精装修工程招标",
+                "meta": {},
+                "region": "安徽",
+                "expert_profile_id": None,
+                "qingtian_model_version": "gpt-5.4",
+                "scoring_engine_version_locked": "v2",
+                "calibrator_version_locked": "",
+                "status": "scoring_preparation",
+                "created_at": "2026-03-19T00:00:00+00:00",
+                "updated_at": "2026-03-19T00:00:00+00:00",
+            }
+        ]
+
+        def _fake_upload_material(project_id, file, material_type, api_key, locale):
+            return {
+                "material": {
+                    "id": "m1",
+                    "project_id": project_id,
+                    "material_type": material_type,
+                    "filename": "招标文件.txt",
+                    "path": f"/tmp/materials/{project_id}/tender_qa/招标文件.txt",
+                    "created_at": "2026-03-19T00:00:00+00:00",
+                }
+            }
+
+        mock_upload_material.side_effect = _fake_upload_material
+
+        response = client.post(
+            "/api/v1/projects/create_from_tender",
+            files={
+                "file": (
+                    "招标文件.txt",
+                    "项目名称：合肥轨道TOD甘棠路一期B地块公共区域精装修工程招标".encode("utf-8"),
+                    "text/plain",
+                )
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["created"] is False
+        assert data["reused_existing"] is True
+        assert data["project"]["id"] == "p1"
+        assert data["project"]["name"] == "合肥轨道TOD甘棠路一期B地块公共区域精装修工程招标"
+        mock_save.assert_called_once()
 
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
