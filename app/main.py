@@ -11859,7 +11859,13 @@ def create_project(
     """
     ensure_data_dirs()
     projects = load_projects()
-    if any(p["name"] == payload.name for p in projects):
+    changed = False
+    for p in projects:
+        if isinstance(p, dict):
+            changed = _ensure_project_v2_fields(p) or changed
+    if changed:
+        save_projects(projects)
+    if any(str(p.get("name") or "").strip() == payload.name for p in projects):
         raise HTTPException(status_code=422, detail="项目名称已存在，请更换名称")
     project_id = str(uuid4())
     record = {
@@ -21745,16 +21751,18 @@ def index(
         # Default to latest created project for better usability.
         selected_project_id = project_ids[-1]
     project_options = []
+    project_search_options = []
     for p in projects:
         pid_raw = str(p.get("id", ""))
         pid = html_lib.escape(pid_raw)
         pname = html_lib.escape(str(p.get("name", p.get("id", ""))))
-        short_id = html_lib.escape(str(p.get("id", ""))[:8])
         selected_attr = " selected" if pid_raw == selected_project_id else ""
         project_options.append(
-            f'<option value="{pid}"{selected_attr}>{pname} ({short_id}…)</option>'
+            f'<option value="{pid}" data-project-name="{pname}"{selected_attr}>{pname}</option>'
         )
+        project_search_options.append(f'<option value="{pname}"></option>')
     project_options_html = "".join(project_options)
+    project_search_options_html = "".join(project_search_options)
     create_notice_html = ""
     if create_ok:
         create_notice_html = (
@@ -22338,12 +22346,12 @@ def index(
         <h2>1) 创建项目</h2>
         <form id="createProject" method="post" action="/web/create_project">
           <input type="hidden" name="api_key" id="createProjectApiKey" value="" />
-          项目名称：<input name="name" placeholder="例如：XX标段施组评审" />
+          项目名称：<input id="createProjectNameInput" name="name" placeholder="例如：XX标段施组评审" autocomplete="off" />
           <button type="submit" id="btnCreateProject">创建</button>
         </form>
         __CREATE_NOTICE_HTML__
         <p id="createProjectMessage" style="margin:8px 0 0 0;font-size:13px;min-height:1.2em"></p>
-        <p style="margin:4px 0 0 0;font-size:13px;color:#64748b">创建后可从下方下拉选择项目，或复制返回的 id 使用。</p>
+        <p style="margin:4px 0 0 0;font-size:13px;color:#64748b">创建后会自动切换到新项目。项目较多时，可在下方输入名称快速定位。</p>
       </div>
 
       <div class="section card">
@@ -22351,11 +22359,20 @@ def index(
         <div class="toolbar">
           <button type="button" id="refreshProjects" class="compact-hidden">刷新项目列表</button>
           <span style="margin-left:4px">项目：</span>
-          <select id="projectSelect">
+          <select id="projectSelect" style="min-width:320px;max-width:480px">
             <option value="">-- 请选择项目 --</option>
             __PROJECT_OPTIONS__
           </select>
-          <span id="currentProjectTag" style="margin-left:4px;font-size:12px;color:#475569"></span>
+          <input
+            type="search"
+            id="projectSearchInput"
+            list="projectSearchSuggestions"
+            placeholder="输入项目名快速定位"
+            autocomplete="off"
+            style="min-width:220px"
+          />
+          <datalist id="projectSearchSuggestions">__PROJECT_SEARCH_OPTIONS__</datalist>
+          <button type="button" id="btnSelectProjectBySearch" class="secondary">定位项目</button>
           <form id="deleteProjectForm" method="post" action="/web/delete_project" class="inline-form">
             <input type="hidden" name="project_id" id="deleteProjectId" value="__SELECTED_PROJECT_ID__" />
             <input type="hidden" name="api_key" id="deleteProjectApiKey" value="" />
@@ -22367,6 +22384,8 @@ def index(
             <button type="button" id="deleteSelectedProjects" class="secondary" style="background:#b91c1c">删除所选项目</button>
           </div>
         </div>
+        <p id="projectListMeta" style="margin:8px 0 0 0;font-size:12px;color:#64748b"></p>
+        <p id="currentProjectTag" style="margin:6px 0 0 0;font-size:15px;font-weight:600;color:#1e293b"></p>
         <details class="compact-hidden" style="margin-top:8px">
           <summary style="cursor:pointer;color:#334155;font-size:13px">高级工具（系统诊断 / 评分体系 / 分析包）</summary>
           <div class="toolbar" style="margin-top:8px">
@@ -24102,6 +24121,39 @@ def index(
             if (el) el.value = value;
           });
         }
+        let projectListCache = [];
+        function projectDisplayName(project) {
+          const row = (project && typeof project === 'object') ? project : {};
+          return String(row.name || row.id || '').trim();
+        }
+        function projectMatchesKeyword(project, keyword) {
+          const needle = String(keyword || '').trim().toLowerCase();
+          if (!needle) return true;
+          return projectDisplayName(project).toLowerCase().includes(needle)
+            || String((project && project.id) || '').toLowerCase().includes(needle);
+        }
+        function updateProjectSearchSuggestions(projects) {
+          const datalist = document.getElementById('projectSearchSuggestions');
+          if (!datalist) return;
+          datalist.innerHTML = '';
+          const seen = new Set();
+          (Array.isArray(projects) ? projects : []).forEach((project) => {
+            const name = projectDisplayName(project);
+            if (!name || seen.has(name)) return;
+            seen.add(name);
+            const opt = document.createElement('option');
+            opt.value = name;
+            datalist.appendChild(opt);
+          });
+        }
+        function updateProjectListMeta(totalCount) {
+          const meta = document.getElementById('projectListMeta');
+          if (!meta) return;
+          const count = Number(totalCount || 0);
+          meta.textContent = count
+            ? ('当前共 ' + count + ' 个项目。项目较多时，可输入名称快速定位。')
+            : '当前暂无项目，请先创建项目。';
+        }
         function updateCurrentProjectTag(projectId) {
           const tag = document.getElementById('currentProjectTag');
           syncProjectHiddenInputs(projectId);
@@ -24110,10 +24162,41 @@ def index(
             tag.textContent = '当前项目：未选择';
             return;
           }
+          const matched = projectListCache.find((project) => String((project && project.id) || '') === String(projectId));
           const sel = document.getElementById('projectSelect');
           const opt = sel && sel.options && sel.selectedIndex >= 0 ? sel.options[sel.selectedIndex] : null;
-          const label = opt && opt.textContent ? opt.textContent : projectId;
+          const label = matched
+            ? projectDisplayName(matched)
+            : (opt && (opt.dataset.projectName || opt.textContent))
+              ? String(opt.dataset.projectName || opt.textContent)
+              : projectId;
           tag.textContent = '当前项目：' + label;
+        }
+        async function locateProjectBySearch() {
+          const input = document.getElementById('projectSearchInput');
+          const keyword = input ? String(input.value || '').trim() : '';
+          if (!keyword) {
+            setSelectMsg('请输入项目名称或关键字后再定位。', true);
+            return;
+          }
+          const exact = projectListCache.find((project) => projectDisplayName(project) === keyword);
+          const matched = exact || projectListCache.find((project) => projectMatchesKeyword(project, keyword));
+          if (!matched || !matched.id) {
+            setSelectMsg('未找到匹配项目：' + keyword, true);
+            return;
+          }
+          const sel = document.getElementById('projectSelect');
+          if (!sel) {
+            setSelectMsg('项目选择器不可用，请刷新页面后重试。', true);
+            return;
+          }
+          sel.value = String(matched.id);
+          if (String(sel.value || '') !== String(matched.id)) {
+            setSelectMsg('未能定位到项目：' + projectDisplayName(matched), true);
+            return;
+          }
+          await onProjectChanged();
+          setSelectMsg('已定位到项目：' + projectDisplayName(matched), false);
         }
 
         function updateProjectBoundControlsState() {
@@ -24903,9 +24986,9 @@ def index(
           a.click();
           a.remove();
         }
-        async function refreshProjects() {
+        async function refreshProjects(preferredProjectId='') {
           setSelectMsg('正在加载…', false);
-          const current = pid() || storageGet('selected_project_id') || '';
+          const current = preferredProjectId || storageGet('selected_project_id') || pid() || '';
           const deleteSel = document.getElementById('projectDeleteSelect');
           const prevDeleteIds = deleteSel
             ? Array.from(deleteSel.selectedOptions || []).map((o) => String(o.value || ''))
@@ -24927,6 +25010,8 @@ def index(
           list.forEach((p) => {
             if (p && p.id) projectMetaById[String(p.id)] = (p.meta && typeof p.meta === 'object') ? p.meta : {};
           });
+          projectListCache = list.slice();
+          updateProjectSearchSuggestions(projectListCache);
           list = list.slice().sort((a, b) => {
             const an = String((a && a.name) || '');
             const bn = String((b && b.name) || '');
@@ -24944,13 +25029,20 @@ def index(
             if (out) { out.textContent = '刷新失败: ' + res.status + '\\n' + text; out.scrollIntoView({ behavior: 'smooth' }); }
             return;
           }
-          setSelectMsg(list.length ? '已加载 ' + list.length + ' 个项目，请在上方下拉框选择' : '暂无项目，请先在「1) 创建项目」中创建', false);
+          updateProjectListMeta(list.length);
+          setSelectMsg(
+            list.length
+              ? ('已加载 ' + list.length + ' 个项目，可直接下拉或输入名称快速定位。')
+              : '暂无项目，请先在「1) 创建项目」中创建',
+            false
+          );
           const sel = document.getElementById('projectSelect');
           sel.innerHTML = '<option value="">-- 选择项目 --</option>';
           list.forEach(p => {
             const o = document.createElement('option');
             o.value = p.id;
-            o.textContent = (p.name || p.id) + ' (' + (p.id || '').slice(0,8) + '…)';
+            o.textContent = projectDisplayName(p);
+            o.dataset.projectName = projectDisplayName(p);
             sel.appendChild(o);
           });
           if (deleteSel) {
@@ -24965,7 +25057,7 @@ def index(
               list.forEach((p) => {
                 const o = document.createElement('option');
                 o.value = p.id;
-                o.textContent = (p.name || p.id) + ' (' + (p.id || '').slice(0,8) + '…)';
+                o.textContent = projectDisplayName(p);
                 if (prevDeleteIds.includes(String(p.id))) o.selected = true;
                 deleteSel.appendChild(o);
               });
@@ -25016,6 +25108,15 @@ def index(
         const elRefresh = document.getElementById('refreshProjects');
         if (elRefresh) elRefresh.onclick = refreshProjects;
         safeChange('projectSelect', onProjectChanged);
+        safeClick('btnSelectProjectBySearch', locateProjectBySearch);
+        const projectSearchInput = document.getElementById('projectSearchInput');
+        if (projectSearchInput) {
+          projectSearchInput.addEventListener('keydown', async (event) => {
+            if (event.key !== 'Enter') return;
+            event.preventDefault();
+            await locateProjectBySearch();
+          });
+        }
         const btnSelfCheck = document.getElementById('btnSelfCheck');
         if (btnSelfCheck) btnSelfCheck.onclick = runSystemSelfCheck;
         const btnScoringFactors = document.getElementById('btnScoringFactors');
@@ -25160,12 +25261,17 @@ def index(
             const outEl = document.getElementById('output');
             if (outEl) outEl.textContent = text;
             if (res && res.ok) {
+              let created = {};
               try {
-                const created = JSON.parse(text || '{}');
+                created = JSON.parse(text || '{}');
                 if (created && created.id) storageSet('selected_project_id', created.id);
               } catch (_) {}
-              setCreateMsg('创建成功，已刷新下方列表，请选择项目', false);
-              await refreshProjects();
+              if (formCreate.elements.name) formCreate.elements.name.value = '';
+              const searchInput = document.getElementById('projectSearchInput');
+              if (searchInput) searchInput.value = '';
+              const createdName = String((created && (created.name || name)) || name || '').trim();
+              setCreateMsg('创建成功，当前项目已自动切换：' + createdName, false);
+              await refreshProjects(String((created && created.id) || ''));
             } else {
               let detail = text;
               try { const j = JSON.parse(text); detail = (j && j.detail) || text; } catch (_) {}
@@ -29259,6 +29365,7 @@ def index(
     </html>
     """
     html = html.replace("__PROJECT_OPTIONS__", project_options_html)
+    html = html.replace("__PROJECT_SEARCH_OPTIONS__", project_search_options_html)
     html = html.replace("__CREATE_NOTICE_HTML__", create_notice_html)
     html = html.replace("__GLOBAL_NOTICE_HTML__", global_notice_html)
     html = html.replace(

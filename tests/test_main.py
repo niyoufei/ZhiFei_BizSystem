@@ -529,6 +529,31 @@ class TestIndexEndpoint:
         assert "已解析（GPT-5.4）" in page
         assert 'data-material-id="m1"' in page
 
+    def test_index_project_selector_shows_plain_names_and_search_controls(self, client):
+        with (
+            patch(
+                "app.main.load_projects",
+                return_value=[
+                    {"id": "p1", "name": "恢复项目_p1"},
+                    {"id": "p2", "name": "合肥轨道TOD甘棠路一期B地块公共区域精装修工程招标"},
+                ],
+            ),
+            patch("app.main.load_materials", return_value=[]),
+            patch("app.main.load_submissions", return_value=[]),
+            patch("app.main.load_expert_profiles", return_value=[]),
+        ):
+            response = client.get("/?project_id=p2")
+
+        assert response.status_code == 200
+        page = response.text
+        assert 'id="projectSearchInput"' in page
+        assert 'id="btnSelectProjectBySearch"' in page
+        assert 'id="projectListMeta"' in page
+        assert 'data-project-name="恢复项目_p1"' in page
+        assert 'data-project-name="合肥轨道TOD甘棠路一期B地块公共区域精装修工程招标"' in page
+        assert "恢复项目_p1 (p1" not in page
+        assert "合肥轨道TOD甘棠路一期B地块公共区域精装修工程招标 (p2" not in page
+
     def test_index_compact_ui_keeps_core_workflow_buttons_visible(self, client):
         response = client.get("/")
         assert response.status_code == 200
@@ -599,6 +624,8 @@ class TestIndexEndpoint:
             'id="uploadShigongApiKey"',
             "async function refreshAuthStatusUi()",
             "async function ensureVerifiedApiKeyForAction(",
+            "创建成功，当前项目已自动切换：",
+            "可直接下拉或输入名称快速定位",
             "window.applySecureDesktopUiGuards = applySecureDesktopUiGuards;",
             "if (typeof window.applySecureDesktopUiGuards === 'function') {",
             "refreshAuthStatusUi().finally(() => refreshProjects());",
@@ -615,6 +642,16 @@ class TestIndexEndpoint:
         assert 'id="authPanel" style="display:none"' in page
         assert '"trusted_local_bypass_active": true' in page
         assert '"ui_auth_required": false' in page
+
+    def test_index_frontend_refreshes_new_project_by_created_id(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert (
+            "const current = preferredProjectId || storageGet('selected_project_id') || pid() || '';"
+            in page
+        )
+        assert "await refreshProjects(String((created && created.id) || ''));" in page
 
     def test_index_renders_16_dimension_weight_sliders(self, client):
         """Index page should render 16-dimension focus sliders on first paint."""
@@ -1246,6 +1283,22 @@ class TestProjectsEndpoints:
         assert data["meta"]["key"] == "value"
         assert data["meta"]["enforce_material_gate"] is True
         assert "required_material_types" in data["meta"]
+
+    @patch("app.main.save_projects")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_create_project_tolerates_legacy_project_without_name(
+        self, mock_ensure, mock_load, mock_save, client
+    ):
+        """Legacy project rows missing name should be auto-healed instead of causing 500."""
+        mock_load.return_value = [{"id": "legacy-p1"}]
+        response = client.post("/api/v1/projects", json={"name": "新项目"})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["name"] == "新项目"
+        assert mock_save.call_count == 2
+        repaired_projects = mock_save.call_args_list[0].args[0]
+        assert repaired_projects[0]["name"] == "恢复项目_legacy-p"
 
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
