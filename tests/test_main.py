@@ -558,6 +558,11 @@ class TestIndexEndpoint:
         page = response.text
         assert ".compact-hidden { display:none !important; }" in page
         assert '<details class="compact-hidden"' in page
+        assert "2.5) 青天评标关注度（16维）" in page
+        assert (
+            '<div class="section card compact-hidden">\n        <h2>2.5) 青天评标关注度（16维）</h2>'
+            not in page
+        )
         for hidden_fragment in (
             'id="refreshProjects" class="compact-hidden"',
             'id="btnRefreshMaterials" class="secondary compact-hidden"',

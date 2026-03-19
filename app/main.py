@@ -21849,7 +21849,7 @@ def index(
     <body class="__SECURE_DESKTOP_BODY_CLASS__">
       <h1>青天评标系统</h1>
       <p style="margin:-8px 0 16px 0;padding:10px;background:#e0f2fe;border-radius:6px;font-size:14px;">
-        <strong>主流程：</strong>创建项目 → 选择项目 → 上传资料 → 上传施组 → 评分 → 录入真实评标 → 学习进化。页面已默认隐藏高级诊断与维护按钮，聚焦试车操作。
+        <strong>主流程：</strong>创建项目 → 选择项目 → 调整16维权重 → 上传资料 → 上传施组 → 评分 → 录入真实评标 → 学习进化。页面已默认隐藏高级诊断与维护按钮，聚焦试车操作。
       </p>
       __GLOBAL_NOTICE_HTML__
       <script>
@@ -22337,7 +22337,7 @@ def index(
         </div>
       </div>
 
-      <div class="section card compact-hidden">
+      <div class="section card">
         <h2>2.5) 青天评标关注度（16维）</h2>
         <p style="font-size:12px;color:#64748b;margin:-4px 0 10px 0">先设置16维关注度，再点击“应用到本项目并重算”。同一项目内所有施组将统一按该配置重算，历史快照会保留。</p>
         <div id="expertProfileStatus" style="font-size:13px;color:#334155;margin-bottom:8px">__EXPERT_PROFILE_STATUS__</div>
