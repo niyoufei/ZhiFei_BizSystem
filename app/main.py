@@ -22187,6 +22187,8 @@ def index(
         .upload-zone .note { display:block; width:100%; }
         .field-group { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-bottom:8px; }
         .field-group p { flex-basis:100%; margin:6px 0 0 0; }
+        .create-project-form { display:flex; flex-wrap:wrap; align-items:center; gap:12px; }
+        .project-name-input { width:min(720px, 62vw); min-width:360px; max-width:100%; padding:12px 14px; font-size:18px; line-height:1.35; }
         .note { font-size:12px; color:#64748b; }
         .muted { margin:4px 0 0 0; font-size:13px; color:#64748b; }
         .result-block { margin-top: 10px; padding: 12px; background: #f8fafc; border-radius: 8px; border-left: 3px solid var(--primary); overflow-x:auto; }
@@ -22205,6 +22207,10 @@ def index(
         .weight-row .raw-value { font-weight:600; color:#0f172a; text-align:right; }
         .weight-row .norm-value { color:#334155; text-align:right; font-size:12px; }
         .secure-desktop .result-block, .secure-desktop #output { user-select: none; }
+        @media (max-width: 768px) {
+          .create-project-form { align-items:stretch; }
+          .project-name-input { width:100%; min-width:0; }
+        }
       </style>
     </head>
     <body class="__SECURE_DESKTOP_BODY_CLASS__">
@@ -22592,9 +22598,9 @@ def index(
 
       <div class="section card">
         <h2>1) 创建项目</h2>
-        <form id="createProject" method="post" action="/web/create_project">
+        <form id="createProject" method="post" action="/web/create_project" class="create-project-form">
           <input type="hidden" name="api_key" id="createProjectApiKey" value="" />
-          项目名称：<input id="createProjectNameInput" name="name" placeholder="例如：XX标段施组评审" autocomplete="off" />
+          项目名称：<input id="createProjectNameInput" class="project-name-input" name="name" placeholder="例如：XX标段施组评审" autocomplete="off" />
           <button type="submit" id="btnCreateProject">创建</button>
         </form>
         <form id="createProjectFromTender" method="post" action="/web/create_project_from_tender" enctype="multipart/form-data" class="inline-form" style="margin-top:10px;gap:8px;flex-wrap:wrap">

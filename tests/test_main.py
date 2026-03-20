@@ -701,6 +701,11 @@ class TestIndexEndpoint:
         response = client.get("/")
         assert response.status_code == 200
         assert 'id="deleteProjectForm"' in response.text
+        assert (
+            'id="createProject" method="post" action="/web/create_project" class="create-project-form"'
+            in response.text
+        )
+        assert 'id="createProjectNameInput" class="project-name-input"' in response.text
         assert 'action="/web/delete_project"' in response.text
         assert 'id="createProjectFromTender"' in response.text
         assert 'action="/web/create_project_from_tender"' in response.text
