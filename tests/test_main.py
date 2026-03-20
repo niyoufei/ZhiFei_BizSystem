@@ -580,6 +580,9 @@ class TestIndexEndpoint:
         assert response.status_code == 200
         page = response.text
         assert 'id="projectSearchInput"' in page
+        assert 'class="project-search-input primary-input"' in page
+        assert 'id="projectSelect" class="project-select-input wide-select"' in page
+        assert 'id="currentProjectTag" class="current-project-text"' in page
         assert 'id="btnSelectProjectBySearch"' in page
         assert 'id="projectListMeta"' in page
         assert 'data-project-name="恢复项目_p1"' in page
@@ -705,12 +708,20 @@ class TestIndexEndpoint:
             'id="createProject" method="post" action="/web/create_project" class="create-project-form"'
             in response.text
         )
-        assert 'id="createProjectNameInput" class="project-name-input"' in response.text
+        assert 'id="apiKeyInput" class="auth-key-input primary-input"' in response.text
+        assert (
+            'class="field-label">项目名称：</span><input id="createProjectNameInput" class="project-name-input primary-input"'
+            in response.text
+        )
         assert 'action="/web/delete_project"' in response.text
         assert 'id="createProjectFromTender"' in response.text
         assert 'action="/web/create_project_from_tender"' in response.text
         assert 'action="/web/upload_materials"' in response.text
         assert 'action="/web/upload_shigong"' in response.text
+        assert 'id="scoreScaleSelect" class="compact-select"' in response.text
+        assert 'id="groundTruthSubmissionSelect" class="wide-select"' in response.text
+        assert 'id="gtJudgeCount" class="compact-select"' in response.text
+        assert 'id="gtFinal" class="score-number-input"' in response.text
 
     def test_index_frontend_has_batch_project_delete_handler(self, client):
         """Section 2 should support selecting multiple projects and batch deleting them."""

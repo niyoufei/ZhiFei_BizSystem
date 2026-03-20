@@ -22157,8 +22157,8 @@ def index(
         body { font-family: system-ui, sans-serif; margin: 0 auto; max-width: 1680px; padding: 20px; background: var(--bg); color: var(--text); line-height: 1.5; }
         h2 { margin-top: 12px; font-size: 1.8rem; color: var(--primary); }
         .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px 20px; margin-bottom: 18px; box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04); }
-        input[type="text"], select { padding: 8px 10px; margin-right: 8px; min-width: 200px; border:1px solid #cbd5e1; border-radius:8px; background:#f8fafc; }
-        button { padding: 10px 16px; background: var(--primary); color: #fff; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; }
+        input[type="text"], input[type="password"], input[type="search"], select { padding: 10px 12px; margin-right: 8px; min-width: 200px; min-height: 48px; border:1px solid #cbd5e1; border-radius:10px; background:#f8fafc; font-size:16px; line-height:1.35; box-sizing:border-box; }
+        button { min-height: 48px; padding: 0 18px; background: var(--primary); color: #fff; border: none; border-radius: 10px; cursor: pointer; font-weight: 600; font-size:16px; line-height:1; white-space:nowrap; }
         button:hover { opacity: 0.9; }
         button:disabled { opacity: 0.45; cursor: not-allowed; }
         button.secondary { background: #64748b; }
@@ -22181,14 +22181,24 @@ def index(
         .upload-zone-state { margin:8px 0 0 0; font-size:12px; color:#64748b; min-height:1.2em; line-height:1.5; }
         .upload-zone .inline-form { width:100%; }
         .visually-hidden-file { position:absolute; left:-9999px; width:1px; height:1px; opacity:0; pointer-events:none; }
-        .file-picker-btn { display:inline-flex; align-items:center; justify-content:center; min-height:38px; padding:0 14px; border:1px solid #94a3b8; border-radius:8px; background:#fff; color:#0f172a; cursor:pointer; font-weight:600; text-decoration:none; user-select:none; }
+        .file-picker-btn { display:inline-flex; align-items:center; justify-content:center; min-height:46px; padding:0 16px; border:1px solid #94a3b8; border-radius:10px; background:#fff; color:#0f172a; cursor:pointer; font-weight:600; font-size:15px; text-decoration:none; user-select:none; }
         .file-picker-btn:hover { background:#f8fafc; border-color:#64748b; }
         .file-picker-name { color:#475569; font-size:14px; line-height:1.5; word-break:break-word; }
         .upload-zone .note { display:block; width:100%; }
         .field-group { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-bottom:8px; }
         .field-group p { flex-basis:100%; margin:6px 0 0 0; }
         .create-project-form { display:flex; flex-wrap:wrap; align-items:center; gap:12px; }
+        .field-label { display:inline-flex; align-items:center; min-width:112px; font-size:16px; font-weight:600; color:#0f172a; }
+        .field-label.tight { min-width:auto; }
+        .primary-input { max-width:100%; }
+        .auth-key-input { width:min(520px, 58vw); min-width:320px; }
         .project-name-input { width:min(720px, 62vw); min-width:360px; max-width:100%; padding:12px 14px; font-size:18px; line-height:1.35; }
+        .project-select-input { min-width:360px !important; max-width:520px !important; }
+        .project-search-input { width:min(520px, 52vw); min-width:320px; }
+        .wide-select { min-width:360px !important; max-width:100%; }
+        .compact-select { min-width:150px; }
+        .score-number-input { width:88px !important; min-width:88px !important; min-height:42px; padding:8px 10px; margin-left:4px; font-size:15px; }
+        .current-project-text { font-size:16px; font-weight:600; color:#0f172a; }
         .note { font-size:12px; color:#64748b; }
         .muted { margin:4px 0 0 0; font-size:13px; color:#64748b; }
         .result-block { margin-top: 10px; padding: 12px; background: #f8fafc; border-radius: 8px; border-left: 3px solid var(--primary); overflow-x:auto; }
@@ -22209,7 +22219,8 @@ def index(
         .secure-desktop .result-block, .secure-desktop #output { user-select: none; }
         @media (max-width: 768px) {
           .create-project-form { align-items:stretch; }
-          .project-name-input { width:100%; min-width:0; }
+          .field-label { min-width:0; width:100%; }
+          .auth-key-input, .project-name-input, .project-search-input, .wide-select, .project-select-input { width:100%; min-width:0 !important; max-width:100% !important; }
         }
       </style>
     </head>
@@ -22223,7 +22234,7 @@ def index(
         <h2>0) API Key 认证</h2>
         <p style="font-size:13px;color:#64748b;margin:-8px 0 8px 0">当前系统已启用写入保护。首次使用前，请先输入并保存 API Key，后续创建、上传、评分、学习进化都会自动复用。</p>
         <div class="toolbar">
-          <input type="password" id="apiKeyInput" placeholder="请输入 API Key" autocomplete="off" style="min-width:320px" />
+          <input type="password" id="apiKeyInput" class="auth-key-input primary-input" placeholder="请输入 API Key" autocomplete="off" />
           <button type="button" id="btnSaveApiKey">保存 API Key</button>
           <button type="button" id="btnClearApiKey" class="secondary">清空</button>
           <span id="authStatusTag" style="font-size:13px;color:#475569"></span>
@@ -22600,7 +22611,7 @@ def index(
         <h2>1) 创建项目</h2>
         <form id="createProject" method="post" action="/web/create_project" class="create-project-form">
           <input type="hidden" name="api_key" id="createProjectApiKey" value="" />
-          项目名称：<input id="createProjectNameInput" class="project-name-input" name="name" placeholder="例如：XX标段施组评审" autocomplete="off" />
+          <span class="field-label">项目名称：</span><input id="createProjectNameInput" class="project-name-input primary-input" name="name" placeholder="例如：XX标段施组评审" autocomplete="off" />
           <button type="submit" id="btnCreateProject">创建</button>
         </form>
         <form id="createProjectFromTender" method="post" action="/web/create_project_from_tender" enctype="multipart/form-data" class="inline-form" style="margin-top:10px;gap:8px;flex-wrap:wrap">
@@ -22620,18 +22631,18 @@ def index(
         <h2>2) 选择项目</h2>
         <div class="toolbar">
           <button type="button" id="refreshProjects" class="compact-hidden">刷新项目列表</button>
-          <span style="margin-left:4px">项目：</span>
-          <select id="projectSelect" style="min-width:320px;max-width:480px">
+          <span class="field-label tight" style="margin-left:4px">项目：</span>
+          <select id="projectSelect" class="project-select-input wide-select">
             <option value="">-- 请选择项目 --</option>
             __PROJECT_OPTIONS__
           </select>
           <input
             type="search"
             id="projectSearchInput"
+            class="project-search-input primary-input"
             list="projectSearchSuggestions"
             placeholder="输入项目名快速定位"
             autocomplete="off"
-            style="min-width:220px"
           />
           <datalist id="projectSearchSuggestions">__PROJECT_SEARCH_OPTIONS__</datalist>
           <button type="button" id="btnSelectProjectBySearch" class="secondary">定位项目</button>
@@ -22647,7 +22658,7 @@ def index(
           </div>
         </div>
         <p id="projectListMeta" style="margin:8px 0 0 0;font-size:12px;color:#64748b"></p>
-        <p id="currentProjectTag" style="margin:6px 0 0 0;font-size:15px;font-weight:600;color:#1e293b"></p>
+        <p id="currentProjectTag" class="current-project-text" style="margin:6px 0 0 0"></p>
         <details class="compact-hidden" style="margin-top:8px">
           <summary style="cursor:pointer;color:#334155;font-size:13px">高级工具（系统诊断 / 评分体系 / 分析包）</summary>
           <div class="toolbar" style="margin-top:8px">
@@ -22783,7 +22794,7 @@ def index(
             <button type="submit" id="btnUploadShigong" name="submit_action" value="upload" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadShigong'); } return true;">上传施组</button>
             <button type="submit" id="btnScoreShigong" class="secondary" formaction="/web/score_shigong" name="submit_action" value="score" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnScoreShigong'); } return true;">评分施组</button>
             <span style="margin-left:8px;color:#334155;font-size:13px">满分标准：</span>
-            <select id="scoreScaleSelect" name="score_scale_max" style="margin-left:4px">
+            <select id="scoreScaleSelect" class="compact-select" name="score_scale_max" style="margin-left:4px">
               <option value="100">100分制</option>
               <option value="5">5分制</option>
             </select>
@@ -22876,7 +22887,7 @@ def index(
         </div>
         <div class="field-group">
           <label>施组文件：</label>
-          <select id="groundTruthSubmissionSelect" style="margin-left:8px;min-width:360px">
+          <select id="groundTruthSubmissionSelect" class="wide-select" style="margin-left:8px">
             <option value="">-- 请选择步骤4已上传施组文件 --</option>
           </select>
           <button type="button" id="btnRefreshGroundTruthSubmissionOptions" class="secondary compact-hidden" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnRefreshGroundTruthSubmissionOptions')">刷新施组选项</button>
@@ -22884,21 +22895,21 @@ def index(
         </div>
         <div class="field-group">
           <label style="margin-right:8px">评委人数：</label>
-          <select id="gtJudgeCount">
+          <select id="gtJudgeCount" class="compact-select">
             <option value="5" selected>5位评委</option>
             <option value="7">7位评委</option>
           </select>
           <span class="note">默认 5 位，可切换到 7 位评委录入。</span>
         </div>
         <div class="field-group">
-          <span id="gtJWrap1" style="display:inline-flex;align-items:center;margin-right:8px">评委1：<input type="number" id="gtJ1" step="0.01" style="width:70px;margin-left:4px" /></span>
-          <span id="gtJWrap2" style="display:inline-flex;align-items:center;margin-right:8px">评委2：<input type="number" id="gtJ2" step="0.01" style="width:70px;margin-left:4px" /></span>
-          <span id="gtJWrap3" style="display:inline-flex;align-items:center;margin-right:8px">评委3：<input type="number" id="gtJ3" step="0.01" style="width:70px;margin-left:4px" /></span>
-          <span id="gtJWrap4" style="display:inline-flex;align-items:center;margin-right:8px">评委4：<input type="number" id="gtJ4" step="0.01" style="width:70px;margin-left:4px" /></span>
-          <span id="gtJWrap5" style="display:inline-flex;align-items:center;margin-right:8px">评委5：<input type="number" id="gtJ5" step="0.01" style="width:70px;margin-left:4px" /></span>
-          <span id="gtJWrap6" style="display:none;align-items:center;margin-right:8px">评委6：<input type="number" id="gtJ6" step="0.01" style="width:70px;margin-left:4px" /></span>
-          <span id="gtJWrap7" style="display:none;align-items:center;margin-right:8px">评委7：<input type="number" id="gtJ7" step="0.01" style="width:70px;margin-left:4px" /></span>
-          最终得分：<input type="number" id="gtFinal" step="0.01" style="width:70px" />
+          <span id="gtJWrap1" style="display:inline-flex;align-items:center;margin-right:8px">评委1：<input type="number" id="gtJ1" class="score-number-input" step="0.01" /></span>
+          <span id="gtJWrap2" style="display:inline-flex;align-items:center;margin-right:8px">评委2：<input type="number" id="gtJ2" class="score-number-input" step="0.01" /></span>
+          <span id="gtJWrap3" style="display:inline-flex;align-items:center;margin-right:8px">评委3：<input type="number" id="gtJ3" class="score-number-input" step="0.01" /></span>
+          <span id="gtJWrap4" style="display:inline-flex;align-items:center;margin-right:8px">评委4：<input type="number" id="gtJ4" class="score-number-input" step="0.01" /></span>
+          <span id="gtJWrap5" style="display:inline-flex;align-items:center;margin-right:8px">评委5：<input type="number" id="gtJ5" class="score-number-input" step="0.01" /></span>
+          <span id="gtJWrap6" style="display:none;align-items:center;margin-right:8px">评委6：<input type="number" id="gtJ6" class="score-number-input" step="0.01" /></span>
+          <span id="gtJWrap7" style="display:none;align-items:center;margin-right:8px">评委7：<input type="number" id="gtJ7" class="score-number-input" step="0.01" /></span>
+          最终得分：<input type="number" id="gtFinal" class="score-number-input" step="0.01" />
         </div>
         <div class="action-row" style="margin-bottom:10px">
           <button type="button" id="btnEvolve" onclick="return window.__zhifeiFallbackClick(event, 'btnEvolve')">学习进化（根据已录入真实评标生成高分逻辑与编制指导）</button>
