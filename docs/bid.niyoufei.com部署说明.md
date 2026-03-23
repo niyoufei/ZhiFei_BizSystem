@@ -1,29 +1,14 @@
 # `bid.niyoufei.com` 部署说明
 
-本文按当前已知信息编写：
+本文按当前要上线的配置编写：
 
 - 域名：`bid.niyoufei.com`
 - 目标服务器 IP：`199.180.118.204`
-- 检查时间：`2026-03-13`
+- DNS 记录：`A bid -> 199.180.118.204`
+- Cloudflare：`Proxied`
+- 检查时间：`2026-03-23`
 
-## 1. 当前阻塞点
-
-当前 `bid.niyoufei.com` 解析结果不是 `199.180.118.204`，而是 `198.18.0.27`。
-
-同时，`http://bid.niyoufei.com` 返回了 Cloudflare `521`，这表示：
-
-- Cloudflare 已经接管了这个域名入口
-- 但 Cloudflare 现在无法连到你的源站
-
-所以当前问题不在应用代码本身，而在以下任一环节：
-
-1. DNS A 记录没有改到 `199.180.118.204`
-2. 虽然 DNS 已经挂到 Cloudflare，但 Cloudflare 的源站配置不是 `199.180.118.204`
-3. 源站机器上没有监听 `80/443`
-4. 源站防火墙没有放通 `80/443`
-5. 反向代理（Caddy/Nginx）没有启动
-
-## 2. 推荐部署结构
+## 1. 推荐部署结构
 
 推荐使用：
 
@@ -39,11 +24,11 @@
 - 外部只访问 `80/443`
 - 应用仍然只在本机回环地址上监听
 
-## 3. 服务器上要做的事
+## 2. 服务器上要做的事
 
 假设服务器是 Ubuntu / Debian：
 
-### 3.1 上传项目
+### 2.1 上传项目
 
 把仓库上传到：
 
@@ -51,7 +36,7 @@
 /opt/zhifei/ZhiFei_BizSystem
 ```
 
-### 3.2 安装 Python 依赖
+### 2.2 安装 Python 依赖
 
 ```bash
 cd /opt/zhifei/ZhiFei_BizSystem
@@ -61,7 +46,7 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-### 3.3 安装 systemd 服务
+### 2.3 安装 systemd 服务与环境变量
 
 复制下面这个文件到系统目录：
 
@@ -80,6 +65,11 @@ python -m pip install -r requirements.txt
 - `ZHIFEI_MAX_UPLOAD_MB=64`
 - `ZHIFEI_REQUIRE_API_KEYS=1`
 
+当前 `zhifei-bid.service` 已经配置为从 `/etc/zhifei-bid.env` 读取运行参数，所以：
+
+- 修改域名、端口、上传限制时，优先改 `/etc/zhifei-bid.env`
+- 改完后执行 `systemctl daemon-reload && systemctl restart zhifei-bid`
+
 然后执行：
 
 ```bash
@@ -89,7 +79,7 @@ sudo systemctl start zhifei-bid
 sudo systemctl status zhifei-bid
 ```
 
-### 3.4 安装 Caddy
+### 2.4 安装 Caddy
 
 复制下面这个文件：
 
@@ -99,33 +89,45 @@ sudo systemctl status zhifei-bid
 然后执行：
 
 ```bash
+sudo caddy validate --config /etc/caddy/Caddyfile
 sudo systemctl restart caddy
 sudo systemctl status caddy
 ```
 
-## 4. DNS 应该怎么改
+### 2.5 防火墙与云安全组
 
-你现在必须确认 Cloudflare / DNS 平台里的 `A` 记录最终指向：
+至少放通：
 
-```text
-199.180.118.204
+- `80/tcp`
+- `443/tcp`
+
+如果服务器启用了 `ufw`，可执行：
+
+```bash
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw status
 ```
 
-如果仍然指向别的地址，域名一定不通。
+## 3. Cloudflare / DNS 应该怎么填
+
+你截图里的目标配置就是这套系统当前应使用的域名入口：
 
 建议检查：
 
 - `Type`: `A`
 - `Name`: `bid`
 - `Content`: `199.180.118.204`
+- `Proxy status`: `Proxied`
+- `TTL`: `Auto`
 
 如果你使用 Cloudflare：
 
-- 先确保源站上 `Caddy` 已正常运行
-- 再决定是否开启橙云代理
+- 先确保源站上 `Caddy` 已正常运行，再开启橙云代理
 - `SSL/TLS` 模式建议使用 `Full (strict)`
+- 若 Cloudflare 仍报 `521`，先回服务器检查 `caddy` 和防火墙，不要先改应用代码
 
-## 5. 521 的直接诊断方法
+## 4. 局部核验命令
 
 在服务器上执行：
 
@@ -141,7 +143,7 @@ curl -I https://bid.niyoufei.com
 - 如果 `127.0.0.1:8000` 通，但 `127.0.0.1` 不通：Caddy 没起来
 - 如果本机都通，但外部域名还是 `521`：防火墙或 Cloudflare 源站配置有问题
 
-## 6. 最终应达到的状态
+## 5. 最终应达到的状态
 
 成功后应满足：
 
@@ -150,10 +152,11 @@ curl -I https://bid.niyoufei.com
 3. `systemctl status caddy` 正常
 4. `https://bid.niyoufei.com` 可直接打开系统
 
-## 7. 当前仓库新增的部署文件
+## 6. 当前仓库中的域名部署文件
 
 - `deploy/caddy/Caddyfile.bid.niyoufei.com`
 - `deploy/systemd/zhifei-bid.service`
+- `deploy/systemd/zhifei-bid.env.example`
 
 如果后续你要我继续，我下一步可以直接按这套配置继续收口成：
 

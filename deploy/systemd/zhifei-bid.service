@@ -9,8 +9,7 @@ User=www-data
 Group=www-data
 WorkingDirectory=/opt/zhifei/ZhiFei_BizSystem
 Environment=PYTHONUNBUFFERED=1
-Environment=HOST=127.0.0.1
-Environment=PORT=8000
+EnvironmentFile=-/etc/zhifei-bid.env
 ExecStart=/opt/zhifei/ZhiFei_BizSystem/.venv/bin/python -m app.main --no-browser
 Restart=always
 RestartSec=3
