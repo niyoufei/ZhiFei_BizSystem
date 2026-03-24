@@ -768,6 +768,18 @@ class TestIndexEndpoint:
         assert 'id="gtJudgeCount" class="compact-select"' in response.text
         assert 'id="gtFinal" class="score-number-input"' in response.text
 
+    def test_index_exposes_ground_truth_autocalc_and_evolve_autosave_bindings(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert 'id="gtFinalRuleHint"' in page
+        assert "function refreshGroundTruthScoringRule" in page
+        assert "function applyGroundTruthFinalScoreAutoFill" in page
+        assert "function submitGroundTruthDraft" in page
+        assert "/ground_truth/scoring_rule" in page
+        assert "学习进化前需先完成真实评标录入" in page
+        assert "本次已先自动录入当前表单中的真实评标，再执行学习进化。" in page
+
     def test_index_frontend_has_batch_project_delete_handler(self, client):
         """Section 2 should support selecting multiple projects and batch deleting them."""
         response = client.get("/")
@@ -8481,6 +8493,40 @@ class TestFeedbackGovernanceRoutes:
         assert data["score_preview"]["matched_submission_count"] == 0
         assert any(row["artifact"] == "high_score_features" for row in data["version_history"])
 
+    @patch("app.main.load_json_version")
+    @patch("app.main.list_json_versions")
+    @patch("app.main.load_high_score_features")
+    def test_load_governance_artifact_payload_falls_back_to_latest_snapshot_when_corrupted(
+        self,
+        mock_load_high_score_features,
+        mock_list_versions,
+        mock_load_json_version,
+    ):
+        from app.main import _load_governance_artifact_payload
+        from app.storage import StorageDataError
+
+        mock_load_high_score_features.side_effect = StorageDataError(
+            Path("/tmp/high_score_features.json"),
+            "json_parse_failed",
+            "数据文件 JSON 格式损坏：high_score_features.json（第 1 行，第 1 列），请使用历史版本回滚。",
+        )
+        mock_list_versions.return_value = [
+            {"version_id": "20260324T111500000000Z", "created_at": "2026-03-24T11:15:00+00:00"}
+        ]
+        mock_load_json_version.return_value = [
+            {
+                "feature_id": "f-1",
+                "dimension_id": "09",
+                "confidence_score": 0.86,
+                "active": True,
+            }
+        ]
+
+        payload = _load_governance_artifact_payload("high_score_features")
+
+        assert isinstance(payload, list)
+        assert payload[0]["feature_id"] == "f-1"
+
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
     def test_feedback_governance_route_includes_score_preview(
@@ -9152,6 +9198,58 @@ class TestFeedbackGovernanceRoutes:
         data = response.json()
         assert data["artifact"] == "high_score_features"
         assert data["versions"][0]["version_id"] == "20260314T010203000000Z"
+
+
+class TestGroundTruthScoreRuleRoutes:
+    def test_calculate_ground_truth_final_score_respects_detected_formula(self):
+        from app.main import _calculate_ground_truth_final_score
+
+        judge_scores = [4.15, 4.09, 4.15, 4.15, 4.21, 3.96, 4.24]
+
+        assert _calculate_ground_truth_final_score(
+            judge_scores,
+            scoring_rule={"formula": "simple_mean", "rounding_digits": 2},
+        ) == pytest.approx(4.14, abs=1e-6)
+        assert _calculate_ground_truth_final_score(
+            judge_scores,
+            scoring_rule={"formula": "trim_one_each_mean", "rounding_digits": 2},
+        ) == pytest.approx(4.15, abs=1e-6)
+
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_ground_truth_scoring_rule_endpoint_detects_simple_mean_from_tender_text(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 5}}]
+        mock_load_materials.return_value = [
+            {
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件正文.pdf",
+                "parsed_text": (
+                    "本章第2.2.2(1)目属于技术文件详细评审内容,"
+                    "以评标委员会各成员打分平均值确定(计算结果保留小数点后两位)。"
+                    "[PAGE:80]"
+                ),
+            }
+        ]
+
+        response = client.get("/api/v1/projects/p1/ground_truth/scoring_rule")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["score_scale_max"] == 5
+        assert data["formula"] == "simple_mean"
+        assert data["auto_compute"] is True
+        assert data["source_filename"] == "招标文件正文.pdf"
+        assert data["source_page_hint"] == "第80页"
+        assert "打分平均值" in data["label"]
 
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")

@@ -7655,6 +7655,202 @@ def _convert_score_to_100(score: object, score_scale_max: int) -> Optional[float
     return _quantize_decimal_score(clipped_normalized, score_scale_max=100)
 
 
+def _quantize_ground_truth_final_score(value: object, *, digits: int = 2) -> Optional[float]:
+    numeric = _to_float_or_none(value)
+    if numeric is None:
+        return None
+    decimal_value = Decimal(str(numeric))
+    quantizer = Decimal("1").scaleb(-max(0, int(digits)))
+    return float(decimal_value.quantize(quantizer, rounding=ROUND_HALF_UP))
+
+
+def _extract_ground_truth_rule_page_hint(text: str, start: int, end: int) -> Optional[str]:
+    window = str(text or "")[max(0, int(start) - 200) : max(int(end), int(start)) + 260]
+    page_match = re.search(r"\[PAGE:(\d+)\]", window)
+    if not page_match:
+        page_match = re.search(r"\[PAGE_SECTION_HINTS:(\d+)\]", window)
+    if not page_match:
+        return None
+    return f"第{page_match.group(1)}页"
+
+
+def _extract_ground_truth_score_rule_from_text(
+    text: str,
+    *,
+    filename: str,
+) -> Optional[Dict[str, object]]:
+    cleaned_text = str(text or "")
+    if not cleaned_text.strip():
+        return None
+    patterns = [
+        (
+            "simple_mean",
+            re.compile(
+                r"(?:技术文件|商务文件).{0,120}?评标委员会各成员.{0,40}?打\s*分平均值确定",
+                re.IGNORECASE | re.DOTALL,
+            ),
+            "按招标文件：评标委员会各成员打分平均值",
+            100,
+        ),
+        (
+            "trim_one_each_mean",
+            re.compile(
+                r"(?:技术文件|商务文件|综合评审).{0,120}?"
+                r"(?:去掉|去除).{0,30}?(?:最高|较高).{0,30}?"
+                r"(?:最低|较低).{0,80}?(?:平均|算术平均)",
+                re.IGNORECASE | re.DOTALL,
+            ),
+            "按招标文件：去最高分、最低分后取平均",
+            95,
+        ),
+        (
+            "simple_mean",
+            re.compile(
+                r"评标委员会各成员.{0,40}?打\s*分平均值确定",
+                re.IGNORECASE | re.DOTALL,
+            ),
+            "按招标文件：评标委员会各成员打分平均值",
+            80,
+        ),
+        (
+            "trim_one_each_mean",
+            re.compile(
+                r"(?:评标委员会|评委|专家).{0,80}?"
+                r"(?:去掉|去除).{0,20}?(?:最高|较高).{0,20}?"
+                r"(?:最低|较低).{0,60}?(?:平均|算术平均)",
+                re.IGNORECASE | re.DOTALL,
+            ),
+            "按招标文件：去最高分、最低分后取平均",
+            75,
+        ),
+    ]
+    matched_rule: Optional[Dict[str, object]] = None
+    for formula, pattern, label, confidence in patterns:
+        match = pattern.search(cleaned_text)
+        if not match:
+            continue
+        start, end = match.span()
+        excerpt = re.sub(r"\s+", " ", cleaned_text[max(0, start - 60) : end + 100]).strip()
+        page_hint = _extract_ground_truth_rule_page_hint(cleaned_text, start, end)
+        matched_rule = {
+            "formula": formula,
+            "label": label,
+            "rounding_digits": 2,
+            "drop_highest_count": 1 if formula == "trim_one_each_mean" else 0,
+            "drop_lowest_count": 1 if formula == "trim_one_each_mean" else 0,
+            "detected": True,
+            "confidence": confidence,
+            "source_filename": str(filename or "").strip() or None,
+            "source_page_hint": page_hint,
+            "source_excerpt": excerpt or None,
+        }
+        break
+    return matched_rule
+
+
+def _default_ground_truth_score_rule(
+    *,
+    project_id: str,
+    project: Dict[str, object],
+) -> Dict[str, object]:
+    return {
+        "project_id": project_id,
+        "score_scale_max": _resolve_project_score_scale_max(project),
+        "formula": "manual",
+        "label": "未识别招标文件取分规则，请人工录入最终得分",
+        "rounding_digits": 2,
+        "drop_highest_count": 0,
+        "drop_lowest_count": 0,
+        "auto_compute": False,
+        "detected": False,
+        "source_filename": None,
+        "source_page_hint": None,
+        "source_excerpt": None,
+    }
+
+
+def _resolve_project_ground_truth_score_rule(
+    project_id: str,
+    *,
+    project: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    project_row = project
+    if project_row is None:
+        project_row = next(
+            (item for item in load_projects() if str(item.get("id") or "") == str(project_id)),
+            None,
+        )
+    if not isinstance(project_row, dict):
+        raise HTTPException(status_code=404, detail="项目不存在")
+    default_rule = _default_ground_truth_score_rule(project_id=project_id, project=project_row)
+    meta = project_row.get("meta") if isinstance(project_row.get("meta"), dict) else {}
+    override_formula = str((meta or {}).get("ground_truth_final_score_formula") or "").strip()
+    if override_formula in {"simple_mean", "trim_one_each_mean"}:
+        override_rule = dict(default_rule)
+        override_rule.update(
+            {
+                "formula": override_formula,
+                "label": (
+                    "按项目配置：评标委员会各成员打分平均值"
+                    if override_formula == "simple_mean"
+                    else "按项目配置：去最高分、最低分后取平均"
+                ),
+                "drop_highest_count": 1 if override_formula == "trim_one_each_mean" else 0,
+                "drop_lowest_count": 1 if override_formula == "trim_one_each_mean" else 0,
+                "auto_compute": True,
+                "detected": True,
+                "source_filename": "project.meta.ground_truth_final_score_formula",
+            }
+        )
+        return override_rule
+    candidates: List[Dict[str, object]] = []
+    for material in load_materials():
+        if str(material.get("project_id") or "") != str(project_id):
+            continue
+        if str(material.get("material_type") or "") != "tender_qa":
+            continue
+        parsed_text = str(material.get("parsed_text") or "").strip()
+        if not parsed_text:
+            continue
+        candidate = _extract_ground_truth_score_rule_from_text(
+            parsed_text,
+            filename=str(material.get("filename") or ""),
+        )
+        if candidate:
+            candidates.append(candidate)
+    if not candidates:
+        return default_rule
+    candidates.sort(
+        key=lambda item: (
+            -int(_to_float_or_none(item.get("confidence")) or 0),
+            str(item.get("source_filename") or ""),
+        )
+    )
+    resolved_rule = dict(default_rule)
+    resolved_rule.update(candidates[0])
+    resolved_rule["auto_compute"] = resolved_rule.get("formula") in {
+        "simple_mean",
+        "trim_one_each_mean",
+    }
+    return resolved_rule
+
+
+def _calculate_ground_truth_final_score(
+    judge_scores: object,
+    *,
+    scoring_rule: Dict[str, object],
+) -> float:
+    normalized_scores = _normalize_judge_scores_or_422(judge_scores)
+    score_values = [Decimal(str(score)) for score in normalized_scores]
+    formula = str(scoring_rule.get("formula") or "").strip()
+    if formula == "trim_one_each_mean" and len(score_values) > 2:
+        score_values = sorted(score_values)[1:-1]
+    average = sum(score_values, Decimal("0")) / Decimal(str(len(score_values)))
+    digits = int(_to_float_or_none(scoring_rule.get("rounding_digits")) or 2)
+    quantized = _quantize_ground_truth_final_score(average, digits=digits)
+    return float(quantized if quantized is not None else 0.0)
+
+
 def _resolve_score_blend_weights(project: Dict[str, object]) -> tuple[float, float, float]:
     meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
     blend_raw = meta.get("score_blend") if isinstance(meta, dict) else {}
@@ -9926,6 +10122,18 @@ def _resolve_governance_artifact_spec(artifact: str) -> Dict[str, object]:
     return spec
 
 
+def _load_latest_valid_governance_snapshot(path: Path, default_payload: object) -> object:
+    for item in list_json_versions(path):
+        version_id = str(item.get("version_id") or "").strip()
+        if not version_id:
+            continue
+        try:
+            return load_json_version(path, version_id, copy.deepcopy(default_payload))
+        except StorageDataError:
+            continue
+    return copy.deepcopy(default_payload)
+
+
 def _load_governance_artifact_payload(
     artifact: str,
     *,
@@ -9937,7 +10145,24 @@ def _load_governance_artifact_payload(
     loader = spec.get("loader")
     if not callable(loader):
         raise HTTPException(status_code=500, detail="治理产物加载器不可用")
-    return loader()
+    default_payload = copy.deepcopy(spec.get("default_payload"))
+    try:
+        return loader()
+    except StorageDataError as exc:
+        path = spec.get("path")
+        recovered_payload = (
+            _load_latest_valid_governance_snapshot(path, default_payload)
+            if isinstance(path, Path)
+            else default_payload
+        )
+        logger.warning(
+            "governance_artifact_storage_fallback artifact=%s path=%s code=%s detail=%s",
+            artifact,
+            getattr(exc, "path", path),
+            getattr(exc, "code", ""),
+            getattr(exc, "detail", str(exc)),
+        )
+        return recovered_payload
 
 
 def _select_calibrator_model_from_rows(
@@ -21243,6 +21468,24 @@ async def add_ground_truth_from_files(
 
 
 @router.get(
+    "/projects/{project_id}/ground_truth/scoring_rule",
+    tags=["自我学习与进化"],
+    responses=RESPONSES_404,
+)
+def get_ground_truth_scoring_rule(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> Dict[str, object]:
+    """返回当前项目真实评标最终得分的取分规则。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    project = next((p for p in projects if p["id"] == project_id), None)
+    if project is None:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    return _resolve_project_ground_truth_score_rule(project_id, project=project)
+
+
+@router.get(
     "/projects/{project_id}/ground_truth",
     response_model=List[GroundTruthRecord],
     tags=["自我学习与进化"],
@@ -23269,6 +23512,7 @@ def index(
           <span id="gtJWrap7" style="display:none;align-items:center;margin-right:8px">评委7：<input type="number" id="gtJ7" class="score-number-input" step="0.01" /></span>
           最终得分：<input type="number" id="gtFinal" class="score-number-input" step="0.01" />
         </div>
+        <p id="gtFinalRuleHint" style="margin:4px 0 10px 0;font-size:12px;color:#475569">待机：正在识别招标文件中的真实评标取分规则。</p>
         <div class="action-row" style="margin-bottom:10px">
           <button type="button" id="btnEvolve" onclick="return window.__zhifeiFallbackClick(event, 'btnEvolve')">学习进化（根据已录入真实评标生成高分逻辑与编制指导）</button>
           <button type="button" id="btnEvolutionHealth" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnEvolutionHealth')">进化健康度</button>
@@ -24669,6 +24913,67 @@ def index(
           const raw = (el && el.value) ? String(el.value).trim() : '5';
           return raw === '7' ? 7 : 5;
         }
+        let groundTruthScoringRuleState = {
+          project_id: '',
+          formula: 'manual',
+          label: '未识别招标文件取分规则，请人工录入最终得分',
+          rounding_digits: 2,
+          drop_highest_count: 0,
+          drop_lowest_count: 0,
+          auto_compute: false,
+          source_filename: '',
+          source_page_hint: '',
+          source_excerpt: '',
+        };
+        let groundTruthDraftCommitState = { project_id: '', signature: '' };
+        function resetGroundTruthDraftCommitState() {
+          groundTruthDraftCommitState = { project_id: '', signature: '' };
+        }
+        function groundTruthDraftSignature(submissionId, judgeScores, finalScore) {
+          const scoresKey = (Array.isArray(judgeScores) ? judgeScores : [])
+            .map((value) => {
+              const numeric = Number(value);
+              return Number.isFinite(numeric) ? numeric.toFixed(2) : '';
+            })
+            .join('|');
+          const finalKey = Number.isFinite(Number(finalScore)) ? Number(finalScore).toFixed(2) : '';
+          return [String(submissionId || '').trim(), scoresKey, finalKey].join('::');
+        }
+        function markGroundTruthDraftCommitted(projectId, submissionId, judgeScores, finalScore) {
+          groundTruthDraftCommitState = {
+            project_id: String(projectId || '').trim(),
+            signature: groundTruthDraftSignature(submissionId, judgeScores, finalScore),
+          };
+        }
+        function isGroundTruthDraftCommitted(projectId, submissionId, judgeScores, finalScore) {
+          return (
+            String(groundTruthDraftCommitState.project_id || '') === String(projectId || '').trim()
+            && String(groundTruthDraftCommitState.signature || '')
+              === groundTruthDraftSignature(submissionId, judgeScores, finalScore)
+          );
+        }
+        function collectGroundTruthJudgeScoreState() {
+          const count = selectedGroundTruthJudgeCount();
+          const scores = [];
+          let filledCount = 0;
+          let complete = true;
+          for (let i = 1; i <= count; i += 1) {
+            const input = document.getElementById('gtJ' + String(i));
+            const raw = String(((input || {}).value || '')).trim();
+            if (!raw) {
+              complete = false;
+              continue;
+            }
+            const value = Number(raw);
+            if (!Number.isFinite(value)) {
+              complete = false;
+              continue;
+            }
+            scores.push(value);
+            filledCount += 1;
+          }
+          return { scores, complete: complete && scores.length === count, filledCount, count };
+        }
         function syncGroundTruthJudgeInputs() {
           const count = selectedGroundTruthJudgeCount();
           for (let i = 1; i <= 7; i += 1) {
@@ -24683,14 +24988,137 @@ def index(
           }
         }
         function collectGroundTruthJudgeScores() {
-          const count = selectedGroundTruthJudgeCount();
-          const scores = [];
-          for (let i = 1; i <= count; i += 1) {
-            const input = document.getElementById('gtJ' + String(i));
-            const value = parseFloat(((input || {}).value || '0'));
-            scores.push(Number.isFinite(value) ? value : 0);
+          return collectGroundTruthJudgeScoreState().scores;
+        }
+        function renderGroundTruthScoreRuleHint(message, isError=false) {
+          const el = document.getElementById('gtFinalRuleHint');
+          if (!el) return;
+          el.textContent = String(message || '').trim();
+          el.style.color = isError ? '#b91c1c' : '#475569';
+        }
+        function roundGroundTruthScore(value, digits) {
+          const factor = Math.pow(10, Math.max(0, Number(digits) || 0));
+          return Math.round((Number(value) + Number.EPSILON) * factor) / factor;
+        }
+        function computeGroundTruthFinalScore(judgeScores) {
+          if (!Array.isArray(judgeScores) || !judgeScores.length) return null;
+          let usable = judgeScores
+            .map((value) => Number(value))
+            .filter((value) => Number.isFinite(value));
+          if (!usable.length) return null;
+          if (String(groundTruthScoringRuleState.formula || '') === 'trim_one_each_mean' && usable.length > 2) {
+            usable = usable.slice().sort((a, b) => a - b).slice(1, -1);
           }
-          return scores;
+          if (!usable.length) return null;
+          const avg = usable.reduce((sum, value) => sum + value, 0) / usable.length;
+          return roundGroundTruthScore(avg, groundTruthScoringRuleState.rounding_digits || 2);
+        }
+        function applyGroundTruthFinalScoreAutoFill() {
+          const finalInput = document.getElementById('gtFinal');
+          if (!finalInput) return;
+          const rule = groundTruthScoringRuleState || {};
+          finalInput.readOnly = !!rule.auto_compute;
+          const scoreState = collectGroundTruthJudgeScoreState();
+          if (!rule.auto_compute) {
+            renderGroundTruthScoreRuleHint(
+              String(rule.label || '未识别招标文件取分规则，请人工录入最终得分。')
+            );
+            return;
+          }
+          if (!scoreState.complete) {
+            finalInput.value = '';
+            renderGroundTruthScoreRuleHint(
+              '按招标文件规则自动计算：请先录满 ' + String(scoreState.count || selectedGroundTruthJudgeCount()) + ' 位评委分。'
+            );
+            return;
+          }
+          const computed = computeGroundTruthFinalScore(scoreState.scores);
+          if (computed == null) {
+            finalInput.value = '';
+            renderGroundTruthScoreRuleHint('未能根据当前评委分自动计算最终得分，请检查输入。', true);
+            return;
+          }
+          const digits = Math.max(0, Number(rule.rounding_digits) || 2);
+          finalInput.value = Number(computed).toFixed(digits);
+          const hintParts = [
+            String(rule.label || '按招标文件规则自动计算'),
+            String(rule.source_filename || '').trim(),
+            String(rule.source_page_hint || '').trim(),
+          ].filter(Boolean);
+          renderGroundTruthScoreRuleHint(hintParts.join(' / '));
+        }
+        async function refreshGroundTruthScoringRule(expectedProjectId=null, switchSeq=null) {
+          const id = expectedProjectId || pid();
+          const finalInput = document.getElementById('gtFinal');
+          if (!id) {
+            groundTruthScoringRuleState = {
+              project_id: '',
+              formula: 'manual',
+              label: '请先选择项目后再录入真实评标。',
+              rounding_digits: 2,
+              drop_highest_count: 0,
+              drop_lowest_count: 0,
+              auto_compute: false,
+              source_filename: '',
+              source_page_hint: '',
+              source_excerpt: '',
+            };
+            if (finalInput) {
+              finalInput.readOnly = false;
+              finalInput.value = '';
+            }
+            renderGroundTruthScoreRuleHint('请先选择项目后再录入真实评标。');
+            return;
+          }
+          try {
+            const res = await fetch('/api/v1/projects/' + id + '/ground_truth/scoring_rule?t=' + Date.now(), {
+              cache: 'no-store',
+            });
+            const data = await res.json().catch(() => ({}));
+            if (isStaleProjectResponse(id, switchSeq)) return;
+            if (res.ok && data && typeof data === 'object') {
+              groundTruthScoringRuleState = {
+                project_id: String(data.project_id || id),
+                formula: String(data.formula || 'manual'),
+                label: String(data.label || '未识别招标文件取分规则，请人工录入最终得分'),
+                rounding_digits: Number(data.rounding_digits || 2) || 2,
+                drop_highest_count: Number(data.drop_highest_count || 0) || 0,
+                drop_lowest_count: Number(data.drop_lowest_count || 0) || 0,
+                auto_compute: !!data.auto_compute,
+                source_filename: String(data.source_filename || ''),
+                source_page_hint: String(data.source_page_hint || ''),
+                source_excerpt: String(data.source_excerpt || ''),
+              };
+            } else {
+              groundTruthScoringRuleState = {
+                project_id: id,
+                formula: 'manual',
+                label: '未识别招标文件取分规则，请人工录入最终得分',
+                rounding_digits: 2,
+                drop_highest_count: 0,
+                drop_lowest_count: 0,
+                auto_compute: false,
+                source_filename: '',
+                source_page_hint: '',
+                source_excerpt: '',
+              };
+            }
+          } catch (_) {
+            if (isStaleProjectResponse(id, switchSeq)) return;
+            groundTruthScoringRuleState = {
+              project_id: id,
+              formula: 'manual',
+              label: '招标取分规则加载失败，请人工录入最终得分',
+              rounding_digits: 2,
+              drop_highest_count: 0,
+              drop_lowest_count: 0,
+              auto_compute: false,
+              source_filename: '',
+              source_page_hint: '',
+              source_excerpt: '',
+            };
+          }
+          applyGroundTruthFinalScoreAutoFill();
         }
         function applyProjectScoreScale(projectId) {
           const el = document.getElementById('scoreScaleSelect');
@@ -25106,6 +25534,14 @@ def index(
           const judgeCountSel = document.getElementById('gtJudgeCount');
           if (judgeCountSel) judgeCountSel.value = '5';
           if (typeof syncGroundTruthJudgeInputs === 'function') syncGroundTruthJudgeInputs();
+          if (typeof resetGroundTruthDraftCommitState === 'function') resetGroundTruthDraftCommitState();
+          if (typeof renderGroundTruthScoreRuleHint === 'function') {
+            renderGroundTruthScoreRuleHint(
+              hasProject
+                ? '待机：正在识别招标文件中的真实评标取分规则。'
+                : '请先选择项目后再录入真实评标。'
+            );
+          }
           if (!hasProject) {
             const scaleSel = document.getElementById('scoreScaleSelect');
             if (scaleSel) scaleSel.value = '100';
@@ -25782,6 +26218,7 @@ def index(
             (typeof refreshFeedMaterials === 'function') ? refreshFeedMaterials(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshGroundTruth === 'function') ? refreshGroundTruth(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshGroundTruthSubmissionOptions === 'function') ? refreshGroundTruthSubmissionOptions(selectedId, switchSeq) : Promise.resolve(),
+            (typeof refreshGroundTruthScoringRule === 'function') ? refreshGroundTruthScoringRule(selectedId, switchSeq) : Promise.resolve(),
           ]);
           if (isStaleProjectResponse(selectedId, switchSeq)) return;
           setSelectMsg('已切换项目并自动刷新下方所有区域。', false);
@@ -27143,7 +27580,30 @@ def index(
         });
         safeChange('gtJudgeCount', function() {
           syncGroundTruthJudgeInputs();
+          resetGroundTruthDraftCommitState();
+          applyGroundTruthFinalScoreAutoFill();
         });
+        for (let i = 1; i <= 7; i += 1) {
+          const judgeInput = document.getElementById('gtJ' + String(i));
+          if (judgeInput) {
+            judgeInput.addEventListener('input', () => {
+              resetGroundTruthDraftCommitState();
+              applyGroundTruthFinalScoreAutoFill();
+            });
+          }
+        }
+        const gtSubmissionSelectEl = document.getElementById('groundTruthSubmissionSelect');
+        if (gtSubmissionSelectEl) {
+          gtSubmissionSelectEl.addEventListener('change', () => {
+            resetGroundTruthDraftCommitState();
+          });
+        }
+        const gtFinalInput = document.getElementById('gtFinal');
+        if (gtFinalInput) {
+          gtFinalInput.addEventListener('input', () => {
+            resetGroundTruthDraftCommitState();
+          });
+        }
         safeChange('groundTruthOtherProject', refreshGroundTruth);
         safeClick('btnRefreshGroundTruth', refreshGroundTruth);
         safeClick('btnRefreshGroundTruthSubmissionOptions', async () => {
@@ -29960,26 +30420,62 @@ def index(
           const retriedData = await retriedRes.json().catch(() => ({}));
           return { res: retriedRes, data: retriedData };
         };
-        safeClick('btnAddGroundTruth', async () => {
-          if (!ensureProjectForAction('evolveResult')) return;
-          const projectId = actionProjectId();
+        function currentGroundTruthDraftFormState() {
           const submissionSelect = document.getElementById('groundTruthSubmissionSelect');
           const submissionId = String((submissionSelect && submissionSelect.value) || '').trim();
-          if (!submissionId) {
-            setResultError('evolveResult', '请先在“施组文件”下拉框选择步骤4已上传施组。');
-            return;
+          const scoreState = collectGroundTruthJudgeScoreState();
+          const finalInput = document.getElementById('gtFinal');
+          const finalRaw = String((finalInput && finalInput.value) || '').trim();
+          const finalScore = finalRaw ? Number(finalRaw) : null;
+          return {
+            submissionSelect,
+            submissionId,
+            scoreState,
+            finalScore,
+            hasAnyInput: scoreState.filledCount > 0 || !!finalRaw || (!!submissionId && scoreState.complete),
+          };
+        }
+        async function submitGroundTruthDraft(projectId, options={}) {
+          const opts = (options && typeof options === 'object') ? options : {};
+          const draft = currentGroundTruthDraftFormState();
+          if (!draft.submissionId) {
+            return {
+              ok: false,
+              skipped: !draft.hasAnyInput,
+              error: '请先在“施组文件”下拉框选择步骤4已上传施组。',
+            };
           }
-          const judgeScores = collectGroundTruthJudgeScores();
-          const finalScore = parseFloat(document.getElementById('gtFinal').value) || 0;
-          setResultLoading('evolveResult', '真实评标录入中（基于步骤4已上传施组）...');
-          document.getElementById('output').textContent = '真实评标录入中（基于步骤4已上传施组）...';
+          if (!draft.scoreState.complete) {
+            return {
+              ok: false,
+              error: '请先录满 ' + String(draft.scoreState.count || selectedGroundTruthJudgeCount()) + ' 位评委分，再录入真实评标。',
+            };
+          }
+          if (groundTruthScoringRuleState && groundTruthScoringRuleState.auto_compute) {
+            applyGroundTruthFinalScoreAutoFill();
+          }
+          const finalInput = document.getElementById('gtFinal');
+          const finalScore = Number((finalInput && finalInput.value) || '');
+          if (!Number.isFinite(finalScore)) {
+            return { ok: false, error: '最终得分未生成，请检查评委分或招标取分规则。' };
+          }
+          if (isGroundTruthDraftCommitted(projectId, draft.submissionId, draft.scoreState.scores, finalScore)) {
+            return {
+              ok: true,
+              alreadyCommitted: true,
+              data: { final_score: finalScore },
+              judgeScores: draft.scoreState.scores,
+              finalScore,
+            };
+          }
           const payload = {
-            submission_id: submissionId,
-            judge_scores: judgeScores,
+            submission_id: draft.submissionId,
+            judge_scores: draft.scoreState.scores,
             final_score: finalScore,
             source: '青天大模型',
           };
-          let res, data;
+          let res;
+          let data = {};
           try {
             res = await fetch('/api/v1/projects/' + projectId + '/ground_truth/from_submission', {
               method: 'POST',
@@ -29988,17 +30484,50 @@ def index(
             });
             data = await res.json().catch(() => ({}));
           } catch (err) {
-            document.getElementById('output').textContent = '真实评标录入失败：' + String((err && err.message) || err || '网络异常');
-            return;
+            return {
+              ok: false,
+              error: '真实评标录入失败：' + String((err && err.message) || err || '网络异常'),
+            };
           }
-          showJson('output', res.ok ? data : (data.detail || data));
           if (!res.ok) {
+            return {
+              ok: false,
+              status: res.status,
+              data,
+              error: String((data && data.detail) || ('HTTP ' + String(res.status || 0))),
+            };
+          }
+          markGroundTruthDraftCommitted(projectId, draft.submissionId, draft.scoreState.scores, finalScore);
+          if (opts.refreshList !== false && typeof refreshGroundTruth === 'function') {
+            await refreshGroundTruth(projectId);
+          }
+          return {
+            ok: true,
+            res,
+            data,
+            submissionLabel: String((draft.submissionSelect && draft.submissionSelect.options && draft.submissionSelect.selectedIndex >= 0 && draft.submissionSelect.options[draft.submissionSelect.selectedIndex] && draft.submissionSelect.options[draft.submissionSelect.selectedIndex].textContent) || draft.submissionId),
+            judgeScores: draft.scoreState.scores,
+            finalScore,
+          };
+        }
+        safeClick('btnAddGroundTruth', async () => {
+          if (!ensureProjectForAction('evolveResult')) return;
+          const projectId = actionProjectId();
+          setResultLoading('evolveResult', '真实评标录入中（基于步骤4已上传施组）...');
+          document.getElementById('output').textContent = '真实评标录入中（基于步骤4已上传施组）...';
+          const submissionResult = await submitGroundTruthDraft(projectId);
+          if (!submissionResult.ok) {
+            document.getElementById('output').textContent = String(submissionResult.error || '真实评标录入失败');
             const evolveErr = document.getElementById('evolveResult');
-            evolveErr.innerHTML = '<p class="error">真实评标录入失败：' + (data.detail || ('HTTP ' + res.status)) + '</p>';
+            evolveErr.innerHTML = '<p class="error">真实评标录入失败：' + escapeHtmlText(String(submissionResult.error || '请求失败')) + '</p>';
             evolveErr.style.display = 'block';
             return;
           }
-          const sourceName = String((submissionSelect && submissionSelect.options && submissionSelect.selectedIndex >= 0 && submissionSelect.options[submissionSelect.selectedIndex] && submissionSelect.options[submissionSelect.selectedIndex].textContent) || submissionId);
+          const data = submissionResult.data || {};
+          showJson('output', data);
+          const sourceName = String(submissionResult.submissionLabel || '');
+          const judgeScores = Array.isArray(submissionResult.judgeScores) ? submissionResult.judgeScores : [];
+          const finalScore = submissionResult.finalScore;
           const evolveEl = document.getElementById('evolveResult');
           const feedbackGuardrail = (data && typeof data.feedback_guardrail === 'object') ? data.feedback_guardrail : {};
           const closedLoop = (data && typeof data.feedback_closed_loop === 'object') ? data.feedback_closed_loop : {};
@@ -30029,12 +30558,26 @@ def index(
                 : '<p style="margin:8px 0 0 0;color:#166534">反馈闭环已接收该样本，未触发极端偏差拦截。</p>'
             );
           evolveEl.style.display = 'block';
+          const submissionSelect = document.getElementById('groundTruthSubmissionSelect');
           if (submissionSelect) submissionSelect.value = '';
-          refreshGroundTruth();
+          resetGroundTruthDraftCommitState();
         });
         safeClick('btnEvolve', async () => {
           if (!ensureProjectForAction('evolveResult')) return;
           const projectId = actionProjectId();
+          const currentDraft = currentGroundTruthDraftFormState();
+          let autoRecordedBeforeEvolve = false;
+          if (currentDraft.hasAnyInput) {
+            const draftResult = await submitGroundTruthDraft(projectId);
+            if (!draftResult.ok) {
+              setResultError(
+                'evolveResult',
+                '学习进化前需先完成真实评标录入：' + String(draftResult.error || '请检查当前表单。')
+              );
+              return;
+            }
+            autoRecordedBeforeEvolve = !draftResult.alreadyCommitted;
+          }
           const preConfirmed = maybeConfirmExtremeSample(projectId, '学习进化');
           if (preConfirmed === null) {
             setResultError('evolveResult', '已取消纳入极端偏差样本，本次未执行学习进化。');
@@ -30052,7 +30595,13 @@ def index(
           const el = document.getElementById('evolveResult');
           el.style.display = 'block';
           if (res.ok) {
-            let html = '<p class="success">学习完成（基于 ' + (data.sample_count || 0) + ' 条真实评标）</p>';
+            const sampleCount = Number(data.sample_count || 0) || 0;
+            let html = sampleCount > 0
+              ? '<p class="success">学习完成（基于 ' + sampleCount + ' 条真实评标）</p>'
+              : '<p class="error">当前项目仍无可学习的真实评标样本，请先录入并保存真实评标。</p>';
+            if (autoRecordedBeforeEvolve) {
+              html += '<p style="margin:6px 0 0 0;color:#166534">本次已先自动录入当前表单中的真实评标，再执行学习进化。</p>';
+            }
             if (data.high_score_logic && data.high_score_logic.length) html += '<strong>高分逻辑</strong><ul>' + data.high_score_logic.map(l => '<li>' + l + '</li>').join('') + '</ul>';
             if (data.writing_guidance && data.writing_guidance.length) html += '<strong>编制指导</strong><ul>' + data.writing_guidance.map(l => '<li>' + l + '</li>').join('') + '</ul>';
             if (data.scoring_evolution && data.scoring_evolution.dimension_multipliers && Object.keys(data.scoring_evolution.dimension_multipliers).length) {
