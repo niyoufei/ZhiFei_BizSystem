@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from app.engine import ops_agents as oa
 
 
@@ -130,6 +132,8 @@ def test_run_ops_agents_cycle_warn_from_sub_agents(monkeypatch):
 
 
 def test_scoring_quality_treats_preparation_critical_as_non_failure():
+    recent_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+
     def fake_requester(**kwargs):
         url = str(kwargs.get("url") or "")
         if url.endswith("/api/v1/projects"):
@@ -142,6 +146,7 @@ def test_scoring_quality_treats_preparation_critical_as_non_failure():
                         "id": "p1",
                         "name": "项目1",
                         "status": "scoring_preparation",
+                        "updated_at": recent_iso,
                     }
                 ],
                 "error": None,
@@ -168,6 +173,181 @@ def test_scoring_quality_treats_preparation_critical_as_non_failure():
     assert result["status"] == "pass"
     assert result["metrics"]["critical_count"] == 0
     assert result["metrics"]["preparation_critical_count"] == 1
+
+
+def test_select_projects_for_ops_audit_excludes_synthetic_and_stale_preparation():
+    now = datetime(2026, 3, 24, 12, 0, tzinfo=timezone.utc)
+    projects = [
+        {
+            "id": "synthetic",
+            "name": "OPS_SMOKE_1",
+            "status": "submitted_to_qingtian",
+            "updated_at": (now - timedelta(hours=1)).isoformat(),
+        },
+        {
+            "id": "recent-real",
+            "name": "真实项目A",
+            "status": "scoring_preparation",
+            "updated_at": (now - timedelta(hours=2)).isoformat(),
+        },
+        {
+            "id": "stale-prep",
+            "name": "真实项目C",
+            "status": "scoring_preparation",
+            "updated_at": (now - timedelta(days=10)).isoformat(),
+        },
+    ]
+
+    selected = oa._select_projects_for_ops_audit(
+        projects, now=now, recent_hours=72, max_projects=10
+    )
+    assert [row["id"] for row in selected] == ["recent-real"]
+
+
+def test_request_json_omits_api_key_for_localhost(monkeypatch):
+    captured_headers = {}
+
+    class _FakeResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def fake_urlopen(req, timeout):
+        captured_headers["headers"] = dict(req.header_items())
+        return _FakeResponse()
+
+    monkeypatch.setattr(oa.request, "urlopen", fake_urlopen)
+
+    oa._request_json(
+        method="GET",
+        url="http://127.0.0.1:8000/health",
+        api_key="secret",
+        timeout=1.0,
+    )
+    assert "X-api-key" not in captured_headers["headers"]
+
+    oa._request_json(
+        method="GET",
+        url="http://example.com/health",
+        api_key="secret",
+        timeout=1.0,
+    )
+    assert captured_headers["headers"]["X-api-key"] == "secret"
+
+
+def test_scoring_quality_ignores_synthetic_and_stale_history():
+    now = datetime.now(timezone.utc)
+    recent_iso = (now - timedelta(hours=1)).isoformat()
+    stale_iso = (now - timedelta(days=10)).isoformat()
+
+    def fake_requester(**kwargs):
+        url = str(kwargs.get("url") or "")
+        if url.endswith("/api/v1/projects"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": [
+                    {
+                        "id": "synthetic",
+                        "name": "E2E_1",
+                        "status": "submitted_to_qingtian",
+                        "updated_at": recent_iso,
+                    },
+                    {
+                        "id": "stale",
+                        "name": "历史项目",
+                        "status": "submitted_to_qingtian",
+                        "updated_at": stale_iso,
+                    },
+                    {
+                        "id": "recent-real",
+                        "name": "真实项目A",
+                        "status": "scoring_preparation",
+                        "updated_at": recent_iso,
+                    },
+                ],
+                "error": None,
+            }
+        if url.endswith("/api/v1/projects/recent-real/mece_audit"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "overall": {"level": "critical"},
+                    "summary": {"submission_total": 0, "submission_scored": 0},
+                },
+                "error": None,
+            }
+        raise AssertionError(f"unexpected url: {url}")
+
+    result = oa._run_scoring_quality_agent(
+        base_url="http://127.0.0.1:8000",
+        api_key=None,
+        timeout=5.0,
+        requester=fake_requester,
+    )
+    assert result["status"] == "pass"
+    assert result["metrics"]["project_count"] == 3
+    assert result["metrics"]["monitored_project_count"] == 1
+    assert result["metrics"]["preparation_critical_count"] == 1
+
+
+def test_evolution_treats_preparation_without_ground_truth_as_pass():
+    recent_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+
+    def fake_requester(**kwargs):
+        url = str(kwargs.get("url") or "")
+        if url.endswith("/api/v1/projects"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": [
+                    {
+                        "id": "recent-real",
+                        "name": "真实项目A",
+                        "status": "scoring_preparation",
+                        "updated_at": recent_iso,
+                    }
+                ],
+                "error": None,
+            }
+        if url.endswith("/api/v1/projects/recent-real/evolution/health"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "ground_truth_count": 0,
+                        "has_evolved_multipliers": False,
+                    }
+                },
+                "error": None,
+            }
+        raise AssertionError(f"unexpected url: {url}")
+
+    result = oa._run_evolution_agent(
+        base_url="http://127.0.0.1:8000",
+        api_key=None,
+        timeout=5.0,
+        auto_evolve=True,
+        min_samples=3,
+        requester=fake_requester,
+    )
+    assert result["status"] == "pass"
+    assert result["metrics"]["monitored_project_count"] == 1
+    assert result["metrics"]["preparation_insufficient_count"] == 1
+    assert result["metrics"]["started_but_insufficient_count"] == 0
 
 
 def test_project_flow_agent_smoke_success():

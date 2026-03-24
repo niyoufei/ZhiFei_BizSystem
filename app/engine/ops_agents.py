@@ -4,9 +4,13 @@ import json
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 from urllib import error, request
+from urllib.parse import urlparse
+
+OPS_AUDIT_PREPARATION_STATUSES = {"scoring_preparation", "draft", "created"}
+OPS_AUDIT_SYNTHETIC_PREFIXES = ("ops_", "ops招标项目_", "e2e_")
 
 
 def _now_iso() -> str:
@@ -31,6 +35,79 @@ def _normalize_projects(payload: Any) -> List[Dict[str, Any]]:
     return []
 
 
+def _normalize_project_status(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _normalize_project_name(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _project_name_is_synthetic(name: Any) -> bool:
+    normalized = _normalize_project_name(name)
+    return any(normalized.startswith(prefix) for prefix in OPS_AUDIT_SYNTHETIC_PREFIXES)
+
+
+def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _project_updated_at(project: Dict[str, Any]) -> Optional[datetime]:
+    return _parse_iso_datetime(project.get("updated_at") or project.get("created_at"))
+
+
+def _select_projects_for_ops_audit(
+    projects: List[Dict[str, Any]],
+    *,
+    now: Optional[datetime] = None,
+    recent_hours: float = 72.0,
+    max_projects: int = 24,
+) -> List[Dict[str, Any]]:
+    if not projects:
+        return []
+    current = now or datetime.now(timezone.utc)
+    cutoff = current - timedelta(hours=max(1.0, float(recent_hours)))
+    selected: List[Dict[str, Any]] = []
+    for project in projects:
+        if not isinstance(project, dict):
+            continue
+        if _project_name_is_synthetic(project.get("name")):
+            continue
+        updated_at = _project_updated_at(project)
+        is_recent = bool(updated_at and updated_at >= cutoff)
+        if is_recent:
+            selected.append(project)
+    selected.sort(
+        key=lambda row: (
+            _project_updated_at(row) or datetime.min.replace(tzinfo=timezone.utc),
+            str(row.get("id") or ""),
+        ),
+        reverse=True,
+    )
+    return selected[: max(1, int(max_projects))]
+
+
+def _is_local_url(url: str) -> bool:
+    try:
+        host = str(urlparse(url).hostname or "").strip().lower()
+    except Exception:
+        return False
+    return host in {"127.0.0.1", "localhost", "::1"} or host.startswith("127.")
+
+
+def _should_send_api_key(url: str, api_key: Optional[str]) -> bool:
+    return bool(api_key) and not _is_local_url(url)
+
+
 def _request_json(
     *,
     method: str,
@@ -43,7 +120,7 @@ def _request_json(
 ) -> Dict[str, Any]:
     headers: Dict[str, str] = {"Accept": "application/json"}
     body: Optional[bytes] = None
-    if api_key:
+    if _should_send_api_key(url, api_key):
         headers["X-API-Key"] = api_key
     if files:
         boundary = f"----CodexBoundary{int(time.time() * 1000)}"
@@ -757,14 +834,15 @@ def _run_scoring_quality_agent(
         }
 
     projects = _normalize_projects(projects_resp.get("json"))
-    if not projects:
+    monitored_projects = _select_projects_for_ops_audit(projects)
+    if not monitored_projects:
         return {
             "name": "scoring_quality",
-            "status": "warn",
+            "status": "pass",
             "duration_ms": int((time.monotonic() - started) * 1000),
             "checks": {"projects": projects_resp},
-            "metrics": {"project_count": 0},
-            "recommendations": ["当前无项目可审计。"],
+            "metrics": {"project_count": len(projects), "monitored_project_count": 0},
+            "recommendations": ["当前无需要纳入评分质量巡检的真实项目。"],
         }
 
     audits: List[Dict[str, Any]] = []
@@ -772,11 +850,11 @@ def _run_scoring_quality_agent(
     preparation_critical = 0
     watch = 0
     good = 0
-    for project in projects:
+    for project in monitored_projects:
         pid = str(project.get("id") or "").strip()
         if not pid:
             continue
-        project_status = str(project.get("status") or "").strip().lower()
+        project_status = _normalize_project_status(project.get("status"))
         resp = requester(
             method="GET",
             url=f"{base_url}/api/v1/projects/{pid}/mece_audit",
@@ -793,7 +871,7 @@ def _run_scoring_quality_agent(
         submission_total = _to_int(summary.get("submission_total"))
         submission_scored = _to_int(summary.get("submission_scored"))
         # 处于准备阶段（未上传施组/未评分）的项目，不应把运维状态打成 fail。
-        in_preparation = project_status in {"scoring_preparation", "draft", "created"} and (
+        in_preparation = project_status in OPS_AUDIT_PREPARATION_STATUSES and (
             submission_total == 0 and submission_scored == 0
         )
         if level == "critical":
@@ -827,6 +905,7 @@ def _run_scoring_quality_agent(
         "checks": {"projects": projects_resp, "audits": audits[:20]},
         "metrics": {
             "project_count": len(projects),
+            "monitored_project_count": len(monitored_projects),
             "good_count": good,
             "watch_count": watch,
             "critical_count": critical,
@@ -863,16 +942,40 @@ def _run_evolution_agent(
         }
 
     projects = _normalize_projects(projects_resp.get("json"))
+    monitored_projects = _select_projects_for_ops_audit(projects)
     checks: List[Dict[str, Any]] = []
     evolve_actions: List[Dict[str, Any]] = []
     mature_projects = 0
     insufficient_projects = 0
+    preparation_insufficient = 0
+    started_but_insufficient = 0
     pending_evolve: List[str] = []
     failed_count = 0
-    for project in projects:
+    if not monitored_projects:
+        return {
+            "name": "evolution",
+            "status": "pass",
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "checks": {"projects": projects_resp, "health": []},
+            "actions": {"evolve": []},
+            "metrics": {
+                "project_count": len(projects),
+                "monitored_project_count": 0,
+                "mature_projects": 0,
+                "insufficient_projects": 0,
+                "preparation_insufficient_count": 0,
+                "started_but_insufficient_count": 0,
+                "pending_evolve_before": 0,
+                "pending_evolve_after": 0,
+                "failed_count": 0,
+            },
+            "recommendations": ["当前无需要纳入进化巡检的真实项目。"],
+        }
+    for project in monitored_projects:
         pid = str(project.get("id") or "").strip()
         if not pid:
             continue
+        project_status = _normalize_project_status(project.get("status"))
         resp = requester(
             method="GET",
             url=f"{base_url}/api/v1/projects/{pid}/evolution/health",
@@ -892,6 +995,10 @@ def _run_evolution_agent(
                 pending_evolve.append(pid)
         else:
             insufficient_projects += 1
+            if project_status in OPS_AUDIT_PREPARATION_STATUSES and gt_count <= 0:
+                preparation_insufficient += 1
+            else:
+                started_but_insufficient += 1
 
     if auto_evolve and pending_evolve:
         for pid in pending_evolve:
@@ -920,8 +1027,17 @@ def _run_evolution_agent(
             if not has_mult:
                 remaining_pending += 1
 
-    pass_flag = failed_count == 0 and remaining_pending == 0
-    warn_flag = pass_flag and mature_projects == 0 and insufficient_projects > 0
+    pass_flag = (
+        failed_count == 0
+        and remaining_pending == 0
+        and (mature_projects > 0 or started_but_insufficient == 0)
+    )
+    warn_flag = (
+        failed_count == 0
+        and remaining_pending == 0
+        and not pass_flag
+        and started_but_insufficient > 0
+    )
     recommendations: List[str] = []
     if failed_count > 0:
         recommendations.append(
@@ -929,10 +1045,12 @@ def _run_evolution_agent(
         )
     elif remaining_pending > 0:
         recommendations.append(f"仍有 {remaining_pending} 个项目未产出进化权重，请人工复核。")
-    elif mature_projects == 0 and insufficient_projects > 0:
+    elif started_but_insufficient > 0:
         recommendations.append(
             "当前项目真实评分样本不足，建议每项目至少录入 3 条后再观察进化效果。"
         )
+    elif preparation_insufficient > 0:
+        recommendations.append("当前真实项目仍处于准备阶段，尚未进入可学习进化区间。")
     else:
         recommendations.append("进化链路状态正常。")
 
@@ -944,8 +1062,11 @@ def _run_evolution_agent(
         "actions": {"evolve": evolve_actions[:20]},
         "metrics": {
             "project_count": len(projects),
+            "monitored_project_count": len(monitored_projects),
             "mature_projects": mature_projects,
             "insufficient_projects": insufficient_projects,
+            "preparation_insufficient_count": preparation_insufficient,
+            "started_but_insufficient_count": started_but_insufficient,
             "pending_evolve_before": len(pending_evolve),
             "pending_evolve_after": remaining_pending,
             "failed_count": failed_count,
