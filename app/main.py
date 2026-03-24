@@ -400,6 +400,7 @@ DEFAULT_RULE_SCORE_WEIGHT = 0.7
 DEFAULT_LLM_SCORE_WEIGHT = 0.3
 DEFAULT_LLM_DELTA_CAP = 35.0
 DEFAULT_SCORE_SCALE_MAX = 100
+DEFAULT_FIVE_SCALE_PRIOR_TRIGGER_DISPLAY_MAX = 1.0
 DEFAULT_ENFORCE_GB_REDLINE = False
 DEFAULT_NORM_RULE_VERSION = "v1_m=0.5+a/10_norm=sum"
 DEFAULT_ENFORCE_MATERIAL_GATE = True
@@ -7397,6 +7398,161 @@ def _select_calibrator_model(project: Dict[str, object]) -> Optional[Dict[str, o
     return _select_calibrator_model_from_rows(project, _load_calibration_models_safe())
 
 
+def _extract_submission_rule_total_100(submission: Dict[str, object]) -> Optional[float]:
+    report = submission.get("report") if isinstance(submission.get("report"), dict) else {}
+    score_value = _to_float_or_none(report.get("rule_total_score"))
+    if score_value is None:
+        score_value = _to_float_or_none(report.get("total_score"))
+    if score_value is None:
+        score_value = _to_float_or_none(submission.get("total_score"))
+    if score_value is None:
+        return None
+    report_scale_max = _normalize_score_scale_max(
+        report.get("score_scale_max"),
+        default=DEFAULT_SCORE_SCALE_MAX,
+    )
+    if report_scale_max != 100 and score_value <= float(report_scale_max):
+        converted = _convert_score_to_100(score_value, report_scale_max)
+        if converted is not None:
+            return float(converted)
+    return float(score_value)
+
+
+def _build_five_scale_global_prior_calibrator(
+    project: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    if _resolve_project_score_scale_max(project) != 5:
+        return None
+    latest_qingtian = _latest_records_by_submission(load_qingtian_results())
+    if not latest_qingtian:
+        return None
+    submissions_by_id = {
+        str(row.get("id") or ""): row
+        for row in load_submissions()
+        if isinstance(row, dict) and str(row.get("id") or "").strip()
+    }
+    deltas: List[float] = []
+    actual_scores: List[float] = []
+    rule_scores: List[float] = []
+    for submission_id, qingtian_row in latest_qingtian.items():
+        submission = submissions_by_id.get(str(submission_id or ""))
+        if not isinstance(submission, dict):
+            continue
+        qingtian_score_100 = _resolve_qingtian_total_score_100(
+            qingtian_row,
+            default_score_scale_max=DEFAULT_SCORE_SCALE_MAX,
+        )
+        rule_total_100 = _extract_submission_rule_total_100(submission)
+        if qingtian_score_100 is None or rule_total_100 is None:
+            continue
+        actual_scores.append(float(qingtian_score_100))
+        rule_scores.append(float(rule_total_100))
+        deltas.append(float(qingtian_score_100) - float(rule_total_100))
+    if not deltas:
+        return None
+    bias = sum(deltas) / len(deltas)
+    sigma = math.sqrt(sum((delta - bias) ** 2 for delta in deltas) / len(deltas))
+    avg_actual = sum(actual_scores) / len(actual_scores)
+    avg_rule = sum(rule_scores) / len(rule_scores)
+    return {
+        "calibrator_version": "prior_five_scale_global_offset_v1",
+        "model_type": "offset",
+        "feature_schema_version": "v2",
+        "train_filter": {"project_id": None, "scope": "five_scale_global_prior"},
+        "metrics": {
+            "sample_count": len(deltas),
+            "avg_actual_score_100": round(avg_actual, 2),
+            "avg_rule_total_score_100": round(avg_rule, 2),
+            "avg_delta_100": round(bias, 2),
+        },
+        "model_artifact": {
+            "model_type": "offset",
+            "feature_schema_version": "v2",
+            "bias": round(float(bias), 6),
+            "sigma": round(max(0.5, float(sigma)), 4),
+            "metrics": {
+                "sample_count": len(deltas),
+                "avg_actual_score_100": round(avg_actual, 2),
+                "avg_rule_total_score_100": round(avg_rule, 2),
+                "avg_delta_100": round(bias, 2),
+            },
+            "gate_passed": True,
+        },
+        "synthetic_prior_kind": "five_scale_global_prior",
+        "deployed": True,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _is_five_scale_global_prior_model(model: Dict[str, object]) -> bool:
+    return str(model.get("synthetic_prior_kind") or "").strip() == "five_scale_global_prior"
+
+
+def _should_apply_five_scale_global_prior(
+    submission: Dict[str, object],
+    *,
+    project: Dict[str, object],
+) -> bool:
+    if _resolve_project_score_scale_max(project) != 5:
+        return False
+    report = submission.get("report") if isinstance(submission.get("report"), dict) else {}
+    if _to_float_or_none(report.get("pred_total_score")) is not None:
+        return False
+    rule_total_100 = _extract_submission_rule_total_100(submission)
+    if rule_total_100 is None:
+        return False
+    display_rule = _convert_score_from_100(rule_total_100, 5)
+    return display_rule is not None and float(display_rule) < float(
+        DEFAULT_FIVE_SCALE_PRIOR_TRIGGER_DISPLAY_MAX
+    )
+
+
+def _preview_submission_with_live_prediction(
+    submission: Dict[str, object],
+    *,
+    project: Dict[str, object],
+    model_override: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    preview = dict(submission)
+    report_obj = preview.get("report")
+    if not isinstance(report_obj, dict) or not _submission_has_generated_score(preview):
+        return preview
+    model = (
+        model_override if isinstance(model_override, dict) else _select_calibrator_model(project)
+    )
+    if not model:
+        return preview
+    artifact = model.get("model_artifact") or model.get("artifact") or {}
+    if _to_float_or_none(
+        report_obj.get("pred_total_score")
+    ) is not None and not _is_five_scale_global_prior_model(model):
+        return preview
+    if not _is_five_scale_global_prior_model(model) and not isinstance(artifact, dict):
+        return preview
+    if _is_five_scale_global_prior_model(model) and not _should_apply_five_scale_global_prior(
+        preview,
+        project=project,
+    ):
+        return preview
+    preview_report = dict(report_obj)
+    preview["report"] = preview_report
+    submission_like = dict(preview)
+    _apply_prediction_to_report_with_model(
+        preview_report,
+        submission_like=submission_like,
+        project=project,
+        model_override=model,
+    )
+    preview["total_score"] = float(
+        submission_like.get(
+            "total_score",
+            preview_report.get("total_score", preview.get("total_score", 0.0)),
+        )
+        or 0.0
+    )
+    return preview
+
+
 def _select_deployed_patch(project_id: str) -> Optional[Dict[str, object]]:
     packages = [
         p
@@ -8353,12 +8509,24 @@ def _apply_prediction_to_report_with_model(
         return str(model.get("calibrator_version") or "")
 
     rule_total = float(report.get("rule_total_score", report.get("total_score", 0.0)))
-    fused_total, llm_total, blend_info = _fuse_rule_and_llm_scores(
-        rule_total=rule_total,
-        llm_total_raw=float(pred),
-        project=project,
-        report=report,
-    )
+    if _is_five_scale_global_prior_model(model):
+        fused_total = _clip_score(float(pred))
+        llm_total = None
+        blend_info = {
+            "mode": "synthetic_prior",
+            "prior_kind": "five_scale_global_prior",
+            "bias": round(float((artifact or {}).get("bias", 0.0)), 4),
+            "sample_count": int(
+                _to_float_or_none(((artifact or {}).get("metrics") or {}).get("sample_count")) or 0
+            ),
+        }
+    else:
+        fused_total, llm_total, blend_info = _fuse_rule_and_llm_scores(
+            rule_total=rule_total,
+            llm_total_raw=float(pred),
+            project=project,
+            report=report,
+        )
     sigma = float(_to_float_or_none(conf.get("sigma")) or 0.0)
     ci95_delta = 1.96 * sigma if sigma > 0 else 0.0
     ci95_lower = _clip_score(fused_total - ci95_delta)
@@ -8774,7 +8942,9 @@ def _score_submission_for_project(
             report_meta["score_confidence_level"] = "high"
         report["meta"] = report_meta
         _apply_deployed_patch_to_report(project_id, report)
+        submission_like = {"id": submission_id, "project_id": project_id, "text": text}
         if _report_is_blocked(report):
+            _apply_prediction_to_report(report, submission_like=submission_like, project=project)
             report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
             report_meta = dict(report_meta or {})
             awareness = _build_score_self_awareness(
@@ -8785,7 +8955,6 @@ def _score_submission_for_project(
             report_meta["score_confidence_level"] = str(awareness.get("level") or "low")
             report["meta"] = report_meta
             return report, list(v2_result.get("evidence_units") or [])
-        submission_like = {"id": submission_id, "project_id": project_id, "text": text}
         _apply_prediction_to_report(report, submission_like=submission_like, project=project)
         _mark_report_scored(report, trigger="score_engine")
         report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
@@ -10190,7 +10359,7 @@ def _select_calibrator_model_from_rows(
     for model in models:
         if bool(model.get("deployed")) and _compatible(model):
             return model
-    return None
+    return _build_five_scale_global_prior_calibrator(project)
 
 
 def _resolve_project_scoring_context_for_governance(
@@ -20489,21 +20658,30 @@ def compare_submissions(
     material_knowledge_snapshot = _build_material_knowledge_profile(project_id)
     rankings = []
     for s in submissions:
-        report_for_awareness = s.get("report") if isinstance(s.get("report"), dict) else None
+        display_submission = (
+            _preview_submission_with_live_prediction(s, project=project)
+            if allow_pred_score
+            else dict(s)
+        )
+        report_for_awareness = (
+            display_submission.get("report")
+            if isinstance(display_submission.get("report"), dict)
+            else None
+        )
         awareness = _ensure_report_score_self_awareness(
             report_for_awareness,
             project_id=project_id,
             material_knowledge_snapshot=material_knowledge_snapshot,
         )
         score_fields = _resolve_submission_score_fields(
-            s,
+            display_submission,
             allow_pred_score=allow_pred_score,
             score_scale_max=score_scale_max,
         )
         ranking_row = {
-            "submission_id": s["id"],
-            "id": s["id"],
-            "filename": s["filename"],
+            "submission_id": display_submission["id"],
+            "id": display_submission["id"],
+            "filename": display_submission["filename"],
             "total_score": score_fields["total_score"],
             "pred_total_score": score_fields["pred_total_score"],
             "rule_total_score": score_fields["rule_total_score"],
@@ -20512,7 +20690,7 @@ def compare_submissions(
                 ((report_for_awareness or {}).get("meta") or {}).get("score_confidence_level") or ""
             ),
             "score_self_awareness": awareness if isinstance(awareness, dict) else {},
-            "created_at": s.get("created_at"),
+            "created_at": display_submission.get("created_at"),
         }
         ranking_row.update(build_compare_sort_fields(ranking_row))
         rankings.append(ranking_row)
@@ -20577,17 +20755,22 @@ def compare_report(
     submissions_for_compare = []
     by_id: Dict[str, Dict[str, object]] = {}
     for s in submissions:
+        display_submission = (
+            _preview_submission_with_live_prediction(s, project=project)
+            if allow_pred_score
+            else dict(s)
+        )
         score_fields_display = _resolve_submission_score_fields(
-            s,
+            display_submission,
             allow_pred_score=allow_pred_score,
             score_scale_max=score_scale_max,
         )
         score_fields_raw = _resolve_submission_score_fields(
-            s,
+            display_submission,
             allow_pred_score=allow_pred_score,
             score_scale_max=100,
         )
-        item = dict(s)
+        item = dict(display_submission)
         item["total_score"] = float(score_fields_raw["total_score"])
         report = item.get("report")
         report = dict(report) if isinstance(report, dict) else {}

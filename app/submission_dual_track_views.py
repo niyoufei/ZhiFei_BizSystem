@@ -35,6 +35,7 @@ def _load_latest_qingtian_by_submission(
 def build_submission_view(
     submission: Dict[str, object],
     *,
+    project: Dict[str, object],
     project_id: str,
     material_knowledge_snapshot: Dict[str, object],
     latest_qingtian_by_submission: Optional[Dict[str, Dict[str, object]]] = None,
@@ -42,16 +43,24 @@ def build_submission_view(
     score_scale_max: int,
 ) -> Dict[str, object]:
     main = _main()
-    view = dict(submission)
+    effective_submission = (
+        main._preview_submission_with_live_prediction(submission, project=project)
+        if allow_pred_score
+        else dict(submission)
+    )
+    view = dict(effective_submission)
     dual_track_summary = qingtian_dual_track_module.build_submission_dual_track_summary(
-        submission,
+        effective_submission,
         latest_qingtian_by_submission=latest_qingtian_by_submission,
         allow_pred_score=allow_pred_score,
         score_scale_max=score_scale_max,
     )
-    report_obj = submission.get("report")
+    report_obj = effective_submission.get("report")
     if not isinstance(report_obj, dict):
-        total_display = main._convert_score_from_100(submission.get("total_score"), score_scale_max)
+        total_display = main._convert_score_from_100(
+            effective_submission.get("total_score"),
+            score_scale_max,
+        )
         if total_display is not None:
             view["total_score"] = total_display
         view["report"] = {"dual_track_summary": dual_track_summary}
@@ -67,7 +76,7 @@ def build_submission_view(
     if rule_total is None:
         rule_total = main._to_float_or_none(report.get("total_score"))
     if rule_total is None:
-        rule_total = main._to_float_or_none(submission.get("total_score"))
+        rule_total = main._to_float_or_none(effective_submission.get("total_score"))
     if rule_total is None:
         rule_total = 0.0
 
@@ -94,7 +103,10 @@ def build_submission_view(
     display_llm = main._convert_score_from_100(raw_llm, score_scale_max)
     display_total = main._convert_score_from_100(raw_total, score_scale_max)
     if display_total is None:
-        display_total = main._convert_score_from_100(submission.get("total_score"), score_scale_max)
+        display_total = main._convert_score_from_100(
+            effective_submission.get("total_score"),
+            score_scale_max,
+        )
     report["pred_total_score"] = display_pred
     report["rule_total_score"] = display_rule
     report["llm_total_score"] = display_llm
@@ -121,20 +133,28 @@ def build_project_submission_views(
         if isinstance(material_knowledge_snapshot, dict)
         else main._build_material_knowledge_profile(project_id)
     )
+    resolved_project = dict(project or {})
+    resolved_project.setdefault("id", project_id)
     resolved_score_scale_max = (
         int(score_scale_max)
         if score_scale_max is not None
-        else main._resolve_project_score_scale_max(project)
+        else main._resolve_project_score_scale_max(resolved_project)
     )
+    resolved_project_meta = (
+        dict(resolved_project.get("meta")) if isinstance(resolved_project.get("meta"), dict) else {}
+    )
+    resolved_project_meta.setdefault("score_scale_max", resolved_score_scale_max)
+    resolved_project["meta"] = resolved_project_meta
     resolved_allow_pred_score = (
         bool(allow_pred_score)
         if allow_pred_score is not None
-        else (main._select_calibrator_model(project) is not None)
+        else (main._select_calibrator_model(resolved_project) is not None)
     )
     latest_qingtian_by_submission = _load_latest_qingtian_by_submission(submissions)
     submissions_view = [
         build_submission_view(
             item,
+            project=resolved_project,
             project_id=project_id,
             material_knowledge_snapshot=resolved_material_snapshot,
             latest_qingtian_by_submission=latest_qingtian_by_submission,
