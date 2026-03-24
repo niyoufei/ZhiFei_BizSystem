@@ -1421,16 +1421,26 @@ class TestProjectsEndpoints:
     @patch("app.main.upload_material")
     @patch("app.main.save_projects")
     @patch("app.main.load_projects")
+    @patch("app.main._read_uploaded_file_content")
+    @patch("app.main._read_uploaded_file_preview_for_project_name")
     @patch("app.main.ensure_data_dirs")
     def test_create_project_from_tender_creates_new_project(
         self,
         mock_ensure,
+        mock_preview_reader,
+        mock_full_reader,
         mock_load,
         mock_save,
         mock_upload_material,
         client,
     ):
         mock_load.return_value = []
+        mock_preview_reader.return_value = (
+            "项目名称：合肥轨道TOD甘棠路一期B地块公共区域精装修工程招标"
+        )
+        mock_full_reader.side_effect = AssertionError(
+            "full parser should not run during auto-create"
+        )
 
         def _fake_upload_material(project_id, file, material_type, api_key, locale):
             return {
@@ -1465,14 +1475,20 @@ class TestProjectsEndpoints:
         assert data["project"]["name"] == "合肥轨道TOD甘棠路一期B地块公共区域精装修工程招标"
         assert data["material"]["material_type"] == "tender_qa"
         mock_save.assert_called_once()
+        mock_preview_reader.assert_called_once()
+        mock_full_reader.assert_not_called()
 
     @patch("app.main.upload_material")
     @patch("app.main.save_projects")
     @patch("app.main.load_projects")
+    @patch("app.main._read_uploaded_file_content")
+    @patch("app.main._read_uploaded_file_preview_for_project_name")
     @patch("app.main.ensure_data_dirs")
     def test_create_project_from_tender_reuses_existing_project(
         self,
         mock_ensure,
+        mock_preview_reader,
+        mock_full_reader,
         mock_load,
         mock_save,
         mock_upload_material,
@@ -1493,6 +1509,12 @@ class TestProjectsEndpoints:
                 "updated_at": "2026-03-19T00:00:00+00:00",
             }
         ]
+        mock_preview_reader.return_value = (
+            "项目名称：合肥轨道TOD甘棠路一期B地块公共区域精装修工程招标"
+        )
+        mock_full_reader.side_effect = AssertionError(
+            "full parser should not run during auto-create"
+        )
 
         def _fake_upload_material(project_id, file, material_type, api_key, locale):
             return {
@@ -1526,6 +1548,8 @@ class TestProjectsEndpoints:
         assert data["project"]["id"] == "p1"
         assert data["project"]["name"] == "合肥轨道TOD甘棠路一期B地块公共区域精装修工程招标"
         mock_save.assert_called_once()
+        mock_preview_reader.assert_called_once()
+        mock_full_reader.assert_not_called()
 
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")

@@ -12054,10 +12054,10 @@ def create_project_from_tender(
     if not content:
         raise HTTPException(status_code=422, detail="招标文件为空，请重新选择文件。")
     try:
-        parsed_text = _read_uploaded_file_content(content, normalized_filename)
+        preview_text = _read_uploaded_file_preview_for_project_name(content, normalized_filename)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    inferred_name = _infer_project_name_from_tender_text(parsed_text, normalized_filename)
+    inferred_name = _infer_project_name_from_tender_text(preview_text, normalized_filename)
 
     projects = load_projects()
     changed = False
@@ -15796,6 +15796,102 @@ def _extract_pdf_text(content: bytes, filename: str) -> str:
     return f"[PDF资料] 文件: {filename}（未提取到有效文本）"
 
 
+def _extract_pdf_text_preview(
+    content: bytes,
+    filename: str,
+    *,
+    max_pages: int = 4,
+    max_chars: int = 16000,
+    ocr_pages: int = 2,
+) -> str:
+    if pymupdf is not None:
+        doc = pymupdf.open(stream=content, filetype="pdf")
+        try:
+            parts: List[str] = []
+            filename_terms = _extract_terms(filename, max_terms=10)
+            for idx, page in enumerate(doc, start=1):
+                if idx > max(1, int(max_pages)):
+                    break
+                page_text = _normalize_ocr_text_block(page.get_text() or "")
+                page_lines: List[str] = [f"[PAGE:{idx}]"]
+                ocr_result: Dict[str, object] = {"text": "", "mode": "", "score": 0.0}
+                need_page_ocr = (
+                    len(page_text.replace("\n", "").strip()) < DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR
+                    or _score_ocr_text_candidate(
+                        page_text,
+                        context_tokens=filename_terms,
+                    )
+                    < 2.2
+                )
+                if (
+                    need_page_ocr
+                    and idx <= max(1, int(ocr_pages))
+                    and pytesseract is not None
+                    and Image is not None
+                ):
+                    try:
+                        pix = page.get_pixmap(matrix=pymupdf.Matrix(2.0, 2.0), alpha=False)
+                        with Image.open(io.BytesIO(pix.tobytes("png"))) as img:
+                            ocr_result = _extract_best_ocr_text_from_image(
+                                img,
+                                context_tokens=filename_terms
+                                + _extract_terms(page_text, max_terms=8),
+                            )
+                    except Exception:
+                        ocr_result = {"text": "", "mode": "", "score": 0.0}
+                page_ocr_text = str(ocr_result.get("text") or "").strip()
+                combined_text = page_text
+                if page_ocr_text:
+                    combined_text = (
+                        combined_text + ("\n" if combined_text else "") + page_ocr_text
+                    ).strip()
+                    page_lines.append(
+                        f"[PAGE_OCR_MODE:{idx}] {ocr_result.get('mode') or 'single_pass'} score={round(float(_to_float_or_none(ocr_result.get('score')) or 0.0), 4)}"
+                    )
+                    page_lines.append(f"[PAGE_OCR:{idx}]")
+                    page_lines.append(page_ocr_text[:3000])
+                if combined_text:
+                    section_hints = _extract_tender_qa_section_titles(combined_text, limit=2)
+                    if section_hints:
+                        page_lines.append(
+                            f"[PAGE_SECTION_HINTS:{idx}] " + "、".join(section_hints[:2])
+                        )
+                if page_text:
+                    page_lines.append(page_text)
+                elif page_ocr_text:
+                    page_lines.append(page_ocr_text[:3000])
+                chunk = "\n".join(page_lines).strip()
+                if chunk:
+                    parts.append(chunk)
+                if sum(len(part) for part in parts) >= max(4000, int(max_chars)):
+                    break
+            merged_pdf_text = "\n\n".join(part for part in parts if part.strip()).strip()
+            if merged_pdf_text:
+                return f"[PDF_BACKEND:pymupdf]\n{merged_pdf_text[: max(4000, int(max_chars))]}"
+        finally:
+            doc.close()
+
+    pypdf_text = _extract_pdf_text_with_pypdf(content)
+    if pypdf_text:
+        limited_parts: List[str] = []
+        for idx, chunk in enumerate(re.split(r"\n\s*\n", pypdf_text), start=1):
+            if idx > max(1, int(max_pages)):
+                break
+            if not chunk.strip():
+                continue
+            limited_parts.append(chunk.strip())
+            if sum(len(part) for part in limited_parts) >= max(4000, int(max_chars)):
+                break
+        preview = "\n\n".join(limited_parts).strip()
+        if preview:
+            return f"[PDF_BACKEND:pypdf]\n{preview[: max(4000, int(max_chars))]}"
+
+    snippet = _extract_binary_text_snippet(content, max_chars=max_chars)
+    if snippet:
+        return snippet
+    return f"[PDF资料] 文件: {filename}（预览未提取到有效文本）"
+
+
 def _read_uploaded_file_content(content: bytes, filename: str) -> str:
     """根据文件名解析上传文件为文本，覆盖招标/清单/图纸/现场照片常见格式。"""
     name = filename.lower()
@@ -15840,6 +15936,54 @@ def _read_uploaded_file_content(content: bytes, filename: str) -> str:
     if name.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")):
         return _extract_image_content(content, filename)
     snippet = _extract_binary_text_snippet(content, max_chars=2000)
+    if snippet:
+        return snippet
+    raise ValueError(
+        "仅支持 .txt、.md、.csv、.doc/.docx/.docm、.pdf、.json、.xlsx/.xls/.xlsm、.dxf/.dwg、图片格式"
+    )
+
+
+def _read_uploaded_file_preview_for_project_name(content: bytes, filename: str) -> str:
+    """为项目名识别提取轻量预览文本，避免自动创建时深解析整份大文件。"""
+    name = filename.lower()
+    if (
+        name.endswith(".txt")
+        or name.endswith(".md")
+        or name.endswith(".csv")
+        or name.endswith(".json")
+    ):
+        return content.decode("utf-8", errors="ignore")[:12000]
+    if name.endswith(".docx"):
+        if Document is None:
+            raise ValueError("DOCX 解析不可用：请安装与当前系统架构兼容的 python-docx/lxml。")
+        doc = Document(io.BytesIO(content))
+        parts: List[str] = []
+        total_chars = 0
+        for paragraph in doc.paragraphs:
+            text = str(paragraph.text or "").strip()
+            if not text:
+                continue
+            parts.append(text)
+            total_chars += len(text)
+            if total_chars >= 12000 or len(parts) >= 80:
+                break
+        return "\n".join(parts)
+    if name.endswith(".doc") or name.endswith(".docm"):
+        snippet = _extract_binary_text_snippet(content, max_chars=12000)
+        if snippet:
+            return snippet
+        return f"[DOC资料] 文件: {filename}（当前环境未启用结构化解析，已纳入文件元信息）"
+    if name.endswith(".pdf"):
+        return _extract_pdf_text_preview(
+            content, filename, max_pages=4, max_chars=14000, ocr_pages=1
+        )
+    if name.endswith(".xlsx") or name.endswith(".xls") or name.endswith(".xlsm"):
+        return _read_uploaded_file_content(content, filename)[:12000]
+    if name.endswith(".dxf") or name.endswith(".dwg"):
+        return _read_uploaded_file_content(content, filename)[:12000]
+    if name.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")):
+        return _read_uploaded_file_content(content, filename)[:12000]
+    snippet = _extract_binary_text_snippet(content, max_chars=12000)
     if snippet:
         return snippet
     raise ValueError(
