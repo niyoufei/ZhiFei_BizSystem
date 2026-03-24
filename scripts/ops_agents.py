@@ -35,7 +35,15 @@ def to_markdown(payload: Dict[str, Any]) -> str:
     ]
 
     agents = payload.get("agents") or {}
-    for name in ("sre_watchdog", "data_hygiene", "project_flow", "scoring_quality", "evolution"):
+    for name in (
+        "sre_watchdog",
+        "data_hygiene",
+        "project_flow",
+        "tender_project_flow",
+        "upload_flow",
+        "scoring_quality",
+        "evolution",
+    ):
         row = agents.get(name) or {}
         lines.append(
             f"- `{name}`: status={row.get('status', '-')}, duration_ms={row.get('duration_ms', '-')}"

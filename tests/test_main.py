@@ -690,6 +690,7 @@ class TestIndexEndpoint:
             in page
         )
         assert "await refreshProjects(String((created && created.id) || ''));" in page
+        assert "nameInput.value = projectName;" in page
 
     def test_index_renders_16_dimension_weight_sliders(self, client):
         """Index page should render 16-dimension focus sliders on first paint."""
@@ -861,23 +862,14 @@ class TestIndexEndpoint:
             assert f"ensureProjectForAction('{guard_result_id}')" in page
 
     def test_index_upload_buttons_use_inline_fallback_click_and_form_submit_compat(self, client):
-        """Upload/score buttons should keep submit fallback while inline fallback click avoids full-page jumps."""
+        """Upload/score forms should rely on submit handlers and native file labels, not old fallback click interception."""
         response = client.get("/")
         assert response.status_code == 200
         page = response.text
+        assert '<button type="submit" id="btnUploadMaterials">上传资料</button>' in page
+        assert 'id="btnUploadShigong" name="submit_action" value="upload">上传施组</button>' in page
         assert (
-            '<button type="submit" id="btnUploadMaterials" onclick="if (window.__zhifeiFallbackClick) '
-            "{ return window.__zhifeiFallbackClick(event, 'btnUploadMaterials'); } return true;\">上传资料</button>"
-            in page
-        )
-        assert (
-            'id="btnUploadShigong" name="submit_action" value="upload" onclick="if (window.__zhifeiFallbackClick) '
-            "{ return window.__zhifeiFallbackClick(event, 'btnUploadShigong'); } return true;\""
-            in page
-        )
-        assert (
-            'id="btnScoreShigong" class="secondary" formaction="/web/score_shigong" name="submit_action" value="score" onclick="if (window.__zhifeiFallbackClick) '
-            "{ return window.__zhifeiFallbackClick(event, 'btnScoreShigong'); } return true;\""
+            'id="btnScoreShigong" class="secondary" formaction="/web/score_shigong" name="submit_action" value="score">评分施组</button>'
             in page
         )
         assert "btnUploadMaterials: { resultId: 'materialsActionStatus'" in page
@@ -899,9 +891,11 @@ class TestIndexEndpoint:
             "function updateFilePickerText(inputId, textId, emptyText = '未选择任何文件')" in page
         )
         assert "function refreshAllFilePickerTexts()" in page
-        assert "document.querySelectorAll('[data-file-input-id]').forEach((button) => {" in page
+        assert "document.querySelectorAll('[data-file-input-id]').forEach((button) => {" not in page
         assert "window.materialTypeLabel = materialTypeLabel;" in page
         assert "typeof window.materialTypeLabel === 'function'" in page
+        assert "async function inferProjectNameFromTenderSelection" in page
+        assert "/api/v1/projects/infer_name_from_tender" in page
         assert (
             "bindFilePicker('createProjectFromTenderFile', 'createProjectFromTenderFileName');"
             in page
@@ -920,6 +914,19 @@ class TestIndexEndpoint:
             in page
         )
         assert "/submissions?t=' + Date.now()" in page
+
+    def test_index_frontend_binds_tender_infer_to_file_change(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert (
+            "const createProjectFromTenderFileInput = document.getElementById('createProjectFromTenderFile');"
+            in page
+        )
+        assert "createProjectFromTenderFileInput.addEventListener('change', async () => {" in page
+        assert (
+            "await inferProjectNameFromTenderSelection(createProjectFromTenderFileInput);" in page
+        )
 
 
 class TestWebCreateProjectFallback:
@@ -1550,6 +1557,35 @@ class TestProjectsEndpoints:
         mock_save.assert_called_once()
         mock_preview_reader.assert_called_once()
         mock_full_reader.assert_not_called()
+
+    @patch("app.main._read_uploaded_file_preview_for_project_name")
+    @patch("app.main.ensure_data_dirs")
+    def test_infer_project_name_from_tender(
+        self,
+        mock_ensure,
+        mock_preview_reader,
+        client,
+    ):
+        mock_preview_reader.return_value = (
+            "项目名称：合肥轨道TOD甘棠路一期B地块公共区域精装修工程招标"
+        )
+
+        response = client.post(
+            "/api/v1/projects/infer_name_from_tender",
+            files={
+                "file": (
+                    "招标文件.txt",
+                    "项目名称：合肥轨道TOD甘棠路一期B地块公共区域精装修工程招标".encode("utf-8"),
+                    "text/plain",
+                )
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["filename"] == "招标文件.txt"
+        assert data["inferred_name"] == "合肥轨道TOD甘棠路一期B地块公共区域精装修工程招标"
+        mock_preview_reader.assert_called_once()
 
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")

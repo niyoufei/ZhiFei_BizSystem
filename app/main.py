@@ -229,6 +229,7 @@ from app.schemas import (
     ProjectCreateFromTenderResponse,
     ProjectEvaluationResponse,
     ProjectExpertProfileResponse,
+    ProjectInferTenderNameResponse,
     ProjectMeceAuditResponse,
     ProjectPreScoreListResponse,
     ProjectRecord,
@@ -2486,6 +2487,27 @@ def _infer_project_name_from_tender_text(text: str, filename: str) -> str:
             "或改用手动输入项目名称创建。"
         ),
     )
+
+
+def _read_tender_upload_and_infer_project_name(file: UploadFile) -> tuple[str, bytes, str]:
+    raw_filename = file.filename or ""
+    normalized_filename = _normalize_uploaded_filename(raw_filename)
+    if not normalized_filename:
+        raise HTTPException(status_code=422, detail="招标文件名为空，请重试或重命名后上传。")
+    if not _is_allowed_material_upload(normalized_filename, file.content_type or "", "tender_qa"):
+        raise HTTPException(
+            status_code=422,
+            detail="招标文件和答疑支持：" + _material_type_ext_hint("tender_qa"),
+        )
+    content = file.file.read()
+    if not content:
+        raise HTTPException(status_code=422, detail="招标文件为空，请重新选择文件。")
+    try:
+        preview_text = _read_uploaded_file_preview_for_project_name(content, normalized_filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    inferred_name = _infer_project_name_from_tender_text(preview_text, normalized_filename)
+    return normalized_filename, content, inferred_name
 
 
 def _mark_project_expert_profile_read_only(
@@ -12029,6 +12051,25 @@ def create_project(
 
 
 @router.post(
+    "/projects/infer_name_from_tender",
+    response_model=ProjectInferTenderNameResponse,
+    tags=["项目管理"],
+    responses={**RESPONSES_401, **RESPONSES_422},
+)
+def infer_project_name_from_tender(
+    file: UploadFile = File(...),
+    api_key: Optional[str] = Depends(verify_api_key),
+) -> ProjectInferTenderNameResponse:
+    """上传招标文件，仅做项目名称识别，不创建项目。"""
+    ensure_data_dirs()
+    normalized_filename, _, inferred_name = _read_tender_upload_and_infer_project_name(file)
+    return ProjectInferTenderNameResponse(
+        inferred_name=inferred_name,
+        filename=normalized_filename,
+    )
+
+
+@router.post(
     "/projects/create_from_tender",
     response_model=ProjectCreateFromTenderResponse,
     tags=["项目管理"],
@@ -12041,23 +12082,7 @@ def create_project_from_tender(
 ) -> ProjectCreateFromTenderResponse:
     """上传招标文件并自动识别项目名称，创建或复用项目后归档资料。"""
     ensure_data_dirs()
-    raw_filename = file.filename or ""
-    normalized_filename = _normalize_uploaded_filename(raw_filename)
-    if not normalized_filename:
-        raise HTTPException(status_code=422, detail="招标文件名为空，请重试或重命名后上传。")
-    if not _is_allowed_material_upload(normalized_filename, file.content_type or "", "tender_qa"):
-        raise HTTPException(
-            status_code=422,
-            detail="招标文件和答疑支持：" + _material_type_ext_hint("tender_qa"),
-        )
-    content = file.file.read()
-    if not content:
-        raise HTTPException(status_code=422, detail="招标文件为空，请重新选择文件。")
-    try:
-        preview_text = _read_uploaded_file_preview_for_project_name(content, normalized_filename)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    inferred_name = _infer_project_name_from_tender_text(preview_text, normalized_filename)
+    normalized_filename, content, inferred_name = _read_tender_upload_and_infer_project_name(file)
 
     projects = load_projects()
     changed = False
@@ -22847,7 +22872,7 @@ def index(
                 <input id="uploadMaterialFile" class="visually-hidden-file" type="file" name="file" accept=".txt,.md,.pdf,.doc,.docx,.docm,.json" multiple />
                 <label for="uploadMaterialFile" class="file-picker-btn" data-file-input-id="uploadMaterialFile">选择文件</label>
                 <span id="uploadMaterialFileName" class="file-picker-name">未选择任何文件</span>
-                <button type="submit" id="btnUploadMaterials" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadMaterials'); } return true;">上传资料</button>
+                <button type="submit" id="btnUploadMaterials">上传资料</button>
                 <span class="note">支持：TXT/MD/PDF/DOC/DOCX/DOCM/JSON，支持一次选择多个文件。</span>
               </form>
               <p id="materialsActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
@@ -22862,7 +22887,7 @@ def index(
                 <input id="uploadMaterialBoqFile" class="visually-hidden-file" type="file" name="file" accept=".xlsx,.xls,.xlsm,.csv,.pdf,.doc,.docx,.txt,.json" multiple />
                 <label for="uploadMaterialBoqFile" class="file-picker-btn" data-file-input-id="uploadMaterialBoqFile">选择文件</label>
                 <span id="uploadMaterialBoqFileName" class="file-picker-name">未选择任何文件</span>
-                <button type="submit" id="btnUploadBoq" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadBoq'); } return true;">上传清单</button>
+                <button type="submit" id="btnUploadBoq">上传清单</button>
                 <span class="note">支持：XLSX/XLS/XLSM/CSV/PDF/DOC/DOCX/TXT/JSON，支持一次选择多个文件。</span>
               </form>
               <p id="materialsActionStatusBoq" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
@@ -22877,7 +22902,7 @@ def index(
                 <input id="uploadMaterialDrawingFile" class="visually-hidden-file" type="file" name="file" accept=".pdf,.doc,.docx,.xlsx,.xls,.dxf,.dwg,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff,.json,.txt" multiple />
                 <label for="uploadMaterialDrawingFile" class="file-picker-btn" data-file-input-id="uploadMaterialDrawingFile">选择文件</label>
                 <span id="uploadMaterialDrawingFileName" class="file-picker-name">未选择任何文件</span>
-                <button type="submit" id="btnUploadDrawing" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadDrawing'); } return true;">上传图纸</button>
+                <button type="submit" id="btnUploadDrawing">上传图纸</button>
                 <span class="note">支持：PDF/DOC/DOCX/XLSX/XLS/DXF/DWG/图片/JSON/TXT，支持一次选择多个文件。</span>
               </form>
               <p id="materialsActionStatusDrawing" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
@@ -22892,7 +22917,7 @@ def index(
                 <input id="uploadMaterialPhotoFile" class="visually-hidden-file" type="file" name="file" accept=".png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff" multiple />
                 <label for="uploadMaterialPhotoFile" class="file-picker-btn" data-file-input-id="uploadMaterialPhotoFile">选择文件</label>
                 <span id="uploadMaterialPhotoFileName" class="file-picker-name">未选择任何文件</span>
-                <button type="submit" id="btnUploadSitePhotos" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadSitePhotos'); } return true;">上传照片</button>
+                <button type="submit" id="btnUploadSitePhotos">上传照片</button>
                 <span class="note">支持：PNG/JPG/JPEG/WEBP/BMP/TIF/TIFF，支持一次选择多个文件。</span>
               </form>
               <p id="materialsActionStatusPhoto" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
@@ -22935,8 +22960,8 @@ def index(
             <input id="uploadShigongFile" class="visually-hidden-file" type="file" name="file" accept=".txt,.docx,.pdf,.json,.xlsx,.xls,.dxf" multiple />
             <label for="uploadShigongFile" class="file-picker-btn" data-file-input-id="uploadShigongFile">选择文件</label>
             <span id="uploadShigongFileName" class="file-picker-name">未选择任何文件</span>
-            <button type="submit" id="btnUploadShigong" name="submit_action" value="upload" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadShigong'); } return true;">上传施组</button>
-            <button type="submit" id="btnScoreShigong" class="secondary" formaction="/web/score_shigong" name="submit_action" value="score" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnScoreShigong'); } return true;">评分施组</button>
+            <button type="submit" id="btnUploadShigong" name="submit_action" value="upload">上传施组</button>
+            <button type="submit" id="btnScoreShigong" class="secondary" formaction="/web/score_shigong" name="submit_action" value="score">评分施组</button>
             <span style="margin-left:8px;color:#334155;font-size:13px">满分标准：</span>
             <select id="scoreScaleSelect" class="compact-select" name="score_scale_max" style="margin-left:4px">
               <option value="100">100分制</option>
@@ -25719,6 +25744,55 @@ def index(
           console.error('createProject form not found');
         }
         const formCreateFromTender = document.getElementById('createProjectFromTender');
+        let inferTenderNameSeq = 0;
+        async function inferProjectNameFromTenderSelection(fileInput, { silent=false } = {}) {
+          const input = fileInput || document.getElementById('createProjectFromTenderFile');
+          const files = input && input.files ? Array.from(input.files) : [];
+          const nameInput = document.getElementById('createProjectNameInput');
+          if (!files.length) {
+            if (nameInput && !silent) nameInput.value = '';
+            return null;
+          }
+          const mySeq = ++inferTenderNameSeq;
+          if (!silent) setCreateMsg('正在识别项目名称…', false);
+          let res;
+          let text = '';
+          try {
+            const fd = new FormData();
+            fd.append('file', files[0]);
+            res = await fetch('/api/v1/projects/infer_name_from_tender', {
+              method: 'POST',
+              headers: apiHeaders(false),
+              body: fd,
+            });
+            text = await res.text();
+          } catch (err) {
+            if (mySeq !== inferTenderNameSeq) return null;
+            if (!silent) {
+              setCreateMsg('项目名称识别失败：' + String((err && err.message) || err || '网络异常'), true);
+            }
+            return null;
+          }
+          if (mySeq !== inferTenderNameSeq) return null;
+          let data = {};
+          try {
+            data = JSON.parse(text || '{}');
+          } catch (_) {}
+          if (!res.ok) {
+            const detail = (data && data.detail) ? String(data.detail) : String(text || '').slice(0, 120);
+            if (!silent) setCreateMsg('项目名称识别失败：' + detail, true);
+            return null;
+          }
+          const inferredName = String((data && data.inferred_name) || '').trim();
+          if (nameInput) {
+            nameInput.value = inferredName;
+            nameInput.title = inferredName;
+          }
+          if (!silent) {
+            setCreateMsg('已识别项目名称：' + inferredName + '。可直接点“创建”或“自动创建”。', false);
+          }
+          return data;
+        }
         if (formCreateFromTender) {
           formCreateFromTender.onsubmit = async (e) => {
             e.preventDefault();
@@ -25753,6 +25827,11 @@ def index(
               const projectId = String((project && project.id) || '').trim();
               const projectName = String((project && project.name) || '').trim();
               if (projectId) storageSet('selected_project_id', projectId);
+              const nameInput = document.getElementById('createProjectNameInput');
+              if (nameInput) {
+                nameInput.value = projectName;
+                nameInput.title = projectName;
+              }
               if (fileInput) fileInput.value = '';
               updateFilePickerText('createProjectFromTenderFile', 'createProjectFromTenderFileName');
               const searchInput = document.getElementById('projectSearchInput');
@@ -25826,21 +25905,18 @@ def index(
           ].forEach(([inputId, textId]) => updateFilePickerText(inputId, textId));
         }
 
-        document.querySelectorAll('[data-file-input-id]').forEach((button) => {
-          button.addEventListener('click', () => {
-            const targetId = String(button.getAttribute('data-file-input-id') || '').trim();
-            if (!targetId) return;
-            const input = document.getElementById(targetId);
-            if (input) input.click();
-          });
-        });
-
         bindFilePicker('uploadMaterialFile', 'uploadMaterialFileName');
         bindFilePicker('uploadMaterialBoqFile', 'uploadMaterialBoqFileName');
         bindFilePicker('uploadMaterialDrawingFile', 'uploadMaterialDrawingFileName');
         bindFilePicker('uploadMaterialPhotoFile', 'uploadMaterialPhotoFileName');
         bindFilePicker('uploadShigongFile', 'uploadShigongFileName');
         bindFilePicker('createProjectFromTenderFile', 'createProjectFromTenderFileName');
+        const createProjectFromTenderFileInput = document.getElementById('createProjectFromTenderFile');
+        if (createProjectFromTenderFileInput) {
+          createProjectFromTenderFileInput.addEventListener('change', async () => {
+            await inferProjectNameFromTenderSelection(createProjectFromTenderFileInput);
+          });
+        }
 
         const MATERIAL_UPLOAD_CONFIGS = {
           tender_qa: { formId: 'uploadMaterial', statusId: 'materialsActionStatus', typeLabel: '招标文件和答疑' },
@@ -26282,9 +26358,8 @@ def index(
           const tbl = document.getElementById('submissionsTable');
           const tbody = tbl ? tbl.querySelector('tbody') : null;
           const emptyEl = document.getElementById('submissionsEmpty');
-          if (tbody) tbody.innerHTML = '';
-          clearSubmissionDualTrackOverview();
           if (!id) {
+            if (tbody) tbody.innerHTML = '';
             if (emptyEl) {
               emptyEl.textContent = '暂无施组，请先选择项目。';
               emptyEl.style.display = 'block';
@@ -26320,6 +26395,7 @@ def index(
             return;
           }
           if (!Array.isArray(subs) || subs.length === 0) {
+            if (tbody) tbody.innerHTML = '';
             if (emptyEl) {
               emptyEl.textContent = '暂无施组，请下方添加。';
               emptyEl.style.display = 'block';
@@ -26330,6 +26406,8 @@ def index(
             return;
           }
           if (emptyEl) emptyEl.style.display = 'none';
+          if (tbody) tbody.innerHTML = '';
+          clearSubmissionDualTrackOverview();
           subs.forEach(s => {
             const tr = document.createElement('tr');
             tr.innerHTML = buildSubmissionTableRowHtml(s, id, escapeHtmlText);
@@ -26440,9 +26518,9 @@ def index(
           const tbl = document.getElementById('materialsTable');
           const tbody = tbl ? tbl.querySelector('tbody') : null;
           const emptyEl = document.getElementById('materialsEmpty');
-          if (tbody) tbody.innerHTML = '';
           if (!id) {
             clearMaterialParsePolling();
+            if (tbody) tbody.innerHTML = '';
             if (emptyEl) {
               emptyEl.textContent = '暂无资料，请先选择项目。';
               emptyEl.style.display = 'block';
@@ -26478,6 +26556,7 @@ def index(
             return;
           }
           if (!Array.isArray(mats) || mats.length === 0) {
+            if (tbody) tbody.innerHTML = '';
             if (emptyEl) {
               emptyEl.textContent = '暂无资料，请下方添加。';
               emptyEl.style.display = 'block';
@@ -26489,6 +26568,7 @@ def index(
           }
           if (emptyEl) emptyEl.style.display = 'none';
           if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState(mats, summary);
+          if (tbody) tbody.innerHTML = '';
           mats.forEach(m => {
             const tr = document.createElement('tr');
             tr.innerHTML = buildMaterialTableRowHtml(m, id);

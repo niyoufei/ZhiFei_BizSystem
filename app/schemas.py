@@ -286,6 +286,13 @@ class ProjectCreateFromTenderResponse(BaseModel):
     reused_existing: bool = Field(..., description="是否复用了已存在项目")
 
 
+class ProjectInferTenderNameResponse(BaseModel):
+    """上传招标文件后仅识别项目名称响应"""
+
+    inferred_name: str = Field(..., description="从招标文件识别出的项目名称")
+    filename: str = Field(..., description="归一化后的招标文件名")
+
+
 class MaterialParseJobRecord(BaseModel):
     id: str
     material_id: str

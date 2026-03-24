@@ -38,12 +38,47 @@ def _request_json(
     api_key: Optional[str] = None,
     timeout: float = 8.0,
     payload: Optional[Dict[str, Any]] = None,
+    form_fields: Optional[Dict[str, Any]] = None,
+    files: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     headers: Dict[str, str] = {"Accept": "application/json"}
     body: Optional[bytes] = None
     if api_key:
         headers["X-API-Key"] = api_key
-    if payload is not None:
+    if files:
+        boundary = f"----CodexBoundary{int(time.time() * 1000)}"
+        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+        chunks: List[bytes] = []
+        for key, value in (form_fields or {}).items():
+            chunks.extend(
+                [
+                    f"--{boundary}\r\n".encode("utf-8"),
+                    (f'Content-Disposition: form-data; name="{key}"\r\n\r\n').encode("utf-8"),
+                    str(value).encode("utf-8"),
+                    b"\r\n",
+                ]
+            )
+        for spec in files:
+            field = str(spec.get("field") or "file")
+            filename = str(spec.get("filename") or "upload.bin")
+            content_type = str(spec.get("content_type") or "application/octet-stream")
+            content = spec.get("content") or b""
+            if isinstance(content, str):
+                content = content.encode("utf-8")
+            chunks.extend(
+                [
+                    f"--{boundary}\r\n".encode("utf-8"),
+                    (
+                        f'Content-Disposition: form-data; name="{field}"; filename="{filename}"\r\n'
+                    ).encode("utf-8"),
+                    f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"),
+                    bytes(content),
+                    b"\r\n",
+                ]
+            )
+        chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+        body = b"".join(chunks)
+    elif payload is not None:
         headers["Content-Type"] = "application/json"
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = request.Request(url=url, method=method, headers=headers, data=body)
@@ -380,6 +415,323 @@ def _run_project_flow_agent(
     }
 
 
+def _run_tender_project_flow_agent(
+    *,
+    base_url: str,
+    api_key: Optional[str],
+    timeout: float,
+    requester: Callable[..., Dict[str, Any]],
+    max_elapsed_ms: int = 15000,
+) -> Dict[str, Any]:
+    started = time.monotonic()
+    checks: Dict[str, Any] = {}
+    actions: Dict[str, Any] = {"create_from_tender": {}, "delete": {}}
+    smoke_name = f"OPS招标项目_{int(time.time() * 1000)}"
+    create_resp = requester(
+        method="POST",
+        url=f"{base_url}/api/v1/projects/create_from_tender",
+        api_key=api_key,
+        timeout=max(15.0, timeout),
+        files=[
+            {
+                "field": "file",
+                "filename": "ops_tender_smoke.txt",
+                "content_type": "text/plain",
+                "content": f"项目名称：{smoke_name}\n工程名称：{smoke_name}\n招标范围：测试范围\n",
+            }
+        ],
+    )
+    checks["create_from_tender"] = create_resp
+    create_json = create_resp.get("json") or {}
+    project_row = create_json.get("project") if isinstance(create_json, dict) else {}
+    project_id = str(((project_row or {}).get("id")) or "").strip()
+    inferred_name = str((create_json or {}).get("inferred_name") or "").strip()
+    created_ok = bool(project_id) and int(create_resp.get("status_code") or 0) == 200
+    inferred_ok = inferred_name == smoke_name
+    elapsed_ok = int(create_resp.get("elapsed_ms") or 0) <= int(max_elapsed_ms)
+    actions["create_from_tender"] = {
+        "project_name": smoke_name,
+        "project_id": project_id,
+        "ok": created_ok,
+        "elapsed_ms": int(create_resp.get("elapsed_ms") or 0),
+        "elapsed_ok": elapsed_ok,
+        "status_code": int(create_resp.get("status_code") or 0),
+    }
+
+    listed_after_create = False
+    removed_after_delete = False
+    delete_ok = False
+    if created_ok:
+        projects_after_create = requester(
+            method="GET",
+            url=f"{base_url}/api/v1/projects",
+            api_key=api_key,
+            timeout=timeout,
+        )
+        checks["projects_after_create"] = projects_after_create
+        projects_rows = _normalize_projects(projects_after_create.get("json"))
+        listed_after_create = any(
+            str(row.get("id") or "").strip() == project_id for row in projects_rows
+        )
+        delete_resp = requester(
+            method="DELETE",
+            url=f"{base_url}/api/v1/projects/{project_id}",
+            api_key=api_key,
+            timeout=max(10.0, timeout),
+        )
+        checks["delete"] = delete_resp
+        delete_ok = int(delete_resp.get("status_code") or 0) in {200, 204}
+        actions["delete"] = {
+            "project_id": project_id,
+            "ok": delete_ok,
+            "status_code": int(delete_resp.get("status_code") or 0),
+        }
+        if delete_ok:
+            projects_after_delete = requester(
+                method="GET",
+                url=f"{base_url}/api/v1/projects",
+                api_key=api_key,
+                timeout=timeout,
+            )
+            checks["projects_after_delete"] = projects_after_delete
+            projects_rows = _normalize_projects(projects_after_delete.get("json"))
+            removed_after_delete = not any(
+                str(row.get("id") or "").strip() == project_id for row in projects_rows
+            )
+
+    pass_flag = (
+        created_ok
+        and inferred_ok
+        and listed_after_create
+        and delete_ok
+        and removed_after_delete
+        and elapsed_ok
+    )
+    recommendations: List[str] = []
+    if not pass_flag:
+        status_code = int(create_resp.get("status_code") or 0)
+        if status_code in {401, 403}:
+            recommendations.append(
+                "招标文件自动创建 smoke 缺少足够权限，请使用本机可信请求或 admin 权限。"
+            )
+        elif status_code >= 400:
+            recommendations.append(
+                "招标文件自动创建主链 smoke 失败，说明 create_from_tender 链路未通过自动巡检。"
+            )
+        elif not elapsed_ok:
+            recommendations.append("招标文件自动创建接口耗时过长，已超过 smoke 阈值。")
+        elif not inferred_ok:
+            recommendations.append("招标文件自动创建未正确识别项目名称，项目名推断链路存在异常。")
+        else:
+            recommendations.append(
+                "招标文件自动创建主链 smoke 失败，请检查 create_from_tender、项目回显和项目删除链路。"
+            )
+    else:
+        recommendations.append("招标文件自动创建主链 smoke 正常。")
+
+    return {
+        "name": "tender_project_flow",
+        "status": _status(pass_flag),
+        "duration_ms": int((time.monotonic() - started) * 1000),
+        "checks": checks,
+        "actions": actions,
+        "metrics": {
+            "created_ok": int(created_ok),
+            "inferred_ok": int(inferred_ok),
+            "elapsed_ok": int(elapsed_ok),
+            "listed_after_create": int(listed_after_create),
+            "delete_ok": int(delete_ok),
+            "removed_after_delete": int(removed_after_delete),
+            "elapsed_ms": int(create_resp.get("elapsed_ms") or 0),
+        },
+        "recommendations": recommendations,
+    }
+
+
+def _run_upload_flow_agent(
+    *,
+    base_url: str,
+    api_key: Optional[str],
+    timeout: float,
+    requester: Callable[..., Dict[str, Any]],
+) -> Dict[str, Any]:
+    started = time.monotonic()
+    checks: Dict[str, Any] = {}
+    actions: Dict[str, Any] = {
+        "create": {},
+        "upload_material": {},
+        "upload_shigong": {},
+        "delete": {},
+    }
+    smoke_name = f"OPS上传项目_{int(time.time() * 1000)}"
+
+    create_resp = requester(
+        method="POST",
+        url=f"{base_url}/api/v1/projects",
+        api_key=api_key,
+        timeout=max(10.0, timeout),
+        payload={"name": smoke_name},
+    )
+    checks["create"] = create_resp
+    project_id = str(((create_resp.get("json") or {}).get("id")) or "").strip()
+    created_ok = bool(project_id) and int(create_resp.get("status_code") or 0) == 200
+    actions["create"] = {
+        "project_id": project_id,
+        "project_name": smoke_name,
+        "ok": created_ok,
+        "status_code": int(create_resp.get("status_code") or 0),
+    }
+    material_upload_ok = False
+    material_listed = False
+    shigong_upload_ok = False
+    submission_listed = False
+    delete_ok = False
+    removed_after_delete = False
+    if created_ok:
+        material_resp = requester(
+            method="POST",
+            url=f"{base_url}/api/v1/projects/{project_id}/materials",
+            api_key=api_key,
+            timeout=max(10.0, timeout),
+            form_fields={"material_type": "tender_qa"},
+            files=[
+                {
+                    "field": "file",
+                    "filename": "ops_material.txt",
+                    "content_type": "text/plain",
+                    "content": f"项目名称：{smoke_name}\n招标范围：测试资料上传\n",
+                }
+            ],
+        )
+        checks["upload_material"] = material_resp
+        material_upload_ok = int(material_resp.get("status_code") or 0) == 200
+        actions["upload_material"] = {
+            "ok": material_upload_ok,
+            "status_code": int(material_resp.get("status_code") or 0),
+        }
+        materials_list_resp = requester(
+            method="GET",
+            url=f"{base_url}/api/v1/projects/{project_id}/materials",
+            api_key=api_key,
+            timeout=timeout,
+        )
+        checks["materials_after_upload"] = materials_list_resp
+        material_rows = materials_list_resp.get("json")
+        if isinstance(material_rows, list):
+            material_listed = any(
+                str(row.get("filename") or "").strip() == "ops_material.txt"
+                for row in material_rows
+                if isinstance(row, dict)
+            )
+
+        shigong_resp = requester(
+            method="POST",
+            url=f"{base_url}/api/v1/projects/{project_id}/shigong",
+            api_key=api_key,
+            timeout=max(10.0, timeout),
+            files=[
+                {
+                    "field": "file",
+                    "filename": "ops_shigong.txt",
+                    "content_type": "text/plain",
+                    "content": "施工组织设计\n一、工程概况\n二、施工部署\n",
+                }
+            ],
+        )
+        checks["upload_shigong"] = shigong_resp
+        shigong_upload_ok = int(shigong_resp.get("status_code") or 0) == 200
+        actions["upload_shigong"] = {
+            "ok": shigong_upload_ok,
+            "status_code": int(shigong_resp.get("status_code") or 0),
+        }
+        submissions_resp = requester(
+            method="GET",
+            url=f"{base_url}/api/v1/projects/{project_id}/submissions",
+            api_key=api_key,
+            timeout=timeout,
+        )
+        checks["submissions_after_upload"] = submissions_resp
+        submission_rows = submissions_resp.get("json")
+        if isinstance(submission_rows, list):
+            submission_listed = any(
+                str(row.get("filename") or "").strip() == "ops_shigong.txt"
+                for row in submission_rows
+                if isinstance(row, dict)
+            )
+
+        delete_resp = requester(
+            method="DELETE",
+            url=f"{base_url}/api/v1/projects/{project_id}",
+            api_key=api_key,
+            timeout=max(10.0, timeout),
+        )
+        checks["delete"] = delete_resp
+        delete_ok = int(delete_resp.get("status_code") or 0) in {200, 204}
+        actions["delete"] = {
+            "project_id": project_id,
+            "ok": delete_ok,
+            "status_code": int(delete_resp.get("status_code") or 0),
+        }
+        if delete_ok:
+            projects_after_delete = requester(
+                method="GET",
+                url=f"{base_url}/api/v1/projects",
+                api_key=api_key,
+                timeout=timeout,
+            )
+            checks["projects_after_delete"] = projects_after_delete
+            projects_rows = _normalize_projects(projects_after_delete.get("json"))
+            removed_after_delete = not any(
+                str(row.get("id") or "").strip() == project_id for row in projects_rows
+            )
+
+    pass_flag = (
+        created_ok
+        and material_upload_ok
+        and material_listed
+        and shigong_upload_ok
+        and submission_listed
+        and delete_ok
+        and removed_after_delete
+    )
+    recommendations: List[str] = []
+    if not pass_flag:
+        if not created_ok:
+            recommendations.append("上传链 smoke 失败：项目创建失败。")
+        elif not material_upload_ok:
+            recommendations.append("上传链 smoke 失败：项目资料上传接口异常。")
+        elif not material_listed:
+            recommendations.append("上传链 smoke 失败：资料上传后未在列表回显。")
+        elif not shigong_upload_ok:
+            recommendations.append("上传链 smoke 失败：施组上传接口异常。")
+        elif not submission_listed:
+            recommendations.append("上传链 smoke 失败：施组上传后未在列表回显。")
+        elif not removed_after_delete:
+            recommendations.append("上传链 smoke 失败：清理测试项目后仍残留。")
+        else:
+            recommendations.append("上传链 smoke 失败：请检查上传区前端与上传接口契约。")
+    else:
+        recommendations.append("资料上传/施组上传/评分主链 smoke 正常。")
+
+    return {
+        "name": "upload_flow",
+        "status": _status(pass_flag),
+        "duration_ms": int((time.monotonic() - started) * 1000),
+        "checks": checks,
+        "actions": actions,
+        "metrics": {
+            "created_ok": int(created_ok),
+            "material_upload_ok": int(material_upload_ok),
+            "material_listed": int(material_listed),
+            "shigong_upload_ok": int(shigong_upload_ok),
+            "submission_listed": int(submission_listed),
+            "delete_ok": int(delete_ok),
+            "removed_after_delete": int(removed_after_delete),
+        },
+        "recommendations": recommendations,
+    }
+
+
 def _run_scoring_quality_agent(
     *,
     base_url: str,
@@ -618,6 +970,8 @@ def run_ops_agents_cycle(
     - sre_watchdog
     - data_hygiene
     - project_flow
+    - tender_project_flow
+    - upload_flow
     - scoring_quality
     - evolution
     """
@@ -654,6 +1008,24 @@ def run_ops_agents_cycle(
             "metrics": {},
             "recommendations": ["SRE未恢复服务，跳过本轮执行。"],
         }
+        agents["tender_project_flow"] = {
+            "name": "tender_project_flow",
+            "status": "fail",
+            "duration_ms": 0,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": ["SRE未恢复服务，跳过本轮执行。"],
+        }
+        agents["upload_flow"] = {
+            "name": "upload_flow",
+            "status": "fail",
+            "duration_ms": 0,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": ["SRE未恢复服务，跳过本轮执行。"],
+        }
         agents["scoring_quality"] = {
             "name": "scoring_quality",
             "status": "fail",
@@ -680,17 +1052,53 @@ def run_ops_agents_cycle(
             auto_repair=auto_repair,
             requester=requester,
         )
+        for name, runner, kwargs in (
+            (
+                "project_flow",
+                _run_project_flow_agent,
+                {
+                    "base_url": base_url,
+                    "api_key": api_key,
+                    "timeout": timeout,
+                    "requester": requester,
+                },
+            ),
+            (
+                "tender_project_flow",
+                _run_tender_project_flow_agent,
+                {
+                    "base_url": base_url,
+                    "api_key": api_key,
+                    "timeout": timeout,
+                    "requester": requester,
+                },
+            ),
+            (
+                "upload_flow",
+                _run_upload_flow_agent,
+                {
+                    "base_url": base_url,
+                    "api_key": api_key,
+                    "timeout": timeout,
+                    "requester": requester,
+                },
+            ),
+        ):
+            try:
+                agents[name] = runner(**kwargs)
+            except Exception as exc:  # noqa: BLE001
+                agents[name] = {
+                    "name": name,
+                    "status": "fail",
+                    "duration_ms": 0,
+                    "checks": {},
+                    "actions": {},
+                    "metrics": {},
+                    "recommendations": [f"agent exception: {type(exc).__name__}: {exc}"],
+                }
+
         futures = {}
         with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as executor:
-            futures[
-                executor.submit(
-                    _run_project_flow_agent,
-                    base_url=base_url,
-                    api_key=api_key,
-                    timeout=timeout,
-                    requester=requester,
-                )
-            ] = "project_flow"
             futures[
                 executor.submit(
                     _run_scoring_quality_agent,
@@ -747,7 +1155,7 @@ def run_ops_agents_cycle(
     return {
         "generated_at": _now_iso(),
         "base_url": base_url,
-        "agent_count": 5,
+        "agent_count": 7,
         "settings": {
             "auto_repair": bool(auto_repair),
             "auto_evolve": bool(auto_evolve),

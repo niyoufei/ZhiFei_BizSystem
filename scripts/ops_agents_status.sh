@@ -48,7 +48,15 @@ print(f"generated_at={data.get('generated_at')}")
 print(f"overall_status={overall.get('status')}")
 print(f"effective_overall_status={'stopped' if snapshot_stale else overall.get('status')}")
 print(f"overall_duration_ms={overall.get('duration_ms')}")
-for key in ("sre_watchdog", "data_hygiene", "project_flow", "scoring_quality", "evolution"):
+for key in (
+    "sre_watchdog",
+    "data_hygiene",
+    "project_flow",
+    "tender_project_flow",
+    "upload_flow",
+    "scoring_quality",
+    "evolution",
+):
     row = (data.get("agents") or {}).get(key) or {}
     print(f"{key}={row.get('status', 'unknown')}")
 PY
