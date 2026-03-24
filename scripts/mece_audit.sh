@@ -14,6 +14,7 @@ RETRY_FLOOR_SECONDS="${RETRY_FLOOR_SECONDS:-2}"
 BATCH_SIZE="${BATCH_SIZE:-10}"
 BATCH_SLEEP_SECONDS="${BATCH_SLEEP_SECONDS:-2}"
 HEALTH_WAIT_SECONDS="${HEALTH_WAIT_SECONDS:-20}"
+INCLUDE_SYNTHETIC_PROJECTS="${INCLUDE_SYNTHETIC_PROJECTS:-0}"
 
 if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
   PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
@@ -65,6 +66,21 @@ wait_for_health() {
   return 1
 }
 
+audit_payload_is_valid() {
+  "$PYTHON_BIN" - "$1" <<'PY' >/dev/null
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+if not isinstance(payload, dict):
+    raise SystemExit(1)
+if not str(payload.get("project_id") or "").strip():
+    raise SystemExit(1)
+PY
+}
+
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
@@ -74,7 +90,7 @@ curl_with_auth "$BASE_URL/health" >"$tmp_dir/health.json"
 echo "[mece] load projects..."
 curl_with_auth "$BASE_URL/api/v1/projects" >"$tmp_dir/projects.json"
 
-"$PYTHON_BIN" - "$BASE_URL" "$tmp_dir/projects.json" "$tmp_dir/project_ids.txt" <<'PY'
+"$PYTHON_BIN" - "$BASE_URL" "$tmp_dir/projects.json" "$tmp_dir/project_ids.txt" "$INCLUDE_SYNTHETIC_PROJECTS" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -82,17 +98,32 @@ from pathlib import Path
 base_url = sys.argv[1]
 projects_path = Path(sys.argv[2])
 out_path = Path(sys.argv[3])
+include_synthetic = str(sys.argv[4]).strip() in {"1", "true", "TRUE", "yes", "on"}
 
 projects = json.loads(projects_path.read_text(encoding="utf-8"))
 ids = []
+synthetic_skipped = 0
 if isinstance(projects, list):
     for row in projects:
         if isinstance(row, dict):
             pid = str(row.get("id") or "").strip()
+            name = str(row.get("name") or "").strip().lower()
             if pid:
+                if (
+                    not include_synthetic
+                    and (
+                        name.startswith("ops_")
+                        or name.startswith("ops招标项目_")
+                        or name.startswith("e2e_")
+                    )
+                ):
+                    synthetic_skipped += 1
+                    continue
                 ids.append(pid)
 out_path.write_text("\n".join(ids), encoding="utf-8")
 print(f"[mece] discovered projects: {len(ids)} @ {base_url}")
+if synthetic_skipped:
+    print(f"[mece] skipped synthetic projects: {synthetic_skipped}")
 PY
 
 project_count=0
@@ -122,8 +153,16 @@ fetch_project_audit() {
     fi
 
     if [[ "$http_code" == "200" ]]; then
-      mv "$body_file" "$out_file"
-      return 0
+      if audit_payload_is_valid "$body_file"; then
+        mv "$body_file" "$out_file"
+        return 0
+      fi
+      if [[ "$attempt" -lt "$MAX_RETRIES" ]]; then
+        echo "[mece] WARN: project_id=$pid returned invalid JSON body, retrying (attempt ${attempt}/${MAX_RETRIES})"
+        sleep 1
+        attempt=$((attempt + 1))
+        continue
+      fi
     fi
 
     if [[ ( -z "$http_code" || "$http_code" == "000" ) && "$attempt" -lt "$MAX_RETRIES" ]]; then
@@ -155,7 +194,7 @@ fetch_project_audit() {
   done
 }
 
-while IFS= read -r pid; do
+while IFS= read -r pid || [[ -n "$pid" ]]; do
   [[ -z "$pid" ]] && continue
   project_count=$((project_count + 1))
   out_file="$tmp_dir/mece_${pid}.json"
