@@ -2303,6 +2303,177 @@ class TestMaterialsEndpoint:
         assert saved_rows[0]["parse_error_message"] is None
         assert mock_save_jobs.called is True
 
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.save_materials")
+    @patch("app.main.load_material_parse_jobs")
+    @patch("app.main.load_materials")
+    def test_bootstrap_material_parse_state_compacts_duplicate_active_jobs(
+        self,
+        mock_load_materials,
+        mock_load_jobs,
+        mock_save_materials,
+        mock_save_jobs,
+    ):
+        from app.main import _bootstrap_material_parse_state
+
+        mock_load_materials.return_value = [
+            {
+                "id": "m1",
+                "project_id": "p1",
+                "material_type": "drawing",
+                "filename": "总图.dxf",
+                "path": "/tmp/总图.dxf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "processing",
+                "parse_backend": "local",
+                "job_id": "j-queued",
+            }
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-processing",
+                "material_id": "m1",
+                "project_id": "p1",
+                "material_type": "drawing",
+                "filename": "总图.dxf",
+                "status": "processing",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:10:00+00:00",
+            },
+            {
+                "id": "j-queued",
+                "material_id": "m1",
+                "project_id": "p1",
+                "material_type": "drawing",
+                "filename": "总图.dxf",
+                "status": "queued",
+                "created_at": "2026-03-09T00:11:00+00:00",
+                "updated_at": "2026-03-09T00:11:00+00:00",
+            },
+        ]
+
+        summary = _bootstrap_material_parse_state()
+
+        assert summary["deduplicated_jobs"] == 1
+        assert summary["recovered_jobs"] == 1
+        saved_jobs = mock_save_jobs.call_args[0][0]
+        assert len(saved_jobs) == 1
+        assert saved_jobs[0]["id"] == "j-processing"
+        assert saved_jobs[0]["status"] == "queued"
+        saved_rows = mock_save_materials.call_args[0][0]
+        assert saved_rows[0]["job_id"] == "j-processing"
+        assert saved_rows[0]["parse_status"] == "queued"
+
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.save_materials")
+    @patch("app.main.load_material_parse_jobs")
+    @patch("app.main.load_materials")
+    def test_bootstrap_material_parse_state_syncs_stale_processing_job_to_parsed(
+        self,
+        mock_load_materials,
+        mock_load_jobs,
+        mock_save_materials,
+        mock_save_jobs,
+    ):
+        from app.main import _bootstrap_material_parse_state
+
+        mock_load_materials.return_value = [
+            {
+                "id": "m1",
+                "project_id": "p1",
+                "material_type": "drawing",
+                "filename": "总图.dxf",
+                "path": "/tmp/总图.dxf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:05:00+00:00",
+                "parse_status": "parsed",
+                "parse_backend": "local",
+                "parse_confidence": 0.91,
+                "parse_finished_at": "2026-03-09T00:05:00+00:00",
+                "job_id": "j-processing",
+            }
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-processing",
+                "material_id": "m1",
+                "project_id": "p1",
+                "material_type": "drawing",
+                "filename": "总图.dxf",
+                "status": "processing",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:01:00+00:00",
+            }
+        ]
+
+        summary = _bootstrap_material_parse_state()
+
+        assert summary["terminal_synced_jobs"] == 1
+        saved_jobs = mock_save_jobs.call_args[0][0]
+        assert saved_jobs[0]["status"] == "parsed"
+        assert saved_jobs[0]["finished_at"] == "2026-03-09T00:05:00+00:00"
+        assert saved_jobs[0]["parse_backend"] == "local"
+        assert saved_jobs[0]["parse_confidence"] == 0.91
+        saved_rows = mock_save_materials.call_args[0][0]
+        assert saved_rows[0]["parse_status"] == "parsed"
+        assert saved_rows[0]["job_id"] == "j-processing"
+
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.save_materials")
+    @patch("app.main.load_material_parse_jobs")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_reparse_project_materials_reuses_active_job_without_appending_duplicates(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        mock_load_jobs,
+        mock_save_materials,
+        mock_save_jobs,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1"}]
+        mock_load_materials.return_value = [
+            {
+                "id": "m1",
+                "project_id": "p1",
+                "material_type": "drawing",
+                "filename": "总图.dxf",
+                "path": "/tmp/总图.dxf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "processing",
+                "parse_backend": "local",
+                "job_id": "j-active",
+            }
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-active",
+                "material_id": "m1",
+                "project_id": "p1",
+                "material_type": "drawing",
+                "filename": "总图.dxf",
+                "status": "processing",
+                "attempt": 1,
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:01:00+00:00",
+            }
+        ]
+
+        response = client.post("/api/v1/projects/p1/materials/reparse")
+        assert response.status_code == 200
+        saved_jobs = mock_save_jobs.call_args[0][0]
+        assert len(saved_jobs) == 1
+        assert saved_jobs[0]["id"] == "j-active"
+        assert saved_jobs[0]["status"] == "queued"
+        saved_rows = mock_save_materials.call_args[0][0]
+        assert saved_rows[0]["job_id"] == "j-active"
+        assert saved_rows[0]["parse_status"] == "queued"
+
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
     def test_get_scoring_readiness_project_not_found(self, mock_ensure, mock_load_projects, client):
@@ -3199,7 +3370,7 @@ class TestMaterialsEndpoint:
             encoding="utf-8",
         )
         site_photo_path.write_text(
-            "[图像资料] 文件: 现场.jpg\n" "[OCR文本提取]\n" "临边防护 扬尘治理 围挡 样板 实测 48",
+            "[图像资料] 文件: 现场.jpg\n[OCR文本提取]\n临边防护 扬尘治理 围挡 样板 实测 48",
             encoding="utf-8",
         )
         mock_load_materials.return_value = [
@@ -5078,9 +5249,11 @@ class TestScoreForProjectEndpoint:
         mock_load_sub.return_value = []
         mock_score.return_value = MagicMock(model_dump=lambda: {"total_score": 78.0})
 
-        with patch("app.main.get_cached_score", return_value=None), patch(
-            "app.main.cache_score_result"
-        ), patch("app.main.load_evolution_reports", return_value={}):
+        with (
+            patch("app.main.get_cached_score", return_value=None),
+            patch("app.main.cache_score_result"),
+            patch("app.main.load_evolution_reports", return_value={}),
+        ):
             response = client.post("/api/v1/projects/p1/score", json={"text": "测试文本"})
         assert response.status_code == 200
         # Check multipliers were passed
@@ -6654,8 +6827,8 @@ class TestAdaptiveApplyEndpoint:
 
         # Configure Path mock chain
         mock_path_instance = MagicMock()
-        mock_path_instance.resolve.return_value.parent.__truediv__ = (
-            lambda self, x: mock_lexicon_path
+        mock_path_instance.resolve.return_value.parent.__truediv__ = lambda self, x: (
+            mock_lexicon_path
         )
         mock_path.return_value = mock_path_instance
 
@@ -8134,9 +8307,11 @@ class TestFeedbackGovernanceRoutes:
             )
         )
 
-        with patch("app.main.load_submissions", return_value=[]), patch(
-            "app.main.load_score_reports", return_value=[]
-        ), patch("app.main.load_qingtian_results", return_value=[]):
+        with (
+            patch("app.main.load_submissions", return_value=[]),
+            patch("app.main.load_score_reports", return_value=[]),
+            patch("app.main.load_qingtian_results", return_value=[]),
+        ):
             response = client.get("/api/v1/projects/p1/feedback/governance")
 
         assert response.status_code == 200
@@ -8187,126 +8362,141 @@ class TestFeedbackGovernanceRoutes:
             report.setdefault("meta", {})["calibrator_version"] = "calib-9"
             return "calib-9"
 
-        with patch(
-            "app.main.load_ground_truth",
-            return_value=[
-                {
-                    "id": "gt-1",
-                    "project_id": "p1",
-                    "final_score": 84,
-                    "score_scale_max": 100,
-                    "judge_scores": [84, 84, 84, 84, 84],
-                    "created_at": "2026-03-15T01:00:00+00:00",
-                    "source_submission_filename": "投标文件A.docx",
-                }
-            ],
-        ), patch("app.main.load_high_score_features", return_value=[]), patch(
-            "app.main.load_evolution_reports", return_value={}
-        ), patch(
-            "app.main.load_calibration_models",
-            return_value=[
-                {
-                    "calibrator_version": "calib-9",
-                    "model_type": "ridge",
-                    "deployed": True,
-                    "train_filter": {"project_id": "p1"},
-                    "updated_at": "2026-03-15T06:00:00+00:00",
-                }
-            ],
-        ), patch(
-            "app.main.load_expert_profiles",
-            return_value=[
-                {
-                    "id": "ep-1",
-                    "weights_norm": {f"{i:02d}": 1 / 16 for i in range(1, 17)},
-                    "name": "默认画像",
-                }
-            ],
-        ), patch(
-            "app.main.list_json_versions",
-            side_effect=lambda path: (
-                [
+        with (
+            patch(
+                "app.main.load_ground_truth",
+                return_value=[
                     {
-                        "version_id": "20260315T050000000000Z",
-                        "created_at": "2026-03-15T05:00:00+00:00",
+                        "id": "gt-1",
+                        "project_id": "p1",
+                        "final_score": 84,
+                        "score_scale_max": 100,
+                        "judge_scores": [84, 84, 84, 84, 84],
+                        "created_at": "2026-03-15T01:00:00+00:00",
+                        "source_submission_filename": "投标文件A.docx",
                     }
-                ]
-                if getattr(path, "stem", "") == "calibration_models"
-                else []
+                ],
             ),
-        ), patch(
-            "app.main.load_json_version",
-            side_effect=lambda path, version_id, default: (
-                [{"calibrator_version": "calib-8", "model_type": "offset"}]
-                if getattr(path, "stem", "") == "calibration_models"
-                else default
+            patch("app.main.load_high_score_features", return_value=[]),
+            patch("app.main.load_evolution_reports", return_value={}),
+            patch(
+                "app.main.load_calibration_models",
+                return_value=[
+                    {
+                        "calibrator_version": "calib-9",
+                        "model_type": "ridge",
+                        "deployed": True,
+                        "train_filter": {"project_id": "p1"},
+                        "updated_at": "2026-03-15T06:00:00+00:00",
+                    }
+                ],
             ),
-        ), patch(
-            "app.main.load_submissions",
-            return_value=[
-                {
-                    "id": "s1",
-                    "project_id": "p1",
-                    "filename": "投标文件A.docx",
-                    "text": "测试内容",
-                    "total_score": 72.0,
-                }
-            ],
-        ), patch(
-            "app.main.load_score_reports",
-            return_value=[
-                {
-                    "id": "r1",
-                    "project_id": "p1",
-                    "submission_id": "s1",
-                    "created_at": "2026-03-15T02:00:00+00:00",
-                    "rule_total_score": 70.0,
-                    "pred_total_score": 72.0,
+            patch(
+                "app.main.load_expert_profiles",
+                return_value=[
+                    {
+                        "id": "ep-1",
+                        "weights_norm": {f"{i:02d}": 1 / 16 for i in range(1, 17)},
+                        "name": "默认画像",
+                    }
+                ],
+            ),
+            patch(
+                "app.main.list_json_versions",
+                side_effect=lambda path: (
+                    [
+                        {
+                            "version_id": "20260315T050000000000Z",
+                            "created_at": "2026-03-15T05:00:00+00:00",
+                        }
+                    ]
+                    if getattr(path, "stem", "") == "calibration_models"
+                    else []
+                ),
+            ),
+            patch(
+                "app.main.load_json_version",
+                side_effect=lambda path, version_id, default: (
+                    [{"calibrator_version": "calib-8", "model_type": "offset"}]
+                    if getattr(path, "stem", "") == "calibration_models"
+                    else default
+                ),
+            ),
+            patch(
+                "app.main.load_submissions",
+                return_value=[
+                    {
+                        "id": "s1",
+                        "project_id": "p1",
+                        "filename": "投标文件A.docx",
+                        "text": "测试内容",
+                        "total_score": 72.0,
+                    }
+                ],
+            ),
+            patch(
+                "app.main.load_score_reports",
+                return_value=[
+                    {
+                        "id": "r1",
+                        "project_id": "p1",
+                        "submission_id": "s1",
+                        "created_at": "2026-03-15T02:00:00+00:00",
+                        "rule_total_score": 70.0,
+                        "pred_total_score": 72.0,
+                        "rule_dim_scores": {
+                            "09": {"dim_score": 4.0},
+                            "10": {"dim_score": 5.0},
+                        },
+                    }
+                ],
+            ),
+            patch(
+                "app.main.load_qingtian_results",
+                return_value=[
+                    {
+                        "submission_id": "s1",
+                        "qt_total_score": 84.0,
+                        "created_at": "2026-03-15T03:00:00+00:00",
+                        "raw_payload": {
+                            "ground_truth_record_id": "gt-1",
+                            "final_score_100": 84.0,
+                        },
+                    }
+                ],
+            ),
+            patch(
+                "app.main._apply_prediction_to_report_with_model",
+                side_effect=_apply_preview,
+            ),
+            patch(
+                "app.main.load_config",
+                return_value=MagicMock(rubric={}, lexicon={}),
+            ),
+            patch(
+                "app.main.load_learning_profiles",
+                return_value=[],
+            ),
+            patch(
+                "app.main._build_material_knowledge_profile",
+                return_value={},
+            ),
+            patch(
+                "app.main._build_material_quality_snapshot",
+                return_value={},
+            ),
+            patch(
+                "app.main._build_submission_sandbox_report",
+                return_value={
+                    "rule_total_score": 74.0,
+                    "pred_total_score": 79.0,
                     "rule_dim_scores": {
-                        "09": {"dim_score": 4.0},
+                        "09": {"dim_score": 6.5},
                         "10": {"dim_score": 5.0},
                     },
-                }
-            ],
-        ), patch(
-            "app.main.load_qingtian_results",
-            return_value=[
-                {
-                    "submission_id": "s1",
-                    "qt_total_score": 84.0,
-                    "created_at": "2026-03-15T03:00:00+00:00",
-                    "raw_payload": {
-                        "ground_truth_record_id": "gt-1",
-                        "final_score_100": 84.0,
-                    },
-                }
-            ],
-        ), patch(
-            "app.main._apply_prediction_to_report_with_model",
-            side_effect=_apply_preview,
-        ), patch(
-            "app.main.load_config",
-            return_value=MagicMock(rubric={}, lexicon={}),
-        ), patch(
-            "app.main.load_learning_profiles",
-            return_value=[],
-        ), patch(
-            "app.main._build_material_knowledge_profile",
-            return_value={},
-        ), patch(
-            "app.main._build_material_quality_snapshot",
-            return_value={},
-        ), patch(
-            "app.main._build_submission_sandbox_report",
-            return_value={
-                "rule_total_score": 74.0,
-                "pred_total_score": 79.0,
-                "rule_dim_scores": {
-                    "09": {"dim_score": 6.5},
-                    "10": {"dim_score": 5.0},
+                    "scoring_status": "scored",
                 },
-                "scoring_status": "scored",
-            },
+            ),
         ):
             response = client.get("/api/v1/projects/p1/feedback/governance")
 
@@ -8387,107 +8577,121 @@ class TestFeedbackGovernanceRoutes:
                 "scoring_status": "scored",
             }
 
-        with patch(
-            "app.main.load_ground_truth",
-            return_value=[
-                {
-                    "id": "gt-1",
-                    "project_id": "p1",
-                    "final_score": 84,
-                    "score_scale_max": 100,
-                    "judge_scores": [84, 84, 84, 84, 84],
-                    "created_at": "2026-03-15T01:00:00+00:00",
-                }
-            ],
-        ), patch("app.main.load_high_score_features", return_value=[]), patch(
-            "app.main.load_evolution_reports", return_value={}
-        ), patch(
-            "app.main.load_calibration_models",
-            return_value=[
-                {
-                    "calibrator_version": "calib-current",
-                    "model_type": "ridge",
-                    "deployed": True,
-                    "train_filter": {"project_id": "p1"},
-                    "updated_at": "2026-03-15T06:00:00+00:00",
-                }
-            ],
-        ), patch("app.main.load_expert_profiles", return_value=[]), patch(
-            "app.main.list_json_versions",
-            side_effect=lambda path: (
-                [
+        with (
+            patch(
+                "app.main.load_ground_truth",
+                return_value=[
                     {
-                        "version_id": "20260315T090000000000Z",
-                        "created_at": "2026-03-15T09:00:00+00:00",
+                        "id": "gt-1",
+                        "project_id": "p1",
+                        "final_score": 84,
+                        "score_scale_max": 100,
+                        "judge_scores": [84, 84, 84, 84, 84],
+                        "created_at": "2026-03-15T01:00:00+00:00",
                     }
-                ]
-                if getattr(path, "stem", "") == "calibration_models"
-                else []
+                ],
             ),
-        ), patch(
-            "app.main.load_json_version",
-            side_effect=lambda path, version_id, default: (
-                [
+            patch("app.main.load_high_score_features", return_value=[]),
+            patch("app.main.load_evolution_reports", return_value={}),
+            patch(
+                "app.main.load_calibration_models",
+                return_value=[
                     {
-                        "calibrator_version": "calib-preview",
+                        "calibrator_version": "calib-current",
                         "model_type": "ridge",
                         "deployed": True,
                         "train_filter": {"project_id": "p1"},
-                        "updated_at": "2026-03-15T09:00:00+00:00",
+                        "updated_at": "2026-03-15T06:00:00+00:00",
                     }
-                ]
-                if getattr(path, "stem", "") == "calibration_models"
-                else default
+                ],
             ),
-        ), patch(
-            "app.main.load_submissions",
-            return_value=[
-                {
-                    "id": "s1",
-                    "project_id": "p1",
-                    "filename": "投标文件A.docx",
-                    "text": "测试内容",
-                    "total_score": 72.0,
-                }
-            ],
-        ), patch(
-            "app.main.load_score_reports",
-            return_value=[
-                {
-                    "id": "r1",
-                    "project_id": "p1",
-                    "submission_id": "s1",
-                    "created_at": "2026-03-15T02:00:00+00:00",
-                    "rule_total_score": 70.0,
-                    "pred_total_score": 72.0,
-                    "rule_dim_scores": {"09": {"dim_score": 4.0}},
-                }
-            ],
-        ), patch(
-            "app.main.load_qingtian_results",
-            return_value=[
-                {
-                    "submission_id": "s1",
-                    "qt_total_score": 84.0,
-                    "created_at": "2026-03-15T03:00:00+00:00",
-                    "raw_payload": {"ground_truth_record_id": "gt-1"},
-                }
-            ],
-        ), patch(
-            "app.main._apply_prediction_to_report_with_model",
-            side_effect=_apply_preview,
-        ), patch(
-            "app.main._build_submission_sandbox_report",
-            side_effect=_sandbox_preview,
-        ), patch(
-            "app.main.load_config",
-            return_value=MagicMock(rubric={}, lexicon={}),
-        ), patch(
-            "app.main._build_material_knowledge_profile",
-            return_value={},
-        ), patch(
-            "app.main._build_material_quality_snapshot",
-            return_value={},
+            patch("app.main.load_expert_profiles", return_value=[]),
+            patch(
+                "app.main.list_json_versions",
+                side_effect=lambda path: (
+                    [
+                        {
+                            "version_id": "20260315T090000000000Z",
+                            "created_at": "2026-03-15T09:00:00+00:00",
+                        }
+                    ]
+                    if getattr(path, "stem", "") == "calibration_models"
+                    else []
+                ),
+            ),
+            patch(
+                "app.main.load_json_version",
+                side_effect=lambda path, version_id, default: (
+                    [
+                        {
+                            "calibrator_version": "calib-preview",
+                            "model_type": "ridge",
+                            "deployed": True,
+                            "train_filter": {"project_id": "p1"},
+                            "updated_at": "2026-03-15T09:00:00+00:00",
+                        }
+                    ]
+                    if getattr(path, "stem", "") == "calibration_models"
+                    else default
+                ),
+            ),
+            patch(
+                "app.main.load_submissions",
+                return_value=[
+                    {
+                        "id": "s1",
+                        "project_id": "p1",
+                        "filename": "投标文件A.docx",
+                        "text": "测试内容",
+                        "total_score": 72.0,
+                    }
+                ],
+            ),
+            patch(
+                "app.main.load_score_reports",
+                return_value=[
+                    {
+                        "id": "r1",
+                        "project_id": "p1",
+                        "submission_id": "s1",
+                        "created_at": "2026-03-15T02:00:00+00:00",
+                        "rule_total_score": 70.0,
+                        "pred_total_score": 72.0,
+                        "rule_dim_scores": {"09": {"dim_score": 4.0}},
+                    }
+                ],
+            ),
+            patch(
+                "app.main.load_qingtian_results",
+                return_value=[
+                    {
+                        "submission_id": "s1",
+                        "qt_total_score": 84.0,
+                        "created_at": "2026-03-15T03:00:00+00:00",
+                        "raw_payload": {"ground_truth_record_id": "gt-1"},
+                    }
+                ],
+            ),
+            patch(
+                "app.main._apply_prediction_to_report_with_model",
+                side_effect=_apply_preview,
+            ),
+            patch(
+                "app.main._build_submission_sandbox_report",
+                side_effect=_sandbox_preview,
+            ),
+            patch(
+                "app.main.load_config",
+                return_value=MagicMock(rubric={}, lexicon={}),
+            ),
+            patch(
+                "app.main._build_material_knowledge_profile",
+                return_value={},
+            ),
+            patch(
+                "app.main._build_material_quality_snapshot",
+                return_value={},
+            ),
         ):
             response = client.post(
                 "/api/v1/projects/p1/feedback/governance/version_preview",
@@ -8902,7 +9106,7 @@ class TestStructuredMaterialAdvancedParsing:
         from app.main import _build_drawing_structured_summary
 
         content = (
-            b"AC1032 DWG PUMP_ROOM GRID_A1 DN200 SECTION-01 HVAC_PIPE FIRE_ALARM" b" LEVEL_1 PLAN_A"
+            b"AC1032 DWG PUMP_ROOM GRID_A1 DN200 SECTION-01 HVAC_PIPE FIRE_ALARM LEVEL_1 PLAN_A"
         )
         summary = _build_drawing_structured_summary(content, "sample.dwg", parsed_text="")
         assert summary["detected_format"] == "dwg"

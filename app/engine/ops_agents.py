@@ -868,12 +868,9 @@ def _run_scoring_quality_agent(
         payload = resp.get("json") or {}
         level = str((payload.get("overall") or {}).get("level") or "").lower()
         summary = payload.get("summary") or {}
-        submission_total = _to_int(summary.get("submission_total"))
         submission_scored = _to_int(summary.get("submission_scored"))
-        # 处于准备阶段（未上传施组/未评分）的项目，不应把运维状态打成 fail。
-        in_preparation = project_status in OPS_AUDIT_PREPARATION_STATUSES and (
-            submission_total == 0 and submission_scored == 0
-        )
+        # 处于准备阶段且尚未完成评分的项目，不应把运维状态打成 fail。
+        in_preparation = project_status in OPS_AUDIT_PREPARATION_STATUSES and submission_scored == 0
         if level == "critical":
             if in_preparation:
                 preparation_critical += 1

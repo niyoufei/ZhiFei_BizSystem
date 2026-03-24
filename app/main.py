@@ -641,6 +641,126 @@ def _normalize_material_parse_job(job: Dict[str, object]) -> tuple[Dict[str, obj
     return normalized, changed
 
 
+def _material_parse_job_sort_key(job: Dict[str, object]) -> tuple[str, str, str]:
+    return (
+        str(job.get("updated_at") or job.get("created_at") or ""),
+        str(job.get("created_at") or ""),
+        str(job.get("id") or ""),
+    )
+
+
+def _find_latest_material_parse_job(
+    jobs: List[Dict[str, object]], material_id: str
+) -> tuple[Optional[int], Optional[Dict[str, object]]]:
+    latest_idx: Optional[int] = None
+    latest_job: Optional[Dict[str, object]] = None
+    for idx, job in enumerate(jobs):
+        if str(job.get("material_id") or "") != material_id:
+            continue
+        if latest_job is None or _material_parse_job_sort_key(job) > _material_parse_job_sort_key(
+            latest_job
+        ):
+            latest_idx = idx
+            latest_job = job
+    return latest_idx, latest_job
+
+
+def _mark_material_parse_job_queued(
+    job: Dict[str, object],
+    *,
+    reason: Optional[str] = None,
+    reset_attempt: bool = False,
+) -> bool:
+    changed = False
+    desired_updates: Dict[str, object] = {
+        "status": "queued",
+        "parse_backend": None,
+        "next_retry_at": None,
+        "started_at": None,
+        "finished_at": None,
+        "parse_confidence": 0.0,
+        "error_class": reason,
+        "error_message": reason,
+    }
+    if reset_attempt:
+        desired_updates["attempt"] = 0
+    for key, value in desired_updates.items():
+        if job.get(key) != value:
+            job[key] = value
+            changed = True
+    if changed:
+        job["updated_at"] = _now_iso()
+    return changed
+
+
+def _mark_material_parse_job_terminal(
+    job: Dict[str, object],
+    material_row: Dict[str, object],
+) -> bool:
+    material_status = str(material_row.get("parse_status") or "").strip().lower()
+    if material_status not in {"parsed", "failed"}:
+        return False
+    changed = False
+    finished_at = str(
+        material_row.get("parse_finished_at") or material_row.get("updated_at") or _now_iso()
+    )
+    confidence = float(
+        _to_float_or_none(material_row.get("parse_confidence"))
+        or _to_float_or_none(job.get("parse_confidence"))
+        or 0.0
+    )
+    desired_updates: Dict[str, object] = {
+        "status": material_status,
+        "parse_backend": material_row.get("parse_backend") or job.get("parse_backend"),
+        "next_retry_at": None,
+        "finished_at": finished_at,
+        "parse_confidence": confidence,
+        "error_class": material_row.get("parse_error_class")
+        if material_status == "failed"
+        else None,
+        "error_message": (
+            material_row.get("parse_error_message") if material_status == "failed" else None
+        ),
+    }
+    for key, value in desired_updates.items():
+        if job.get(key) != value:
+            job[key] = value
+            changed = True
+    if changed:
+        job["updated_at"] = str(material_row.get("updated_at") or _now_iso())
+    return changed
+
+
+def _compact_material_parse_jobs(
+    jobs: List[Dict[str, object]],
+) -> tuple[List[Dict[str, object]], int]:
+    grouped: Dict[str, List[int]] = {}
+    for idx, job in enumerate(jobs):
+        material_id = str(job.get("material_id") or "").strip()
+        status = str(job.get("status") or "queued")
+        if material_id and status in {"queued", "processing"}:
+            grouped.setdefault(material_id, []).append(idx)
+    keep_indices = set(range(len(jobs)))
+    removed_count = 0
+    for indices in grouped.values():
+        if len(indices) <= 1:
+            continue
+        keep_idx = max(
+            indices,
+            key=lambda idx: (
+                str(jobs[idx].get("status") or "") == "processing",
+                _material_parse_job_sort_key(jobs[idx]),
+            ),
+        )
+        for idx in indices:
+            if idx == keep_idx:
+                continue
+            keep_indices.discard(idx)
+            removed_count += 1
+    compacted = [job for idx, job in enumerate(jobs) if idx in keep_indices]
+    return compacted, removed_count
+
+
 def _ensure_material_parse_job(
     jobs: List[Dict[str, object]],
     material_row: Dict[str, object],
@@ -650,14 +770,7 @@ def _ensure_material_parse_job(
     material_id = str(material_row.get("id") or "").strip()
     if not material_id:
         return jobs, None, False
-    latest_job: Optional[Dict[str, object]] = None
-    for job in jobs:
-        if str(job.get("material_id") or "") != material_id:
-            continue
-        if latest_job is None or str(job.get("created_at") or "") > str(
-            latest_job.get("created_at") or ""
-        ):
-            latest_job = job
+    _, latest_job = _find_latest_material_parse_job(jobs, material_id)
     if latest_job and not force_requeue:
         status = str(latest_job.get("status") or "")
         if status in {"queued", "processing", "parsed"}:
@@ -689,26 +802,85 @@ def _ensure_material_parse_job(
     return jobs, job_id, True
 
 
+def _requeue_material_parse_job(
+    jobs: List[Dict[str, object]],
+    material_row: Dict[str, object],
+) -> tuple[List[Dict[str, object]], Optional[str], bool, bool]:
+    material_id = str(material_row.get("id") or "").strip()
+    if not material_id:
+        return jobs, None, False, False
+    latest_idx, latest_job = _find_latest_material_parse_job(jobs, material_id)
+    if latest_job is None:
+        jobs, job_id, created = _ensure_material_parse_job(jobs, material_row, force_requeue=True)
+        return jobs, job_id, created, created
+    status = str(latest_job.get("status") or "")
+    if status in {"queued", "processing", "failed"}:
+        changed = _mark_material_parse_job_queued(
+            latest_job,
+            reason="worker_recovered" if status == "processing" else None,
+            reset_attempt=status == "failed",
+        )
+        if latest_idx is not None:
+            jobs[latest_idx] = latest_job
+        return jobs, str(latest_job.get("id") or ""), False, changed
+    jobs, job_id, created = _ensure_material_parse_job(jobs, material_row, force_requeue=True)
+    return jobs, job_id, created, created
+
+
 def _bootstrap_material_parse_state() -> Dict[str, int]:
     materials = load_materials()
-    jobs = load_material_parse_jobs()
+    raw_jobs = load_material_parse_jobs()
     materials_changed = False
     jobs_changed = False
     queued_count = 0
+    normalized_jobs: List[Dict[str, object]] = []
+    for job in raw_jobs:
+        normalized_job, job_changed = _normalize_material_parse_job(job)
+        normalized_jobs.append(normalized_job)
+        jobs_changed = jobs_changed or job_changed
+    jobs, deduplicated_jobs = _compact_material_parse_jobs(normalized_jobs)
+    jobs_changed = jobs_changed or deduplicated_jobs > 0
+    recovered_jobs = 0
+    terminal_synced_jobs = 0
     for idx, row in enumerate(materials):
         normalized, row_changed = _normalize_material_row_for_parse(row)
         job_id = str(normalized.get("job_id") or "")
         created = False
-        if str(normalized.get("parse_status") or "") != "parsed":
-            force_requeue = row_changed or str(normalized.get("parse_status") or "") in {
-                "queued",
+        material_id = str(normalized.get("id") or "").strip()
+        material_status = str(normalized.get("parse_status") or "").strip().lower()
+        latest_idx, latest_job = _find_latest_material_parse_job(jobs, material_id)
+        latest_status = str((latest_job or {}).get("status") or "")
+        if (
+            latest_job
+            and latest_status in {"queued", "processing"}
+            and material_status
+            in {
+                "parsed",
                 "failed",
             }
-            jobs, job_id, created = _ensure_material_parse_job(
-                jobs,
-                normalized,
-                force_requeue=force_requeue,
-            )
+        ):
+            if _mark_material_parse_job_terminal(latest_job, normalized):
+                if latest_idx is not None:
+                    jobs[latest_idx] = latest_job
+                jobs_changed = True
+                terminal_synced_jobs += 1
+                job_id = str(latest_job.get("id") or "")
+        elif material_status != "parsed":
+            if latest_job and latest_status == "processing":
+                if _mark_material_parse_job_queued(latest_job, reason="worker_recovered"):
+                    if latest_idx is not None:
+                        jobs[latest_idx] = latest_job
+                    jobs_changed = True
+                    recovered_jobs += 1
+                job_id = str(latest_job.get("id") or "")
+            elif latest_job:
+                job_id = str(latest_job.get("id") or "")
+            else:
+                jobs, job_id, created = _ensure_material_parse_job(
+                    jobs,
+                    normalized,
+                    force_requeue=False,
+                )
             if created:
                 normalized["job_id"] = job_id
                 normalized["parse_status"] = "queued"
@@ -717,22 +889,23 @@ def _bootstrap_material_parse_state() -> Dict[str, int]:
                 jobs_changed = True
                 queued_count += 1
                 row_changed = True
+            elif job_id and str(normalized.get("job_id") or "") != job_id:
+                normalized["job_id"] = job_id
+                row_changed = True
         if row_changed:
             materials[idx] = normalized
             materials_changed = True
-    normalized_jobs: List[Dict[str, object]] = []
-    for job in jobs:
-        normalized_job, job_changed = _normalize_material_parse_job(job)
-        normalized_jobs.append(normalized_job)
-        jobs_changed = jobs_changed or job_changed
     if materials_changed:
         save_materials(materials)
     if jobs_changed:
-        save_material_parse_jobs(normalized_jobs)
+        save_material_parse_jobs(jobs)
     return {
         "materials_changed": int(materials_changed),
         "jobs_changed": int(jobs_changed),
         "queued_count": int(queued_count),
+        "deduplicated_jobs": int(deduplicated_jobs),
+        "recovered_jobs": int(recovered_jobs),
+        "terminal_synced_jobs": int(terminal_synced_jobs),
     }
 
 
@@ -6874,8 +7047,8 @@ def _render_scoring_factors_markdown(payload: Dict[str, object]) -> str:
     ]
     for d in dims:
         lines.append(
-            f"| {d.get('dimension_id')} | {d.get('name','')} | {d.get('module','')} | "
-            f"{d.get('max_score', 10)} | {d.get('scoring_model','')} |"
+            f"| {d.get('dimension_id')} | {d.get('name', '')} | {d.get('module', '')} | "
+            f"{d.get('max_score', 10)} | {d.get('scoring_model', '')} |"
         )
     lines.extend(
         [
@@ -6889,7 +7062,7 @@ def _render_scoring_factors_markdown(payload: Dict[str, object]) -> str:
     for p in penalties:
         lines.append(
             f"| {p.get('code')} | {p.get('engine')} | {p.get('deduct_per_hit')} | "
-            f"{p.get('max_deduct')} | {p.get('description','')} |"
+            f"{p.get('max_deduct')} | {p.get('description', '')} |"
         )
 
     lines.extend(
@@ -13098,7 +13271,7 @@ def upload_material(
         "lexical_terms": [],
     }
     jobs = load_material_parse_jobs()
-    jobs, job_id, _ = _ensure_material_parse_job(jobs, record, force_requeue=True)
+    jobs, job_id, _, _ = _requeue_material_parse_job(jobs, record)
     record["job_id"] = job_id
     materials.append(record)
     save_materials(materials)
@@ -13205,7 +13378,7 @@ def reparse_project_materials(
         if str(row.get("project_id") or "") != str(project_id):
             continue
         normalized, _ = _normalize_material_row_for_parse(dict(row))
-        jobs, job_id, created = _ensure_material_parse_job(jobs, normalized, force_requeue=True)
+        jobs, job_id, _, _ = _requeue_material_parse_job(jobs, normalized)
         normalized["job_id"] = job_id
         normalized["parse_status"] = "queued"
         normalized["parse_backend"] = "queued"
@@ -13215,7 +13388,7 @@ def reparse_project_materials(
         normalized["parse_finished_at"] = None
         normalized["updated_at"] = _now_iso()
         materials[idx] = normalized
-        changed = True or created
+        changed = True
     if changed:
         save_materials(materials)
         save_material_parse_jobs(jobs)
