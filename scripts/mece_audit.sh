@@ -170,7 +170,7 @@ while IFS= read -r pid; do
   fi
 done <"$tmp_dir/project_ids.txt"
 
-"$PYTHON_BIN" - "$BASE_URL" "$tmp_dir" "$OUT_JSON" "$OUT_MD" <<'PY'
+"$PYTHON_BIN" - "$BASE_URL" "$tmp_dir" "$tmp_dir/project_ids.txt" "$OUT_JSON" "$OUT_MD" "$api_fail_count" "$rate_limit_retry_count" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
@@ -178,8 +178,16 @@ from pathlib import Path
 
 base_url = sys.argv[1]
 tmp_dir = Path(sys.argv[2])
-out_json = Path(sys.argv[3])
-out_md = Path(sys.argv[4])
+project_ids_path = Path(sys.argv[3])
+out_json = Path(sys.argv[4])
+out_md = Path(sys.argv[5])
+api_fail_count = int(sys.argv[6])
+rate_limit_retry_count = int(sys.argv[7])
+
+discovered_ids = [
+    line.strip() for line in project_ids_path.read_text(encoding="utf-8").splitlines() if line.strip()
+]
+discovered_set = set(discovered_ids)
 
 audits = []
 for fp in sorted(tmp_dir.glob("mece_*.json")):
@@ -194,6 +202,12 @@ summary = {
     "generated_at": datetime.now(timezone.utc).isoformat(),
     "base_url": base_url,
     "project_count": len(audits),
+    "discovered_project_count": len(discovered_ids),
+    "successful_project_count": len(audits),
+    "request_fail_count": api_fail_count,
+    "rate_limit_retry_count": rate_limit_retry_count,
+    "missing_project_count": 0,
+    "missing_project_ids": [],
     "critical_count": 0,
     "watch_count": 0,
     "good_count": 0,
@@ -229,6 +243,11 @@ for a in audits:
 if scores:
     summary["avg_health_score"] = round(sum(scores) / len(scores), 2)
 
+audit_ids = {str((row or {}).get("project_id") or "").strip() for row in audits if isinstance(row, dict)}
+missing_project_ids = sorted(pid for pid in discovered_ids if pid not in audit_ids)
+summary["missing_project_count"] = len(missing_project_ids)
+summary["missing_project_ids"] = missing_project_ids[:20]
+
 out_json.parent.mkdir(parents=True, exist_ok=True)
 out_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -237,7 +256,11 @@ lines = [
     "",
     f"- 生成时间: `{summary['generated_at']}`",
     f"- 服务地址: `{base_url}`",
-    f"- 项目数: `{summary['project_count']}`",
+    f"- 发现项目数: `{summary['discovered_project_count']}`",
+    f"- 成功汇总项目数: `{summary['successful_project_count']}`",
+    f"- 请求失败数: `{summary['request_fail_count']}`",
+    f"- 缺失项目数: `{summary['missing_project_count']}`",
+    f"- 429/限流重试次数: `{summary['rate_limit_retry_count']}`",
     f"- 平均健康分: `{summary['avg_health_score']}`",
     f"- good/watch/critical: `{summary['good_count']}/{summary['watch_count']}/{summary['critical_count']}`",
     "",
@@ -255,6 +278,11 @@ if summary["projects"]:
             lines.append(f"  - 建议: {rec}")
 else:
     lines.append("- 当前无项目可审计。")
+if summary["missing_project_ids"]:
+    lines.append("")
+    lines.append("## 缺失项目")
+    for pid in summary["missing_project_ids"]:
+        lines.append(f"- `{pid}`")
 lines.append("")
 out_md.parent.mkdir(parents=True, exist_ok=True)
 out_md.write_text("\n".join(lines), encoding="utf-8")
