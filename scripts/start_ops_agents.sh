@@ -27,6 +27,29 @@ if [[ -z "$API_KEY" ]]; then
   API_KEY="$("$PYTHON_BIN" "$ROOT_DIR/scripts/resolve_api_key.py" --preferred-role ops --fallback-role admin 2>/dev/null || true)"
 fi
 
+kill_matching_ops_agents() {
+  local pids
+  pids="$(
+    ps -axo pid=,command= | awk -v root="$ROOT_DIR" -v base="$BASE_URL" '
+      index($0, "scripts/ops_agents.py") && (index($0, root) || index($0, "--base-url " base)) {print $1}
+    ' | tr '\n' ' '
+  )"
+  if [[ -z "${pids// }" ]]; then
+    return 0
+  fi
+  for pid in $pids; do
+    [[ -z "${pid}" ]] && continue
+    kill "$pid" >/dev/null 2>&1 || true
+  done
+  sleep 1
+  for pid in $pids; do
+    [[ -z "${pid}" ]] && continue
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      kill -9 "$pid" >/dev/null 2>&1 || true
+    fi
+  done
+}
+
 if command -v screen >/dev/null 2>&1; then
   screen -S "$SCREEN_SESSION" -X quit >/dev/null 2>&1 || true
   screen -wipe >/dev/null 2>&1 || true
@@ -43,6 +66,8 @@ if [[ -f "$PID_FILE" ]]; then
   fi
   rm -f "$PID_FILE"
 fi
+
+kill_matching_ops_agents
 
 if ! "$PYTHON_BIN" "$ROOT_DIR/scripts/rotate_runtime_logs.py" --keep "$LOG_KEEP" "$LOG_FILE" "$STATUS_JSON" "$STATUS_MD" >/dev/null 2>&1; then
   echo "Warning: runtime log rotation failed; continuing with existing files." >&2
