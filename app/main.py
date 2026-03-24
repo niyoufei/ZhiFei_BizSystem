@@ -26290,14 +26290,18 @@ def index(
             let okCount = 0;
             let failCount = 0;
             const details = [];
+            const uploadedSubmissions = [];
             for (const f of files) {
               const fd = new FormData();
               fd.append('file', f);
               try {
                 const res = await fetch('/api/v1/projects/' + projectId + '/shigong', { method: 'POST', headers, body: fd });
                 const text = await res.text();
+                let payload = {};
+                try { payload = JSON.parse(text || '{}'); } catch (_) {}
                 if (res.ok) {
                   okCount += 1;
+                  if (payload && typeof payload === 'object') uploadedSubmissions.push(payload);
                   details.push('[成功] ' + f.name);
                 } else {
                   failCount += 1;
@@ -26317,11 +26321,21 @@ def index(
               failCount > 0
             );
             if (okCount > 0) {
-              await refreshSubmissions(projectId, projectSwitchSeq);
-              if (typeof refreshScoringDiagnostic === 'function') await refreshScoringDiagnostic(projectId, projectSwitchSeq);
+              upsertSubmissionRowsImmediately(projectId, uploadedSubmissions);
             }
-            if (fileInput && failCount === 0) fileInput.value = '';
-            if (fileInput && fileInput.id) updateFilePickerText(fileInput.id, fileInput.id + 'Name');
+            if (okCount > 0) {
+              if (fileInput && failCount === 0) fileInput.value = '';
+              if (fileInput && fileInput.id) updateFilePickerText(fileInput.id, fileInput.id + 'Name');
+              await waitForNextPaint();
+              await Promise.all([
+                refreshSubmissions(projectId, projectSwitchSeq),
+                (typeof refreshScoringDiagnostic === 'function')
+                  ? refreshScoringDiagnostic(projectId, projectSwitchSeq)
+                  : Promise.resolve(),
+              ]);
+            } else {
+              if (fileInput && fileInput.id) updateFilePickerText(fileInput.id, fileInput.id + 'Name');
+            }
           } finally {
             uploadShigongInFlight = false;
           }
@@ -26431,6 +26445,47 @@ def index(
           const emptyEl = document.getElementById(emptyId);
           if (!emptyEl) return;
           emptyEl.style.display = (tbody && tbody.querySelector('tr')) ? 'none' : 'block';
+        }
+        function waitForNextPaint() {
+          return new Promise((resolve) => {
+            if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+              window.requestAnimationFrame(() => resolve());
+              return;
+            }
+            setTimeout(resolve, 0);
+          });
+        }
+        function upsertSubmissionRowsImmediately(projectId, submissions) {
+          const rows = Array.isArray(submissions)
+            ? submissions.filter((item) => item && typeof item === 'object')
+            : [];
+          if (!projectId || !rows.length) return;
+          const table = document.getElementById('submissionsTable');
+          const tbody = table ? table.querySelector('tbody') : null;
+          const emptyEl = document.getElementById('submissionsEmpty');
+          if (!tbody) return;
+          if (emptyEl) emptyEl.style.display = 'none';
+          rows
+            .slice()
+            .sort((left, right) => {
+              const leftCreated = String((left && left.created_at) || '');
+              const rightCreated = String((right && right.created_at) || '');
+              if (leftCreated !== rightCreated) return rightCreated.localeCompare(leftCreated);
+              return String((right && right.id) || '').localeCompare(String((left && left.id) || ''));
+            })
+            .forEach((submission) => {
+              const submissionId = String((submission && submission.id) || '');
+              const existingButton = Array.from(
+                tbody.querySelectorAll ? tbody.querySelectorAll('.js-delete-submission') : []
+              ).find((btn) => String(btn.getAttribute('data-submission-id') || '') === submissionId);
+              const existingRow = existingButton && existingButton.closest ? existingButton.closest('tr') : null;
+              if (existingRow) existingRow.remove();
+              const tr = document.createElement('tr');
+              tr.innerHTML = buildSubmissionTableRowHtml(submission, projectId, escapeHtmlText);
+              if (tbody.firstChild) tbody.insertBefore(tr, tbody.firstChild);
+              else tbody.appendChild(tr);
+            });
+          updateTableEmptyState('submissionsTable', 'submissionsEmpty');
         }
         function extractApiErrorMessage(status, text, data) {
           const detail = (data && data.detail) ? String(data.detail) : String(text || '').trim();

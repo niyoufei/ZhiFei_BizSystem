@@ -890,6 +890,11 @@ class TestIndexEndpoint:
         assert "let uploadShigongInFlight = false;" in page
         assert "let scoreShigongInFlight = false;" in page
         assert "let shigongSubmitIntent = 'upload';" in page
+        assert "const uploadedSubmissions = [];" in page
+        assert "upsertSubmissionRowsImmediately(projectId, uploadedSubmissions);" in page
+        assert "await waitForNextPaint();" in page
+        assert "function waitForNextPaint()" in page
+        assert "function upsertSubmissionRowsImmediately(projectId, submissions)" in page
         assert "function describeSelectedFiles(files, emptyText = '未选择任何文件')" in page
         assert (
             "function updateFilePickerText(inputId, textId, emptyText = '未选择任何文件')" in page
