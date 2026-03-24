@@ -268,6 +268,57 @@ def test_scoring_quality_treats_preparation_pending_submission_as_non_failure():
     assert result["metrics"]["preparation_critical_count"] == 1
 
 
+def test_scoring_quality_ignores_evolution_only_watch_for_scored_project():
+    recent_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+
+    def fake_requester(**kwargs):
+        url = str(kwargs.get("url") or "")
+        if url.endswith("/api/v1/projects"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": [
+                    {
+                        "id": "p1",
+                        "name": "项目1",
+                        "status": "scoring_preparation",
+                        "updated_at": recent_iso,
+                    }
+                ],
+                "error": None,
+            }
+        if url.endswith("/api/v1/projects/p1/mece_audit"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "overall": {"level": "watch"},
+                    "dimensions": [
+                        {"key": "input_chain", "status": "pass"},
+                        {"key": "scoring_validity", "status": "pass"},
+                        {"key": "self_evolution_loop", "status": "fail"},
+                        {"key": "runtime_stability", "status": "pass"},
+                    ],
+                    "summary": {"submission_total": 4, "submission_scored": 1},
+                },
+                "error": None,
+            }
+        raise AssertionError(f"unexpected url: {url}")
+
+    result = oa._run_scoring_quality_agent(
+        base_url="http://127.0.0.1:8000",
+        api_key=None,
+        timeout=5.0,
+        requester=fake_requester,
+    )
+    assert result["status"] == "pass"
+    assert result["metrics"]["watch_count"] == 0
+    assert result["metrics"]["critical_count"] == 0
+    assert result["metrics"]["ignored_non_scoring_issue_count"] == 1
+
+
 def test_select_projects_for_ops_audit_excludes_synthetic_and_stale_preparation():
     now = datetime(2026, 3, 24, 12, 0, tzinfo=timezone.utc)
     projects = [

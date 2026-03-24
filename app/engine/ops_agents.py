@@ -857,6 +857,42 @@ def _run_upload_flow_agent(
     }
 
 
+def _mece_dimension_status(payload: Dict[str, Any], key: str) -> str:
+    dimensions = payload.get("dimensions")
+    if not isinstance(dimensions, list):
+        return ""
+    for row in dimensions:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("key") or "").strip() != key:
+            continue
+        return str(row.get("status") or "").strip().lower()
+    return ""
+
+
+def _scoring_quality_level_from_mece_audit(payload: Dict[str, Any]) -> str:
+    """
+    scoring_quality 只关注评分主链本身：
+    - input_chain
+    - scoring_validity
+
+    自我进化与运行稳定性分别由 evolution / sre_watchdog / data_hygiene 负责，
+    不应反向把评分质量误判成 warn/fail。
+    """
+    statuses = [
+        _mece_dimension_status(payload, "input_chain"),
+        _mece_dimension_status(payload, "scoring_validity"),
+    ]
+    focused = [item for item in statuses if item]
+    if not focused:
+        return str((payload.get("overall") or {}).get("level") or "").strip().lower()
+    if any(item == "fail" for item in focused):
+        return "critical"
+    if any(item == "warn" for item in focused):
+        return "watch"
+    return "good"
+
+
 def _run_scoring_quality_agent(
     *,
     base_url: str,
@@ -898,6 +934,7 @@ def _run_scoring_quality_agent(
     preparation_critical = 0
     watch = 0
     good = 0
+    ignored_non_scoring_issue_count = 0
     for project in monitored_projects:
         pid = str(project.get("id") or "").strip()
         if not pid:
@@ -914,11 +951,14 @@ def _run_scoring_quality_agent(
             critical += 1
             continue
         payload = resp.get("json") or {}
-        level = str((payload.get("overall") or {}).get("level") or "").lower()
+        level = _scoring_quality_level_from_mece_audit(payload)
+        overall_level = str((payload.get("overall") or {}).get("level") or "").lower()
         summary = payload.get("summary") or {}
         submission_scored = _to_int(summary.get("submission_scored"))
         # 处于准备阶段且尚未完成评分的项目，不应把运维状态打成 fail。
         in_preparation = project_status in OPS_AUDIT_PREPARATION_STATUSES and submission_scored == 0
+        if overall_level in {"watch", "critical"} and level == "good":
+            ignored_non_scoring_issue_count += 1
         if level == "critical":
             if in_preparation:
                 preparation_critical += 1
@@ -935,10 +975,16 @@ def _run_scoring_quality_agent(
     if critical > 0:
         recommendations.append(f"存在 {critical} 个项目处于 critical，请优先补齐资料与评分门禁。")
     elif watch > 0:
-        recommendations.append(f"存在 {watch} 个项目处于 watch，建议补充样本与进化训练。")
+        recommendations.append(
+            f"存在 {watch} 个项目处于 watch，建议优先复核评分区分度、资料门禁和证据链。"
+        )
     elif preparation_critical > 0:
         recommendations.append(
             f"有 {preparation_critical} 个项目处于准备阶段（未上传施组/未评分），不计入故障。"
+        )
+    elif ignored_non_scoring_issue_count > 0:
+        recommendations.append(
+            f"有 {ignored_non_scoring_issue_count} 个项目仅存在进化/运行提示，不计入评分质量故障。"
         )
     else:
         recommendations.append("所有项目评分质量状态良好。")
@@ -955,6 +1001,7 @@ def _run_scoring_quality_agent(
             "watch_count": watch,
             "critical_count": critical,
             "preparation_critical_count": preparation_critical,
+            "ignored_non_scoring_issue_count": ignored_non_scoring_issue_count,
         },
         "recommendations": recommendations,
     }
