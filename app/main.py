@@ -8339,16 +8339,12 @@ def _report_is_blocked(report: Optional[Dict[str, object]]) -> bool:
     return bool(meta.get("score_blocked_by_material_utilization"))
 
 
-def _submission_is_scored(submission: Dict[str, object]) -> bool:
+def _submission_has_generated_score(submission: Dict[str, object]) -> bool:
     report_obj = submission.get("report")
     if isinstance(report_obj, dict):
-        if _report_is_blocked(report_obj):
-            return False
         status = str(report_obj.get("scoring_status") or "").strip().lower()
         if status == "pending":
             return False
-        if status == "scored":
-            return True
         if _to_float_or_none(report_obj.get("rule_total_score")) is not None:
             return True
         if _to_float_or_none(report_obj.get("pred_total_score")) is not None:
@@ -8356,6 +8352,22 @@ def _submission_is_scored(submission: Dict[str, object]) -> bool:
         if _to_float_or_none(report_obj.get("total_score")) is not None:
             return True
     return _to_float_or_none(submission.get("total_score")) is not None
+
+
+def _submission_is_scored(submission: Dict[str, object]) -> bool:
+    report_obj = submission.get("report")
+    if isinstance(report_obj, dict):
+        if not _submission_has_generated_score(submission):
+            return False
+        if _report_is_blocked(report_obj):
+            return False
+        status = str(report_obj.get("scoring_status") or "").strip().lower()
+        if status == "pending":
+            return False
+        if status == "scored":
+            return True
+        return True
+    return _submission_has_generated_score(submission)
 
 
 def _mark_report_scored(report: Dict[str, object], *, trigger: str) -> None:
@@ -20246,7 +20258,7 @@ def compare_submissions(
     submissions_all = [s for s in load_submissions() if s["project_id"] == project_id]
     if not submissions_all:
         raise HTTPException(status_code=404, detail=t("api.no_submissions", locale=locale))
-    submissions = [s for s in submissions_all if _submission_is_scored(s)]
+    submissions = [s for s in submissions_all if _submission_has_generated_score(s)]
     if not submissions:
         raise HTTPException(status_code=404, detail="暂无已评分施组，请先点击“评分施组”。")
     material_knowledge_snapshot = _build_material_knowledge_profile(project_id)
@@ -20275,7 +20287,7 @@ def compare_submissions(
                 ((report_for_awareness or {}).get("meta") or {}).get("score_confidence_level") or ""
             ),
             "score_self_awareness": awareness if isinstance(awareness, dict) else {},
-            "created_at": s["created_at"],
+            "created_at": s.get("created_at"),
         }
         ranking_row.update(build_compare_sort_fields(ranking_row))
         rankings.append(ranking_row)
@@ -20333,7 +20345,7 @@ def compare_report(
     submissions_all = [s for s in load_submissions() if s["project_id"] == project_id]
     if not submissions_all:
         raise HTTPException(status_code=404, detail=t("api.no_submissions", locale=locale))
-    submissions = [s for s in submissions_all if _submission_is_scored(s)]
+    submissions = [s for s in submissions_all if _submission_has_generated_score(s)]
     if not submissions:
         raise HTTPException(status_code=404, detail="暂无已评分施组，请先点击“评分施组”。")
     material_knowledge_snapshot = _build_material_knowledge_profile(project_id)
@@ -22643,7 +22655,7 @@ def index(
             btnMaterialKnowledgeProfileDownload: { resultId: 'materialKnowledgeProfileResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials/knowledge_profile.md', loading: '知识画像下载准备中...' },
             btnScoringDiagnostic: { resultId: 'scoringDiagnosticResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/scoring_diagnostic/latest', loading: '评分证据链诊断生成中...' },
             btnCompare: { resultId: 'compareResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare', loading: '对比排名加载中...' },
-            btnCompareReport: { resultId: 'compareReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare_report', loading: '对比报告生成中...' },
+            btnCompareReport: { resultId: 'compareReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare_report', loading: '满分优化清单生成中...' },
             btnInsights: { resultId: 'insightsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/insights', loading: '洞察分析中...' },
             btnLearning: { resultId: 'learningResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/learning', loading: '学习画像生成中...' },
             btnEvidenceTrace: { resultId: 'evidenceTraceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/evidence_trace/latest', loading: '证据追溯生成中...' },
@@ -23142,14 +23154,17 @@ def index(
               <option value="100">100分制</option>
               <option value="5">5分制</option>
             </select>
+            <button type="button" id="btnOptimizationReport" class="secondary">满分优化清单（逐页）</button>
             <button type="button" id="btnScoringDiagnostic" class="secondary compact-hidden" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnScoringDiagnostic')">评分证据链诊断</button>
             <span class="note">支持一次选择多个文件（Mac 按 Command，Windows 按 Ctrl）。</span>
           </form>
           <p id="shigongGateSummary" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
           <p id="shigongActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
+          <p class="note" style="margin:6px 0 0 0">满分优化清单会展示定位页码、证据片段、建议改写和验收标准。</p>
           <div id="scoringReadinessResult" class="result-block" style="display:none"></div>
           <div id="scoringDiagnosticResult" class="result-block" style="display:none"></div>
           <div id="materialUtilizationResult" class="result-block" style="display:none"></div>
+          <div id="compareReportResult" class="result-block" style="display:none"></div>
         </div>
       </div>
 
@@ -23158,14 +23173,13 @@ def index(
         <p style="font-size:12px;color:#64748b;margin:-4px 0 8px 0">对比排名：看多份施组分数排序；对比报告：看叙述性差异；洞察：看弱项与扣分建议；学习画像：生成维度权重供后续评分参考。</p>
         <div class="action-row">
           <button type="button" id="btnCompare" onclick="return window.__zhifeiFallbackClick(event, 'btnCompare')">对比排名</button>
-          <button type="button" id="btnCompareReport" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnCompareReport')">对比报告（叙述）</button>
+          <button type="button" id="btnCompareReport" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnCompareReport')">满分优化清单（逐页）</button>
           <button type="button" id="btnInsights" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnInsights')">洞察</button>
           <button type="button" id="btnLearning" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnLearning')">生成学习画像</button>
           <button type="button" id="btnEvidenceTrace" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnEvidenceTrace')">证据追溯（最新施组）</button>
           <button type="button" id="btnScoringBasis" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnScoringBasis')">评分依据（最新施组）</button>
         </div>
         <div id="compareResult" class="result-block" style="display:none"></div>
-        <div id="compareReportResult" class="result-block" style="display:none"></div>
         <div id="insightsResult" class="result-block" style="display:none"></div>
         <div id="learningResult" class="result-block" style="display:none"></div>
         <div id="evidenceTraceResult" class="result-block" style="display:none"></div>
@@ -23258,7 +23272,7 @@ def index(
         <div class="action-row" style="margin-bottom:10px">
           <button type="button" id="btnEvolve" onclick="return window.__zhifeiFallbackClick(event, 'btnEvolve')">学习进化（根据已录入真实评标生成高分逻辑与编制指导）</button>
           <button type="button" id="btnEvolutionHealth" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnEvolutionHealth')">进化健康度</button>
-          <button type="button" id="btnFeedbackGovernance" class="secondary compact-hidden" onclick="return window.__zhifeiFallbackClick(event, 'btnFeedbackGovernance')">闭环治理面板</button>
+          <button type="button" id="btnFeedbackGovernance" class="secondary compact-hidden" onclick="return window.__zhifeiFallbackClick(event, 'btnFeedbackGovernance')">评分治理（异常样本/校准/回退）</button>
           <button type="button" id="btnWritingGuidance" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnWritingGuidance')">查看编制指导</button>
           <button type="button" id="btnCompilationInstructions" class="secondary compact-hidden" onclick="return window.__zhifeiFallbackClick(event, 'btnCompilationInstructions')">编制系统指令（可导出为编制约束）</button>
         </div>
@@ -23334,7 +23348,7 @@ def index(
             btnScoreShigong: { resultId: 'shigongActionStatus', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/rescore', loading: '施组评分中...' },
             btnScoringDiagnostic: { resultId: 'scoringDiagnosticResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/scoring_diagnostic/latest', loading: '评分证据链诊断生成中...' },
             btnCompare: { resultId: 'compareResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare', loading: '对比排名加载中...' },
-            btnCompareReport: { resultId: 'compareReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare_report', loading: '对比报告生成中...' },
+            btnCompareReport: { resultId: 'compareReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare_report', loading: '满分优化清单生成中...' },
             btnInsights: { resultId: 'insightsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/insights', loading: '洞察分析中...' },
             btnLearning: { resultId: 'learningResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/learning', loading: '学习画像生成中...' },
             btnEvidenceTrace: { resultId: 'evidenceTraceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/evidence_trace/latest', loading: '证据追溯生成中...' },
@@ -23612,6 +23626,7 @@ def index(
                   + '</div>';
               }).join('');
               const html = ''
+                + '<p class="note">用途：定位低分页码、证据片段、建议改写和验收标准，直接支撑“如何把施组做到更高分”。</p>'
                 + '<p><strong>摘要</strong>：' + (summary || '无') + '</p>'
                 + '<p><strong>最高分</strong>：' + fallbackEscapeHtml(top.filename || '-') + '（' + fallbackEscapeHtml(top.total_score) + '）'
                 + '，' + confidenceText(top)
@@ -23677,7 +23692,8 @@ def index(
               const fewShotRecent = Array.isArray(data.few_shot_recent) ? data.few_shot_recent : [];
               const versions = Array.isArray(data.version_history) ? data.version_history : [];
               const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
-              const html = '<strong>闭环治理面板</strong>'
+              const html = '<strong>评分治理面板（异常样本 / few-shot / 回退快照）</strong>'
+                + '<p class="note" style="margin:6px 0">用途：处理真实评分闭环中的异常样本、few-shot 采纳/忽略、版本预演与回退；它不是逐页编制优化清单。</p>'
                 + '<table><tr><th>指标</th><th>值</th></tr>'
                 + '<tr><td>真实评分样本</td><td>' + fallbackEscapeHtml((summary && summary.ground_truth_count) || 0) + '</td></tr>'
                 + '<tr><td>可参与闭环样本</td><td>' + fallbackEscapeHtml((summary && summary.active_ground_truth_count) || 0) + '</td></tr>'
@@ -24270,7 +24286,7 @@ def index(
               );
             }
             if (actionId === 'btnCompareReport') {
-              fallbackSetOutput('[' + actionId + '] HTTP ' + String(res.status) + '\\n已渲染精简版对比报告（详情已显示在页面，不再输出完整JSON）');
+              fallbackSetOutput('[' + actionId + '] HTTP ' + String(res.status) + '\\n已渲染满分优化清单（详情已显示在页面，不再输出完整JSON）');
             } else {
               fallbackSetOutput('[' + actionId + '] HTTP ' + String(res.status) + '\\n' + String(text || ''));
             }
@@ -24716,7 +24732,7 @@ def index(
         const PROJECT_REQUIRED_BUTTON_IDS = [
           'deleteCurrentProject', 'btnWeightsReset', 'btnWeightsSave', 'btnWeightsApply',
           'btnMaterialDepthReport', 'btnMaterialDepthReportDownload', 'btnMaterialKnowledgeProfile', 'btnMaterialKnowledgeProfileDownload',
-          'btnScoringDiagnostic',
+          'btnScoringDiagnostic', 'btnOptimizationReport',
           'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
           'btnEvolve', 'btnEvolutionHealth', 'btnFeedbackGovernance', 'btnWritingGuidance', 'btnCompilationInstructions',
           'btnRebuildDelta', 'btnRebuildSamples', 'btnTrainCalibratorV2', 'btnApplyCalibPredict',
@@ -24725,7 +24741,7 @@ def index(
         ];
         const NON_BLOCKING_ACTION_BUTTON_IDS = [
           'btnUploadMaterials', 'btnUploadBoq', 'btnUploadDrawing', 'btnUploadSitePhotos', 'btnRefreshMaterials', 'btnMaterialDepthReport', 'btnMaterialDepthReportDownload', 'btnMaterialKnowledgeProfile', 'btnMaterialKnowledgeProfileDownload', 'btnUploadShigong', 'btnScoreShigong', 'btnScoringDiagnostic', 'btnRefreshSubmissions',
-          'btnCompare', 'btnCompareReport', 'btnInsights', 'btnLearning',
+          'btnOptimizationReport', 'btnCompare', 'btnCompareReport', 'btnInsights', 'btnLearning',
           'btnEvidenceTrace', 'btnScoringBasis',
           'btnAdaptive', 'btnAdaptivePatch', 'btnAdaptiveValidate', 'btnAdaptiveApply',
           'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
@@ -26423,6 +26439,7 @@ def index(
               if (closedLoop.ok === false) doneMsg += ' 反馈闭环执行异常，请查看“原始输出”。';
               else doneMsg += ' 反馈闭环已执行。';
             }
+            doneMsg += ' 满分优化清单已同步刷新。';
             if (o) o.textContent = doneMsg;
             setActionStatus('shigongActionStatus', doneMsg, blockedCount > 0);
             if (typeof renderMaterialUtilizationPanel === 'function') {
@@ -26435,6 +26452,7 @@ def index(
             if (typeof refreshScoringDiagnostic === 'function') {
               await refreshScoringDiagnostic(projectId, projectSwitchSeq);
             }
+            triggerOptimizationReportAction(projectId);
           } finally {
             scoreShigongInFlight = false;
           }
@@ -26556,11 +26574,39 @@ def index(
           const out = document.getElementById('output');
           if (out) out.textContent = JSON.stringify({ ok: true, id: materialId, filename: filename || '' }, null, 2);
         }
+        function triggerOptimizationReportAction(projectId='', options=null) {
+          const opts = (options && typeof options === 'object') ? options : {};
+          const effectiveProjectId = String(projectId || resolveProjectId() || '').trim();
+          if (!effectiveProjectId) {
+            setResultError('compareReportResult', '请先选择项目后再查看满分优化清单。');
+            return false;
+          }
+          const triggerBtn = document.getElementById('btnCompareReport');
+          if (!triggerBtn || typeof triggerBtn.click !== 'function') {
+            setResultError('compareReportResult', '满分优化清单入口不可用。');
+            return false;
+          }
+          triggerBtn.click();
+          if (opts.scrollIntoView) {
+            const panel = document.getElementById('compareReportResult');
+            if (panel && typeof panel.scrollIntoView === 'function') {
+              panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+          }
+          return true;
+        }
         function bindDeleteRowHandlers() {
           const submissionsTable = document.getElementById('submissionsTable');
           if (submissionsTable && !submissionsTable.dataset.deleteBound) {
             submissionsTable.dataset.deleteBound = '1';
             submissionsTable.addEventListener('click', (ev) => {
+              const optimizeBtn = ev.target && ev.target.closest ? ev.target.closest('.js-open-compare-report') : null;
+              if (optimizeBtn) {
+                ev.preventDefault();
+                const projectId = optimizeBtn.getAttribute('data-project-id') || resolveProjectId();
+                triggerOptimizationReportAction(projectId, { scrollIntoView: true });
+                return;
+              }
               const govBtn = ev.target && ev.target.closest ? ev.target.closest('.js-open-feedback-governance') : null;
               if (govBtn) {
                 ev.preventDefault();
@@ -26587,6 +26633,13 @@ def index(
           if (overviewEl && !overviewEl.dataset.govBound) {
             overviewEl.dataset.govBound = '1';
             overviewEl.addEventListener('click', (ev) => {
+              const optimizeBtn = ev.target && ev.target.closest ? ev.target.closest('.js-open-compare-report') : null;
+              if (optimizeBtn) {
+                ev.preventDefault();
+                const projectId = optimizeBtn.getAttribute('data-project-id') || resolveProjectId();
+                triggerOptimizationReportAction(projectId, { scrollIntoView: true });
+                return;
+              }
               const govBtn = ev.target && ev.target.closest ? ev.target.closest('.js-open-feedback-governance') : null;
               if (!govBtn) return;
               ev.preventDefault();
@@ -27134,6 +27187,13 @@ def index(
             ? report.dual_track_summary
             : {};
         }
+        function getSubmissionMaterialUtilizationGate(submission) {
+          const report = getSubmissionReport(submission);
+          const meta = (report && typeof report.meta === 'object') ? report.meta : {};
+          return (meta && typeof meta.material_utilization_gate === 'object')
+            ? meta.material_utilization_gate
+            : {};
+        }
         function submissionAlignmentStatusLabel(status) {
           const raw = String(status || '').trim();
           if (raw === 'approximation_better') return '逼近层更接近青天';
@@ -27148,7 +27208,6 @@ def index(
           const esc = typeof escapeFn === 'function' ? escapeFn : ((v) => String(v == null ? '' : v));
           const flags = getSubmissionScoringFlags(submission);
           if (flags.isPending) return '<span class="note">待评分</span>';
-          if (flags.isBlocked) return '<span class="error">待补资料后重评分</span>';
           const summary = getSubmissionDualTrackSummary(submission);
           const detailTokens = [];
           const independentScore = toFiniteNumber(summary.independent_score);
@@ -27159,15 +27218,24 @@ def index(
           if (qingtianScore != null) detailTokens.push('青天: ' + qingtianScore);
           const scaleLabel = String(summary.scale_label || '').trim();
           if (scaleLabel) detailTokens.push(scaleLabel);
+          const displayTotal100 = toFiniteNumber(summary.display_total_score_100);
+          const scaleMax = Number(summary.scale_max || 100) === 5 ? 5 : 100;
+          if (scaleMax !== 100 && displayTotal100 != null) {
+            detailTokens.push('折算100分口径: ' + displayTotal100);
+          }
           const displayLabel = String(summary.display_score_label || (approximationScore != null ? '逼近分' : '独立分'));
           const displayTotal = summary.display_total_score != null
             ? summary.display_total_score
             : ((submission && submission.total_score != null) ? submission.total_score : null);
           let html = '-';
+          if (flags.isBlocked) {
+            html = '<div class="error">已生成分数，但本施组触发资料利用预警。</div>';
+          }
           if (displayTotal != null) {
-            html = '<div><strong>' + esc(displayLabel + ': ' + displayTotal) + '</strong></div>';
+            const primaryText = displayLabel + ': ' + displayTotal + (scaleMax === 5 ? ' / 5' : '');
+            html += '<div><strong>' + esc(primaryText) + '</strong></div>';
           } else if (detailTokens.length) {
-            html = '<div><strong>' + esc(displayLabel) + '</strong></div>';
+            html += '<div><strong>' + esc(displayLabel) + '</strong></div>';
           }
           if (detailTokens.length) {
             html += '<div class="note">' + esc(detailTokens.join(' / ')) + '</div>';
@@ -27178,8 +27246,11 @@ def index(
           const esc = typeof escapeFn === 'function' ? escapeFn : ((v) => String(v == null ? '' : v));
           const flags = getSubmissionScoringFlags(submission);
           if (flags.isPending) return '<span class="note">待评分后生成双轨诊断。</span>';
-          if (flags.isBlocked) return '<span class="error">资料门禁未通过，建议先补齐资料后重评分。</span>';
           const summary = getSubmissionDualTrackSummary(submission);
+          const utilGate = getSubmissionMaterialUtilizationGate(submission);
+          const gateReasons = Array.isArray(summary.material_gate_reasons) && summary.material_gate_reasons.length
+            ? summary.material_gate_reasons
+            : (Array.isArray(utilGate.reasons) ? utilGate.reasons : []);
           const deltaTokens = [];
           const independentDelta = toFiniteNumber(summary.independent_delta_100);
           const approximationDelta = toFiniteNumber(summary.approximation_delta_100);
@@ -27188,7 +27259,13 @@ def index(
           if (approximationDelta != null) deltaTokens.push('逼近偏差 ' + approximationDelta);
           if (improvement != null) deltaTokens.push('改善 ' + improvement);
           let html = '';
-          if (deltaTokens.length) {
+          if (flags.isBlocked) {
+            html += '<div class="error"><strong>已评分，但本施组对部分项目资料未形成足够证据关联。</strong></div>';
+            if (gateReasons.length) {
+              html += '<div class="error">' + esc(gateReasons.slice(0, 2).join('；')) + '</div>';
+            }
+            html += '<div class="note">这是施组级资料利用预警，不是项目资料未上传。建议先看“满分优化清单”，再决定是否补资料复评。</div>';
+          } else if (deltaTokens.length) {
             html += '<div><strong>' + esc(deltaTokens.join(' / ')) + '</strong><span class="note">（100分口径）</span></div>';
           } else {
             html += '<div class="note">暂无青天对照偏差。</div>';
@@ -27202,7 +27279,7 @@ def index(
             html += '<div class="note">' + esc(governanceHint) + '</div>';
           }
           if (projectId) {
-            html += '<div style="margin-top:6px"><button type="button" class="secondary js-open-feedback-governance" data-project-id="' + esc(String(projectId || '')) + '">查看闭环治理</button></div>';
+            html += '<div style="margin-top:6px"><button type="button" class="secondary js-open-compare-report" data-project-id="' + esc(String(projectId || '')) + '">查看满分优化清单（逐页）</button></div>';
           }
           return html;
         }
@@ -27294,11 +27371,13 @@ def index(
           const esc = typeof escapeFn === 'function' ? escapeFn : ((v) => String(v == null ? '' : v));
           const rows = Array.isArray(submissions) ? submissions : [];
           if (!rows.length) return '';
-          const scoredSummaries = rows
+          const generatedRows = rows
             .filter((row) => {
               const flags = getSubmissionScoringFlags(row);
-              return !flags.isPending && !flags.isBlocked;
-            })
+              return !flags.isPending;
+            });
+          const blockedRows = generatedRows.filter((row) => getSubmissionScoringFlags(row).isBlocked);
+          const scoredSummaries = generatedRows
             .map((row) => getSubmissionDualTrackSummary(row))
             .filter((summary) => summary && typeof summary === 'object');
           const avg = (values) => {
@@ -27318,18 +27397,24 @@ def index(
               ? '当前默认展示逼近分，并保留独立分作审计基线。'
               : '当前默认展示独立分。';
           }
+          if (blockedRows.length) {
+            headline = '已生成评分 ' + scoredSummaries.length + ' 份，其中 ' + blockedRows.length + ' 份触发资料利用预警；分数已保留，建议按满分优化清单补强后复评。';
+          }
           if (improvementAvg != null) {
-            if (improvementAvg > 0) {
-              headline = '逼近层整体上更接近青天，建议继续用治理面板稳态收敛。';
-            } else if (improvementAvg < 0) {
+            if (improvementAvg > 0 && !blockedRows.length) {
+              headline = '逼近层整体上更接近青天，建议继续用评分治理稳态收敛。';
+            } else if (improvementAvg < 0 && !blockedRows.length) {
               headline = '独立层整体上更接近青天，建议先检查闭环样本和校准版本。';
             }
           }
           const metricTokens = [
-            '已评分施组 ' + scoredSummaries.length + ' 份',
+            '已生成评分 ' + scoredSummaries.length + ' 份',
             '双轨样本 ' + approximationRows.length + ' 份',
             '青天对照 ' + qingtianRows.length + ' 份',
           ];
+          if (blockedRows.length) {
+            metricTokens.push('资料利用预警 ' + blockedRows.length + ' 份');
+          }
           const metricSpecs = [
             ['independent_avg', '独立均分', avg(independentRows.map((row) => row.independent_score)), false],
             ['approximation_avg', '逼近均分', avg(approximationRows.map((row) => row.approximation_score)), false],
@@ -27347,7 +27432,8 @@ def index(
           html += '<p style="margin:6px 0 0 0;color:#1f2937">' + esc(headline) + '</p>';
           html += '<p style="margin:6px 0 0 0;font-size:12px;color:#475569">' + esc(metricTokens.join('；')) + '</p>';
           if (projectId) {
-            html += '<div style="margin-top:8px"><button type="button" class="secondary js-open-feedback-governance" data-project-id="' + esc(String(projectId || '')) + '">打开闭环治理面板</button></div>';
+            html += '<div style="margin-top:8px"><button type="button" class="secondary js-open-compare-report" data-project-id="' + esc(String(projectId || '')) + '">查看满分优化清单（逐页）</button></div>';
+            html += '<div style="margin-top:8px"><button type="button" class="secondary js-open-feedback-governance" data-project-id="' + esc(String(projectId || '')) + '">查看评分治理（异常样本/校准/回退）</button></div>';
           }
           return html;
         }
@@ -27552,7 +27638,8 @@ def index(
           const sandboxRows = Array.isArray(sandboxPreview.rows) ? sandboxPreview.rows : [];
           const sandboxErrors = Array.isArray(sandboxPreview.errors) ? sandboxPreview.errors : [];
           const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
-          let html = '<strong>闭环治理面板（异常样本 / few-shot / 回退快照）</strong>';
+          let html = '<strong>评分治理面板（异常样本 / few-shot / 回退快照）</strong>';
+          html += '<p class="note" style="margin:6px 0">用途：处理真实评分闭环中的异常样本、few-shot 采纳/忽略、版本预演与回退；它不是逐页编制优化清单。</p>';
           if (opts.actionMessage) {
             html += '<p class="success" style="margin:6px 0">' + escapeHtmlText(String(opts.actionMessage || '')) + '</p>';
           }
@@ -27854,7 +27941,7 @@ def index(
           const opts = (options && typeof options === 'object') ? options : {};
           const effectiveProjectId = String(projectId || actionProjectId() || '');
           if (!effectiveProjectId) {
-            setResultError('feedbackGovernanceResult', '请先选择项目后再查看闭环治理。');
+            setResultError('feedbackGovernanceResult', '请先选择项目后再查看评分治理。');
             return null;
           }
           if (!opts.suppressLoading) {
@@ -29243,9 +29330,14 @@ def index(
           }
         });
 
+        safeClick('btnOptimizationReport', async () => {
+          if (!ensureProjectForAction('compareReportResult')) return;
+          triggerOptimizationReportAction(actionProjectId(), { scrollIntoView: true });
+        });
+
         safeClick('btnCompareReport', async () => {
           if (!ensureProjectForAction('compareReportResult')) return;
-          setResultLoading('compareReportResult', '对比报告生成中...');
+          setResultLoading('compareReportResult', '满分优化清单生成中...');
           const projectId = actionProjectId();
           const res = await fetch('/api/v1/projects/' + projectId + '/compare_report');
           const data = await res.json().catch(() => ({}));
@@ -29276,7 +29368,8 @@ def index(
               const reason = Array.isArray(awareness.reasons) && awareness.reasons.length ? ('；' + awareness.reasons[0]) : '';
               return '置信度 ' + esc(level) + score + reason;
             };
-            let html = '<p><strong>摘要</strong>: ' + (data.summary || '') + '</p>';
+            let html = '<p class="note">用途：定位低分页码、证据片段、建议改写和验收标准，直接支撑“如何把施组做到更高分”。</p>';
+            html += '<p><strong>摘要</strong>: ' + (data.summary || '') + '</p>';
             if (data.top_submission && data.top_submission.filename)
               html += '<p>最高: ' + data.top_submission.filename + ' — ' + scoreText(data.top_submission) + '；' + confidenceText(data.top_submission) + '</p>';
             if (data.bottom_submission && data.bottom_submission.filename)

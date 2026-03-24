@@ -19,12 +19,19 @@ def build_submission_dual_track_summary(
 ) -> Dict[str, object]:
     main = _main()
     report = submission.get("report") if isinstance(submission.get("report"), dict) else {}
+    report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+    util_gate = (
+        report_meta.get("material_utilization_gate")
+        if isinstance(report_meta.get("material_utilization_gate"), dict)
+        else {}
+    )
     raw_rule_total = main._to_float_or_none(report.get("rule_total_score"))
     if raw_rule_total is None:
         raw_rule_total = main._to_float_or_none(report.get("total_score"))
     raw_pred_total = main._to_float_or_none(report.get("pred_total_score"))
     if not allow_pred_score:
         raw_pred_total = None
+    display_total_score_100 = raw_pred_total if raw_pred_total is not None else raw_rule_total
 
     display_fields = main._resolve_submission_score_fields(
         submission,
@@ -79,7 +86,7 @@ def build_submission_dual_track_summary(
             governance_hint = "逼近层当前更接近青天，可继续沉淀校准样本和 few-shot。"
         elif abs_delta_improvement_100 is not None and abs_delta_improvement_100 < 0:
             alignment_status = "independent_better"
-            governance_hint = "独立层当前更接近青天，建议优先查看闭环治理面板。"
+            governance_hint = "独立层当前更接近青天，建议优先查看评分治理面板。"
         else:
             alignment_status = "tracks_tied"
             governance_hint = "独立层与逼近层当前和青天偏差相当，可继续观察。"
@@ -94,8 +101,11 @@ def build_submission_dual_track_summary(
         "display_score_source": str(display_fields.get("score_source") or "rule"),
         "display_score_label": "逼近分" if raw_pred_total is not None else "独立分",
         "display_total_score": display_fields.get("total_score"),
+        "display_total_score_100": display_total_score_100,
         "independent_score": display_fields.get("rule_total_score"),
+        "independent_score_100": raw_rule_total,
         "approximation_score": display_fields.get("pred_total_score"),
+        "approximation_score_100": raw_pred_total,
         "qingtian_score": float(qingtian_score) if qingtian_score is not None else None,
         "scale_max": int(score_scale_max),
         "scale_label": main._score_scale_label(score_scale_max),
@@ -108,6 +118,15 @@ def build_submission_dual_track_summary(
         "abs_delta_improvement_100": abs_delta_improvement_100,
         "alignment_status": alignment_status,
         "governance_hint": governance_hint,
+        "material_gate_blocked": bool(util_gate.get("blocked")),
+        "material_gate_warned": bool(util_gate.get("warned")),
+        "material_gate_reasons": [
+            str(item).strip()
+            for item in (
+                util_gate.get("reasons") if isinstance(util_gate.get("reasons"), list) else []
+            )
+            if str(item).strip()
+        ][:4],
     }
 
 
@@ -148,7 +167,7 @@ def build_submission_dual_track_overview(
         headline = "当前默认展示逼近分，并保留独立分作审计基线。"
     if improvement_avg is not None:
         if improvement_avg > 0:
-            headline = "逼近层整体上更接近青天，建议继续用治理面板稳态收敛。"
+            headline = "逼近层整体上更接近青天，建议继续用评分治理稳态收敛。"
         elif improvement_avg < 0:
             headline = "独立层整体上更接近青天，建议先检查闭环样本和校准版本。"
 
@@ -187,10 +206,10 @@ def render_submission_dual_track_score_html(
 ) -> str:
     if is_pending:
         return '<span class="note">待评分</span>'
-    if is_blocked:
-        return '<span class="error">待补资料后重评分</span>'
     display_label = str(summary.get("display_score_label") or "独立分")
     display_total = summary.get("display_total_score")
+    display_total_100 = _main()._to_float_or_none(summary.get("display_total_score_100"))
+    scale_max = int(_main()._to_float_or_none(summary.get("scale_max")) or 100)
     detail_tokens: List[str] = []
     independent_score = summary.get("independent_score")
     approximation_score = summary.get("approximation_score")
@@ -204,11 +223,16 @@ def render_submission_dual_track_score_html(
     scale_label = str(summary.get("scale_label") or "").strip()
     if scale_label:
         detail_tokens.append(scale_label)
+    if scale_max != 100 and display_total_100 is not None:
+        detail_tokens.append(f"折算100分口径: {display_total_100}")
     lines: List[str] = []
+    if is_blocked:
+        lines.append('<div class="error">已生成分数，但本施组触发资料利用预警。</div>')
     if display_total is not None:
-        lines.append(
-            "<div><strong>" + html.escape(f"{display_label}: {display_total}") + "</strong></div>"
-        )
+        primary_text = f"{display_label}: {display_total}"
+        if scale_max == 5:
+            primary_text += " / 5"
+        lines.append("<div><strong>" + html.escape(primary_text) + "</strong></div>")
     elif detail_tokens:
         lines.append("<div><strong>" + html.escape(display_label) + "</strong></div>")
     if detail_tokens:
@@ -225,8 +249,6 @@ def render_submission_dual_track_diagnostic_html(
 ) -> str:
     if is_pending:
         return '<span class="note">待评分后生成双轨诊断。</span>'
-    if is_blocked:
-        return '<span class="error">资料门禁未通过，建议先补齐资料再查看偏差诊断。</span>'
 
     alignment_status = str(summary.get("alignment_status") or "").strip()
     alignment_label_map = {
@@ -249,7 +271,27 @@ def render_submission_dual_track_diagnostic_html(
         delta_tokens.append(f"改善 {improvement}")
 
     lines: List[str] = []
-    if delta_tokens:
+    gate_reasons = [
+        str(item).strip()
+        for item in (
+            summary.get("material_gate_reasons")
+            if isinstance(summary.get("material_gate_reasons"), list)
+            else []
+        )
+        if str(item).strip()
+    ]
+    if is_blocked:
+        lines.append(
+            '<div class="error"><strong>已评分，但本施组对部分项目资料未形成足够证据关联。</strong></div>'
+        )
+        if gate_reasons:
+            lines.append(
+                '<div class="error">' + html.escape("；".join(gate_reasons[:2])) + "</div>"
+            )
+        lines.append(
+            '<div class="note">这是施组级资料利用预警，不是项目资料未上传。建议先看“满分优化清单”，再决定是否补资料复评。</div>'
+        )
+    elif delta_tokens:
         lines.append(
             "<div><strong>"
             + html.escape(" / ".join(delta_tokens))
@@ -269,9 +311,9 @@ def render_submission_dual_track_diagnostic_html(
     if project_id:
         lines.append(
             '<div style="margin-top:6px"><button type="button" class="secondary '
-            'js-open-feedback-governance" data-project-id="'
+            'js-open-compare-report" data-project-id="'
             + html.escape(project_id)
-            + '">查看闭环治理</button></div>'
+            + '">查看满分优化清单（逐页）</button></div>'
         )
     return "".join(lines)
 
@@ -284,11 +326,14 @@ def render_submission_dual_track_overview_html(
     if not overview or int(_main()._to_float_or_none(overview.get("submission_count")) or 0) <= 0:
         return ""
 
+    blocked_count = int(_main()._to_float_or_none(overview.get("blocked_count")) or 0)
     metric_tokens: List[str] = [
-        f"已评分施组 {int(_main()._to_float_or_none(overview.get('submission_count')) or 0)} 份",
+        f"已生成评分 {int(_main()._to_float_or_none(overview.get('submission_count')) or 0)} 份",
         f"双轨样本 {int(_main()._to_float_or_none(overview.get('dual_track_count')) or 0)} 份",
         f"青天对照 {int(_main()._to_float_or_none(overview.get('ground_truth_count')) or 0)} 份",
     ]
+    if blocked_count > 0:
+        metric_tokens.append(f"资料利用预警 {blocked_count} 份")
     optional_metrics = [
         ("independent_avg", "独立均分"),
         ("approximation_avg", "逼近均分"),
@@ -306,6 +351,11 @@ def render_submission_dual_track_overview_html(
 
     rendered = "<strong>双轨总览</strong>"
     headline = str(overview.get("headline") or "").strip()
+    if blocked_count > 0:
+        headline = (
+            f"已生成评分 {int(_main()._to_float_or_none(overview.get('submission_count')) or 0)} 份，"
+            f"其中 {blocked_count} 份触发资料利用预警；分数已保留，建议按满分优化清单补强后复评。"
+        )
     if headline:
         rendered += '<p style="margin:6px 0 0 0;color:#1f2937">' + html.escape(headline) + "</p>"
     rendered += (
@@ -316,9 +366,15 @@ def render_submission_dual_track_overview_html(
     if project_id:
         rendered += (
             '<div style="margin-top:8px"><button type="button" class="secondary '
+            'js-open-compare-report" data-project-id="'
+            + html.escape(project_id)
+            + '">查看满分优化清单（逐页）</button></div>'
+        )
+        rendered += (
+            '<div style="margin-top:8px"><button type="button" class="secondary '
             'js-open-feedback-governance" data-project-id="'
             + html.escape(project_id)
-            + '">打开闭环治理面板</button></div>'
+            + '">查看评分治理（异常样本/校准/回退）</button></div>'
         )
     return rendered
 

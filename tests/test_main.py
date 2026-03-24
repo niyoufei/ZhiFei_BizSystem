@@ -533,7 +533,51 @@ class TestIndexEndpoint:
         assert "逼近层整体上更接近青天" in page
         assert "独立: 78.0 / 逼近: 82.0 / 青天: 84.0 / 100分制" in page
         assert "独立偏差 -6.0 / 逼近偏差 -2.0 / 改善 4.0" in page
-        assert "打开闭环治理面板" in page
+        assert "查看满分优化清单（逐页）" in page
+        assert "查看评分治理（异常样本/校准/回退）" in page
+
+    def test_index_renders_blocked_submission_with_score_and_material_warning(self, client):
+        submission = {
+            "id": "s1",
+            "project_id": "p1",
+            "filename": "施工组织设计A.docx",
+            "total_score": 74.65,
+            "report": {
+                "scoring_status": "blocked",
+                "total_score": 74.65,
+                "rule_total_score": 74.65,
+                "meta": {
+                    "material_utilization_gate": {
+                        "blocked": True,
+                        "reasons": ["关键资料未形成证据：图纸"],
+                    }
+                },
+            },
+            "text": "t1",
+            "created_at": "2026-03-16T08:00:00+00:00",
+        }
+        with (
+            patch(
+                "app.main.load_projects",
+                return_value=[{"id": "p1", "name": "测试项目", "meta": {"score_scale_max": 5}}],
+            ),
+            patch("app.main.load_materials", return_value=[]),
+            patch("app.main.load_submissions", return_value=[submission]),
+            patch("app.main.load_qingtian_results", return_value=[]),
+            patch("app.main.load_expert_profiles", return_value=[]),
+            patch("app.main._select_calibrator_model", return_value=None),
+            patch("app.main._build_material_knowledge_profile", return_value={}),
+            patch("app.main._ensure_report_score_self_awareness"),
+        ):
+            response = client.get("/?project_id=p1")
+
+        assert response.status_code == 200
+        page = response.text
+        assert "已生成分数，但本施组触发资料利用预警。" in page
+        assert "这是施组级资料利用预警，不是项目资料未上传。" in page
+        assert "折算100分口径: 74.65" in page
+        assert "查看满分优化清单（逐页）" in page
+        assert "查看评分治理（异常样本/校准/回退）" in page
 
     def test_index_renders_selected_project_material_rows(self, client):
         materials = [
@@ -824,6 +868,7 @@ class TestIndexEndpoint:
         assert response.status_code == 200
         page = response.text
         for button_id in (
+            "btnOptimizationReport",
             "btnCompare",
             "btnCompareReport",
             "btnInsights",
@@ -882,9 +927,11 @@ class TestIndexEndpoint:
         assert "btnUploadSitePhotos: { resultId: 'materialsActionStatusPhoto'" in page
         assert "btnUploadShigong: { resultId: 'shigongActionStatus'" in page
         assert "btnScoreShigong: { resultId: 'shigongActionStatus'" in page
+        assert 'id="btnOptimizationReport" class="secondary">满分优化清单（逐页）</button>' in page
         assert "safeClick('btnUploadMaterials', uploadMaterialsAction);" not in page
         assert "safeClick('btnUploadShigong', uploadShigongAction);" not in page
         assert "safeClick('btnScoreShigong', scoreShigongAction);" not in page
+        assert "safeClick('btnOptimizationReport'" in page
         assert "function captureViewportY()" not in page
         assert "function restoreViewportY(y)" not in page
         assert "let uploadShigongInFlight = false;" in page
@@ -895,6 +942,7 @@ class TestIndexEndpoint:
         assert "await waitForNextPaint();" in page
         assert "function waitForNextPaint()" in page
         assert "function upsertSubmissionRowsImmediately(projectId, submissions)" in page
+        assert "function triggerOptimizationReportAction(projectId='', options=null)" in page
         assert "function describeSelectedFiles(files, emptyText = '未选择任何文件')" in page
         assert (
             "function updateFilePickerText(inputId, textId, emptyText = '未选择任何文件')" in page
@@ -5674,6 +5722,64 @@ class TestCompareEndpoints:
         assert data["project_id"] == "p1"
 
     @patch("app.main.build_compare_narrative")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_compare_report_includes_blocked_generated_scores(
+        self,
+        mock_ensure,
+        mock_load,
+        mock_narrative,
+        client,
+    ):
+        mock_load.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "blocked.pdf",
+                "total_score": 74.65,
+                "report": {
+                    "scoring_status": "blocked",
+                    "total_score": 74.65,
+                    "rule_total_score": 74.65,
+                    "meta": {
+                        "material_utilization_gate": {
+                            "blocked": True,
+                            "reasons": ["关键资料未形成证据：图纸"],
+                        }
+                    },
+                },
+            },
+            {
+                "id": "s2",
+                "project_id": "p1",
+                "filename": "scored.pdf",
+                "total_score": 82.0,
+                "report": {
+                    "scoring_status": "scored",
+                    "total_score": 82.0,
+                    "rule_total_score": 82.0,
+                },
+            },
+        ]
+
+        def _fake_narrative(rows):
+            row_map = {str(row.get("id")): row for row in rows}
+            assert "s1" in row_map
+            assert "s2" in row_map
+            return {
+                "summary": "ok",
+                "top_submission": {"id": "s2", "filename": "scored.pdf", "total_score": 82.0},
+                "bottom_submission": {"id": "s1", "filename": "blocked.pdf", "total_score": 74.65},
+                "key_diffs": [],
+            }
+
+        mock_narrative.side_effect = _fake_narrative
+        response = client.get("/api/v1/projects/p1/compare_report")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["bottom_submission"]["filename"] == "blocked.pdf"
+
+    @patch("app.main.build_compare_narrative")
     @patch("app.main.load_calibration_models")
     @patch("app.main.load_projects")
     @patch("app.main.load_submissions")
@@ -5772,6 +5878,34 @@ class TestCompareEndpoints:
         response = client.get("/api/v1/projects/p1/compare")
         assert response.status_code == 404
         assert "请先点击“评分施组”" in response.json()["detail"]
+
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_compare_includes_blocked_generated_scores(self, mock_ensure, mock_load, client):
+        mock_load.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "blocked.pdf",
+                "total_score": 74.65,
+                "report": {
+                    "scoring_status": "blocked",
+                    "total_score": 74.65,
+                    "rule_total_score": 74.65,
+                    "meta": {
+                        "material_utilization_gate": {
+                            "blocked": True,
+                            "reasons": ["关键资料未形成证据：图纸"],
+                        }
+                    },
+                },
+            }
+        ]
+
+        response = client.get("/api/v1/projects/p1/compare")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["rankings"][0]["filename"] == "blocked.pdf"
 
 
 class TestEvidenceTraceEndpoints:

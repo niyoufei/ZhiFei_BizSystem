@@ -183,6 +183,7 @@ def build_selected_project_submission_render_context(
     )
     rows_html: List[str] = []
     dual_track_overview_rows: List[Dict[str, object]] = []
+    blocked_overview_count = 0
     for view in bundle["submissions_view"]:
         report_obj = view.get("report")
         report = report_obj if isinstance(report_obj, dict) else {}
@@ -195,24 +196,21 @@ def build_selected_project_submission_render_context(
             if isinstance(report.get("dual_track_summary"), dict)
             else {}
         )
-        if not is_pending and not is_blocked and dual_track_summary:
+        if not is_pending and dual_track_summary:
             dual_track_overview_rows.append(dual_track_summary)
+            if is_blocked:
+                blocked_overview_count += 1
         score_cell = qingtian_dual_track_module.render_submission_dual_track_score_html(
             dual_track_summary,
             is_pending=is_pending,
             is_blocked=is_blocked,
         )
-        if is_pending:
-            diagnostic_cell = '<span class="note">待评分后生成双轨诊断。</span>'
-        elif is_blocked:
-            diagnostic_cell = '<span class="error">资料门禁未通过，建议先补齐资料后重评分。</span>'
-        else:
-            diagnostic_cell = (
-                qingtian_dual_track_module.render_submission_dual_track_diagnostic_html(
-                    dual_track_summary,
-                    project_id=project_id,
-                )
-            )
+        diagnostic_cell = qingtian_dual_track_module.render_submission_dual_track_diagnostic_html(
+            dual_track_summary,
+            project_id=project_id,
+            is_pending=is_pending,
+            is_blocked=is_blocked,
+        )
 
         util_gate = (
             report_meta.get("material_utilization_gate")
@@ -334,10 +332,12 @@ def build_selected_project_submission_render_context(
     overview_html = ""
     overview_display = "none"
     if dual_track_overview_rows:
+        overview_payload = qingtian_dual_track_module.build_submission_dual_track_overview(
+            dual_track_overview_rows
+        )
+        overview_payload["blocked_count"] = blocked_overview_count
         overview_html = qingtian_dual_track_module.render_submission_dual_track_overview_html(
-            qingtian_dual_track_module.build_submission_dual_track_overview(
-                dual_track_overview_rows
-            ),
+            overview_payload,
             project_id=project_id,
         )
         overview_display = "block" if overview_html else "none"
