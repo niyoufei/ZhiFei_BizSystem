@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -16,6 +17,8 @@ if str(ROOT) not in sys.path:
 def to_markdown(payload: Dict[str, Any]) -> str:
     overall = payload.get("overall") or {}
     settings = payload.get("settings") or {}
+    runtime = payload.get("runtime") or {}
+    agent_names = payload.get("expected_agent_names") or []
     lines = [
         "# Ops Agents Status",
         "",
@@ -31,19 +34,17 @@ def to_markdown(payload: Dict[str, Any]) -> str:
         f"- min_evolve_samples: `{settings.get('min_evolve_samples')}`",
         f"- timeout_seconds: `{settings.get('timeout_seconds')}`",
         "",
+        "## Runtime",
+        f"- cycle: `{runtime.get('cycle')}`",
+        f"- interval_seconds: `{runtime.get('interval_seconds')}`",
+        f"- launcher: `{runtime.get('launcher')}`",
+        f"- pid: `{runtime.get('pid')}`",
+        "",
         "## Agents",
     ]
 
     agents = payload.get("agents") or {}
-    for name in (
-        "sre_watchdog",
-        "data_hygiene",
-        "project_flow",
-        "tender_project_flow",
-        "upload_flow",
-        "scoring_quality",
-        "evolution",
-    ):
+    for name in agent_names:
         row = agents.get(name) or {}
         lines.append(
             f"- `{name}`: status={row.get('status', '-')}, duration_ms={row.get('duration_ms', '-')}"
@@ -106,6 +107,13 @@ def main() -> int:
             timeout=max(2.0, float(args.timeout_seconds)),
             max_workers=max(1, int(args.max_workers)),
         )
+        payload["runtime"] = {
+            "cycle": cycles,
+            "interval_seconds": float(args.interval_seconds),
+            "max_cycles": int(args.max_cycles),
+            "pid": os.getpid(),
+            "launcher": os.environ.get("OPS_AGENTS_LAUNCHER", "direct"),
+        }
         write_outputs(payload, output_json=output_json, output_md=output_md)
         overall_status = str((payload.get("overall") or {}).get("status") or "fail")
         print(

@@ -11,6 +11,17 @@ from urllib.parse import urlparse
 
 OPS_AUDIT_PREPARATION_STATUSES = {"scoring_preparation", "draft", "created"}
 OPS_AUDIT_SYNTHETIC_PREFIXES = ("ops_", "ops招标项目_", "e2e_")
+OPS_AGENT_NAMES = (
+    "sre_watchdog",
+    "data_hygiene",
+    "project_flow",
+    "tender_project_flow",
+    "upload_flow",
+    "scoring_quality",
+    "evolution",
+)
+OPS_AGENT_DEFAULT_INTERVAL_SECONDS = 60.0
+OPS_AGENT_STALE_GRACE_SECONDS = 90.0
 
 
 def _now_iso() -> str:
@@ -208,6 +219,43 @@ def _status(pass_flag: bool, warn_flag: bool = False) -> str:
     if warn_flag:
         return "warn"
     return "fail"
+
+
+def _placeholder_agent(name: str, message: str) -> Dict[str, Any]:
+    return {
+        "name": name,
+        "status": "fail",
+        "duration_ms": 0,
+        "checks": {},
+        "actions": {},
+        "metrics": {},
+        "recommendations": [message],
+    }
+
+
+def _ensure_agent_coverage(agents: Dict[str, Dict[str, Any]], *, reason: str) -> List[str]:
+    missing = [name for name in OPS_AGENT_NAMES if name not in agents]
+    for name in missing:
+        agents[name] = _placeholder_agent(name, reason)
+    return missing
+
+
+def ops_agents_snapshot_is_stale(
+    generated_at: Any,
+    *,
+    now: Optional[datetime] = None,
+    interval_seconds: Optional[float] = None,
+    grace_seconds: float = OPS_AGENT_STALE_GRACE_SECONDS,
+) -> bool:
+    generated = _parse_iso_datetime(generated_at)
+    if generated is None:
+        return True
+    current = now or datetime.now(timezone.utc)
+    interval = max(1.0, float(interval_seconds or OPS_AGENT_DEFAULT_INTERVAL_SECONDS))
+    grace = max(30.0, float(grace_seconds))
+    age_seconds = max(0.0, (current - generated).total_seconds())
+    stale_after = max(interval * 2.0, interval + grace)
+    return age_seconds > stale_after
 
 
 def _run_sre_watchdog(
@@ -1108,60 +1156,8 @@ def run_ops_agents_cycle(
 
     agents: Dict[str, Dict[str, Any]] = {"sre_watchdog": sre}
     if sre.get("status") == "fail":
-        agents["data_hygiene"] = {
-            "name": "data_hygiene",
-            "status": "fail",
-            "duration_ms": 0,
-            "checks": {},
-            "actions": {},
-            "metrics": {},
-            "recommendations": ["SRE未恢复服务，跳过本轮执行。"],
-        }
-        agents["project_flow"] = {
-            "name": "project_flow",
-            "status": "fail",
-            "duration_ms": 0,
-            "checks": {},
-            "actions": {},
-            "metrics": {},
-            "recommendations": ["SRE未恢复服务，跳过本轮执行。"],
-        }
-        agents["tender_project_flow"] = {
-            "name": "tender_project_flow",
-            "status": "fail",
-            "duration_ms": 0,
-            "checks": {},
-            "actions": {},
-            "metrics": {},
-            "recommendations": ["SRE未恢复服务，跳过本轮执行。"],
-        }
-        agents["upload_flow"] = {
-            "name": "upload_flow",
-            "status": "fail",
-            "duration_ms": 0,
-            "checks": {},
-            "actions": {},
-            "metrics": {},
-            "recommendations": ["SRE未恢复服务，跳过本轮执行。"],
-        }
-        agents["scoring_quality"] = {
-            "name": "scoring_quality",
-            "status": "fail",
-            "duration_ms": 0,
-            "checks": {},
-            "actions": {},
-            "metrics": {},
-            "recommendations": ["SRE未恢复服务，跳过本轮执行。"],
-        }
-        agents["evolution"] = {
-            "name": "evolution",
-            "status": "fail",
-            "duration_ms": 0,
-            "checks": {},
-            "actions": {},
-            "metrics": {},
-            "recommendations": ["SRE未恢复服务，跳过本轮执行。"],
-        }
+        for name in OPS_AGENT_NAMES[1:]:
+            agents[name] = _placeholder_agent(name, "SRE未恢复服务，跳过本轮执行。")
     else:
         agents["data_hygiene"] = _run_data_hygiene_agent(
             base_url=base_url,
@@ -1243,17 +1239,24 @@ def run_ops_agents_cycle(
                 try:
                     agents[name] = future.result()
                 except Exception as exc:  # noqa: BLE001
-                    agents[name] = {
-                        "name": name,
-                        "status": "fail",
-                        "duration_ms": 0,
-                        "checks": {},
-                        "actions": {},
-                        "metrics": {},
-                        "recommendations": [f"agent_exception: {type(exc).__name__}: {exc}"],
-                    }
+                    agents[name] = _placeholder_agent(
+                        name, f"agent_exception: {type(exc).__name__}: {exc}"
+                    )
 
-    statuses = [str(row.get("status") or "fail") for row in agents.values()]
+    missing_agent_names = _ensure_agent_coverage(
+        agents, reason="agent coverage gap detected; this watchdog cycle is incomplete."
+    )
+    if missing_agent_names:
+        coverage_msg = (
+            "ops_agents 覆盖缺口：缺少 "
+            + ", ".join(missing_agent_names)
+            + "，本轮巡检已按 fail 处理。"
+        )
+        for name in missing_agent_names:
+            agents[name]["recommendations"] = [coverage_msg]
+
+    ordered_agents = {name: agents[name] for name in OPS_AGENT_NAMES}
+    statuses = [str(row.get("status") or "fail") for row in ordered_agents.values()]
     fail_count = sum(1 for s in statuses if s == "fail")
     warn_count = sum(1 for s in statuses if s == "warn")
     pass_count = sum(1 for s in statuses if s == "pass")
@@ -1264,7 +1267,7 @@ def run_ops_agents_cycle(
         overall_status = "warn"
 
     recommendations: List[str] = []
-    for row in agents.values():
+    for row in ordered_agents.values():
         for text in row.get("recommendations") or []:
             msg = str(text).strip()
             if msg and msg not in recommendations:
@@ -1273,7 +1276,9 @@ def run_ops_agents_cycle(
     return {
         "generated_at": _now_iso(),
         "base_url": base_url,
-        "agent_count": 7,
+        "agent_count": len(OPS_AGENT_NAMES),
+        "expected_agent_names": list(OPS_AGENT_NAMES),
+        "missing_agent_names": missing_agent_names,
         "settings": {
             "auto_repair": bool(auto_repair),
             "auto_evolve": bool(auto_evolve),
@@ -1288,6 +1293,6 @@ def run_ops_agents_cycle(
             "fail_count": fail_count,
             "duration_ms": int((time.monotonic() - cycle_started) * 1000),
         },
-        "agents": agents,
+        "agents": ordered_agents,
         "recommendations": recommendations[:20],
     }

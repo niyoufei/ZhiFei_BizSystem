@@ -128,7 +128,56 @@ def test_run_ops_agents_cycle_warn_from_sub_agents(monkeypatch):
     assert result["overall"]["warn_count"] == 1
     assert result["overall"]["fail_count"] == 0
     assert "quality watch" in result["recommendations"]
-    assert result["agent_count"] == 7
+    assert result["agent_count"] == len(oa.OPS_AGENT_NAMES)
+    assert result["expected_agent_names"] == list(oa.OPS_AGENT_NAMES)
+    assert result["missing_agent_names"] == []
+
+
+def test_ensure_agent_coverage_backfills_missing_agents():
+    agents = {
+        "sre_watchdog": {
+            "name": "sre_watchdog",
+            "status": "pass",
+            "duration_ms": 1,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": [],
+        }
+    }
+
+    missing = oa._ensure_agent_coverage(agents, reason="coverage gap")
+
+    assert "sre_watchdog" not in missing
+    assert set(missing) == set(oa.OPS_AGENT_NAMES[1:])
+    for name in oa.OPS_AGENT_NAMES[1:]:
+        assert agents[name]["status"] == "fail"
+        assert agents[name]["recommendations"] == ["coverage gap"]
+
+
+def test_ops_agents_snapshot_is_stale_uses_interval_window():
+    now = datetime(2026, 3, 24, 12, 0, tzinfo=timezone.utc)
+    fresh = (now - timedelta(seconds=100)).isoformat()
+    stale = (now - timedelta(seconds=181)).isoformat()
+
+    assert (
+        oa.ops_agents_snapshot_is_stale(
+            fresh,
+            now=now,
+            interval_seconds=90,
+            grace_seconds=30,
+        )
+        is False
+    )
+    assert (
+        oa.ops_agents_snapshot_is_stale(
+            stale,
+            now=now,
+            interval_seconds=90,
+            grace_seconds=30,
+        )
+        is True
+    )
 
 
 def test_scoring_quality_treats_preparation_critical_as_non_failure():
