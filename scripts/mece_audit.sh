@@ -9,6 +9,11 @@ API_KEY="${API_KEY:-}"
 STRICT="${STRICT:-0}"
 OUT_JSON="${OUT_JSON:-$ROOT_DIR/build/mece_audit_latest.json}"
 OUT_MD="${OUT_MD:-$ROOT_DIR/build/mece_audit_latest.md}"
+MAX_RETRIES="${MAX_RETRIES:-3}"
+RETRY_FLOOR_SECONDS="${RETRY_FLOOR_SECONDS:-2}"
+BATCH_SIZE="${BATCH_SIZE:-10}"
+BATCH_SLEEP_SECONDS="${BATCH_SLEEP_SECONDS:-2}"
+HEALTH_WAIT_SECONDS="${HEALTH_WAIT_SECONDS:-20}"
 
 if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
   PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
@@ -19,12 +24,45 @@ if [[ -z "$API_KEY" ]]; then
   API_KEY="$("$PYTHON_BIN" "$ROOT_DIR/scripts/resolve_api_key.py" --preferred-role ops --fallback-role admin 2>/dev/null || true)"
 fi
 
+host_port="$(python3 - "$BASE_URL" <<'PY'
+import sys
+from urllib.parse import urlparse
+
+u = urlparse(sys.argv[1])
+host = (u.hostname or "").strip().lower()
+port = u.port or (443 if u.scheme == "https" else 80)
+print(f"{host}:{port}")
+PY
+)"
+BASE_HOST="${host_port%%:*}"
+IS_LOCAL_BASE=0
+if [[ "$BASE_HOST" == "127.0.0.1" || "$BASE_HOST" == "localhost" || "$BASE_HOST" == "::1" ]]; then
+  IS_LOCAL_BASE=1
+fi
+
+AUTH_HEADER_VALUE=""
+if [[ -n "$API_KEY" && "$IS_LOCAL_BASE" != "1" ]]; then
+  AUTH_HEADER_VALUE="$API_KEY"
+fi
+
 curl_with_auth() {
-  if [[ -n "$API_KEY" ]]; then
-    curl -fsS -H "X-API-Key: $API_KEY" "$@"
+  if [[ -n "$AUTH_HEADER_VALUE" ]]; then
+    curl -fsS -H "X-API-Key: $AUTH_HEADER_VALUE" "$@"
   else
     curl -fsS "$@"
   fi
+}
+
+wait_for_health() {
+  local waited=0
+  while (( waited < HEALTH_WAIT_SECONDS )); do
+    if curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
 }
 
 tmp_dir="$(mktemp -d)"
@@ -59,13 +97,76 @@ PY
 
 project_count=0
 api_fail_count=0
+rate_limit_retry_count=0
+
+fetch_project_audit() {
+  local pid="$1"
+  local out_file="$2"
+  local attempt=1
+
+  while true; do
+    local header_file="$tmp_dir/mece_${pid}_${attempt}.headers"
+    local body_file="$tmp_dir/mece_${pid}_${attempt}.body"
+    local http_code
+    if [[ -n "$AUTH_HEADER_VALUE" ]]; then
+      http_code="$(
+        curl -sS -D "$header_file" -o "$body_file" -w "%{http_code}" \
+          -H "X-API-Key: $AUTH_HEADER_VALUE" \
+          "$BASE_URL/api/v1/projects/$pid/mece_audit" || true
+      )"
+    else
+      http_code="$(
+        curl -sS -D "$header_file" -o "$body_file" -w "%{http_code}" \
+          "$BASE_URL/api/v1/projects/$pid/mece_audit" || true
+      )"
+    fi
+
+    if [[ "$http_code" == "200" ]]; then
+      mv "$body_file" "$out_file"
+      return 0
+    fi
+
+    if [[ ( -z "$http_code" || "$http_code" == "000" ) && "$attempt" -lt "$MAX_RETRIES" ]]; then
+      echo "[mece] WARN: project_id=$pid connection interrupted, waiting for health recovery (attempt ${attempt}/${MAX_RETRIES})"
+      if wait_for_health; then
+        attempt=$((attempt + 1))
+        continue
+      fi
+    fi
+
+    if [[ "$http_code" == "429" && "$attempt" -lt "$MAX_RETRIES" ]]; then
+      local retry_after
+      retry_after="$(
+        awk 'BEGIN{IGNORECASE=1} /^Retry-After:/ {gsub(/\r/, "", $2); print $2; exit}' \
+          "$header_file" 2>/dev/null || true
+      )"
+      if [[ ! "$retry_after" =~ ^[0-9]+$ ]]; then
+        retry_after="$RETRY_FLOOR_SECONDS"
+      fi
+      echo "[mece] WARN: project_id=$pid hit 429, retry after ${retry_after}s (attempt ${attempt}/${MAX_RETRIES})"
+      rate_limit_retry_count=$((rate_limit_retry_count + 1))
+      sleep "$retry_after"
+      attempt=$((attempt + 1))
+      continue
+    fi
+
+    mv "$body_file" "$out_file.failed" 2>/dev/null || true
+    return 1
+  done
+}
+
 while IFS= read -r pid; do
   [[ -z "$pid" ]] && continue
   project_count=$((project_count + 1))
   out_file="$tmp_dir/mece_${pid}.json"
-  if ! curl_with_auth "$BASE_URL/api/v1/projects/$pid/mece_audit" >"$out_file"; then
+  if ! fetch_project_audit "$pid" "$out_file"; then
     echo "[mece] WARN: audit failed for project_id=$pid"
     api_fail_count=$((api_fail_count + 1))
+  fi
+  if [[ "$BATCH_SIZE" =~ ^[0-9]+$ ]] && [[ "$BATCH_SLEEP_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    if (( BATCH_SIZE > 0 )) && (( project_count % BATCH_SIZE == 0 )); then
+      sleep "$BATCH_SLEEP_SECONDS"
+    fi
   fi
 done <"$tmp_dir/project_ids.txt"
 
@@ -168,6 +269,10 @@ if [[ "$api_fail_count" -gt 0 ]]; then
     echo "[mece] strict mode enabled, treat audit request failure as error."
     exit 1
   fi
+fi
+
+if [[ "$rate_limit_retry_count" -gt 0 ]]; then
+  echo "[mece] INFO: rate limit retries used=${rate_limit_retry_count}"
 fi
 
 echo "[mece] PASS"
