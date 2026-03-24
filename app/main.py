@@ -6034,6 +6034,7 @@ def _build_project_scoring_diagnostic(
         material_depth=material_depth,
         material_knowledge=material_knowledge,
         readiness=readiness,
+        latest_submission=latest_submission,
         basis_util=basis_util,
         basis_retrieval=basis_retrieval,
         conflict_summary=conflict_summary,
@@ -22518,6 +22519,7 @@ def index(
         .upload-zone { border:1px solid var(--border); border-radius:12px; background:#f8fafc; padding:12px; }
         .upload-zone[data-health="missing"], .upload-zone[data-health="uploaded_unparsed"] { border-color:#dc2626; background:#fef2f2; box-shadow:0 0 0 1px rgba(220,38,38,0.08); }
         .upload-zone[data-health="parsed_not_used"] { border-color:#d97706; background:#fff7ed; box-shadow:0 0 0 1px rgba(217,119,6,0.08); }
+        .upload-zone[data-health="parsed_ready"] { border-color:#2563eb; background:#eff6ff; box-shadow:0 0 0 1px rgba(37,99,235,0.08); }
         .upload-zone[data-health="active"] { border-color:#16a34a; background:#f0fdf4; box-shadow:0 0 0 1px rgba(22,163,74,0.08); }
         .upload-zone h4 { margin:0 0 8px 0; font-size:18px; color:#1e293b; }
         .upload-zone-state { margin:8px 0 0 0; font-size:12px; color:#64748b; min-height:1.2em; line-height:1.5; }
@@ -24868,6 +24870,8 @@ def index(
 
         let projectSwitchSeq = 0;
         let materialParsePollTimer = null;
+        let projectAutoRefreshTimer = null;
+        const PROJECT_AUTO_REFRESH_INTERVAL_MS = 5000;
         function selectedProjectIdStrict() {
           const sel = document.getElementById('projectSelect');
           return (sel && sel.value) ? String(sel.value) : '';
@@ -24882,6 +24886,33 @@ def index(
             clearTimeout(materialParsePollTimer);
             materialParsePollTimer = null;
           }
+        }
+        function clearProjectAutoRefresh() {
+          if (projectAutoRefreshTimer) {
+            clearTimeout(projectAutoRefreshTimer);
+            projectAutoRefreshTimer = null;
+          }
+        }
+        function scheduleProjectAutoRefresh(projectId, switchSeq) {
+          clearProjectAutoRefresh();
+          if (!projectId || isStaleProjectResponse(projectId, switchSeq)) return;
+          if (document.visibilityState === 'hidden') return;
+          projectAutoRefreshTimer = setTimeout(async () => {
+            if (document.visibilityState === 'hidden') {
+              scheduleProjectAutoRefresh(projectId, switchSeq);
+              return;
+            }
+            if (isStaleProjectResponse(projectId, switchSeq)) return;
+            try {
+              if (typeof refreshMaterials === 'function') await refreshMaterials(projectId, switchSeq);
+              if (typeof refreshSubmissions === 'function') await refreshSubmissions(projectId, switchSeq);
+              if (typeof refreshScoringDiagnostic === 'function') await refreshScoringDiagnostic(projectId, switchSeq);
+            } finally {
+              if (!isStaleProjectResponse(projectId, switchSeq)) {
+                scheduleProjectAutoRefresh(projectId, switchSeq);
+              }
+            }
+          }, PROJECT_AUTO_REFRESH_INTERVAL_MS);
         }
         function materialParseBackendLabel(backend) {
           const raw = String(backend || '').trim();
@@ -25012,6 +25043,7 @@ def index(
         function resetProjectPanelsToStandby(projectId) {
           const hasProject = !!projectId;
           clearMaterialParsePolling();
+          clearProjectAutoRefresh();
           setTableStandby(
             'materialsTable',
             'materialsEmpty',
@@ -25737,6 +25769,7 @@ def index(
           ]);
           if (isStaleProjectResponse(selectedId, switchSeq)) return;
           setSelectMsg('已切换项目并自动刷新下方所有区域。', false);
+          scheduleProjectAutoRefresh(selectedId, switchSeq);
         }
         const elRefresh = document.getElementById('refreshProjects');
         if (elRefresh) elRefresh.onclick = refreshProjects;
@@ -28189,6 +28222,16 @@ def index(
               text += '；请点击重新解析';
               if (parseErrorPreview.length) text += '；最近错误 ' + String(parseErrorPreview[0] || '');
               stateEl.style.color = '#991b1b';
+            } else if (status === 'parsed_ready') {
+              if (statusLabel.indexOf('待施组') >= 0) {
+                text += '；解析已完成，待上传施组后自动进入评分证据链';
+              } else {
+                text += '；解析已完成，待完成评分后自动进入评分证据链';
+              }
+              if (projectNumericCategorySummary.length) text += '；已提取 ' + String(projectNumericCategorySummary[0] || '');
+              if (missingNumericCount > 0) text += '；建议补充数值锚点 ' + String(missingNumericCount) + ' 项';
+              if (missingNumericCategorySummary.length) text += '；重点缺口 ' + String(missingNumericCategorySummary[0] || '');
+              stateEl.style.color = '#1d4ed8';
             } else if (status === 'parsed_not_used') {
               text += '；已解析但尚未进入评分证据链';
               if (missingNumericCount > 0) text += '；建议补充数值锚点 ' + String(missingNumericCount) + ' 项';
@@ -28839,6 +28882,7 @@ def index(
             const typeTone = (status) => {
               const s = String(status || '');
               if (s === 'active') return { border: '#16a34a', bg: '#f0fdf4', title: '#166534' };
+              if (s === 'parsed_ready') return { border: '#2563eb', bg: '#eff6ff', title: '#1d4ed8' };
               if (s === 'processing') return { border: '#d97706', bg: '#fff7ed', title: '#92400e' };
               if (s === 'queued') return { border: '#94a3b8', bg: '#f8fafc', title: '#475569' };
               if (s === 'failed') return { border: '#dc2626', bg: '#fef2f2', title: '#991b1b' };
@@ -30162,6 +30206,22 @@ def index(
         if (typeof window.applySecureDesktopUiGuards === 'function') {
           window.applySecureDesktopUiGuards();
         }
+        document.addEventListener('visibilitychange', () => {
+          if (document.visibilityState === 'hidden') {
+            clearMaterialParsePolling();
+            clearProjectAutoRefresh();
+            return;
+          }
+          const currentId = selectedProjectIdStrict();
+          if (!currentId) return;
+          scheduleProjectAutoRefresh(currentId, projectSwitchSeq);
+          if (typeof refreshMaterials === 'function') refreshMaterials(currentId, projectSwitchSeq);
+          if (typeof refreshScoringDiagnostic === 'function') refreshScoringDiagnostic(currentId, projectSwitchSeq);
+        });
+        window.addEventListener('beforeunload', () => {
+          clearMaterialParsePolling();
+          clearProjectAutoRefresh();
+        });
         refreshAuthStatusUi().finally(() => refreshProjects());
 
       </script>

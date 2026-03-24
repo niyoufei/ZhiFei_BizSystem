@@ -281,6 +281,85 @@ def test_build_material_type_cards_summarizes_material_signals_and_missing_requi
     assert "缺少工程量清单" in boq["guidance"][0]
 
 
+def test_build_material_type_cards_marks_parsed_materials_waiting_for_score():
+    cards = build_material_type_cards(
+        material_rows=[
+            {
+                "material_type": "drawing",
+                "filename": "总图.dxf",
+                "parse_status": "parsed",
+                "parse_backend": "local",
+                "parse_confidence": 0.86,
+            }
+        ],
+        material_depth={
+            "depth_gate": {"enforce": True},
+            "by_type": [
+                {
+                    "material_type": "drawing",
+                    "files": 1,
+                    "parsed_chars": 3200,
+                    "parsed_chunks": 4,
+                    "numeric_terms": 3,
+                    "meets_chars": True,
+                    "meets_chunks": True,
+                    "meets_numeric_terms": False,
+                }
+            ],
+        },
+        material_knowledge={
+            "by_type": [
+                {
+                    "material_type": "drawing",
+                    "top_numeric_terms": ["10", "11"],
+                    "top_terms": ["节点", "偏差"],
+                    "top_dimensions": [{"dimension_id": "14"}],
+                    "structured_quality_score": 0.55,
+                    "structured_quality_max": 0.72,
+                    "structured_quality_signal_coverage": 0.61,
+                }
+            ]
+        },
+        readiness={"material_gate": {"required_types": ["drawing"]}},
+        latest_submission={
+            "exists": True,
+            "is_scored": False,
+            "scoring_status": "pending",
+        },
+        basis_util={
+            "available_types": ["drawing"],
+            "by_type": {
+                "drawing": {
+                    "retrieval_total": 0,
+                    "retrieval_hit": 0,
+                    "consistency_total": 0,
+                    "consistency_hit": 0,
+                    "fallback_total": 0,
+                    "fallback_hit": 0,
+                }
+            },
+        },
+        basis_retrieval={"preview": [], "consistency_preview": []},
+        conflict_summary={"conflicts": []},
+        requirement_hits=[],
+        context=MaterialCardContext(
+            normalize_material_type=_normalize_material_type,
+            normalize_numeric_token=_normalize_numeric_token,
+            classify_numeric_anchor_category=_classify_numeric_anchor_category,
+            append_numeric_anchor_bucket=_append_numeric_anchor_bucket,
+            build_numeric_anchor_category_summary=_build_numeric_anchor_category_summary,
+            material_type_label=_material_type_label,
+            to_float_or_none=_to_float_or_none,
+        ),
+    )
+
+    drawing = next(item for item in cards if item["material_type"] == "drawing")
+
+    assert drawing["status"] == "parsed_ready"
+    assert drawing["status_label"] == "已解析待评分"
+    assert drawing["guidance"][0] == "图纸已解析，待完成施组评分后自动进入证据链。"
+
+
 def test_build_project_scoring_summary_and_recommendations():
     summary = build_project_scoring_summary(
         readiness={"ready": True, "gate_passed": True},

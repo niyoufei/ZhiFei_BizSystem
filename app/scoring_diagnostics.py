@@ -313,6 +313,7 @@ def build_material_type_cards(
     material_depth: Dict[str, object],
     material_knowledge: Dict[str, object],
     readiness: Dict[str, object],
+    latest_submission: Optional[Dict[str, object]] = None,
     basis_util: Dict[str, object],
     basis_retrieval: Dict[str, object],
     conflict_summary: Dict[str, object],
@@ -360,6 +361,9 @@ def build_material_type_cards(
         if isinstance(basis_util.get("available_types"), list)
         else []
     )
+    latest_submission = latest_submission if isinstance(latest_submission, dict) else {}
+    latest_submission_exists = bool(latest_submission.get("exists"))
+    latest_submission_scored = bool(latest_submission.get("is_scored"))
     normalized_required_types = {
         context.normalize_material_type(item)
         for item in required_types
@@ -594,6 +598,18 @@ def build_material_type_cards(
             status = "active"
             status_label = "已参与评分"
             guidance.append(f"{context.material_type_label(mat_type)}已进入评分证据链。")
+        elif latest_submission_exists and not latest_submission_scored:
+            status = "parsed_ready"
+            status_label = "已解析待评分"
+            guidance.append(
+                f"{context.material_type_label(mat_type)}已解析，待完成施组评分后自动进入证据链。"
+            )
+        elif not latest_submission_exists:
+            status = "parsed_ready"
+            status_label = "已解析待施组"
+            guidance.append(
+                f"{context.material_type_label(mat_type)}已解析，待上传施组后自动进入评分证据链。"
+            )
         else:
             status = "parsed_not_used"
             status_label = "已解析未命中"

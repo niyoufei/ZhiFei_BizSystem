@@ -768,7 +768,11 @@ class TestIndexEndpoint:
         assert "function clearMaterialParsePolling" in page
         assert "function applyMaterialParseZoneState" in page
         assert "function scheduleMaterialParsePolling" in page
+        assert "function scheduleProjectAutoRefresh" in page
+        assert "PROJECT_AUTO_REFRESH_INTERVAL_MS" in page
+        assert "visibilitychange" in page
         assert "/materials/parse_status" in page
+        assert "parsed_ready" in page
         assert "资料提取锚点：" in page
         assert "资料锚点类别：" in page
         assert "命中证据：" in page
