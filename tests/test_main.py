@@ -8335,6 +8335,73 @@ class TestFeedbackClosedLoopSafety:
         mock_sync_weights.assert_not_called()
         mock_auto_run.assert_not_called()
 
+    @patch("app.main.save_evolution_reports")
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main._build_feature_confidence_summary")
+    @patch("app.main._build_material_knowledge_profile")
+    @patch("app.main.build_evolution_report")
+    @patch("app.main._merge_materials_text")
+    @patch("app.main.load_project_context")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_projects")
+    def test_refresh_evolution_report_keeps_learning_quality_blocked_samples(
+        self,
+        mock_load_projects,
+        mock_load_ground_truth,
+        mock_load_project_context,
+        mock_merge_materials_text,
+        mock_build_evolution_report,
+        mock_build_material_knowledge_profile,
+        mock_build_feature_confidence_summary,
+        mock_load_evolution_reports,
+        mock_save_evolution_reports,
+    ):
+        from app.main import _refresh_evolution_report_from_ground_truth
+
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 5}}]
+        mock_load_ground_truth.return_value = [
+            {
+                "id": "gt-1",
+                "project_id": "p1",
+                "shigong_text": "示例施组文本",
+                "judge_scores": [4.2, 4.3, 4.3, 4.4, 4.4, 4.4, 4.5],
+                "final_score": 4.31,
+                "score_scale_max": 5,
+                "learning_quality_gate": {
+                    "blocked": True,
+                    "reasons": ["material_gate_blocked", "low_score_self_awareness"],
+                },
+            }
+        ]
+        mock_load_project_context.return_value = {}
+        mock_merge_materials_text.return_value = ""
+        mock_build_material_knowledge_profile.return_value = {}
+        mock_build_feature_confidence_summary.return_value = {}
+        mock_load_evolution_reports.return_value = {}
+
+        def _build(project_id, records, project_context):
+            assert project_id == "p1"
+            assert project_context == ""
+            assert len(records) == 1
+            assert records[0]["final_score"] == pytest.approx(86.2, abs=1e-6)
+            return {
+                "project_id": "p1",
+                "high_score_logic": ["逻辑A"],
+                "writing_guidance": ["建议A"],
+                "sample_count": len(records),
+                "updated_at": "2026-03-25T06:30:00+00:00",
+                "scoring_evolution": {},
+                "compilation_instructions": {},
+            }
+
+        mock_build_evolution_report.side_effect = _build
+
+        payload = _refresh_evolution_report_from_ground_truth("p1")
+
+        assert payload["refreshed"] is True
+        assert payload["sample_count"] == 1
+        mock_save_evolution_reports.assert_called_once()
+
 
 class TestGroundTruthGuardrailRoutes:
     @patch("app.main._run_feedback_closed_loop_safe")
@@ -9400,6 +9467,73 @@ class TestGroundTruthScoreRuleRoutes:
 
         assert response.status_code == 409
         assert "confirm_extreme_sample=1" in response.json()["detail"]
+
+    @patch("app.main.save_evolution_reports")
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.enhance_evolution_report_with_llm")
+    @patch("app.main.build_evolution_report")
+    @patch("app.main._merge_materials_text")
+    @patch("app.main.load_project_context")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_evolve_uses_learning_quality_blocked_ground_truth_samples_for_report(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_ground_truth,
+        mock_load_project_context,
+        mock_merge_materials_text,
+        mock_build_evolution_report,
+        mock_enhance_evolution_report,
+        mock_load_evolution_reports,
+        mock_save_evolution_reports,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 5}}]
+        mock_load_ground_truth.return_value = [
+            {
+                "id": "gt-1",
+                "project_id": "p1",
+                "shigong_text": "示例施组文本",
+                "judge_scores": [4.27, 4.25, 4.27, 4.27, 4.41, 4.27, 4.46],
+                "final_score": 4.31,
+                "score_scale_max": 5,
+                "learning_quality_gate": {
+                    "blocked": True,
+                    "reasons": ["material_gate_blocked", "low_score_self_awareness"],
+                },
+            }
+        ]
+        mock_load_project_context.return_value = {}
+        mock_merge_materials_text.return_value = ""
+        mock_load_evolution_reports.return_value = {}
+        mock_enhance_evolution_report.return_value = None
+
+        def _build(project_id, records, project_context):
+            assert project_id == "p1"
+            assert project_context == ""
+            assert len(records) == 1
+            assert records[0]["final_score"] == pytest.approx(86.2, abs=1e-6)
+            return {
+                "project_id": "p1",
+                "high_score_logic": ["逻辑A"],
+                "writing_guidance": ["建议A"],
+                "sample_count": len(records),
+                "updated_at": "2026-03-25T06:35:00+00:00",
+                "scoring_evolution": {},
+                "compilation_instructions": {},
+            }
+
+        mock_build_evolution_report.side_effect = _build
+
+        response = client.post("/api/v1/projects/p1/evolve")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["sample_count"] == 1
+        assert data["high_score_logic"] == ["逻辑A"]
+        mock_save_evolution_reports.assert_called_once()
 
 
 class TestDynamicBlendAdjustment:

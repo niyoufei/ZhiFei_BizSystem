@@ -9508,7 +9508,6 @@ def _refresh_evolution_report_from_ground_truth(
         project_id,
         include_guardrail_blocked=include_guardrail_blocked,
     )
-    records_raw = [row for row in records_raw if not _learning_quality_gate_is_blocked(row)]
     records = [
         _ground_truth_record_for_learning(
             r if isinstance(r, dict) else {},
@@ -21791,7 +21790,6 @@ def evolve_project(
         project_id,
         include_guardrail_blocked=bool(confirm_extreme_sample),
     )
-    records_raw = [row for row in records_raw if not _learning_quality_gate_is_blocked(row)]
     records = [
         _ground_truth_record_for_learning(
             r if isinstance(r, dict) else {},
