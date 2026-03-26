@@ -29320,6 +29320,36 @@ def index(
           const bySubmission = Array.isArray(source.material_utilization_by_submission)
             ? source.material_utilization_by_submission
             : [];
+          const gateReasons = (gate && Array.isArray(gate.reasons))
+            ? gate.reasons.map((item) => String(item || '').trim()).filter((item) => !!item)
+            : [];
+          const requiredPresentCount = Array.isArray(gate && gate.required_types_present)
+            ? gate.required_types_present.length
+            : 0;
+          const coveredRequiredCount = Array.isArray(gate && gate.covered_required_types)
+            ? gate.covered_required_types.length
+            : 0;
+          const uploadedTypeCount = Array.isArray(gate && gate.uploaded_types)
+            ? gate.uploaded_types.length
+            : 0;
+          const coveredUploadedCount = Array.isArray(gate && gate.covered_uploaded_types)
+            ? gate.covered_uploaded_types.length
+            : 0;
+          const blockedSubmissionDetails = bySubmission
+            .filter((item) => {
+              const itemGate = (item && typeof item.gate === 'object') ? item.gate : {};
+              return !!itemGate.blocked;
+            })
+            .map((item) => {
+              const itemGate = (item && typeof item.gate === 'object') ? item.gate : {};
+              const reasons = Array.isArray(itemGate.reasons)
+                ? itemGate.reasons.map((reason) => String(reason || '').trim()).filter((reason) => !!reason)
+                : [];
+              return {
+                filename: String((item && item.filename) || '').trim(),
+                reasons: reasons,
+              };
+            });
           const toPct = (v) => {
             const n = Number(v);
             return Number.isFinite(n) ? (n * 100).toFixed(1) + '%' : '-';
@@ -29346,6 +29376,26 @@ def index(
                       : '<p class="success" style="margin:6px 0 8px 0"><strong>门禁状态：通过</strong></p>'
                 )
               : '')
+            + (
+              gateReasons.length
+                ? '<p class="' + (((gate && gate.blocked_submissions > 0) || (gate && gate.blocked)) ? 'error' : 'note') + '" style="margin:4px 0 8px 0"><strong>关键原因：</strong>'
+                  + escapeHtmlText(gateReasons.slice(0, 3).join('；'))
+                  + '</p>'
+                : ''
+            )
+            + (
+              (!gateReasons.length && blockedSubmissionDetails.length)
+                ? '<p class="error" style="margin:4px 0 8px 0"><strong>阻断施组：</strong>'
+                  + escapeHtmlText(
+                    blockedSubmissionDetails.slice(0, 3).map((item) => {
+                      const filename = item.filename || '未命名施组';
+                      const reasonText = item.reasons.slice(0, 2).join('；');
+                      return reasonText ? (filename + '：' + reasonText) : filename;
+                    }).join('；')
+                  )
+                  + '</p>'
+                : ''
+            )
             + '<table><tr><th>维度</th><th>命中/总数</th><th>命中率</th></tr>'
             + '<tr><td>资料检索锚点</td><td>' + escapeHtmlText(retrievalHit) + ' / ' + escapeHtmlText(retrievalTotal) + '</td><td>' + escapeHtmlText(toPct(summary.retrieval_hit_rate)) + '</td></tr>'
             + '<tr><td>检索文件覆盖</td><td>' + escapeHtmlText(retrievalFileHit) + ' / ' + escapeHtmlText(retrievalFileTotal) + '</td><td>' + escapeHtmlText(toPct(summary.retrieval_file_coverage_rate)) + '</td></tr>'
@@ -29353,6 +29403,20 @@ def index(
             + '<tr><td>跨资料一致性</td><td>' + escapeHtmlText(consistencyHit) + ' / ' + escapeHtmlText(consistencyTotal) + '</td><td>' + escapeHtmlText(toPct(summary.consistency_hit_rate)) + '</td></tr>'
             + '<tr><td>资料维度约束</td><td>' + escapeHtmlText(materialDimensionHit) + ' / ' + escapeHtmlText(materialDimensionTotal) + '</td><td>' + escapeHtmlText(toPct(summary.material_dimension_hit_rate)) + '</td></tr>'
             + '<tr><td>关键词兜底</td><td>' + escapeHtmlText(fallbackHit) + ' / ' + escapeHtmlText(fallbackTotal) + '</td><td>' + escapeHtmlText(toPct(summary.fallback_hit_rate)) + '</td></tr>'
+            + (
+              gate && gate.enabled && requiredPresentCount > 0
+                ? '<tr><td>关键资料覆盖</td><td>' + escapeHtmlText(coveredRequiredCount) + ' / ' + escapeHtmlText(requiredPresentCount) + '</td><td>'
+                  + escapeHtmlText(toPct(gate.required_type_coverage_rate))
+                  + '（阈值 ' + escapeHtmlText(toPct((gate.thresholds || {}).min_required_type_coverage_rate)) + '）</td></tr>'
+                : ''
+            )
+            + (
+              gate && gate.enabled && uploadedTypeCount > 0
+                ? '<tr><td>已上传类型覆盖</td><td>' + escapeHtmlText(coveredUploadedCount) + ' / ' + escapeHtmlText(uploadedTypeCount) + '</td><td>'
+                  + escapeHtmlText(toPct(gate.uploaded_type_coverage_rate))
+                  + '（阈值 ' + escapeHtmlText(toPct((gate.thresholds || {}).min_uploaded_type_coverage_rate)) + '）</td></tr>'
+                : ''
+            )
             + '<tr><td>查询特征规模</td><td>' + escapeHtmlText(queryTermsCount) + ' + ' + escapeHtmlText(queryNumericTermsCount) + '</td><td>文本词 + 数字约束</td></tr>'
             + '<tr><td>资料画像增强</td><td>' + escapeHtmlText(materialProfileQueryTermsCount) + ' + ' + escapeHtmlText(materialProfileQueryNumericTermsCount) + '</td><td>画像词 + 画像数字锚点</td></tr>'
             + '</table>';

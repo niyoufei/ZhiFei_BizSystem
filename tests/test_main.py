@@ -783,6 +783,10 @@ class TestIndexEndpoint:
         assert "let cachedProjectSubmissions = {};" in page
         assert "function buildGroundTruthSubmissionOptionsSignature" in page
         assert "await refreshGroundTruthSubmissionOptions(id, switchSeq, subs);" in page
+        assert "关键原因：" in page
+        assert "阻断施组：" in page
+        assert "关键资料覆盖" in page
+        assert "已上传类型覆盖" in page
         assert (
             "await refreshGroundTruthSubmissionOptions(null, null, undefined, { forceFetch: true });"
             in page
