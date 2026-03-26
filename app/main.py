@@ -2620,6 +2620,9 @@ _PROJECT_NAME_FIELD_PATTERNS = [
     ),
     re.compile(r"(?:项目概况|工程概况)\s*[:：]\s*([^\n\r]{6,120}(?:工程|项目|标段)[^\n\r]{0,80})"),
 ]
+_PROJECT_NAME_TITLE_SUFFIX_RE = re.compile(
+    r"(?:招标文件(?:正文)?|施工招标(?:文件)?|公开招标(?:文件)?|招标公告|答疑澄清|答疑|澄清|补遗)$"
+)
 _PROJECT_NAME_FILENAME_SUFFIX_RE = re.compile(
     r"(?:招标文件(?:及答疑)?|招标答疑|答疑澄清|答疑|澄清|补遗|招标公告|公开招标|施工招标|文件)$"
 )
@@ -2658,6 +2661,31 @@ def _infer_project_name_from_filename(filename: str) -> str:
     return ""
 
 
+def _infer_project_name_from_title_lines(text: str) -> str:
+    title_hints = ("招标文件", "招标", "施工总承包", "总承包", "EPC", "改造", "装修", "工程")
+    ignored_prefixes = ("第", "目录", "说明", "附件", "投标", "投标人", "资格", "评标", "招标编号")
+    non_empty_lines = [
+        unicodedata.normalize("NFKC", str(raw or "")).replace("\u3000", " ").strip()
+        for raw in str(text or "").splitlines()
+    ]
+    for raw_line in non_empty_lines[:80]:
+        if not raw_line or len(raw_line) < 6 or len(raw_line) > 80:
+            continue
+        if raw_line.startswith(ignored_prefixes):
+            continue
+        if not any(marker in raw_line for marker in ("工程", "项目", "标段")):
+            continue
+        if not any(hint in raw_line for hint in title_hints):
+            continue
+        candidate = _clean_project_name_candidate(raw_line)
+        candidate = _PROJECT_NAME_TITLE_SUFFIX_RE.sub("", candidate).strip(
+            "：:;；,，。.()（）[]【】"
+        )
+        if _is_valid_project_name_candidate(candidate):
+            return candidate
+    return ""
+
+
 def _infer_project_name_from_tender_text(text: str, filename: str) -> str:
     normalized_text = unicodedata.normalize("NFKC", str(text or "")).replace("\u3000", " ")
     scan_text = normalized_text[:40000]
@@ -2672,6 +2700,9 @@ def _infer_project_name_from_tender_text(text: str, filename: str) -> str:
         candidate = _clean_project_name_candidate(raw_line.split("：", 1)[-1].split(":", 1)[-1])
         if _is_valid_project_name_candidate(candidate):
             return candidate
+    title_line_candidate = _infer_project_name_from_title_lines(normalized_text)
+    if title_line_candidate:
+        return title_line_candidate
     fallback = _infer_project_name_from_filename(filename)
     if fallback:
         return fallback
@@ -2684,7 +2715,28 @@ def _infer_project_name_from_tender_text(text: str, filename: str) -> str:
     )
 
 
-def _read_tender_upload_and_infer_project_name(file: UploadFile) -> tuple[str, bytes, str]:
+def _resolve_tender_project_name(
+    preview_text: str,
+    filename: str,
+    *,
+    project_name_override: object = "",
+) -> str:
+    manual_name = _clean_project_name_candidate(project_name_override)
+    if manual_name:
+        if not _is_valid_project_name_candidate(manual_name):
+            raise HTTPException(
+                status_code=422,
+                detail="手动填写的项目名称不完整，请补充到“XX项目/XX工程/XX标段”级别后重试。",
+            )
+        return manual_name
+    return _infer_project_name_from_tender_text(preview_text, filename)
+
+
+def _read_tender_upload_and_infer_project_name(
+    file: UploadFile,
+    *,
+    project_name_override: object = "",
+) -> tuple[str, bytes, str]:
     raw_filename = file.filename or ""
     normalized_filename = _normalize_uploaded_filename(raw_filename)
     if not normalized_filename:
@@ -2701,7 +2753,11 @@ def _read_tender_upload_and_infer_project_name(file: UploadFile) -> tuple[str, b
         preview_text = _read_uploaded_file_preview_for_project_name(content, normalized_filename)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    inferred_name = _infer_project_name_from_tender_text(preview_text, normalized_filename)
+    inferred_name = _resolve_tender_project_name(
+        preview_text,
+        normalized_filename,
+        project_name_override=project_name_override,
+    )
     return normalized_filename, content, inferred_name
 
 
@@ -13328,12 +13384,16 @@ def infer_project_name_from_tender(
 )
 def create_project_from_tender(
     file: UploadFile = File(...),
+    project_name_override: Optional[str] = Form(None),
     api_key: Optional[str] = Depends(verify_api_key),
     locale: str = Depends(get_locale),
 ) -> ProjectCreateFromTenderResponse:
     """上传招标文件并自动识别项目名称，创建或复用项目后归档资料。"""
     ensure_data_dirs()
-    normalized_filename, content, inferred_name = _read_tender_upload_and_infer_project_name(file)
+    normalized_filename, content, inferred_name = _read_tender_upload_and_infer_project_name(
+        file,
+        project_name_override=project_name_override or "",
+    )
 
     projects = load_projects()
     changed = False
@@ -23001,6 +23061,7 @@ def web_create_project_from_tender(
     request: Request,
     file: UploadFile = File(...),
     api_key: str = Form(""),
+    project_name_override: str = Form(""),
 ):
     if not str(getattr(file, "filename", "") or "").strip():
         return RedirectResponse(
@@ -23014,7 +23075,12 @@ def web_create_project_from_tender(
     if redirect is not None:
         return redirect
     try:
-        result = create_project_from_tender(file=file, api_key=verified_api_key, locale="zh")
+        result = create_project_from_tender(
+            file=file,
+            project_name_override=project_name_override,
+            api_key=verified_api_key,
+            locale="zh",
+        )
     except HTTPException as exc:
         detail = str(getattr(exc, "detail", "自动创建失败"))
         return RedirectResponse(url="/?create_error=" + quote_plus(detail), status_code=303)
@@ -23993,6 +24059,7 @@ def index(
         </form>
         <form id="createProjectFromTender" method="post" action="/web/create_project_from_tender" enctype="multipart/form-data" class="inline-form" style="margin-top:10px;gap:8px;flex-wrap:wrap">
           <input type="hidden" name="api_key" id="createProjectFromTenderApiKey" value="" />
+          <input type="hidden" name="project_name_override" id="createProjectFromTenderOverride" value="" />
           <span style="color:#475569">或上传招标文件自动识别项目名：</span>
           <input id="createProjectFromTenderFile" class="visually-hidden-file" type="file" name="file" accept=".txt,.md,.pdf,.doc,.docx,.docm,.json" />
           <label for="createProjectFromTenderFile" class="file-picker-btn" data-file-input-id="createProjectFromTenderFile">选择招标文件</label>
@@ -24001,13 +24068,14 @@ def index(
         </form>
         __CREATE_NOTICE_HTML__
         <p id="createProjectMessage" style="margin:8px 0 0 0;font-size:13px;min-height:1.2em"></p>
-        <p style="margin:4px 0 0 0;font-size:13px;color:#64748b">可手动输入项目名称，或直接上传招标文件自动识别创建。若识别到同名项目，系统会直接切换到现有项目并把招标文件归档进去。</p>
+        <p style="margin:4px 0 0 0;font-size:13px;color:#64748b">可手动输入项目名称，或直接上传招标文件自动识别创建。若自动识别不稳定，可先在上方补齐项目名称后继续点“自动创建”。若识别到同名项目，系统会直接切换到现有项目并把招标文件归档进去。</p>
       </div>
 
       <div class="section card">
         <h2>2) 选择项目</h2>
         <div class="toolbar">
           <button type="button" id="refreshProjects" class="compact-hidden">刷新项目列表</button>
+          <button type="button" id="btnStartNewProject" class="secondary">开始新项目</button>
           <span class="field-label tight" style="margin-left:4px">项目：</span>
           <select id="projectSelect" class="project-select-input wide-select">
             <option value="">-- 请选择项目 --</option>
@@ -24050,7 +24118,7 @@ def index(
         <p id="selectProjectMessage" style="margin:8px 0 0 0;font-size:13px;min-height:1.2em"></p>
         <div id="selfCheckResult" class="result-block" style="display:none"></div>
         <div id="scoringFactorsResult" class="result-block" style="display:none"></div>
-        <p class="muted">下方所有操作将使用选中的项目。选择项目后建议先上传项目资料（招标、清单等），再上传施组进行评分。删除项目会同时删除该项目全部资料与记录。</p>
+        <p class="muted">下方所有操作将使用选中的项目。点击“开始新项目”可切换到空白录入界面，历史项目会保留在列表中但自动隐藏。删除资料不会直接删除已学习权重、校准器或真实评标记录，但会影响该项目后续重评分和证据链；删除整个项目或施组会同步删除对应记录。</p>
       </div>
 
       <div class="section card" id="section-materials">
@@ -25630,8 +25698,16 @@ def index(
             setAuthStatusTag('', false);
           }
         }
+        function projectIntakeModeEnabled() {
+          return storageGet('project_intake_mode') === '1';
+        }
+        function setProjectIntakeMode(enabled) {
+          if (enabled) storageSet('project_intake_mode', '1');
+          else storageRemove('project_intake_mode');
+        }
         function pickProjectFromSelect(sel) {
           if (!sel) return '';
+          if (projectIntakeModeEnabled() && !sel.value) return '';
           if (sel.value) return sel.value;
           const remembered = storageGet('selected_project_id');
           if (remembered) {
@@ -26612,6 +26688,22 @@ def index(
           el.textContent = msg || '';
           el.style.color = isError ? '#b91c1c' : '#15803d';
         }
+        function normalizeTenderCreateErrorMessage(detail, projectNameOverride='') {
+          const raw = String(detail || '').trim();
+          const overrideName = String(projectNameOverride || '').trim();
+          if (!raw) {
+            return '自动创建未完成，请检查招标文件内容，或先手动填写项目名称后再试。';
+          }
+          if (raw.includes('无法从招标文件中识别项目名称')) {
+            return overrideName
+              ? '自动创建未完成：当前文件未识别到清晰项目名，但上方项目名称会作为兜底名称。请直接再次点“自动创建”，或点“创建”先建项目。'
+              : '自动创建未完成：当前文件未识别到清晰项目名。可先在上方填写项目名称，再点“自动创建”，也可改用“创建”先建项目。';
+          }
+          if (raw.includes('手动填写的项目名称不完整')) {
+            return raw;
+          }
+          return raw.slice(0, 120);
+        }
         function setSelfCheckResult(summary, details, isError) {
           const el = document.getElementById('selfCheckResult');
           if (!el) return;
@@ -26879,9 +26971,32 @@ def index(
           a.click();
           a.remove();
         }
-        async function refreshProjects(preferredProjectId='') {
+        function clearCreateProjectDraft() {
+          const nameInput = document.getElementById('createProjectNameInput');
+          if (nameInput) {
+            nameInput.value = '';
+            nameInput.title = '';
+          }
+          const tenderInput = document.getElementById('createProjectFromTenderFile');
+          if (tenderInput) tenderInput.value = '';
+          const tenderOverride = document.getElementById('createProjectFromTenderOverride');
+          if (tenderOverride) tenderOverride.value = '';
+          updateFilePickerText('createProjectFromTenderFile', 'createProjectFromTenderFileName');
+          inferTenderNameSeq += 1;
+        }
+        async function refreshProjects(preferredProjectId='', options=null) {
+          const opts = (options && typeof options === 'object') ? options : {};
+          const allowEmptySelection = !!opts.allowEmptySelection;
+          const intakeMode = allowEmptySelection || projectIntakeModeEnabled();
+          const emptySelectionMessage = String(
+            opts.emptySelectionMessage || '已切换到新项目录入界面，历史项目已保留并隐藏。'
+          );
           setSelectMsg('正在加载…', false);
-          const current = preferredProjectId || storageGet('selected_project_id') || pid() || '';
+          const current = preferredProjectId || (
+            intakeMode
+              ? ''
+              : (storageGet('selected_project_id') || pid() || '')
+          );
           const deleteSel = document.getElementById('projectDeleteSelect');
           const prevDeleteIds = deleteSel
             ? Array.from(deleteSel.selectedOptions || []).map((o) => String(o.value || ''))
@@ -26961,28 +27076,44 @@ def index(
           if (deleteSelectedBtn) deleteSelectedBtn.disabled = !list.length;
           if (current && list.some(p => p.id === current)) {
             sel.value = current;
-          } else if (list.length > 0) {
+          } else if (!intakeMode && list.length > 0) {
             sel.value = list[list.length - 1].id;
+          } else {
+            sel.value = '';
           }
           if (sel.value) {
             storageSet('selected_project_id', sel.value);
+            setProjectIntakeMode(false);
           } else {
             storageRemove('selected_project_id');
+            if (intakeMode) setProjectIntakeMode(true);
           }
           applyProjectScoreScale(sel.value || '');
-          await onProjectChanged();
+          await onProjectChanged({
+            emptySelectionIsInfo: intakeMode,
+            emptySelectionMessage,
+          });
         }
-        async function onProjectChanged() {
+        async function onProjectChanged(options=null) {
+          const opts = (options && typeof options === 'object') ? options : {};
           const selectedId = selectedProjectIdStrict() || pid();
           projectSwitchSeq += 1;
           const switchSeq = projectSwitchSeq;
-          if (selectedId) storageSet('selected_project_id', selectedId);
-          else storageRemove('selected_project_id');
+          if (selectedId) {
+            storageSet('selected_project_id', selectedId);
+            setProjectIntakeMode(false);
+          } else {
+            storageRemove('selected_project_id');
+            if (opts.emptySelectionIsInfo) setProjectIntakeMode(true);
+          }
           applyProjectScoreScale(selectedId);
           updateProjectBoundControlsState();
           resetProjectPanelsToStandby(selectedId);
           if (!selectedId) {
-            setSelectMsg('请先在上方选择项目。', true);
+            setSelectMsg(
+              String(opts.emptySelectionMessage || '请先在上方选择项目。'),
+              !opts.emptySelectionIsInfo
+            );
             return;
           }
           await Promise.all([
@@ -26999,8 +27130,28 @@ def index(
           setSelectMsg('已切换项目并自动刷新下方所有区域。', false);
           scheduleProjectAutoRefresh(selectedId, switchSeq);
         }
+        async function startNewProjectIntake() {
+          setProjectIntakeMode(true);
+          clearCreateProjectDraft();
+          const searchInput = document.getElementById('projectSearchInput');
+          if (searchInput) searchInput.value = '';
+          const sel = document.getElementById('projectSelect');
+          if (sel) sel.value = '';
+          storageRemove('selected_project_id');
+          updateProjectBoundControlsState();
+          resetProjectPanelsToStandby('');
+          setCreateMsg('已切换到新项目录入模式，可直接填写项目名称或上传招标文件自动建项。', false);
+          await refreshProjects('', {
+            allowEmptySelection: true,
+            emptySelectionMessage: '已切换到新项目录入界面，历史项目已保留并隐藏。',
+          });
+          const nameInput = document.getElementById('createProjectNameInput');
+          if (nameInput && typeof nameInput.focus === 'function') nameInput.focus();
+        }
         const elRefresh = document.getElementById('refreshProjects');
         if (elRefresh) elRefresh.onclick = refreshProjects;
+        const btnStartNewProject = document.getElementById('btnStartNewProject');
+        if (btnStartNewProject) btnStartNewProject.onclick = startNewProjectIntake;
         safeChange('projectSelect', onProjectChanged);
         safeClick('btnSelectProjectBySearch', locateProjectBySearch);
         const projectSearchInput = document.getElementById('projectSearchInput');
@@ -27179,12 +27330,24 @@ def index(
         }
         const formCreateFromTender = document.getElementById('createProjectFromTender');
         let inferTenderNameSeq = 0;
+        function syncCreateProjectNameOverride() {
+          const nameInput = document.getElementById('createProjectNameInput');
+          const overrideInput = document.getElementById('createProjectFromTenderOverride');
+          if (!overrideInput) return '';
+          const value = String((nameInput && nameInput.value) || '').trim();
+          overrideInput.value = value;
+          return value;
+        }
         async function inferProjectNameFromTenderSelection(fileInput, { silent=false } = {}) {
           const input = fileInput || document.getElementById('createProjectFromTenderFile');
           const files = input && input.files ? Array.from(input.files) : [];
           const nameInput = document.getElementById('createProjectNameInput');
           if (!files.length) {
-            if (nameInput && !silent) nameInput.value = '';
+            if (nameInput && !silent) {
+              nameInput.value = '';
+              nameInput.title = '';
+            }
+            syncCreateProjectNameOverride();
             return null;
           }
           const mySeq = ++inferTenderNameSeq;
@@ -27214,7 +27377,12 @@ def index(
           } catch (_) {}
           if (!res.ok) {
             const detail = (data && data.detail) ? String(data.detail) : String(text || '').slice(0, 120);
-            if (!silent) setCreateMsg('项目名称识别失败：' + detail, true);
+            if (!silent) {
+              setCreateMsg(
+                '项目名称识别失败：' + normalizeTenderCreateErrorMessage(detail, syncCreateProjectNameOverride()),
+                true
+              );
+            }
             return null;
           }
           const inferredName = String((data && data.inferred_name) || '').trim();
@@ -27222,6 +27390,7 @@ def index(
             nameInput.value = inferredName;
             nameInput.title = inferredName;
           }
+          syncCreateProjectNameOverride();
           if (!silent) {
             setCreateMsg('已识别项目名称：' + inferredName + '。可直接点“创建”或“自动创建”。', false);
           }
@@ -27238,6 +27407,8 @@ def index(
             let res, text;
             try {
               const formData = new FormData(formCreateFromTender);
+              const manualProjectName = syncCreateProjectNameOverride();
+              if (manualProjectName) formData.set('project_name_override', manualProjectName);
               res = await fetch('/api/v1/projects/create_from_tender', {
                 method: 'POST',
                 headers: apiHeaders(false),
@@ -27266,6 +27437,7 @@ def index(
                 nameInput.value = projectName;
                 nameInput.title = projectName;
               }
+              syncCreateProjectNameOverride();
               if (fileInput) fileInput.value = '';
               updateFilePickerText('createProjectFromTenderFile', 'createProjectFromTenderFileName');
               const searchInput = document.getElementById('projectSearchInput');
@@ -27278,7 +27450,13 @@ def index(
             } else {
               let detail = text;
               try { const j = JSON.parse(text); detail = (j && j.detail) || text; } catch (_) {}
-              setCreateMsg('自动创建失败: ' + res.status + ' ' + (detail || '').slice(0, 120), true);
+              setCreateMsg(
+                normalizeTenderCreateErrorMessage(
+                  detail,
+                  syncCreateProjectNameOverride()
+                ),
+                true
+              );
               const outSc = document.getElementById('output');
               if (outSc) outSc.scrollIntoView({ behavior: 'smooth' });
             }
@@ -27286,6 +27464,11 @@ def index(
         } else {
           console.error('createProjectFromTender form not found');
         }
+        const createProjectNameInput = document.getElementById('createProjectNameInput');
+        if (createProjectNameInput) {
+          createProjectNameInput.addEventListener('input', syncCreateProjectNameOverride);
+        }
+        syncCreateProjectNameOverride();
 
         function setFormPid(form) {
           const fid = form.querySelector('input[name="project_id"]');
@@ -27758,7 +27941,11 @@ def index(
           const id = resolveProjectId(projectIdOverride);
           if (!id) { alert('删除失败：请先选择项目'); return; }
           if (!materialId) { alert('删除失败：记录ID为空'); return; }
-          const ok = confirm('确认删除该文件？');
+          const ok = confirm(
+            '确认删除该资料文件？\n\n'
+            + '这不会直接删除已学习的权重、校准器或真实评标记录，'
+            + '但会影响该项目后续重评分、证据链和资料利用诊断。'
+          );
           if (!ok) return;
           let res;
           let text = '';
@@ -27783,7 +27970,18 @@ def index(
           if (typeof refreshScoringReadiness === 'function') refreshScoringReadiness();
           if (typeof refreshScoringDiagnostic === 'function') refreshScoringDiagnostic();
           const out = document.getElementById('output');
-          if (out) out.textContent = JSON.stringify({ ok: true, id: materialId, filename: filename || '' }, null, 2);
+          if (out) {
+            out.textContent = JSON.stringify(
+              {
+                ok: true,
+                id: materialId,
+                filename: filename || '',
+                note: '已删除资料文件；该项目既有学习结果保留，但后续重评分会基于剩余资料重新计算。',
+              },
+              null,
+              2
+            );
+          }
         }
         function triggerOptimizationReportAction(projectId='', options=null) {
           const opts = (options && typeof options === 'object') ? options : {};

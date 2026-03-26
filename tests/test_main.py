@@ -799,9 +799,23 @@ class TestIndexEndpoint:
         response = client.get("/")
         assert response.status_code == 200
         page = response.text
+        assert 'id="btnStartNewProject"' in page
+        assert "async function startNewProjectIntake()" in page
+        assert "const intakeMode = allowEmptySelection || projectIntakeModeEnabled();" in page
+        assert "storageGet('project_intake_mode') === '1'" in page
+        assert "await refreshProjects('', {" in page
+        assert "allowEmptySelection: true," in page
+        assert "emptySelectionIsInfo: intakeMode," in page
+        assert "已切换到新项目录入界面，历史项目已保留并隐藏。" in page
+        assert "删除资料不会直接删除已学习权重、校准器或真实评标记录" in page
+        assert "这不会直接删除已学习的权重、校准器或真实评标记录" in page
+        assert "project_name_override" in page
+        assert "normalizeTenderCreateErrorMessage(" in page
+        assert "syncCreateProjectNameOverride()" in page
+        assert "未识别到清晰项目名" in page
         assert (
             "const current = preferredProjectId || storageGet('selected_project_id') || pid() || '';"
-            in page
+            not in page
         )
         assert "await refreshProjects(String((created && created.id) || ''));" in page
         assert "nameInput.value = projectName;" in page
@@ -1757,6 +1771,81 @@ class TestProjectsEndpoints:
         assert data["inferred_name"] == "合肥轨道TOD甘棠路一期B地块公共区域精装修工程招标"
         mock_preview_reader.assert_called_once()
 
+    @patch("app.main._read_uploaded_file_preview_for_project_name")
+    @patch("app.main.ensure_data_dirs")
+    def test_infer_project_name_from_tender_title_line_without_explicit_field(
+        self,
+        mock_ensure,
+        mock_preview_reader,
+        client,
+    ):
+        mock_preview_reader.return_value = "包河区档案馆提升改造项目施工总承包招标文件"
+
+        response = client.post(
+            "/api/v1/projects/infer_name_from_tender",
+            files={
+                "file": (
+                    "招标文件正文.pdf",
+                    b"fake-pdf",
+                    "application/pdf",
+                )
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["inferred_name"] == "包河区档案馆提升改造项目施工总承包"
+
+    @patch("app.main.upload_material")
+    @patch("app.main.save_projects")
+    @patch("app.main.load_projects")
+    @patch("app.main._read_uploaded_file_preview_for_project_name")
+    @patch("app.main.ensure_data_dirs")
+    def test_create_project_from_tender_accepts_manual_project_name_override(
+        self,
+        mock_ensure,
+        mock_preview_reader,
+        mock_load_projects,
+        mock_save_projects,
+        mock_upload_material,
+        client,
+    ):
+        mock_load_projects.return_value = []
+        mock_preview_reader.return_value = "招标文件正文"
+
+        def _fake_upload_material(project_id, file, material_type, api_key, locale):
+            return {
+                "material": {
+                    "id": "m1",
+                    "project_id": project_id,
+                    "material_type": material_type,
+                    "filename": "招标文件正文.pdf",
+                    "path": f"/tmp/materials/{project_id}/tender_qa/招标文件正文.pdf",
+                    "created_at": "2026-03-26T00:00:00+00:00",
+                }
+            }
+
+        mock_upload_material.side_effect = _fake_upload_material
+
+        response = client.post(
+            "/api/v1/projects/create_from_tender",
+            data={"project_name_override": "包河区档案馆提升改造项目施工总承包"},
+            files={
+                "file": (
+                    "招标文件正文.pdf",
+                    b"fake-pdf",
+                    "application/pdf",
+                )
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["created"] is True
+        assert data["inferred_name"] == "包河区档案馆提升改造项目施工总承包"
+        assert data["project"]["name"] == "包河区档案馆提升改造项目施工总承包"
+        mock_save_projects.assert_called_once()
+
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
     def test_list_projects_empty(self, mock_ensure, mock_load, client):
@@ -2234,6 +2323,46 @@ class TestFeedbackLoopHooks:
 
 class TestMaterialsEndpoint:
     """Tests for /projects/{project_id}/materials endpoint."""
+
+    @patch("app.main._run_feedback_closed_loop_safe")
+    @patch("app.main._invalidate_material_index_cache")
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.load_material_parse_jobs")
+    @patch("app.main.save_materials")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_delete_material_keeps_learning_artifacts_intact(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        mock_save_materials,
+        mock_load_parse_jobs,
+        mock_save_parse_jobs,
+        mock_invalidate_cache,
+        mock_feedback_loop,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_load_materials.return_value = [
+            {
+                "id": "m1",
+                "project_id": "p1",
+                "filename": "招标文件正文.pdf",
+                "path": "/tmp/nonexistent-material.pdf",
+            }
+        ]
+        mock_load_parse_jobs.return_value = [{"material_id": "m1"}]
+
+        response = client.delete("/api/v1/projects/p1/materials/m1")
+
+        assert response.status_code == 200
+        assert response.json()["ok"] is True
+        mock_save_materials.assert_called_once()
+        mock_save_parse_jobs.assert_called_once()
+        mock_invalidate_cache.assert_called_once_with("p1")
+        mock_feedback_loop.assert_not_called()
 
     @patch("app.main.save_materials")
     @patch("app.main.load_materials")
