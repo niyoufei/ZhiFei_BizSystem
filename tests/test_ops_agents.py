@@ -265,7 +265,153 @@ def test_runtime_repair_agent_warns_on_non_repairable_optional_failures():
     assert result["actions"]["repair_data_hygiene"]["attempted"] is False
     assert result["actions"]["restart_runtime"]["attempted"] is False
     assert result["metrics"]["non_repairable_after_count"] == 1
+    assert result["metrics"]["optional_after_count"] == 1
+    assert result["metrics"]["optional_parser_after_count"] == 1
     assert any("仅告警项" in row for row in result["recommendations"])
+
+
+def test_run_ops_agents_cycle_retries_smoke_after_restart(monkeypatch):
+    project_calls = {"count": 0}
+    restart_calls = {"count": 0}
+
+    monkeypatch.setattr(
+        oa,
+        "_run_sre_watchdog",
+        lambda **kwargs: {
+            "name": "sre_watchdog",
+            "status": "pass",
+            "duration_ms": 1,
+            "checks": {},
+            "actions": {},
+            "recommendations": [],
+        },
+    )
+    monkeypatch.setattr(
+        oa,
+        "_run_data_hygiene_agent",
+        lambda **kwargs: {
+            "name": "data_hygiene",
+            "status": "pass",
+            "duration_ms": 1,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": [],
+        },
+    )
+    monkeypatch.setattr(
+        oa,
+        "_run_runtime_repair_agent",
+        lambda **kwargs: {
+            "name": "runtime_repair",
+            "status": "pass",
+            "duration_ms": 1,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": [],
+        },
+    )
+
+    def fake_project_flow(**kwargs):
+        project_calls["count"] += 1
+        if project_calls["count"] == 1:
+            return {
+                "name": "project_flow",
+                "status": "fail",
+                "duration_ms": 1,
+                "checks": {},
+                "actions": {},
+                "metrics": {},
+                "recommendations": ["first smoke failed"],
+            }
+        return {
+            "name": "project_flow",
+            "status": "pass",
+            "duration_ms": 1,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": ["retry smoke passed"],
+        }
+
+    monkeypatch.setattr(oa, "_run_project_flow_agent", fake_project_flow)
+    monkeypatch.setattr(
+        oa,
+        "_run_tender_project_flow_agent",
+        lambda **kwargs: {
+            "name": "tender_project_flow",
+            "status": "pass",
+            "duration_ms": 1,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": [],
+        },
+    )
+    monkeypatch.setattr(
+        oa,
+        "_run_upload_flow_agent",
+        lambda **kwargs: {
+            "name": "upload_flow",
+            "status": "pass",
+            "duration_ms": 1,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": [],
+        },
+    )
+    monkeypatch.setattr(
+        oa,
+        "_run_scoring_quality_agent",
+        lambda **kwargs: {
+            "name": "scoring_quality",
+            "status": "pass",
+            "duration_ms": 1,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": [],
+        },
+    )
+    monkeypatch.setattr(
+        oa,
+        "_run_evolution_agent",
+        lambda **kwargs: {
+            "name": "evolution",
+            "status": "pass",
+            "duration_ms": 1,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": [],
+        },
+    )
+    monkeypatch.setattr(
+        oa,
+        "_run_restart_command",
+        lambda restart_cmd: restart_calls.__setitem__("count", restart_calls["count"] + 1)
+        or {
+            "attempted": True,
+            "ok": True,
+            "returncode": 0,
+            "error": None,
+        },
+    )
+
+    result = oa.run_ops_agents_cycle(base_url="http://127.0.0.1:8000", max_workers=2)
+
+    assert result["overall"]["status"] == "pass"
+    assert project_calls["count"] == 2
+    assert restart_calls["count"] == 1
+    assert result["agents"]["project_flow"]["status"] == "pass"
+    assert result["agents"]["project_flow"]["actions"]["runtime_retry"]["attempted"] is True
+    assert result["agents"]["project_flow"]["actions"]["runtime_retry"]["recovered"] is True
+    assert any(
+        "自动重启并完成 smoke 重试恢复" in row
+        for row in result["agents"]["project_flow"]["recommendations"]
+    )
 
 
 def test_ensure_agent_coverage_backfills_missing_agents():

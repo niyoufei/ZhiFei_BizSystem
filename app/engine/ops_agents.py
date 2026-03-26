@@ -281,6 +281,67 @@ def _self_check_required_fail_names(payload: Dict[str, Any]) -> List[str]:
     return out
 
 
+def _self_check_failed_optional_items(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row in _self_check_failed_items(payload):
+        if bool(row.get("required")):
+            continue
+        out.append(row)
+    return out
+
+
+def _self_check_item_category(row: Dict[str, Any]) -> str:
+    category = str(row.get("category") or "").strip().lower()
+    if category:
+        return category
+    name = str(row.get("name") or "").strip().lower()
+    if name.startswith("parser_"):
+        return "parser"
+    if name.startswith("openai_") or name.startswith("gemini_"):
+        return "llm"
+    if name.startswith("auth_") or name.startswith("rate_limit_") or name.startswith("runtime_"):
+        return "security"
+    if name.startswith("project_"):
+        return "project"
+    if (
+        name.startswith("vision_")
+        or name.startswith("material_parse_")
+        or name.startswith("gpt_parse_")
+        or name.startswith("structured_summary_")
+    ):
+        return "async_parse"
+    if name.startswith("data_"):
+        return "data"
+    return "other"
+
+
+def _classify_optional_warning_items(items: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+    groups: Dict[str, List[str]] = {
+        "repairable": [],
+        "async_parse": [],
+        "parser": [],
+        "llm": [],
+        "security": [],
+        "project": [],
+        "data": [],
+        "other": [],
+    }
+    for row in items:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "").strip()
+        if not name:
+            continue
+        category = _self_check_item_category(row)
+        if name in OPS_RUNTIME_REPAIRABLE_ITEMS:
+            groups["repairable"].append(name)
+        if category in groups:
+            groups[category].append(name)
+        else:
+            groups["other"].append(name)
+    return groups
+
+
 def _run_restart_command(restart_cmd: List[str]) -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "attempted": False,
@@ -306,6 +367,83 @@ def _run_restart_command(restart_cmd: List[str]) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         result["error"] = f"{type(exc).__name__}: {exc}"
     return result
+
+
+def _run_smoke_agent_with_runtime_retry(
+    *,
+    name: str,
+    runner: Callable[..., Dict[str, Any]],
+    kwargs: Dict[str, Any],
+    auto_repair: bool,
+    restart_cmd: List[str],
+    retry_budget: Dict[str, bool],
+) -> Dict[str, Any]:
+    try:
+        first_result = runner(**kwargs)
+    except Exception as exc:  # noqa: BLE001
+        first_result = _placeholder_agent(name, f"agent_exception: {type(exc).__name__}: {exc}")
+    actions = dict(first_result.get("actions") or {})
+    retry_info: Dict[str, Any] = {
+        "attempted": False,
+        "budget_consumed": bool(retry_budget.get("used")),
+        "restart": {
+            "attempted": False,
+            "ok": False,
+            "returncode": None,
+            "error": None,
+        },
+        "initial_status": str(first_result.get("status") or "fail"),
+        "retry_status": None,
+        "recovered": False,
+    }
+    if (
+        str(first_result.get("status") or "") != "fail"
+        or not auto_repair
+        or retry_budget.get("used")
+    ):
+        actions["runtime_retry"] = retry_info
+        first_result["actions"] = actions
+        return first_result
+
+    retry_budget["used"] = True
+    retry_info["attempted"] = True
+    retry_info["budget_consumed"] = True
+    restart_result = _run_restart_command(restart_cmd)
+    retry_info["restart"] = restart_result
+    if restart_result.get("ok"):
+        try:
+            retried = runner(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            retried = _placeholder_agent(
+                name, f"agent_exception_after_retry: {type(exc).__name__}: {exc}"
+            )
+        retry_info["retry_status"] = str(retried.get("status") or "fail")
+        retry_info["recovered"] = str(retried.get("status") or "") != "fail"
+        retry_actions = dict(retried.get("actions") or {})
+        retry_actions["runtime_retry"] = retry_info
+        retried["actions"] = retry_actions
+        if retry_info["recovered"]:
+            recommendations = list(retried.get("recommendations") or [])
+            recovery_msg = "运行态已自动重启并完成 smoke 重试恢复。"
+            if recovery_msg not in recommendations:
+                recommendations.insert(0, recovery_msg)
+            retried["recommendations"] = recommendations
+        else:
+            recommendations = list(retried.get("recommendations") or [])
+            retry_fail_msg = "运行态已自动重启并重试 smoke，但主链仍未恢复。"
+            if retry_fail_msg not in recommendations:
+                recommendations.append(retry_fail_msg)
+            retried["recommendations"] = recommendations
+        return retried
+
+    recommendations = list(first_result.get("recommendations") or [])
+    restart_fail_msg = "已尝试自动重启后重试 smoke，但运行态重启失败。"
+    if restart_fail_msg not in recommendations:
+        recommendations.append(restart_fail_msg)
+    first_result["recommendations"] = recommendations
+    actions["runtime_retry"] = retry_info
+    first_result["actions"] = actions
+    return first_result
 
 
 def ops_agents_snapshot_is_stale(
@@ -512,7 +650,9 @@ def _run_runtime_repair_agent(
     payload_before = self_check_before.get("json") or {}
     failed_before = _self_check_failed_names(payload_before)
     required_failed_before = _self_check_required_fail_names(payload_before)
-    repairable_before = [name for name in failed_before if name in OPS_RUNTIME_REPAIRABLE_ITEMS]
+    optional_failed_before = _self_check_failed_optional_items(payload_before)
+    optional_groups_before = _classify_optional_warning_items(optional_failed_before)
+    repairable_before = list(optional_groups_before.get("repairable") or [])
     non_repairable_before = [
         name for name in failed_before if name not in OPS_RUNTIME_REPAIRABLE_ITEMS
     ]
@@ -564,7 +704,9 @@ def _run_runtime_repair_agent(
     payload_after = self_check_after.get("json") or {}
     failed_after = _self_check_failed_names(payload_after)
     required_failed_after = _self_check_required_fail_names(payload_after)
-    repairable_after = [name for name in failed_after if name in OPS_RUNTIME_REPAIRABLE_ITEMS]
+    optional_failed_after = _self_check_failed_optional_items(payload_after)
+    optional_groups_after = _classify_optional_warning_items(optional_failed_after)
+    repairable_after = list(optional_groups_after.get("repairable") or [])
     non_repairable_after = [
         name for name in failed_after if name not in OPS_RUNTIME_REPAIRABLE_ITEMS
     ]
@@ -590,9 +732,21 @@ def _run_runtime_repair_agent(
             + " 仍异常，建议人工检查解析队列与服务日志。"
         )
     elif non_repairable_after:
+        category_summaries = []
+        for label, key in (
+            ("解析依赖", "parser"),
+            ("LLM配置", "llm"),
+            ("安全配置", "security"),
+            ("项目态", "project"),
+            ("数据态", "data"),
+            ("其他", "other"),
+        ):
+            names = optional_groups_after.get(key) or []
+            if names:
+                category_summaries.append(label + ":" + "、".join(names))
         recommendations.append(
             "运行态已完成可修复项处理，但仍有仅告警项："
-            + "、".join(non_repairable_after)
+            + "；".join(category_summaries or ["、".join(non_repairable_after)])
             + "，当前未执行自动修复。"
         )
     elif auto_fixed:
@@ -615,8 +769,16 @@ def _run_runtime_repair_agent(
             "required_failed_after_count": len(required_failed_after),
             "repairable_before_count": len(repairable_before),
             "repairable_after_count": len(repairable_after),
+            "optional_before_count": len(optional_failed_before),
+            "optional_after_count": len(optional_failed_after),
             "non_repairable_before_count": len(non_repairable_before),
             "non_repairable_after_count": len(non_repairable_after),
+            "optional_parser_after_count": len(optional_groups_after.get("parser") or []),
+            "optional_llm_after_count": len(optional_groups_after.get("llm") or []),
+            "optional_security_after_count": len(optional_groups_after.get("security") or []),
+            "optional_project_after_count": len(optional_groups_after.get("project") or []),
+            "optional_data_after_count": len(optional_groups_after.get("data") or []),
+            "optional_other_after_count": len(optional_groups_after.get("other") or []),
             "auto_fixed_count": len(auto_fixed),
         },
         "recommendations": recommendations,
@@ -1398,6 +1560,7 @@ def run_ops_agents_cycle(
     cycle_started = time.monotonic()
     restart_cmd = restart_cmd or ["./scripts/restart_server.sh"]
     requester = _request_json
+    smoke_retry_budget = {"used": False}
 
     sre = _run_sre_watchdog(
         base_url=base_url,
@@ -1460,18 +1623,14 @@ def run_ops_agents_cycle(
                 },
             ),
         ):
-            try:
-                agents[name] = runner(**kwargs)
-            except Exception as exc:  # noqa: BLE001
-                agents[name] = {
-                    "name": name,
-                    "status": "fail",
-                    "duration_ms": 0,
-                    "checks": {},
-                    "actions": {},
-                    "metrics": {},
-                    "recommendations": [f"agent exception: {type(exc).__name__}: {exc}"],
-                }
+            agents[name] = _run_smoke_agent_with_runtime_retry(
+                name=name,
+                runner=runner,
+                kwargs=kwargs,
+                auto_repair=auto_repair,
+                restart_cmd=restart_cmd,
+                retry_budget=smoke_retry_budget,
+            )
 
         futures = {}
         with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as executor:
