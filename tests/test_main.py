@@ -779,6 +779,18 @@ class TestIndexEndpoint:
         assert "/ground_truth/scoring_rule" in page
         assert "学习进化前需先完成真实评标录入" in page
         assert "本次已先自动录入当前表单中的真实评标，再执行学习进化。" in page
+        assert "已评分（资料预警）" in page
+        assert "let cachedProjectSubmissions = {};" in page
+        assert "function buildGroundTruthSubmissionOptionsSignature" in page
+        assert "await refreshGroundTruthSubmissionOptions(id, switchSeq, subs);" in page
+        assert (
+            "await refreshGroundTruthSubmissionOptions(null, null, undefined, { forceFetch: true });"
+            in page
+        )
+        assert (
+            "(typeof refreshGroundTruthSubmissionOptions === 'function') ? refreshGroundTruthSubmissionOptions(selectedId, switchSeq) : Promise.resolve(),"
+            not in page
+        )
 
     def test_index_frontend_has_batch_project_delete_handler(self, client):
         """Section 2 should support selecting multiple projects and batch deleting them."""

@@ -24430,9 +24430,6 @@ def index(
             if (actionId === 'btnUploadShigong' || actionId === 'btnScoreShigong') {
               if (typeof refreshSubmissions === 'function') await Promise.resolve(refreshSubmissions(projectId));
               else await fallbackRefreshSubmissionsTable(projectId);
-              if (typeof refreshGroundTruthSubmissionOptions === 'function') {
-                await Promise.resolve(refreshGroundTruthSubmissionOptions(projectId));
-              }
               if (typeof refreshScoringReadiness === 'function') await Promise.resolve(refreshScoringReadiness(projectId));
               else await fallbackFetchScoringReadiness(projectId);
               if (typeof refreshScoringDiagnostic === 'function') await Promise.resolve(refreshScoringDiagnostic(projectId));
@@ -25496,6 +25493,7 @@ def index(
         let projectSwitchSeq = 0;
         let materialParsePollTimer = null;
         let projectAutoRefreshTimer = null;
+        let cachedProjectSubmissions = {};
         const PROJECT_AUTO_REFRESH_INTERVAL_MS = 5000;
         function selectedProjectIdStrict() {
           const sel = document.getElementById('projectSelect');
@@ -26398,7 +26396,6 @@ def index(
             (typeof refreshScoringDiagnostic === 'function') ? refreshScoringDiagnostic(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshFeedMaterials === 'function') ? refreshFeedMaterials(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshGroundTruth === 'function') ? refreshGroundTruth(selectedId, switchSeq) : Promise.resolve(),
-            (typeof refreshGroundTruthSubmissionOptions === 'function') ? refreshGroundTruthSubmissionOptions(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshGroundTruthScoringRule === 'function') ? refreshGroundTruthScoringRule(selectedId, switchSeq) : Promise.resolve(),
           ]);
           if (isStaleProjectResponse(selectedId, switchSeq)) return;
@@ -27155,7 +27152,6 @@ def index(
           updateTableEmptyState('submissionsTable', 'submissionsEmpty');
           if (typeof refreshSubmissions === 'function') await refreshSubmissions(id);
           if (typeof refreshScoringReadiness === 'function') refreshScoringReadiness();
-          if (typeof refreshGroundTruthSubmissionOptions === 'function') refreshGroundTruthSubmissionOptions();
           if (typeof refreshScoringDiagnostic === 'function') refreshScoringDiagnostic();
           const out = document.getElementById('output');
           if (out) out.textContent = JSON.stringify({ ok: true, id: submissionId, filename: filename || '' }, null, 2);
@@ -27296,6 +27292,7 @@ def index(
               emptyEl.textContent = '暂无施组，请先选择项目。';
               emptyEl.style.display = 'block';
             }
+            delete cachedProjectSubmissions[String(id || '')];
             if (typeof clearMaterialUtilizationPanel === 'function') clearMaterialUtilizationPanel();
             if (typeof clearScoringReadinessPanel === 'function') clearScoringReadinessPanel();
             if (typeof clearScoringDiagnosticPanel === 'function') clearScoringDiagnosticPanel();
@@ -27311,6 +27308,7 @@ def index(
               emptyEl.textContent = '施组列表加载失败，请稍后重试。';
               emptyEl.style.display = 'block';
             }
+            delete cachedProjectSubmissions[String(id || '')];
             clearSubmissionDualTrackOverview();
             return;
           }
@@ -27321,9 +27319,11 @@ def index(
               emptyEl.textContent = '施组列表加载失败（HTTP ' + String(res.status || 0) + '）';
               emptyEl.style.display = 'block';
             }
+            delete cachedProjectSubmissions[String(id || '')];
             if (typeof clearMaterialUtilizationPanel === 'function') clearMaterialUtilizationPanel();
             clearSubmissionDualTrackOverview();
             if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
+            await refreshGroundTruthSubmissionOptions(id, switchSeq, []);
             return;
           }
           if (!Array.isArray(subs) || subs.length === 0) {
@@ -27332,11 +27332,14 @@ def index(
               emptyEl.textContent = '暂无施组，请下方添加。';
               emptyEl.style.display = 'block';
             }
+            cachedProjectSubmissions[String(id || '')] = [];
             if (typeof clearMaterialUtilizationPanel === 'function') clearMaterialUtilizationPanel();
             clearSubmissionDualTrackOverview();
             if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
+            await refreshGroundTruthSubmissionOptions(id, switchSeq, []);
             return;
           }
+          cachedProjectSubmissions[String(id || '')] = subs;
           if (emptyEl) emptyEl.style.display = 'none';
           if (tbody) tbody.innerHTML = '';
           clearSubmissionDualTrackOverview();
@@ -27369,81 +27372,128 @@ def index(
           }
           updateTableEmptyState('submissionsTable', 'submissionsEmpty');
           if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
-          await refreshGroundTruthSubmissionOptions(id, switchSeq);
+          await refreshGroundTruthSubmissionOptions(id, switchSeq, subs);
         }
-        async function refreshGroundTruthSubmissionOptions(expectedProjectId=null, switchSeq=null) {
+        function groundTruthSubmissionStatusLabel(status) {
+          const raw = String(status || '').toLowerCase();
+          if (raw === 'pending') return '待评分';
+          if (raw === 'blocked') return '已评分（资料预警）';
+          if (raw === 'scored') return '已评分';
+          return '';
+        }
+        function buildGroundTruthSubmissionOptionsSignature(submissions) {
+          const rows = Array.isArray(submissions) ? submissions : [];
+          return rows.map((s) => {
+            const report = (s && typeof s.report === 'object') ? s.report : {};
+            return [
+              String((s && s.id) || ''),
+              String((s && s.filename) || ''),
+              String((s && s.created_at) || ''),
+              String((report && report.scoring_status) || ''),
+            ].join('|');
+          }).join('||');
+        }
+        function renderGroundTruthSubmissionOptions(selectEl, projectId, submissions, previousValue='') {
+          const rows = Array.isArray(submissions) ? submissions : [];
+          const projectKey = String(projectId || '');
+          const nextSignature = buildGroundTruthSubmissionOptionsSignature(rows);
+          if (
+            String(selectEl.dataset.projectId || '') === projectKey
+            && String(selectEl.dataset.optionsSignature || '') === nextSignature
+          ) {
+            if (previousValue && rows.some((s) => String((s && s.id) || '') === previousValue)) {
+              selectEl.value = previousValue;
+            } else if (!rows.some((s) => String((s && s.id) || '') === String(selectEl.value || ''))) {
+              selectEl.value = '';
+            }
+            selectEl.disabled = false;
+            return;
+          }
+          selectEl.innerHTML = '';
+          const leadOpt = document.createElement('option');
+          leadOpt.value = '';
+          if (!rows.length) {
+            leadOpt.textContent = '-- 暂无施组，请先在步骤4上传 --';
+            selectEl.appendChild(leadOpt);
+            selectEl.value = '';
+            selectEl.disabled = false;
+            selectEl.dataset.projectId = projectKey;
+            selectEl.dataset.optionsSignature = nextSignature;
+            return;
+          }
+          leadOpt.textContent = '-- 请选择步骤4已上传施组文件 --';
+          selectEl.appendChild(leadOpt);
+          rows.forEach((s) => {
+            const opt = document.createElement('option');
+            opt.value = String((s && s.id) || '');
+            const report = (s && s.report) || {};
+            const statusLabel = groundTruthSubmissionStatusLabel(report && report.scoring_status);
+            const createdAt = String((s && s.created_at) || '').slice(0, 19);
+            const suffix = [createdAt, statusLabel].filter(Boolean).join(' / ');
+            opt.textContent = String((s && s.filename) || '未命名施组') + (suffix ? ('（' + suffix + '）') : '');
+            selectEl.appendChild(opt);
+          });
+          if (previousValue && rows.some((s) => String((s && s.id) || '') === previousValue)) {
+            selectEl.value = previousValue;
+          } else {
+            selectEl.value = '';
+          }
+          selectEl.disabled = false;
+          selectEl.dataset.projectId = projectKey;
+          selectEl.dataset.optionsSignature = nextSignature;
+        }
+        async function refreshGroundTruthSubmissionOptions(expectedProjectId=null, switchSeq=null, submissionsOverride=undefined, options=undefined) {
           const id = expectedProjectId || pid();
           const sel = document.getElementById('groundTruthSubmissionSelect');
           if (!sel) return;
           const prev = String(sel.value || '');
-          sel.innerHTML = '';
-          const pendingOpt = document.createElement('option');
-          pendingOpt.value = '';
-          if (!id) {
-            pendingOpt.textContent = '-- 请先选择项目 --';
-            sel.appendChild(pendingOpt);
-            sel.value = '';
-            return;
-          }
-          pendingOpt.textContent = '-- 加载步骤4施组中... --';
-          sel.appendChild(pendingOpt);
-          sel.disabled = true;
-          let res;
-          try {
-            res = await fetch('/api/v1/projects/' + id + '/submissions?t=' + Date.now(), { cache: 'no-store' });
-          } catch (_) {
+          const forceFetch = !!(options && typeof options === 'object' && options.forceFetch);
+          const resetGroundTruthSubmissionSelect = (text) => {
             sel.innerHTML = '';
-            const errOpt = document.createElement('option');
-            errOpt.value = '';
-            errOpt.textContent = '-- 施组列表加载失败，请稍后重试 --';
-            sel.appendChild(errOpt);
-            sel.value = '';
-            sel.disabled = false;
-            return;
-          }
-          if (isStaleProjectResponse(id, switchSeq)) {
-            sel.disabled = false;
-            return;
-          }
-          const subs = await res.json().catch(() => []);
-          sel.innerHTML = '';
-          const leadOpt = document.createElement('option');
-          leadOpt.value = '';
-          if (!res.ok || !Array.isArray(subs)) {
-            leadOpt.textContent = '-- 施组列表加载失败，请稍后重试 --';
-            sel.appendChild(leadOpt);
-            sel.value = '';
-            sel.disabled = false;
-            return;
-          }
-          if (!subs.length) {
-            leadOpt.textContent = '-- 暂无施组，请先在步骤4上传 --';
-            sel.appendChild(leadOpt);
-            sel.value = '';
-            sel.disabled = false;
-            return;
-          }
-          leadOpt.textContent = '-- 请选择步骤4已上传施组文件 --';
-          sel.appendChild(leadOpt);
-          subs.forEach((s) => {
             const opt = document.createElement('option');
-            opt.value = String((s && s.id) || '');
-            const report = (s && s.report) || {};
-            const status = String((report && report.scoring_status) || '').toLowerCase();
-            const statusLabel = status === 'pending'
-              ? '待评分'
-              : (status === 'blocked' ? '已阻断' : (status === 'scored' ? '已评分' : ''));
-            const createdAt = String((s && s.created_at) || '').slice(0, 19);
-            const suffix = [createdAt, statusLabel].filter(Boolean).join(' / ');
-            opt.textContent = String((s && s.filename) || '未命名施组') + (suffix ? ('（' + suffix + '）') : '');
+            opt.value = '';
+            opt.textContent = text;
             sel.appendChild(opt);
-          });
-          if (prev && subs.some((s) => String((s && s.id) || '') === prev)) {
-            sel.value = prev;
-          } else {
             sel.value = '';
+            sel.disabled = false;
+            sel.dataset.projectId = String(id || '');
+            sel.dataset.optionsSignature = '';
+          };
+          if (!id) {
+            resetGroundTruthSubmissionSelect('-- 请先选择项目 --');
+            return;
           }
-          sel.disabled = false;
+          let subs = Array.isArray(submissionsOverride)
+            ? submissionsOverride
+            : (forceFetch ? null : cachedProjectSubmissions[String(id || '')]);
+          if (!Array.isArray(subs)) {
+            sel.innerHTML = '';
+            const pendingOpt = document.createElement('option');
+            pendingOpt.value = '';
+            pendingOpt.textContent = '-- 加载步骤4施组中... --';
+            sel.appendChild(pendingOpt);
+            sel.disabled = true;
+            let res;
+            try {
+              res = await fetch('/api/v1/projects/' + id + '/submissions?t=' + Date.now(), { cache: 'no-store' });
+            } catch (_) {
+              delete cachedProjectSubmissions[String(id || '')];
+              resetGroundTruthSubmissionSelect('-- 施组列表加载失败，请稍后重试 --');
+              return;
+            }
+            if (isStaleProjectResponse(id, switchSeq)) {
+              sel.disabled = false;
+              return;
+            }
+            subs = await res.json().catch(() => []);
+            if (!res.ok || !Array.isArray(subs)) {
+              delete cachedProjectSubmissions[String(id || '')];
+              resetGroundTruthSubmissionSelect('-- 施组列表加载失败，请稍后重试 --');
+              return;
+            }
+            cachedProjectSubmissions[String(id || '')] = subs;
+          }
+          renderGroundTruthSubmissionOptions(sel, id, subs, prev);
         }
         async function refreshMaterials(expectedProjectId=null, switchSeq=null) {
           const id = expectedProjectId || pid();
@@ -27790,7 +27840,7 @@ def index(
         safeClick('btnRefreshGroundTruthSubmissionOptions', async () => {
           if (!ensureProjectForAction('evolveResult')) return;
           setResultLoading('evolveResult', '施组选项刷新中...');
-          await refreshGroundTruthSubmissionOptions();
+          await refreshGroundTruthSubmissionOptions(null, null, undefined, { forceFetch: true });
           setResultSuccess('evolveResult', '施组选项已刷新：请在下拉框中选择步骤4已上传施组。');
         });
 
@@ -29510,7 +29560,7 @@ def index(
             : (statusRaw === 'pending'
               ? '<span style="color:#92400e">待评分</span>'
               : (statusRaw === 'blocked'
-                ? '<span class="error">已阻断</span>'
+                ? '<span class="error">' + escapeHtmlText(groundTruthSubmissionStatusLabel(statusRaw) || '已评分（资料预警）') + '</span>'
                 : escapeHtmlText(latest.scoring_status || '未生成')));
           const toPct = (v) => {
             const n = Number(v);
