@@ -29453,6 +29453,7 @@ def index(
           const retrievalHit = Number(summary.retrieval_hit || 0);
           const consistencyTotal = Number(summary.consistency_total || 0);
           const consistencyHit = Number(summary.consistency_hit || 0);
+          const consistencyHitRate = toFiniteNumber(summary.consistency_hit_rate);
           const fallbackTotal = Number(summary.fallback_total || 0);
           const fallbackHit = Number(summary.fallback_hit || 0);
           const retrievalFileTotal = Number(summary.retrieval_file_total || 0);

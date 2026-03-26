@@ -859,6 +859,7 @@ class TestIndexEndpoint:
         assert "function buildGroundTruthSubmissionOptionsSignature" in page
         assert "await refreshGroundTruthSubmissionOptions(id, switchSeq, subs);" in page
         assert "isWarned: hasGate ? (!!utilGate.warned && !utilGate.blocked) : false," in page
+        assert "const consistencyHitRate = toFiniteNumber(summary.consistency_hit_rate);" in page
         assert "当前缺口资料类型：" in page
         assert "阻断施组：" in page
         assert "建议动作：" in page
