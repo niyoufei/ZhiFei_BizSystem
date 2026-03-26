@@ -29354,6 +29354,100 @@ def index(
             const n = Number(v);
             return Number.isFinite(n) ? (n * 100).toFixed(1) + '%' : '-';
           };
+          const normalizeMaterialUtilizationText = (value) => {
+            let text = String(value || '').trim();
+            if (text.indexOf('资料利用门禁：') === 0) {
+              text = text.slice('资料利用门禁：'.length).trim();
+            }
+            return text;
+          };
+          const dedupeMaterialUtilizationTexts = (items) => {
+            const out = [];
+            (Array.isArray(items) ? items : []).forEach((item) => {
+              const text = String(item || '').trim();
+              if (!text || out.includes(text)) return;
+              out.push(text);
+            });
+            return out;
+          };
+          const uncoveredTypeLabels = uncoveredTypes.map(materialTypeDisplayName).filter((item) => !!item);
+          const gateThresholds = (gate && typeof gate.thresholds === 'object') ? gate.thresholds : {};
+          const primaryHighlights = [];
+          if (uncoveredTypeLabels.length) {
+            primaryHighlights.push('当前缺口资料类型：' + uncoveredTypeLabels.join('、'));
+          }
+          if (consistencyTotal > 0 && consistencyHitRate != null && consistencyHitRate < 0.35) {
+            primaryHighlights.push('跨资料一致性命中率 ' + toPct(summary.consistency_hit_rate) + ' 偏低');
+          }
+          if (retrievalUnhitFileCount > 0 && retrievalFileTotal >= 3) {
+            primaryHighlights.push('已有 ' + String(retrievalUnhitFileCount) + ' 份已检索文件未形成命中证据');
+          }
+          if (
+            gate && gate.enabled && requiredPresentCount > 0
+            && gate.required_type_coverage_rate != null
+            && Number(gate.required_type_coverage_rate) < Number(gateThresholds.min_required_type_coverage_rate || 0)
+          ) {
+            primaryHighlights.push(
+              '关键资料覆盖 ' + toPct(gate.required_type_coverage_rate)
+              + ' 低于阈值 ' + toPct(gateThresholds.min_required_type_coverage_rate)
+            );
+          }
+          if (
+            gate && gate.enabled && uploadedTypeCount > 0
+            && gate.uploaded_type_coverage_rate != null
+            && Number(gate.uploaded_type_coverage_rate) < Number(gateThresholds.min_uploaded_type_coverage_rate || 0)
+          ) {
+            primaryHighlights.push(
+              '已上传类型覆盖 ' + toPct(gate.uploaded_type_coverage_rate)
+              + ' 低于阈值 ' + toPct(gateThresholds.min_uploaded_type_coverage_rate)
+            );
+          }
+          const normalizedGateReasons = dedupeMaterialUtilizationTexts(
+            gateReasons.map(normalizeMaterialUtilizationText)
+          );
+          const extraAlerts = dedupeMaterialUtilizationTexts(
+            alerts.map(normalizeMaterialUtilizationText).filter((text) => {
+              if (!text) return false;
+              if (normalizedGateReasons.includes(text)) return false;
+              if (
+                uncoveredTypeLabels.length
+                && text === ('以下资料类型未形成有效评分证据：' + uncoveredTypeLabels.join('、'))
+              ) {
+                return false;
+              }
+              if (text.indexOf('关键资料未形成证据：') === 0) return false;
+              if (text.indexOf('关键资料覆盖率 ') === 0) return false;
+              if (text.indexOf('已上传资料类型覆盖率 ') === 0) return false;
+              if (
+                consistencyTotal > 0
+                && consistencyHitRate != null
+                && consistencyHitRate < 0.35
+                && text.indexOf('跨资料一致性命中率 ') === 0
+              ) {
+                return false;
+              }
+              if (
+                retrievalUnhitFileCount > 0
+                && retrievalFileTotal >= 3
+                && text.indexOf('有 ') === 0
+                && text.indexOf('已检索资料未形成命中证据') > 0
+              ) {
+                return false;
+              }
+              return true;
+            })
+          ).slice(0, 4);
+          const actionHints = dedupeMaterialUtilizationTexts([
+            uncoveredTypeLabels.length
+              ? ('优先补齐' + uncoveredTypeLabels.join('、') + '对应章节的直接引用，并让施组正文显式回应这些资料。')
+              : '',
+            retrievalUnhitFilenames.length
+              ? ('优先检查未命中文件：' + retrievalUnhitFilenames.slice(0, 3).join('、'))
+              : '',
+            (consistencyTotal > 0 && consistencyHitRate != null && consistencyHitRate < 0.35)
+              ? '核对工期、质量、危大工程等跨资料约束是否在施组正文中逐条响应。'
+              : '',
+          ]).slice(0, 3);
 
           const orderedTypes = [];
           availableTypes.forEach((t) => {
@@ -29377,15 +29471,17 @@ def index(
                 )
               : '')
             + (
-              gateReasons.length
-                ? '<p class="' + (((gate && gate.blocked_submissions > 0) || (gate && gate.blocked)) ? 'error' : 'note') + '" style="margin:4px 0 8px 0"><strong>关键原因：</strong>'
-                  + escapeHtmlText(gateReasons.slice(0, 3).join('；'))
-                  + '</p>'
+              primaryHighlights.length
+                ? '<ul style="margin:6px 0 8px 18px;color:#9f1239">'
+                  + primaryHighlights.map((item) => '<li>' + escapeHtmlText(item) + '</li>').join('')
+                  + '</ul>'
                 : ''
             )
             + (
-              (!gateReasons.length && blockedSubmissionDetails.length)
-                ? '<p class="error" style="margin:4px 0 8px 0"><strong>阻断施组：</strong>'
+              blockedSubmissionDetails.length
+                ? '<p class="' + (((gate && gate.blocked_submissions > 0) || (gate && gate.blocked)) ? 'error' : 'note') + '" style="margin:4px 0 8px 0"><strong>'
+                  + escapeHtmlText(blockedSubmissionDetails.length > 1 ? '阻断施组：' : '当前阻断施组：')
+                  + '</strong>'
                   + escapeHtmlText(
                     blockedSubmissionDetails.slice(0, 3).map((item) => {
                       const filename = item.filename || '未命名施组';
@@ -29393,6 +29489,13 @@ def index(
                       return reasonText ? (filename + '：' + reasonText) : filename;
                     }).join('；')
                   )
+                  + '</p>'
+                : ''
+            )
+            + (
+              actionHints.length
+                ? '<p style="margin:4px 0 8px 0;color:#92400e"><strong>建议动作：</strong>'
+                  + escapeHtmlText(actionHints[0])
                   + '</p>'
                 : ''
             )
@@ -29519,15 +29622,12 @@ def index(
             html += '</table></details>';
           }
 
-          if (uncoveredTypes.length) {
-            html += '<p class="error" style="margin-top:8px">未形成有效评分证据的资料类型：'
-              + escapeHtmlText(uncoveredTypes.map(materialTypeDisplayName).join('、'))
-              + '</p>';
-          }
-          if (alerts.length) {
+          if (extraAlerts.length) {
+            html += '<details style="margin-top:8px"><summary>补充提示</summary>';
             html += '<ul style="margin:6px 0 0 18px;color:#9f1239">'
-              + alerts.map((a) => '<li>' + escapeHtmlText(a) + '</li>').join('')
+              + extraAlerts.map((a) => '<li>' + escapeHtmlText(a) + '</li>').join('')
               + '</ul>';
+            html += '</details>';
           }
           if (retrievalUnhitFilenames.length) {
             html += '<details style="margin-top:8px"><summary>未形成命中证据的资料文件（Top 10）</summary>';
