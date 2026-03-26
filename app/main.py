@@ -3098,6 +3098,73 @@ def _parse_iso_datetime(value: object) -> Optional[datetime]:
         return None
 
 
+PROJECT_PICKER_HIDDEN_PREFIXES = (
+    "ops_",
+    "ops招标项目_",
+    "ops上传项目_",
+    "ops_smoke_",
+    "e2e_",
+)
+
+
+def _project_is_hidden_from_picker(project: Dict[str, object]) -> bool:
+    name = str(project.get("name") or project.get("id") or "").strip().lower()
+    return any(name.startswith(prefix) for prefix in PROJECT_PICKER_HIDDEN_PREFIXES)
+
+
+def _project_picker_month_key(project: Dict[str, object]) -> str:
+    dt = _parse_iso_datetime(project.get("created_at") or project.get("updated_at"))
+    if dt is None:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    local_dt = dt.astimezone()
+    return f"{local_dt.year:04d}-{local_dt.month:02d}"
+
+
+def _project_picker_month_label(month_key: str) -> str:
+    if not re.fullmatch(r"\d{4}-\d{2}", str(month_key or "").strip()):
+        return "全部月份"
+    year, month = str(month_key).split("-", 1)
+    return f"{year}年{month}月"
+
+
+def _project_picker_month_choices(projects: List[Dict[str, object]]) -> List[str]:
+    months = {
+        _project_picker_month_key(project)
+        for project in projects
+        if not _project_is_hidden_from_picker(project)
+    }
+    return sorted((month for month in months if month), reverse=True)
+
+
+def _default_project_picker_month_key(projects: List[Dict[str, object]]) -> str:
+    current_month = datetime.now().astimezone().strftime("%Y-%m")
+    choices = _project_picker_month_choices(projects)
+    if current_month in choices:
+        return current_month
+    if choices:
+        return choices[0]
+    return "all"
+
+
+def _filter_projects_for_picker(
+    projects: List[Dict[str, object]],
+    *,
+    month_key: str,
+) -> List[Dict[str, object]]:
+    normalized_month = str(month_key or "").strip()
+    rows: List[Dict[str, object]] = []
+    for project in projects:
+        if _project_is_hidden_from_picker(project):
+            continue
+        if normalized_month and normalized_month != "all":
+            if _project_picker_month_key(project) != normalized_month:
+                continue
+        rows.append(project)
+    return rows
+
+
 def _latest_record_time(
     rows: List[Dict[str, object]], field: str = "created_at"
 ) -> Optional[datetime]:
@@ -23431,15 +23498,24 @@ def index(
         if recovered is not None:
             projects = load_projects()
             project_ids = [str(p.get("id", "")) for p in projects]
+    picker_month_default = _default_project_picker_month_key(projects)
+    picker_projects = _filter_projects_for_picker(projects, month_key=picker_month_default)
+    picker_project_ids = [str(p.get("id", "")) for p in picker_projects]
     selected_project_id = ""
-    if project_id and project_id in project_ids:
+    if project_id and project_id in picker_project_ids:
         selected_project_id = project_id
-    elif project_ids:
-        # Default to latest created project for better usability.
-        selected_project_id = project_ids[-1]
+    elif picker_project_ids:
+        selected_project_id = picker_project_ids[-1]
     project_options = []
     project_search_options = []
-    for p in projects:
+    project_month_options = ['<option value="all">全部月份</option>']
+    for month_key in _project_picker_month_choices(projects):
+        selected_attr = " selected" if month_key == picker_month_default else ""
+        project_month_options.append(
+            f'<option value="{html_lib.escape(month_key)}"{selected_attr}>'
+            f"{html_lib.escape(_project_picker_month_label(month_key))}</option>"
+        )
+    for p in picker_projects:
         pid_raw = str(p.get("id", ""))
         pid = html_lib.escape(pid_raw)
         pname = html_lib.escape(str(p.get("name", p.get("id", ""))))
@@ -23450,6 +23526,7 @@ def index(
         project_search_options.append(f'<option value="{pname}"></option>')
     project_options_html = "".join(project_options)
     project_search_options_html = "".join(project_search_options)
+    project_month_options_html = "".join(project_month_options)
     create_notice_html = ""
     if create_ok:
         create_notice_html = (
@@ -24081,6 +24158,8 @@ def index(
             <option value="">-- 请选择项目 --</option>
             __PROJECT_OPTIONS__
           </select>
+          <span class="field-label tight" style="margin-left:4px">月份：</span>
+          <select id="projectMonthFilter" class="compact-select">__PROJECT_MONTH_OPTIONS__</select>
           <input
             type="search"
             id="projectSearchInput"
@@ -26048,9 +26127,105 @@ def index(
           });
         }
         let projectListCache = [];
+        let projectVisibleListCache = [];
         function projectDisplayName(project) {
           const row = (project && typeof project === 'object') ? project : {};
           return String(row.name || row.id || '').trim();
+        }
+        function projectNameLower(project) {
+          return projectDisplayName(project).toLowerCase();
+        }
+        function projectIsSystemGenerated(project) {
+          const normalized = projectNameLower(project);
+          return normalized.startsWith('ops_')
+            || normalized.startsWith('ops招标项目_')
+            || normalized.startsWith('ops上传项目_')
+            || normalized.startsWith('ops_smoke_')
+            || normalized.startsWith('e2e_');
+        }
+        function projectMonthKey(project) {
+          const row = (project && typeof project === 'object') ? project : {};
+          const raw = String(row.created_at || row.updated_at || '').trim();
+          if (!raw) return '';
+          const dt = new Date(raw);
+          if (!Number.isNaN(dt.getTime())) {
+            return String(dt.getFullYear()) + '-' + String(dt.getMonth() + 1).padStart(2, '0');
+          }
+          const matched = raw.match(/^(\\d{4}-\\d{2})/);
+          return matched ? matched[1] : '';
+        }
+        function projectMonthLabel(monthKey) {
+          const normalized = String(monthKey || '').trim();
+          if (!/^\\d{4}-\\d{2}$/.test(normalized)) return '全部月份';
+          return normalized.slice(0, 4) + '年' + normalized.slice(5, 7) + '月';
+        }
+        function projectMonthChoices(projects) {
+          const months = new Set();
+          (Array.isArray(projects) ? projects : []).forEach((project) => {
+            if (projectIsSystemGenerated(project)) return;
+            const key = projectMonthKey(project);
+            if (key) months.add(key);
+          });
+          return Array.from(months).sort((left, right) => right.localeCompare(left));
+        }
+        function defaultProjectMonthFilterValue(projects) {
+          const stored = String(storageGet('project_month_filter') || '').trim();
+          const months = projectMonthChoices(projects);
+          if (stored === 'all') return 'all';
+          if (stored && months.includes(stored)) return stored;
+          const now = new Date();
+          const currentMonth = String(now.getFullYear()) + '-' + String(now.getMonth() + 1).padStart(2, '0');
+          if (months.includes(currentMonth)) return currentMonth;
+          return months[0] || 'all';
+        }
+        function populateProjectMonthFilter(projects) {
+          const select = document.getElementById('projectMonthFilter');
+          const months = projectMonthChoices(projects);
+          const preferred = defaultProjectMonthFilterValue(projects);
+          if (!select) return preferred;
+          const previousValue = String(select.value || '').trim();
+          const selectedValue = (
+            previousValue === 'all' || months.includes(previousValue)
+              ? previousValue
+              : preferred
+          ) || 'all';
+          select.innerHTML = '<option value="all">全部月份</option>'
+            + months.map((monthKey) => (
+              '<option value="' + escapeHtmlText(monthKey) + '">'
+              + escapeHtmlText(projectMonthLabel(monthKey))
+              + '</option>'
+            )).join('');
+          select.value = selectedValue;
+          if (select.value === 'all') storageRemove('project_month_filter');
+          else storageSet('project_month_filter', select.value);
+          return String(select.value || 'all');
+        }
+        function buildProjectPickerView(projects) {
+          const rows = Array.isArray(projects) ? projects : [];
+          const monthFilter = populateProjectMonthFilter(rows);
+          const visible = [];
+          let hiddenSystemCount = 0;
+          let hiddenMonthCount = 0;
+          rows.forEach((project) => {
+            if (projectIsSystemGenerated(project)) {
+              hiddenSystemCount += 1;
+              return;
+            }
+            if (monthFilter !== 'all' && projectMonthKey(project) !== monthFilter) {
+              hiddenMonthCount += 1;
+              return;
+            }
+            visible.push(project);
+          });
+          projectVisibleListCache = visible.slice();
+          return {
+            projects: visible,
+            totalCount: rows.length,
+            visibleCount: visible.length,
+            hiddenSystemCount,
+            hiddenMonthCount,
+            monthFilter,
+          };
         }
         function projectMatchesKeyword(project, keyword) {
           const needle = String(keyword || '').trim().toLowerCase();
@@ -26072,13 +26247,28 @@ def index(
             datalist.appendChild(opt);
           });
         }
-        function updateProjectListMeta(totalCount) {
+        function updateProjectListMeta(payload) {
           const meta = document.getElementById('projectListMeta');
           if (!meta) return;
-          const count = Number(totalCount || 0);
-          meta.textContent = count
-            ? ('当前共 ' + count + ' 个项目。项目较多时，可输入名称快速定位。')
-            : '当前暂无项目，请先创建项目。';
+          const info = (payload && typeof payload === 'object') ? payload : {};
+          const totalCount = Number(info.totalCount || info.visibleCount || 0);
+          const visibleCount = Number(info.visibleCount || totalCount || 0);
+          if (!totalCount) {
+            meta.textContent = '当前暂无项目，请先创建项目。';
+            return;
+          }
+          const suffix = [];
+          if (String(info.monthFilter || '') && String(info.monthFilter || '') !== 'all') {
+            suffix.push('月份：' + projectMonthLabel(info.monthFilter));
+          }
+          if (Number(info.hiddenSystemCount || 0) > 0) {
+            suffix.push('已隐藏系统项目 ' + String(info.hiddenSystemCount) + ' 个');
+          }
+          if (Number(info.hiddenMonthCount || 0) > 0) {
+            suffix.push('已按月份隐藏 ' + String(info.hiddenMonthCount) + ' 个');
+          }
+          meta.textContent = '当前显示 ' + visibleCount + ' / ' + totalCount + ' 个项目。'
+            + (suffix.length ? (' ' + suffix.join('；') + '。') : ' 项目较多时，可输入名称快速定位。');
         }
         function updateCurrentProjectTag(projectId) {
           const tag = document.getElementById('currentProjectTag');
@@ -26105,10 +26295,10 @@ def index(
             setSelectMsg('请输入项目名称或关键字后再定位。', true);
             return;
           }
-          const exact = projectListCache.find((project) => projectDisplayName(project) === keyword);
-          const matched = exact || projectListCache.find((project) => projectMatchesKeyword(project, keyword));
+          const exact = projectVisibleListCache.find((project) => projectDisplayName(project) === keyword);
+          const matched = exact || projectVisibleListCache.find((project) => projectMatchesKeyword(project, keyword));
           if (!matched || !matched.id) {
-            setSelectMsg('未找到匹配项目：' + keyword, true);
+            setSelectMsg('未找到匹配项目：' + keyword + '。如需查找其它月份，请先切换月份筛选。', true);
             return;
           }
           const sel = document.getElementById('projectSelect');
@@ -27018,8 +27208,6 @@ def index(
           list.forEach((p) => {
             if (p && p.id) projectMetaById[String(p.id)] = (p.meta && typeof p.meta === 'object') ? p.meta : {};
           });
-          projectListCache = list.slice();
-          updateProjectSearchSuggestions(projectListCache);
           list = list.slice().sort((a, b) => {
             const an = String((a && a.name) || '');
             const bn = String((b && b.name) || '');
@@ -27030,6 +27218,7 @@ def index(
             const bt = String((b && (b.updated_at || b.created_at)) || '');
             return at.localeCompare(bt);
           });
+          projectListCache = list.slice();
           if (!res.ok) {
             const errMsg = (typeof list === 'object' && list && list.detail) ? String(list.detail) : (text || '').slice(0, 200);
             setSelectMsg('刷新失败: ' + res.status + ' ' + errMsg, true);
@@ -27037,11 +27226,18 @@ def index(
             if (out) { out.textContent = '刷新失败: ' + res.status + '\\n' + text; out.scrollIntoView({ behavior: 'smooth' }); }
             return;
           }
-          updateProjectListMeta(list.length);
+          const pickerView = buildProjectPickerView(projectListCache);
+          list = pickerView.projects.slice();
+          updateProjectSearchSuggestions(projectVisibleListCache);
+          updateProjectListMeta(pickerView);
           setSelectMsg(
             list.length
-              ? ('已加载 ' + list.length + ' 个项目，可直接下拉或输入名称快速定位。')
-              : '暂无项目，请先在「1) 创建项目」中创建',
+              ? ('已加载 ' + list.length + ' 个可见项目，可直接下拉或输入名称快速定位。')
+              : (
+                pickerView.totalCount > 0
+                  ? '当前筛选条件下暂无可见项目，请切换月份查看。'
+                  : '暂无项目，请先在「1) 创建项目」中创建'
+              ),
             false
           );
           const sel = document.getElementById('projectSelect');
@@ -27090,8 +27286,11 @@ def index(
           }
           applyProjectScoreScale(sel.value || '');
           await onProjectChanged({
-            emptySelectionIsInfo: intakeMode,
-            emptySelectionMessage,
+            emptySelectionIsInfo: intakeMode || (pickerView.totalCount > 0 && list.length === 0),
+            emptySelectionMessage:
+              pickerView.totalCount > 0 && list.length === 0
+                ? '当前月份筛选下暂无可见项目，可切换月份查看；OPS/E2E 系统项目已默认隐藏。'
+                : emptySelectionMessage,
           });
         }
         async function onProjectChanged(options=null) {
@@ -27152,6 +27351,7 @@ def index(
         if (elRefresh) elRefresh.onclick = refreshProjects;
         const btnStartNewProject = document.getElementById('btnStartNewProject');
         if (btnStartNewProject) btnStartNewProject.onclick = startNewProjectIntake;
+        safeChange('projectMonthFilter', () => refreshProjects(selectedProjectIdStrict() || ''));
         safeChange('projectSelect', onProjectChanged);
         safeClick('btnSelectProjectBySearch', locateProjectBySearch);
         const projectSearchInput = document.getElementById('projectSearchInput');
@@ -32177,6 +32377,7 @@ def index(
     </html>
     """
     html = html.replace("__PROJECT_OPTIONS__", project_options_html)
+    html = html.replace("__PROJECT_MONTH_OPTIONS__", project_month_options_html)
     html = html.replace("__PROJECT_SEARCH_OPTIONS__", project_search_options_html)
     html = html.replace("__CREATE_NOTICE_HTML__", create_notice_html)
     html = html.replace("__GLOBAL_NOTICE_HTML__", global_notice_html)

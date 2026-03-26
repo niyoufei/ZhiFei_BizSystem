@@ -800,13 +800,24 @@ class TestIndexEndpoint:
         assert response.status_code == 200
         page = response.text
         assert 'id="btnStartNewProject"' in page
+        assert 'id="projectMonthFilter"' in page
         assert "async function startNewProjectIntake()" in page
         assert "const intakeMode = allowEmptySelection || projectIntakeModeEnabled();" in page
+        assert "function projectIsSystemGenerated(project)" in page
+        assert "function buildProjectPickerView(projects)" in page
+        assert (
+            "safeChange('projectMonthFilter', () => refreshProjects(selectedProjectIdStrict() || ''));"
+            in page
+        )
         assert "storageGet('project_intake_mode') === '1'" in page
         assert "await refreshProjects('', {" in page
         assert "allowEmptySelection: true," in page
-        assert "emptySelectionIsInfo: intakeMode," in page
+        assert (
+            "emptySelectionIsInfo: intakeMode || (pickerView.totalCount > 0 && list.length === 0),"
+            in page
+        )
         assert "已切换到新项目录入界面，历史项目已保留并隐藏。" in page
+        assert "OPS/E2E 系统项目已默认隐藏" in page
         assert "删除资料不会直接删除已学习权重、校准器或真实评标记录" in page
         assert "这不会直接删除已学习的权重、校准器或真实评标记录" in page
         assert "project_name_override" in page
@@ -819,6 +830,46 @@ class TestIndexEndpoint:
         )
         assert "await refreshProjects(String((created && created.id) || ''));" in page
         assert "nameInput.value = projectName;" in page
+
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_index_initial_picker_hides_ops_and_filters_to_default_month(
+        self, mock_ensure, mock_load_projects, client
+    ):
+        mock_load_projects.return_value = [
+            {
+                "id": "ops1",
+                "name": "OPS_SMOKE_1773985009729",
+                "meta": {},
+                "created_at": "2026-03-21T00:00:00+08:00",
+                "updated_at": "2026-03-21T00:00:00+08:00",
+            },
+            {
+                "id": "p-old",
+                "name": "二月项目",
+                "meta": {},
+                "created_at": "2026-02-19T00:00:00+08:00",
+                "updated_at": "2026-02-19T00:00:00+08:00",
+            },
+            {
+                "id": "p-current",
+                "name": "三月项目",
+                "meta": {},
+                "created_at": "2026-03-19T00:00:00+08:00",
+                "updated_at": "2026-03-19T00:00:00+08:00",
+            },
+        ]
+
+        response = client.get("/")
+
+        assert response.status_code == 200
+        page = response.text
+        assert "OPS_SMOKE_1773985009729" not in page
+        assert "二月项目" not in page
+        assert "三月项目" in page
+        assert 'id="projectMonthFilter"' in page
+        assert "2026年02月" in page
+        assert "2026年03月" in page
 
     def test_index_renders_16_dimension_weight_sliders(self, client):
         """Index page should render 16-dimension focus sliders on first paint."""
