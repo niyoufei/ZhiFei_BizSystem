@@ -30,6 +30,7 @@ def test_run_ops_agents_cycle_short_circuit_on_sre_fail(monkeypatch):
     assert result["agents"]["upload_flow"]["status"] == "fail"
     assert result["agents"]["scoring_quality"]["status"] == "fail"
     assert result["agents"]["evolution"]["status"] == "fail"
+    assert result["agents"]["learning_calibration"]["status"] == "fail"
 
 
 def test_run_ops_agents_cycle_warn_from_sub_agents(monkeypatch):
@@ -128,6 +129,19 @@ def test_run_ops_agents_cycle_warn_from_sub_agents(monkeypatch):
         "_run_evolution_agent",
         lambda **kwargs: {
             "name": "evolution",
+            "status": "pass",
+            "duration_ms": 1,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": [],
+        },
+    )
+    monkeypatch.setattr(
+        oa,
+        "_run_learning_calibration_agent",
+        lambda **kwargs: {
+            "name": "learning_calibration",
             "status": "pass",
             "duration_ms": 1,
             "checks": {},
@@ -390,6 +404,19 @@ def test_run_ops_agents_cycle_retries_smoke_after_restart(monkeypatch):
     )
     monkeypatch.setattr(
         oa,
+        "_run_learning_calibration_agent",
+        lambda **kwargs: {
+            "name": "learning_calibration",
+            "status": "pass",
+            "duration_ms": 1,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": [],
+        },
+    )
+    monkeypatch.setattr(
+        oa,
         "_run_restart_command",
         lambda restart_cmd: restart_calls.__setitem__("count", restart_calls["count"] + 1)
         or {
@@ -412,6 +439,276 @@ def test_run_ops_agents_cycle_retries_smoke_after_restart(monkeypatch):
         "自动重启并完成 smoke 重试恢复" in row
         for row in result["agents"]["project_flow"]["recommendations"]
     )
+
+
+def test_learning_calibration_agent_auto_runs_evolve_and_reflection():
+    recent_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    calls = {"health": 0, "governance": 0}
+
+    def fake_requester(**kwargs):
+        method = str(kwargs.get("method") or "")
+        url = str(kwargs.get("url") or "")
+        if method == "GET" and url.endswith("/api/v1/projects"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": [
+                    {
+                        "id": "p1",
+                        "name": "真实项目A",
+                        "status": "submitted_to_qingtian",
+                        "updated_at": recent_iso,
+                    }
+                ],
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/evolution/health"):
+            calls["health"] += 1
+            summary = {
+                "ground_truth_count": 4,
+                "eligible_learning_ground_truth_count": 3,
+                "matched_prediction_count": 3,
+                "guardrail_blocked_count": 0,
+                "learning_quality_blocked_count": 0,
+                "has_evolved_multipliers": calls["health"] > 1,
+                "evolution_weights_usable": calls["health"] > 1,
+                "last_evolution_updated_at": "",
+            }
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": summary,
+                    "drift": {"level": "watch"},
+                },
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/feedback/governance"):
+            calls["governance"] += 1
+            current_version = "prior_five_scale_global_offset_v1"
+            if calls["governance"] > 1:
+                current_version = "calib_auto_ridge_1"
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "manual_confirmation_required": False,
+                        "few_shot_pending_review_count": 0,
+                    },
+                    "score_preview": {
+                        "current_calibrator_version": current_version,
+                    },
+                    "version_history": [
+                        {
+                            "artifact": "calibration_models",
+                            "latest_created_at": "",
+                        }
+                    ],
+                },
+                "error": None,
+            }
+        if method == "POST" and url.endswith("/api/v1/projects/p1/evolve"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {"ok": True},
+                "error": None,
+            }
+        if method == "POST" and url.endswith("/api/v1/projects/p1/reflection/auto_run"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "ok": True,
+                    "calibrator_deployed": True,
+                    "patch_deployed": False,
+                    "patch_auto_govern": {"action": "rollback"},
+                },
+                "error": None,
+            }
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    result = oa._run_learning_calibration_agent(
+        base_url="http://127.0.0.1:8000",
+        api_key=None,
+        timeout=5.0,
+        auto_evolve=True,
+        min_samples=3,
+        requester=fake_requester,
+    )
+
+    assert result["status"] == "pass"
+    assert result["metrics"]["mature_projects"] == 1
+    assert result["metrics"]["pending_evolve_before"] == 1
+    assert result["metrics"]["pending_evolve_after"] == 0
+    assert result["metrics"]["pending_calibration_before"] == 1
+    assert result["metrics"]["pending_calibration_after"] == 0
+    assert result["metrics"]["calibrator_deployed_count"] == 1
+    assert result["metrics"]["patch_rollback_count"] == 1
+    assert result["metrics"]["post_verify_failed_count"] == 0
+    assert result["actions"]["evolve"][0]["attempted"] is True
+    assert result["actions"]["reflection_auto_run"][0]["attempted"] is True
+
+
+def test_learning_calibration_agent_warns_when_manual_confirmation_required():
+    recent_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+
+    def fake_requester(**kwargs):
+        method = str(kwargs.get("method") or "")
+        url = str(kwargs.get("url") or "")
+        if method == "GET" and url.endswith("/api/v1/projects"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": [
+                    {
+                        "id": "p1",
+                        "name": "真实项目A",
+                        "status": "submitted_to_qingtian",
+                        "updated_at": recent_iso,
+                    }
+                ],
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/evolution/health"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "ground_truth_count": 4,
+                        "eligible_learning_ground_truth_count": 3,
+                        "matched_prediction_count": 3,
+                        "guardrail_blocked_count": 1,
+                        "has_evolved_multipliers": True,
+                        "evolution_weights_usable": True,
+                    },
+                    "drift": {"level": "low"},
+                },
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/feedback/governance"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "manual_confirmation_required": True,
+                        "few_shot_pending_review_count": 0,
+                    },
+                    "score_preview": {
+                        "current_calibrator_version": "prior_five_scale_global_offset_v1",
+                    },
+                    "version_history": [],
+                },
+                "error": None,
+            }
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    result = oa._run_learning_calibration_agent(
+        base_url="http://127.0.0.1:8000",
+        api_key=None,
+        timeout=5.0,
+        auto_evolve=True,
+        min_samples=3,
+        requester=fake_requester,
+    )
+
+    assert result["status"] == "warn"
+    assert result["metrics"]["manual_confirmation_required_count"] == 1
+    assert result["metrics"]["pending_calibration_after"] == 1
+    assert result["metrics"]["reflection_attempted_count"] == 0
+    assert any("极端偏差样本" in row for row in result["recommendations"])
+
+
+def test_learning_calibration_agent_respects_recent_reflection_cooldown():
+    recent_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    calibration_latest = datetime.now(timezone.utc).isoformat()
+
+    def fake_requester(**kwargs):
+        method = str(kwargs.get("method") or "")
+        url = str(kwargs.get("url") or "")
+        if method == "GET" and url.endswith("/api/v1/projects"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": [
+                    {
+                        "id": "p1",
+                        "name": "真实项目A",
+                        "status": "submitted_to_qingtian",
+                        "updated_at": recent_iso,
+                    }
+                ],
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/evolution/health"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "ground_truth_count": 4,
+                        "eligible_learning_ground_truth_count": 3,
+                        "matched_prediction_count": 3,
+                        "guardrail_blocked_count": 0,
+                        "has_evolved_multipliers": True,
+                        "evolution_weights_usable": True,
+                    },
+                    "drift": {"level": "watch"},
+                },
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/feedback/governance"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "manual_confirmation_required": False,
+                        "few_shot_pending_review_count": 0,
+                    },
+                    "score_preview": {
+                        "current_calibrator_version": "calib_auto_existing",
+                    },
+                    "version_history": [
+                        {
+                            "artifact": "calibration_models",
+                            "latest_created_at": calibration_latest,
+                        }
+                    ],
+                },
+                "error": None,
+            }
+        if method == "POST":
+            raise AssertionError(f"unexpected post request: {method} {url}")
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    result = oa._run_learning_calibration_agent(
+        base_url="http://127.0.0.1:8000",
+        api_key=None,
+        timeout=5.0,
+        auto_evolve=True,
+        min_samples=3,
+        requester=fake_requester,
+    )
+
+    assert result["status"] == "warn"
+    assert result["metrics"]["reflection_attempted_count"] == 0
+    assert result["metrics"]["reflection_cooldown_skipped_count"] == 1
+    assert any("60 分钟" in row for row in result["recommendations"])
 
 
 def test_ensure_agent_coverage_backfills_missing_agents():

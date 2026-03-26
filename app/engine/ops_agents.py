@@ -24,6 +24,8 @@ OPS_RUNTIME_RESTART_ITEMS = frozenset(
         "material_parse_backlog_ok",
     }
 )
+OPS_LEARNING_CALIBRATION_RETRY_SECONDS = 3600.0
+OPS_LEARNING_CALIBRATION_DRIFT_ALERT_LEVELS = frozenset({"watch", "medium", "high"})
 OPS_AGENT_NAMES = (
     "sre_watchdog",
     "data_hygiene",
@@ -33,6 +35,7 @@ OPS_AGENT_NAMES = (
     "upload_flow",
     "scoring_quality",
     "evolution",
+    "learning_calibration",
 )
 OPS_AGENT_DEFAULT_INTERVAL_SECONDS = 60.0
 OPS_AGENT_STALE_GRACE_SECONDS = 90.0
@@ -252,6 +255,41 @@ def _ensure_agent_coverage(agents: Dict[str, Dict[str, Any]], *, reason: str) ->
     for name in missing:
         agents[name] = _placeholder_agent(name, reason)
     return missing
+
+
+def _json_object(value: Any) -> Dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _artifact_latest_created_at(payload: Dict[str, Any], artifact: str) -> Optional[datetime]:
+    rows = payload.get("version_history")
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("artifact") or "").strip() != str(artifact or "").strip():
+            continue
+        return _parse_iso_datetime(row.get("latest_created_at"))
+    return None
+
+
+def _retry_due(
+    last_run_at: Any,
+    *,
+    cooldown_seconds: float = OPS_LEARNING_CALIBRATION_RETRY_SECONDS,
+    now: Optional[datetime] = None,
+) -> bool:
+    last_dt = _parse_iso_datetime(last_run_at)
+    if last_dt is None:
+        return True
+    current = now or datetime.now(timezone.utc)
+    return (current - last_dt).total_seconds() >= max(60.0, float(cooldown_seconds))
+
+
+def _has_project_specific_calibrator(version: Any) -> bool:
+    text = str(version or "").strip()
+    return bool(text) and not text.startswith("prior_")
 
 
 def _self_check_failed_items(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1492,11 +1530,9 @@ def _run_evolution_agent(
         and remaining_pending == 0
         and (mature_projects > 0 or started_but_insufficient == 0)
     )
-    warn_flag = (
-        failed_count == 0
-        and remaining_pending == 0
-        and not pass_flag
-        and started_but_insufficient > 0
+    warn_flag = failed_count == 0 and (
+        (remaining_pending == 0 and not pass_flag and started_but_insufficient > 0)
+        or (remaining_pending > 0 and not auto_evolve)
     )
     recommendations: List[str] = []
     if failed_count > 0:
@@ -1504,7 +1540,12 @@ def _run_evolution_agent(
             f"进化链路存在 {failed_count} 处失败，建议检查真实评分样本与API日志。"
         )
     elif remaining_pending > 0:
-        recommendations.append(f"仍有 {remaining_pending} 个项目未产出进化权重，请人工复核。")
+        if auto_evolve:
+            recommendations.append(f"仍有 {remaining_pending} 个项目未产出进化权重，请人工复核。")
+        else:
+            recommendations.append(
+                f"仍有 {remaining_pending} 个项目待学习校准 agent 产出进化权重。"
+            )
     elif started_but_insufficient > 0:
         recommendations.append(
             "当前项目真实评分样本不足，建议每项目至少录入 3 条后再观察进化效果。"
@@ -1535,6 +1576,451 @@ def _run_evolution_agent(
     }
 
 
+def _run_learning_calibration_agent(
+    *,
+    base_url: str,
+    api_key: Optional[str],
+    timeout: float,
+    auto_evolve: bool,
+    min_samples: int,
+    requester: Callable[..., Dict[str, Any]],
+) -> Dict[str, Any]:
+    started = time.monotonic()
+    projects_resp = requester(
+        method="GET",
+        url=f"{base_url}/api/v1/projects",
+        api_key=api_key,
+        timeout=timeout,
+    )
+    if int(projects_resp.get("status_code") or 0) != 200:
+        return {
+            "name": "learning_calibration",
+            "status": "fail",
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "checks": {"projects": projects_resp},
+            "actions": {"evolve": [], "reflection_auto_run": []},
+            "metrics": {},
+            "recommendations": ["无法读取项目列表，学习校准巡检中断。"],
+        }
+
+    projects = _normalize_projects(projects_resp.get("json"))
+    monitored_projects = _select_projects_for_ops_audit(projects)
+    if not monitored_projects:
+        return {
+            "name": "learning_calibration",
+            "status": "pass",
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "checks": {"projects": projects_resp, "projects_health": []},
+            "actions": {"evolve": [], "reflection_auto_run": []},
+            "metrics": {
+                "project_count": len(projects),
+                "monitored_project_count": 0,
+                "mature_projects": 0,
+                "insufficient_projects": 0,
+                "preparation_insufficient_count": 0,
+                "started_but_insufficient_count": 0,
+                "reflection_ready_projects": 0,
+                "reflection_not_ready_count": 0,
+                "pending_evolve_before": 0,
+                "pending_evolve_after": 0,
+                "pending_calibration_before": 0,
+                "pending_calibration_after": 0,
+                "evolve_attempted_count": 0,
+                "evolve_success_count": 0,
+                "reflection_attempted_count": 0,
+                "reflection_success_count": 0,
+                "manual_confirmation_required_count": 0,
+                "few_shot_pending_review_count": 0,
+                "few_shot_pending_project_count": 0,
+                "drift_alert_before_count": 0,
+                "drift_alert_after_count": 0,
+                "evolve_cooldown_skipped_count": 0,
+                "reflection_cooldown_skipped_count": 0,
+                "calibrator_deployed_count": 0,
+                "patch_deployed_count": 0,
+                "patch_rollback_count": 0,
+                "post_verify_failed_count": 0,
+                "failed_count": 0,
+            },
+            "recommendations": ["当前无需要纳入学习校准巡检的真实项目。"],
+        }
+
+    checks: List[Dict[str, Any]] = []
+    evolve_actions: List[Dict[str, Any]] = []
+    reflection_actions: List[Dict[str, Any]] = []
+    mature_projects = 0
+    insufficient_projects = 0
+    preparation_insufficient = 0
+    started_but_insufficient = 0
+    reflection_ready_projects = 0
+    reflection_not_ready_count = 0
+    pending_evolve_before = 0
+    pending_evolve_after = 0
+    pending_calibration_before = 0
+    pending_calibration_after = 0
+    evolve_attempted_count = 0
+    evolve_success_count = 0
+    reflection_attempted_count = 0
+    reflection_success_count = 0
+    manual_confirmation_required_count = 0
+    few_shot_pending_review_count = 0
+    few_shot_pending_project_count = 0
+    drift_alert_before_count = 0
+    drift_alert_after_count = 0
+    evolve_cooldown_skipped_count = 0
+    reflection_cooldown_skipped_count = 0
+    calibrator_deployed_count = 0
+    patch_deployed_count = 0
+    patch_rollback_count = 0
+    post_verify_failed_count = 0
+    failed_count = 0
+
+    for project in monitored_projects:
+        pid = str(project.get("id") or "").strip()
+        if not pid:
+            continue
+        project_status = _normalize_project_status(project.get("status"))
+        project_manual_confirmation_required = False
+        project_checks: Dict[str, Any] = {"project_id": pid}
+        checks.append(project_checks)
+
+        health_resp = requester(
+            method="GET",
+            url=f"{base_url}/api/v1/projects/{pid}/evolution/health",
+            api_key=api_key,
+            timeout=timeout,
+        )
+        project_checks["health"] = health_resp
+        if int(health_resp.get("status_code") or 0) != 200:
+            failed_count += 1
+            continue
+
+        health_payload = _json_object(health_resp.get("json"))
+        health_summary = _json_object(health_payload.get("summary"))
+        health_drift = _json_object(health_payload.get("drift"))
+        gt_count = _to_int(health_summary.get("ground_truth_count"))
+        eligible_learning_count = _to_int(
+            health_summary.get("eligible_learning_ground_truth_count") or gt_count
+        )
+        matched_prediction_count = _to_int(health_summary.get("matched_prediction_count"))
+        guardrail_blocked_count = _to_int(health_summary.get("guardrail_blocked_count"))
+        has_evolved_multipliers = bool(
+            health_summary.get("has_evolved_multipliers")
+            or health_summary.get("evolution_weights_usable")
+        )
+        drift_level = str(health_drift.get("level") or "").strip().lower()
+        drift_alert_before = drift_level in OPS_LEARNING_CALIBRATION_DRIFT_ALERT_LEVELS
+        if drift_alert_before:
+            drift_alert_before_count += 1
+
+        if eligible_learning_count >= int(min_samples):
+            mature_projects += 1
+        else:
+            insufficient_projects += 1
+            if project_status in OPS_AUDIT_PREPARATION_STATUSES and gt_count <= 0:
+                preparation_insufficient += 1
+            else:
+                started_but_insufficient += 1
+            continue
+
+        reflection_ready = matched_prediction_count >= int(min_samples)
+        if reflection_ready:
+            reflection_ready_projects += 1
+        else:
+            reflection_not_ready_count += 1
+
+        governance_resp = requester(
+            method="GET",
+            url=f"{base_url}/api/v1/projects/{pid}/feedback/governance",
+            api_key=api_key,
+            timeout=max(12.0, timeout),
+        )
+        project_checks["governance"] = governance_resp
+        if int(governance_resp.get("status_code") or 0) != 200:
+            failed_count += 1
+            continue
+
+        governance_payload = _json_object(governance_resp.get("json"))
+        governance_summary = _json_object(governance_payload.get("summary"))
+        governance_score_preview = _json_object(governance_payload.get("score_preview"))
+        current_calibrator_version = str(
+            governance_score_preview.get("current_calibrator_version") or ""
+        ).strip()
+        has_project_calibrator = _has_project_specific_calibrator(current_calibrator_version)
+        manual_confirmation_required = (
+            bool(governance_summary.get("manual_confirmation_required"))
+            or guardrail_blocked_count > 0
+        )
+        if manual_confirmation_required:
+            project_manual_confirmation_required = True
+        pending_few_shot_count = _to_int(governance_summary.get("few_shot_pending_review_count"))
+        few_shot_pending_review_count += pending_few_shot_count
+        if pending_few_shot_count > 0:
+            few_shot_pending_project_count += 1
+
+        needs_evolve = not has_evolved_multipliers
+        needs_reflection = reflection_ready and (not has_project_calibrator or drift_alert_before)
+        if needs_evolve:
+            pending_evolve_before += 1
+        if reflection_ready and not has_project_calibrator:
+            pending_calibration_before += 1
+
+        if auto_evolve and needs_evolve and not manual_confirmation_required:
+            evolve_due = _retry_due(health_summary.get("last_evolution_updated_at"))
+            if evolve_due:
+                evolve_attempted_count += 1
+                evolve_resp = requester(
+                    method="POST",
+                    url=f"{base_url}/api/v1/projects/{pid}/evolve",
+                    api_key=api_key,
+                    timeout=max(30.0, timeout),
+                )
+                evolve_ok = int(evolve_resp.get("status_code") or 0) == 200
+                if evolve_ok:
+                    evolve_success_count += 1
+                elif int(evolve_resp.get("status_code") or 0) == 409:
+                    project_manual_confirmation_required = True
+                else:
+                    failed_count += 1
+                evolve_actions.append(
+                    {
+                        "project_id": pid,
+                        "attempted": True,
+                        "ok": evolve_ok,
+                        "response": evolve_resp,
+                    }
+                )
+            else:
+                evolve_cooldown_skipped_count += 1
+                evolve_actions.append(
+                    {
+                        "project_id": pid,
+                        "attempted": False,
+                        "ok": False,
+                        "reason": "cooldown",
+                    }
+                )
+
+        if auto_evolve and needs_reflection and not manual_confirmation_required:
+            reflection_due = _retry_due(
+                _artifact_latest_created_at(governance_payload, "calibration_models")
+            )
+            if reflection_due:
+                reflection_attempted_count += 1
+                reflection_resp = requester(
+                    method="POST",
+                    url=f"{base_url}/api/v1/projects/{pid}/reflection/auto_run",
+                    api_key=api_key,
+                    timeout=max(45.0, timeout),
+                )
+                reflection_payload = _json_object(reflection_resp.get("json"))
+                reflection_ok = int(reflection_resp.get("status_code") or 0) == 200
+                if reflection_ok:
+                    reflection_success_count += 1
+                    if bool(reflection_payload.get("calibrator_deployed")):
+                        calibrator_deployed_count += 1
+                    if bool(reflection_payload.get("patch_deployed")):
+                        patch_deployed_count += 1
+                    patch_auto_govern = _json_object(reflection_payload.get("patch_auto_govern"))
+                    if str(patch_auto_govern.get("action") or "").strip().lower() == "rollback":
+                        patch_rollback_count += 1
+                elif int(reflection_resp.get("status_code") or 0) == 409:
+                    project_manual_confirmation_required = True
+                else:
+                    failed_count += 1
+                reflection_actions.append(
+                    {
+                        "project_id": pid,
+                        "attempted": True,
+                        "ok": reflection_ok,
+                        "response": reflection_resp,
+                    }
+                )
+            else:
+                reflection_cooldown_skipped_count += 1
+                reflection_actions.append(
+                    {
+                        "project_id": pid,
+                        "attempted": False,
+                        "ok": False,
+                        "reason": "cooldown",
+                    }
+                )
+
+        verify_health = requester(
+            method="GET",
+            url=f"{base_url}/api/v1/projects/{pid}/evolution/health",
+            api_key=api_key,
+            timeout=timeout,
+        )
+        project_checks["verify_health"] = verify_health
+        if int(verify_health.get("status_code") or 0) != 200:
+            failed_count += 1
+            continue
+        verify_health_payload = _json_object(verify_health.get("json"))
+        verify_health_summary = _json_object(verify_health_payload.get("summary"))
+        verify_health_drift = _json_object(verify_health_payload.get("drift"))
+        has_evolved_after = bool(
+            verify_health_summary.get("has_evolved_multipliers")
+            or verify_health_summary.get("evolution_weights_usable")
+        )
+        if str(verify_health_drift.get("level") or "").strip().lower() in (
+            OPS_LEARNING_CALIBRATION_DRIFT_ALERT_LEVELS
+        ):
+            drift_alert_after_count += 1
+        if not has_evolved_after:
+            pending_evolve_after += 1
+
+        verify_governance = requester(
+            method="GET",
+            url=f"{base_url}/api/v1/projects/{pid}/feedback/governance",
+            api_key=api_key,
+            timeout=max(12.0, timeout),
+        )
+        project_checks["verify_governance"] = verify_governance
+        if int(verify_governance.get("status_code") or 0) != 200:
+            failed_count += 1
+            continue
+        verify_governance_payload = _json_object(verify_governance.get("json"))
+        verify_governance_summary = _json_object(verify_governance_payload.get("summary"))
+        verify_governance_score_preview = _json_object(
+            verify_governance_payload.get("score_preview")
+        )
+        verify_calibrator_version = str(
+            verify_governance_score_preview.get("current_calibrator_version") or ""
+        ).strip()
+        has_project_calibrator_after = _has_project_specific_calibrator(verify_calibrator_version)
+        if reflection_ready and not has_project_calibrator_after:
+            pending_calibration_after += 1
+
+        latest_reflection_action = next(
+            (
+                row
+                for row in reversed(reflection_actions)
+                if str(row.get("project_id") or "") == pid and bool(row.get("attempted"))
+            ),
+            None,
+        )
+        if (
+            latest_reflection_action
+            and bool(latest_reflection_action.get("ok"))
+            and bool(
+                _json_object(
+                    _json_object(latest_reflection_action.get("response")).get("json")
+                ).get("calibrator_deployed")
+            )
+            and not has_project_calibrator_after
+        ):
+            post_verify_failed_count += 1
+
+        latest_evolve_action = next(
+            (
+                row
+                for row in reversed(evolve_actions)
+                if str(row.get("project_id") or "") == pid and bool(row.get("attempted"))
+            ),
+            None,
+        )
+        if latest_evolve_action and bool(latest_evolve_action.get("ok")) and not has_evolved_after:
+            post_verify_failed_count += 1
+
+        if bool(verify_governance_summary.get("manual_confirmation_required")):
+            project_manual_confirmation_required = True
+        if project_manual_confirmation_required:
+            manual_confirmation_required_count += 1
+
+    total_failure_count = failed_count + post_verify_failed_count
+    pass_flag = (
+        total_failure_count == 0
+        and pending_evolve_after == 0
+        and pending_calibration_after == 0
+        and manual_confirmation_required_count == 0
+        and reflection_not_ready_count == 0
+        and started_but_insufficient == 0
+        and evolve_cooldown_skipped_count == 0
+        and reflection_cooldown_skipped_count == 0
+    )
+    warn_flag = total_failure_count == 0 and not pass_flag
+
+    recommendations: List[str] = []
+    if total_failure_count > 0:
+        recommendations.append(
+            f"学习校准链路存在 {total_failure_count} 处执行/复核失败，建议检查 reflection 日志与项目治理产物。"
+        )
+    if manual_confirmation_required_count > 0:
+        recommendations.append(
+            f"有 {manual_confirmation_required_count} 个项目存在极端偏差样本，需人工确认后才能继续自动学习。"
+        )
+    if pending_evolve_after > 0:
+        recommendations.append(
+            f"仍有 {pending_evolve_after} 个项目未形成可用进化权重，当前评分尚未完全进入学习态。"
+        )
+    if pending_calibration_after > 0:
+        recommendations.append(
+            f"仍有 {pending_calibration_after} 个项目未形成项目级校准器，当前可能仍在使用 prior 兜底逼近。"
+        )
+    if reflection_not_ready_count > 0:
+        recommendations.append(
+            f"有 {reflection_not_ready_count} 个项目真实样本已达学习门槛，但可关联预测样本不足，建议优先用步骤4施组下拉录入真实评标。"
+        )
+    if few_shot_pending_project_count > 0:
+        recommendations.append(
+            f"有 {few_shot_pending_project_count} 个项目存在 few-shot 待审核样本，建议人工确认后再观察编制指导收敛。"
+        )
+    if drift_alert_after_count > 0:
+        recommendations.append(
+            f"有 {drift_alert_after_count} 个项目误差仍处于 watch/medium/high，建议继续补录最新真实评分。"
+        )
+    if evolve_cooldown_skipped_count > 0 or reflection_cooldown_skipped_count > 0:
+        recommendations.append(
+            "部分项目距上次自动学习/校准未满 60 分钟，本轮已跳过重复训练以避免版本噪音。"
+        )
+    if not recommendations:
+        recommendations.append("学习校准链路状态正常。")
+
+    return {
+        "name": "learning_calibration",
+        "status": _status(pass_flag, warn_flag=warn_flag),
+        "duration_ms": int((time.monotonic() - started) * 1000),
+        "checks": {"projects": projects_resp, "projects_health": checks[:20]},
+        "actions": {
+            "evolve": evolve_actions[:20],
+            "reflection_auto_run": reflection_actions[:20],
+        },
+        "metrics": {
+            "project_count": len(projects),
+            "monitored_project_count": len(monitored_projects),
+            "mature_projects": mature_projects,
+            "insufficient_projects": insufficient_projects,
+            "preparation_insufficient_count": preparation_insufficient,
+            "started_but_insufficient_count": started_but_insufficient,
+            "reflection_ready_projects": reflection_ready_projects,
+            "reflection_not_ready_count": reflection_not_ready_count,
+            "pending_evolve_before": pending_evolve_before,
+            "pending_evolve_after": pending_evolve_after,
+            "pending_calibration_before": pending_calibration_before,
+            "pending_calibration_after": pending_calibration_after,
+            "evolve_attempted_count": evolve_attempted_count,
+            "evolve_success_count": evolve_success_count,
+            "reflection_attempted_count": reflection_attempted_count,
+            "reflection_success_count": reflection_success_count,
+            "manual_confirmation_required_count": manual_confirmation_required_count,
+            "few_shot_pending_review_count": few_shot_pending_review_count,
+            "few_shot_pending_project_count": few_shot_pending_project_count,
+            "drift_alert_before_count": drift_alert_before_count,
+            "drift_alert_after_count": drift_alert_after_count,
+            "evolve_cooldown_skipped_count": evolve_cooldown_skipped_count,
+            "reflection_cooldown_skipped_count": reflection_cooldown_skipped_count,
+            "calibrator_deployed_count": calibrator_deployed_count,
+            "patch_deployed_count": patch_deployed_count,
+            "patch_rollback_count": patch_rollback_count,
+            "post_verify_failed_count": post_verify_failed_count,
+            "failed_count": failed_count,
+        },
+        "recommendations": recommendations[:20],
+    }
+
+
 def run_ops_agents_cycle(
     *,
     base_url: str = "http://127.0.0.1:8000",
@@ -1556,6 +2042,7 @@ def run_ops_agents_cycle(
     - upload_flow
     - scoring_quality
     - evolution
+    - learning_calibration
     """
     cycle_started = time.monotonic()
     restart_cmd = restart_cmd or ["./scripts/restart_server.sh"]
@@ -1632,6 +2119,15 @@ def run_ops_agents_cycle(
                 retry_budget=smoke_retry_budget,
             )
 
+        agents["learning_calibration"] = _run_learning_calibration_agent(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout,
+            auto_evolve=auto_evolve,
+            min_samples=min_evolve_samples,
+            requester=requester,
+        )
+
         futures = {}
         with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as executor:
             futures[
@@ -1649,7 +2145,7 @@ def run_ops_agents_cycle(
                     base_url=base_url,
                     api_key=api_key,
                     timeout=timeout,
-                    auto_evolve=auto_evolve,
+                    auto_evolve=False,
                     min_samples=min_evolve_samples,
                     requester=requester,
                 )
