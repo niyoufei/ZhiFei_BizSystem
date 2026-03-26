@@ -817,6 +817,95 @@ def test_learning_calibration_agent_respects_recent_reflection_cooldown():
     assert any("60 分钟" in row for row in result["recommendations"])
 
 
+def test_learning_calibration_agent_reports_bootstrap_review_failures():
+    recent_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    calibration_latest = datetime.now(timezone.utc).isoformat()
+
+    def fake_requester(**kwargs):
+        method = str(kwargs.get("method") or "")
+        url = str(kwargs.get("url") or "")
+        if method == "GET" and url.endswith("/api/v1/projects"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": [
+                    {
+                        "id": "p1",
+                        "name": "真实项目A",
+                        "status": "submitted_to_qingtian",
+                        "updated_at": recent_iso,
+                    }
+                ],
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/evolution/health"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "ground_truth_count": 1,
+                        "eligible_learning_ground_truth_count": 1,
+                        "matched_prediction_count": 1,
+                        "guardrail_blocked_count": 0,
+                        "evolution_weight_min_samples": 1,
+                        "has_evolved_multipliers": True,
+                        "evolution_weights_usable": True,
+                    },
+                    "drift": {"level": "low"},
+                },
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/feedback/governance"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "manual_confirmation_required": False,
+                        "few_shot_pending_review_count": 0,
+                        "current_calibrator_bootstrap_small_sample": False,
+                        "current_calibrator_deployment_mode": "prior_fallback",
+                        "latest_project_calibrator_deployment_mode": "bootstrap_candidate_only",
+                        "latest_project_calibrator_auto_review": {
+                            "checked": True,
+                            "passed": False,
+                            "action": "rollback",
+                            "reason": "preview_worsened_beyond_tolerance",
+                        },
+                    },
+                    "score_preview": {
+                        "current_calibrator_version": "prior_five_scale_global_offset_v1",
+                    },
+                    "version_history": [
+                        {
+                            "artifact": "calibration_models",
+                            "latest_created_at": calibration_latest,
+                        }
+                    ],
+                },
+                "error": None,
+            }
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    result = oa._run_learning_calibration_agent(
+        base_url="http://127.0.0.1:8000",
+        api_key=None,
+        timeout=5.0,
+        auto_evolve=True,
+        min_samples=1,
+        requester=fake_requester,
+    )
+
+    assert result["status"] == "warn"
+    assert result["metrics"]["pending_calibration_after"] == 1
+    assert result["metrics"]["bootstrap_review_failed_count"] == 1
+    assert any("自动阻止部署" in row for row in result["recommendations"])
+
+
 def test_ensure_agent_coverage_backfills_missing_agents():
     agents = {
         "sre_watchdog": {

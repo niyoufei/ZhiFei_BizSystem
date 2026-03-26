@@ -233,6 +233,14 @@ def build_feedback_governance_report(
         project_id,
         artifact_payload_overrides=artifact_payload_overrides,
     )
+    calibrator_rows = main._load_governance_artifact_payload(
+        "calibration_models",
+        artifact_payload_overrides=artifact_payload_overrides,
+    )
+    calibrator_state = main._summarize_project_calibrator_state(
+        project,
+        calibrator_rows if isinstance(calibrator_rows, list) else [],
+    )
     score_preview = main._build_governance_score_preview(
         project_id,
         project,
@@ -314,6 +322,29 @@ def build_feedback_governance_report(
         recommendations.append(
             "部分沙箱重评分样本执行失败，请先查看错误明细后再决定是否继续治理操作。"
         )
+    latest_project_calibrator_version = str(
+        calibrator_state.get("latest_project_calibrator_version") or ""
+    ).strip()
+    latest_project_calibrator_mode = str(
+        calibrator_state.get("latest_project_calibrator_deployment_mode") or ""
+    ).strip()
+    latest_project_auto_review = main._normalize_calibrator_auto_review_state(
+        calibrator_state.get("latest_project_calibrator_auto_review")
+    )
+    if latest_project_calibrator_version:
+        if latest_project_calibrator_mode == "bootstrap_auto_deploy":
+            recommendations.append(
+                "当前项目级校准器处于小样本 bootstrap 监控态，已可参与逼近评分；建议继续补录真实评标样本，尽快升级为完整 CV 校准。"
+            )
+        elif latest_project_calibrator_mode == "bootstrap_candidate_only":
+            if str(latest_project_auto_review.get("action") or "") == "rollback":
+                recommendations.append(
+                    "最新小样本 bootstrap 校准器在只读偏差复核中表现变差，系统已自动保留为候选未部署，当前仍沿用旧校准器或 prior。"
+                )
+            else:
+                recommendations.append(
+                    "最新小样本 bootstrap 校准器尚未正式部署，建议继续补录真实评标样本后再自动复核。"
+                )
 
     return {
         "project_id": project_id,
@@ -353,6 +384,36 @@ def build_feedback_governance_report(
                 or ""
             ),
             "manual_override_hint": summary_guardrail.get("manual_override_hint"),
+            "current_calibrator_version": calibrator_state.get("current_calibrator_version"),
+            "current_calibrator_model_type": calibrator_state.get("current_calibrator_model_type"),
+            "current_calibrator_source": calibrator_state.get("current_calibrator_source"),
+            "current_calibrator_bootstrap_small_sample": bool(
+                calibrator_state.get("current_calibrator_bootstrap_small_sample")
+            ),
+            "current_calibrator_deployment_mode": calibrator_state.get(
+                "current_calibrator_deployment_mode"
+            ),
+            "current_calibrator_auto_review": calibrator_state.get("current_calibrator_auto_review")
+            or {},
+            "latest_project_calibrator_version": calibrator_state.get(
+                "latest_project_calibrator_version"
+            ),
+            "latest_project_calibrator_model_type": calibrator_state.get(
+                "latest_project_calibrator_model_type"
+            ),
+            "latest_project_calibrator_deployed": bool(
+                calibrator_state.get("latest_project_calibrator_deployed")
+            ),
+            "latest_project_calibrator_bootstrap_small_sample": bool(
+                calibrator_state.get("latest_project_calibrator_bootstrap_small_sample")
+            ),
+            "latest_project_calibrator_deployment_mode": calibrator_state.get(
+                "latest_project_calibrator_deployment_mode"
+            ),
+            "latest_project_calibrator_auto_review": calibrator_state.get(
+                "latest_project_calibrator_auto_review"
+            )
+            or {},
         },
         "blocked_samples": blocked_samples,
         "approved_samples": approved_samples,
@@ -362,7 +423,7 @@ def build_feedback_governance_report(
         "artifact_impacts": artifact_impacts,
         "score_preview": score_preview,
         "sandbox_preview": sandbox_preview,
-        "recommendations": recommendations[:10],
+        "recommendations": recommendations[:12],
     }
 
 

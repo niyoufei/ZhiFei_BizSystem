@@ -454,6 +454,7 @@ DEFAULT_CALIBRATION_FRESHNESS_DAYS = 90
 DEFAULT_CALIBRATION_MIN_RECENT_RATIO = 0.6
 DEFAULT_PROJECT_LEARNING_MIN_SAMPLES = 1
 LEGACY_PROJECT_LEARNING_MIN_SAMPLES = 3
+DEFAULT_BOOTSTRAP_CALIBRATION_MAX_AVG_DELTA_INCREASE = 0.5
 DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO = 0.4
 DEFAULT_FEW_SHOT_MIN_HIGH_SCORE_100 = 78.0
 DEFAULT_LEARNING_MIN_AWARENESS_SCORE = 45.0
@@ -9197,6 +9198,10 @@ def _build_calibrator_summary(
     spearman_tolerance: Optional[float] = None,
     auto_candidates: Optional[List[Dict[str, Any]]] = None,
     sample_count: Optional[int] = None,
+    bootstrap_small_sample: bool = False,
+    full_validation_min_samples: Optional[int] = LEGACY_PROJECT_LEARNING_MIN_SAMPLES,
+    deployment_mode: Optional[str] = None,
+    auto_review: Optional[Dict[str, Any]] = None,
     skipped_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     gate_payload: Dict[str, Any] = {}
@@ -9215,12 +9220,314 @@ def _build_calibrator_summary(
         "baseline_metrics": baseline_metrics or {},
         "gate": gate_payload,
         "auto_candidates": auto_candidates or [],
+        "bootstrap_small_sample": bool(bootstrap_small_sample),
+        "full_validation_min_samples": (
+            int(full_validation_min_samples) if full_validation_min_samples is not None else None
+        ),
+        "deployment_mode": deployment_mode,
+        "auto_review": auto_review or {},
     }
     if sample_count is not None:
         summary["sample_count"] = int(sample_count)
     if skipped_reason:
         summary["skipped_reason"] = skipped_reason
     return summary
+
+
+def _normalize_calibrator_auto_review_state(payload: object) -> Dict[str, Any]:
+    data = payload if isinstance(payload, dict) else {}
+    passed_raw = data.get("passed")
+    passed = passed_raw if isinstance(passed_raw, bool) else None
+    return {
+        "checked": bool(data.get("checked")),
+        "passed": passed,
+        "action": str(data.get("action") or "skip").strip().lower() or "skip",
+        "reason": str(data.get("reason") or "not_run").strip() or "not_run",
+        "review_mode": str(data.get("review_mode") or "bootstrap_preview").strip()
+        or "bootstrap_preview",
+        "reviewed_at": str(data.get("reviewed_at") or ""),
+        "matched_submission_count": int(
+            _to_float_or_none(data.get("matched_submission_count")) or 0
+        ),
+        "avg_abs_delta_stored": _to_float_or_none(data.get("avg_abs_delta_stored")),
+        "avg_abs_delta_preview": _to_float_or_none(data.get("avg_abs_delta_preview")),
+        "avg_abs_delta_improvement": _to_float_or_none(data.get("avg_abs_delta_improvement")),
+        "improved_row_count": int(_to_float_or_none(data.get("improved_row_count")) or 0),
+        "worsened_row_count": int(_to_float_or_none(data.get("worsened_row_count")) or 0),
+        "max_allowed_avg_delta_increase": float(
+            _to_float_or_none(data.get("max_allowed_avg_delta_increase"))
+            or DEFAULT_BOOTSTRAP_CALIBRATION_MAX_AVG_DELTA_INCREASE
+        ),
+    }
+
+
+def _calibrator_summary_dict(model: Dict[str, object]) -> Dict[str, object]:
+    return (
+        model.get("calibrator_summary") if isinstance(model.get("calibrator_summary"), dict) else {}
+    )
+
+
+def _calibrator_bootstrap_small_sample(model: Dict[str, object]) -> bool:
+    summary = _calibrator_summary_dict(model)
+    if "bootstrap_small_sample" in summary:
+        return bool(summary.get("bootstrap_small_sample"))
+    metrics = model.get("metrics") if isinstance(model.get("metrics"), dict) else {}
+    return bool(metrics.get("bootstrap_small_sample"))
+
+
+def _calibrator_deployment_mode(model: Dict[str, object]) -> str:
+    summary = _calibrator_summary_dict(model)
+    mode = str(summary.get("deployment_mode") or "").strip()
+    if mode:
+        return mode
+    version = str(model.get("calibrator_version") or "").strip()
+    if version.startswith("prior_"):
+        return "prior_fallback"
+    if bool(model.get("deployed")):
+        return (
+            "bootstrap_auto_deploy" if _calibrator_bootstrap_small_sample(model) else "cv_validated"
+        )
+    if bool(model.get("gate_passed")) is False:
+        return "gate_rejected"
+    return "candidate_only"
+
+
+def _calibrator_auto_review_state(model: Dict[str, object]) -> Dict[str, Any]:
+    summary = _calibrator_summary_dict(model)
+    return _normalize_calibrator_auto_review_state(summary.get("auto_review"))
+
+
+def _project_calibrator_rows(
+    project: Dict[str, object],
+    rows: List[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    project_id = str(project.get("id") or "").strip()
+    return sorted(
+        [
+            row
+            for row in rows
+            if str(((row.get("train_filter") or {}).get("project_id") or "")).strip() == project_id
+        ],
+        key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""),
+        reverse=True,
+    )
+
+
+def _summarize_project_calibrator_state(
+    project: Dict[str, object],
+    rows: List[Dict[str, object]],
+) -> Dict[str, object]:
+    current = _select_calibrator_model_from_rows(project, rows or []) or {}
+    project_rows = _project_calibrator_rows(project, rows or [])
+    latest_project = project_rows[0] if project_rows else {}
+    current_version = str(current.get("calibrator_version") or "").strip()
+    latest_project_version = str(latest_project.get("calibrator_version") or "").strip()
+    current_source = "none"
+    if current_version:
+        current_source = "prior" if current_version.startswith("prior_") else "project"
+    return {
+        "current_calibrator_version": current_version or None,
+        "current_calibrator_model_type": str(current.get("model_type") or "") or None,
+        "current_calibrator_source": current_source,
+        "current_calibrator_bootstrap_small_sample": _calibrator_bootstrap_small_sample(current),
+        "current_calibrator_deployment_mode": _calibrator_deployment_mode(current),
+        "current_calibrator_auto_review": _calibrator_auto_review_state(current),
+        "latest_project_calibrator_version": latest_project_version or None,
+        "latest_project_calibrator_model_type": str(latest_project.get("model_type") or "") or None,
+        "latest_project_calibrator_deployed": bool(latest_project.get("deployed")),
+        "latest_project_calibrator_bootstrap_small_sample": _calibrator_bootstrap_small_sample(
+            latest_project
+        ),
+        "latest_project_calibrator_deployment_mode": _calibrator_deployment_mode(latest_project),
+        "latest_project_calibrator_auto_review": _calibrator_auto_review_state(latest_project),
+    }
+
+
+def _build_calibration_models_preview_override(
+    project: Dict[str, object],
+    existing_rows: List[Dict[str, object]],
+    candidate_record: Dict[str, object],
+) -> List[Dict[str, object]]:
+    project_id = str(project.get("id") or "").strip()
+    candidate_version = str(candidate_record.get("calibrator_version") or "").strip()
+    preview_rows: List[Dict[str, object]] = []
+    for row in existing_rows:
+        copied = copy.deepcopy(row) if isinstance(row, dict) else {}
+        if (
+            project_id
+            and str(((copied.get("train_filter") or {}).get("project_id") or "")).strip()
+            == project_id
+        ):
+            copied["deployed"] = False
+        preview_rows.append(copied)
+    candidate_copy = copy.deepcopy(candidate_record)
+    candidate_copy["deployed"] = True
+    if candidate_version:
+        preview_rows = [
+            row
+            for row in preview_rows
+            if str(row.get("calibrator_version") or "").strip() != candidate_version
+        ]
+    preview_rows.append(candidate_copy)
+    return preview_rows
+
+
+def _build_calibrator_auto_review(
+    *,
+    project_id: str,
+    project: Dict[str, object],
+    existing_models: List[Dict[str, object]],
+    candidate_record: Dict[str, object],
+) -> Dict[str, Any]:
+    bootstrap_small_sample = _calibrator_bootstrap_small_sample(candidate_record)
+    default_action = "keep_with_monitoring" if bootstrap_small_sample else "keep"
+    result: Dict[str, Any] = {
+        "checked": False,
+        "passed": None,
+        "action": default_action,
+        "reason": "not_required",
+        "review_mode": "bootstrap_preview",
+        "reviewed_at": _now_iso(),
+        "matched_submission_count": 0,
+        "avg_abs_delta_stored": None,
+        "avg_abs_delta_preview": None,
+        "avg_abs_delta_improvement": None,
+        "improved_row_count": 0,
+        "worsened_row_count": 0,
+        "max_allowed_avg_delta_increase": DEFAULT_BOOTSTRAP_CALIBRATION_MAX_AVG_DELTA_INCREASE,
+    }
+    if not bool(candidate_record.get("deployed")):
+        result["action"] = "skip"
+        result["reason"] = "candidate_not_deployed"
+        return result
+    if not bootstrap_small_sample:
+        result["reason"] = "full_validation_not_required"
+        return result
+
+    override_rows = _build_calibration_models_preview_override(
+        project, existing_models, candidate_record
+    )
+    artifact_payload_overrides = {"calibration_models": override_rows}
+    artifact_impacts = _build_governance_artifact_impacts(
+        project_id,
+        artifact_payload_overrides=artifact_payload_overrides,
+    )
+    preview = _build_governance_score_preview(
+        project_id,
+        project,
+        artifact_impacts,
+        artifact_payload_overrides=artifact_payload_overrides,
+    )
+    matched_submission_count = int(_to_float_or_none(preview.get("matched_submission_count")) or 0)
+    avg_abs_delta_stored = _to_float_or_none(preview.get("avg_abs_delta_stored"))
+    avg_abs_delta_preview = _to_float_or_none(preview.get("avg_abs_delta_preview"))
+    avg_abs_delta_improvement = _to_float_or_none(preview.get("avg_abs_delta_improvement"))
+    improved_row_count = int(_to_float_or_none(preview.get("improved_row_count")) or 0)
+    worsened_row_count = int(_to_float_or_none(preview.get("worsened_row_count")) or 0)
+    result.update(
+        {
+            "matched_submission_count": matched_submission_count,
+            "avg_abs_delta_stored": avg_abs_delta_stored,
+            "avg_abs_delta_preview": avg_abs_delta_preview,
+            "avg_abs_delta_improvement": avg_abs_delta_improvement,
+            "improved_row_count": improved_row_count,
+            "worsened_row_count": worsened_row_count,
+        }
+    )
+    if (
+        matched_submission_count <= 0
+        or avg_abs_delta_stored is None
+        or avg_abs_delta_preview is None
+    ):
+        result["action"] = "keep_with_monitoring"
+        result["reason"] = "no_comparable_rows"
+        return result
+
+    result["checked"] = True
+    tolerance = float(result["max_allowed_avg_delta_increase"])
+    preview_worsened = float(avg_abs_delta_preview) > float(avg_abs_delta_stored) + tolerance
+    if preview_worsened:
+        result["passed"] = False
+        result["action"] = "rollback"
+        result["reason"] = "preview_worsened_beyond_tolerance"
+    elif float(avg_abs_delta_preview) + 1e-6 < float(avg_abs_delta_stored):
+        result["passed"] = True
+        result["action"] = "keep"
+        result["reason"] = "preview_improved"
+    else:
+        result["passed"] = True
+        result["action"] = "keep_with_monitoring"
+        result["reason"] = "preview_non_inferior_within_tolerance"
+    return result
+
+
+def _finalize_calibrator_record_for_deploy(
+    *,
+    project: Optional[Dict[str, object]],
+    existing_models: List[Dict[str, object]],
+    record: Dict[str, object],
+    auto_deploy_requested: bool,
+) -> Dict[str, Any]:
+    summary = dict(record.get("calibrator_summary") or {})
+    metrics = dict(record.get("metrics") or {})
+    bootstrap_small_sample = _calibrator_bootstrap_small_sample(record)
+    auto_review = _normalize_calibrator_auto_review_state(summary.get("auto_review"))
+    deployment_mode = "candidate_only"
+    if not bool(record.get("gate_passed")) and not bool(metrics.get("gate_passed")):
+        deployment_mode = "gate_rejected"
+    elif bool(record.get("deployed")):
+        deployment_mode = "bootstrap_auto_deploy" if bootstrap_small_sample else "cv_validated"
+    elif bootstrap_small_sample:
+        deployment_mode = "bootstrap_candidate_only"
+
+    if (
+        auto_deploy_requested
+        and bool(record.get("deployed"))
+        and isinstance(project, dict)
+        and str(project.get("id") or "").strip()
+    ):
+        auto_review = _build_calibrator_auto_review(
+            project_id=str(project.get("id") or ""),
+            project=project,
+            existing_models=existing_models,
+            candidate_record=record,
+        )
+        if bool(auto_review.get("checked")) and str(auto_review.get("action") or "") == "rollback":
+            record["deployed"] = False
+            deployment_mode = (
+                "bootstrap_candidate_only" if bootstrap_small_sample else "candidate_only"
+            )
+        elif (
+            bootstrap_small_sample
+            and str(auto_review.get("action") or "") == "keep_with_monitoring"
+        ):
+            deployment_mode = "bootstrap_auto_deploy"
+
+    summary["bootstrap_small_sample"] = bool(bootstrap_small_sample)
+    summary["full_validation_min_samples"] = LEGACY_PROJECT_LEARNING_MIN_SAMPLES
+    summary["deployment_mode"] = deployment_mode
+    summary["auto_review"] = auto_review
+    record["calibrator_summary"] = summary
+    metrics["bootstrap_small_sample"] = bool(bootstrap_small_sample)
+    metrics["deployment_mode"] = deployment_mode
+    metrics["auto_review_checked"] = bool(auto_review.get("checked"))
+    metrics["auto_review_passed"] = auto_review.get("passed")
+    metrics["auto_review_action"] = auto_review.get("action")
+    metrics["auto_review_reason"] = auto_review.get("reason")
+    metrics["auto_review_matched_submission_count"] = int(
+        _to_float_or_none(auto_review.get("matched_submission_count")) or 0
+    )
+    metrics["auto_review_avg_abs_delta_stored"] = _to_float_or_none(
+        auto_review.get("avg_abs_delta_stored")
+    )
+    metrics["auto_review_avg_abs_delta_preview"] = _to_float_or_none(
+        auto_review.get("avg_abs_delta_preview")
+    )
+    metrics["auto_review_avg_abs_delta_improvement"] = _to_float_or_none(
+        auto_review.get("avg_abs_delta_improvement")
+    )
+    record["metrics"] = metrics
+    return record
 
 
 def _build_calibration_baseline_metrics(
@@ -9355,6 +9662,10 @@ def _train_calibrator_with_gate(
         spearman_tolerance=spearman_tolerance,
         auto_candidates=auto_candidates,
         sample_count=sample_count,
+        bootstrap_small_sample=bootstrap_small_sample,
+        full_validation_min_samples=LEGACY_PROJECT_LEARNING_MIN_SAMPLES,
+        deployment_mode="candidate_only",
+        auto_review=_normalize_calibrator_auto_review_state({}),
     )
     return {
         "model_artifact": model_artifact,
@@ -10529,12 +10840,17 @@ def _summarize_versioned_artifact_payload(
             key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""),
             default={},
         )
+        latest_auto_review = _calibrator_auto_review_state(latest)
         return {
             "summary_type": "calibration_models",
             "primary_count": len(rows),
             "latest_calibrator_version": str(latest.get("calibrator_version") or ""),
             "latest_model_type": str(latest.get("model_type") or ""),
             "gate_passed_count": sum(1 for row in rows if bool(row.get("gate_passed"))),
+            "latest_bootstrap_small_sample": _calibrator_bootstrap_small_sample(latest),
+            "latest_deployment_mode": _calibrator_deployment_mode(latest),
+            "latest_auto_review_action": str(latest_auto_review.get("action") or ""),
+            "latest_auto_review_passed": latest_auto_review.get("passed"),
         }
     if artifact == "expert_profiles":
         rows = [
@@ -10918,7 +11234,11 @@ def _build_governance_score_preview(
         )
         or {}
     )
-    current_calibrator_version = str(calibrator.get("calibrator_version") or "")
+    calibrator_state = _summarize_project_calibrator_state(
+        project,
+        calibrator_rows if isinstance(calibrator_rows, list) else [],
+    )
+    current_calibrator_version = str(calibrator_state.get("current_calibrator_version") or "")
     requires_rule_rescore = any(
         bool(item.get("changed_since_latest_snapshot"))
         for item in artifact_impacts
@@ -11053,6 +11373,16 @@ def _build_governance_score_preview(
         "matched_submission_count": len(all_rows),
         "preview_limit": preview_limit,
         "current_calibrator_version": current_calibrator_version or None,
+        "current_calibrator_model_type": calibrator_state.get("current_calibrator_model_type"),
+        "current_calibrator_source": calibrator_state.get("current_calibrator_source"),
+        "current_calibrator_bootstrap_small_sample": bool(
+            calibrator_state.get("current_calibrator_bootstrap_small_sample")
+        ),
+        "current_calibrator_deployment_mode": calibrator_state.get(
+            "current_calibrator_deployment_mode"
+        ),
+        "current_calibrator_auto_review": calibrator_state.get("current_calibrator_auto_review")
+        or {},
         "calibrator_changed_since_latest_snapshot": calibrator_changed_since_latest_snapshot,
         "requires_rule_rescore": requires_rule_rescore,
         "dimension_preview_supported": False,
@@ -20096,15 +20426,29 @@ def train_calibrator(
 
     models = load_calibration_models()
     train_scope_project_id = str(payload.project_id or "").strip()
+    project = None
+    projects: List[Dict[str, object]] = []
+    if train_scope_project_id:
+        projects = load_projects()
+        project = next(
+            (row for row in projects if str(row.get("id") or "") == train_scope_project_id),
+            None,
+        )
     if payload.auto_deploy and bool(gate_passed) and train_scope_project_id:
+        record["deployed"] = True
+    record = _finalize_calibrator_record_for_deploy(
+        project=project,
+        existing_models=models,
+        record=record,
+        auto_deploy_requested=bool(payload.auto_deploy),
+    )
+    if bool(record.get("deployed")) and train_scope_project_id:
         for m in models:
             if (
                 str(((m.get("train_filter") or {}).get("project_id") or ""))
                 == train_scope_project_id
             ):
                 m["deployed"] = False
-        record["deployed"] = True
-        projects = load_projects()
         for p in projects:
             if str(p.get("id")) == train_scope_project_id:
                 p["calibrator_version_locked"] = version
@@ -20580,6 +20924,10 @@ def auto_run_reflection_pipeline(
         calibrator_version=None,
         gate_passed=None,
         sample_count=len(samples),
+        bootstrap_small_sample=len(samples) < LEGACY_PROJECT_LEARNING_MIN_SAMPLES,
+        full_validation_min_samples=LEGACY_PROJECT_LEARNING_MIN_SAMPLES,
+        deployment_mode="candidate_only" if len(samples) >= min_learning_samples else None,
+        auto_review=_normalize_calibrator_auto_review_state({}),
         skipped_reason="insufficient_samples" if len(samples) < min_learning_samples else None,
     )
     calibrator_model_type = calibrator_summary.get("model_type")
@@ -20590,6 +20938,7 @@ def auto_run_reflection_pipeline(
     calibrator_auto_candidates: List[Dict[str, Any]] = (
         calibrator_summary.get("auto_candidates") or []
     )
+    calibrator_auto_review: Dict[str, Any] = calibrator_summary.get("auto_review") or {}
     if len(samples) >= min_learning_samples:
         feature_rows = [
             {
@@ -20637,7 +20986,21 @@ def auto_run_reflection_pipeline(
             "created_at": _now_iso(),
         }
         models = load_calibration_models()
-        if record["deployed"]:
+        record = _finalize_calibrator_record_for_deploy(
+            project=project,
+            existing_models=models,
+            record=record,
+            auto_deploy_requested=bool(gate_passed),
+        )
+        calibrator_summary = dict(record.get("calibrator_summary") or calibrator_summary)
+        calibrator_model_type = calibrator_summary.get("model_type")
+        calibrator_gate_passed = calibrator_summary.get("gate_passed")
+        calibrator_cv_metrics = calibrator_summary.get("cv_metrics") or {}
+        calibrator_baseline_metrics = calibrator_summary.get("baseline_metrics") or {}
+        calibrator_gate = calibrator_summary.get("gate") or {}
+        calibrator_auto_candidates = calibrator_summary.get("auto_candidates") or []
+        calibrator_auto_review = calibrator_summary.get("auto_review") or {}
+        if bool(record.get("deployed")):
             for m in models:
                 if str(((m.get("train_filter") or {}).get("project_id") or "")) == project_id:
                     m["deployed"] = False
@@ -20748,6 +21111,7 @@ def auto_run_reflection_pipeline(
         calibrator_baseline_metrics=calibrator_baseline_metrics,
         calibrator_gate=calibrator_gate,
         calibrator_auto_candidates=calibrator_auto_candidates,
+        calibrator_auto_review=calibrator_auto_review,
         prediction_updated_reports=updated_reports,
         prediction_updated_submissions=updated_submissions,
         patch_id=patch_id,
@@ -28574,6 +28938,28 @@ def index(
           const sandboxPreview = (data.sandbox_preview && typeof data.sandbox_preview === 'object') ? data.sandbox_preview : {};
           const sandboxRows = Array.isArray(sandboxPreview.rows) ? sandboxPreview.rows : [];
           const sandboxErrors = Array.isArray(sandboxPreview.errors) ? sandboxPreview.errors : [];
+          const currentCalibratorAutoReview = (summary.current_calibrator_auto_review && typeof summary.current_calibrator_auto_review === 'object')
+            ? summary.current_calibrator_auto_review
+            : ((scorePreview.current_calibrator_auto_review && typeof scorePreview.current_calibrator_auto_review === 'object') ? scorePreview.current_calibrator_auto_review : {});
+          const latestProjectCalibratorAutoReview = (summary.latest_project_calibrator_auto_review && typeof summary.latest_project_calibrator_auto_review === 'object')
+            ? summary.latest_project_calibrator_auto_review
+            : {};
+          const formatCalibratorMode = (value) => ({
+            prior_fallback: 'prior 兜底',
+            cv_validated: '完整 CV 校准',
+            bootstrap_auto_deploy: '小样本 bootstrap（已部署）',
+            bootstrap_candidate_only: '小样本 bootstrap（候选未部署）',
+            candidate_only: '候选未部署',
+            gate_rejected: '闸门未通过',
+          }[String(value || '').trim()] || String(value || '-') || '-');
+          const formatAutoReview = (review) => {
+            const item = (review && typeof review === 'object') ? review : {};
+            const checked = !!item.checked;
+            const passed = (typeof item.passed === 'boolean') ? (item.passed ? '通过' : '未通过') : '未执行';
+            const action = String(item.action || 'skip').trim() || 'skip';
+            const reason = String(item.reason || '-').trim() || '-';
+            return '状态=' + passed + '；动作=' + action + '；原因=' + reason + (checked ? '' : '；仅进入监控');
+          };
           const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
           let html = '<strong>评分治理面板（异常样本 / few-shot / 回退快照）</strong>';
           html += '<p class="note" style="margin:6px 0">用途：处理真实评分闭环中的异常样本、few-shot 采纳/忽略、版本预演与回退；它不是逐页编制优化清单。</p>';
@@ -28637,6 +29023,12 @@ def index(
           html += '<tr><td>few-shot 待审核</td><td>' + escapeHtmlText(summary.few_shot_pending_review_count || 0) + '</td></tr>';
           html += '<tr><td>few-shot 版本数</td><td>' + escapeHtmlText(summary.few_shot_feature_version_count || 0) + '</td></tr>';
           html += '<tr><td>最新 few-shot 版本</td><td>' + escapeHtmlText(summary.latest_few_shot_version_id || '-') + '</td></tr>';
+          html += '<tr><td>当前校准器</td><td>' + escapeHtmlText(summary.current_calibrator_version || '-') + '</td></tr>';
+          html += '<tr><td>当前校准形态</td><td>' + escapeHtmlText(formatCalibratorMode(summary.current_calibrator_deployment_mode)) + '</td></tr>';
+          html += '<tr><td>当前自动复核</td><td>' + escapeHtmlText(formatAutoReview(currentCalibratorAutoReview)) + '</td></tr>';
+          html += '<tr><td>最新项目级校准器</td><td>' + escapeHtmlText(summary.latest_project_calibrator_version || '-') + '</td></tr>';
+          html += '<tr><td>最新项目级形态</td><td>' + escapeHtmlText(formatCalibratorMode(summary.latest_project_calibrator_deployment_mode)) + '</td></tr>';
+          html += '<tr><td>最新项目级自动复核</td><td>' + escapeHtmlText(formatAutoReview(latestProjectCalibratorAutoReview)) + '</td></tr>';
           html += '</table>';
           if (blockedSamples.length) {
             html += '<strong>被拦截样本</strong><table><tr><th>记录ID</th><th>来源</th><th>真实分</th><th>预测分</th><th>偏差(100分)</th><th>审核状态</th><th>说明</th><th>操作</th></tr>';
@@ -28767,6 +29159,12 @@ def index(
             previewSummaryParts.push('匹配样本=' + escapeHtmlText(scorePreview.matched_submission_count || 0));
             if (scorePreview.current_calibrator_version) {
               previewSummaryParts.push('当前校准器=' + escapeHtmlText(scorePreview.current_calibrator_version));
+            }
+            if (scorePreview.current_calibrator_deployment_mode) {
+              previewSummaryParts.push('校准形态=' + escapeHtmlText(formatCalibratorMode(scorePreview.current_calibrator_deployment_mode)));
+            }
+            if (scorePreview.current_calibrator_bootstrap_small_sample) {
+              previewSummaryParts.push('当前为小样本 bootstrap 校准');
             }
             if (scorePreview.avg_abs_delta_stored != null) {
               previewSummaryParts.push('已落库平均绝对偏差=' + escapeHtmlText(scorePreview.avg_abs_delta_stored));
@@ -31378,8 +31776,14 @@ def index(
             const spearmanTolerance = gate.spearman_tolerance ?? metrics.gate_spearman_tolerance;
             const cvMode = cv.mode ?? metrics.cv_mode;
             const cvPredCount = cv.pred_count ?? metrics.cv_pred_count;
+            const bootstrapSmallSample = !!summary.bootstrap_small_sample;
+            const deploymentMode = summary.deployment_mode || metrics.deployment_mode || '-';
+            const autoReview = (summary.auto_review && typeof summary.auto_review === 'object')
+              ? summary.auto_review
+              : ((data.calibrator_auto_review && typeof data.calibrator_auto_review === 'object') ? data.calibrator_auto_review : {});
             const gateText = typeof gatePassed === 'boolean' ? (gatePassed ? '通过' : '未通过') : '-';
             html += '<p style="margin:4px 0"><b>校准摘要</b>：模型=' + modelType + '；版本=' + version + '；闸门=' + gateText + (sampleCount != null ? ('；样本=' + sampleCount) : '') + '</p>';
+            html += '<p style="margin:4px 0"><b>部署形态</b>：' + String(deploymentMode || '-') + (bootstrapSmallSample ? '；当前属于小样本 bootstrap 校准' : '') + '</p>';
             if (skippedReason) {
               html += '<p style="margin:4px 0;color:#9a3412"><b>提示</b>：本次未训练校准器（' + skippedReason + '）。</p>';
             }
@@ -31387,6 +31791,13 @@ def index(
               html += '<p style="margin:4px 0"><b>CV</b> MAE=' + fmtMetric(cvMae) + ' RMSE=' + fmtMetric(cvRmse) + ' Spearman=' + fmtMetric(cvSpearman) + '（' + (cvMode || '-') + ', n=' + (cvPredCount || 0) + '）</p>';
               html += '<p style="margin:4px 0"><b>Baseline</b> MAE=' + fmtMetric(baselineMae) + ' RMSE=' + fmtMetric(baselineRmse) + ' Spearman=' + fmtMetric(baselineSpearman) + '</p>';
               html += '<p style="margin:4px 0"><b>闸门阈值</b> MAE改进≥' + fmtMetric(improveThreshold) + '，Spearman不下降超过' + fmtMetric(spearmanTolerance) + '</p>';
+            }
+            if (autoReview && Object.keys(autoReview).length) {
+              const reviewChecked = !!autoReview.checked;
+              const reviewPassed = (typeof autoReview.passed === 'boolean') ? (autoReview.passed ? '通过' : '未通过') : '未执行';
+              const reviewAction = String(autoReview.action || 'skip');
+              const reviewReason = String(autoReview.reason || '-');
+              html += '<p style="margin:4px 0"><b>自动复核</b>：' + reviewPassed + '；动作=' + reviewAction + '；原因=' + reviewReason + (reviewChecked ? '' : '；当前仅进入监控') + '</p>';
             }
             const candidates = Array.isArray(summary.auto_candidates) ? summary.auto_candidates : (Array.isArray(data.calibrator_auto_candidates) ? data.calibrator_auto_candidates : []);
             if (candidates.length) {

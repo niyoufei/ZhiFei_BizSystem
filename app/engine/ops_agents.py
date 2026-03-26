@@ -1651,6 +1651,9 @@ def _run_learning_calibration_agent(
                 "evolve_cooldown_skipped_count": 0,
                 "reflection_cooldown_skipped_count": 0,
                 "calibrator_deployed_count": 0,
+                "bootstrap_active_count": 0,
+                "bootstrap_monitoring_count": 0,
+                "bootstrap_review_failed_count": 0,
                 "patch_deployed_count": 0,
                 "patch_rollback_count": 0,
                 "post_verify_failed_count": 0,
@@ -1684,6 +1687,9 @@ def _run_learning_calibration_agent(
     evolve_cooldown_skipped_count = 0
     reflection_cooldown_skipped_count = 0
     calibrator_deployed_count = 0
+    bootstrap_active_count = 0
+    bootstrap_monitoring_count = 0
+    bootstrap_review_failed_count = 0
     patch_deployed_count = 0
     patch_rollback_count = 0
     post_verify_failed_count = 0
@@ -1905,8 +1911,28 @@ def _run_learning_calibration_agent(
             verify_governance_score_preview.get("current_calibrator_version") or ""
         ).strip()
         has_project_calibrator_after = _has_project_specific_calibrator(verify_calibrator_version)
+        latest_project_deployment_mode = str(
+            verify_governance_summary.get("latest_project_calibrator_deployment_mode") or ""
+        ).strip()
+        latest_project_auto_review = _json_object(
+            verify_governance_summary.get("latest_project_calibrator_auto_review")
+        )
+        if bool(verify_governance_summary.get("current_calibrator_bootstrap_small_sample")):
+            bootstrap_active_count += 1
+            if (
+                str(
+                    verify_governance_summary.get("current_calibrator_deployment_mode") or ""
+                ).strip()
+                == "bootstrap_auto_deploy"
+            ):
+                bootstrap_monitoring_count += 1
         if reflection_ready and not has_project_calibrator_after:
             pending_calibration_after += 1
+            if (
+                latest_project_deployment_mode == "bootstrap_candidate_only"
+                and str(latest_project_auto_review.get("action") or "").strip() == "rollback"
+            ):
+                bootstrap_review_failed_count += 1
 
         latest_reflection_action = next(
             (
@@ -1974,6 +2000,14 @@ def _run_learning_calibration_agent(
         recommendations.append(
             f"仍有 {pending_calibration_after} 个项目未形成项目级校准器，当前可能仍在使用 prior 兜底逼近。"
         )
+    if bootstrap_monitoring_count > 0:
+        recommendations.append(
+            f"有 {bootstrap_monitoring_count} 个项目当前使用小样本 bootstrap 校准，已自动部署但仍需继续补录真实评分样本。"
+        )
+    if bootstrap_review_failed_count > 0:
+        recommendations.append(
+            f"有 {bootstrap_review_failed_count} 个项目的小样本 bootstrap 校准在只读偏差复核中变差，系统已自动阻止部署。"
+        )
     if reflection_not_ready_count > 0:
         recommendations.append(
             f"有 {reflection_not_ready_count} 个项目真实样本已达学习门槛，但可关联预测样本不足，建议优先用步骤4施组下拉录入真实评标。"
@@ -2027,6 +2061,9 @@ def _run_learning_calibration_agent(
             "evolve_cooldown_skipped_count": evolve_cooldown_skipped_count,
             "reflection_cooldown_skipped_count": reflection_cooldown_skipped_count,
             "calibrator_deployed_count": calibrator_deployed_count,
+            "bootstrap_active_count": bootstrap_active_count,
+            "bootstrap_monitoring_count": bootstrap_monitoring_count,
+            "bootstrap_review_failed_count": bootstrap_review_failed_count,
             "patch_deployed_count": patch_deployed_count,
             "patch_rollback_count": patch_rollback_count,
             "post_verify_failed_count": post_verify_failed_count,

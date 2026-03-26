@@ -1339,7 +1339,90 @@ class TestAutoRunReflection:
         assert data["calibrator_summary"]["sample_count"] == 1
         assert data["calibrator_summary"]["cv_metrics"]["mode"] == "bootstrap_in_sample"
         assert data["calibrator_summary"]["gate_passed"] is True
+        assert data["calibrator_summary"]["bootstrap_small_sample"] is True
+        assert data["calibrator_summary"]["deployment_mode"] == "bootstrap_auto_deploy"
+        assert data["calibrator_summary"]["auto_review"]["action"] == "keep_with_monitoring"
+        assert data["calibrator_summary"]["auto_review"]["reason"] == "no_comparable_rows"
+        assert data["calibrator_auto_review"]["action"] == "keep_with_monitoring"
         assert data["patch_id"] is None
+
+    @patch("app.main._build_governance_score_preview")
+    @patch("app.main._build_governance_artifact_impacts")
+    @patch("app.main.save_patch_packages")
+    @patch("app.main.load_patch_packages")
+    @patch("app.main.save_submissions")
+    @patch("app.main.save_score_reports")
+    @patch("app.main.load_score_reports")
+    @patch("app.main.load_submissions")
+    @patch("app.main.save_projects")
+    @patch("app.main.save_calibration_models")
+    @patch("app.main.load_calibration_models")
+    @patch("app.main.load_calibration_samples")
+    @patch("app.main.load_delta_cases")
+    @patch("app.main._refresh_project_reflection_objects")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_auto_run_reflection_bootstrap_rolls_back_when_preview_worsens(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_refresh,
+        mock_load_delta,
+        mock_load_samples,
+        mock_load_models,
+        mock_save_models,
+        mock_save_projects,
+        mock_load_submissions,
+        mock_load_reports,
+        mock_save_reports,
+        mock_save_submissions,
+        mock_load_patches,
+        mock_save_patches,
+        mock_build_impacts,
+        mock_build_preview,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 100}}]
+        mock_load_delta.return_value = []
+        mock_load_samples.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "feature_schema_version": "v2",
+                "x_features": {"rule_total_score": 80},
+                "y_label": 84,
+            }
+        ]
+        mock_load_models.return_value = []
+        mock_load_submissions.return_value = []
+        mock_load_reports.return_value = []
+        mock_load_patches.return_value = []
+        mock_build_impacts.return_value = []
+        mock_build_preview.return_value = {
+            "matched_submission_count": 1,
+            "avg_abs_delta_stored": 4.0,
+            "avg_abs_delta_preview": 5.2,
+            "avg_abs_delta_improvement": -1.2,
+            "improved_row_count": 0,
+            "worsened_row_count": 1,
+            "rows": [],
+        }
+
+        resp = _client().post("/api/v1/projects/p1/reflection/auto_run")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["calibrator_deployed"] is False
+        assert data["prediction_updated_reports"] == 0
+        assert data["prediction_updated_submissions"] == 0
+        assert data["calibrator_summary"]["bootstrap_small_sample"] is True
+        assert data["calibrator_summary"]["deployment_mode"] == "bootstrap_candidate_only"
+        assert data["calibrator_summary"]["auto_review"]["checked"] is True
+        assert data["calibrator_summary"]["auto_review"]["passed"] is False
+        assert data["calibrator_summary"]["auto_review"]["action"] == "rollback"
+        assert (
+            data["calibrator_summary"]["auto_review"]["reason"]
+            == "preview_worsened_beyond_tolerance"
+        )
+        assert data["calibrator_auto_review"]["action"] == "rollback"
 
 
 class TestScoringFactorsEndpoint:

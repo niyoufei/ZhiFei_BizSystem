@@ -866,6 +866,12 @@ class TestIndexEndpoint:
         assert "补充提示" in page
         assert "关键资料覆盖" in page
         assert "已上传类型覆盖" in page
+        assert "小样本 bootstrap（已部署）" in page
+        assert "小样本 bootstrap（候选未部署）" in page
+        assert "当前校准形态" in page
+        assert "最新项目级自动复核" in page
+        assert "<b>自动复核</b>" in page
+        assert "当前属于小样本 bootstrap 校准" in page
         assert (
             "await refreshGroundTruthSubmissionOptions(null, null, undefined, { forceFetch: true });"
             in page
@@ -9049,6 +9055,10 @@ class TestFeedbackGovernanceRoutes:
         preview = data["score_preview"]
         assert preview["matched_submission_count"] == 1
         assert preview["current_calibrator_version"] == "calib-9"
+        assert preview["current_calibrator_model_type"] == "ridge"
+        assert preview["current_calibrator_source"] == "project"
+        assert preview["current_calibrator_bootstrap_small_sample"] is False
+        assert preview["current_calibrator_deployment_mode"] == "cv_validated"
         assert preview["calibrator_changed_since_latest_snapshot"] is True
         assert preview["requires_rule_rescore"] is False
         assert preview["dimension_preview_supported"] is False
@@ -9085,6 +9095,10 @@ class TestFeedbackGovernanceRoutes:
             "沙箱重评分显示当前完整体系可将平均绝对偏差从 12.00 分收敛到 5.00 分" in item
             for item in data["recommendations"]
         )
+        assert data["summary"]["current_calibrator_version"] == "calib-9"
+        assert data["summary"]["current_calibrator_deployment_mode"] == "cv_validated"
+        assert data["summary"]["latest_project_calibrator_version"] == "calib-9"
+        assert data["summary"]["latest_project_calibrator_deployment_mode"] == "cv_validated"
 
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
@@ -9254,6 +9268,7 @@ class TestFeedbackGovernanceRoutes:
         assert data["matches_current"] is False
         governance = data["governance"]
         assert governance["score_preview"]["current_calibrator_version"] == "calib-preview"
+        assert governance["score_preview"]["current_calibrator_deployment_mode"] == "cv_validated"
         assert governance["score_preview"]["avg_abs_delta_preview"] == 8.0
         assert governance["sandbox_preview"]["avg_abs_delta_sandbox"] == 4.0
         assert any("只读预演" in item for item in data["recommendations"])
