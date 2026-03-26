@@ -11,9 +11,23 @@ from urllib.parse import urlparse
 
 OPS_AUDIT_PREPARATION_STATUSES = {"scoring_preparation", "draft", "created"}
 OPS_AUDIT_SYNTHETIC_PREFIXES = ("ops_", "ops招标项目_", "e2e_")
+OPS_RUNTIME_REPAIRABLE_ITEMS = frozenset(
+    {
+        "data_hygiene",
+        "vision_parse_queue_healthy",
+        "material_parse_backlog_ok",
+    }
+)
+OPS_RUNTIME_RESTART_ITEMS = frozenset(
+    {
+        "vision_parse_queue_healthy",
+        "material_parse_backlog_ok",
+    }
+)
 OPS_AGENT_NAMES = (
     "sre_watchdog",
     "data_hygiene",
+    "runtime_repair",
     "project_flow",
     "tender_project_flow",
     "upload_flow",
@@ -240,6 +254,60 @@ def _ensure_agent_coverage(agents: Dict[str, Dict[str, Any]], *, reason: str) ->
     return missing
 
 
+def _self_check_failed_items(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return []
+    return [row for row in items if isinstance(row, dict) and not bool(row.get("ok"))]
+
+
+def _self_check_failed_names(payload: Dict[str, Any]) -> List[str]:
+    out: List[str] = []
+    for row in _self_check_failed_items(payload):
+        name = str(row.get("name") or "").strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def _self_check_required_fail_names(payload: Dict[str, Any]) -> List[str]:
+    out: List[str] = []
+    for row in _self_check_failed_items(payload):
+        name = str(row.get("name") or "").strip()
+        if not name or name in out:
+            continue
+        if bool(row.get("required")):
+            out.append(name)
+    return out
+
+
+def _run_restart_command(restart_cmd: List[str]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "attempted": False,
+        "ok": False,
+        "returncode": None,
+        "error": None,
+    }
+    if not restart_cmd:
+        return result
+    result["attempted"] = True
+    try:
+        proc = subprocess.run(
+            restart_cmd,
+            capture_output=True,
+            text=True,
+            timeout=90,
+            check=False,
+        )
+        result["returncode"] = int(proc.returncode)
+        result["ok"] = proc.returncode == 0
+        if proc.returncode != 0:
+            result["error"] = (proc.stderr or proc.stdout or "").strip()[:600]
+    except Exception as exc:  # noqa: BLE001
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
 def ops_agents_snapshot_is_stale(
     generated_at: Any,
     *,
@@ -292,21 +360,7 @@ def _run_sre_watchdog(
         "error": None,
     }
     if not pass_flag and auto_repair and restart_cmd:
-        restart_result["attempted"] = True
-        try:
-            proc = subprocess.run(
-                restart_cmd,
-                capture_output=True,
-                text=True,
-                timeout=90,
-                check=False,
-            )
-            restart_result["returncode"] = int(proc.returncode)
-            restart_result["ok"] = proc.returncode == 0
-            if proc.returncode != 0:
-                restart_result["error"] = (proc.stderr or proc.stdout or "").strip()[:600]
-        except Exception as exc:  # noqa: BLE001
-            restart_result["error"] = f"{type(exc).__name__}: {exc}"
+        restart_result = _run_restart_command(restart_cmd)
         # restart 后复测
         checks["/health_after_restart"] = requester(
             method="GET",
@@ -413,6 +467,158 @@ def _run_data_hygiene_agent(
         "checks": {"audit_before": audit_before, "audit_after": audit_after},
         "actions": {"repair": repair_action},
         "metrics": {"orphan_before": orphan_before, "orphan_after": orphan_after},
+        "recommendations": recommendations,
+    }
+
+
+def _run_runtime_repair_agent(
+    *,
+    base_url: str,
+    api_key: Optional[str],
+    timeout: float,
+    auto_repair: bool,
+    restart_cmd: List[str],
+    requester: Callable[..., Dict[str, Any]],
+) -> Dict[str, Any]:
+    started = time.monotonic()
+    checks: Dict[str, Any] = {}
+    actions: Dict[str, Any] = {
+        "repair_data_hygiene": {"attempted": False, "ok": False, "status_code": None},
+        "restart_runtime": {
+            "attempted": False,
+            "ok": False,
+            "returncode": None,
+            "error": None,
+        },
+    }
+    self_check_before = requester(
+        method="GET",
+        url=f"{base_url}/api/v1/system/self_check",
+        api_key=api_key,
+        timeout=timeout,
+    )
+    checks["self_check_before"] = self_check_before
+    if int(self_check_before.get("status_code") or 0) != 200:
+        return {
+            "name": "runtime_repair",
+            "status": "fail",
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "checks": checks,
+            "actions": actions,
+            "metrics": {},
+            "recommendations": ["运行态自修复无法读取 self_check，建议先恢复系统状态接口。"],
+        }
+
+    payload_before = self_check_before.get("json") or {}
+    failed_before = _self_check_failed_names(payload_before)
+    required_failed_before = _self_check_required_fail_names(payload_before)
+    repairable_before = [name for name in failed_before if name in OPS_RUNTIME_REPAIRABLE_ITEMS]
+    non_repairable_before = [
+        name for name in failed_before if name not in OPS_RUNTIME_REPAIRABLE_ITEMS
+    ]
+
+    if auto_repair and "data_hygiene" in repairable_before:
+        repair_resp = requester(
+            method="POST",
+            url=f"{base_url}/api/v1/system/data_hygiene/repair",
+            api_key=api_key,
+            timeout=max(10.0, timeout),
+        )
+        actions["repair_data_hygiene"] = {
+            "attempted": True,
+            "ok": int(repair_resp.get("status_code") or 0) == 200,
+            "status_code": int(repair_resp.get("status_code") or 0),
+        }
+        checks["data_hygiene_repair"] = repair_resp
+
+    if auto_repair and any(name in OPS_RUNTIME_RESTART_ITEMS for name in repairable_before):
+        actions["restart_runtime"] = _run_restart_command(restart_cmd)
+
+    self_check_after = self_check_before
+    if actions["repair_data_hygiene"]["attempted"] or actions["restart_runtime"]["attempted"]:
+        self_check_after = requester(
+            method="GET",
+            url=f"{base_url}/api/v1/system/self_check",
+            api_key=api_key,
+            timeout=timeout,
+        )
+        checks["self_check_after"] = self_check_after
+
+    if int(self_check_after.get("status_code") or 0) != 200:
+        return {
+            "name": "runtime_repair",
+            "status": "fail",
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "checks": checks,
+            "actions": actions,
+            "metrics": {
+                "failed_before_count": len(failed_before),
+                "repairable_before_count": len(repairable_before),
+                "required_failed_before_count": len(required_failed_before),
+            },
+            "recommendations": [
+                "运行态自修复后仍无法读取 self_check，建议检查服务日志和启动链路。"
+            ],
+        }
+
+    payload_after = self_check_after.get("json") or {}
+    failed_after = _self_check_failed_names(payload_after)
+    required_failed_after = _self_check_required_fail_names(payload_after)
+    repairable_after = [name for name in failed_after if name in OPS_RUNTIME_REPAIRABLE_ITEMS]
+    non_repairable_after = [
+        name for name in failed_after if name not in OPS_RUNTIME_REPAIRABLE_ITEMS
+    ]
+    auto_fixed = [name for name in failed_before if name not in failed_after]
+
+    pass_flag = not failed_after
+    warn_flag = False
+    if not pass_flag:
+        if not repairable_after and not required_failed_after:
+            warn_flag = True
+        elif repairable_after and not auto_repair:
+            warn_flag = True
+
+    recommendations: List[str] = []
+    if required_failed_after:
+        recommendations.append(
+            "运行态仍存在必需项失败，说明服务主链异常，建议优先检查 health/ready/self_check 依赖。"
+        )
+    elif repairable_after:
+        recommendations.append(
+            "运行态自修复未完全恢复："
+            + "、".join(repairable_after)
+            + " 仍异常，建议人工检查解析队列与服务日志。"
+        )
+    elif non_repairable_after:
+        recommendations.append(
+            "运行态已完成可修复项处理，但仍有仅告警项："
+            + "、".join(non_repairable_after)
+            + "，当前未执行自动修复。"
+        )
+    elif auto_fixed:
+        recommendations.append(
+            "运行态问题已自动修复：" + "、".join(auto_fixed) + "，建议继续观察后续自检快照。"
+        )
+    else:
+        recommendations.append("运行态巡检正常，未发现需要自动修复的问题。")
+
+    return {
+        "name": "runtime_repair",
+        "status": _status(pass_flag, warn_flag=warn_flag),
+        "duration_ms": int((time.monotonic() - started) * 1000),
+        "checks": checks,
+        "actions": actions,
+        "metrics": {
+            "failed_before_count": len(failed_before),
+            "failed_after_count": len(failed_after),
+            "required_failed_before_count": len(required_failed_before),
+            "required_failed_after_count": len(required_failed_after),
+            "repairable_before_count": len(repairable_before),
+            "repairable_after_count": len(repairable_after),
+            "non_repairable_before_count": len(non_repairable_before),
+            "non_repairable_after_count": len(non_repairable_after),
+            "auto_fixed_count": len(auto_fixed),
+        },
         "recommendations": recommendations,
     }
 
@@ -1182,6 +1388,7 @@ def run_ops_agents_cycle(
     运行一轮“多智能体运维闭环”。
     - sre_watchdog
     - data_hygiene
+    - runtime_repair
     - project_flow
     - tender_project_flow
     - upload_flow
@@ -1211,6 +1418,14 @@ def run_ops_agents_cycle(
             api_key=api_key,
             timeout=timeout,
             auto_repair=auto_repair,
+            requester=requester,
+        )
+        agents["runtime_repair"] = _run_runtime_repair_agent(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout,
+            auto_repair=auto_repair,
+            restart_cmd=restart_cmd,
             requester=requester,
         )
         for name, runner, kwargs in (

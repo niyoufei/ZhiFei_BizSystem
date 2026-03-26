@@ -24,6 +24,7 @@ def test_run_ops_agents_cycle_short_circuit_on_sre_fail(monkeypatch):
     assert result["overall"]["fail_count"] >= 1
     assert result["agents"]["sre_watchdog"]["status"] == "fail"
     assert result["agents"]["data_hygiene"]["status"] == "fail"
+    assert result["agents"]["runtime_repair"]["status"] == "fail"
     assert result["agents"]["project_flow"]["status"] == "fail"
     assert result["agents"]["tender_project_flow"]["status"] == "fail"
     assert result["agents"]["upload_flow"]["status"] == "fail"
@@ -49,6 +50,19 @@ def test_run_ops_agents_cycle_warn_from_sub_agents(monkeypatch):
         "_run_data_hygiene_agent",
         lambda **kwargs: {
             "name": "data_hygiene",
+            "status": "pass",
+            "duration_ms": 1,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": [],
+        },
+    )
+    monkeypatch.setattr(
+        oa,
+        "_run_runtime_repair_agent",
+        lambda **kwargs: {
+            "name": "runtime_repair",
             "status": "pass",
             "duration_ms": 1,
             "checks": {},
@@ -131,6 +145,127 @@ def test_run_ops_agents_cycle_warn_from_sub_agents(monkeypatch):
     assert result["agent_count"] == len(oa.OPS_AGENT_NAMES)
     assert result["expected_agent_names"] == list(oa.OPS_AGENT_NAMES)
     assert result["missing_agent_names"] == []
+
+
+def test_runtime_repair_agent_auto_repairs_data_hygiene_and_async_parse(monkeypatch):
+    calls = {"self_check": 0}
+
+    def fake_requester(**kwargs):
+        method = str(kwargs.get("method") or "")
+        url = str(kwargs.get("url") or "")
+        if method == "GET" and url.endswith("/api/v1/system/self_check"):
+            calls["self_check"] += 1
+            if calls["self_check"] == 1:
+                return {
+                    "ok": True,
+                    "status_code": 200,
+                    "elapsed_ms": 1,
+                    "json": {
+                        "ok": True,
+                        "degraded": True,
+                        "items": [
+                            {"name": "health", "ok": True, "required": True},
+                            {
+                                "name": "data_hygiene",
+                                "ok": False,
+                                "required": False,
+                            },
+                            {
+                                "name": "vision_parse_queue_healthy",
+                                "ok": False,
+                                "required": False,
+                            },
+                        ],
+                    },
+                    "error": None,
+                }
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "ok": True,
+                    "degraded": False,
+                    "items": [{"name": "health", "ok": True, "required": True}],
+                },
+                "error": None,
+            }
+        if method == "POST" and url.endswith("/api/v1/system/data_hygiene/repair"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {"repaired": True},
+                "error": None,
+            }
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    monkeypatch.setattr(
+        oa,
+        "_run_restart_command",
+        lambda restart_cmd: {
+            "attempted": True,
+            "ok": True,
+            "returncode": 0,
+            "error": None,
+        },
+    )
+
+    result = oa._run_runtime_repair_agent(
+        base_url="http://127.0.0.1:8000",
+        api_key=None,
+        timeout=5.0,
+        auto_repair=True,
+        restart_cmd=["./scripts/restart_server.sh"],
+        requester=fake_requester,
+    )
+
+    assert result["status"] == "pass"
+    assert result["actions"]["repair_data_hygiene"]["attempted"] is True
+    assert result["actions"]["restart_runtime"]["attempted"] is True
+    assert result["metrics"]["auto_fixed_count"] == 2
+    assert any("已自动修复" in row for row in result["recommendations"])
+
+
+def test_runtime_repair_agent_warns_on_non_repairable_optional_failures():
+    def fake_requester(**kwargs):
+        method = str(kwargs.get("method") or "")
+        url = str(kwargs.get("url") or "")
+        if method == "GET" and url.endswith("/api/v1/system/self_check"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "ok": True,
+                    "degraded": True,
+                    "items": [
+                        {"name": "health", "ok": True, "required": True},
+                        {
+                            "name": "parser_ocr",
+                            "ok": False,
+                            "required": False,
+                        },
+                    ],
+                },
+                "error": None,
+            }
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    result = oa._run_runtime_repair_agent(
+        base_url="http://127.0.0.1:8000",
+        api_key=None,
+        timeout=5.0,
+        auto_repair=True,
+        restart_cmd=["./scripts/restart_server.sh"],
+        requester=fake_requester,
+    )
+
+    assert result["status"] == "warn"
+    assert result["actions"]["repair_data_hygiene"]["attempted"] is False
+    assert result["actions"]["restart_runtime"]["attempted"] is False
+    assert result["metrics"]["non_repairable_after_count"] == 1
+    assert any("仅告警项" in row for row in result["recommendations"])
 
 
 def test_ensure_agent_coverage_backfills_missing_agents():
