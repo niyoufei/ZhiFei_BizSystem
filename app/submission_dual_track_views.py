@@ -48,6 +48,25 @@ def build_submission_view(
         if allow_pred_score
         else dict(submission)
     )
+    report_obj = effective_submission.get("report")
+    if isinstance(report_obj, dict):
+        normalized_report = dict(report_obj)
+        normalized_meta = (
+            dict(normalized_report.get("meta"))
+            if isinstance(normalized_report.get("meta"), dict)
+            else {}
+        )
+        raw_util_gate = normalized_meta.get("material_utilization_gate")
+        if isinstance(raw_util_gate, dict):
+            normalized_util_gate = main._normalize_material_utilization_gate_state(raw_util_gate)
+            normalized_meta["material_utilization_gate"] = normalized_util_gate
+            scoring_status = str(normalized_report.get("scoring_status") or "").strip().lower()
+            if scoring_status == "blocked" and not bool(normalized_util_gate.get("blocked")):
+                normalized_report["scoring_status"] = "scored"
+                normalized_report["scoring_trigger"] = "material_utilization_warn_only"
+        normalized_report["meta"] = normalized_meta
+        effective_submission = dict(effective_submission)
+        effective_submission["report"] = normalized_report
     view = dict(effective_submission)
     dual_track_summary = qingtian_dual_track_module.build_submission_dual_track_summary(
         effective_submission,
@@ -208,9 +227,13 @@ def build_selected_project_submission_render_context(
         report_obj = view.get("report")
         report = report_obj if isinstance(report_obj, dict) else {}
         report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+        util_gate = main._normalize_material_utilization_gate_state(
+            report_meta.get("material_utilization_gate")
+        )
         scoring_status = str(report.get("scoring_status") or "").strip().lower()
         is_pending = scoring_status == "pending"
-        is_blocked = scoring_status == "blocked"
+        is_blocked = bool(util_gate.get("blocked"))
+        is_warned = bool(util_gate.get("warned"))
         dual_track_summary = (
             report.get("dual_track_summary")
             if isinstance(report.get("dual_track_summary"), dict)
@@ -232,11 +255,6 @@ def build_selected_project_submission_render_context(
             is_blocked=is_blocked,
         )
 
-        util_gate = (
-            report_meta.get("material_utilization_gate")
-            if isinstance(report_meta.get("material_utilization_gate"), dict)
-            else {}
-        )
         evidence_trace = (
             report_meta.get("evidence_trace")
             if isinstance(report_meta.get("evidence_trace"), dict)
@@ -331,6 +349,8 @@ def build_selected_project_submission_render_context(
             )
         if util_blocked:
             score_cell += '<div class="error">资料利用门禁未达标（建议补齐资料后重评分）</div>'
+        elif is_warned:
+            score_cell += '<div class="note">资料利用存在补强提示（不阻断当前评分）。</div>'
 
         submission_id = html.escape(str(view.get("id", "")))
         filename_raw = str(view.get("filename", ""))

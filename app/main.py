@@ -6702,15 +6702,18 @@ def _evaluate_material_utilization_gate(
         ),
     )
 
-    reasons: List[str] = []
+    blocking_reasons: List[str] = []
+    warning_reasons: List[str] = []
     if retrieval_total < min_retrieval_total:
-        reasons.append(f"资料检索证据数量 {retrieval_total} 低于阈值 {min_retrieval_total}")
+        blocking_reasons.append(
+            f"资料检索证据数量 {retrieval_total} 低于阈值 {min_retrieval_total}"
+        )
     if (
         retrieval_file_total > 0
         and retrieval_file_coverage_rate is not None
         and retrieval_file_coverage_rate < min_retrieval_file_coverage
     ):
-        reasons.append(
+        blocking_reasons.append(
             "资料检索文件覆盖率 "
             + f"{retrieval_file_coverage_rate:.1%} 低于阈值 {min_retrieval_file_coverage:.1%}"
         )
@@ -6719,44 +6722,52 @@ def _evaluate_material_utilization_gate(
         and retrieval_hit_rate is not None
         and retrieval_hit_rate < min_retrieval
     ):
-        reasons.append(f"资料检索命中率 {retrieval_hit_rate:.1%} 低于阈值 {min_retrieval:.1%}")
+        blocking_reasons.append(
+            f"资料检索命中率 {retrieval_hit_rate:.1%} 低于阈值 {min_retrieval:.1%}"
+        )
     if (
         consistency_total > 0
         and consistency_hit_rate is not None
         and consistency_hit_rate < min_consistency
     ):
-        reasons.append(
+        blocking_reasons.append(
             f"跨资料一致性命中率 {consistency_hit_rate:.1%} 低于阈值 {min_consistency:.1%}"
         )
     if len(uncovered_required) > max_uncovered:
         labels = "、".join(_material_type_label(x) for x in uncovered_required)
-        reasons.append(f"关键资料未形成证据：{labels}（允许未覆盖 {max_uncovered} 类）")
+        blocking_reasons.append(f"关键资料未形成证据：{labels}（允许未覆盖 {max_uncovered} 类）")
     if required_presence_rate is not None and required_presence_rate < min_required_presence:
         labels = "、".join(_material_type_label(x) for x in missing_required_upload)
-        reasons.append(
+        blocking_reasons.append(
             "关键资料上传覆盖率 "
             + f"{required_presence_rate:.1%} 低于阈值 {min_required_presence:.1%}"
             + (f"，缺少：{labels}" if labels else "")
         )
     if required_coverage_rate is not None and required_coverage_rate < min_required_coverage:
-        reasons.append(
+        blocking_reasons.append(
             f"关键资料覆盖率 {required_coverage_rate:.1%} 低于阈值 {min_required_coverage:.1%}"
         )
+    optional_uncovered_uploaded_types = [
+        material_type
+        for material_type in uncovered_uploaded_types
+        if material_type not in normalized_required
+    ]
     if (
         enforce_uploaded_type_coverage
         and uploaded_type_coverage_rate is not None
         and uploaded_type_coverage_rate < min_uploaded_type_coverage
+        and optional_uncovered_uploaded_types
     ):
-        labels = "、".join(_material_type_label(x) for x in uncovered_uploaded_types)
-        reasons.append(
-            "已上传资料类型覆盖率 "
-            + f"{uploaded_type_coverage_rate:.1%} 低于阈值 {min_uploaded_type_coverage:.1%}"
-            + (f"，未形成证据类型：{labels}" if labels else "")
+        labels = "、".join(_material_type_label(x) for x in optional_uncovered_uploaded_types)
+        warning_reasons.append(
+            "已上传的补充资料暂未形成证据："
+            + f"{labels}"
+            + f"（当前覆盖率 {uploaded_type_coverage_rate:.1%}，目标 {min_uploaded_type_coverage:.1%}）"
         )
 
-    failed = bool(reasons)
-    blocked = bool(enabled and failed and mode == "block")
-    warned = bool(enabled and failed and mode != "block")
+    failed = bool(blocking_reasons or warning_reasons)
+    blocked = bool(enabled and blocking_reasons and mode == "block")
+    warned = bool(enabled and (warning_reasons or (blocking_reasons and mode != "block")))
     if not enabled:
         level = "disabled"
     elif blocked:
@@ -6765,6 +6776,9 @@ def _evaluate_material_utilization_gate(
         level = "warn"
     else:
         level = "pass"
+    reasons = (
+        blocking_reasons if blocked else (blocking_reasons + warning_reasons if warned else [])
+    )
 
     return {
         "enabled": enabled,
@@ -6774,6 +6788,8 @@ def _evaluate_material_utilization_gate(
         "warned": warned,
         "level": level,
         "reasons": reasons,
+        "blocking_reasons": blocking_reasons,
+        "warning_reasons": warning_reasons,
         "thresholds": {
             "min_retrieval_total": min_retrieval_total,
             "min_retrieval_file_coverage_rate": min_retrieval_file_coverage,
@@ -6795,6 +6811,7 @@ def _evaluate_material_utilization_gate(
         "uploaded_types": available_types,
         "covered_uploaded_types": covered_uploaded_types,
         "uncovered_uploaded_types": uncovered_uploaded_types,
+        "optional_uncovered_uploaded_types": optional_uncovered_uploaded_types,
         "uploaded_type_coverage_rate": uploaded_type_coverage_rate,
         "metrics": {
             "retrieval_total": retrieval_total,
@@ -6805,6 +6822,100 @@ def _evaluate_material_utilization_gate(
             "consistency_hit_rate": consistency_hit_rate,
         },
     }
+
+
+def _normalize_material_utilization_gate_state(payload: object) -> Dict[str, object]:
+    gate = dict(payload) if isinstance(payload, dict) else {}
+    if not gate:
+        return {}
+    thresholds = gate.get("thresholds") if isinstance(gate.get("thresholds"), dict) else {}
+    metrics = gate.get("metrics") if isinstance(gate.get("metrics"), dict) else {}
+    required_types = (
+        gate.get("required_types") if isinstance(gate.get("required_types"), list) else []
+    )
+    uploaded_types = (
+        gate.get("uploaded_types") if isinstance(gate.get("uploaded_types"), list) else []
+    )
+    uncovered_uploaded_types = (
+        gate.get("uncovered_uploaded_types")
+        if isinstance(gate.get("uncovered_uploaded_types"), list)
+        else []
+    )
+    if not thresholds and not metrics and not required_types and not uploaded_types:
+        reasons = [str(item).strip() for item in (gate.get("reasons") or []) if str(item).strip()]
+        normalized = dict(gate)
+        normalized["reasons"] = reasons
+        normalized["blocked"] = bool(gate.get("blocked"))
+        normalized["warned"] = bool(gate.get("warned"))
+        normalized["passed"] = bool(gate.get("passed", not reasons))
+        normalized["level"] = (
+            "blocked"
+            if normalized["blocked"]
+            else (
+                "warn" if normalized["warned"] else ("pass" if normalized["passed"] else "unknown")
+            )
+        )
+        return normalized
+
+    summary = {
+        "retrieval_total": int(_to_float_or_none(metrics.get("retrieval_total")) or 0),
+        "retrieval_hit_rate": _to_float_or_none(metrics.get("retrieval_hit_rate")),
+        "retrieval_file_total": int(_to_float_or_none(metrics.get("retrieval_file_total")) or 0),
+        "retrieval_file_coverage_rate": _to_float_or_none(
+            metrics.get("retrieval_file_coverage_rate")
+        ),
+        "consistency_total": int(_to_float_or_none(metrics.get("consistency_total")) or 0),
+        "consistency_hit_rate": _to_float_or_none(metrics.get("consistency_hit_rate")),
+        "available_types": uploaded_types,
+        "uncovered_types": uncovered_uploaded_types,
+    }
+    policy = {
+        "enabled": bool(gate.get("enabled", DEFAULT_ENFORCE_MATERIAL_UTILIZATION_GATE)),
+        "mode": str(gate.get("mode") or DEFAULT_MATERIAL_UTILIZATION_GATE_MODE),
+        "enforce_uploaded_type_coverage": bool(
+            gate.get("enforce_uploaded_type_coverage", DEFAULT_ENFORCE_UPLOADED_TYPE_COVERAGE)
+        ),
+        "min_retrieval_total": int(
+            _to_float_or_none(thresholds.get("min_retrieval_total"))
+            or DEFAULT_MIN_MATERIAL_RETRIEVAL_TOTAL
+        ),
+        "min_retrieval_file_coverage_rate": float(
+            _to_float_or_none(thresholds.get("min_retrieval_file_coverage_rate"))
+            or DEFAULT_MIN_MATERIAL_RETRIEVAL_FILE_COVERAGE_RATE
+        ),
+        "min_retrieval_hit_rate": float(
+            _to_float_or_none(thresholds.get("min_retrieval_hit_rate"))
+            or DEFAULT_MIN_MATERIAL_RETRIEVAL_HIT_RATE
+        ),
+        "min_consistency_hit_rate": float(
+            _to_float_or_none(thresholds.get("min_consistency_hit_rate"))
+            or DEFAULT_MIN_MATERIAL_CONSISTENCY_HIT_RATE
+        ),
+        "max_uncovered_required_types": int(
+            _to_float_or_none(thresholds.get("max_uncovered_required_types"))
+            or DEFAULT_MAX_UNCOVERED_REQUIRED_TYPES
+        ),
+        "min_required_type_presence_rate": float(
+            _to_float_or_none(thresholds.get("min_required_type_presence_rate"))
+            or DEFAULT_MIN_REQUIRED_TYPE_PRESENCE_RATE
+        ),
+        "min_required_type_coverage_rate": float(
+            _to_float_or_none(thresholds.get("min_required_type_coverage_rate"))
+            or DEFAULT_MIN_REQUIRED_TYPE_COVERAGE_RATE
+        ),
+        "min_uploaded_type_coverage_rate": float(
+            _to_float_or_none(thresholds.get("min_uploaded_type_coverage_rate"))
+            or DEFAULT_MIN_UPLOADED_TYPE_COVERAGE_RATE
+        ),
+    }
+    normalized = _evaluate_material_utilization_gate(
+        summary,
+        policy=policy,
+        required_types=[str(item) for item in required_types],
+    )
+    merged = dict(gate)
+    merged.update(normalized)
+    return merged
 
 
 def _aggregate_material_utilization_gates(gates: List[Dict[str, object]]) -> Dict[str, object]:
@@ -27932,11 +28043,17 @@ def index(
         }
         function getSubmissionScoringFlags(submission) {
           const report = getSubmissionReport(submission);
+          const meta = (report && typeof report.meta === 'object') ? report.meta : {};
+          const utilGate = (meta && typeof meta.material_utilization_gate === 'object')
+            ? meta.material_utilization_gate
+            : {};
           const scoringStatus = String((report && report.scoring_status) || '').toLowerCase();
+          const hasGate = !!(utilGate && Object.keys(utilGate).length);
           return {
             report: report,
             isPending: scoringStatus === 'pending',
-            isBlocked: scoringStatus === 'blocked',
+            isBlocked: hasGate ? !!utilGate.blocked : scoringStatus === 'blocked',
+            isWarned: hasGate ? (!!utilGate.warned && !utilGate.blocked) : false,
           };
         }
         function getSubmissionDualTrackSummary(submission) {
@@ -28117,6 +28234,8 @@ def index(
           }
           if (utilBlocked) {
             scoreHtml += '<div class="error">资料利用门禁未达标（建议补齐资料后重评分）</div>';
+          } else if (flags.isWarned) {
+            scoreHtml += '<div class="note">资料利用存在补强提示（不阻断当前评分）。</div>';
           }
           return ''
             + '<td>' + esc(row.filename || '') + '</td>'

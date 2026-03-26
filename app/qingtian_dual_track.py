@@ -20,10 +20,8 @@ def build_submission_dual_track_summary(
     main = _main()
     report = submission.get("report") if isinstance(submission.get("report"), dict) else {}
     report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
-    util_gate = (
+    util_gate = main._normalize_material_utilization_gate_state(
         report_meta.get("material_utilization_gate")
-        if isinstance(report_meta.get("material_utilization_gate"), dict)
-        else {}
     )
     raw_rule_total = main._to_float_or_none(report.get("rule_total_score"))
     if raw_rule_total is None:

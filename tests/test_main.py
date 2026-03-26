@@ -579,6 +579,76 @@ class TestIndexEndpoint:
         assert "查看满分优化清单（逐页）" in page
         assert "查看评分治理（异常样本/校准/回退）" in page
 
+    def test_index_downgrades_optional_uploaded_material_issue_to_note(self, client):
+        submission = {
+            "id": "s1",
+            "project_id": "p1",
+            "filename": "施工组织设计A.docx",
+            "total_score": 74.65,
+            "report": {
+                "scoring_status": "blocked",
+                "total_score": 74.65,
+                "rule_total_score": 74.65,
+                "meta": {
+                    "material_utilization_gate": {
+                        "enabled": True,
+                        "mode": "block",
+                        "blocked": True,
+                        "warned": False,
+                        "passed": False,
+                        "level": "blocked",
+                        "reasons": [
+                            "已上传资料类型覆盖率 75.0% 低于阈值 100.0%，未形成证据类型：现场照片"
+                        ],
+                        "thresholds": {
+                            "min_retrieval_total": 2,
+                            "min_retrieval_file_coverage_rate": 0.2,
+                            "min_retrieval_hit_rate": 0.2,
+                            "min_consistency_hit_rate": 0.2,
+                            "max_uncovered_required_types": 0,
+                            "min_required_type_presence_rate": 0.6,
+                            "min_required_type_coverage_rate": 0.6,
+                            "min_uploaded_type_coverage_rate": 1.0,
+                        },
+                        "required_types": ["tender_qa", "boq", "drawing"],
+                        "uploaded_types": ["tender_qa", "boq", "drawing", "site_photo"],
+                        "uncovered_uploaded_types": ["site_photo"],
+                        "uploaded_type_coverage_rate": 0.75,
+                        "metrics": {
+                            "retrieval_total": 10,
+                            "retrieval_hit_rate": 0.8,
+                            "retrieval_file_total": 6,
+                            "retrieval_file_coverage_rate": 0.8,
+                            "consistency_total": 6,
+                            "consistency_hit_rate": 0.8,
+                        },
+                    }
+                },
+            },
+            "text": "t1",
+            "created_at": "2026-03-16T08:00:00+00:00",
+        }
+        from app.submission_dual_track_views import build_selected_project_submission_render_context
+
+        with (
+            patch("app.main.load_qingtian_results", return_value=[]),
+            patch("app.main._select_calibrator_model", return_value=None),
+            patch("app.main._ensure_report_score_self_awareness"),
+        ):
+            rendered = build_selected_project_submission_render_context(
+                "p1",
+                [submission],
+                allow_pred_score=False,
+                score_scale_max=5,
+                material_knowledge_snapshot={},
+            )
+
+        rows_html = rendered["rows_html"]
+        assert "资料利用存在补强提示（不阻断当前评分）。" in rows_html
+        assert "已生成分数，但本施组触发资料利用预警。" not in rows_html
+        assert "已评分，但本施组对部分项目资料未形成足够证据关联。" not in rows_html
+        assert "资料利用门禁未达标（建议补齐资料后重评分）" not in rows_html
+
     def test_index_renders_selected_project_material_rows(self, client):
         materials = [
             {
@@ -788,6 +858,7 @@ class TestIndexEndpoint:
         assert "let cachedProjectSubmissions = {};" in page
         assert "function buildGroundTruthSubmissionOptionsSignature" in page
         assert "await refreshGroundTruthSubmissionOptions(id, switchSeq, subs);" in page
+        assert "isWarned: hasGate ? (!!utilGate.warned && !utilGate.blocked) : false," in page
         assert "当前缺口资料类型：" in page
         assert "阻断施组：" in page
         assert "建议动作：" in page
@@ -5232,7 +5303,9 @@ class TestMaterialAdvancedParsing:
         assert gate["blocked"] is True
         assert any("资料检索证据数量" in str(x) for x in (gate.get("reasons") or []))
 
-    def test_evaluate_material_utilization_gate_blocks_when_uploaded_type_uncovered(self):
+    def test_evaluate_material_utilization_gate_warns_when_only_optional_uploaded_type_uncovered(
+        self,
+    ):
         from app.main import _evaluate_material_utilization_gate
 
         summary = {
@@ -5263,10 +5336,13 @@ class TestMaterialAdvancedParsing:
             policy=policy,
             required_types=["tender_qa", "boq", "drawing"],
         )
-        assert gate["blocked"] is True
+        assert gate["blocked"] is False
+        assert gate["warned"] is True
+        assert gate["level"] == "warn"
         assert gate["uploaded_type_coverage_rate"] == pytest.approx(0.75, abs=1e-4)
         assert "site_photo" in (gate.get("uncovered_uploaded_types") or [])
-        assert any("已上传资料类型覆盖率" in str(x) for x in (gate.get("reasons") or []))
+        assert "site_photo" in (gate.get("optional_uncovered_uploaded_types") or [])
+        assert any("已上传的补充资料暂未形成证据" in str(x) for x in (gate.get("reasons") or []))
 
     def test_resolve_material_utilization_policy_defaults_to_nonzero_file_coverage(self):
         from app.main import _resolve_material_utilization_policy
