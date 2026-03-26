@@ -190,8 +190,8 @@ def _baseline_predictions(feature_rows: List[Dict[str, Any]]) -> List[float]:
 def train_offset_calibrator(feature_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """恒定偏置校准：pred = clip(rule_total_score + bias)"""
     xs, ys = _extract_xy_rule(feature_rows)
-    if len(xs) < 3:
-        raise ValueError("训练样本不足，至少需要3条可用样本")
+    if len(xs) < 1:
+        raise ValueError("训练样本不足，至少需要1条可用样本")
     diffs = [y - x for x, y in zip(xs, ys)]
     bias = sum(diffs) / len(diffs)
     preds = [_clip(x + bias) for x in xs]

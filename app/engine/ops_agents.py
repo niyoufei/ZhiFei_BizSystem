@@ -52,6 +52,16 @@ def _to_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _health_learning_min_samples(summary: Dict[str, Any], fallback: int) -> int:
+    return max(
+        1,
+        _to_int(
+            summary.get("evolution_weight_min_samples"),
+            max(1, int(fallback)),
+        ),
+    )
+
+
 def _normalize_projects(payload: Any) -> List[Dict[str, Any]]:
     if isinstance(payload, list):
         return [x for x in payload if isinstance(x, dict)]
@@ -1449,6 +1459,7 @@ def _run_evolution_agent(
     started_but_insufficient = 0
     pending_evolve: List[str] = []
     failed_count = 0
+    max_required_min_samples = max(1, int(min_samples))
     if not monitored_projects:
         return {
             "name": "evolution",
@@ -1486,8 +1497,10 @@ def _run_evolution_agent(
             continue
         summary = (resp.get("json") or {}).get("summary") or {}
         gt_count = _to_int(summary.get("ground_truth_count"))
+        project_min_samples = _health_learning_min_samples(summary, min_samples)
+        max_required_min_samples = max(max_required_min_samples, project_min_samples)
         has_mult = bool(summary.get("has_evolved_multipliers"))
-        if gt_count >= int(min_samples):
+        if gt_count >= int(project_min_samples):
             mature_projects += 1
             if not has_mult:
                 pending_evolve.append(pid)
@@ -1548,7 +1561,8 @@ def _run_evolution_agent(
             )
     elif started_but_insufficient > 0:
         recommendations.append(
-            "当前项目真实评分样本不足，建议每项目至少录入 3 条后再观察进化效果。"
+            "当前项目真实评分样本不足，建议每项目至少录入 "
+            f"{max_required_min_samples} 条后再观察进化效果。"
         )
     elif preparation_insufficient > 0:
         recommendations.append("当前真实项目仍处于准备阶段，尚未进入可学习进化区间。")
@@ -1698,6 +1712,7 @@ def _run_learning_calibration_agent(
         health_payload = _json_object(health_resp.get("json"))
         health_summary = _json_object(health_payload.get("summary"))
         health_drift = _json_object(health_payload.get("drift"))
+        project_min_samples = _health_learning_min_samples(health_summary, min_samples)
         gt_count = _to_int(health_summary.get("ground_truth_count"))
         eligible_learning_count = _to_int(
             health_summary.get("eligible_learning_ground_truth_count") or gt_count
@@ -1713,7 +1728,7 @@ def _run_learning_calibration_agent(
         if drift_alert_before:
             drift_alert_before_count += 1
 
-        if eligible_learning_count >= int(min_samples):
+        if eligible_learning_count >= int(project_min_samples):
             mature_projects += 1
         else:
             insufficient_projects += 1
@@ -1723,7 +1738,7 @@ def _run_learning_calibration_agent(
                 started_but_insufficient += 1
             continue
 
-        reflection_ready = matched_prediction_count >= int(min_samples)
+        reflection_ready = matched_prediction_count >= int(project_min_samples)
         if reflection_ready:
             reflection_ready_projects += 1
         else:
@@ -2027,7 +2042,7 @@ def run_ops_agents_cycle(
     api_key: Optional[str] = None,
     auto_repair: bool = True,
     auto_evolve: bool = True,
-    min_evolve_samples: int = 3,
+    min_evolve_samples: int = 1,
     restart_cmd: Optional[List[str]] = None,
     timeout: float = 8.0,
     max_workers: int = 3,

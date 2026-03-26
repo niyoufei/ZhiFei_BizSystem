@@ -3183,7 +3183,8 @@ class TestMaterialsEndpoint:
         assert summary["matched_prediction_count"] == 1
         assert summary["guardrail_blocked_count"] == 1
         assert summary["learning_quality_blocked_count"] == 1
-        assert any(
+        assert summary["evolution_weight_min_samples"] == 1
+        assert not any(
             "可纳入自动学习的真实评标样本不足" in str(item) for item in payload["recommendations"]
         )
         assert any("被排除在自动学习之外" in str(item) for item in payload["recommendations"])
@@ -3208,6 +3209,7 @@ class TestMaterialsEndpoint:
                 "id": "p1",
                 "meta": {
                     "score_scale_max": 100,
+                    "learning_min_samples": 3,
                     "evolution_weight_min_samples": 3,
                     "evolution_weight_max_age_days": 90,
                 },
@@ -3230,7 +3232,14 @@ class TestMaterialsEndpoint:
 
         payload = _build_evolution_health_report(
             "p1",
-            {"id": "p1", "meta": {"score_scale_max": 100, "evolution_weight_min_samples": 3}},
+            {
+                "id": "p1",
+                "meta": {
+                    "score_scale_max": 100,
+                    "learning_min_samples": 3,
+                    "evolution_weight_min_samples": 3,
+                },
+            },
         )
         summary = payload["summary"]
         assert summary["stored_evolved_multipliers"] is True
@@ -8319,7 +8328,7 @@ class TestScoringContextEvolutionGuard:
         ]
         mock_load_evolution.return_value = {
             "p1": {
-                "sample_count": 3,
+                "sample_count": 1,
                 "updated_at": fresh_at,
                 "scoring_evolution": {"dimension_multipliers": {"01": 1.3}},
             }

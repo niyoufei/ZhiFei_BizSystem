@@ -75,7 +75,7 @@ def main() -> int:
     parser.add_argument("--api-key", default="")
     parser.add_argument("--auto-repair", type=int, default=1, choices=[0, 1])
     parser.add_argument("--auto-evolve", type=int, default=1, choices=[0, 1])
-    parser.add_argument("--min-evolve-samples", type=int, default=3)
+    parser.add_argument("--min-evolve-samples", type=int, default=1)
     parser.add_argument("--timeout-seconds", type=float, default=8.0)
     parser.add_argument("--max-workers", type=int, default=3)
     parser.add_argument("--interval-seconds", type=float, default=0.0)

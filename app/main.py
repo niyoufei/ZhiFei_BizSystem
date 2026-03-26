@@ -452,6 +452,8 @@ DEFAULT_MATERIAL_PARSE_BACKLOG_WARN = 18
 DEFAULT_CALIBRATION_MIN_SAMPLES = 20
 DEFAULT_CALIBRATION_FRESHNESS_DAYS = 90
 DEFAULT_CALIBRATION_MIN_RECENT_RATIO = 0.6
+DEFAULT_PROJECT_LEARNING_MIN_SAMPLES = 1
+LEGACY_PROJECT_LEARNING_MIN_SAMPLES = 3
 DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO = 0.4
 DEFAULT_FEW_SHOT_MIN_HIGH_SCORE_100 = 78.0
 DEFAULT_LEARNING_MIN_AWARENESS_SCORE = 45.0
@@ -2543,7 +2545,7 @@ def _ensure_project_v2_fields(
         meta["min_uploaded_type_coverage_rate"] = float(DEFAULT_MIN_UPLOADED_TYPE_COVERAGE_RATE)
         changed = True
     if "evolution_weight_min_samples" not in meta:
-        meta["evolution_weight_min_samples"] = 3
+        meta["evolution_weight_min_samples"] = DEFAULT_PROJECT_LEARNING_MIN_SAMPLES
         changed = True
     if "evolution_weight_max_age_days" not in meta:
         meta["evolution_weight_max_age_days"] = DEFAULT_CALIBRATION_FRESHNESS_DAYS
@@ -2591,6 +2593,24 @@ def _build_project_record(name: str, meta: Optional[Dict[str, Any]] = None) -> D
     }
     _ensure_project_v2_fields(record)
     return record
+
+
+def _resolve_project_learning_min_samples(project: Optional[Dict[str, object]]) -> int:
+    meta = project.get("meta") if isinstance(project, dict) else None
+    if not isinstance(meta, dict):
+        return DEFAULT_PROJECT_LEARNING_MIN_SAMPLES
+    explicit = _to_float_or_none(meta.get("learning_min_samples"))
+    if explicit is not None:
+        return max(1, int(explicit))
+    raw = _to_float_or_none(meta.get("evolution_weight_min_samples"))
+    if raw is None:
+        return DEFAULT_PROJECT_LEARNING_MIN_SAMPLES
+    normalized = max(1, int(raw))
+    if bool(meta.get("evolution_weight_min_samples_explicit")):
+        return normalized
+    if normalized == LEGACY_PROJECT_LEARNING_MIN_SAMPLES:
+        return DEFAULT_PROJECT_LEARNING_MIN_SAMPLES
+    return normalized
 
 
 _PROJECT_NAME_FIELD_PATTERNS = [
@@ -2924,7 +2944,7 @@ def _evaluate_evolution_weight_status(
     )
     stored = bool(dimension_multipliers)
     meta = current_project.get("meta") if isinstance(current_project.get("meta"), dict) else {}
-    min_samples = max(1, int(_to_float_or_none(meta.get("evolution_weight_min_samples")) or 3))
+    min_samples = _resolve_project_learning_min_samples(current_project)
     max_age_days = max(
         1.0,
         float(
@@ -9203,6 +9223,154 @@ def _build_calibrator_summary(
     return summary
 
 
+def _build_calibration_baseline_metrics(
+    feature_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    labeled_rows = [row for row in feature_rows if row.get("y_label") is not None]
+    y_true = [float(row.get("y_label")) for row in labeled_rows]
+    baseline_pred = [
+        max(0.0, min(100.0, float(((row.get("x_features") or {}).get("rule_total_score") or 0.0))))
+        for row in labeled_rows
+    ]
+    return calc_metrics(y_true, baseline_pred)
+
+
+def _train_calibrator_with_gate(
+    feature_rows: List[Dict[str, Any]],
+    *,
+    model_type: str,
+    alpha: float,
+    sample_floor: int,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    labeled_rows = [row for row in feature_rows if row.get("y_label") is not None]
+    sample_count = len(labeled_rows)
+    if sample_count < max(1, int(sample_floor)):
+        raise ValueError(f"训练样本不足，至少需要{max(1, int(sample_floor))}条可用样本")
+
+    requested_model_type = str(model_type or "auto").lower().strip()
+    baseline_metrics = _build_calibration_baseline_metrics(labeled_rows)
+    improve_threshold = max(0.2, float(baseline_metrics.get("mae") or 0.0) * 0.01)
+    spearman_tolerance = 0.02
+    bootstrap_small_sample = sample_count < LEGACY_PROJECT_LEARNING_MIN_SAMPLES
+
+    if bootstrap_small_sample:
+        if requested_model_type not in {"auto", "offset"}:
+            raise ValueError(
+                "小样本模式仅支持 auto/offset；至少需要3条可用样本才能训练 "
+                "linear1d/isotonic1d/ridge"
+            )
+        model_artifact = train_offset_calibrator(labeled_rows)
+        selected_type = "offset"
+        cv = {
+            "ok": True,
+            "metrics": {
+                "mae": float(((model_artifact.get("metrics") or {}).get("mae") or 0.0)),
+                "rmse": float(((model_artifact.get("metrics") or {}).get("rmse") or 0.0)),
+                "spearman": float(((model_artifact.get("metrics") or {}).get("spearman") or 0.0)),
+            },
+            "pred_count": sample_count,
+            "mode": "bootstrap_in_sample",
+        }
+        gate_passed = bool(model_artifact.get("gate_passed"))
+    else:
+        if requested_model_type == "auto":
+            model_artifact = train_best_calibrator_auto(labeled_rows, alpha=float(alpha), seed=seed)
+        elif requested_model_type == "offset":
+            model_artifact = train_offset_calibrator(labeled_rows)
+        elif requested_model_type == "linear1d":
+            model_artifact = train_linear1d_calibrator(labeled_rows, alpha=float(alpha))
+        elif requested_model_type == "isotonic1d":
+            model_artifact = train_isotonic1d_calibrator(labeled_rows)
+        else:
+            model_artifact = train_ridge_calibrator(labeled_rows, alpha=float(alpha))
+        selected_type = str(model_artifact.get("model_type") or requested_model_type or "ridge")
+        cv = cross_validate_calibrator(
+            model_type=selected_type,
+            feature_rows=labeled_rows,
+            alpha=float(alpha),
+            seed=seed,
+        )
+        cv_metrics = (
+            (cv.get("metrics") or {})
+            if bool(cv.get("ok"))
+            else {"mae": 0.0, "rmse": 0.0, "spearman": 0.0}
+        )
+        gate_passed = (
+            bool(cv.get("ok"))
+            and float(cv_metrics.get("mae") or 0.0)
+            <= float(baseline_metrics.get("mae") or 0.0) - improve_threshold
+            and float(cv_metrics.get("spearman") or 0.0)
+            >= float(baseline_metrics.get("spearman") or 0.0) - spearman_tolerance
+        )
+
+    cv_metrics = (
+        (cv.get("metrics") or {})
+        if bool(cv.get("ok"))
+        else {"mae": 0.0, "rmse": 0.0, "spearman": 0.0}
+    )
+    model_artifact.setdefault("metrics", {})
+    model_artifact["metrics"]["cv_mae"] = cv_metrics.get("mae")
+    model_artifact["metrics"]["cv_rmse"] = cv_metrics.get("rmse")
+    model_artifact["metrics"]["cv_spearman"] = cv_metrics.get("spearman")
+    model_artifact["metrics"]["cv_mode"] = cv.get("mode")
+    model_artifact["metrics"]["cv_pred_count"] = cv.get("pred_count")
+    model_artifact["metrics"]["baseline_mae"] = baseline_metrics.get("mae")
+    model_artifact["metrics"]["baseline_rmse"] = baseline_metrics.get("rmse")
+    model_artifact["metrics"]["baseline_spearman"] = baseline_metrics.get("spearman")
+    model_artifact["metrics"]["gate_improve_threshold"] = round(improve_threshold, 4)
+    model_artifact["metrics"]["gate_spearman_tolerance"] = spearman_tolerance
+    if bootstrap_small_sample:
+        model_artifact["metrics"]["bootstrap_small_sample"] = True
+        model_artifact["metrics"]["bootstrap_sample_count"] = sample_count
+    model_artifact["gate_passed"] = bool(gate_passed)
+
+    auto_candidates = _extract_auto_candidates(model_artifact)
+    if bootstrap_small_sample and not auto_candidates:
+        auto_candidates = [
+            {
+                "model_type": selected_type,
+                "ok": True,
+                "gate_passed": bool(gate_passed),
+                "metrics": dict(model_artifact.get("metrics") or {}),
+            }
+        ]
+    summary = _build_calibrator_summary(
+        model_type=selected_type,
+        calibrator_version=None,
+        gate_passed=bool(gate_passed),
+        cv_metrics={
+            "mae": cv_metrics.get("mae"),
+            "rmse": cv_metrics.get("rmse"),
+            "spearman": cv_metrics.get("spearman"),
+            "mode": cv.get("mode"),
+            "pred_count": cv.get("pred_count"),
+        },
+        baseline_metrics={
+            "mae": baseline_metrics.get("mae"),
+            "rmse": baseline_metrics.get("rmse"),
+            "spearman": baseline_metrics.get("spearman"),
+        },
+        improve_threshold=improve_threshold,
+        spearman_tolerance=spearman_tolerance,
+        auto_candidates=auto_candidates,
+        sample_count=sample_count,
+    )
+    return {
+        "model_artifact": model_artifact,
+        "selected_type": selected_type,
+        "gate_passed": bool(gate_passed),
+        "cv": cv,
+        "cv_metrics": summary.get("cv_metrics") or {},
+        "baseline_metrics": summary.get("baseline_metrics") or {},
+        "gate": summary.get("gate") or {},
+        "auto_candidates": auto_candidates,
+        "summary": summary,
+        "sample_count": sample_count,
+        "bootstrap_small_sample": bootstrap_small_sample,
+    }
+
+
 def _refresh_project_reflection_objects(
     project_id: str,
     *,
@@ -10228,10 +10396,12 @@ def _build_evolution_health_report(
     evo_status = _evaluate_evolution_weight_status(project_id, project=project, evo=evo)
     has_evolved_multipliers = bool(evo_status.get("usable"))
     stored_evolved_multipliers = bool(evo_status.get("stored"))
+    min_learning_samples = _resolve_project_learning_min_samples(project)
     recommendations: List[str] = []
-    if len(eligible_ground_truth_rows) < 3:
+    if len(eligible_ground_truth_rows) < min_learning_samples:
         recommendations.append(
-            "可纳入自动学习的真实评标样本不足，建议至少保留 3 条以上有效样本后再观察进化稳定性。"
+            "可纳入自动学习的真实评标样本不足，建议至少保留 "
+            f"{min_learning_samples} 条以上有效样本后再观察进化稳定性。"
         )
     if learning_quality_blocked_count > 0:
         recommendations.append(
@@ -18024,13 +18194,16 @@ def _build_project_mece_audit(project_id: str, project: Dict[str, object]) -> Di
     stored_evolved_multipliers = bool(gt_summary.get("stored_evolved_multipliers"))
     evo_fail_reasons: List[str] = []
     evo_warnings: List[str] = []
+    min_learning_samples = _resolve_project_learning_min_samples(project)
     if gt_count <= 0:
         evo_fail_reasons.append("未录入真实评标，进化闭环未激活。")
-    elif gt_count < 3:
-        evo_warnings.append(f"真实评标样本仅 {gt_count} 条，建议至少 3 条以上。")
+    elif gt_count < min_learning_samples:
+        evo_warnings.append(
+            f"真实评标样本仅 {gt_count} 条，建议至少 {min_learning_samples} 条以上。"
+        )
     if gt_count > 0 and matched_pred_count <= 0:
         evo_fail_reasons.append("真实评标与系统预测未形成有效匹配，闭环训练不可用。")
-    if gt_count >= 3 and not has_evolved_multipliers:
+    if gt_count >= min_learning_samples and not has_evolved_multipliers:
         evo_warnings.append("已具备样本但尚未产出进化权重，建议执行“学习进化”。")
     if stored_evolved_multipliers and not has_evolved_multipliers:
         evo_warnings.append("系统内已有进化权重，但当前未达到生效条件，评分仍未使用该权重。")
@@ -19879,89 +20052,32 @@ def train_calibrator(
                 for s in rebuilt_samples
             ]
 
+    sample_floor = DEFAULT_PROJECT_LEARNING_MIN_SAMPLES
+    if payload.project_id:
+        projects = load_projects()
+        project = next(
+            (row for row in projects if str(row.get("id") or "") == payload.project_id), None
+        )
+        if isinstance(project, dict):
+            sample_floor = _resolve_project_learning_min_samples(project)
     try:
-        if model_type == "auto":
-            model_artifact = train_best_calibrator_auto(feature_rows, alpha=float(payload.alpha))
-        elif model_type == "offset":
-            model_artifact = train_offset_calibrator(feature_rows)
-        elif model_type == "linear1d":
-            model_artifact = train_linear1d_calibrator(feature_rows, alpha=float(payload.alpha))
-        elif model_type == "isotonic1d":
-            model_artifact = train_isotonic1d_calibrator(feature_rows)
-        else:
-            model_artifact = train_ridge_calibrator(feature_rows, alpha=float(payload.alpha))
+        training_result = _train_calibrator_with_gate(
+            feature_rows,
+            model_type=model_type,
+            alpha=float(payload.alpha),
+            sample_floor=sample_floor,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
-    selected_type = str(model_artifact.get("model_type") or model_type or "ridge")
+    model_artifact = training_result["model_artifact"]
+    selected_type = str(training_result["selected_type"] or model_type or "ridge")
     # 为审计保留 auto 来源
     version_prefix = f"calib_{'auto_' if model_type == 'auto' else ''}{selected_type}"
-
-    # 统一用 CV 口径做上线闸门（避免 in-sample 过拟合）
-    cv = cross_validate_calibrator(
-        model_type=selected_type,
-        feature_rows=feature_rows,
-        alpha=float(payload.alpha),
-        seed=42,
-    )
-    # baseline: raw rule_total_score
-    y_true = [float(r.get("y_label")) for r in feature_rows if r.get("y_label") is not None]
-    baseline_pred = [
-        max(0.0, min(100.0, float(((r.get("x_features") or {}).get("rule_total_score") or 0.0))))
-        for r in feature_rows
-        if r.get("y_label") is not None
-    ]
-    baseline_metrics = calc_metrics(y_true, baseline_pred)
-    cv_metrics = (
-        (cv.get("metrics") or {})
-        if bool(cv.get("ok"))
-        else {"mae": 0.0, "rmse": 0.0, "spearman": 0.0}
-    )
-    improve_threshold = max(0.2, float(baseline_metrics.get("mae") or 0.0) * 0.01)
-    spearman_tolerance = 0.02
-    gate_passed = (
-        bool(cv.get("ok"))
-        and float(cv_metrics.get("mae") or 0.0)
-        <= float(baseline_metrics.get("mae") or 0.0) - improve_threshold
-        and float(cv_metrics.get("spearman") or 0.0)
-        >= float(baseline_metrics.get("spearman") or 0.0) - spearman_tolerance
-    )
-    model_artifact.setdefault("metrics", {})
-    model_artifact["metrics"]["cv_mae"] = cv_metrics.get("mae")
-    model_artifact["metrics"]["cv_rmse"] = cv_metrics.get("rmse")
-    model_artifact["metrics"]["cv_spearman"] = cv_metrics.get("spearman")
-    model_artifact["metrics"]["cv_mode"] = cv.get("mode")
-    model_artifact["metrics"]["cv_pred_count"] = cv.get("pred_count")
-    model_artifact["metrics"]["baseline_mae"] = baseline_metrics.get("mae")
-    model_artifact["metrics"]["baseline_rmse"] = baseline_metrics.get("rmse")
-    model_artifact["metrics"]["baseline_spearman"] = baseline_metrics.get("spearman")
-    model_artifact["metrics"]["gate_improve_threshold"] = round(improve_threshold, 4)
-    model_artifact["metrics"]["gate_spearman_tolerance"] = spearman_tolerance
-    model_artifact["gate_passed"] = gate_passed
-
-    auto_candidates = _extract_auto_candidates(model_artifact)
+    gate_passed = bool(training_result["gate_passed"])
     version = f"{version_prefix}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
-    calibrator_summary = _build_calibrator_summary(
-        model_type=selected_type,
-        calibrator_version=version,
-        gate_passed=bool(gate_passed),
-        cv_metrics={
-            "mae": cv_metrics.get("mae"),
-            "rmse": cv_metrics.get("rmse"),
-            "spearman": cv_metrics.get("spearman"),
-            "mode": cv.get("mode"),
-            "pred_count": cv.get("pred_count"),
-        },
-        baseline_metrics={
-            "mae": baseline_metrics.get("mae"),
-            "rmse": baseline_metrics.get("rmse"),
-            "spearman": baseline_metrics.get("spearman"),
-        },
-        improve_threshold=improve_threshold,
-        spearman_tolerance=spearman_tolerance,
-        auto_candidates=auto_candidates,
-        sample_count=len(feature_rows),
-    )
+    calibrator_summary = dict(training_result["summary"])
+    calibrator_summary["calibrator_version"] = version
     record = {
         "calibrator_version": version,
         "model_type": selected_type,
@@ -20458,12 +20574,13 @@ def auto_run_reflection_pipeline(
 
     calibrator_version = None
     calibrator_deployed = False
+    min_learning_samples = _resolve_project_learning_min_samples(project)
     calibrator_summary = _build_calibrator_summary(
         model_type=None,
         calibrator_version=None,
         gate_passed=None,
         sample_count=len(samples),
-        skipped_reason="insufficient_samples" if len(samples) < 3 else None,
+        skipped_reason="insufficient_samples" if len(samples) < min_learning_samples else None,
     )
     calibrator_model_type = calibrator_summary.get("model_type")
     calibrator_gate_passed = calibrator_summary.get("gate_passed")
@@ -20473,7 +20590,7 @@ def auto_run_reflection_pipeline(
     calibrator_auto_candidates: List[Dict[str, Any]] = (
         calibrator_summary.get("auto_candidates") or []
     )
-    if len(samples) >= 3:
+    if len(samples) >= min_learning_samples:
         feature_rows = [
             {
                 "feature_schema_version": s.get("feature_schema_version", "v2"),
@@ -20483,78 +20600,21 @@ def auto_run_reflection_pipeline(
             }
             for s in samples
         ]
-        # “最强自动校准”：多候选 + CV 闸门 + 自动选择最佳模型
-        model_artifact = train_best_calibrator_auto(feature_rows, alpha=1.0)
-        selected_type = str(model_artifact.get("model_type") or "ridge")
-        calibrator_model_type = selected_type
-
-        # 统一用 CV 口径做上线闸门（避免 in-sample 过拟合）
-        cv = cross_validate_calibrator(
-            model_type=selected_type,
-            feature_rows=feature_rows,
+        training_result = _train_calibrator_with_gate(
+            feature_rows,
+            model_type="auto",
             alpha=1.0,
-            seed=42,
+            sample_floor=min_learning_samples,
         )
-        # baseline: raw rule_total_score
-        y_true = [float(r.get("y_label")) for r in feature_rows if r.get("y_label") is not None]
-        baseline_pred = [
-            float(((r.get("x_features") or {}).get("rule_total_score") or 0.0))
-            for r in feature_rows
-            if r.get("y_label") is not None
-        ]
-        baseline_metrics = calc_metrics(y_true, baseline_pred)
-        cv_metrics = (
-            (cv.get("metrics") or {})
-            if bool(cv.get("ok"))
-            else {"mae": 0.0, "rmse": 0.0, "spearman": 0.0}
-        )
-        improve_threshold = max(0.2, float(baseline_metrics.get("mae") or 0.0) * 0.01)
-        spearman_tolerance = 0.02
-        gate_passed = (
-            bool(cv.get("ok"))
-            and float(cv_metrics.get("mae") or 0.0)
-            <= float(baseline_metrics.get("mae") or 0.0) - improve_threshold
-            and float(cv_metrics.get("spearman") or 0.0)
-            >= float(baseline_metrics.get("spearman") or 0.0) - spearman_tolerance
-        )
-        model_artifact.setdefault("metrics", {})
-        model_artifact["metrics"]["cv_mae"] = cv_metrics.get("mae")
-        model_artifact["metrics"]["cv_rmse"] = cv_metrics.get("rmse")
-        model_artifact["metrics"]["cv_spearman"] = cv_metrics.get("spearman")
-        model_artifact["metrics"]["cv_mode"] = cv.get("mode")
-        model_artifact["metrics"]["cv_pred_count"] = cv.get("pred_count")
-        model_artifact["metrics"]["baseline_mae"] = baseline_metrics.get("mae")
-        model_artifact["metrics"]["baseline_rmse"] = baseline_metrics.get("rmse")
-        model_artifact["metrics"]["baseline_spearman"] = baseline_metrics.get("spearman")
-        model_artifact["metrics"]["gate_improve_threshold"] = round(improve_threshold, 4)
-        model_artifact["metrics"]["gate_spearman_tolerance"] = spearman_tolerance
-        model_artifact["gate_passed"] = gate_passed
-
-        auto_candidates = _extract_auto_candidates(model_artifact)
+        model_artifact = training_result["model_artifact"]
+        selected_type = str(training_result["selected_type"] or "offset")
+        calibrator_model_type = selected_type
+        gate_passed = bool(training_result["gate_passed"])
         calibrator_version = (
             f"calib_auto_{selected_type}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
         )
-        calibrator_summary = _build_calibrator_summary(
-            model_type=selected_type,
-            calibrator_version=calibrator_version,
-            gate_passed=bool(gate_passed),
-            cv_metrics={
-                "mae": cv_metrics.get("mae"),
-                "rmse": cv_metrics.get("rmse"),
-                "spearman": cv_metrics.get("spearman"),
-                "mode": cv.get("mode"),
-                "pred_count": cv.get("pred_count"),
-            },
-            baseline_metrics={
-                "mae": baseline_metrics.get("mae"),
-                "rmse": baseline_metrics.get("rmse"),
-                "spearman": baseline_metrics.get("spearman"),
-            },
-            improve_threshold=improve_threshold,
-            spearman_tolerance=spearman_tolerance,
-            auto_candidates=auto_candidates,
-            sample_count=len(feature_rows),
-        )
+        calibrator_summary = dict(training_result["summary"])
+        calibrator_summary["calibrator_version"] = calibrator_version
         calibrator_model_type = calibrator_summary.get("model_type")
         calibrator_gate_passed = calibrator_summary.get("gate_passed")
         calibrator_cv_metrics = calibrator_summary.get("cv_metrics") or {}

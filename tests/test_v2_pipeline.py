@@ -1250,31 +1250,16 @@ class TestAutoRunReflection:
         mock_load_delta,
         mock_load_samples,
     ):
-        mock_load_projects.return_value = [{"id": "p1"}]
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 100}}]
         mock_load_delta.return_value = []
-        mock_load_samples.return_value = [
-            {
-                "id": "s1",
-                "project_id": "p1",
-                "feature_schema_version": "v2",
-                "x_features": {"rule_total_score": 80},
-                "y_label": 81,
-            },
-            {
-                "id": "s2",
-                "project_id": "p1",
-                "feature_schema_version": "v2",
-                "x_features": {"rule_total_score": 82},
-                "y_label": 83,
-            },
-        ]
+        mock_load_samples.return_value = []
 
         resp = _client().post("/api/v1/projects/p1/reflection/auto_run")
         assert resp.status_code == 200
         data = resp.json()
         assert data["calibrator_version"] is None
         assert data["calibrator_deployed"] is False
-        assert data["calibrator_summary"]["sample_count"] == 2
+        assert data["calibrator_summary"]["sample_count"] == 0
         assert data["calibrator_summary"]["skipped_reason"] == "insufficient_samples"
         assert data["calibrator_model_type"] is None
         assert data["calibrator_gate_passed"] is None
@@ -1282,6 +1267,79 @@ class TestAutoRunReflection:
         assert data["calibrator_baseline_metrics"] == {}
         assert data["calibrator_gate"] == {}
         assert data["calibrator_auto_candidates"] == []
+
+    @patch("app.main.save_patch_packages")
+    @patch("app.main.load_patch_packages")
+    @patch("app.main.save_submissions")
+    @patch("app.main.save_score_reports")
+    @patch("app.main.load_score_reports")
+    @patch("app.main.load_submissions")
+    @patch("app.main.save_projects")
+    @patch("app.main.save_calibration_models")
+    @patch("app.main.load_calibration_models")
+    @patch("app.main.load_calibration_samples")
+    @patch("app.main.load_delta_cases")
+    @patch("app.main._refresh_project_reflection_objects")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_auto_run_reflection_bootstraps_single_sample_calibrator(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_refresh,
+        mock_load_delta,
+        mock_load_samples,
+        mock_load_models,
+        mock_save_models,
+        mock_save_projects,
+        mock_load_submissions,
+        mock_load_reports,
+        mock_save_reports,
+        mock_save_submissions,
+        mock_load_patches,
+        mock_save_patches,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 100}}]
+        mock_load_delta.return_value = []
+        mock_load_samples.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "feature_schema_version": "v2",
+                "x_features": {"rule_total_score": 80},
+                "y_label": 84,
+            }
+        ]
+        mock_load_models.return_value = []
+        mock_load_submissions.return_value = [
+            {
+                "id": "sb1",
+                "project_id": "p1",
+                "text": "abc",
+                "report": {"rule_total_score": 80, "score_scale_max": 100},
+            }
+        ]
+        mock_load_reports.return_value = [
+            {
+                "id": "rp1",
+                "project_id": "p1",
+                "submission_id": "sb1",
+                "rule_total_score": 80,
+                "score_scale_max": 100,
+            }
+        ]
+        mock_load_patches.return_value = []
+
+        resp = _client().post("/api/v1/projects/p1/reflection/auto_run")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["calibrator_deployed"] is True
+        assert data["calibrator_model_type"] == "offset"
+        assert data["calibrator_gate_passed"] is True
+        assert data["calibrator_summary"]["sample_count"] == 1
+        assert data["calibrator_summary"]["cv_metrics"]["mode"] == "bootstrap_in_sample"
+        assert data["calibrator_summary"]["gate_passed"] is True
+        assert data["patch_id"] is None
 
 
 class TestScoringFactorsEndpoint:
