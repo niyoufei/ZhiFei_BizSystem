@@ -780,7 +780,9 @@ class TestIndexEndpoint:
             "可直接下拉或输入名称快速定位",
             "window.applySecureDesktopUiGuards = applySecureDesktopUiGuards;",
             "if (typeof window.applySecureDesktopUiGuards === 'function') {",
-            "refreshAuthStatusUi().finally(() => refreshProjects());",
+            "refreshAuthStatusUi().finally(() => {",
+            "if (INITIAL_CREATE_ERROR) {",
+            "refreshProjects();",
             "Object.prototype.hasOwnProperty.call(authStatusState, 'ui_auth_required')",
             'let authStatusState = {"auth_enabled": true,',
         ):
@@ -802,6 +804,7 @@ class TestIndexEndpoint:
         assert 'id="btnStartNewProject"' in page
         assert 'id="projectMonthFilter"' in page
         assert "async function startNewProjectIntake()" in page
+        assert "async function enterProjectIntakeMode(message, options=null)" in page
         assert "const intakeMode = allowEmptySelection || projectIntakeModeEnabled();" in page
         assert "function projectIsSystemGenerated(project)" in page
         assert "function buildProjectPickerView(projects)" in page
@@ -809,6 +812,7 @@ class TestIndexEndpoint:
             "safeChange('projectMonthFilter', () => refreshProjects(selectedProjectIdStrict() || ''));"
             in page
         )
+        assert "const INITIAL_CREATE_ERROR = __INITIAL_CREATE_ERROR__;" not in page
         assert "storageGet('project_intake_mode') === '1'" in page
         assert "await refreshProjects('', {" in page
         assert "allowEmptySelection: true," in page
@@ -816,6 +820,7 @@ class TestIndexEndpoint:
             "emptySelectionIsInfo: intakeMode || (pickerView.totalCount > 0 && list.length === 0),"
             in page
         )
+        assert "自动创建未完成，当前保留在新项目录入界面；请先补齐项目名称或更换招标文件。" in page
         assert "已切换到新项目录入界面，历史项目已保留并隐藏。" in page
         assert "OPS/E2E 系统项目已默认隐藏" in page
         assert "删除资料不会直接删除已学习权重、校准器或真实评标记录" in page
@@ -1846,6 +1851,56 @@ class TestProjectsEndpoints:
         assert response.status_code == 200
         data = response.json()
         assert data["inferred_name"] == "包河区档案馆提升改造项目施工总承包"
+
+    @patch("app.main._read_uploaded_file_preview_for_project_name")
+    @patch("app.main.ensure_data_dirs")
+    def test_infer_project_name_from_tender_filename_strips_copy_suffix(
+        self,
+        mock_ensure,
+        mock_preview_reader,
+        client,
+    ):
+        mock_preview_reader.return_value = ""
+
+        response = client.post(
+            "/api/v1/projects/infer_name_from_tender",
+            files={
+                "file": (
+                    "包河区档案馆提升改造项目施工总承包招标文件正文(2).pdf",
+                    b"fake-pdf",
+                    "application/pdf",
+                )
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["inferred_name"] == "包河区档案馆提升改造项目施工总承包"
+
+    @patch("app.main._read_uploaded_file_preview_for_project_name")
+    @patch("app.main.ensure_data_dirs")
+    def test_infer_project_name_from_tender_rejects_generic_template_title(
+        self,
+        mock_ensure,
+        mock_preview_reader,
+        client,
+    ):
+        mock_preview_reader.return_value = "房建市政工程总承包招标示范文本〈2023年版〉"
+
+        response = client.post(
+            "/api/v1/projects/infer_name_from_tender",
+            files={
+                "file": (
+                    "房建市政工程总承包招标示范文本〈2023年版〉.pdf",
+                    b"fake-pdf",
+                    "application/pdf",
+                )
+            },
+        )
+
+        assert response.status_code == 422
+        data = response.json()
+        assert "招标示范文本/模板" in data["detail"]
 
     @patch("app.main.upload_material")
     @patch("app.main.save_projects")

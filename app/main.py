@@ -2624,12 +2624,58 @@ _PROJECT_NAME_TITLE_SUFFIX_RE = re.compile(
     r"(?:招标文件(?:正文)?|施工招标(?:文件)?|公开招标(?:文件)?|招标公告|答疑澄清|答疑|澄清|补遗)$"
 )
 _PROJECT_NAME_FILENAME_SUFFIX_RE = re.compile(
-    r"(?:招标文件(?:及答疑)?|招标答疑|答疑澄清|答疑|澄清|补遗|招标公告|公开招标|施工招标|文件)$"
+    r"(?:招标文件(?:正文|及答疑)?|招标答疑|答疑澄清|答疑|澄清|补遗|招标公告|公开招标|施工招标|文件)$"
 )
+_PROJECT_NAME_COPY_SUFFIX_RE = re.compile(r"(?:[\s_-]*[（(]\d+[)）]|[\s_-]+\d+)$")
+_PROJECT_NAME_VERSION_SUFFIX_RE = re.compile(
+    r"(?:[\s_-]*(?:副本|终稿|最终版|最新版|定稿|扫描件|电子版|打印版|修订版|完整版|文本版|正式版|封面))+$"
+)
+_GENERIC_PROJECT_NAME_KEYWORDS = (
+    "招标示范文本",
+    "示范文本",
+    "标准文本",
+    "标准文件",
+    "范本",
+    "模板",
+)
+_GENERIC_PROJECT_NAME_EXACT = {
+    "招标文件",
+    "招标文件正文",
+    "施工招标文件",
+    "公开招标文件",
+    "房建市政工程总承包招标示范文本",
+    "房建市政工程总承包招标示范文本〈2023年版〉",
+    "房建市政工程总承包招标示范文本（2023年版）",
+}
+
+
+def _strip_inferred_project_name_noise(name: object) -> str:
+    text = _normalize_project_name_key(name)
+    previous = ""
+    while text and text != previous:
+        previous = text
+        text = _PROJECT_NAME_COPY_SUFFIX_RE.sub("", text).strip()
+        text = _PROJECT_NAME_VERSION_SUFFIX_RE.sub("", text).strip()
+        text = _PROJECT_NAME_TITLE_SUFFIX_RE.sub("", text).strip(
+            "：:;；,，。.()（）[]【】<>《》〈〉"
+        )
+        text = _PROJECT_NAME_FILENAME_SUFFIX_RE.sub("", text).strip(
+            "：:;；,，。.()（）[]【】<>《》〈〉"
+        )
+    return text
+
+
+def _looks_like_generic_project_name_candidate(name: object) -> bool:
+    normalized = _normalize_project_name_key(name)
+    if not normalized:
+        return False
+    if normalized in _GENERIC_PROJECT_NAME_EXACT:
+        return True
+    return any(keyword in normalized for keyword in _GENERIC_PROJECT_NAME_KEYWORDS)
 
 
 def _clean_project_name_candidate(name: object) -> str:
-    text = _normalize_project_name_key(name).strip("：:;；,，。.()（）[]【】")
+    text = _normalize_project_name_key(name).strip("：:;；,，。.()（）[]【】<>《》〈〉")
     text = re.sub(
         r"[，。；;]\s*(?:招标编号|项目编号|建设地点|建设单位|招标人|招标范围|工期|质量标准).*$",
         "",
@@ -2644,6 +2690,8 @@ def _is_valid_project_name_candidate(name: str) -> bool:
         return False
     if not any("\u4e00" <= ch <= "\u9fff" or ch.isalnum() for ch in text):
         return False
+    if _looks_like_generic_project_name_candidate(text):
+        return False
     if text in {"项目名称", "工程名称", "标段名称", "项目概况", "工程概况", "本项目", "本工程"}:
         return False
     if text.endswith(("项目名称", "工程名称", "标段名称")):
@@ -2651,11 +2699,15 @@ def _is_valid_project_name_candidate(name: str) -> bool:
     return any(token in text for token in ("工程", "项目", "标段"))
 
 
-def _infer_project_name_from_filename(filename: str) -> str:
+def _candidate_project_name_from_filename(filename: str) -> str:
     stem = Path(_normalize_uploaded_filename(filename)).stem
     candidate = re.sub(r"[_\-]+", " ", stem)
-    candidate = _PROJECT_NAME_FILENAME_SUFFIX_RE.sub("", candidate).strip()
-    candidate = _clean_project_name_candidate(candidate)
+    candidate = _strip_inferred_project_name_noise(candidate)
+    return _clean_project_name_candidate(candidate)
+
+
+def _infer_project_name_from_filename(filename: str) -> str:
+    candidate = _candidate_project_name_from_filename(filename)
     if _is_valid_project_name_candidate(candidate):
         return candidate
     return ""
@@ -2677,10 +2729,8 @@ def _infer_project_name_from_title_lines(text: str) -> str:
             continue
         if not any(hint in raw_line for hint in title_hints):
             continue
-        candidate = _clean_project_name_candidate(raw_line)
-        candidate = _PROJECT_NAME_TITLE_SUFFIX_RE.sub("", candidate).strip(
-            "：:;；,，。.()（）[]【】"
-        )
+        candidate = _strip_inferred_project_name_noise(raw_line)
+        candidate = _clean_project_name_candidate(candidate)
         if _is_valid_project_name_candidate(candidate):
             return candidate
     return ""
@@ -2689,23 +2739,45 @@ def _infer_project_name_from_title_lines(text: str) -> str:
 def _infer_project_name_from_tender_text(text: str, filename: str) -> str:
     normalized_text = unicodedata.normalize("NFKC", str(text or "")).replace("\u3000", " ")
     scan_text = normalized_text[:40000]
+    generic_candidate_seen = False
     for pattern in _PROJECT_NAME_FIELD_PATTERNS:
         for match in pattern.finditer(scan_text):
-            candidate = _clean_project_name_candidate(match.group(1))
+            candidate = _strip_inferred_project_name_noise(match.group(1))
+            candidate = _clean_project_name_candidate(candidate)
+            if _looks_like_generic_project_name_candidate(candidate):
+                generic_candidate_seen = True
+                continue
             if _is_valid_project_name_candidate(candidate):
                 return candidate
     for raw_line in normalized_text.splitlines()[:120]:
         if not any(marker in raw_line for marker in ("项目名称", "工程名称", "标段名称")):
             continue
-        candidate = _clean_project_name_candidate(raw_line.split("：", 1)[-1].split(":", 1)[-1])
+        candidate = _strip_inferred_project_name_noise(
+            raw_line.split("：", 1)[-1].split(":", 1)[-1]
+        )
+        candidate = _clean_project_name_candidate(candidate)
+        if _looks_like_generic_project_name_candidate(candidate):
+            generic_candidate_seen = True
+            continue
         if _is_valid_project_name_candidate(candidate):
             return candidate
     title_line_candidate = _infer_project_name_from_title_lines(normalized_text)
     if title_line_candidate:
         return title_line_candidate
+    fallback_candidate = _candidate_project_name_from_filename(filename)
+    if _looks_like_generic_project_name_candidate(fallback_candidate):
+        generic_candidate_seen = True
     fallback = _infer_project_name_from_filename(filename)
     if fallback:
         return fallback
+    if generic_candidate_seen:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "当前文件更像招标示范文本/模板，未识别到真实项目名称。"
+                "请先在上方填写项目名称，再点“自动创建”，或改用“创建”先建项目。"
+            ),
+        )
     raise HTTPException(
         status_code=422,
         detail=(
@@ -23502,7 +23574,9 @@ def index(
     picker_projects = _filter_projects_for_picker(projects, month_key=picker_month_default)
     picker_project_ids = [str(p.get("id", "")) for p in picker_projects]
     selected_project_id = ""
-    if project_id and project_id in picker_project_ids:
+    if create_error and not project_id:
+        selected_project_id = ""
+    elif project_id and project_id in picker_project_ids:
         selected_project_id = project_id
     elif picker_project_ids:
         selected_project_id = picker_project_ids[-1]
@@ -27329,9 +27403,11 @@ def index(
           setSelectMsg('已切换项目并自动刷新下方所有区域。', false);
           scheduleProjectAutoRefresh(selectedId, switchSeq);
         }
-        async function startNewProjectIntake() {
+        const INITIAL_CREATE_ERROR = __INITIAL_CREATE_ERROR__;
+        async function enterProjectIntakeMode(message, options=null) {
+          const opts = (options && typeof options === 'object') ? options : {};
           setProjectIntakeMode(true);
-          clearCreateProjectDraft();
+          if (opts.clearDraft) clearCreateProjectDraft();
           const searchInput = document.getElementById('projectSearchInput');
           if (searchInput) searchInput.value = '';
           const sel = document.getElementById('projectSelect');
@@ -27339,13 +27415,24 @@ def index(
           storageRemove('selected_project_id');
           updateProjectBoundControlsState();
           resetProjectPanelsToStandby('');
-          setCreateMsg('已切换到新项目录入模式，可直接填写项目名称或上传招标文件自动建项。', false);
+          if (message) setCreateMsg(String(message), !!opts.isError);
           await refreshProjects('', {
             allowEmptySelection: true,
+            emptySelectionMessage: String(
+              opts.emptySelectionMessage || '已切换到新项目录入界面，历史项目已保留并隐藏。'
+            ),
+          });
+          if (opts.focusNameInput) {
+            const nameInput = document.getElementById('createProjectNameInput');
+            if (nameInput && typeof nameInput.focus === 'function') nameInput.focus();
+          }
+        }
+        async function startNewProjectIntake() {
+          await enterProjectIntakeMode('已切换到新项目录入模式，可直接填写项目名称或上传招标文件自动建项。', {
+            clearDraft: true,
+            focusNameInput: true,
             emptySelectionMessage: '已切换到新项目录入界面，历史项目已保留并隐藏。',
           });
-          const nameInput = document.getElementById('createProjectNameInput');
-          if (nameInput && typeof nameInput.focus === 'function') nameInput.focus();
         }
         const elRefresh = document.getElementById('refreshProjects');
         if (elRefresh) elRefresh.onclick = refreshProjects;
@@ -27650,13 +27737,14 @@ def index(
             } else {
               let detail = text;
               try { const j = JSON.parse(text); detail = (j && j.detail) || text; } catch (_) {}
-              setCreateMsg(
-                normalizeTenderCreateErrorMessage(
-                  detail,
-                  syncCreateProjectNameOverride()
-                ),
-                true
+              const normalizedError = normalizeTenderCreateErrorMessage(
+                detail,
+                syncCreateProjectNameOverride()
               );
+              await enterProjectIntakeMode(normalizedError, {
+                isError: true,
+                emptySelectionMessage: '自动创建未完成，当前保留在新项目录入界面；请先补齐项目名称或更换招标文件。',
+              });
               const outSc = document.getElementById('output');
               if (outSc) outSc.scrollIntoView({ behavior: 'smooth' });
             }
@@ -32370,7 +32458,16 @@ def index(
           clearMaterialParsePolling();
           clearProjectAutoRefresh();
         });
-        refreshAuthStatusUi().finally(() => refreshProjects());
+        refreshAuthStatusUi().finally(() => {
+          if (INITIAL_CREATE_ERROR) {
+            enterProjectIntakeMode('自动创建未完成，请先补齐项目名称或更换招标文件。', {
+              isError: true,
+              emptySelectionMessage: '自动创建未完成，当前保留在新项目录入界面；请先补齐项目名称或更换招标文件。',
+            });
+            return;
+          }
+          refreshProjects();
+        });
 
       </script>
     </body>
@@ -32381,6 +32478,9 @@ def index(
     html = html.replace("__PROJECT_SEARCH_OPTIONS__", project_search_options_html)
     html = html.replace("__CREATE_NOTICE_HTML__", create_notice_html)
     html = html.replace("__GLOBAL_NOTICE_HTML__", global_notice_html)
+    html = html.replace(
+        "__INITIAL_CREATE_ERROR__", "true" if bool(create_error and not project_id) else "false"
+    )
     html = html.replace(
         "__INITIAL_AUTH_STATUS_JSON__",
         json.dumps(initial_auth_status, ensure_ascii=False),
