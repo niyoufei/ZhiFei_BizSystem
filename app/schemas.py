@@ -1086,6 +1086,13 @@ class GroundTruthRecord(BaseModel):
     id: str
     project_id: str
     shigong_text: str
+    source_submission_id: Optional[str] = Field(None, description="关联施组ID（若来自步骤4）")
+    source_submission_filename: Optional[str] = Field(
+        None, description="关联施组文件名，优先用于界面展示"
+    )
+    source_submission_created_at: Optional[str] = Field(
+        None, description="关联施组上传时间（若可追溯）"
+    )
     judge_scores: List[float] = Field(..., description="5或7个评委得分")
     judge_count: Optional[int] = Field(None, description="评委人数（5或7）")
     score_scale_max: Optional[int] = Field(None, description="该条真实评分的原始满分制（5或100）")

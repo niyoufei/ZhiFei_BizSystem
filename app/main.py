@@ -9764,6 +9764,67 @@ def _list_project_ground_truth_records(
     return [row for row in rows if not _feedback_guardrail_is_blocked(row)]
 
 
+def _resolve_ground_truth_source_submission(
+    row: Dict[str, object],
+    *,
+    submissions_by_id: Dict[str, Dict[str, object]],
+    submissions_by_text: Dict[str, Dict[str, object]],
+) -> Optional[Dict[str, object]]:
+    source_submission_id = str(row.get("source_submission_id") or "").strip()
+    if source_submission_id:
+        matched = submissions_by_id.get(source_submission_id)
+        if matched is not None:
+            return matched
+    shigong_text = str(row.get("shigong_text") or "").strip()
+    if not shigong_text:
+        return None
+    return submissions_by_text.get(shigong_text)
+
+
+def _enrich_ground_truth_submission_metadata(
+    project_id: str,
+    rows: List[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    submissions = [s for s in load_submissions() if str(s.get("project_id") or "") == project_id]
+    submissions_by_id: Dict[str, Dict[str, object]] = {
+        str(s.get("id") or "").strip(): s for s in submissions if str(s.get("id") or "").strip()
+    }
+    submissions_by_text: Dict[str, Dict[str, object]] = {}
+    for submission in submissions:
+        text = str(submission.get("text") or "").strip()
+        if text and text not in submissions_by_text:
+            submissions_by_text[text] = submission
+
+    enriched_rows: List[Dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        enriched = dict(row)
+        submission = _resolve_ground_truth_source_submission(
+            enriched,
+            submissions_by_id=submissions_by_id,
+            submissions_by_text=submissions_by_text,
+        )
+        if submission is not None:
+            submission_id = str(submission.get("id") or "").strip()
+            submission_filename = str(submission.get("filename") or "").strip()
+            submission_created_at = str(submission.get("created_at") or "").strip()
+            if submission_id and not str(enriched.get("source_submission_id") or "").strip():
+                enriched["source_submission_id"] = submission_id
+            if (
+                submission_filename
+                and not str(enriched.get("source_submission_filename") or "").strip()
+            ):
+                enriched["source_submission_filename"] = submission_filename
+            if (
+                submission_created_at
+                and not str(enriched.get("source_submission_created_at") or "").strip()
+            ):
+                enriched["source_submission_created_at"] = submission_created_at
+        enriched_rows.append(enriched)
+    return enriched_rows
+
+
 def _collect_blocked_ground_truth_guardrails(
     project_id: str,
     *,
@@ -21683,6 +21744,7 @@ def list_ground_truth(
     if not any(p["id"] == project_id for p in projects):
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
     records = [r for r in load_ground_truth() if r.get("project_id") == project_id]
+    records = _enrich_ground_truth_submission_metadata(project_id, records)
     return [GroundTruthRecord(**r) for r in records]
 
 
@@ -23643,7 +23705,7 @@ def index(
           </select>
           <button type="button" id="btnRefreshGroundTruth" class="secondary compact-hidden" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnRefreshGroundTruth')">刷新</button>
         </div>
-        <table id="groundTruthTable"><thead><tr><th>序号</th><th>施组摘要</th><th>评委分（5/7）</th><th>最终分</th><th>来源</th><th>操作</th></tr></thead><tbody></tbody></table>
+        <table id="groundTruthTable"><thead><tr><th>序号</th><th>施组文件</th><th>评委分（5/7）</th><th>最终分</th><th>来源</th><th>操作</th></tr></thead><tbody></tbody></table>
         <p id="groundTruthEmpty" style="font-size:13px;color:#64748b;margin:6px 0 10px 0;display:none">暂无真实评标，请下方录入。</p>
         <div style="margin-bottom:10px">
           <strong>投喂包（即本项目资料）：</strong>上传后可在下方查看文件名与上传时间。
@@ -27765,17 +27827,22 @@ def index(
           }
           if (emptyEl) emptyEl.style.display = 'none';
           list.forEach((r, idx) => {
-            const summary = (r.shigong_text || '').slice(0, 50);
+            const sourceSubmissionFilename = String(r.source_submission_filename || '').trim();
+            const shigongText = String(r.shigong_text || '');
+            const summary = sourceSubmissionFilename || shigongText.slice(0, 50);
             const scores = Array.isArray(r.judge_scores) ? r.judge_scores : [];
             const scoresStr = scores.length
               ? (scores.map(s => Number(s).toFixed(1)).join(', ') + '（' + scores.length + '人）')
               : '-';
             const tr = document.createElement('tr');
-            const st = r.shigong_text || '';
+            const titleText = sourceSubmissionFilename || shigongText.slice(0, 200);
+            const displayLabel = sourceSubmissionFilename
+              ? sourceSubmissionFilename
+              : (summary ? summary + (shigongText.length > 50 ? '…' : '') : '-');
             const actionCell = isCurrent
               ? '<td><button type="button" class="btn-danger js-delete-ground-truth" data-gt-id="' + escapeHtmlText(String(r.id || '')) + '">删除</button></td>'
               : '<td></td>';
-            tr.innerHTML = '<td>' + (idx + 1) + '</td><td title="' + st.slice(0, 200).replace(/"/g, '&quot;') + '">' + (summary ? summary + (st.length > 50 ? '…' : '') : '-') + '</td><td>' + scoresStr + '</td><td>' + (r.final_score != null ? r.final_score : '-') + '</td><td>' + (r.source || '-') + '</td>' + actionCell;
+            tr.innerHTML = '<td>' + (idx + 1) + '</td><td title="' + escapeHtmlText(titleText) + '">' + escapeHtmlText(displayLabel) + '</td><td>' + scoresStr + '</td><td>' + (r.final_score != null ? r.final_score : '-') + '</td><td>' + (r.source || '-') + '</td>' + actionCell;
             if (isCurrent) {
               const delBtn = tr.querySelector('button');
               if (delBtn) delBtn.onclick = async () => {

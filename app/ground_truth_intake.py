@@ -93,6 +93,7 @@ def build_ground_truth_record_from_submission(
     )
     record["source_submission_id"] = submission_id
     record["source_submission_filename"] = submission.get("filename")
+    record["source_submission_created_at"] = submission.get("created_at")
     return record
 
 
@@ -109,7 +110,7 @@ def build_ground_truth_record_from_uploaded_file(
     main = _main()
     judge_scores_list = main._parse_judge_scores_form(judge_scores_form)
     shigong_text = main._read_uploaded_file_content(content, filename or "")
-    return build_ground_truth_record(
+    record = build_ground_truth_record(
         project_id,
         shigong_text=shigong_text,
         judge_scores=judge_scores_list,
@@ -117,6 +118,8 @@ def build_ground_truth_record_from_uploaded_file(
         source=source,
         locale=locale,
     )
+    record["source_submission_filename"] = filename or None
+    return record
 
 
 def build_ground_truth_batch_items_from_uploaded_files(
@@ -151,6 +154,7 @@ def build_ground_truth_batch_items_from_uploaded_files(
                 judge_weights=None,
                 qualitative_tags_by_judge=None,
             )
+            record["source_submission_filename"] = clean_filename or None
             success_records.append(record)
             items.append(
                 {

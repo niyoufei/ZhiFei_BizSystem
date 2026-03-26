@@ -772,10 +772,15 @@ class TestIndexEndpoint:
         response = client.get("/")
         assert response.status_code == 200
         page = response.text
+        assert "施组文件" in page
         assert 'id="gtFinalRuleHint"' in page
         assert "function refreshGroundTruthScoringRule" in page
         assert "function applyGroundTruthFinalScoreAutoFill" in page
         assert "function submitGroundTruthDraft" in page
+        assert (
+            "const sourceSubmissionFilename = String(r.source_submission_filename || '').trim();"
+            in page
+        )
         assert "/ground_truth/scoring_rule" in page
         assert "学习进化前需先完成真实评标录入" in page
         assert "本次已先自动录入当前表单中的真实评标，再执行学习进化。" in page
@@ -8422,6 +8427,51 @@ class TestFeedbackClosedLoopSafety:
 
 
 class TestGroundTruthGuardrailRoutes:
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_ground_truth_enriches_submission_filename_for_legacy_rows(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_ground_truth,
+        mock_load_submissions,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1"}]
+        mock_load_ground_truth.return_value = [
+            {
+                "id": "gt-1",
+                "project_id": "p1",
+                "shigong_text": "示例施组文本" * 20,
+                "judge_scores": [4.1, 4.2, 4.3, 4.4, 4.5],
+                "final_score": 4.3,
+                "source": "青天大模型",
+                "created_at": "2026-03-24T10:16:57+00:00",
+            }
+        ]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "安徽省豪伟建设集团有限公司-包河区档案馆提升改造项目施工总承包(1).pdf",
+                "text": "示例施组文本" * 20,
+                "created_at": "2026-03-24T10:16:57+00:00",
+            }
+        ]
+
+        response = client.get("/api/v1/projects/p1/ground_truth")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data[0]["source_submission_id"] == "s1"
+        assert (
+            data[0]["source_submission_filename"]
+            == "安徽省豪伟建设集团有限公司-包河区档案馆提升改造项目施工总承包(1).pdf"
+        )
+        assert data[0]["source_submission_created_at"] == "2026-03-24T10:16:57+00:00"
+
     @patch("app.main._run_feedback_closed_loop_safe")
     @patch("app.main._sync_ground_truth_record_to_qingtian")
     @patch("app.main.save_ground_truth")
@@ -8446,6 +8496,7 @@ class TestGroundTruthGuardrailRoutes:
                 "id": "s1",
                 "project_id": "p1",
                 "filename": "施组一.docx",
+                "created_at": "2026-03-24T10:16:57+00:00",
                 "text": "示例施组文本" * 20,
             }
         ]
@@ -8485,6 +8536,9 @@ class TestGroundTruthGuardrailRoutes:
         assert data["learning_quality_gate"]["blocked"] is True
         assert data["few_shot_distillation"]["reason"] == "guardrail_blocked"
         assert data["feedback_closed_loop"]["guardrail_triggered"] is True
+        assert data["source_submission_id"] == "s1"
+        assert data["source_submission_filename"] == "施组一.docx"
+        assert data["source_submission_created_at"] == "2026-03-24T10:16:57+00:00"
         mock_run_closed_loop.assert_called_once()
         assert mock_run_closed_loop.call_args.kwargs["ground_truth_record_ids"]
 
