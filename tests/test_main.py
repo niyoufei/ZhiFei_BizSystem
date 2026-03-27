@@ -880,6 +880,28 @@ class TestIndexEndpoint:
         assert "2026年02月" in page
         assert "2026年03月" in page
 
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_index_prefills_create_project_name_when_project_selected_by_query(
+        self, mock_ensure, mock_load_projects, client
+    ):
+        mock_load_projects.return_value = [
+            {
+                "id": "p-dao",
+                "name": "稻香村医疗救治服务综合楼EPC工程总承包",
+                "meta": {},
+                "created_at": "2026-03-27T00:00:00+08:00",
+                "updated_at": "2026-03-27T00:00:00+08:00",
+            }
+        ]
+
+        response = client.get("/?project_id=p-dao")
+
+        assert response.status_code == 200
+        page = response.text
+        assert 'value="稻香村医疗救治服务综合楼EPC工程总承包"' in page
+        assert 'title="稻香村医疗救治服务综合楼EPC工程总承包"' in page
+
     def test_index_renders_16_dimension_weight_sliders(self, client):
         """Index page should render 16-dimension focus sliders on first paint."""
         response = client.get("/")
@@ -1956,6 +1978,41 @@ class TestProjectsEndpoints:
         assert response.status_code == 422
         data = response.json()
         assert "招标示范文本/模板" in data["detail"]
+
+    @patch("app.main._read_uploaded_file_preview_for_project_name")
+    @patch("app.main.ensure_data_dirs")
+    def test_infer_project_name_from_tender_skips_generic_cover_and_uses_real_project_title(
+        self,
+        mock_ensure,
+        mock_preview_reader,
+        client,
+    ):
+        mock_preview_reader.return_value = """
+[PAGE:1]
+房建市政工程总承包招标示范文本（2023年版）
+合肥市房屋建筑和市政基础设施工程总承包
+招标文件示范文本
+[PAGE:2]
+稻香村医疗救治服务综合楼EPC工程总承包
+招标文件
+[PAGE:5]
+1.1 项目名称：稻香村医疗救治服务综合楼EPC工程总承包
+"""
+
+        response = client.post(
+            "/api/v1/projects/infer_name_from_tender",
+            files={
+                "file": (
+                    "招标文件.pdf",
+                    b"fake-pdf",
+                    "application/pdf",
+                )
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["inferred_name"] == "稻香村医疗救治服务综合楼EPC工程总承包"
 
     @patch("app.main.upload_material")
     @patch("app.main.save_projects")

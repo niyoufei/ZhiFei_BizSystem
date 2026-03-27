@@ -2658,6 +2658,8 @@ _GENERIC_PROJECT_NAME_KEYWORDS = (
     "标准文件",
     "范本",
     "模板",
+    "房屋建筑和市政基础设施工程总承包",
+    "招标文件示范文本",
 )
 _GENERIC_PROJECT_NAME_EXACT = {
     "招标文件",
@@ -2667,6 +2669,7 @@ _GENERIC_PROJECT_NAME_EXACT = {
     "房建市政工程总承包招标示范文本",
     "房建市政工程总承包招标示范文本〈2023年版〉",
     "房建市政工程总承包招标示范文本（2023年版）",
+    "合肥市房屋建筑和市政基础设施工程总承包",
 }
 
 
@@ -17494,7 +17497,7 @@ def _read_uploaded_file_preview_for_project_name(content: bytes, filename: str) 
         return f"[DOC资料] 文件: {filename}（当前环境未启用结构化解析，已纳入文件元信息）"
     if name.endswith(".pdf"):
         return _extract_pdf_text_preview(
-            content, filename, max_pages=4, max_chars=14000, ocr_pages=1
+            content, filename, max_pages=6, max_chars=22000, ocr_pages=2
         )
     if name.endswith(".xlsx") or name.endswith(".xls") or name.endswith(".xlsm"):
         return _read_uploaded_file_content(content, filename)[:12000]
@@ -23645,6 +23648,14 @@ def index(
     project_options_html = "".join(project_options)
     project_search_options_html = "".join(project_search_options)
     project_month_options_html = "".join(project_month_options)
+    initial_create_project_name = ""
+    if project_id:
+        selected_project = next(
+            (project for project in projects if str(project.get("id", "")) == str(project_id)),
+            None,
+        )
+        if isinstance(selected_project, dict):
+            initial_create_project_name = str(selected_project.get("name") or "").strip()
     create_notice_html = ""
     if create_ok:
         create_notice_html = (
@@ -24249,7 +24260,7 @@ def index(
         <h2>1) 创建项目</h2>
         <form id="createProject" method="post" action="/web/create_project" class="create-project-form">
           <input type="hidden" name="api_key" id="createProjectApiKey" value="" />
-          <span class="field-label">项目名称：</span><input id="createProjectNameInput" class="project-name-input primary-input" name="name" placeholder="例如：XX标段施组评审" autocomplete="off" />
+          <span class="field-label">项目名称：</span><input id="createProjectNameInput" class="project-name-input primary-input" name="name" placeholder="例如：XX标段施组评审" autocomplete="off" value="__CREATE_PROJECT_NAME_VALUE__" title="__CREATE_PROJECT_NAME_VALUE__" />
           <button type="submit" id="btnCreateProject">创建</button>
         </form>
         <form id="createProjectFromTender" method="post" action="/web/create_project_from_tender" enctype="multipart/form-data" class="inline-form" style="margin-top:10px;gap:8px;flex-wrap:wrap">
@@ -32616,6 +32627,9 @@ def index(
     html = html.replace("__PROJECT_SEARCH_OPTIONS__", project_search_options_html)
     html = html.replace("__CREATE_NOTICE_HTML__", create_notice_html)
     html = html.replace("__GLOBAL_NOTICE_HTML__", global_notice_html)
+    html = html.replace(
+        "__CREATE_PROJECT_NAME_VALUE__", html_lib.escape(initial_create_project_name)
+    )
     html = html.replace(
         "__INITIAL_CREATE_ERROR__", "true" if bool(create_error and not project_id) else "false"
     )
