@@ -1191,10 +1191,14 @@ class TestIndexEndpoint:
             "const createProjectFromTenderFileInput = document.getElementById('createProjectFromTenderFile');"
             in page
         )
+        assert "function currentSelectedProjectDisplayName()" in page
+        assert "async function ensureTenderCreateUsesRecognizedProject(inferredName)" in page
+        assert "await ensureTenderCreateUsesRecognizedProject(inferredName);" in page
         assert "createProjectFromTenderFileInput.addEventListener('change', async () => {" in page
         assert (
             "await inferProjectNameFromTenderSelection(createProjectFromTenderFileInput);" in page
         )
+        assert "旧项目已暂时隐藏，避免混淆。" in page
 
 
 class TestWebCreateProjectFallback:

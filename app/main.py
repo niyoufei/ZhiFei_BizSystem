@@ -27530,6 +27530,27 @@ def index(
             emptySelectionMessage: '已切换到新项目录入界面，历史项目已保留并隐藏。',
           });
         }
+        function currentSelectedProjectDisplayName() {
+          const sel = document.getElementById('projectSelect');
+          if (!sel || !sel.options || sel.selectedIndex < 0) return '';
+          const opt = sel.options[sel.selectedIndex];
+          if (!opt) return '';
+          return String(opt.dataset.projectName || opt.textContent || '').trim();
+        }
+        async function ensureTenderCreateUsesRecognizedProject(inferredName) {
+          const recognizedName = String(inferredName || '').trim();
+          if (!recognizedName) return;
+          if (projectIntakeModeEnabled() && !selectedProjectIdStrict()) return;
+          const currentName = currentSelectedProjectDisplayName();
+          if (currentName && currentName === recognizedName) return;
+          await enterProjectIntakeMode(
+            '已自动识别项目名称：' + recognizedName + '。可直接点“自动创建”或“创建”。',
+            {
+              emptySelectionMessage:
+                '已识别项目名称，待点击“自动创建”或“创建”；旧项目已暂时隐藏，避免混淆。',
+            }
+          );
+        }
         async function renameCurrentProject() {
           const projectId = selectedProjectIdStrict() || pid();
           if (!projectId) {
@@ -27827,6 +27848,7 @@ def index(
             nameInput.title = inferredName;
           }
           syncCreateProjectNameOverride();
+          await ensureTenderCreateUsesRecognizedProject(inferredName);
           if (!silent) {
             setCreateMsg('已识别项目名称：' + inferredName + '。可直接点“创建”或“自动创建”。', false);
           }
