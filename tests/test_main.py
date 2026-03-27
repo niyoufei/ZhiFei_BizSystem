@@ -697,6 +697,8 @@ class TestIndexEndpoint:
         assert 'class="project-search-input primary-input"' in page
         assert 'id="projectSelect" class="project-select-input wide-select"' in page
         assert 'id="currentProjectTag" class="current-project-text"' in page
+        assert 'id="renameProjectNameInput"' in page
+        assert 'id="btnRenameProject"' in page
         assert 'id="btnSelectProjectBySearch"' in page
         assert 'id="projectListMeta"' in page
         assert 'data-project-name="恢复项目_p1"' in page
@@ -805,9 +807,11 @@ class TestIndexEndpoint:
         assert 'id="projectMonthFilter"' in page
         assert "async function startNewProjectIntake()" in page
         assert "async function enterProjectIntakeMode(message, options=null)" in page
+        assert "async function renameCurrentProject()" in page
         assert "const intakeMode = allowEmptySelection || projectIntakeModeEnabled();" in page
         assert "function projectIsSystemGenerated(project)" in page
         assert "function buildProjectPickerView(projects)" in page
+        assert "setRenameProjectMessage('项目名称已更新：" in page
         assert (
             "safeChange('projectMonthFilter', () => refreshProjects(selectedProjectIdStrict() || ''));"
             in page
@@ -901,6 +905,8 @@ class TestIndexEndpoint:
         assert 'action="/web/delete_project"' in response.text
         assert 'id="createProjectFromTender"' in response.text
         assert 'action="/web/create_project_from_tender"' in response.text
+        assert 'id="renameProjectNameInput"' in response.text
+        assert 'id="btnRenameProject"' in response.text
         assert 'action="/web/upload_materials"' in response.text
         assert 'action="/web/upload_shigong"' in response.text
         assert 'id="scoreScaleSelect" class="compact-select"' in response.text
@@ -1664,6 +1670,55 @@ class TestProjectsEndpoints:
         assert mock_save.call_count == 2
         repaired_projects = mock_save.call_args_list[0].args[0]
         assert repaired_projects[0]["name"] == "恢复项目_legacy-p"
+
+    @patch("app.main.save_projects")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_rename_project_success(self, mock_ensure, mock_load, mock_save, client):
+        mock_load.return_value = [
+            {
+                "id": "p1",
+                "name": "房建市政工程总承包招标示范文本〈2023年版〉",
+                "meta": {},
+                "created_at": "2026-03-26T00:00:00+00:00",
+                "updated_at": "2026-03-26T00:00:00+00:00",
+            }
+        ]
+
+        response = client.put(
+            "/api/v1/projects/p1", json={"name": "包河区档案馆提升改造项目施工总承包"}
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["id"] == "p1"
+        assert data["name"] == "包河区档案馆提升改造项目施工总承包"
+        mock_save.assert_called_once()
+
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_rename_project_rejects_duplicate_name(self, mock_ensure, mock_load, client):
+        mock_load.return_value = [
+            {
+                "id": "p1",
+                "name": "项目一",
+                "meta": {},
+                "created_at": "2026-03-26T00:00:00+00:00",
+                "updated_at": "2026-03-26T00:00:00+00:00",
+            },
+            {
+                "id": "p2",
+                "name": "项目二",
+                "meta": {},
+                "created_at": "2026-03-26T00:00:00+00:00",
+                "updated_at": "2026-03-26T00:00:00+00:00",
+            },
+        ]
+
+        response = client.put("/api/v1/projects/p1", json={"name": "项目二"})
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == "项目名称已存在，请更换名称"
 
     @patch("app.main.upload_material")
     @patch("app.main.save_projects")

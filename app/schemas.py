@@ -228,6 +228,12 @@ class ProjectCreate(BaseModel):
     }
 
 
+class ProjectRename(BaseModel):
+    """项目改名请求"""
+
+    name: str = Field(..., description="新的项目名称")
+
+
 class ProjectRecord(BaseModel):
     """项目记录"""
 

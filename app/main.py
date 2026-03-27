@@ -233,6 +233,7 @@ from app.schemas import (
     ProjectMeceAuditResponse,
     ProjectPreScoreListResponse,
     ProjectRecord,
+    ProjectRename,
     ProjectRequirementRecord,
     ProjectScoreHistory,
     ProjectScoringDiagnosticResponse,
@@ -2594,6 +2595,26 @@ def _build_project_record(name: str, meta: Optional[Dict[str, Any]] = None) -> D
     }
     _ensure_project_v2_fields(record)
     return record
+
+
+def _rename_project_record(
+    projects: List[Dict[str, object]],
+    project_id: str,
+    *,
+    new_name: object,
+) -> Dict[str, object]:
+    project = _find_project(project_id, projects)
+    clean_name = _normalize_project_name_key(new_name)
+    if not clean_name:
+        raise HTTPException(status_code=422, detail="项目名称不能为空")
+    existing = _find_project_by_name(projects, clean_name)
+    if existing is not None and str(existing.get("id") or "") != str(project.get("id") or ""):
+        raise HTTPException(status_code=422, detail="项目名称已存在，请更换名称")
+    if str(project.get("name") or "") != clean_name:
+        project["name"] = clean_name
+        project["updated_at"] = _now_iso()
+    _ensure_project_v2_fields(project)
+    return project
 
 
 def _resolve_project_learning_min_samples(project: Optional[Dict[str, object]]) -> int:
@@ -13600,6 +13621,29 @@ def list_projects() -> list[ProjectRecord]:
     return [ProjectRecord(**p) for p in projects]
 
 
+@router.put(
+    "/projects/{project_id}",
+    response_model=ProjectRecord,
+    tags=["项目管理"],
+    responses={**RESPONSES_401, **RESPONSES_404, **RESPONSES_422},
+)
+def rename_project(
+    project_id: str,
+    payload: ProjectRename,
+    api_key: Optional[str] = Depends(verify_api_key),
+    locale: str = Depends(get_locale),
+) -> ProjectRecord:
+    """修正已有项目名称。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    for project in projects:
+        if isinstance(project, dict):
+            _ensure_project_v2_fields(project)
+    project = _rename_project_record(projects, project_id, new_name=payload.name)
+    save_projects(projects)
+    return ProjectRecord(**project)
+
+
 @router.get(
     "/projects/{project_id}/expert-profile",
     response_model=ProjectExpertProfileResponse,
@@ -24257,6 +24301,18 @@ def index(
         </div>
         <p id="projectListMeta" style="margin:8px 0 0 0;font-size:12px;color:#64748b"></p>
         <p id="currentProjectTag" class="current-project-text" style="margin:6px 0 0 0"></p>
+        <div class="toolbar" style="margin-top:8px;gap:8px">
+          <span class="field-label tight">纠正项目名：</span>
+          <input
+            type="text"
+            id="renameProjectNameInput"
+            class="project-name-input primary-input"
+            placeholder="为当前项目填写正确项目名称"
+            autocomplete="off"
+          />
+          <button type="button" id="btnRenameProject" class="secondary">保存项目名</button>
+        </div>
+        <p id="renameProjectMessage" style="margin:6px 0 0 0;font-size:12px;color:#64748b;min-height:1.2em">用于修正误识别项目名；不会删除资料、施组、真实评标或学习结果。</p>
         <details class="compact-hidden" style="margin-top:8px">
           <summary style="cursor:pointer;color:#334155;font-size:13px">高级工具（系统诊断 / 评分体系 / 分析包）</summary>
           <div class="toolbar" style="margin-top:8px">
@@ -26165,6 +26221,7 @@ def index(
           'deleteCurrentProject', 'btnWeightsReset', 'btnWeightsSave', 'btnWeightsApply',
           'btnMaterialDepthReport', 'btnMaterialDepthReportDownload', 'btnMaterialKnowledgeProfile', 'btnMaterialKnowledgeProfileDownload',
           'btnScoringDiagnostic', 'btnOptimizationReport',
+          'btnRenameProject',
           'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
           'btnEvolve', 'btnEvolutionHealth', 'btnFeedbackGovernance', 'btnWritingGuidance', 'btnCompilationInstructions',
           'btnRebuildDelta', 'btnRebuildSamples', 'btnTrainCalibratorV2', 'btnApplyCalibPredict',
@@ -26183,6 +26240,7 @@ def index(
           'btnMinePatchV2', 'btnShadowPatchV2', 'btnDeployPatchV2', 'btnRollbackPatchV2',
         ];
         const PROJECT_REQUIRED_INPUT_IDS = [
+          'renameProjectNameInput',
           'scoreScaleSelect',
           'feedFile', 'groundTruthSubmissionSelect', 'groundTruthScope', 'groundTruthOtherProject',
           'gtJudgeCount', 'gtJ1', 'gtJ2', 'gtJ3', 'gtJ4', 'gtJ5', 'gtJ6', 'gtJ7', 'gtFinal', 'patchType', 'patchIdInput',
@@ -26344,9 +26402,31 @@ def index(
           meta.textContent = '当前显示 ' + visibleCount + ' / ' + totalCount + ' 个项目。'
             + (suffix.length ? (' ' + suffix.join('；') + '。') : ' 项目较多时，可输入名称快速定位。');
         }
+        function setRenameProjectMessage(msg, isError=false) {
+          const el = document.getElementById('renameProjectMessage');
+          if (!el) return;
+          el.textContent = msg || '';
+          el.style.color = isError ? '#b91c1c' : '#64748b';
+        }
+        function syncRenameProjectInput(projectId) {
+          const input = document.getElementById('renameProjectNameInput');
+          if (!input) return;
+          if (!projectId) {
+            input.value = '';
+            input.title = '';
+            setRenameProjectMessage('用于修正误识别项目名；不会删除资料、施组、真实评标或学习结果。', false);
+            return;
+          }
+          const matched = projectListCache.find((project) => String((project && project.id) || '') === String(projectId));
+          const label = matched ? projectDisplayName(matched) : '';
+          input.value = label;
+          input.title = label;
+          setRenameProjectMessage('可在此纠正当前项目名称；不会删除资料、施组、真实评标或学习结果。', false);
+        }
         function updateCurrentProjectTag(projectId) {
           const tag = document.getElementById('currentProjectTag');
           syncProjectHiddenInputs(projectId);
+          syncRenameProjectInput(projectId);
           if (!tag) return;
           if (!projectId) {
             tag.textContent = '当前项目：未选择';
@@ -26958,6 +27038,11 @@ def index(
           if (!raw) {
             return '自动创建未完成，请检查招标文件内容，或先手动填写项目名称后再试。';
           }
+          if (raw.includes('招标示范文本/模板')) {
+            return overrideName
+              ? '自动创建未完成：当前文件更像通用模板，但上方项目名称会作为兜底名称。请直接再次点“自动创建”，或点“创建”先建项目。'
+              : '自动创建未完成：当前文件更像通用招标示范文本/模板。请先在上方填写真实项目名称，再点“自动创建”。';
+          }
           if (raw.includes('无法从招标文件中识别项目名称')) {
             return overrideName
               ? '自动创建未完成：当前文件未识别到清晰项目名，但上方项目名称会作为兜底名称。请直接再次点“自动创建”，或点“创建”先建项目。'
@@ -27434,10 +27519,63 @@ def index(
             emptySelectionMessage: '已切换到新项目录入界面，历史项目已保留并隐藏。',
           });
         }
+        async function renameCurrentProject() {
+          const projectId = selectedProjectIdStrict() || pid();
+          if (!projectId) {
+            setRenameProjectMessage('请先选择需要纠正名称的项目。', true);
+            return;
+          }
+          if (!(await ensureVerifiedApiKeyForAction('btnRenameProject', (msg) => setRenameProjectMessage(msg, true)))) return;
+          const input = document.getElementById('renameProjectNameInput');
+          const newName = String((input && input.value) || '').trim();
+          if (!newName) {
+            setRenameProjectMessage('请先填写正确的项目名称。', true);
+            return;
+          }
+          setRenameProjectMessage('正在保存项目名称…', false);
+          let res, text;
+          try {
+            res = await fetch('/api/v1/projects/' + encodeURIComponent(projectId), {
+              method: 'PUT',
+              headers: apiHeaders(),
+              body: JSON.stringify({ name: newName }),
+            });
+            text = await res.text();
+          } catch (err) {
+            setRenameProjectMessage('保存失败：' + String((err && err.message) || err), true);
+            return;
+          }
+          const outEl = document.getElementById('output');
+          if (outEl) outEl.textContent = text;
+          let payload = {};
+          try { payload = JSON.parse(text || '{}'); } catch (_) {}
+          if (!res.ok) {
+            setRenameProjectMessage(
+              '保存失败：' + String((payload && payload.detail) || text || ('HTTP ' + res.status)).slice(0, 120),
+              true
+            );
+            return;
+          }
+          const updatedName = String((payload && payload.name) || newName).trim();
+          if (input) {
+            input.value = updatedName;
+            input.title = updatedName;
+          }
+          const createNameInput = document.getElementById('createProjectNameInput');
+          if (createNameInput) {
+            createNameInput.value = updatedName;
+            createNameInput.title = updatedName;
+          }
+          syncCreateProjectNameOverride();
+          setRenameProjectMessage('项目名称已更新：' + updatedName, false);
+          setSelectMsg('已修正当前项目名称：' + updatedName, false);
+          await refreshProjects(projectId);
+        }
         const elRefresh = document.getElementById('refreshProjects');
         if (elRefresh) elRefresh.onclick = refreshProjects;
         const btnStartNewProject = document.getElementById('btnStartNewProject');
         if (btnStartNewProject) btnStartNewProject.onclick = startNewProjectIntake;
+        safeClick('btnRenameProject', renameCurrentProject);
         safeChange('projectMonthFilter', () => refreshProjects(selectedProjectIdStrict() || ''));
         safeChange('projectSelect', onProjectChanged);
         safeClick('btnSelectProjectBySearch', locateProjectBySearch);
