@@ -59,6 +59,23 @@ set +e
 APP_DIR="$ROOT_DIR" PORT="$PORT" PY_BIN="$PY_BIN" launchctl submit -l "$LABEL" -- /bin/sh "$RUNNER" 2>"$submit_err_file"
 submit_status=$?
 set -e
+
+write_mode_file() {
+  local mode="$1"
+  local reason="$2"
+  {
+    echo "mode=$mode"
+    echo "label=$LABEL"
+    echo "port=$PORT"
+    echo "updated_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    echo "reason=$reason"
+  } > "$MODE_FILE"
+}
+
+launchd_entry_present() {
+  launchctl list | grep -Fq "$LABEL"
+}
+
 if [[ "$submit_status" -ne 0 ]]; then
   echo "launchctl submit failed (status=$submit_status)."
   sed -n '1,40p' "$submit_err_file" || true
@@ -68,13 +85,7 @@ if [[ "$submit_status" -ne 0 ]]; then
       echo "fallback: using regular background restart (launchctl submit failed)."
       launchctl remove "$LABEL" >/dev/null 2>&1 || true
       PORT="$PORT" ./scripts/restart_server.sh
-      {
-        echo "mode=fallback"
-        echo "label=$LABEL"
-        echo "port=$PORT"
-        echo "updated_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-        echo "reason=launchctl_submit_failed"
-      } > "$MODE_FILE"
+      write_mode_file "fallback" "launchctl_submit_failed"
       exit 0
       ;;
   esac
@@ -84,16 +95,16 @@ rm -f "$submit_err_file"
 
 for _ in $(seq 1 30); do
   if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
-    echo "launchd service started: $LABEL"
-    echo "URL: http://127.0.0.1:${PORT}/"
-    echo "Log: $LOG_FILE"
-    {
-      echo "mode=launchd"
-      echo "label=$LABEL"
-      echo "port=$PORT"
-      echo "updated_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-      echo "reason="
-    } > "$MODE_FILE"
+    if launchd_entry_present; then
+      echo "launchd service started: $LABEL"
+      echo "URL: http://127.0.0.1:${PORT}/"
+      echo "Log: $LOG_FILE"
+      write_mode_file "launchd" ""
+      exit 0
+    fi
+    echo "launchd health passed, but launchd entry is not visible: $LABEL"
+    echo "marking daemon mode as fallback to preserve accurate auto-heal semantics."
+    write_mode_file "fallback" "launchd_entry_missing"
     exit 0
   fi
   sleep 0.5
@@ -119,13 +130,7 @@ if [[ "$launch_status" == "126" || "$launch_status" == "1" ]]; then
       echo "fallback: using regular background restart (non-launchd daemon mode)."
       launchctl remove "$LABEL" >/dev/null 2>&1 || true
       PORT="$PORT" ./scripts/restart_server.sh
-      {
-        echo "mode=fallback"
-        echo "label=$LABEL"
-        echo "port=$PORT"
-        echo "updated_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-        echo "reason=launchd_workspace_permission_blocked"
-      } > "$MODE_FILE"
+      write_mode_file "fallback" "launchd_workspace_permission_blocked"
       exit 0
       ;;
   esac

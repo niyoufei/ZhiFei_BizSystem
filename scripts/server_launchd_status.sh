@@ -32,11 +32,31 @@ else
   reason=""
 fi
 
+write_mode_file() {
+  local next_mode="$1"
+  local next_reason="$2"
+  {
+    echo "mode=$next_mode"
+    echo "label=$LABEL"
+    echo "port=$PORT"
+    echo "updated_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    echo "reason=$next_reason"
+  } > "$MODE_FILE"
+}
+
 PORT="$PORT" ./scripts/server_status.sh
 
 health_ok=0
 if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
   health_ok=1
+fi
+
+if [[ "$mode" == "launchd" && -z "$entry" ]]; then
+  echo "note: daemon mode claims launchd, but no launchd entry is currently visible."
+  echo "note: downgrade daemon mode to fallback so status and auto-heal stay truthful."
+  mode="fallback"
+  reason="launchd_entry_missing"
+  write_mode_file "$mode" "$reason"
 fi
 
 if [[ "$mode" == "fallback" ]]; then
