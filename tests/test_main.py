@@ -1211,6 +1211,10 @@ class TestIndexEndpoint:
         assert "function applyMaterialParseZoneState" in page
         assert "function scheduleMaterialParsePolling" in page
         assert "function scheduleProjectAutoRefresh" in page
+        assert "materialsParseSummary" in page
+        assert "function setMaterialParseSummary" in page
+        assert "function renderMaterialParseSummary" in page
+        assert "latest_finished_at" in page
         assert "parse_stage_label" in page
         assert "parse_route_label" in page
         assert "queue_position" in page
@@ -3120,7 +3124,18 @@ class TestMaterialsEndpoint:
                 "status": "processing",
                 "parse_backend": "gpt-5.4-vision",
                 "attempt": 1,
-            }
+            },
+            {
+                "id": "j0",
+                "material_id": "m0",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.xlsx",
+                "status": "parsed",
+                "parse_backend": "local",
+                "attempt": 1,
+                "finished_at": "2026-03-09T00:02:03+00:00",
+            },
         ]
 
         response = client.get("/api/v1/projects/p1/materials/parse_status")
@@ -3131,6 +3146,8 @@ class TestMaterialsEndpoint:
         assert data["summary"]["queued_materials"] == 1
         assert data["summary"]["worker_count"] == 2
         assert data["summary"]["backlog"] == 1
+        assert data["summary"]["latest_finished_at"] == "2026-03-09T00:02:03+00:00"
+        assert data["summary"]["latest_finished_filename"] == "工程量清单.xlsx"
         assert data["jobs"][0]["status"] == "processing"
         assert data["materials"][0]["parse_backend"] == "queued"
         assert data["materials"][0]["parse_effective_status"] == "processing"

@@ -990,6 +990,8 @@ def _build_material_parse_jobs_summary(
     failure_count = 0
     gpt_jobs = 0
     gpt_failed_jobs = 0
+    latest_finished_at = ""
+    latest_finished_filename = ""
     for job in jobs:
         normalized, _ = _normalize_material_parse_job(job)
         if project_id and str(normalized.get("project_id") or "") != str(project_id):
@@ -1005,6 +1007,10 @@ def _build_material_parse_jobs_summary(
             gpt_jobs += 1
             if status == "failed":
                 gpt_failed_jobs += 1
+        finished_at = str(normalized.get("finished_at") or "").strip()
+        if finished_at and finished_at > latest_finished_at:
+            latest_finished_at = finished_at
+            latest_finished_filename = str(normalized.get("filename") or "").strip()
     total_jobs = len(filtered)
     return filtered, {
         "total_jobs": total_jobs,
@@ -1014,6 +1020,8 @@ def _build_material_parse_jobs_summary(
         "gpt_jobs": gpt_jobs,
         "gpt_failed_jobs": gpt_failed_jobs,
         "gpt_ratio": round(float(gpt_jobs) / float(total_jobs), 4) if total_jobs > 0 else 0.0,
+        "latest_finished_at": latest_finished_at or None,
+        "latest_finished_filename": latest_finished_filename or None,
     }
 
 
@@ -24789,6 +24797,7 @@ def index(
           <button type="button" id="btnMaterialKnowledgeProfile" class="secondary compact-hidden" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialKnowledgeProfile')">知识画像</button>
           <button type="button" id="btnMaterialKnowledgeProfileDownload" class="secondary compact-hidden" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialKnowledgeProfileDownload')">下载知识画像(.md)</button>
         </div>
+        <p id="materialsParseSummary" style="font-size:13px;color:#64748b;margin:0 0 8px 0">待机：请先选择项目。</p>
         <table id="materialsTable"><thead><tr><th>资料类型</th><th>文件名</th><th>解析状态</th><th>上传时间</th><th>操作</th></tr></thead><tbody>__MATERIAL_ROWS__</tbody></table>
         <p id="materialsEmpty" style="font-size:13px;color:#64748b;margin:6px 0 0 0;display:__MATERIALS_EMPTY_DISPLAY__">暂无资料，请下方添加。</p>
         <div id="materialDepthReportResult" class="result-block" style="display:none"></div>
@@ -25632,6 +25641,9 @@ def index(
                 emptyEl.textContent = '资料列表加载失败，请稍后重试。';
                 emptyEl.style.display = 'block';
               }
+              if (typeof setMaterialParseSummary === 'function') {
+                setMaterialParseSummary('资料解析概览加载失败，请稍后重试。', '#991b1b');
+              }
               return;
             }
             const rows = Array.isArray(payload && payload.materials) ? payload.materials : [];
@@ -25641,6 +25653,12 @@ def index(
                 emptyEl.textContent = '资料列表加载失败（HTTP ' + String((res && res.status) || 0) + '）';
                 emptyEl.style.display = 'block';
               }
+              if (typeof setMaterialParseSummary === 'function') {
+                setMaterialParseSummary(
+                  '资料解析概览加载失败（HTTP ' + String((res && res.status) || 0) + '）。',
+                  '#991b1b'
+                );
+              }
               return;
             }
             if (!rows.length) {
@@ -25648,10 +25666,16 @@ def index(
                 emptyEl.textContent = '暂无资料，请下方添加。';
                 emptyEl.style.display = 'block';
               }
+              if (typeof renderMaterialParseSummary === 'function') {
+                renderMaterialParseSummary(summary, []);
+              }
               if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState([], summary);
               return;
             }
             if (emptyEl) emptyEl.style.display = 'none';
+            if (typeof renderMaterialParseSummary === 'function') {
+              renderMaterialParseSummary(rows && summary ? summary : {}, rows);
+            }
             if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState(rows, summary);
             rows.forEach((m) => {
               const tr = document.createElement('tr');
@@ -27011,6 +27035,70 @@ def index(
           if (raw === 'hybrid') return '混合解析';
           return raw;
         }
+        function setMaterialParseSummary(text, tone='#64748b') {
+          const el = document.getElementById('materialsParseSummary');
+          if (!el) return;
+          el.textContent = String(text || '').trim();
+          el.style.color = tone || '#64748b';
+        }
+        function formatMaterialParseTimestamp(value) {
+          const raw = String(value || '').trim();
+          if (!raw) return '';
+          return raw.slice(0, 19).replace('T', ' ');
+        }
+        function renderMaterialParseSummary(summary, materials) {
+          const meta = (summary && typeof summary === 'object') ? summary : {};
+          const rows = Array.isArray(materials) ? materials : [];
+          const total = Number(meta.materials_total || rows.length || 0);
+          const parsed = Number(meta.parsed_materials || 0);
+          const processing = Number(meta.processing_materials || 0);
+          const queued = Number(meta.queued_materials || 0);
+          const failed = Number(meta.failed_materials || 0);
+          const backlog = Number(meta.backlog || (processing + queued) || 0);
+          const workerCount = Number(meta.worker_count || 0);
+          const aliveWorkerCount = Number(meta.alive_worker_count || 0);
+          const latestFinishedAt = formatMaterialParseTimestamp(meta.latest_finished_at);
+          const latestFinishedFilename = String(meta.latest_finished_filename || '').trim();
+          const activeRoutes = [];
+          rows.forEach((row) => {
+            if (!row || typeof row !== 'object') return;
+            const status = String(row.parse_effective_status || row.parse_status || 'queued').trim().toLowerCase();
+            if (status !== 'queued' && status !== 'processing') return;
+            const routeLabel = String(row.parse_route_label || '').trim();
+            if (routeLabel && !activeRoutes.includes(routeLabel)) activeRoutes.push(routeLabel);
+          });
+          if (!total) {
+            setMaterialParseSummary('当前解析概览：暂无资料。');
+            return;
+          }
+          let tone = '#166534';
+          if (processing > 0) tone = '#92400e';
+          else if (queued > 0) tone = '#475569';
+          else if (failed > 0) tone = '#9a3412';
+          const parts = [
+            '当前解析概览：共 ' + String(total) + ' 份',
+            '已解析 ' + String(parsed) + ' 份',
+            '解析中 ' + String(processing) + ' 份',
+            '排队 ' + String(queued) + ' 份',
+            '失败 ' + String(failed) + ' 份',
+          ];
+          if (workerCount > 0) {
+            parts.push('worker ' + String(aliveWorkerCount) + '/' + String(workerCount));
+          }
+          if (backlog > 0) {
+            parts.push('队列积压 ' + String(backlog) + ' 份');
+          }
+          let summaryText = parts.join('；') + '。';
+          if (latestFinishedAt) {
+            summaryText += ' 最近完成：'
+              + (latestFinishedFilename ? (latestFinishedFilename + ' / ') : '')
+              + latestFinishedAt + '。';
+          }
+          if (activeRoutes.length) {
+            summaryText += ' 当前路径：' + activeRoutes.slice(0, 2).join('、') + '。';
+          }
+          setMaterialParseSummary(summaryText, tone);
+        }
         function materialParseStatusMeta(material) {
           const row = (material && typeof material === 'object') ? material : {};
           const status = String(row.parse_effective_status || row.parse_status || 'queued').trim().toLowerCase();
@@ -27185,6 +27273,9 @@ def index(
             'materialsTable',
             'materialsEmpty',
             hasProject ? '待机：正在加载当前项目资料…' : '暂无资料，请先选择项目。'
+          );
+          setMaterialParseSummary(
+            hasProject ? '待机：正在加载当前项目资料解析概览…' : '待机：请先选择项目。'
           );
           setTableStandby(
             'submissionsTable',
@@ -29266,6 +29357,7 @@ def index(
               emptyEl.textContent = '暂无资料，请先选择项目。';
               emptyEl.style.display = 'block';
             }
+            setMaterialParseSummary('待机：请先选择项目。');
             if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState([], {});
             if (typeof clearScoringReadinessPanel === 'function') clearScoringReadinessPanel();
             if (typeof clearScoringDiagnosticPanel === 'function') clearScoringDiagnosticPanel();
@@ -29281,6 +29373,7 @@ def index(
               emptyEl.textContent = '资料列表加载失败，请稍后重试。';
               emptyEl.style.display = 'block';
             }
+            setMaterialParseSummary('资料解析概览加载失败，请稍后重试。', '#991b1b');
             return;
           }
           if (isStaleProjectResponse(id, switchSeq)) return;
@@ -29292,6 +29385,7 @@ def index(
               emptyEl.textContent = '资料列表加载失败（HTTP ' + String(res.status || 0) + '）';
               emptyEl.style.display = 'block';
             }
+            setMaterialParseSummary('资料解析概览加载失败（HTTP ' + String(res.status || 0) + '）。', '#991b1b');
             if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState([], {});
             if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             return;
@@ -29302,12 +29396,14 @@ def index(
               emptyEl.textContent = '暂无资料，请下方添加。';
               emptyEl.style.display = 'block';
             }
+            renderMaterialParseSummary(summary, []);
             if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState([], summary);
             scheduleMaterialParsePolling(id, summary, switchSeq);
             if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             return;
           }
           if (emptyEl) emptyEl.style.display = 'none';
+          renderMaterialParseSummary(summary, mats);
           if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState(mats, summary);
           if (tbody) tbody.innerHTML = '';
           mats.forEach(m => {
