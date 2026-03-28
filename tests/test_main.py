@@ -161,6 +161,42 @@ class TestVersionedJsonHistoryRoutes:
 
 
 class TestMaterialParseWorkerLifecycle:
+    @patch("app.main._bootstrap_material_parse_state")
+    @patch("app.main.threading.Thread")
+    def test_start_material_parse_worker_starts_worker_pool(
+        self,
+        mock_thread_cls,
+        mock_bootstrap_state,
+    ):
+        from app import main as main_module
+
+        original_worker = main_module._MATERIAL_PARSE_WORKER
+        original_workers = list(main_module._MATERIAL_PARSE_WORKERS)
+        original_event_state = main_module._MATERIAL_PARSE_STOP_EVENT.is_set()
+        worker_pool = [
+            MagicMock(name=f"worker-{idx}")
+            for idx in range(main_module.DEFAULT_MATERIAL_PARSE_WORKER_COUNT)
+        ]
+        mock_thread_cls.side_effect = worker_pool
+        main_module._MATERIAL_PARSE_WORKER = None
+        main_module._MATERIAL_PARSE_WORKERS = []
+        try:
+            main_module._start_material_parse_worker()
+
+            assert mock_thread_cls.call_count == main_module.DEFAULT_MATERIAL_PARSE_WORKER_COUNT
+            for worker in worker_pool:
+                worker.start.assert_called_once()
+            mock_bootstrap_state.assert_called_once()
+            assert main_module._MATERIAL_PARSE_WORKER is worker_pool[0]
+            assert main_module._MATERIAL_PARSE_WORKERS == worker_pool
+        finally:
+            main_module._MATERIAL_PARSE_WORKER = original_worker
+            main_module._MATERIAL_PARSE_WORKERS = original_workers
+            if original_event_state:
+                main_module._MATERIAL_PARSE_STOP_EVENT.set()
+            else:
+                main_module._MATERIAL_PARSE_STOP_EVENT.clear()
+
     @patch("app.main.logger.warning")
     @patch("app.main.threading.Thread")
     def test_stop_timeout_keeps_worker_reference_to_avoid_duplicate_worker(
@@ -171,10 +207,12 @@ class TestMaterialParseWorkerLifecycle:
         from app import main as main_module
 
         worker = MagicMock()
-        worker.is_alive.side_effect = [True, True, True]
+        worker.is_alive.return_value = True
         original_worker = main_module._MATERIAL_PARSE_WORKER
+        original_workers = list(main_module._MATERIAL_PARSE_WORKERS)
         original_event_state = main_module._MATERIAL_PARSE_STOP_EVENT.is_set()
         main_module._MATERIAL_PARSE_WORKER = worker
+        main_module._MATERIAL_PARSE_WORKERS = [worker]
         try:
             main_module._stop_material_parse_worker()
             assert main_module._MATERIAL_PARSE_WORKER is worker
@@ -187,10 +225,73 @@ class TestMaterialParseWorkerLifecycle:
             assert main_module._MATERIAL_PARSE_WORKER is worker
         finally:
             main_module._MATERIAL_PARSE_WORKER = original_worker
+            main_module._MATERIAL_PARSE_WORKERS = original_workers
             if original_event_state:
                 main_module._MATERIAL_PARSE_STOP_EVENT.set()
             else:
                 main_module._MATERIAL_PARSE_STOP_EVENT.clear()
+
+
+class TestMaterialParsePerformanceGuards:
+    @patch("app.main._call_gpt_material_parser")
+    @patch("app.main._render_pdf_page_pngs_for_gpt")
+    def test_augment_tender_summary_skips_gpt_when_local_summary_is_strong(
+        self,
+        mock_render_pages,
+        mock_call_gpt,
+    ):
+        local_summary = {
+            "structured_quality_score": 0.83,
+            "section_titles": [
+                "第一章 招标公告",
+                "第二章 投标人须知",
+                "第三章 评标办法",
+                "第四章 合同",
+            ],
+            "scoring_point_terms": ["工期", "质量", "安全文明"],
+            "mandatory_clause_terms": ["否决投标", "资格条件"],
+            "top_numeric_terms": ["90", "100", "15", "48", "3"],
+        }
+        parsed_text = "项目名称 工期 质量 安全文明 " * 240
+
+        with patch("app.main.get_openai_api_key", return_value="sk-test"):
+            merged, backend, confidence, error = app_main._augment_tender_summary_with_gpt(
+                b"%PDF-1.4",
+                "招标文件正文.pdf",
+                parsed_text,
+                local_summary,
+            )
+
+        assert backend == "local"
+        assert error == ""
+        assert confidence == 0.83
+        assert merged["gpt_skip_reason"] == "local_summary_strong"
+        mock_render_pages.assert_not_called()
+        mock_call_gpt.assert_not_called()
+
+    @patch("app.main._rebuild_project_anchors_and_requirements")
+    def test_material_parse_rebuilds_are_debounced_per_project(self, mock_rebuild):
+        from app import main as main_module
+
+        original_pending = dict(main_module._MATERIAL_PARSE_PENDING_REBUILDS)
+        try:
+            main_module._MATERIAL_PARSE_PENDING_REBUILDS.clear()
+            with patch("app.main.time.monotonic", return_value=100.0):
+                main_module._schedule_project_material_rebuild("p1")
+                main_module._schedule_project_material_rebuild("p1")
+                main_module._schedule_project_material_rebuild("p2")
+            with patch("app.main.time.monotonic", return_value=103.0):
+                rebuilt = main_module._drain_due_project_material_rebuilds(limit=10)
+
+            assert rebuilt == 2
+            assert mock_rebuild.call_count == 2
+            mock_rebuild.assert_any_call("p1")
+            mock_rebuild.assert_any_call("p2")
+            assert "p1" not in main_module._MATERIAL_PARSE_PENDING_REBUILDS
+            assert "p2" not in main_module._MATERIAL_PARSE_PENDING_REBUILDS
+        finally:
+            main_module._MATERIAL_PARSE_PENDING_REBUILDS.clear()
+            main_module._MATERIAL_PARSE_PENDING_REBUILDS.update(original_pending)
 
 
 class TestSecureDesktopExportBlock:

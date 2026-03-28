@@ -450,6 +450,9 @@ DEFAULT_MATERIAL_PARSE_VERSION = "v3-gpt-async"
 DEFAULT_MATERIAL_PARSE_JOB_POLL_SECONDS = 1.0
 DEFAULT_MATERIAL_PARSE_MAX_ATTEMPTS = 3
 DEFAULT_MATERIAL_PARSE_BACKLOG_WARN = 18
+DEFAULT_MATERIAL_PARSE_WORKER_COUNT = 2
+DEFAULT_MATERIAL_PARSE_REBUILD_DEBOUNCE_SECONDS = 2.0
+DEFAULT_TENDER_GPT_FASTPATH_MIN_QUALITY = 0.72
 DEFAULT_CALIBRATION_MIN_SAMPLES = 20
 DEFAULT_CALIBRATION_FRESHNESS_DAYS = 90
 DEFAULT_CALIBRATION_MIN_RECENT_RATIO = 0.6
@@ -515,8 +518,69 @@ _MATERIAL_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
 _MATERIAL_INDEX_CACHE_ORDER: List[str] = []
 _MATERIAL_INDEX_CACHE_LOCK = threading.RLock()
 _MATERIAL_PARSE_STATE_LOCK = threading.RLock()
+_MATERIAL_PARSE_WORKER_LOCK = threading.RLock()
 _MATERIAL_PARSE_STOP_EVENT = threading.Event()
 _MATERIAL_PARSE_WORKER: Optional[threading.Thread] = None
+_MATERIAL_PARSE_WORKERS: List[threading.Thread] = []
+_MATERIAL_PARSE_PENDING_REBUILDS: Dict[str, float] = {}
+_MATERIAL_PARSE_PENDING_REBUILDS_LOCK = threading.RLock()
+
+
+class _MaterialParseWorkerHealthProbe:
+    def is_alive(self) -> bool:
+        with _MATERIAL_PARSE_WORKER_LOCK:
+            workers = _refresh_material_parse_workers_locked()
+            return any(worker.is_alive() for worker in workers)
+
+
+_MATERIAL_PARSE_WORKER_HEALTH_PROBE = _MaterialParseWorkerHealthProbe()
+
+
+def _refresh_material_parse_workers_locked() -> List[threading.Thread]:
+    global _MATERIAL_PARSE_WORKER
+    workers = [worker for worker in _MATERIAL_PARSE_WORKERS if worker and worker.is_alive()]
+    if _MATERIAL_PARSE_WORKER and _MATERIAL_PARSE_WORKER.is_alive():
+        if all(worker is not _MATERIAL_PARSE_WORKER for worker in workers):
+            workers.insert(0, _MATERIAL_PARSE_WORKER)
+    _MATERIAL_PARSE_WORKERS[:] = workers
+    _MATERIAL_PARSE_WORKER = workers[0] if workers else None
+    return list(workers)
+
+
+def _schedule_project_material_rebuild(project_id: str) -> None:
+    project_key = str(project_id or "").strip()
+    if not project_key:
+        return
+    due_at = time.monotonic() + DEFAULT_MATERIAL_PARSE_REBUILD_DEBOUNCE_SECONDS
+    with _MATERIAL_PARSE_PENDING_REBUILDS_LOCK:
+        _MATERIAL_PARSE_PENDING_REBUILDS[project_key] = due_at
+
+
+def _claim_due_project_material_rebuilds(*, limit: int = 1) -> List[str]:
+    now = time.monotonic()
+    with _MATERIAL_PARSE_PENDING_REBUILDS_LOCK:
+        due_project_ids = [
+            project_id
+            for project_id, due_at in _MATERIAL_PARSE_PENDING_REBUILDS.items()
+            if due_at <= now
+        ]
+        due_project_ids.sort()
+        claimed = due_project_ids[: max(1, int(limit))]
+        for project_id in claimed:
+            _MATERIAL_PARSE_PENDING_REBUILDS.pop(project_id, None)
+    return claimed
+
+
+def _drain_due_project_material_rebuilds(*, limit: int = 1) -> int:
+    rebuilt = 0
+    for project_id in _claim_due_project_material_rebuilds(limit=limit):
+        try:
+            _rebuild_project_anchors_and_requirements(project_id)
+        except Exception:
+            logger.exception("material parse deferred rebuild failed for project %s", project_id)
+        else:
+            rebuilt += 1
+    return rebuilt
 
 
 def _material_row_cache_token(row: Dict[str, object]) -> Dict[str, object]:
@@ -1724,6 +1788,9 @@ def _augment_tender_summary_with_gpt(
     gpt_error = ""
     parse_confidence = float(_clip_score01(local_summary.get("structured_quality_score") or 0.0))
     merged = dict(local_summary)
+    if _should_fastpath_tender_local_summary(local_summary, parsed_text=parsed_text):
+        merged["gpt_skip_reason"] = "local_summary_strong"
+        return merged, gpt_backend, round(parse_confidence, 4), gpt_error
     page_structures: List[Dict[str, object]] = []
     pages = (
         _render_pdf_page_pngs_for_gpt(content, max_pages=8)
@@ -1957,6 +2024,25 @@ def _augment_drawing_summary_with_gpt(
         4,
     )
     return merged, "hybrid", parse_confidence, ""
+
+
+def _should_fastpath_tender_local_summary(
+    local_summary: Dict[str, object],
+    *,
+    parsed_text: str,
+) -> bool:
+    quality = float(_clip_score01(local_summary.get("structured_quality_score") or 0.0))
+    section_titles = _to_text_items(local_summary.get("section_titles"), max_items=18)
+    scoring_terms = _to_text_items(local_summary.get("scoring_point_terms"), max_items=18)
+    mandatory_terms = _to_text_items(local_summary.get("mandatory_clause_terms"), max_items=18)
+    numeric_terms = _merge_numeric_values(local_summary.get("top_numeric_terms"), limit=18)
+    parsed_chars = len(str(parsed_text or "").strip())
+    return bool(
+        quality >= DEFAULT_TENDER_GPT_FASTPATH_MIN_QUALITY
+        and parsed_chars >= 2400
+        and len(section_titles) >= 4
+        and (len(scoring_terms) + len(mandatory_terms) >= 4 or len(numeric_terms) >= 5)
+    )
 
 
 def _augment_site_photo_summary_with_gpt(
@@ -2258,10 +2344,7 @@ def _complete_material_parse_job(
         save_materials(materials)
     project_id = str(updates.get("project_id") or "")
     if project_id and not failed:
-        try:
-            _rebuild_project_anchors_and_requirements(project_id)
-        except Exception:
-            pass
+        _schedule_project_material_rebuild(project_id)
 
 
 def _process_material_parse_job(job: Dict[str, object]) -> None:
@@ -2302,40 +2385,59 @@ def _material_parse_worker_loop() -> None:
     while not _MATERIAL_PARSE_STOP_EVENT.is_set():
         job = _claim_next_material_parse_job()
         if not job:
+            if _drain_due_project_material_rebuilds(limit=1) > 0:
+                continue
             _MATERIAL_PARSE_STOP_EVENT.wait(DEFAULT_MATERIAL_PARSE_JOB_POLL_SECONDS)
             continue
         _process_material_parse_job(job)
+        _drain_due_project_material_rebuilds(limit=1)
 
 
 def _start_material_parse_worker() -> None:
     global _MATERIAL_PARSE_WORKER
-    if _MATERIAL_PARSE_WORKER and _MATERIAL_PARSE_WORKER.is_alive():
-        return
-    if _MATERIAL_PARSE_WORKER and not _MATERIAL_PARSE_WORKER.is_alive():
-        _MATERIAL_PARSE_WORKER = None
-    _MATERIAL_PARSE_STOP_EVENT.clear()
-    _bootstrap_material_parse_state()
-    worker = threading.Thread(
-        target=_material_parse_worker_loop,
-        name="material-parse-worker",
-        daemon=True,
-    )
-    worker.start()
-    _MATERIAL_PARSE_WORKER = worker
+    with _MATERIAL_PARSE_WORKER_LOCK:
+        active_workers = _refresh_material_parse_workers_locked()
+        if active_workers:
+            return
+        _MATERIAL_PARSE_STOP_EVENT.clear()
+        _bootstrap_material_parse_state()
+        for index in range(DEFAULT_MATERIAL_PARSE_WORKER_COUNT):
+            worker = threading.Thread(
+                target=_material_parse_worker_loop,
+                name=f"material-parse-worker-{index + 1}",
+                daemon=True,
+            )
+            worker.start()
+            active_workers.append(worker)
+        _MATERIAL_PARSE_WORKERS[:] = active_workers
+        _MATERIAL_PARSE_WORKER = active_workers[0] if active_workers else None
 
 
 def _stop_material_parse_worker() -> None:
     global _MATERIAL_PARSE_WORKER
     _MATERIAL_PARSE_STOP_EVENT.set()
-    worker = _MATERIAL_PARSE_WORKER
-    if worker and worker.is_alive():
-        worker.join(timeout=2.0)
+    with _MATERIAL_PARSE_WORKER_LOCK:
+        workers = _refresh_material_parse_workers_locked()
+    if not workers:
+        _MATERIAL_PARSE_WORKER = None
+        return
+    alive_after_join: List[threading.Thread] = []
+    for worker in workers:
         if worker.is_alive():
-            logger.warning(
-                "material parse worker did not stop within timeout; keeping reference to avoid duplicate workers"
-            )
-            return
-    _MATERIAL_PARSE_WORKER = None
+            worker.join(timeout=2.0)
+        if worker.is_alive():
+            alive_after_join.append(worker)
+    if alive_after_join:
+        with _MATERIAL_PARSE_WORKER_LOCK:
+            _MATERIAL_PARSE_WORKERS[:] = alive_after_join
+            _MATERIAL_PARSE_WORKER = alive_after_join[0]
+        logger.warning(
+            "material parse worker did not stop within timeout; keeping reference to avoid duplicate workers"
+        )
+        return
+    with _MATERIAL_PARSE_WORKER_LOCK:
+        _MATERIAL_PARSE_WORKERS.clear()
+        _MATERIAL_PARSE_WORKER = None
 
 
 def _now_iso() -> str:
@@ -13042,7 +13144,7 @@ def _build_system_self_check_context() -> SystemSelfCheckContext:
         resolve_dwg_converter_binaries=_resolve_dwg_converter_binaries,
         build_material_parse_jobs_summary=_build_material_parse_jobs_summary,
         to_float_or_none=_to_float_or_none,
-        material_parse_worker=_MATERIAL_PARSE_WORKER,
+        material_parse_worker=_MATERIAL_PARSE_WORKER_HEALTH_PROBE,
         material_parse_backlog_warn=DEFAULT_MATERIAL_PARSE_BACKLOG_WARN,
         load_materials=load_materials,
         normalize_material_row_for_parse=_normalize_material_row_for_parse,
