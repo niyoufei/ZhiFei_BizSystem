@@ -901,6 +901,8 @@ class TestIndexEndpoint:
         page = response.text
         assert 'value="稻香村医疗救治服务综合楼EPC工程总承包"' in page
         assert 'title="稻香村医疗救治服务综合楼EPC工程总承包"' in page
+        assert 'id="createProjectRecognizedName"' in page
+        assert "系统已自动识别项目名称" in page
 
     def test_index_renders_16_dimension_weight_sliders(self, client):
         """Index page should render 16-dimension focus sliders on first paint."""
@@ -924,6 +926,8 @@ class TestIndexEndpoint:
             'class="field-label">项目名称：</span><input id="createProjectNameInput" class="project-name-input primary-input"'
             in response.text
         )
+        assert 'id="createProjectRecognizedName"' in response.text
+        assert 'id="createProjectRecognizedNameText"' in response.text
         assert 'action="/web/delete_project"' in response.text
         assert 'id="createProjectFromTender"' in response.text
         assert 'action="/web/create_project_from_tender"' in response.text
@@ -1187,12 +1191,14 @@ class TestIndexEndpoint:
         response = client.get("/")
         assert response.status_code == 200
         page = response.text
+        assert "function setRecognizedProjectName(name)" in page
         assert (
             "const createProjectFromTenderFileInput = document.getElementById('createProjectFromTenderFile');"
             in page
         )
         assert "function currentSelectedProjectDisplayName()" in page
         assert "async function ensureTenderCreateUsesRecognizedProject(inferredName)" in page
+        assert "setRecognizedProjectName(inferredName);" in page
         assert "await ensureTenderCreateUsesRecognizedProject(inferredName);" in page
         assert "createProjectFromTenderFileInput.addEventListener('change', async () => {" in page
         assert (

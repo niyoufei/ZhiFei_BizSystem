@@ -23656,6 +23656,23 @@ def index(
         )
         if isinstance(selected_project, dict):
             initial_create_project_name = str(selected_project.get("name") or "").strip()
+    initial_create_project_name_notice = ""
+    if initial_create_project_name:
+        initial_create_project_name_notice = (
+            '<div id="createProjectRecognizedName" '
+            'style="margin:8px 0 0 0;padding:8px 10px;border-radius:8px;'
+            'background:#eff6ff;color:#1d4ed8;font-size:13px">'
+            '系统已自动识别项目名称：<strong id="createProjectRecognizedNameText">'
+            + html_lib.escape(initial_create_project_name)
+            + "</strong></div>"
+        )
+    else:
+        initial_create_project_name_notice = (
+            '<div id="createProjectRecognizedName" '
+            'style="display:none;margin:8px 0 0 0;padding:8px 10px;border-radius:8px;'
+            'background:#eff6ff;color:#1d4ed8;font-size:13px">'
+            '系统已自动识别项目名称：<strong id="createProjectRecognizedNameText"></strong></div>'
+        )
     create_notice_html = ""
     if create_ok:
         create_notice_html = (
@@ -24273,6 +24290,7 @@ def index(
           <button type="submit" id="btnCreateProjectFromTender" class="secondary">自动创建</button>
         </form>
         __CREATE_NOTICE_HTML__
+        __CREATE_PROJECT_RECOGNIZED_NAME_HTML__
         <p id="createProjectMessage" style="margin:8px 0 0 0;font-size:13px;min-height:1.2em"></p>
         <p style="margin:4px 0 0 0;font-size:13px;color:#64748b">可手动输入项目名称，或直接上传招标文件自动识别创建。若自动识别不稳定，可先在上方补齐项目名称后继续点“自动创建”。若识别到同名项目，系统会直接切换到现有项目并把招标文件归档进去。</p>
       </div>
@@ -27037,6 +27055,19 @@ def index(
           el.textContent = msg || '';
           el.style.color = isError ? '#b91c1c' : '#15803d';
         }
+        function setRecognizedProjectName(name) {
+          const box = document.getElementById('createProjectRecognizedName');
+          const textEl = document.getElementById('createProjectRecognizedNameText');
+          if (!box || !textEl) return;
+          const value = String(name || '').trim();
+          if (!value) {
+            box.style.display = 'none';
+            textEl.textContent = '';
+            return;
+          }
+          textEl.textContent = value;
+          box.style.display = 'block';
+        }
         function setSelectMsg(msg, isError) {
           const el = document.getElementById('selectProjectMessage');
           if (!el) { alert(msg); return; }
@@ -27337,6 +27368,7 @@ def index(
             nameInput.value = '';
             nameInput.title = '';
           }
+          setRecognizedProjectName('');
           const tenderInput = document.getElementById('createProjectFromTenderFile');
           if (tenderInput) tenderInput.value = '';
           const tenderOverride = document.getElementById('createProjectFromTenderOverride');
@@ -27804,6 +27836,7 @@ def index(
               nameInput.value = '';
               nameInput.title = '';
             }
+            setRecognizedProjectName('');
             syncCreateProjectNameOverride();
             return null;
           }
@@ -27822,6 +27855,7 @@ def index(
             text = await res.text();
           } catch (err) {
             if (mySeq !== inferTenderNameSeq) return null;
+            setRecognizedProjectName('');
             if (!silent) {
               setCreateMsg('项目名称识别失败：' + String((err && err.message) || err || '网络异常'), true);
             }
@@ -27834,6 +27868,7 @@ def index(
           } catch (_) {}
           if (!res.ok) {
             const detail = (data && data.detail) ? String(data.detail) : String(text || '').slice(0, 120);
+            setRecognizedProjectName('');
             if (!silent) {
               setCreateMsg(
                 '项目名称识别失败：' + normalizeTenderCreateErrorMessage(detail, syncCreateProjectNameOverride()),
@@ -27847,6 +27882,7 @@ def index(
             nameInput.value = inferredName;
             nameInput.title = inferredName;
           }
+          setRecognizedProjectName(inferredName);
           syncCreateProjectNameOverride();
           await ensureTenderCreateUsesRecognizedProject(inferredName);
           if (!silent) {
@@ -27895,6 +27931,7 @@ def index(
                 nameInput.value = projectName;
                 nameInput.title = projectName;
               }
+              setRecognizedProjectName(projectName);
               syncCreateProjectNameOverride();
               if (fileInput) fileInput.value = '';
               updateFilePickerText('createProjectFromTenderFile', 'createProjectFromTenderFileName');
@@ -32648,6 +32685,9 @@ def index(
     html = html.replace("__PROJECT_MONTH_OPTIONS__", project_month_options_html)
     html = html.replace("__PROJECT_SEARCH_OPTIONS__", project_search_options_html)
     html = html.replace("__CREATE_NOTICE_HTML__", create_notice_html)
+    html = html.replace(
+        "__CREATE_PROJECT_RECOGNIZED_NAME_HTML__", initial_create_project_name_notice
+    )
     html = html.replace("__GLOBAL_NOTICE_HTML__", global_notice_html)
     html = html.replace(
         "__CREATE_PROJECT_NAME_VALUE__", html_lib.escape(initial_create_project_name)
