@@ -16,6 +16,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+import app.main as app_main
 from app.main import _build_score_self_awareness, app, create_app
 
 
@@ -1989,6 +1990,22 @@ class TestProjectsEndpoints:
         data = response.json()
         assert "招标示范文本/模板" in data["detail"]
 
+    def test_read_uploaded_file_preview_for_project_name_scans_pdf_until_valid_project_name(self):
+        with patch("app.main._extract_pdf_text_preview", return_value="preview") as mock_preview:
+            result = app_main._read_uploaded_file_preview_for_project_name(
+                b"%PDF-1.4\n", "招标文件.pdf"
+            )
+
+        assert result == "preview"
+        mock_preview.assert_called_once_with(
+            b"%PDF-1.4\n",
+            "招标文件.pdf",
+            max_pages=10,
+            max_chars=32000,
+            ocr_pages=3,
+            stop_when_project_name_found=True,
+        )
+
     @patch("app.main._read_uploaded_file_preview_for_project_name")
     @patch("app.main.ensure_data_dirs")
     def test_infer_project_name_from_tender_skips_generic_cover_and_uses_real_project_title(
@@ -2023,6 +2040,41 @@ class TestProjectsEndpoints:
         assert response.status_code == 200
         data = response.json()
         assert data["inferred_name"] == "稻香村医疗救治服务综合楼EPC工程总承包"
+
+    @patch("app.main._read_uploaded_file_preview_for_project_name")
+    @patch("app.main.ensure_data_dirs")
+    def test_infer_project_name_from_tender_reads_project_name_field_from_page7(
+        self,
+        mock_ensure,
+        mock_preview_reader,
+        client,
+    ):
+        mock_preview_reader.return_value = """
+[PAGE:1]
+房建市政工程总承包招标示范文本（2023年版）
+合肥市房屋建筑和市政基础设施工程总承包
+[PAGE:7]
+第一章、招标公告
+1.1 项目名称：包河经开区延边路（繁华大道-沈阳路）、月潭路（炊马井路-南淝河路）、炊马井路（月潭路-长春路）等3条道路工程
+"""
+
+        response = client.post(
+            "/api/v1/projects/infer_name_from_tender",
+            files={
+                "file": (
+                    "招标文件.pdf",
+                    b"fake-pdf",
+                    "application/pdf",
+                )
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert (
+            data["inferred_name"]
+            == "包河经开区延边路(繁华大道-沈阳路)、月潭路(炊马井路-南淝河路)、炊马井路(月潭路-长春路)等3条道路工程"
+        )
 
     @patch("app.main.upload_material")
     @patch("app.main.save_projects")

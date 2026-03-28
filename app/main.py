@@ -17325,6 +17325,7 @@ def _extract_pdf_text_preview(
     max_pages: int = 4,
     max_chars: int = 16000,
     ocr_pages: int = 2,
+    stop_when_project_name_found: bool = False,
 ) -> str:
     if pymupdf is not None:
         doc = pymupdf.open(stream=content, filetype="pdf")
@@ -17385,6 +17386,16 @@ def _extract_pdf_text_preview(
                 chunk = "\n".join(page_lines).strip()
                 if chunk:
                     parts.append(chunk)
+                if stop_when_project_name_found:
+                    current_preview = "\n\n".join(part for part in parts if part.strip()).strip()
+                    try:
+                        current_project_name = _infer_project_name_from_tender_text(
+                            current_preview, ""
+                        )
+                    except HTTPException:
+                        current_project_name = ""
+                    if current_project_name:
+                        break
                 if sum(len(part) for part in parts) >= max(4000, int(max_chars)):
                     break
             merged_pdf_text = "\n\n".join(part for part in parts if part.strip()).strip()
@@ -17497,7 +17508,12 @@ def _read_uploaded_file_preview_for_project_name(content: bytes, filename: str) 
         return f"[DOC资料] 文件: {filename}（当前环境未启用结构化解析，已纳入文件元信息）"
     if name.endswith(".pdf"):
         return _extract_pdf_text_preview(
-            content, filename, max_pages=6, max_chars=22000, ocr_pages=2
+            content,
+            filename,
+            max_pages=10,
+            max_chars=32000,
+            ocr_pages=3,
+            stop_when_project_name_found=True,
         )
     if name.endswith(".xlsx") or name.endswith(".xls") or name.endswith(".xlsm"):
         return _read_uploaded_file_content(content, filename)[:12000]
