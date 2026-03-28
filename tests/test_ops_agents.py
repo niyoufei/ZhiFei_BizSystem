@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from app.engine import ops_agents as oa
 
@@ -353,9 +354,14 @@ def test_runtime_repair_agent_warns_on_non_repairable_optional_failures():
     assert any("仅告警项" in row for row in result["recommendations"])
 
 
-def test_run_ops_agents_cycle_retries_smoke_after_restart(monkeypatch):
+def test_run_ops_agents_cycle_retries_smoke_after_restart(monkeypatch, tmp_path: Path):
     project_calls = {"count": 0}
     restart_calls = {"count": 0}
+    monkeypatch.setattr(
+        oa,
+        "OPS_SMOKE_RUNTIME_RETRY_STATE_PATH",
+        tmp_path / "ops_agents_smoke_retry_state.json",
+    )
 
     monkeypatch.setattr(
         oa,
@@ -508,6 +514,165 @@ def test_run_ops_agents_cycle_retries_smoke_after_restart(monkeypatch):
         "自动重启并完成 smoke 重试恢复" in row
         for row in result["agents"]["project_flow"]["recommendations"]
     )
+
+
+def test_run_ops_agents_cycle_skips_smoke_restart_during_cooldown(
+    monkeypatch,
+    tmp_path: Path,
+):
+    project_calls = {"count": 0}
+    restart_calls = {"count": 0}
+    retry_state_path = tmp_path / "ops_agents_smoke_retry_state.json"
+    monkeypatch.setattr(oa, "OPS_SMOKE_RUNTIME_RETRY_STATE_PATH", retry_state_path)
+    oa._save_smoke_runtime_retry_state(
+        {
+            "project_flow": {
+                "attempted_at": (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(),
+                "outcome": "restart_ok",
+            }
+        },
+        retry_state_path,
+    )
+
+    monkeypatch.setattr(
+        oa,
+        "_run_sre_watchdog",
+        lambda **kwargs: {
+            "name": "sre_watchdog",
+            "status": "pass",
+            "duration_ms": 1,
+            "checks": {},
+            "actions": {},
+            "recommendations": [],
+        },
+    )
+    monkeypatch.setattr(
+        oa,
+        "_run_data_hygiene_agent",
+        lambda **kwargs: {
+            "name": "data_hygiene",
+            "status": "pass",
+            "duration_ms": 1,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": [],
+        },
+    )
+    monkeypatch.setattr(
+        oa,
+        "_run_runtime_repair_agent",
+        lambda **kwargs: {
+            "name": "runtime_repair",
+            "status": "pass",
+            "duration_ms": 1,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": [],
+        },
+    )
+
+    def fake_project_flow(**kwargs):
+        project_calls["count"] += 1
+        return {
+            "name": "project_flow",
+            "status": "fail",
+            "duration_ms": 1,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": ["first smoke failed"],
+        }
+
+    monkeypatch.setattr(oa, "_run_project_flow_agent", fake_project_flow)
+    monkeypatch.setattr(
+        oa,
+        "_run_tender_project_flow_agent",
+        lambda **kwargs: {
+            "name": "tender_project_flow",
+            "status": "pass",
+            "duration_ms": 1,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": [],
+        },
+    )
+    monkeypatch.setattr(
+        oa,
+        "_run_upload_flow_agent",
+        lambda **kwargs: {
+            "name": "upload_flow",
+            "status": "pass",
+            "duration_ms": 1,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": [],
+        },
+    )
+    monkeypatch.setattr(
+        oa,
+        "_run_scoring_quality_agent",
+        lambda **kwargs: {
+            "name": "scoring_quality",
+            "status": "pass",
+            "duration_ms": 1,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": [],
+        },
+    )
+    monkeypatch.setattr(
+        oa,
+        "_run_evolution_agent",
+        lambda **kwargs: {
+            "name": "evolution",
+            "status": "pass",
+            "duration_ms": 1,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": [],
+        },
+    )
+    monkeypatch.setattr(
+        oa,
+        "_run_learning_calibration_agent",
+        lambda **kwargs: {
+            "name": "learning_calibration",
+            "status": "pass",
+            "duration_ms": 1,
+            "checks": {},
+            "actions": {},
+            "metrics": {},
+            "recommendations": [],
+        },
+    )
+    monkeypatch.setattr(
+        oa,
+        "_run_restart_command",
+        lambda restart_cmd: restart_calls.__setitem__("count", restart_calls["count"] + 1)
+        or {
+            "attempted": True,
+            "ok": True,
+            "returncode": 0,
+            "error": None,
+        },
+    )
+
+    result = oa.run_ops_agents_cycle(base_url="http://127.0.0.1:8000", max_workers=2)
+
+    assert result["overall"]["status"] == "fail"
+    assert project_calls["count"] == 1
+    assert restart_calls["count"] == 0
+    runtime_retry = result["agents"]["project_flow"]["actions"]["runtime_retry"]
+    assert runtime_retry["attempted"] is False
+    assert runtime_retry["cooldown_skipped"] is True
+    assert runtime_retry["cooldown_remaining_seconds"] > 0
+    assert any("冷却期" in row for row in result["agents"]["project_flow"]["recommendations"])
 
 
 def test_learning_calibration_agent_auto_runs_evolve_and_reflection():

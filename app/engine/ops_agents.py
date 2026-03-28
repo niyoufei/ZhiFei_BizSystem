@@ -5,6 +5,7 @@ import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from urllib import error, request
 from urllib.parse import urlparse
@@ -24,6 +25,8 @@ OPS_RUNTIME_RESTART_ITEMS = frozenset(
         "material_parse_backlog_ok",
     }
 )
+OPS_SMOKE_RUNTIME_RETRY_SECONDS = 1800.0
+OPS_SMOKE_RUNTIME_RETRY_STATE_PATH = Path("build/ops_agents_smoke_retry_state.json")
 OPS_LEARNING_CALIBRATION_RETRY_SECONDS = 3600.0
 OPS_LEARNING_CALIBRATION_DRIFT_ALERT_LEVELS = frozenset({"watch", "medium", "high"})
 OPS_AGENT_NAMES = (
@@ -474,6 +477,67 @@ def _run_restart_command(restart_cmd: List[str]) -> Dict[str, Any]:
     return result
 
 
+def _load_smoke_runtime_retry_state(path: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
+    retry_path = path or OPS_SMOKE_RUNTIME_RETRY_STATE_PATH
+    try:
+        payload = json.loads(retry_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for key, value in payload.items():
+        if isinstance(key, str) and isinstance(value, dict):
+            out[key] = dict(value)
+    return out
+
+
+def _save_smoke_runtime_retry_state(
+    state: Dict[str, Dict[str, Any]],
+    path: Optional[Path] = None,
+) -> None:
+    retry_path = path or OPS_SMOKE_RUNTIME_RETRY_STATE_PATH
+    retry_path.parent.mkdir(parents=True, exist_ok=True)
+    retry_path.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def _smoke_runtime_retry_cooldown_remaining(
+    name: str,
+    *,
+    cooldown_seconds: float,
+    path: Optional[Path] = None,
+    now: Optional[datetime] = None,
+) -> float:
+    state = _load_smoke_runtime_retry_state(path)
+    item = state.get(str(name or "").strip()) or {}
+    attempted_at = _parse_iso_datetime(item.get("attempted_at"))
+    if attempted_at is None:
+        return 0.0
+    current = now or datetime.now(timezone.utc)
+    elapsed = max(0.0, (current - attempted_at).total_seconds())
+    return max(0.0, float(cooldown_seconds) - elapsed)
+
+
+def _record_smoke_runtime_retry_attempt(
+    name: str,
+    *,
+    outcome: str,
+    path: Optional[Path] = None,
+) -> None:
+    key = str(name or "").strip()
+    if not key:
+        return
+    state = _load_smoke_runtime_retry_state(path)
+    state[key] = {
+        "attempted_at": _now_iso(),
+        "outcome": str(outcome or "").strip() or "attempted",
+    }
+    _save_smoke_runtime_retry_state(state, path)
+
+
 def _run_smoke_agent_with_runtime_retry(
     *,
     name: str,
@@ -482,6 +546,8 @@ def _run_smoke_agent_with_runtime_retry(
     auto_repair: bool,
     restart_cmd: List[str],
     retry_budget: Dict[str, bool],
+    retry_cooldown_seconds: float = OPS_SMOKE_RUNTIME_RETRY_SECONDS,
+    retry_state_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     try:
         first_result = runner(**kwargs)
@@ -500,6 +566,8 @@ def _run_smoke_agent_with_runtime_retry(
         "initial_status": str(first_result.get("status") or "fail"),
         "retry_status": None,
         "recovered": False,
+        "cooldown_skipped": False,
+        "cooldown_remaining_seconds": 0,
     }
     if (
         str(first_result.get("status") or "") != "fail"
@@ -510,11 +578,37 @@ def _run_smoke_agent_with_runtime_retry(
         first_result["actions"] = actions
         return first_result
 
+    cooldown_remaining = _smoke_runtime_retry_cooldown_remaining(
+        name,
+        cooldown_seconds=retry_cooldown_seconds,
+        path=retry_state_path,
+    )
+    if cooldown_remaining > 0:
+        retry_info["cooldown_skipped"] = True
+        retry_info["cooldown_remaining_seconds"] = int(round(cooldown_remaining))
+        actions["runtime_retry"] = retry_info
+        first_result["actions"] = actions
+        recommendations = list(first_result.get("recommendations") or [])
+        cooldown_minutes = max(1, int((cooldown_remaining + 59.0) // 60.0))
+        cooldown_msg = (
+            "运行态自动重启重试仍处于冷却期，已跳过重复重启以避免周期性打断页面；"
+            f"约 {cooldown_minutes} 分钟后才会再次尝试。"
+        )
+        if cooldown_msg not in recommendations:
+            recommendations.append(cooldown_msg)
+        first_result["recommendations"] = recommendations
+        return first_result
+
     retry_budget["used"] = True
     retry_info["attempted"] = True
     retry_info["budget_consumed"] = True
     restart_result = _run_restart_command(restart_cmd)
     retry_info["restart"] = restart_result
+    _record_smoke_runtime_retry_attempt(
+        name,
+        outcome="restart_ok" if restart_result.get("ok") else "restart_failed",
+        path=retry_state_path,
+    )
     if restart_result.get("ok"):
         try:
             retried = runner(**kwargs)
@@ -2241,6 +2335,7 @@ def run_ops_agents_cycle(
                 auto_repair=auto_repair,
                 restart_cmd=restart_cmd,
                 retry_budget=smoke_retry_budget,
+                retry_state_path=OPS_SMOKE_RUNTIME_RETRY_STATE_PATH,
             )
 
         agents["learning_calibration"] = _run_learning_calibration_agent(
