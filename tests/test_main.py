@@ -2261,6 +2261,21 @@ class TestProjectsEndpoints:
             "饮马井路(月谭路-长春路)等3条道路工程"
         )
 
+    def test_infer_project_name_from_tender_prefers_explicit_project_name_without_project_suffix(
+        self,
+    ):
+        preview = """
+[PAGE:5]
+第一章 招标公告
+1.1 项目名称：蜀山区城区危房改造
+2.1 招标项目名称：蜀山区危险围墙、外墙维修工程
+"""
+
+        assert (
+            app_main._infer_project_name_from_tender_text(preview, "招标文件.pdf")
+            == "蜀山区城区危房改造"
+        )
+
     @patch("app.main._read_uploaded_file_preview_for_project_name")
     @patch("app.main.ensure_data_dirs")
     def test_infer_project_name_from_tender_skips_generic_cover_and_uses_real_project_title(

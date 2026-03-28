@@ -3008,7 +3008,7 @@ def _clean_project_name_candidate(name: object) -> str:
     return text[:120].rstrip()
 
 
-def _is_valid_project_name_candidate(name: str) -> bool:
+def _is_valid_project_name_candidate(name: str, *, require_project_token: bool = True) -> bool:
     text = _clean_project_name_candidate(name)
     if len(text) < 4:
         return False
@@ -3020,6 +3020,8 @@ def _is_valid_project_name_candidate(name: str) -> bool:
         return False
     if text.endswith(("项目名称", "工程名称", "标段名称")):
         return False
+    if not require_project_token:
+        return True
     return any(token in text for token in ("工程", "项目", "标段"))
 
 
@@ -3126,7 +3128,7 @@ def _infer_project_name_from_tender_text(text: str, filename: str) -> str:
         if _looks_like_generic_project_name_candidate(candidate):
             generic_candidate_seen = True
             continue
-        if _is_valid_project_name_candidate(candidate):
+        if _is_valid_project_name_candidate(candidate, require_project_token=False):
             return candidate
     for pattern in _PROJECT_NAME_FIELD_PATTERNS:
         for match in pattern.finditer(scan_text):
@@ -3135,7 +3137,7 @@ def _infer_project_name_from_tender_text(text: str, filename: str) -> str:
             if _looks_like_generic_project_name_candidate(candidate):
                 generic_candidate_seen = True
                 continue
-            if _is_valid_project_name_candidate(candidate):
+            if _is_valid_project_name_candidate(candidate, require_project_token=False):
                 return candidate
     for raw_line in scan_lines[:500]:
         if not any(marker in raw_line for marker in ("项目名称", "工程名称", "标段名称")):
@@ -3147,7 +3149,7 @@ def _infer_project_name_from_tender_text(text: str, filename: str) -> str:
         if _looks_like_generic_project_name_candidate(candidate):
             generic_candidate_seen = True
             continue
-        if _is_valid_project_name_candidate(candidate):
+        if _is_valid_project_name_candidate(candidate, require_project_token=False):
             return candidate
     title_line_candidate = _infer_project_name_from_title_lines(scan_text)
     if title_line_candidate:
@@ -3183,7 +3185,7 @@ def _resolve_tender_project_name(
 ) -> str:
     manual_name = _clean_project_name_candidate(project_name_override)
     if manual_name:
-        if not _is_valid_project_name_candidate(manual_name):
+        if not _is_valid_project_name_candidate(manual_name, require_project_token=False):
             raise HTTPException(
                 status_code=422,
                 detail="手动填写的项目名称不完整，请补充到“XX项目/XX工程/XX标段”级别后重试。",
