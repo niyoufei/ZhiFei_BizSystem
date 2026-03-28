@@ -269,6 +269,87 @@ class TestMaterialParsePerformanceGuards:
         mock_render_pages.assert_not_called()
         mock_call_gpt.assert_not_called()
 
+    @patch("app.main._call_gpt_material_parser")
+    @patch("app.main._render_pdf_page_pngs_for_gpt")
+    def test_augment_drawing_summary_skips_gpt_when_local_summary_is_strong(
+        self,
+        mock_render_pages,
+        mock_call_gpt,
+    ):
+        local_summary = {
+            "detected_format": "dwg",
+            "structured_quality_score": 0.82,
+            "structured_terms": [
+                "总平面",
+                "节点详图",
+                "综合排布",
+                "消防",
+                "净高复核",
+                "机电",
+                "轴线",
+                "标高",
+            ],
+            "discipline_keywords": ["建筑", "机电"],
+            "sheet_type_tags": ["节点详图/大样", "系统图/原理图"],
+            "risk_keywords": ["洞口", "高支模"],
+            "top_numeric_terms": ["600", "1200", "3.5", "45", "90", "18"],
+            "binary_marker_terms": ["WALL", "DOOR", "LEVEL", "GRID_A", "GRID_B", "BEAM"],
+        }
+
+        merged, backend, confidence, error = app_main._augment_drawing_summary_with_gpt(
+            b"AC1027",
+            "总图.dwg",
+            "总平面 节点详图 机电 综合排布 标高 轴线 " * 80,
+            local_summary,
+        )
+
+        assert backend == "local"
+        assert error == ""
+        assert confidence == 0.82
+        assert merged["gpt_skip_reason"] == "local_summary_strong"
+        mock_render_pages.assert_not_called()
+        mock_call_gpt.assert_not_called()
+
+    @patch("app.main._call_gpt_material_parser")
+    def test_augment_site_photo_summary_skips_gpt_when_local_summary_is_strong(
+        self,
+        mock_call_gpt,
+    ):
+        local_summary = {
+            "structured_quality_score": 0.78,
+            "ocr_quality_score": 0.66,
+            "visual_capability": "ocr_multistage",
+            "structured_terms": [
+                "安全文明",
+                "成品保护",
+                "临边防护",
+                "脚手架",
+                "材料堆放",
+                "进度形象",
+                "质量样板",
+                "封闭围挡",
+            ],
+            "safety_scene_tags": ["临边防护", "脚手架"],
+            "civilization_scene_tags": ["材料堆放"],
+            "quality_scene_tags": ["质量样板"],
+            "progress_scene_tags": ["进度形象"],
+            "top_numeric_terms": ["3", "5", "20", "120"],
+        }
+
+        merged, backend, confidence, error = app_main._augment_site_photo_summary_with_gpt(
+            b"\x89PNG",
+            "现场照片.png",
+            "临边防护 脚手架 材料堆放 质量样板 进度形象 " * 20,
+            local_summary,
+        )
+
+        assert backend == "local"
+        assert error == ""
+        assert confidence == 0.78
+        assert merged["gpt_skip_reason"] == "local_summary_strong"
+        assert merged["evidence_confidence"] == 0.78
+        mock_call_gpt.assert_not_called()
+
     @patch("app.main._rebuild_project_anchors_and_requirements")
     def test_material_parse_rebuilds_are_debounced_per_project(self, mock_rebuild):
         from app import main as main_module

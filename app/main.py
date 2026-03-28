@@ -453,6 +453,8 @@ DEFAULT_MATERIAL_PARSE_BACKLOG_WARN = 18
 DEFAULT_MATERIAL_PARSE_WORKER_COUNT = 2
 DEFAULT_MATERIAL_PARSE_REBUILD_DEBOUNCE_SECONDS = 2.0
 DEFAULT_TENDER_GPT_FASTPATH_MIN_QUALITY = 0.72
+DEFAULT_DRAWING_GPT_FASTPATH_MIN_QUALITY = 0.74
+DEFAULT_SITE_PHOTO_GPT_FASTPATH_MIN_QUALITY = 0.7
 DEFAULT_CALIBRATION_MIN_SAMPLES = 20
 DEFAULT_CALIBRATION_FRESHNESS_DAYS = 90
 DEFAULT_CALIBRATION_MIN_RECENT_RATIO = 0.6
@@ -1940,6 +1942,9 @@ def _augment_drawing_summary_with_gpt(
 ) -> tuple[Dict[str, object], str, float, str]:
     merged = dict(local_summary)
     parse_confidence = float(_clip_score01(local_summary.get("structured_quality_score") or 0.0))
+    if _should_fastpath_drawing_local_summary(local_summary, parsed_text=parsed_text):
+        merged["gpt_skip_reason"] = "local_summary_strong"
+        return merged, "local", round(parse_confidence, 4), ""
     image_bytes: Optional[bytes] = None
     image_mime = "image/png"
     ext = Path(filename).suffix.lower()
@@ -2045,6 +2050,32 @@ def _should_fastpath_tender_local_summary(
     )
 
 
+def _should_fastpath_drawing_local_summary(
+    local_summary: Dict[str, object],
+    *,
+    parsed_text: str,
+) -> bool:
+    quality = float(_clip_score01(local_summary.get("structured_quality_score") or 0.0))
+    structured_terms = _to_text_items(local_summary.get("structured_terms"), max_items=24)
+    discipline_keywords = _to_text_items(local_summary.get("discipline_keywords"), max_items=12)
+    sheet_type_tags = _to_text_items(local_summary.get("sheet_type_tags"), max_items=12)
+    risk_keywords = _to_text_items(local_summary.get("risk_keywords"), max_items=12)
+    top_numeric_terms = _merge_numeric_values(local_summary.get("top_numeric_terms"), limit=18)
+    binary_marker_terms = _to_text_items(local_summary.get("binary_marker_terms"), max_items=18)
+    detected_format = str(local_summary.get("detected_format") or "").strip().lower()
+    parsed_chars = len(str(parsed_text or "").strip())
+    return bool(
+        quality >= DEFAULT_DRAWING_GPT_FASTPATH_MIN_QUALITY
+        and len(structured_terms) >= 8
+        and (
+            len(discipline_keywords) + len(sheet_type_tags) + len(risk_keywords) >= 4
+            or len(top_numeric_terms) >= 6
+            or len(binary_marker_terms) >= 6
+        )
+        and (parsed_chars >= 900 or detected_format in {"dwg", "dxf"})
+    )
+
+
 def _augment_site_photo_summary_with_gpt(
     content: bytes,
     filename: str,
@@ -2052,6 +2083,17 @@ def _augment_site_photo_summary_with_gpt(
     local_summary: Dict[str, object],
 ) -> tuple[Dict[str, object], str, float, str]:
     merged = dict(local_summary)
+    parse_confidence = float(_clip_score01(local_summary.get("structured_quality_score") or 0.0))
+    if _should_fastpath_site_photo_local_summary(local_summary, parsed_text=parsed_text):
+        merged["gpt_skip_reason"] = "local_summary_strong"
+        merged["evidence_confidence"] = round(
+            max(
+                parse_confidence,
+                float(_clip_score01(local_summary.get("ocr_quality_score") or 0.0)),
+            ),
+            4,
+        )
+        return merged, "local", round(parse_confidence, 4), ""
     ext = Path(filename).suffix.lower()
     image_mime = f"image/{'jpeg' if ext in {'.jpg', '.jpeg'} else ext.lstrip('.')}"
     ok, payload, err = _call_gpt_material_parser(
@@ -2059,7 +2101,6 @@ def _augment_site_photo_summary_with_gpt(
         image_bytes=content,
         image_mime=image_mime,
     )
-    parse_confidence = float(_clip_score01(local_summary.get("structured_quality_score") or 0.0))
     if not ok:
         return merged, "local", parse_confidence, err
     for field in (
@@ -2115,6 +2156,32 @@ def _augment_site_photo_summary_with_gpt(
         4,
     )
     return merged, "hybrid", parse_confidence, ""
+
+
+def _should_fastpath_site_photo_local_summary(
+    local_summary: Dict[str, object],
+    *,
+    parsed_text: str,
+) -> bool:
+    quality = float(_clip_score01(local_summary.get("structured_quality_score") or 0.0))
+    ocr_quality = float(_clip_score01(local_summary.get("ocr_quality_score") or 0.0))
+    structured_terms = _to_text_items(local_summary.get("structured_terms"), max_items=24)
+    scene_tags = (
+        _to_text_items(local_summary.get("safety_scene_tags"), max_items=10)
+        + _to_text_items(local_summary.get("civilization_scene_tags"), max_items=10)
+        + _to_text_items(local_summary.get("quality_scene_tags"), max_items=10)
+        + _to_text_items(local_summary.get("progress_scene_tags"), max_items=10)
+    )
+    top_numeric_terms = _merge_numeric_values(local_summary.get("top_numeric_terms"), limit=16)
+    visual_capability = str(local_summary.get("visual_capability") or "").strip().lower()
+    parsed_chars = len(str(parsed_text or "").strip())
+    return bool(
+        quality >= DEFAULT_SITE_PHOTO_GPT_FASTPATH_MIN_QUALITY
+        and visual_capability in {"ocr_text", "ocr_multistage"}
+        and ocr_quality >= 0.4
+        and parsed_chars >= 160
+        and (len(scene_tags) >= 4 or len(structured_terms) >= 8 or len(top_numeric_terms) >= 5)
+    )
 
 
 def _parse_material_record_payload(row: Dict[str, object]) -> Dict[str, object]:
