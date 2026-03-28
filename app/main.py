@@ -30,7 +30,7 @@ except ImportError:
     pass
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import quote_plus
 from uuid import uuid4
 
@@ -2932,6 +2932,10 @@ _PROJECT_NAME_FIELD_PATTERNS = [
 _PROJECT_NAME_TITLE_SUFFIX_RE = re.compile(
     r"(?:招标文件(?:正文)?|施工招标(?:文件)?|公开招标(?:文件)?|招标公告|答疑澄清|答疑|澄清|补遗)$"
 )
+_PROJECT_NAME_FIELD_LINE_RE = re.compile(
+    r"^(?:\d+(?:\.\d+)*)?\s*"
+    r"(?:招标项目名称|项目名称|工程名称|标段名称|项目名|工程名|标段名)\s*[:：]\s*(.*)$"
+)
 _PROJECT_NAME_FILENAME_SUFFIX_RE = re.compile(
     r"(?:招标文件(?:正文|及答疑)?|招标答疑|答疑澄清|答疑|澄清|补遗|招标公告|公开招标|施工招标|文件)$"
 )
@@ -2947,6 +2951,7 @@ _GENERIC_PROJECT_NAME_KEYWORDS = (
     "范本",
     "模板",
     "房屋建筑和市政基础设施工程总承包",
+    "房屋建筑和市政基础设施工程施工",
     "招标文件示范文本",
 )
 _GENERIC_PROJECT_NAME_EXACT = {
@@ -2958,6 +2963,7 @@ _GENERIC_PROJECT_NAME_EXACT = {
     "房建市政工程总承包招标示范文本〈2023年版〉",
     "房建市政工程总承包招标示范文本（2023年版）",
     "合肥市房屋建筑和市政基础设施工程总承包",
+    "合肥市房屋建筑和市政基础设施工程施工",
 }
 
 
@@ -3025,6 +3031,57 @@ def _infer_project_name_from_filename(filename: str) -> str:
     return ""
 
 
+def _collect_multiline_project_name_field(
+    lines: Sequence[str], start_index: int, initial: str
+) -> str:
+    parts: List[str] = []
+
+    def _append_part(value: str) -> None:
+        normalized = unicodedata.normalize("NFKC", str(value or "")).replace("\u3000", " ")
+        cleaned = normalized.strip().strip("：:;；,，。")
+        if cleaned:
+            parts.append(cleaned)
+
+    _append_part(initial)
+    for raw_line in lines[start_index + 1 : start_index + 4]:
+        normalized = (
+            unicodedata.normalize("NFKC", str(raw_line or "")).replace("\u3000", " ").strip()
+        )
+        if not normalized:
+            continue
+        if re.match(r"^\d+(?:\.\d+)+\s*", normalized):
+            break
+        if _PROJECT_NAME_FIELD_LINE_RE.match(normalized):
+            break
+        if any(
+            marker in normalized
+            for marker in (
+                "项目审批",
+                "核准",
+                "备案机关",
+                "批文名称",
+                "项目编号",
+                "招标项目编号",
+                "标段编号",
+                "招标人",
+                "项目业主",
+                "资金来源",
+                "资金落实情况",
+                "建设地点",
+                "建设规模",
+                "招标范围",
+            )
+        ):
+            break
+        _append_part(normalized)
+        merged = "".join(parts)
+        if any(token in merged for token in ("工程", "项目", "标段")) and merged.endswith(
+            ("工程", "项目", "标段")
+        ):
+            break
+    return "".join(parts)
+
+
 def _infer_project_name_from_title_lines(text: str) -> str:
     title_hints = ("招标文件", "招标", "施工总承包", "总承包", "EPC", "改造", "装修", "工程")
     ignored_prefixes = ("第", "目录", "说明", "附件", "投标", "投标人", "资格", "评标", "招标编号")
@@ -3052,6 +3109,19 @@ def _infer_project_name_from_tender_text(text: str, filename: str) -> str:
     normalized_text = unicodedata.normalize("NFKC", str(text or "")).replace("\u3000", " ")
     scan_text = normalized_text[:40000]
     generic_candidate_seen = False
+    scan_lines = [line.strip() for line in scan_text.splitlines()]
+    for line_index, raw_line in enumerate(scan_lines[:500]):
+        match = _PROJECT_NAME_FIELD_LINE_RE.match(raw_line)
+        if not match:
+            continue
+        candidate = _collect_multiline_project_name_field(scan_lines, line_index, match.group(1))
+        candidate = _strip_inferred_project_name_noise(candidate)
+        candidate = _clean_project_name_candidate(candidate)
+        if _looks_like_generic_project_name_candidate(candidate):
+            generic_candidate_seen = True
+            continue
+        if _is_valid_project_name_candidate(candidate):
+            return candidate
     for pattern in _PROJECT_NAME_FIELD_PATTERNS:
         for match in pattern.finditer(scan_text):
             candidate = _strip_inferred_project_name_noise(match.group(1))
@@ -3061,7 +3131,7 @@ def _infer_project_name_from_tender_text(text: str, filename: str) -> str:
                 continue
             if _is_valid_project_name_candidate(candidate):
                 return candidate
-    for raw_line in normalized_text.splitlines()[:120]:
+    for raw_line in scan_lines[:500]:
         if not any(marker in raw_line for marker in ("项目名称", "工程名称", "标段名称")):
             continue
         candidate = _strip_inferred_project_name_noise(
@@ -3073,7 +3143,7 @@ def _infer_project_name_from_tender_text(text: str, filename: str) -> str:
             continue
         if _is_valid_project_name_candidate(candidate):
             return candidate
-    title_line_candidate = _infer_project_name_from_title_lines(normalized_text)
+    title_line_candidate = _infer_project_name_from_title_lines(scan_text)
     if title_line_candidate:
         return title_line_candidate
     fallback_candidate = _candidate_project_name_from_filename(filename)
@@ -17710,14 +17780,17 @@ def _extract_pdf_text_preview(
                     parts.append(chunk)
                 if stop_when_project_name_found:
                     current_preview = "\n\n".join(part for part in parts if part.strip()).strip()
-                    try:
-                        current_project_name = _infer_project_name_from_tender_text(
-                            current_preview, ""
-                        )
-                    except HTTPException:
-                        current_project_name = ""
-                    if current_project_name:
-                        break
+                    if any(
+                        marker in current_preview for marker in ("项目名称", "工程名称", "标段名称")
+                    ):
+                        try:
+                            current_project_name = _infer_project_name_from_tender_text(
+                                current_preview, ""
+                            )
+                        except HTTPException:
+                            current_project_name = ""
+                        if current_project_name:
+                            break
                 if sum(len(part) for part in parts) >= max(4000, int(max_chars)):
                     break
             merged_pdf_text = "\n\n".join(part for part in parts if part.strip()).strip()

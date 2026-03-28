@@ -2191,6 +2191,62 @@ class TestProjectsEndpoints:
             stop_when_project_name_found=True,
         )
 
+    def test_read_uploaded_file_preview_for_project_name_keeps_scanning_until_explicit_field(self):
+        class _FakePage:
+            def __init__(self, text: str):
+                self._text = text
+
+            def get_text(self):
+                return self._text
+
+        class _FakeDoc:
+            def __init__(self, pages):
+                self._pages = pages
+
+            def __iter__(self):
+                return iter(self._pages)
+
+            def close(self):
+                return None
+
+        fake_doc = _FakeDoc(
+            [
+                _FakePage("合肥市房屋建筑和市政基础设施工程施工\n招标文件示范文本"),
+                _FakePage(
+                    "包河经开区延边路（繁华大道-沈阳路）、\n"
+                    "月谭路（饮马井路-南淝河路）、饮马井路\n"
+                    "（月谭路-长春路）等3条道路工程招标"
+                ),
+                _FakePage(""),
+                _FakePage(""),
+                _FakePage(""),
+                _FakePage(""),
+                _FakePage(""),
+                _FakePage(""),
+                _FakePage(
+                    "第一章 招标公告\n"
+                    "1.1 项目名称：包河经开区延边路（繁华大道-沈阳路）、月谭路（饮马井路-南淝河路）、饮马井路\n"
+                    "（月谭路-长春路）等3条道路工程"
+                ),
+            ]
+        )
+
+        with patch("app.main.pymupdf") as mock_pymupdf, patch(
+            "app.main._score_ocr_text_candidate", return_value=5.0
+        ):
+            mock_pymupdf.open.return_value = fake_doc
+            preview = app_main._read_uploaded_file_preview_for_project_name(
+                b"%PDF-1.4\n",
+                "招标文件正文 (2).pdf",
+            )
+
+        assert "1.1 项目名称" in preview
+        assert (
+            app_main._infer_project_name_from_tender_text(preview, "招标文件正文 (2).pdf")
+            == "包河经开区延边路(繁华大道-沈阳路)、月谭路(饮马井路-南淝河路)、"
+            "饮马井路(月谭路-长春路)等3条道路工程"
+        )
+
     @patch("app.main._read_uploaded_file_preview_for_project_name")
     @patch("app.main.ensure_data_dirs")
     def test_infer_project_name_from_tender_skips_generic_cover_and_uses_real_project_title(
@@ -2259,6 +2315,41 @@ class TestProjectsEndpoints:
         assert (
             data["inferred_name"]
             == "包河经开区延边路(繁华大道-沈阳路)、月潭路(炊马井路-南淝河路)、炊马井路(月潭路-长春路)等3条道路工程"
+        )
+
+    @patch("app.main._read_uploaded_file_preview_for_project_name")
+    @patch("app.main.ensure_data_dirs")
+    def test_infer_project_name_from_tender_skips_generic_construction_cover_and_reads_page9_name(
+        self,
+        mock_ensure,
+        mock_preview_reader,
+        client,
+    ):
+        mock_preview_reader.return_value = """
+[PAGE:1]
+合肥市房屋建筑和市政基础设施工程施工
+招标文件示范文本
+[PAGE:9]
+第一章、招标公告
+1.1 项目名称：包河经开区延边路（繁华大道-沈阳路）、月谭路（饮马井路-南淝河路）、饮马井路（月谭路-长春路）等3条道路工程
+"""
+
+        response = client.post(
+            "/api/v1/projects/infer_name_from_tender",
+            files={
+                "file": (
+                    "招标文件正文 (2).pdf",
+                    b"fake-pdf",
+                    "application/pdf",
+                )
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert (
+            data["inferred_name"]
+            == "包河经开区延边路(繁华大道-沈阳路)、月谭路(饮马井路-南淝河路)、饮马井路(月谭路-长春路)等3条道路工程"
         )
 
     @patch("app.main.upload_material")
