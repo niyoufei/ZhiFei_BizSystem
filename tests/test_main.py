@@ -1211,6 +1211,9 @@ class TestIndexEndpoint:
         assert "function applyMaterialParseZoneState" in page
         assert "function scheduleMaterialParsePolling" in page
         assert "function scheduleProjectAutoRefresh" in page
+        assert "parse_stage_label" in page
+        assert "parse_route_label" in page
+        assert "queue_position" in page
         assert "PROJECT_AUTO_REFRESH_INTERVAL_MS" in page
         assert "visibilitychange" in page
         assert "/materials/parse_status" in page
@@ -3006,9 +3009,13 @@ class TestMaterialsEndpoint:
         assert data["project_id"] == "p1"
         assert data["summary"]["materials_total"] == 1
         assert data["summary"]["queued_materials"] == 1
+        assert data["summary"]["worker_count"] == 2
         assert data["summary"]["backlog"] == 1
         assert data["jobs"][0]["status"] == "processing"
         assert data["materials"][0]["parse_backend"] == "queued"
+        assert data["materials"][0]["parse_effective_status"] == "processing"
+        assert "解析中" in str(data["materials"][0]["parse_stage_label"])
+        assert data["materials"][0]["parse_route_label"] == "本地预解析，必要时 GPT 深解析"
 
     @patch("app.main.save_material_parse_jobs")
     @patch("app.main.save_materials")

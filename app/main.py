@@ -1041,6 +1041,125 @@ def _material_parse_status_label(
     return "待解析"
 
 
+def _material_parse_worker_alive_count() -> int:
+    with _MATERIAL_PARSE_WORKER_LOCK:
+        return len(_refresh_material_parse_workers_locked())
+
+
+def _material_supports_gpt_deep_parse(material_type: object) -> bool:
+    normalized = _normalize_material_type(material_type)
+    return bool(get_openai_api_key()) and normalized in {"tender_qa", "drawing", "site_photo"}
+
+
+def _material_parse_route_label(
+    material_row: Dict[str, object],
+    *,
+    effective_status: Optional[str] = None,
+    active_job: Optional[Dict[str, object]] = None,
+) -> str:
+    material_type = _normalize_material_type(
+        material_row.get("material_type"), filename=material_row.get("filename")
+    )
+    status = str(effective_status or material_row.get("parse_status") or "").strip().lower()
+    backend = str(
+        material_row.get("parse_backend") or (active_job or {}).get("parse_backend") or ""
+    ).strip()
+    summary = (
+        material_row.get("structured_summary")
+        if isinstance(material_row.get("structured_summary"), dict)
+        else {}
+    )
+    if status in {"queued", "processing"} and _material_supports_gpt_deep_parse(material_type):
+        return "本地预解析，必要时 GPT 深解析"
+    if str(summary.get("gpt_skip_reason") or "").strip() == "local_summary_strong":
+        return "本地快解析"
+    if backend == "hybrid":
+        return "本地预解析 + GPT 深解析"
+    if backend.startswith("gpt"):
+        return "GPT 深解析"
+    if backend == "local":
+        return "本地解析"
+    if _material_supports_gpt_deep_parse(material_type):
+        return "本地预解析，必要时 GPT 深解析"
+    return "本地解析"
+
+
+def _build_material_parse_runtime_details(
+    material_row: Dict[str, object],
+    *,
+    active_job: Optional[Dict[str, object]] = None,
+    queue_position: Optional[int] = None,
+) -> Dict[str, object]:
+    row = dict(material_row)
+    row_status = str(row.get("parse_status") or "queued").strip().lower()
+    job_status = str((active_job or {}).get("status") or "").strip().lower()
+    effective_status = job_status if job_status in {"queued", "processing"} else row_status
+    parse_route_label = _material_parse_route_label(
+        row,
+        effective_status=effective_status,
+        active_job=active_job,
+    )
+    error_text = str(row.get("parse_error_message") or row.get("parse_error_class") or "").strip()
+    note = ""
+    if effective_status == "queued":
+        if queue_position == 1:
+            stage_label = "排队中（即将开始）"
+        elif isinstance(queue_position, int) and queue_position > 1:
+            stage_label = f"排队中（第 {queue_position} 位）"
+        else:
+            stage_label = "排队中"
+        note = (
+            "先做本地结构化预解析，只有本地结果不足时才会进入 GPT 深解析。"
+            if parse_route_label.startswith("本地预解析")
+            else "等待本地解析 worker 处理。"
+        )
+    elif effective_status == "processing":
+        if parse_route_label.startswith("本地预解析"):
+            stage_label = "解析中（本地预解析/深解析决策）"
+            note = "当前先做本地结构化预解析；若本地结果不足，再进入 GPT 深解析。"
+        else:
+            stage_label = f"解析中（{parse_route_label}）"
+            note = "当前正在执行本地解析。"
+    elif effective_status == "parsed":
+        stage_label = _material_parse_status_label(
+            effective_status,
+            parse_backend=row.get("parse_backend"),
+            parse_error_message=row.get("parse_error_message"),
+        )
+        if parse_route_label == "本地快解析":
+            note = "本地结构化结果已足够强，已跳过 GPT 深解析。"
+        elif parse_route_label == "本地预解析 + GPT 深解析":
+            note = "已完成本地预解析与 GPT 深解析。"
+        elif parse_route_label == "本地解析":
+            note = "已完成本地解析。"
+    elif effective_status == "failed":
+        stage_label = _material_parse_status_label(
+            effective_status,
+            parse_backend=row.get("parse_backend"),
+            parse_error_message=row.get("parse_error_message"),
+        )
+        note = (
+            "本次解析失败，可点击重新解析；系统会继续优先保留本地解析结果。"
+            if error_text
+            else "可点击重新解析。"
+        )
+    else:
+        stage_label = _material_parse_status_label(
+            effective_status,
+            parse_backend=row.get("parse_backend"),
+            parse_error_message=row.get("parse_error_message"),
+        )
+    return {
+        "parse_effective_status": effective_status,
+        "parse_stage_label": stage_label,
+        "parse_route_label": parse_route_label,
+        "parse_note": note,
+        "queue_position": int(queue_position)
+        if isinstance(queue_position, int) and queue_position > 0
+        else None,
+    }
+
+
 def _build_project_material_index(project_id: str) -> Dict[str, object]:
     rows = [m for m in load_materials() if str(m.get("project_id")) == str(project_id)]
     rows.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
@@ -14827,6 +14946,38 @@ def get_material_parse_status(
         if str(m.get("project_id") or "") == str(project_id)
     ]
     jobs, summary = _build_material_parse_jobs_summary(project_id)
+    latest_job_by_material_id: Dict[str, Dict[str, object]] = {}
+    queued_positions: Dict[str, int] = {}
+    queued_jobs = [
+        dict(job) for job in jobs if str(job.get("status") or "").strip().lower() == "queued"
+    ]
+    queued_jobs.sort(key=_material_parse_job_sort_key)
+    for idx, job in enumerate(queued_jobs, start=1):
+        material_id = str(job.get("material_id") or "").strip()
+        if material_id and material_id not in queued_positions:
+            queued_positions[material_id] = idx
+    for job in jobs:
+        material_id = str(job.get("material_id") or "").strip()
+        if not material_id:
+            continue
+        current = latest_job_by_material_id.get(material_id)
+        if current is None or _material_parse_job_sort_key(job) > _material_parse_job_sort_key(
+            current
+        ):
+            latest_job_by_material_id[material_id] = dict(job)
+    enriched_materials: List[Dict[str, object]] = []
+    for row in materials:
+        material_id = str(row.get("id") or "").strip()
+        active_job = latest_job_by_material_id.get(material_id)
+        enriched = dict(row)
+        enriched.update(
+            _build_material_parse_runtime_details(
+                row,
+                active_job=active_job,
+                queue_position=queued_positions.get(material_id),
+            )
+        )
+        enriched_materials.append(enriched)
     summary["materials_total"] = len(materials)
     summary["parsed_materials"] = sum(
         1 for row in materials if str(row.get("parse_status") or "") == "parsed"
@@ -14840,11 +14991,13 @@ def get_material_parse_status(
     summary["queued_materials"] = sum(
         1 for row in materials if str(row.get("parse_status") or "") == "queued"
     )
+    summary["worker_count"] = DEFAULT_MATERIAL_PARSE_WORKER_COUNT
+    summary["alive_worker_count"] = _material_parse_worker_alive_count()
     return MaterialParseStatusResponse(
         project_id=project_id,
         summary=summary,
         jobs=[MaterialParseJobRecord(**job) for job in jobs],
-        materials=[MaterialRecord(**row) for row in materials],
+        materials=[MaterialRecord(**row) for row in enriched_materials],
         generated_at=_now_iso(),
     )
 
@@ -26779,22 +26932,51 @@ def index(
         }
         function materialParseStatusMeta(material) {
           const row = (material && typeof material === 'object') ? material : {};
-          const status = String(row.parse_status || 'queued').trim().toLowerCase();
+          const status = String(row.parse_effective_status || row.parse_status || 'queued').trim().toLowerCase();
           const backend = materialParseBackendLabel(row.parse_backend);
+          const stageLabel = String(row.parse_stage_label || '').trim();
+          const routeLabel = String(row.parse_route_label || '').trim();
+          const note = String(row.parse_note || '').trim();
+          const queuePosition = Number(row.queue_position || 0);
           const errorText = String(row.parse_error_message || row.parse_error_class || '').trim();
           if (status === 'parsed') {
-            return { status: 'parsed', label: backend === '-' ? '已解析' : ('已解析（' + backend + ')'), tone: '#166534' };
+            return {
+              status: 'parsed',
+              label: stageLabel || (backend === '-' ? '已解析' : ('已解析（' + backend + ')')),
+              detail: note || routeLabel,
+              tone: '#166534',
+            };
           }
           if (status === 'processing') {
-            return { status: 'processing', label: '解析中（' + backend + '）', tone: '#92400e' };
+            return {
+              status: 'processing',
+              label: stageLabel || '解析中（' + backend + '）',
+              detail: note || routeLabel,
+              tone: '#92400e',
+            };
           }
           if (status === 'failed') {
-            return { status: 'failed', label: errorText ? ('解析失败：' + errorText.slice(0, 48)) : '解析失败', tone: '#991b1b' };
+            return {
+              status: 'failed',
+              label: stageLabel || (errorText ? ('解析失败：' + errorText.slice(0, 48)) : '解析失败'),
+              detail: note || routeLabel,
+              tone: '#991b1b',
+            };
           }
           if (status === 'queued') {
-            return { status: 'queued', label: '排队中', tone: '#475569' };
+            return {
+              status: 'queued',
+              label: stageLabel || '排队中',
+              detail: note || routeLabel || (queuePosition > 0 ? ('队列第 ' + String(queuePosition) + ' 位') : ''),
+              tone: '#475569',
+            };
           }
-          return { status: status || 'idle', label: '待解析', tone: '#64748b' };
+          return {
+            status: status || 'idle',
+            label: stageLabel || '待解析',
+            detail: note || routeLabel,
+            tone: '#64748b',
+          };
         }
         function buildMaterialTableRowHtml(material, projectId) {
           const row = (material && typeof material === 'object') ? material : {};
@@ -26802,10 +26984,13 @@ def index(
           const materialTypeText = typeof window.materialTypeLabel === 'function'
             ? window.materialTypeLabel(row.material_type || 'tender_qa')
             : '招标文件和答疑';
+          const parseDetailHtml = parseMeta.detail
+            ? ('<div style="margin-top:4px;font-size:12px;color:#64748b;line-height:1.5">' + escapeHtmlText(parseMeta.detail) + '</div>')
+            : '';
           return ''
             + '<td>' + escapeHtmlText(materialTypeText) + '</td>'
             + '<td>' + escapeHtmlText(row.filename || '') + '</td>'
-            + '<td><span style="color:' + escapeHtmlText(parseMeta.tone || '#475569') + '">' + escapeHtmlText(parseMeta.label || '-') + '</span></td>'
+            + '<td><span style="color:' + escapeHtmlText(parseMeta.tone || '#475569') + '">' + escapeHtmlText(parseMeta.label || '-') + '</span>' + parseDetailHtml + '</td>'
             + '<td>' + escapeHtmlText(String(row.created_at || '').slice(0, 19)) + '</td>'
             + '<td><button type="button" class="btn-danger js-delete-material" data-material-id="' + escapeHtmlText(String(row.id || '')) + '" data-project-id="' + escapeHtmlText(String(projectId || '')) + '" data-filename="' + escapeHtmlText(String(row.filename || '')) + '">删除</button></td>';
         }
@@ -26815,14 +27000,28 @@ def index(
           rows.forEach((row) => {
             if (!row || typeof row !== 'object') return;
             const typeKey = String(row.material_type || '').trim() || 'tender_qa';
-            if (!cardsByType[typeKey]) cardsByType[typeKey] = { total: 0, parsed: 0, queued: 0, processing: 0, failed: 0 };
+            if (!cardsByType[typeKey]) cardsByType[typeKey] = {
+              total: 0,
+              parsed: 0,
+              queued: 0,
+              processing: 0,
+              failed: 0,
+              minQueuePosition: 0,
+              routeLabels: [],
+            };
             const bucket = cardsByType[typeKey];
             bucket.total += 1;
-            const status = String(row.parse_status || 'queued').trim().toLowerCase();
+            const status = String(row.parse_effective_status || row.parse_status || 'queued').trim().toLowerCase();
+            const routeLabel = String(row.parse_route_label || '').trim();
+            const queuePosition = Number(row.queue_position || 0);
             if (status === 'parsed') bucket.parsed += 1;
             else if (status === 'processing') bucket.processing += 1;
             else if (status === 'failed') bucket.failed += 1;
             else bucket.queued += 1;
+            if (routeLabel && !bucket.routeLabels.includes(routeLabel)) bucket.routeLabels.push(routeLabel);
+            if (queuePosition > 0 && (bucket.minQueuePosition <= 0 || queuePosition < bucket.minQueuePosition)) {
+              bucket.minQueuePosition = queuePosition;
+            }
           });
           ['tender_qa', 'boq', 'drawing', 'site_photo'].forEach((materialType) => {
             const zoneEl = document.getElementById(materialTypeUploadZoneId(materialType));
@@ -26838,13 +27037,16 @@ def index(
             if (bucket.processing > 0) {
               zoneEl.dataset.health = 'processing';
               stateEl.style.color = '#92400e';
-              stateEl.textContent = '当前状态：解析中 ' + bucket.processing + ' 份；已解析 ' + bucket.parsed + ' 份。';
+              stateEl.textContent = '当前状态：解析中 ' + bucket.processing + ' 份；已解析 ' + bucket.parsed + ' 份。'
+                + (bucket.routeLabels.length ? ' 解析路径：' + String(bucket.routeLabels[0] || '') + '。' : '');
               return;
             }
             if (bucket.queued > 0) {
               zoneEl.dataset.health = 'queued';
               stateEl.style.color = '#475569';
-              stateEl.textContent = '当前状态：排队中 ' + bucket.queued + ' 份；已解析 ' + bucket.parsed + ' 份。';
+              stateEl.textContent = '当前状态：排队中 ' + bucket.queued + ' 份；已解析 ' + bucket.parsed + ' 份。'
+                + (bucket.minQueuePosition > 0 ? ' 最前队列位置：第 ' + String(bucket.minQueuePosition) + ' 位。' : '')
+                + (bucket.routeLabels.length ? ' 解析路径：' + String(bucket.routeLabels[0] || '') + '。' : '');
               return;
             }
             if (bucket.failed > 0 && bucket.parsed <= 0) {

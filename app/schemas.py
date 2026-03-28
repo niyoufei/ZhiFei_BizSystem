@@ -280,6 +280,11 @@ class MaterialRecord(BaseModel):
     parse_version: Optional[str] = None
     structured_summary: Optional[Dict[str, Any]] = None
     job_id: Optional[str] = None
+    parse_effective_status: Optional[str] = None
+    parse_stage_label: Optional[str] = None
+    parse_route_label: Optional[str] = None
+    parse_note: Optional[str] = None
+    queue_position: Optional[int] = None
 
 
 class ProjectCreateFromTenderResponse(BaseModel):
