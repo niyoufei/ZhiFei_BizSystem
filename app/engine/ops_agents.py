@@ -338,6 +338,63 @@ def _self_check_failed_optional_items(payload: Dict[str, Any]) -> List[Dict[str,
     return out
 
 
+def _self_check_item(payload: Dict[str, Any], name: str) -> Optional[Dict[str, Any]]:
+    target = str(name or "").strip()
+    if not target:
+        return None
+    for row in _self_check_failed_items(payload):
+        row_name = str(row.get("name") or "").strip()
+        if row_name == target:
+            return row
+    return None
+
+
+def _parse_bool_detail_flag(detail: Any, key: str) -> Optional[bool]:
+    text = str(detail or "").strip().lower()
+    target = str(key or "").strip().lower()
+    if not text or not target:
+        return None
+    for suffix in ("=true", ":true", ": true"):
+        if f"{target}{suffix}" in text:
+            return True
+    for suffix in ("=false", ":false", ": false"):
+        if f"{target}{suffix}" in text:
+            return False
+    return None
+
+
+def _material_parse_queue_is_busy(payload: Dict[str, Any]) -> bool:
+    failed_names = set(_self_check_failed_names(payload))
+    if not failed_names.intersection(OPS_RUNTIME_RESTART_ITEMS):
+        return False
+    summary = payload.get("summary")
+    if not isinstance(summary, dict):
+        return False
+    parse_summary = summary.get("parse_job_summary")
+    if not isinstance(parse_summary, dict):
+        return False
+    backlog = _to_int(parse_summary.get("backlog"), 0)
+    status_counts = parse_summary.get("status_counts")
+    if not isinstance(status_counts, dict):
+        return False
+    processing = _to_int(status_counts.get("processing"), 0)
+    vision_item = _self_check_item(payload, "vision_parse_queue_healthy")
+    worker_alive = _parse_bool_detail_flag((vision_item or {}).get("detail"), "worker")
+    return worker_alive is True and backlog > 0 and processing > 0
+
+
+def _runtime_restart_items_needing_restart(
+    payload: Dict[str, Any],
+    repairable_names: List[str],
+) -> List[str]:
+    candidates = [name for name in repairable_names if name in OPS_RUNTIME_RESTART_ITEMS]
+    if not candidates:
+        return []
+    if _material_parse_queue_is_busy(payload):
+        return []
+    return candidates
+
+
 def _self_check_item_category(row: Dict[str, Any]) -> str:
     category = str(row.get("category") or "").strip().lower()
     if category:
@@ -701,9 +758,11 @@ def _run_runtime_repair_agent(
     optional_failed_before = _self_check_failed_optional_items(payload_before)
     optional_groups_before = _classify_optional_warning_items(optional_failed_before)
     repairable_before = list(optional_groups_before.get("repairable") or [])
+    restartable_before = _runtime_restart_items_needing_restart(payload_before, repairable_before)
     non_repairable_before = [
         name for name in failed_before if name not in OPS_RUNTIME_REPAIRABLE_ITEMS
     ]
+    async_parse_busy_before = _material_parse_queue_is_busy(payload_before)
 
     if auto_repair and "data_hygiene" in repairable_before:
         repair_resp = requester(
@@ -719,7 +778,7 @@ def _run_runtime_repair_agent(
         }
         checks["data_hygiene_repair"] = repair_resp
 
-    if auto_repair and any(name in OPS_RUNTIME_RESTART_ITEMS for name in repairable_before):
+    if auto_repair and restartable_before:
         actions["restart_runtime"] = _run_restart_command(restart_cmd)
 
     self_check_after = self_check_before
@@ -755,15 +814,19 @@ def _run_runtime_repair_agent(
     optional_failed_after = _self_check_failed_optional_items(payload_after)
     optional_groups_after = _classify_optional_warning_items(optional_failed_after)
     repairable_after = list(optional_groups_after.get("repairable") or [])
+    restartable_after = _runtime_restart_items_needing_restart(payload_after, repairable_after)
     non_repairable_after = [
         name for name in failed_after if name not in OPS_RUNTIME_REPAIRABLE_ITEMS
     ]
+    async_parse_busy_after = _material_parse_queue_is_busy(payload_after)
     auto_fixed = [name for name in failed_before if name not in failed_after]
 
     pass_flag = not failed_after
     warn_flag = False
     if not pass_flag:
         if not repairable_after and not required_failed_after:
+            warn_flag = True
+        elif repairable_after and not restartable_after and async_parse_busy_after:
             warn_flag = True
         elif repairable_after and not auto_repair:
             warn_flag = True
@@ -772,6 +835,11 @@ def _run_runtime_repair_agent(
     if required_failed_after:
         recommendations.append(
             "运行态仍存在必需项失败，说明服务主链异常，建议优先检查 health/ready/self_check 依赖。"
+        )
+    elif repairable_after and not restartable_after and async_parse_busy_after:
+        recommendations.append(
+            "解析队列当前处于繁忙处理态，已跳过自动重启以避免打断多文件上传；"
+            "建议继续观察队列是否持续消化。"
         )
     elif repairable_after:
         recommendations.append(
@@ -817,6 +885,8 @@ def _run_runtime_repair_agent(
             "required_failed_after_count": len(required_failed_after),
             "repairable_before_count": len(repairable_before),
             "repairable_after_count": len(repairable_after),
+            "restartable_before_count": len(restartable_before),
+            "restartable_after_count": len(restartable_after),
             "optional_before_count": len(optional_failed_before),
             "optional_after_count": len(optional_failed_after),
             "non_repairable_before_count": len(non_repairable_before),
@@ -828,6 +898,8 @@ def _run_runtime_repair_agent(
             "optional_data_after_count": len(optional_groups_after.get("data") or []),
             "optional_other_after_count": len(optional_groups_after.get("other") or []),
             "auto_fixed_count": len(auto_fixed),
+            "async_parse_busy_before_count": int(async_parse_busy_before),
+            "async_parse_busy_after_count": int(async_parse_busy_after),
         },
         "recommendations": recommendations,
     }

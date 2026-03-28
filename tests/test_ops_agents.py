@@ -241,6 +241,75 @@ def test_runtime_repair_agent_auto_repairs_data_hygiene_and_async_parse(monkeypa
     assert any("已自动修复" in row for row in result["recommendations"])
 
 
+def test_runtime_repair_agent_skips_restart_for_busy_parse_queue(monkeypatch):
+    def fake_requester(**kwargs):
+        method = str(kwargs.get("method") or "")
+        url = str(kwargs.get("url") or "")
+        if method == "GET" and url.endswith("/api/v1/system/self_check"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "ok": True,
+                    "degraded": True,
+                    "summary": {
+                        "parse_job_summary": {
+                            "backlog": 57,
+                            "status_counts": {
+                                "processing": 20,
+                                "queued": 37,
+                            },
+                        }
+                    },
+                    "items": [
+                        {"name": "health", "ok": True, "required": True},
+                        {
+                            "name": "vision_parse_queue_healthy",
+                            "ok": False,
+                            "required": False,
+                            "detail": "worker=True, backlog=57",
+                        },
+                        {
+                            "name": "material_parse_backlog_ok",
+                            "ok": False,
+                            "required": False,
+                            "detail": "backlog=57",
+                        },
+                    ],
+                },
+                "error": None,
+            }
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    monkeypatch.setattr(
+        oa,
+        "_run_restart_command",
+        lambda restart_cmd: {
+            "attempted": True,
+            "ok": True,
+            "returncode": 0,
+            "error": None,
+        },
+    )
+
+    result = oa._run_runtime_repair_agent(
+        base_url="http://127.0.0.1:8000",
+        api_key=None,
+        timeout=5.0,
+        auto_repair=True,
+        restart_cmd=["./scripts/restart_server.sh"],
+        requester=fake_requester,
+    )
+
+    assert result["status"] == "warn"
+    assert result["actions"]["restart_runtime"]["attempted"] is False
+    assert result["metrics"]["repairable_after_count"] == 2
+    assert result["metrics"]["restartable_after_count"] == 0
+    assert result["metrics"]["async_parse_busy_after_count"] == 1
+    assert any("繁忙处理态" in row for row in result["recommendations"])
+
+
 def test_runtime_repair_agent_warns_on_non_repairable_optional_failures():
     def fake_requester(**kwargs):
         method = str(kwargs.get("method") or "")
