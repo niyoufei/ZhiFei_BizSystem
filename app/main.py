@@ -2999,6 +2999,12 @@ def _clean_project_name_candidate(name: object) -> str:
         "",
         text,
     )
+    text = re.sub(r"\s*([()（）\-、])\s*", r"\1", text)
+    text = re.sub(
+        r"(?<=[\u4e00-\u9fffA-Za-z0-9])\s+(?=[\u4e00-\u9fffA-Za-z0-9])",
+        "",
+        text,
+    )
     return text[:120].rstrip()
 
 

@@ -2247,6 +2247,20 @@ class TestProjectsEndpoints:
             "饮马井路(月谭路-长春路)等3条道路工程"
         )
 
+    def test_infer_project_name_from_tender_normalizes_ocr_spacing_in_project_name(self):
+        preview = """
+[PAGE:9]
+第一章、招标公告
+1.1 项目名称:包河经开区延边路(繁华大道-沈阳路)、月谭路(饮马井
+路-南淝河路)、饮马井路(月谭路-长春路)等3 条道路工程
+"""
+
+        assert (
+            app_main._infer_project_name_from_tender_text(preview, "招标文件正文 (2).pdf")
+            == "包河经开区延边路(繁华大道-沈阳路)、月谭路(饮马井路-南淝河路)、"
+            "饮马井路(月谭路-长春路)等3条道路工程"
+        )
+
     @patch("app.main._read_uploaded_file_preview_for_project_name")
     @patch("app.main.ensure_data_dirs")
     def test_infer_project_name_from_tender_skips_generic_cover_and_uses_real_project_title(
