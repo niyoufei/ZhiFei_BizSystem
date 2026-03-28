@@ -1218,6 +1218,7 @@ class TestIndexEndpoint:
         assert "parse_stage_label" in page
         assert "parse_route_label" in page
         assert "queue_position" in page
+        assert "确认删除该资料文件？\\n\\n" in page
         assert "PROJECT_AUTO_REFRESH_INTERVAL_MS" in page
         assert "visibilitychange" in page
         assert "/materials/parse_status" in page
