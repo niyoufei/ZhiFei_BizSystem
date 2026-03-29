@@ -23275,6 +23275,11 @@ def evolve_project(
         )
         report["enhancement_fallback_used"] = bool(enhanced.get("enhancement_fallback_used"))
         report["enhancement_attempts"] = int(enhanced.get("enhancement_attempts") or 0)
+        report["enhancement_applied"] = bool(enhanced.get("enhancement_applied", True))
+        report["enhancement_governed"] = bool(enhanced.get("enhancement_governed", False))
+        report["enhancement_governance_notes"] = list(
+            enhanced.get("enhancement_governance_notes") or []
+        )
         report["enhancement_review_provider"] = enhanced.get("enhancement_review_provider")
         report["enhancement_review_status"] = str(
             enhanced.get("enhancement_review_status") or "not_run"

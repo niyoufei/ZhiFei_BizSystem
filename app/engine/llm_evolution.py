@@ -213,6 +213,11 @@ def _attach_enhancement_review(
     ground_truth_records: List[Dict[str, Any]],
     project_context: str,
 ) -> None:
+    original_logic = list(report.get("high_score_logic") or [])
+    original_guidance = list(report.get("writing_guidance") or [])
+    result["enhancement_applied"] = True
+    result["enhancement_governed"] = False
+    result["enhancement_governance_notes"] = []
     result["enhancement_review_provider"] = None
     result["enhancement_review_status"] = "not_run"
     result["enhancement_review_similarity"] = None
@@ -252,6 +257,13 @@ def _attach_enhancement_review(
     result["enhancement_review_status"] = "diverged"
     result["enhancement_review_notes"] = [
         f"{review_provider} 复核与主结果差异较大，相似度 {similarity:.2f}；建议人工复核高分逻辑与编制指导。"
+    ]
+    result["high_score_logic"] = original_logic
+    result["writing_guidance"] = original_guidance
+    result["enhancement_applied"] = False
+    result["enhancement_governed"] = True
+    result["enhancement_governance_notes"] = [
+        "主 provider 增强结果与备用 provider 复核分歧过大，已自动回退到规则版高分逻辑与编制指导。"
     ]
 
 

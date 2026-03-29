@@ -284,6 +284,8 @@ class TestEnhanceEvolutionReportWithLlm:
         assert out["enhancement_provider_chain"] == ["openai", "gemini"]
         assert out["enhancement_fallback_used"] is False
         assert out["enhancement_attempts"] == 1
+        assert out["enhancement_applied"] is True
+        assert out["enhancement_governed"] is False
         assert out["enhancement_review_provider"] == "gemini"
         assert out["enhancement_review_status"] == "confirmed"
         assert out["enhancement_review_similarity"] == 1.0
@@ -334,6 +336,11 @@ class TestEnhanceEvolutionReportWithLlm:
         assert out["enhancement_review_provider"] == "gemini"
         assert out["enhancement_review_status"] == "diverged"
         assert (out["enhancement_review_similarity"] or 0) < 0.35
+        assert out["enhancement_applied"] is False
+        assert out["enhancement_governed"] is True
+        assert out["high_score_logic"] == ["a"]
+        assert out["writing_guidance"] == ["b"]
+        assert out["enhancement_governance_notes"]
 
 
 class TestProviderAccountPooling:

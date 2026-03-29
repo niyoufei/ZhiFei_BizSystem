@@ -1282,6 +1282,18 @@ class EvolutionReport(BaseModel):
         0,
         description="本次增强总尝试次数（含同 provider 重试）",
     )
+    enhancement_applied: bool = Field(
+        True,
+        description="本次 LLM 增强结果是否已实际应用到最终进化报告",
+    )
+    enhancement_governed: bool = Field(
+        False,
+        description="本次增强是否因治理规则被保守回退",
+    )
+    enhancement_governance_notes: List[str] = Field(
+        default_factory=list,
+        description="增强治理说明",
+    )
     enhancement_review_provider: Optional[str] = Field(
         None,
         description="用于复核主增强结果的备用 provider：openai | gemini",
