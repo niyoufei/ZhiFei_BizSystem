@@ -444,6 +444,7 @@ DEFAULT_MATERIAL_RETRIEVAL_PER_FILE_QUOTA = 3
 DEFAULT_MIN_MATERIAL_RETRIEVAL_FILE_COVERAGE_RATE = 0.35
 DEFAULT_ENFORCE_UPLOADED_TYPE_COVERAGE = True
 DEFAULT_MIN_UPLOADED_TYPE_COVERAGE_RATE = 1.0
+DEFAULT_MATERIAL_GATE_RATE_TOLERANCE = 0.005
 DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR = 200
 DEFAULT_PDF_OCR_MAX_PAGES = 30
 DEFAULT_MATERIAL_INDEX_CACHE_SIZE = 12
@@ -7173,6 +7174,31 @@ def _evaluate_material_utilization_gate(
     policy: Optional[Dict[str, object]] = None,
     required_types: Optional[List[str]] = None,
 ) -> Dict[str, object]:
+    def _rate_below_threshold(value: Optional[float], threshold: float) -> bool:
+        if value is None:
+            return False
+        return float(value) < (float(threshold) - float(DEFAULT_MATERIAL_GATE_RATE_TOLERANCE))
+
+    def _coverage_allowed_uncovered_count(total: int, threshold: float) -> int:
+        if total <= 0:
+            return 0
+        min_required_hits = max(
+            0,
+            min(
+                total,
+                int(
+                    math.ceil(
+                        max(
+                            0.0,
+                            float(threshold) - float(DEFAULT_MATERIAL_GATE_RATE_TOLERANCE),
+                        )
+                        * float(total)
+                    )
+                ),
+            ),
+        )
+        return max(0, total - min_required_hits)
+
     data = summary if isinstance(summary, dict) else {}
     gate_policy = policy if isinstance(policy, dict) else {}
     enabled = bool(gate_policy.get("enabled", DEFAULT_ENFORCE_MATERIAL_UTILIZATION_GATE))
@@ -7319,15 +7345,16 @@ def _evaluate_material_utilization_gate(
 
     blocking_reasons: List[str] = []
     warning_reasons: List[str] = []
+    retrieval_file_coverage_failed = (
+        retrieval_file_total > 0
+        and retrieval_file_coverage_rate is not None
+        and _rate_below_threshold(retrieval_file_coverage_rate, min_retrieval_file_coverage)
+    )
     if retrieval_total < min_retrieval_total:
         blocking_reasons.append(
             f"资料检索证据数量 {retrieval_total} 低于阈值 {min_retrieval_total}"
         )
-    if (
-        retrieval_file_total > 0
-        and retrieval_file_coverage_rate is not None
-        and retrieval_file_coverage_rate < min_retrieval_file_coverage
-    ):
+    if retrieval_file_coverage_failed:
         blocking_reasons.append(
             "资料检索文件覆盖率 "
             + f"{retrieval_file_coverage_rate:.1%} 低于阈值 {min_retrieval_file_coverage:.1%}"
@@ -7348,17 +7375,31 @@ def _evaluate_material_utilization_gate(
         blocking_reasons.append(
             f"跨资料一致性命中率 {consistency_hit_rate:.1%} 低于阈值 {min_consistency:.1%}"
         )
-    if len(uncovered_required) > max_uncovered:
+    required_presence_failed = required_presence_rate is not None and _rate_below_threshold(
+        required_presence_rate, min_required_presence
+    )
+    required_coverage_failed = required_coverage_rate is not None and _rate_below_threshold(
+        required_coverage_rate, min_required_coverage
+    )
+    allowed_uncovered_by_coverage = _coverage_allowed_uncovered_count(
+        len(required_present),
+        min_required_coverage,
+    )
+    effective_max_uncovered = max(max_uncovered, allowed_uncovered_by_coverage)
+    uncovered_required_failed = len(uncovered_required) > effective_max_uncovered
+    if uncovered_required_failed:
         labels = "、".join(_material_type_label(x) for x in uncovered_required)
-        blocking_reasons.append(f"关键资料未形成证据：{labels}（允许未覆盖 {max_uncovered} 类）")
-    if required_presence_rate is not None and required_presence_rate < min_required_presence:
+        blocking_reasons.append(
+            f"关键资料未形成证据：{labels}（允许未覆盖 {effective_max_uncovered} 类）"
+        )
+    if required_presence_failed:
         labels = "、".join(_material_type_label(x) for x in missing_required_upload)
         blocking_reasons.append(
             "关键资料上传覆盖率 "
             + f"{required_presence_rate:.1%} 低于阈值 {min_required_presence:.1%}"
             + (f"，缺少：{labels}" if labels else "")
         )
-    if required_coverage_rate is not None and required_coverage_rate < min_required_coverage:
+    if required_coverage_failed:
         blocking_reasons.append(
             f"关键资料覆盖率 {required_coverage_rate:.1%} 低于阈值 {min_required_coverage:.1%}"
         )
@@ -7367,12 +7408,13 @@ def _evaluate_material_utilization_gate(
         for material_type in uncovered_uploaded_types
         if material_type not in normalized_required
     ]
-    if (
+    uploaded_type_coverage_failed = (
         enforce_uploaded_type_coverage
         and uploaded_type_coverage_rate is not None
-        and uploaded_type_coverage_rate < min_uploaded_type_coverage
+        and _rate_below_threshold(uploaded_type_coverage_rate, min_uploaded_type_coverage)
         and optional_uncovered_uploaded_types
-    ):
+    )
+    if uploaded_type_coverage_failed:
         labels = "、".join(_material_type_label(x) for x in optional_uncovered_uploaded_types)
         warning_reasons.append(
             "已上传的补充资料暂未形成证据："
@@ -7414,6 +7456,7 @@ def _evaluate_material_utilization_gate(
             "min_required_type_presence_rate": min_required_presence,
             "min_required_type_coverage_rate": min_required_coverage,
             "min_uploaded_type_coverage_rate": min_uploaded_type_coverage,
+            "rate_tolerance": DEFAULT_MATERIAL_GATE_RATE_TOLERANCE,
         },
         "required_types": normalized_required,
         "required_types_missing_upload": missing_required_upload,
@@ -7428,6 +7471,11 @@ def _evaluate_material_utilization_gate(
         "uncovered_uploaded_types": uncovered_uploaded_types,
         "optional_uncovered_uploaded_types": optional_uncovered_uploaded_types,
         "uploaded_type_coverage_rate": uploaded_type_coverage_rate,
+        "required_presence_failed": required_presence_failed,
+        "required_coverage_failed": required_coverage_failed,
+        "uncovered_required_failed": uncovered_required_failed,
+        "uploaded_type_coverage_failed": uploaded_type_coverage_failed,
+        "retrieval_file_coverage_failed": retrieval_file_coverage_failed,
         "metrics": {
             "retrieval_total": retrieval_total,
             "retrieval_hit_rate": retrieval_hit_rate,
@@ -9202,11 +9250,31 @@ def _ensure_report_score_self_awareness(
         meta = {}
         report["meta"] = meta
     _ensure_report_material_usage_metadata(report)
+    gate = _normalize_material_utilization_gate_state(
+        (
+            meta.get("material_utilization_gate")
+            if isinstance(meta.get("material_utilization_gate"), dict)
+            else {}
+        )
+    )
+    if gate:
+        meta["material_utilization_gate"] = gate
     awareness = meta.get("score_self_awareness")
+    expected_gate_state = (
+        "blocked"
+        if bool(gate.get("blocked"))
+        else ("warned" if bool(gate.get("warned")) else "normal")
+    )
     if isinstance(awareness, dict) and awareness:
-        if not meta.get("score_confidence_level"):
-            meta["score_confidence_level"] = str(awareness.get("level") or "low")
-        return awareness
+        existing_state = str(awareness.get("state") or "").strip().lower()
+        stale_gate_state = existing_state not in {"", expected_gate_state}
+        stale_block_reason = expected_gate_state != "blocked" and any(
+            "资料利用门禁阻断" in str(item or "") for item in (awareness.get("reasons") or [])
+        )
+        if not stale_gate_state and not stale_block_reason:
+            if not meta.get("score_confidence_level"):
+                meta["score_confidence_level"] = str(awareness.get("level") or "low")
+            return awareness
     knowledge_snapshot = material_knowledge_snapshot
     if knowledge_snapshot is None and project_id:
         try:
@@ -31384,8 +31452,7 @@ def index(
           }
           if (
             gate && gate.enabled && requiredPresentCount > 0
-            && gate.required_type_coverage_rate != null
-            && Number(gate.required_type_coverage_rate) < Number(gateThresholds.min_required_type_coverage_rate || 0)
+            && gate.required_coverage_failed
           ) {
             primaryHighlights.push(
               '关键资料覆盖 ' + toPct(gate.required_type_coverage_rate)
@@ -31394,8 +31461,7 @@ def index(
           }
           if (
             gate && gate.enabled && uploadedTypeCount > 0
-            && gate.uploaded_type_coverage_rate != null
-            && Number(gate.uploaded_type_coverage_rate) < Number(gateThresholds.min_uploaded_type_coverage_rate || 0)
+            && gate.uploaded_type_coverage_failed
           ) {
             primaryHighlights.push(
               '已上传类型覆盖 ' + toPct(gate.uploaded_type_coverage_rate)

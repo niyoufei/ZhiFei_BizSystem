@@ -6100,6 +6100,92 @@ class TestMaterialAdvancedParsing:
         assert "site_photo" in (gate.get("optional_uncovered_uploaded_types") or [])
         assert any("已上传的补充资料暂未形成证据" in str(x) for x in (gate.get("reasons") or []))
 
+    def test_evaluate_material_utilization_gate_tolerates_two_of_three_required_types(self):
+        from app.main import _evaluate_material_utilization_gate
+
+        summary = {
+            "retrieval_total": 10,
+            "retrieval_hit_rate": 0.8,
+            "retrieval_file_total": 6,
+            "retrieval_file_coverage_rate": 0.8,
+            "consistency_total": 6,
+            "consistency_hit_rate": 0.8,
+            "available_types": ["tender_qa", "boq", "drawing"],
+            "uncovered_types": ["boq"],
+        }
+        policy = {
+            "enabled": True,
+            "mode": "block",
+            "min_retrieval_total": 2,
+            "min_retrieval_hit_rate": 0.2,
+            "min_retrieval_file_coverage_rate": 0.2,
+            "min_consistency_hit_rate": 0.2,
+            "max_uncovered_required_types": 0,
+            "min_required_type_presence_rate": 0.0,
+            "min_required_type_coverage_rate": 0.67,
+        }
+        gate = _evaluate_material_utilization_gate(
+            summary,
+            policy=policy,
+            required_types=["tender_qa", "boq", "drawing"],
+        )
+        assert gate["required_type_coverage_rate"] == pytest.approx(0.6667, abs=1e-4)
+        assert gate["blocked"] is False
+        assert gate["passed"] is True
+        assert gate["required_coverage_failed"] is False
+        assert gate["uncovered_required_failed"] is False
+
+    def test_ensure_report_score_self_awareness_recomputes_when_gate_state_changes(self):
+        from app.main import _ensure_report_score_self_awareness
+
+        report = {
+            "total_score": 85.39,
+            "rule_total_score": 13.89,
+            "meta": {
+                "material_utilization_gate": {
+                    "enabled": True,
+                    "mode": "block",
+                    "thresholds": {
+                        "min_retrieval_total": 0,
+                        "min_retrieval_file_coverage_rate": 0.35,
+                        "min_retrieval_hit_rate": 0.25,
+                        "min_consistency_hit_rate": 0.25,
+                        "max_uncovered_required_types": 0,
+                        "min_required_type_presence_rate": 0.0,
+                        "min_required_type_coverage_rate": 0.67,
+                        "min_uploaded_type_coverage_rate": 1.0,
+                    },
+                    "metrics": {
+                        "retrieval_total": 34,
+                        "retrieval_hit_rate": 0.3,
+                        "retrieval_file_total": 6,
+                        "retrieval_file_coverage_rate": 0.6,
+                        "consistency_total": 4,
+                        "consistency_hit_rate": 0.5,
+                    },
+                    "required_types": ["tender_qa", "boq", "drawing"],
+                    "uploaded_types": ["tender_qa", "boq", "drawing", "site_photo"],
+                    "uncovered_uploaded_types": ["boq"],
+                },
+                "score_self_awareness": {
+                    "level": "low",
+                    "score_0_100": 18.0,
+                    "state": "blocked",
+                    "reasons": ["资料利用门禁阻断"],
+                },
+                "evidence_trace": {
+                    "mandatory_hit_rate": 0.3146,
+                    "source_files_hit_count": 6,
+                },
+            },
+        }
+
+        awareness = _ensure_report_score_self_awareness(report, material_knowledge_snapshot={})
+
+        assert awareness["state"] == "normal"
+        assert "资料利用门禁阻断" not in (awareness.get("reasons") or [])
+        assert report["meta"]["material_utilization_gate"]["blocked"] is False
+
     def test_resolve_material_utilization_policy_defaults_to_nonzero_file_coverage(self):
         from app.main import _resolve_material_utilization_policy
 
