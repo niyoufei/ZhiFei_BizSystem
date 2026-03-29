@@ -14574,8 +14574,9 @@ def _delete_project_cascade(project_id: str, *, locale: str = "zh") -> Dict[str,
     """
     ensure_data_dirs()
     projects = load_projects()
-    target = next((p for p in projects if str(p.get("id")) == project_id), None)
-    if target is None:
+    try:
+        target = _find_project(project_id, projects)
+    except HTTPException:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
     target_name = str(target.get("name") or project_id)
     target_profile_id = str(target.get("expert_profile_id") or "")

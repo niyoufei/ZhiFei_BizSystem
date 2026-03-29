@@ -1564,21 +1564,22 @@ def test_tender_project_flow_agent_smoke_success():
         files = kwargs.get("files") or []
         if method == "POST" and url.endswith("/api/v1/projects/create_from_tender"):
             assert files and files[0]["filename"] == "ops_tender_smoke.txt"
+            assert "项目名称：OPS招标项目1工程" in str(files[0]["content"])
             state["created"] = True
             return {
                 "ok": True,
                 "status_code": 200,
                 "elapsed_ms": 1200,
                 "json": {
-                    "project": {"id": "ops-tender-p1", "name": "OPS招标项目_1"},
-                    "inferred_name": "OPS招标项目_1",
+                    "project": {"id": "ops-tender-p1", "name": "OPS招标项目1工程"},
+                    "inferred_name": "OPS招标项目1工程",
                 },
                 "error": None,
             }
         if method == "GET" and url.endswith("/api/v1/projects"):
             rows = [{"id": "p1", "name": "项目1"}]
             if state["created"] and not state["deleted"]:
-                rows.append({"id": "ops-tender-p1", "name": "OPS招标项目_1"})
+                rows.append({"id": "ops-tender-p1", "name": "OPS招标项目1工程"})
             return {
                 "ok": True,
                 "status_code": 200,

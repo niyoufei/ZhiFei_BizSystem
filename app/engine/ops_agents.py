@@ -1133,7 +1133,7 @@ def _run_tender_project_flow_agent(
     started = time.monotonic()
     checks: Dict[str, Any] = {}
     actions: Dict[str, Any] = {"create_from_tender": {}, "delete": {}}
-    smoke_name = f"OPS招标项目_{int(time.time() * 1000)}"
+    smoke_name = f"OPS招标项目{int(time.time() * 1000)}工程"
     create_resp = requester(
         method="POST",
         url=f"{base_url}/api/v1/projects/create_from_tender",

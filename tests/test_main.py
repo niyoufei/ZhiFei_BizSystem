@@ -7,6 +7,7 @@ import os
 import re
 import tempfile
 from collections import Counter
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
@@ -1551,6 +1552,80 @@ class TestWebFallbackOps:
         assert "msg_type=success" in location
         assert "project_id" not in location
         mock_delete.assert_called_once()
+
+    def test_delete_project_cascade_recovers_missing_project_record(self):
+        target = {
+            "id": "p-recovered",
+            "name": "OPS招标项目1工程",
+            "meta": {},
+            "region": "合肥",
+            "expert_profile_id": "",
+            "qingtian_model_version": "qingtian-2026.02",
+            "scoring_engine_version_locked": "v2.0.0",
+            "calibrator_version_locked": None,
+            "status": "scoring_preparation",
+            "created_at": "2026-03-29T00:00:00+00:00",
+            "updated_at": "2026-03-29T00:00:00+00:00",
+        }
+
+        with ExitStack() as stack:
+            stack.enter_context(patch("app.main.ensure_data_dirs"))
+            stack.enter_context(patch("app.main.load_projects", return_value=[]))
+            mock_find_project = stack.enter_context(
+                patch("app.main._find_project", return_value=target)
+            )
+            stack.enter_context(patch("app.main.save_projects"))
+            stack.enter_context(
+                patch(
+                    "app.main.load_materials",
+                    return_value=[
+                        {
+                            "id": "m1",
+                            "project_id": "p-recovered",
+                            "path": "/tmp/missing-material.txt",
+                        }
+                    ],
+                )
+            )
+            stack.enter_context(patch("app.main.save_materials"))
+            stack.enter_context(patch("app.main.load_material_parse_jobs", return_value=[]))
+            stack.enter_context(patch("app.main.save_material_parse_jobs"))
+            stack.enter_context(patch("app.main._invalidate_material_index_cache"))
+            stack.enter_context(patch("app.main.load_submissions", return_value=[]))
+            stack.enter_context(patch("app.main.save_submissions"))
+            stack.enter_context(patch("app.main.load_score_reports", return_value=[]))
+            stack.enter_context(patch("app.main.save_score_reports"))
+            stack.enter_context(patch("app.main._load_evidence_units_safe", return_value=[]))
+            stack.enter_context(patch("app.main.save_evidence_units"))
+            stack.enter_context(patch("app.main.load_qingtian_results", return_value=[]))
+            stack.enter_context(patch("app.main.save_qingtian_results"))
+            stack.enter_context(patch("app.main.load_delta_cases", return_value=[]))
+            stack.enter_context(patch("app.main.save_delta_cases"))
+            stack.enter_context(patch("app.main.load_calibration_samples", return_value=[]))
+            stack.enter_context(patch("app.main.save_calibration_samples"))
+            stack.enter_context(patch("app.main.load_patch_packages", return_value=[]))
+            stack.enter_context(patch("app.main.save_patch_packages"))
+            stack.enter_context(patch("app.main.load_patch_deployments", return_value=[]))
+            stack.enter_context(patch("app.main.save_patch_deployments"))
+            stack.enter_context(patch("app.main.load_project_anchors", return_value=[]))
+            stack.enter_context(patch("app.main.save_project_anchors"))
+            stack.enter_context(patch("app.main.load_project_requirements", return_value=[]))
+            stack.enter_context(patch("app.main.save_project_requirements"))
+            stack.enter_context(patch("app.main.load_learning_profiles", return_value=[]))
+            stack.enter_context(patch("app.main.save_learning_profiles"))
+            stack.enter_context(patch("app.main.load_score_history", return_value=[]))
+            stack.enter_context(patch("app.main.save_score_history"))
+            stack.enter_context(patch("app.main.load_project_context", return_value={}))
+            stack.enter_context(patch("app.main.save_project_context"))
+            stack.enter_context(patch("app.main.load_ground_truth", return_value=[]))
+            stack.enter_context(patch("app.main.save_ground_truth"))
+            stack.enter_context(patch("app.main.load_evolution_reports", return_value={}))
+            stack.enter_context(patch("app.main.save_evolution_reports"))
+            result = app_main._delete_project_cascade("p-recovered")
+
+        assert result["project_id"] == "p-recovered"
+        assert result["project_name"] == "OPS招标项目1工程"
+        mock_find_project.assert_called_once()
 
     def test_web_upload_materials_requires_file(self, client):
         response = client.post(
