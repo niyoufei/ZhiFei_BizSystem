@@ -1820,6 +1820,9 @@ def _run_learning_calibration_agent(
                 "bootstrap_active_count": 0,
                 "bootstrap_monitoring_count": 0,
                 "bootstrap_review_failed_count": 0,
+                "llm_status_unavailable_count": 0,
+                "llm_provider_degraded_count": 0,
+                "llm_fallback_unavailable_count": 0,
                 "enhancement_review_diverged_count": 0,
                 "enhancement_governed_count": 0,
                 "patch_deployed_count": 0,
@@ -1831,6 +1834,32 @@ def _run_learning_calibration_agent(
         }
 
     checks: List[Dict[str, Any]] = []
+    llm_status_resp = requester(
+        method="GET",
+        url=f"{base_url}/api/v1/config/llm_status",
+        api_key=api_key,
+        timeout=timeout,
+    )
+    llm_status_unavailable_count = 0
+    llm_provider_degraded_count = 0
+    llm_fallback_unavailable_count = 0
+    if int(llm_status_resp.get("status_code") or 0) != 200:
+        llm_status_unavailable_count = 1
+    else:
+        llm_status_payload = _json_object(llm_status_resp.get("json"))
+        provider_health = {
+            str(key): str(value or "").strip().lower()
+            for key, value in _json_object(llm_status_payload.get("provider_health")).items()
+        }
+        llm_provider_degraded_count = sum(
+            1 for value in provider_health.values() if value and value != "healthy"
+        )
+        provider_chain = [
+            str(item or "").strip() for item in llm_status_payload.get("provider_chain") or []
+        ]
+        if len([item for item in provider_chain if item]) < 2:
+            llm_fallback_unavailable_count = 1
+
     evolve_actions: List[Dict[str, Any]] = []
     reflection_actions: List[Dict[str, Any]] = []
     mature_projects = 0
@@ -2155,10 +2184,23 @@ def _run_learning_calibration_agent(
         and evolve_cooldown_skipped_count == 0
         and reflection_cooldown_skipped_count == 0
         and enhancement_review_diverged_count == 0
+        and llm_status_unavailable_count == 0
+        and llm_provider_degraded_count == 0
+        and llm_fallback_unavailable_count == 0
     )
     warn_flag = total_failure_count == 0 and not pass_flag
 
     recommendations: List[str] = []
+    if llm_status_unavailable_count > 0:
+        recommendations.append("无法读取 LLM 池状态，学习进化链的 provider 退化风险当前不可见。")
+    if llm_provider_degraded_count > 0:
+        recommendations.append(
+            f"有 {llm_provider_degraded_count} 个 LLM provider 当前处于 cooldown，系统虽可自动切换，但建议继续观察账号池稳定性。"
+        )
+    if llm_fallback_unavailable_count > 0:
+        recommendations.append(
+            "当前学习进化仅剩单 provider 可用，跨 provider fallback 与双模型复核暂时不可用。"
+        )
     if total_failure_count > 0:
         recommendations.append(
             f"学习校准链路存在 {total_failure_count} 处执行/复核失败，建议检查 reflection 日志与项目治理产物。"
@@ -2214,7 +2256,11 @@ def _run_learning_calibration_agent(
         "name": "learning_calibration",
         "status": _status(pass_flag, warn_flag=warn_flag),
         "duration_ms": int((time.monotonic() - started) * 1000),
-        "checks": {"projects": projects_resp, "projects_health": checks[:20]},
+        "checks": {
+            "projects": projects_resp,
+            "llm_status": llm_status_resp,
+            "projects_health": checks[:20],
+        },
         "actions": {
             "evolve": evolve_actions[:20],
             "reflection_auto_run": reflection_actions[:20],
@@ -2247,6 +2293,9 @@ def _run_learning_calibration_agent(
             "bootstrap_active_count": bootstrap_active_count,
             "bootstrap_monitoring_count": bootstrap_monitoring_count,
             "bootstrap_review_failed_count": bootstrap_review_failed_count,
+            "llm_status_unavailable_count": llm_status_unavailable_count,
+            "llm_provider_degraded_count": llm_provider_degraded_count,
+            "llm_fallback_unavailable_count": llm_fallback_unavailable_count,
             "enhancement_review_diverged_count": enhancement_review_diverged_count,
             "enhancement_governed_count": enhancement_governed_count,
             "patch_deployed_count": patch_deployed_count,

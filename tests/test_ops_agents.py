@@ -6,6 +6,33 @@ from pathlib import Path
 from app.engine import ops_agents as oa
 
 
+def _ok_llm_status_response(
+    *,
+    provider_health: dict[str, str] | None = None,
+    provider_chain: list[str] | None = None,
+) -> dict:
+    chain = provider_chain if provider_chain is not None else ["openai", "gemini"]
+    health = (
+        provider_health
+        if provider_health is not None
+        else {"openai": "healthy", "gemini": "healthy"}
+    )
+    return {
+        "ok": True,
+        "status_code": 200,
+        "elapsed_ms": 1,
+        "json": {
+            "evolution_backend": chain[0] if chain else "rules",
+            "requested_backend": "auto",
+            "provider_chain": chain,
+            "provider_health": health,
+            "openai_account_count": 4,
+            "gemini_account_count": 2,
+        },
+        "error": None,
+    }
+
+
 def test_run_ops_agents_cycle_short_circuit_on_sre_fail(monkeypatch):
     monkeypatch.setattr(
         oa,
@@ -682,6 +709,8 @@ def test_learning_calibration_agent_auto_runs_evolve_and_reflection():
     def fake_requester(**kwargs):
         method = str(kwargs.get("method") or "")
         url = str(kwargs.get("url") or "")
+        if method == "GET" and url.endswith("/api/v1/config/llm_status"):
+            return _ok_llm_status_response()
         if method == "GET" and url.endswith("/api/v1/projects"):
             return {
                 "ok": True,
@@ -797,6 +826,8 @@ def test_learning_calibration_agent_respects_project_single_sample_threshold():
     def fake_requester(**kwargs):
         method = str(kwargs.get("method") or "")
         url = str(kwargs.get("url") or "")
+        if method == "GET" and url.endswith("/api/v1/config/llm_status"):
+            return _ok_llm_status_response()
         if method == "GET" and url.endswith("/api/v1/projects"):
             return {
                 "ok": True,
@@ -902,6 +933,8 @@ def test_learning_calibration_agent_warns_when_manual_confirmation_required():
     def fake_requester(**kwargs):
         method = str(kwargs.get("method") or "")
         url = str(kwargs.get("url") or "")
+        if method == "GET" and url.endswith("/api/v1/config/llm_status"):
+            return _ok_llm_status_response()
         if method == "GET" and url.endswith("/api/v1/projects"):
             return {
                 "ok": True,
@@ -977,6 +1010,8 @@ def test_learning_calibration_agent_respects_recent_reflection_cooldown():
     def fake_requester(**kwargs):
         method = str(kwargs.get("method") or "")
         url = str(kwargs.get("url") or "")
+        if method == "GET" and url.endswith("/api/v1/config/llm_status"):
+            return _ok_llm_status_response()
         if method == "GET" and url.endswith("/api/v1/projects"):
             return {
                 "ok": True,
@@ -1058,6 +1093,8 @@ def test_learning_calibration_agent_reports_bootstrap_review_failures():
     def fake_requester(**kwargs):
         method = str(kwargs.get("method") or "")
         url = str(kwargs.get("url") or "")
+        if method == "GET" and url.endswith("/api/v1/config/llm_status"):
+            return _ok_llm_status_response()
         if method == "GET" and url.endswith("/api/v1/projects"):
             return {
                 "ok": True,
@@ -1146,6 +1183,8 @@ def test_learning_calibration_agent_warns_when_enhancement_review_diverged():
     def fake_requester(**kwargs):
         method = str(kwargs.get("method") or "")
         url = str(kwargs.get("url") or "")
+        if method == "GET" and url.endswith("/api/v1/config/llm_status"):
+            return _ok_llm_status_response()
         if method == "GET" and url.endswith("/api/v1/projects"):
             return {
                 "ok": True,
@@ -1213,6 +1252,84 @@ def test_learning_calibration_agent_warns_when_enhancement_review_diverged():
     assert result["metrics"]["enhancement_review_diverged_count"] == 1
     assert result["metrics"]["enhancement_governed_count"] == 1
     assert any("双模型分歧" in row for row in result["recommendations"])
+
+
+def test_learning_calibration_agent_warns_when_llm_pool_is_degraded():
+    recent_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+
+    def fake_requester(**kwargs):
+        method = str(kwargs.get("method") or "")
+        url = str(kwargs.get("url") or "")
+        if method == "GET" and url.endswith("/api/v1/config/llm_status"):
+            return _ok_llm_status_response(
+                provider_health={"openai": "cooldown", "gemini": "healthy"},
+                provider_chain=["gemini", "openai"],
+            )
+        if method == "GET" and url.endswith("/api/v1/projects"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": [
+                    {
+                        "id": "p1",
+                        "name": "真实项目A",
+                        "status": "submitted_to_qingtian",
+                        "updated_at": recent_iso,
+                    }
+                ],
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/evolution/health"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "ground_truth_count": 3,
+                        "eligible_learning_ground_truth_count": 3,
+                        "matched_prediction_count": 3,
+                        "guardrail_blocked_count": 0,
+                        "has_evolved_multipliers": True,
+                        "evolution_weights_usable": True,
+                    },
+                    "drift": {"level": "low"},
+                },
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/feedback/governance"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "manual_confirmation_required": False,
+                        "few_shot_pending_review_count": 0,
+                    },
+                    "score_preview": {
+                        "current_calibrator_version": "calib_auto_existing",
+                    },
+                    "version_history": [],
+                },
+                "error": None,
+            }
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    result = oa._run_learning_calibration_agent(
+        base_url="http://127.0.0.1:8000",
+        api_key=None,
+        timeout=5.0,
+        auto_evolve=True,
+        min_samples=1,
+        requester=fake_requester,
+    )
+
+    assert result["status"] == "warn"
+    assert result["metrics"]["llm_provider_degraded_count"] == 1
+    assert result["metrics"]["llm_fallback_unavailable_count"] == 0
+    assert any("provider 当前处于 cooldown" in row for row in result["recommendations"])
 
 
 def test_ensure_agent_coverage_backfills_missing_agents():
