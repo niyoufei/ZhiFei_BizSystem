@@ -1349,8 +1349,26 @@ class TestIndexEndpoint:
         assert "let shigongSubmitIntent = 'upload';" in page
         assert "const uploadedSubmissions = [];" in page
         assert "upsertSubmissionRowsImmediately(projectId, uploadedSubmissions);" in page
+        assert (
+            "const uploadSummary = '施组上传完成：成功 ' + okCount + '，失败 ' + failCount + '。';"
+            in page
+        )
+        assert "let visibleConfirmed = false;" in page
+        assert "await ensureUploadedSubmissionsVisible(" in page
+        assert "hasUploadedSubmissionsVisible(refreshedSubs, uploadedSubmissions);" in page
+        assert "已显示到施组列表，可直接继续评分。" in page
+        assert "系统会继续自动刷新。" in page
         assert "await waitForNextPaint();" in page
         assert "function waitForNextPaint()" in page
+        assert "function buildSubmissionVisibilityKey(submission)" in page
+        assert (
+            "function hasUploadedSubmissionsVisible(currentSubmissions, expectedSubmissions)"
+            in page
+        )
+        assert (
+            "async function ensureUploadedSubmissionsVisible(projectId, expectedSubmissions, switchSeq, options=null)"
+            in page
+        )
         assert "function upsertSubmissionRowsImmediately(projectId, submissions)" in page
         assert "function triggerOptimizationReportAction(projectId='', options=null)" in page
         assert "function describeSelectedFiles(files, emptyText = '未选择任何文件')" in page

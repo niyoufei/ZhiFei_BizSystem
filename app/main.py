@@ -28945,12 +28945,20 @@ def index(
                 details.push('[失败] ' + f.name + ' -> ' + String((err && err.message) || err || '网络异常'));
               }
             }
-            if (o) o.textContent = '施组上传完成：成功 ' + okCount + '，失败 ' + failCount + '。成功文件已入库，待点击“评分施组”后出分。' + NL + details.join(NL);
+            const uploadSummary = '施组上传完成：成功 ' + okCount + '，失败 ' + failCount + '。';
+            if (o) {
+              o.textContent = uploadSummary
+                + (okCount > 0
+                  ? ' 成功文件已入库，正在同步施组列表。'
+                  : ' 未有成功上传文件。')
+                + (details.length ? (NL + details.join(NL)) : '');
+            }
             setActionStatus(
               'shigongActionStatus',
-              '上传完成：成功 ' + okCount + '，失败 ' + failCount + '。成功文件待评分。',
+              uploadSummary + (okCount > 0 ? '正在同步施组列表…' : '未有成功上传文件。'),
               failCount > 0
             );
+            let visibleConfirmed = false;
             if (okCount > 0) {
               upsertSubmissionRowsImmediately(projectId, uploadedSubmissions);
             }
@@ -28958,8 +28966,13 @@ def index(
               if (fileInput && failCount === 0) fileInput.value = '';
               if (fileInput && fileInput.id) updateFilePickerText(fileInput.id, fileInput.id + 'Name');
               await waitForNextPaint();
+              const refreshedSubs = await ensureUploadedSubmissionsVisible(
+                projectId,
+                uploadedSubmissions,
+                projectSwitchSeq
+              );
+              visibleConfirmed = hasUploadedSubmissionsVisible(refreshedSubs, uploadedSubmissions);
               await Promise.all([
-                refreshSubmissions(projectId, projectSwitchSeq),
                 (typeof refreshScoringDiagnostic === 'function')
                   ? refreshScoringDiagnostic(projectId, projectSwitchSeq)
                   : Promise.resolve(),
@@ -28967,6 +28980,18 @@ def index(
             } else {
               if (fileInput && fileInput.id) updateFilePickerText(fileInput.id, fileInput.id + 'Name');
             }
+            const finalStatus = uploadSummary
+              + (okCount > 0
+                ? (
+                  visibleConfirmed
+                    ? '已显示到施组列表，可直接继续评分。'
+                    : '已入库，列表同步稍有延迟，系统会继续自动刷新。'
+                )
+                : '未有成功上传文件。');
+            if (o) {
+              o.textContent = finalStatus + (details.length ? (NL + details.join(NL)) : '');
+            }
+            setActionStatus('shigongActionStatus', finalStatus, failCount > 0);
           } finally {
             uploadShigongInFlight = false;
           }
@@ -29087,6 +29112,51 @@ def index(
             }
             setTimeout(resolve, 0);
           });
+        }
+        function buildSubmissionVisibilityKey(submission) {
+          const row = (submission && typeof submission === 'object') ? submission : {};
+          const id = String(row.id || '').trim();
+          if (id) return 'id:' + id;
+          const filename = String(row.filename || '').trim();
+          const createdAt = String(row.created_at || '').trim();
+          if (!filename) return '';
+          return 'file:' + filename + '|' + createdAt;
+        }
+        function hasUploadedSubmissionsVisible(currentSubmissions, expectedSubmissions) {
+          const currentRows = Array.isArray(currentSubmissions) ? currentSubmissions : [];
+          const expectedRows = Array.isArray(expectedSubmissions) ? expectedSubmissions : [];
+          if (!expectedRows.length) return true;
+          const currentKeys = new Set(
+            currentRows
+              .map((row) => buildSubmissionVisibilityKey(row))
+              .filter((key) => !!key)
+          );
+          return expectedRows.every((row) => {
+            const key = buildSubmissionVisibilityKey(row);
+            return !!key && currentKeys.has(key);
+          });
+        }
+        async function ensureUploadedSubmissionsVisible(projectId, expectedSubmissions, switchSeq, options=null) {
+          const opts = (options && typeof options === 'object') ? options : {};
+          const maxAttempts = Math.max(1, Number(opts.maxAttempts || 5));
+          const retryDelayMs = Math.max(150, Number(opts.retryDelayMs || 350));
+          let latestRows = Array.isArray(cachedProjectSubmissions[String(projectId || '')])
+            ? cachedProjectSubmissions[String(projectId || '')]
+            : [];
+          if (!projectId || !Array.isArray(expectedSubmissions) || !expectedSubmissions.length) {
+            return latestRows;
+          }
+          for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+            latestRows = await refreshSubmissions(projectId, switchSeq);
+            if (hasUploadedSubmissionsVisible(latestRows, expectedSubmissions)) {
+              return latestRows;
+            }
+            if (attempt + 1 >= maxAttempts || isStaleProjectResponse(projectId, switchSeq)) {
+              break;
+            }
+            await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+          }
+          return latestRows;
         }
         function upsertSubmissionRowsImmediately(projectId, submissions) {
           const rows = Array.isArray(submissions)
@@ -29312,7 +29382,7 @@ def index(
             if (typeof clearScoringReadinessPanel === 'function') clearScoringReadinessPanel();
             if (typeof clearScoringDiagnosticPanel === 'function') clearScoringDiagnosticPanel();
             clearSubmissionDualTrackOverview();
-            return;
+            return [];
           }
           let res;
           try {
@@ -29325,9 +29395,9 @@ def index(
             }
             delete cachedProjectSubmissions[String(id || '')];
             clearSubmissionDualTrackOverview();
-            return;
+            return [];
           }
-          if (isStaleProjectResponse(id, switchSeq)) return;
+          if (isStaleProjectResponse(id, switchSeq)) return [];
           const subs = await res.json().catch(() => []);
           if (!res.ok) {
             if (emptyEl) {
@@ -29339,7 +29409,7 @@ def index(
             clearSubmissionDualTrackOverview();
             if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             await refreshGroundTruthSubmissionOptions(id, switchSeq, []);
-            return;
+            return [];
           }
           if (!Array.isArray(subs) || subs.length === 0) {
             if (tbody) tbody.innerHTML = '';
@@ -29352,7 +29422,7 @@ def index(
             clearSubmissionDualTrackOverview();
             if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             await refreshGroundTruthSubmissionOptions(id, switchSeq, []);
-            return;
+            return [];
           }
           cachedProjectSubmissions[String(id || '')] = subs;
           if (emptyEl) emptyEl.style.display = 'none';
@@ -29388,6 +29458,7 @@ def index(
           updateTableEmptyState('submissionsTable', 'submissionsEmpty');
           if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
           await refreshGroundTruthSubmissionOptions(id, switchSeq, subs);
+          return subs;
         }
         function groundTruthSubmissionStatusLabel(status) {
           const raw = String(status || '').toLowerCase();
