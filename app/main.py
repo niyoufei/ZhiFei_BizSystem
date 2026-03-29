@@ -24702,6 +24702,9 @@ def index(
 
       <div class="section card">
         <h2>1) 创建项目</h2>
+        <div class="toolbar" style="margin-bottom:8px">
+          <button type="button" id="btnStartNewProject" class="secondary">开始新项目</button>
+        </div>
         <form id="createProject" method="post" action="/web/create_project" class="create-project-form">
           <input type="hidden" name="api_key" id="createProjectApiKey" value="" />
           <span class="field-label">项目名称：</span><input id="createProjectNameInput" class="project-name-input primary-input" name="name" placeholder="例如：XX标段施组评审" autocomplete="off" value="__CREATE_PROJECT_NAME_VALUE__" title="__CREATE_PROJECT_NAME_VALUE__" />
@@ -24726,7 +24729,6 @@ def index(
         <h2>2) 选择项目</h2>
         <div class="toolbar">
           <button type="button" id="refreshProjects" class="compact-hidden">刷新项目列表</button>
-          <button type="button" id="btnStartNewProject" class="secondary">开始新项目</button>
           <span class="field-label tight" style="margin-left:4px">项目：</span>
           <select id="projectSelect" class="project-select-input wide-select">
             <option value="">-- 请选择项目 --</option>
@@ -24757,18 +24759,6 @@ def index(
         </div>
         <p id="projectListMeta" style="margin:8px 0 0 0;font-size:12px;color:#64748b"></p>
         <p id="currentProjectTag" class="current-project-text" style="margin:6px 0 0 0"></p>
-        <div class="toolbar" style="margin-top:8px;gap:8px">
-          <span class="field-label tight">纠正项目名：</span>
-          <input
-            type="text"
-            id="renameProjectNameInput"
-            class="project-name-input primary-input"
-            placeholder="为当前项目填写正确项目名称"
-            autocomplete="off"
-          />
-          <button type="button" id="btnRenameProject" class="secondary">保存项目名</button>
-        </div>
-        <p id="renameProjectMessage" style="margin:6px 0 0 0;font-size:12px;color:#64748b;min-height:1.2em">用于修正误识别项目名；不会删除资料、施组、真实评标或学习结果。</p>
         <details class="compact-hidden" style="margin-top:8px">
           <summary style="cursor:pointer;color:#334155;font-size:13px">高级工具（系统诊断 / 评分体系 / 分析包）</summary>
           <div class="toolbar" style="margin-top:8px">
@@ -24783,7 +24773,7 @@ def index(
         <p id="selectProjectMessage" style="margin:8px 0 0 0;font-size:13px;min-height:1.2em"></p>
         <div id="selfCheckResult" class="result-block" style="display:none"></div>
         <div id="scoringFactorsResult" class="result-block" style="display:none"></div>
-        <p class="muted">下方所有操作将使用选中的项目。点击“开始新项目”可切换到空白录入界面，历史项目会保留在列表中但自动隐藏。删除资料不会直接删除已学习权重、校准器或真实评标记录，但会影响该项目后续重评分和证据链；删除整个项目或施组会同步删除对应记录。</p>
+        <p class="muted">下方所有操作将使用选中的项目。需要开始新项目时，请回到「1) 创建项目」点击“开始新项目”。历史项目会保留在列表中但自动隐藏。删除资料不会直接删除已学习权重、校准器或真实评标记录，但会影响该项目后续重评分和证据链；删除整个项目或施组会同步删除对应记录。</p>
       </div>
 
       <div class="section card" id="section-materials">

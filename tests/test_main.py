@@ -880,8 +880,8 @@ class TestIndexEndpoint:
         assert 'class="project-search-input primary-input"' in page
         assert 'id="projectSelect" class="project-select-input wide-select"' in page
         assert 'id="currentProjectTag" class="current-project-text"' in page
-        assert 'id="renameProjectNameInput"' in page
-        assert 'id="btnRenameProject"' in page
+        assert 'id="renameProjectNameInput"' not in page
+        assert 'id="btnRenameProject"' not in page
         assert 'id="btnSelectProjectBySearch"' in page
         assert 'id="projectListMeta"' in page
         assert 'data-project-name="恢复项目_p1"' in page
@@ -987,14 +987,13 @@ class TestIndexEndpoint:
         assert response.status_code == 200
         page = response.text
         assert 'id="btnStartNewProject"' in page
+        assert page.index('id="btnStartNewProject"') < page.index("<h2>2) 选择项目</h2>")
         assert 'id="projectMonthFilter"' in page
         assert "async function startNewProjectIntake()" in page
         assert "async function enterProjectIntakeMode(message, options=null)" in page
-        assert "async function renameCurrentProject()" in page
         assert "const intakeMode = allowEmptySelection || projectIntakeModeEnabled();" in page
         assert "function projectIsSystemGenerated(project)" in page
         assert "function buildProjectPickerView(projects)" in page
-        assert "setRenameProjectMessage('项目名称已更新：" in page
         assert (
             "safeChange('projectMonthFilter', () => refreshProjects(selectedProjectIdStrict() || ''));"
             in page
@@ -1012,6 +1011,7 @@ class TestIndexEndpoint:
         assert "OPS/E2E 系统项目已默认隐藏" in page
         assert "删除资料不会直接删除已学习权重、校准器或真实评标记录" in page
         assert "这不会直接删除已学习的权重、校准器或真实评标记录" in page
+        assert "纠正项目名" not in page
         assert "project_name_override" in page
         assert "normalizeTenderCreateErrorMessage(" in page
         assert "syncCreateProjectNameOverride()" in page
@@ -1114,8 +1114,12 @@ class TestIndexEndpoint:
         assert 'action="/web/delete_project"' in response.text
         assert 'id="createProjectFromTender"' in response.text
         assert 'action="/web/create_project_from_tender"' in response.text
-        assert 'id="renameProjectNameInput"' in response.text
-        assert 'id="btnRenameProject"' in response.text
+        assert 'id="btnStartNewProject"' in response.text
+        assert response.text.index('id="btnStartNewProject"') < response.text.index(
+            "<h2>2) 选择项目</h2>"
+        )
+        assert 'id="renameProjectNameInput"' not in response.text
+        assert 'id="btnRenameProject"' not in response.text
         assert 'action="/web/upload_materials"' in response.text
         assert 'action="/web/upload_shigong"' in response.text
         assert 'id="scoreScaleSelect" class="compact-select"' in response.text
