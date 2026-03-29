@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
+from app.engine.llm_evolution_common import parse_api_key_pool
 from app.engine.openai_compat import get_openai_model
 
 # 支持的真实后端: rules | openai | gemini
@@ -47,11 +48,15 @@ def _list_legacy_spark_env_keys() -> List[str]:
 
 
 def _provider_configured(provider: str) -> bool:
+    return _provider_key_count(provider) > 0
+
+
+def _provider_key_count(provider: str) -> int:
     if provider == "openai":
-        return bool((os.getenv("OPENAI_API_KEY") or "").strip())
+        return len(parse_api_key_pool(os.getenv("OPENAI_API_KEY"), os.getenv("OPENAI_API_KEYS")))
     if provider == "gemini":
-        return bool((os.getenv("GEMINI_API_KEY") or "").strip())
-    return False
+        return len(parse_api_key_pool(os.getenv("GEMINI_API_KEY"), os.getenv("GEMINI_API_KEYS")))
+    return 0
 
 
 def _unique_provider_chain(items: List[str]) -> List[str]:
@@ -114,8 +119,10 @@ def get_llm_backend_status() -> Dict[str, Any]:
         "spark_configured": bool(legacy_spark_env_keys),
         "legacy_spark_env_keys": legacy_spark_env_keys,
         "openai_configured": openai_configured,
+        "openai_account_count": _provider_key_count("openai"),
         "openai_model": get_openai_model() if openai_configured else None,
         "gemini_configured": gemini_configured,
+        "gemini_account_count": _provider_key_count("gemini"),
         "provider_chain": provider_chain,
         "fallback_providers": provider_chain[1:],
     }

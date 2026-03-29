@@ -57,12 +57,13 @@ def extract_json_from_content(content: str) -> Optional[Dict[str, Any]]:
 def call_openai_json(
     user_message: str,
     *,
+    api_key: str | None = None,
     model: str | None = None,
     max_tokens: int = 4096,
     timeout: int = 120,
     temperature: float = 0.3,
 ) -> Tuple[bool, Optional[Dict[str, Any]], str]:
-    key = get_openai_api_key()
+    key = api_key or get_openai_api_key()
     if not key:
         return False, None, "missing_credentials"
     try:
@@ -110,12 +111,13 @@ def call_openai_multimodal_json(
     *,
     image_bytes: bytes | None = None,
     image_mime: str = "image/png",
+    api_key: str | None = None,
     model: str | None = None,
     max_tokens: int = 4096,
     timeout: int = 120,
     temperature: float = 0.2,
 ) -> Tuple[bool, Optional[Dict[str, Any]], str]:
-    key = get_openai_api_key()
+    key = api_key or get_openai_api_key()
     if not key:
         return False, None, "missing_credentials"
     try:

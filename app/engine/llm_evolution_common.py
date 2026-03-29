@@ -60,3 +60,24 @@ def parse_evolution_response(parsed: Dict[str, Any]) -> Optional[Dict[str, Any]]
     if not high or not guidance:
         return None
     return {"high_score_logic": high, "writing_guidance": guidance}
+
+
+def parse_api_key_pool(
+    primary_value: Optional[str],
+    pooled_value: Optional[str],
+) -> List[str]:
+    """统一解析单 key + 多 key 池配置，并去重保序。"""
+    seen: set[str] = set()
+    ordered: List[str] = []
+    raw_items: List[str] = []
+    if pooled_value:
+        raw_items.extend(str(pooled_value).split(","))
+    if primary_value:
+        raw_items.append(str(primary_value))
+    for raw in raw_items:
+        item = str(raw or "").strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered

@@ -83,8 +83,16 @@ class LLMBackendStatus(BaseModel):
         default_factory=list, description="检测到的历史 Spark 兼容环境变量键名"
     )
     openai_configured: bool = Field(..., description="是否已配置 OPENAI_API_KEY")
+    openai_account_count: int = Field(
+        0,
+        description="当前 OpenAI 可用账号数（OPENAI_API_KEY + OPENAI_API_KEYS 汇总）",
+    )
     openai_model: Optional[str] = Field(None, description="当前 OpenAI 模型")
     gemini_configured: bool = Field(..., description="是否已配置 GEMINI_API_KEY")
+    gemini_account_count: int = Field(
+        0,
+        description="当前 Gemini 可用账号数（GEMINI_API_KEY + GEMINI_API_KEYS 汇总）",
+    )
     provider_chain: List[str] = Field(
         default_factory=list,
         description="当前实际调用链路，按主后端到备用后端排序",

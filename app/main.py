@@ -13796,8 +13796,10 @@ def llm_status() -> LLMBackendStatus:
         spark_configured=s["spark_configured"],
         legacy_spark_env_keys=list(s.get("legacy_spark_env_keys") or []),
         openai_configured=s["openai_configured"],
+        openai_account_count=int(s.get("openai_account_count") or 0),
         openai_model=s.get("openai_model"),
         gemini_configured=s["gemini_configured"],
+        gemini_account_count=int(s.get("gemini_account_count") or 0),
         provider_chain=list(s.get("provider_chain") or []),
         fallback_providers=list(s.get("fallback_providers") or []),
     )

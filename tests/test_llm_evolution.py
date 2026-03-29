@@ -13,6 +13,7 @@ from app.engine.llm_evolution import (
     get_evolution_llm_provider_chain,
     get_llm_backend_status,
 )
+from app.engine.llm_evolution_common import parse_api_key_pool
 from app.engine.openai_compat import resolve_openai_model
 
 
@@ -77,6 +78,12 @@ class TestOpenAIModelAliases:
         assert resolve_openai_model("gpt-5") == "gpt-5.4"
 
 
+class TestApiKeyPoolParsing:
+    def test_parse_api_key_pool_dedupes_and_keeps_order(self):
+        keys = parse_api_key_pool("key-b", "key-a, key-b , key-c")
+        assert keys == ["key-a", "key-b", "key-c"]
+
+
 class TestEnhanceEvolutionReportWithLlm:
     def test_rules_backend_returns_none(self):
         with patch.dict(os.environ, {EVOLUTION_LLM_BACKEND_ENV: "rules"}):
@@ -126,6 +133,8 @@ class TestEnhanceEvolutionReportWithLlm:
         assert status["spark_configured"] is True
         assert status["legacy_spark_env_keys"] == ["SPARK_MODEL"]
         assert status["openai_configured"] is True
+        assert status["openai_account_count"] == 1
+        assert status["gemini_account_count"] == 0
         assert status["provider_chain"] == ["openai"]
         assert status["fallback_providers"] == []
 
@@ -134,8 +143,8 @@ class TestEnhanceEvolutionReportWithLlm:
             os.environ,
             {
                 EVOLUTION_LLM_BACKEND_ENV: AUTO_MULTI_PROVIDER_BACKEND,
-                "OPENAI_API_KEY": "openai-key",
-                "GEMINI_API_KEY": "gemini-key",
+                "OPENAI_API_KEYS": "openai-key,openai-key-2",
+                "GEMINI_API_KEYS": "gemini-key,gemini-key-2",
             },
             clear=True,
         ):
@@ -144,6 +153,8 @@ class TestEnhanceEvolutionReportWithLlm:
         assert status["evolution_backend"] == "openai"
         assert status["requested_backend"] == AUTO_MULTI_PROVIDER_BACKEND
         assert status["auto_mode"] is True
+        assert status["openai_account_count"] == 2
+        assert status["gemini_account_count"] == 2
         assert status["provider_chain"] == ["openai", "gemini"]
         assert status["fallback_providers"] == ["gemini"]
 
@@ -252,6 +263,84 @@ class TestEnhanceEvolutionReportWithLlm:
         assert out["enhancement_fallback_used"] is False
         assert out["enhancement_attempts"] == 1
         mock_gemini.assert_not_called()
+
+
+class TestProviderAccountPooling:
+    def test_openai_provider_switches_to_second_account_when_first_fails(self):
+        from app.engine import llm_evolution_openai as openai_module
+
+        openai_module._OPENAI_KEY_FAILURES.clear()
+        openai_module._OPENAI_KEY_CURSOR = 0
+        report = {
+            "project_id": "p1",
+            "high_score_logic": ["a"],
+            "writing_guidance": ["b"],
+            "sample_count": 1,
+            "updated_at": "2020-01-01T00:00:00Z",
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "OPENAI_API_KEYS": "key-1,key-2",
+            },
+            clear=True,
+        ):
+            with patch.object(
+                openai_module,
+                "_call_openai_http",
+                side_effect=[
+                    (False, None, "rate_limit"),
+                    (
+                        True,
+                        {"high_score_logic": ["o1"], "writing_guidance": ["w1"]},
+                        "",
+                    ),
+                ],
+            ) as mock_call:
+                out = openai_module.enhance_evolution_report_openai("p1", report, [], "")
+
+        assert out is not None
+        assert out["enhanced_by"] == "openai"
+        assert mock_call.call_args_list[0].kwargs["api_key"] == "key-1"
+        assert mock_call.call_args_list[1].kwargs["api_key"] == "key-2"
+
+    def test_gemini_provider_switches_to_second_account_when_first_fails(self):
+        from app.engine import llm_evolution_gemini as gemini_module
+
+        gemini_module._GEMINI_KEY_FAILURES.clear()
+        gemini_module._GEMINI_KEY_CURSOR = 0
+        report = {
+            "project_id": "p1",
+            "high_score_logic": ["a"],
+            "writing_guidance": ["b"],
+            "sample_count": 1,
+            "updated_at": "2020-01-01T00:00:00Z",
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "GEMINI_API_KEYS": "g-1,g-2",
+            },
+            clear=True,
+        ):
+            with patch.object(
+                gemini_module,
+                "_call_gemini_http",
+                side_effect=[
+                    (False, None, "quota"),
+                    (
+                        True,
+                        {"high_score_logic": ["g1"], "writing_guidance": ["w1"]},
+                        "",
+                    ),
+                ],
+            ) as mock_call:
+                out = gemini_module.enhance_evolution_report_gemini("p1", report, [], "")
+
+        assert out is not None
+        assert out["enhanced_by"] == "gemini"
+        assert mock_call.call_args_list[0].kwargs["api_key"] == "g-1"
+        assert mock_call.call_args_list[1].kwargs["api_key"] == "g-2"
 
 
 class TestLlmEvolutionSparkModule:
