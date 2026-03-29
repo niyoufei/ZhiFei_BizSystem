@@ -31513,31 +31513,41 @@ def index(
           const gateThresholds = (gate && typeof gate.thresholds === 'object') ? gate.thresholds : {};
           const primaryHighlights = [];
           if (uncoveredTypeLabels.length) {
-            primaryHighlights.push('当前缺口资料类型：' + uncoveredTypeLabels.join('、'));
+            primaryHighlights.push({ level: 'warn', text: '当前缺口资料类型：' + uncoveredTypeLabels.join('、') });
           }
           if (consistencyTotal > 0 && consistencyHitRate != null && consistencyHitRate < 0.35) {
-            primaryHighlights.push('跨资料一致性命中率 ' + toPct(summary.consistency_hit_rate) + ' 偏低');
+            primaryHighlights.push({
+              level: 'warn',
+              text: '跨资料一致性命中率 ' + toPct(summary.consistency_hit_rate) + ' 偏低',
+            });
           }
           if (retrievalUnhitFileCount > 0 && retrievalFileTotal >= 3) {
-            primaryHighlights.push('已有 ' + String(retrievalUnhitFileCount) + ' 份已检索文件未形成命中证据');
+            primaryHighlights.push({
+              level: 'note',
+              text: '提示：已有 ' + String(retrievalUnhitFileCount) + ' 份已检索文件暂未形成命中证据',
+            });
           }
           if (
             gate && gate.enabled && requiredPresentCount > 0
             && gate.required_coverage_failed
           ) {
-            primaryHighlights.push(
-              '关键资料覆盖 ' + toPct(gate.required_type_coverage_rate)
-              + ' 低于阈值 ' + toPct(gateThresholds.min_required_type_coverage_rate)
-            );
+            primaryHighlights.push({
+              level: 'warn',
+              text:
+                '关键资料覆盖 ' + toPct(gate.required_type_coverage_rate)
+                + ' 低于阈值 ' + toPct(gateThresholds.min_required_type_coverage_rate),
+            });
           }
           if (
             gate && gate.enabled && uploadedTypeCount > 0
             && gate.uploaded_type_coverage_failed
           ) {
-            primaryHighlights.push(
-              '已上传类型覆盖 ' + toPct(gate.uploaded_type_coverage_rate)
-              + ' 低于阈值 ' + toPct(gateThresholds.min_uploaded_type_coverage_rate)
-            );
+            primaryHighlights.push({
+              level: 'warn',
+              text:
+                '已上传类型覆盖 ' + toPct(gate.uploaded_type_coverage_rate)
+                + ' 低于阈值 ' + toPct(gateThresholds.min_uploaded_type_coverage_rate),
+            });
           }
           const normalizedGateReasons = dedupeMaterialUtilizationTexts(
             gateReasons.map(normalizeMaterialUtilizationText)
@@ -31596,21 +31606,33 @@ def index(
             if (key && !orderedTypes.includes(key)) orderedTypes.push(key);
           });
 
+          const gateBlocked = !!(gate && (gate.blocked_submissions > 0 || gate.blocked));
+          const gateWarned = !!(gate && !gateBlocked && (gate.warn_submissions > 0 || gate.warned));
+          const highlightColorForLevel = (level) => {
+            if (level === 'error') return '#9f1239';
+            if (level === 'warn') return gateBlocked ? '#9f1239' : '#9a3412';
+            return '#475569';
+          };
           let html =
             '<strong>资料利用审计（本次评分）</strong>'
             + (gate && gate.enabled
               ? (
-                  (gate.blocked_submissions > 0 || gate.blocked)
+                  gateBlocked
                     ? '<p class="error" style="margin:6px 0 8px 0"><strong>门禁状态：阻断</strong>（存在资料利用阈值未达标的施组）</p>'
-                    : (gate.warn_submissions > 0 || gate.warned)
+                    : gateWarned
                       ? '<p style="margin:6px 0 8px 0;color:#9a3412"><strong>门禁状态：预警</strong>（建议补齐资料关联后重评分）</p>'
                       : '<p class="success" style="margin:6px 0 8px 0"><strong>门禁状态：通过</strong></p>'
                 )
               : '')
             + (
               primaryHighlights.length
-                ? '<ul style="margin:6px 0 8px 18px;color:#9f1239">'
-                  + primaryHighlights.map((item) => '<li>' + escapeHtmlText(item) + '</li>').join('')
+                ? '<ul style="margin:6px 0 8px 18px">'
+                  + primaryHighlights.map((item) => {
+                    const entry = (item && typeof item === 'object') ? item : { level: 'note', text: String(item || '') };
+                    return '<li style="color:' + highlightColorForLevel(String(entry.level || 'note')) + '">'
+                      + escapeHtmlText(String(entry.text || ''))
+                      + '</li>';
+                  }).join('')
                   + '</ul>'
                 : ''
             )

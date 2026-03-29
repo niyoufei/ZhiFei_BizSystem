@@ -1155,6 +1155,9 @@ class TestIndexEndpoint:
         assert "补充提示" in page
         assert "关键资料覆盖" in page
         assert "已上传类型覆盖" in page
+        assert "提示：已有 " in page
+        assert "const highlightColorForLevel = (level) =>" in page
+        assert "return '#475569';" in page
         assert "小样本 bootstrap（已部署）" in page
         assert "小样本 bootstrap（候选未部署）" in page
         assert "当前校准形态" in page
