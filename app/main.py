@@ -13816,6 +13816,8 @@ def llm_status() -> LLMBackendStatus:
         gemini_account_count=int(s.get("gemini_account_count") or 0),
         gemini_pool_health=dict(s.get("gemini_pool_health") or {}),
         provider_health=dict(s.get("provider_health") or {}),
+        provider_quality=dict(s.get("provider_quality") or {}),
+        provider_review_stats=dict(s.get("provider_review_stats") or {}),
         primary_provider_reason=s.get("primary_provider_reason"),
         provider_chain=list(s.get("provider_chain") or []),
         fallback_providers=list(s.get("fallback_providers") or []),

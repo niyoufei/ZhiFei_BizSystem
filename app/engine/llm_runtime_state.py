@@ -9,11 +9,27 @@ from typing import Any, Dict
 LLM_RUNTIME_STATE_PATH = Path(__file__).resolve().parents[2] / "build" / "llm_runtime_state.json"
 _STATE_LOCK = threading.Lock()
 _KNOWN_PROVIDERS = ("openai", "gemini")
+_KNOWN_REVIEW_STATUSES = ("confirmed", "diverged", "unavailable", "fallback_only")
+
+
+def _empty_provider_review_stats() -> Dict[str, Any]:
+    return {
+        "confirmed_count": 0,
+        "diverged_count": 0,
+        "unavailable_count": 0,
+        "fallback_only_count": 0,
+        "last_status": None,
+        "last_at": None,
+    }
 
 
 def _empty_state() -> Dict[str, Any]:
     return {
         "provider_failures": {},
+        "provider_quality_degraded": {},
+        "provider_review_stats": {
+            provider: _empty_provider_review_stats() for provider in _KNOWN_PROVIDERS
+        },
         "account_failures": {provider: {} for provider in _KNOWN_PROVIDERS},
     }
 
@@ -31,6 +47,8 @@ def _load_state_unlocked() -> Dict[str, Any]:
     if not isinstance(payload, dict):
         return _empty_state()
     provider_failures = payload.get("provider_failures")
+    provider_quality_degraded = payload.get("provider_quality_degraded")
+    provider_review_stats = payload.get("provider_review_stats")
     account_failures = payload.get("account_failures")
     state = _empty_state()
     if isinstance(provider_failures, dict):
@@ -39,6 +57,25 @@ def _load_state_unlocked() -> Dict[str, Any]:
                 normalized = _normalize_timestamp(failed_at)
                 if normalized is not None:
                     state["provider_failures"][provider] = normalized
+    if isinstance(provider_quality_degraded, dict):
+        for provider, degraded_at in provider_quality_degraded.items():
+            if provider in _KNOWN_PROVIDERS:
+                normalized = _normalize_timestamp(degraded_at)
+                if normalized is not None:
+                    state["provider_quality_degraded"][provider] = normalized
+    if isinstance(provider_review_stats, dict):
+        for provider, stats in provider_review_stats.items():
+            if provider not in _KNOWN_PROVIDERS or not isinstance(stats, dict):
+                continue
+            row = _empty_provider_review_stats()
+            for status in _KNOWN_REVIEW_STATUSES:
+                row[f"{status}_count"] = max(
+                    0, int(_normalize_timestamp(stats.get(f"{status}_count")) or 0)
+                )
+            last_status = str(stats.get("last_status") or "").strip()
+            row["last_status"] = last_status if last_status in _KNOWN_REVIEW_STATUSES else None
+            row["last_at"] = _normalize_timestamp(stats.get("last_at"))
+            state["provider_review_stats"][provider] = row
     if isinstance(account_failures, dict):
         for provider in _KNOWN_PROVIDERS:
             rows = account_failures.get(provider)
@@ -83,6 +120,44 @@ def get_provider_failure_timestamps() -> Dict[str, float]:
     }
 
 
+def get_provider_quality_degraded_timestamps() -> Dict[str, float]:
+    with _STATE_LOCK:
+        state = _load_state_unlocked()
+    return {
+        provider: float(degraded_at)
+        for provider, degraded_at in (state.get("provider_quality_degraded") or {}).items()
+        if provider in _KNOWN_PROVIDERS
+    }
+
+
+def get_provider_review_stats() -> Dict[str, Dict[str, Any]]:
+    with _STATE_LOCK:
+        state = _load_state_unlocked()
+    out: Dict[str, Dict[str, Any]] = {}
+    rows = state.get("provider_review_stats") or {}
+    for provider in _KNOWN_PROVIDERS:
+        stats = rows.get(provider)
+        if not isinstance(stats, dict):
+            continue
+        out[provider] = {
+            "confirmed_count": max(0, int(_normalize_timestamp(stats.get("confirmed_count")) or 0)),
+            "diverged_count": max(0, int(_normalize_timestamp(stats.get("diverged_count")) or 0)),
+            "unavailable_count": max(
+                0, int(_normalize_timestamp(stats.get("unavailable_count")) or 0)
+            ),
+            "fallback_only_count": max(
+                0, int(_normalize_timestamp(stats.get("fallback_only_count")) or 0)
+            ),
+            "last_status": (
+                str(stats.get("last_status") or "").strip()
+                if str(stats.get("last_status") or "").strip() in _KNOWN_REVIEW_STATUSES
+                else None
+            ),
+            "last_at": _normalize_timestamp(stats.get("last_at")),
+        }
+    return out
+
+
 def set_provider_failure(provider: str, failed_at: float) -> None:
     if provider not in _KNOWN_PROVIDERS:
         return
@@ -98,6 +173,40 @@ def clear_provider_failure(provider: str) -> None:
     with _STATE_LOCK:
         state = _load_state_unlocked()
         state["provider_failures"].pop(provider, None)
+        _save_state_unlocked(state)
+
+
+def set_provider_quality_degraded(provider: str, degraded_at: float) -> None:
+    if provider not in _KNOWN_PROVIDERS:
+        return
+    with _STATE_LOCK:
+        state = _load_state_unlocked()
+        state["provider_quality_degraded"][provider] = float(degraded_at)
+        _save_state_unlocked(state)
+
+
+def clear_provider_quality_degraded(provider: str) -> None:
+    if provider not in _KNOWN_PROVIDERS:
+        return
+    with _STATE_LOCK:
+        state = _load_state_unlocked()
+        state["provider_quality_degraded"].pop(provider, None)
+        _save_state_unlocked(state)
+
+
+def record_provider_review_outcome(provider: str, status: str, recorded_at: float) -> None:
+    normalized_status = str(status or "").strip()
+    if provider not in _KNOWN_PROVIDERS or normalized_status not in _KNOWN_REVIEW_STATUSES:
+        return
+    with _STATE_LOCK:
+        state = _load_state_unlocked()
+        row = (state.get("provider_review_stats") or {}).setdefault(
+            provider, _empty_provider_review_stats()
+        )
+        count_key = f"{normalized_status}_count"
+        row[count_key] = max(0, int(_normalize_timestamp(row.get(count_key)) or 0)) + 1
+        row["last_status"] = normalized_status
+        row["last_at"] = float(recorded_at)
         _save_state_unlocked(state)
 
 

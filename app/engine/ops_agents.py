@@ -1844,6 +1844,8 @@ def _run_learning_calibration_agent(
     )
     llm_status_unavailable_count = 0
     llm_provider_degraded_count = 0
+    llm_provider_quality_degraded_count = 0
+    llm_provider_review_regression_count = 0
     llm_fallback_unavailable_count = 0
     openai_pool_health: Dict[str, Any] = {}
     gemini_pool_health: Dict[str, Any] = {}
@@ -1855,11 +1857,27 @@ def _run_learning_calibration_agent(
             str(key): str(value or "").strip().lower()
             for key, value in _json_object(llm_status_payload.get("provider_health")).items()
         }
+        provider_quality = {
+            str(key): str(value or "").strip().lower()
+            for key, value in _json_object(llm_status_payload.get("provider_quality")).items()
+        }
+        provider_review_stats = {
+            str(key): _json_object(value)
+            for key, value in _json_object(llm_status_payload.get("provider_review_stats")).items()
+        }
         openai_pool_health = _json_object(llm_status_payload.get("openai_pool_health"))
         gemini_pool_health = _json_object(llm_status_payload.get("gemini_pool_health"))
         llm_provider_degraded_count = sum(
             1 for value in provider_health.values() if value and value != "healthy"
         )
+        llm_provider_quality_degraded_count = sum(
+            1 for value in provider_quality.values() if value and value != "stable"
+        )
+        for stats in provider_review_stats.values():
+            confirmed_count = _to_int(stats.get("confirmed_count"))
+            diverged_count = _to_int(stats.get("diverged_count"))
+            if diverged_count >= 2 and diverged_count > confirmed_count:
+                llm_provider_review_regression_count += 1
         provider_chain = [
             str(item or "").strip() for item in llm_status_payload.get("provider_chain") or []
         ]
@@ -2202,6 +2220,8 @@ def _run_learning_calibration_agent(
         and enhancement_review_diverged_count == 0
         and llm_status_unavailable_count == 0
         and llm_provider_degraded_count == 0
+        and llm_provider_quality_degraded_count == 0
+        and llm_provider_review_regression_count == 0
         and llm_fallback_unavailable_count == 0
         and llm_account_cooldown_count == 0
         and llm_provider_thin_pool_count == 0
@@ -2214,6 +2234,14 @@ def _run_learning_calibration_agent(
     if llm_provider_degraded_count > 0:
         recommendations.append(
             f"有 {llm_provider_degraded_count} 个 LLM provider 当前处于 cooldown，系统虽可自动切换，但建议继续观察账号池稳定性。"
+        )
+    if llm_provider_quality_degraded_count > 0:
+        recommendations.append(
+            f"有 {llm_provider_quality_degraded_count} 个 LLM provider 最近复核分歧偏高，系统已自动降权其主位优先级。"
+        )
+    if llm_provider_review_regression_count > 0:
+        recommendations.append(
+            f"有 {llm_provider_review_regression_count} 个 LLM provider 的累计复核分歧已超过确认次数，建议重点观察其长期输出质量。"
         )
     if llm_fallback_unavailable_count > 0:
         recommendations.append(
@@ -2321,6 +2349,8 @@ def _run_learning_calibration_agent(
             "bootstrap_review_failed_count": bootstrap_review_failed_count,
             "llm_status_unavailable_count": llm_status_unavailable_count,
             "llm_provider_degraded_count": llm_provider_degraded_count,
+            "llm_provider_quality_degraded_count": llm_provider_quality_degraded_count,
+            "llm_provider_review_regression_count": llm_provider_review_regression_count,
             "llm_fallback_unavailable_count": llm_fallback_unavailable_count,
             "llm_account_cooldown_count": llm_account_cooldown_count,
             "llm_provider_thin_pool_count": llm_provider_thin_pool_count,

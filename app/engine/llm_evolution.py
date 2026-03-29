@@ -20,8 +20,13 @@ from app.engine.llm_evolution_gemini import get_gemini_evolution_pool_health
 from app.engine.llm_evolution_openai import get_openai_evolution_pool_health
 from app.engine.llm_runtime_state import (
     clear_provider_failure,
+    clear_provider_quality_degraded,
     get_provider_failure_timestamps,
+    get_provider_quality_degraded_timestamps,
+    get_provider_review_stats,
+    record_provider_review_outcome,
     set_provider_failure,
+    set_provider_quality_degraded,
 )
 from app.engine.openai_compat import get_openai_model
 
@@ -40,8 +45,12 @@ REAL_LLM_PROVIDERS: Tuple[str, ...] = ("openai", "gemini")
 DEFAULT_ENHANCEMENT_REVIEW_SIMILARITY_THRESHOLD = 0.35
 EVOLUTION_LLM_PROVIDER_COOLDOWN_ENV = "EVOLUTION_LLM_ACCOUNT_COOLDOWN_SECONDS"
 DEFAULT_EVOLUTION_LLM_PROVIDER_COOLDOWN_SECONDS = 300.0
+EVOLUTION_LLM_QUALITY_DEGRADE_SECONDS_ENV = "EVOLUTION_LLM_QUALITY_DEGRADE_SECONDS"
+DEFAULT_EVOLUTION_LLM_QUALITY_DEGRADE_SECONDS = 1800.0
 _PROVIDER_FAILURES: Dict[str, float] = {}
 _PROVIDER_FAILURES_LOCK = threading.Lock()
+_PROVIDER_QUALITY_DEGRADED: Dict[str, float] = {}
+_PROVIDER_QUALITY_DEGRADED_LOCK = threading.Lock()
 
 
 def _to_int(value: Any, default: int = 0) -> int:
@@ -56,6 +65,13 @@ def _sync_provider_failures_from_runtime_state() -> None:
     with _PROVIDER_FAILURES_LOCK:
         _PROVIDER_FAILURES.clear()
         _PROVIDER_FAILURES.update(persisted)
+
+
+def _sync_provider_quality_from_runtime_state() -> None:
+    persisted = get_provider_quality_degraded_timestamps()
+    with _PROVIDER_QUALITY_DEGRADED_LOCK:
+        _PROVIDER_QUALITY_DEGRADED.clear()
+        _PROVIDER_QUALITY_DEGRADED.update(persisted)
 
 
 def _get_requested_evolution_llm_backend() -> Optional[str]:
@@ -104,6 +120,14 @@ def _provider_cooldown_seconds() -> float:
         return DEFAULT_EVOLUTION_LLM_PROVIDER_COOLDOWN_SECONDS
 
 
+def _provider_quality_degrade_seconds() -> float:
+    raw = str(os.getenv(EVOLUTION_LLM_QUALITY_DEGRADE_SECONDS_ENV) or "").strip()
+    try:
+        return max(300.0, float(raw)) if raw else DEFAULT_EVOLUTION_LLM_QUALITY_DEGRADE_SECONDS
+    except Exception:
+        return DEFAULT_EVOLUTION_LLM_QUALITY_DEGRADE_SECONDS
+
+
 def _provider_health_state(provider: str) -> str:
     if provider not in REAL_LLM_PROVIDERS:
         return "unknown"
@@ -117,6 +141,17 @@ def _provider_health_state(provider: str) -> str:
 
 def _provider_is_healthy(provider: str) -> bool:
     return _provider_health_state(provider) == "healthy"
+
+
+def _provider_quality_state(provider: str) -> str:
+    if provider not in REAL_LLM_PROVIDERS:
+        return "unknown"
+    degraded_at = _PROVIDER_QUALITY_DEGRADED.get(provider)
+    if degraded_at is None:
+        return "stable"
+    if (time.time() - degraded_at) >= _provider_quality_degrade_seconds():
+        return "stable"
+    return "degraded"
 
 
 def _provider_pool_health(provider: str) -> Dict[str, int]:
@@ -133,6 +168,19 @@ def _provider_priority_key(provider: str) -> tuple[int, int, int]:
     total_accounts = max(0, _to_int(pool.get("total_accounts"), 0))
     cooling_accounts = max(0, _to_int(pool.get("cooling_accounts"), 0))
     return (healthy_accounts, total_accounts - cooling_accounts, total_accounts)
+
+
+def _mark_provider_quality_stable(provider: str) -> None:
+    with _PROVIDER_QUALITY_DEGRADED_LOCK:
+        _PROVIDER_QUALITY_DEGRADED.pop(provider, None)
+    clear_provider_quality_degraded(provider)
+
+
+def _mark_provider_quality_degraded(provider: str) -> None:
+    degraded_at = time.time()
+    with _PROVIDER_QUALITY_DEGRADED_LOCK:
+        _PROVIDER_QUALITY_DEGRADED[provider] = degraded_at
+    set_provider_quality_degraded(provider, degraded_at)
 
 
 def _mark_provider_success(provider: str) -> None:
@@ -168,7 +216,11 @@ def _order_provider_chain(
         )
     ranked_healthy = sorted(
         healthy,
-        key=lambda provider: (_provider_priority_key(provider), -base.index(provider)),
+        key=lambda provider: (
+            _provider_quality_state(provider) == "stable",
+            _provider_priority_key(provider),
+            -base.index(provider),
+        ),
         reverse=True,
     )
     return ranked_healthy + cooling
@@ -193,6 +245,8 @@ def _provider_selection_reason(
             return "default_openai_primary"
         if _provider_health_state("openai") != "healthy":
             return "openai_cooldown_promoted_gemini"
+        if _provider_quality_state("openai") != "stable":
+            return "openai_quality_degraded_promoted_gemini"
         if _provider_priority_key("gemini") > _provider_priority_key("openai"):
             return "openai_thin_pool_promoted_gemini"
         return f"auto_selected_{primary}"
@@ -210,6 +264,7 @@ def get_evolution_llm_provider_chain() -> List[str]:
     - 显式请求的 provider 若未配置，不阻断；会自动回退到其他已配置 provider
     """
     _sync_provider_failures_from_runtime_state()
+    _sync_provider_quality_from_runtime_state()
     requested_backend = _get_requested_evolution_llm_backend()
     normalized_backend = _normalize_evolution_llm_backend(requested_backend)
     configured = [provider for provider in REAL_LLM_PROVIDERS if _provider_configured(provider)]
@@ -239,6 +294,7 @@ def get_evolution_llm_backend() -> str:
 def get_llm_backend_status() -> Dict[str, Any]:
     """返回各 LLM 后端的配置状态，便于运维与界面展示（不暴露密钥）。"""
     _sync_provider_failures_from_runtime_state()
+    _sync_provider_quality_from_runtime_state()
     requested_backend = _get_requested_evolution_llm_backend()
     backend = get_evolution_llm_backend()
     provider_chain = get_evolution_llm_provider_chain()
@@ -247,6 +303,7 @@ def get_llm_backend_status() -> Dict[str, Any]:
     gemini_configured = _provider_configured("gemini")
     openai_pool_health = get_openai_evolution_pool_health() if openai_configured else {}
     gemini_pool_health = get_gemini_evolution_pool_health() if gemini_configured else {}
+    provider_review_stats = get_provider_review_stats()
     return {
         "evolution_backend": backend,
         "requested_backend": requested_backend,
@@ -264,6 +321,16 @@ def get_llm_backend_status() -> Dict[str, Any]:
         "gemini_pool_health": gemini_pool_health,
         "provider_health": {
             provider: _provider_health_state(provider)
+            for provider in REAL_LLM_PROVIDERS
+            if _provider_configured(provider)
+        },
+        "provider_quality": {
+            provider: _provider_quality_state(provider)
+            for provider in REAL_LLM_PROVIDERS
+            if _provider_configured(provider)
+        },
+        "provider_review_stats": {
+            provider: dict(provider_review_stats.get(provider) or {})
             for provider in REAL_LLM_PROVIDERS
             if _provider_configured(provider)
         },
@@ -372,6 +439,7 @@ def _attach_enhancement_review(
     if len(provider_chain) < 2:
         return
     if actual_provider != primary_provider:
+        record_provider_review_outcome(actual_provider, "fallback_only", time.time())
         result["enhancement_review_status"] = "fallback_only"
         result["enhancement_review_notes"] = [
             "主 provider 已失败并切换到备用 provider，本次跳过备用复核。"
@@ -390,6 +458,7 @@ def _attach_enhancement_review(
     )
     if review is None:
         _mark_provider_failure(review_provider)
+        record_provider_review_outcome(actual_provider, "unavailable", time.time())
         result["enhancement_review_status"] = "unavailable"
         result["enhancement_review_notes"] = [f"{review_provider} 复核未返回有效结果，保留主结果。"]
         return
@@ -398,11 +467,15 @@ def _attach_enhancement_review(
     threshold = DEFAULT_ENHANCEMENT_REVIEW_SIMILARITY_THRESHOLD
     result["enhancement_review_similarity"] = similarity
     if similarity >= threshold:
+        _mark_provider_quality_stable(actual_provider)
+        record_provider_review_outcome(actual_provider, "confirmed", time.time())
         result["enhancement_review_status"] = "confirmed"
         result["enhancement_review_notes"] = [
             f"{review_provider} 复核通过，结果相似度 {similarity:.2f}。"
         ]
         return
+    _mark_provider_quality_degraded(actual_provider)
+    record_provider_review_outcome(actual_provider, "diverged", time.time())
     result["enhancement_review_status"] = "diverged"
     result["enhancement_review_notes"] = [
         f"{review_provider} 复核与主结果差异较大，相似度 {similarity:.2f}；建议人工复核高分逻辑与编制指导。"

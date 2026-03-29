@@ -9267,6 +9267,17 @@ class TestLlmStatusEndpoint:
             "gemini_configured": False,
             "gemini_account_count": 0,
             "gemini_pool_health": {},
+            "provider_quality": {"openai": "stable"},
+            "provider_review_stats": {
+                "openai": {
+                    "confirmed_count": 2,
+                    "diverged_count": 0,
+                    "unavailable_count": 0,
+                    "fallback_only_count": 0,
+                    "last_status": "confirmed",
+                    "last_at": 1.0,
+                }
+            },
             "provider_chain": ["openai"],
             "fallback_providers": [],
         }
@@ -9288,6 +9299,9 @@ class TestLlmStatusEndpoint:
         assert payload["gemini_configured"] is False
         assert payload["gemini_account_count"] == 0
         assert payload["gemini_pool_health"] == {}
+        assert payload["provider_quality"] == {"openai": "stable"}
+        assert payload["provider_review_stats"]["openai"]["confirmed_count"] == 2
+        assert payload["provider_review_stats"]["openai"]["last_status"] == "confirmed"
         assert payload["provider_chain"] == ["openai"]
         assert payload["fallback_providers"] == []
 

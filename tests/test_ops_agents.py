@@ -9,6 +9,8 @@ from app.engine import ops_agents as oa
 def _ok_llm_status_response(
     *,
     provider_health: dict[str, str] | None = None,
+    provider_quality: dict[str, str] | None = None,
+    provider_review_stats: dict[str, dict] | None = None,
     provider_chain: list[str] | None = None,
     openai_pool_health: dict[str, int] | None = None,
     gemini_pool_health: dict[str, int] | None = None,
@@ -18,6 +20,33 @@ def _ok_llm_status_response(
         provider_health
         if provider_health is not None
         else {"openai": "healthy", "gemini": "healthy"}
+    )
+    quality = (
+        provider_quality
+        if provider_quality is not None
+        else {"openai": "stable", "gemini": "stable"}
+    )
+    review_stats = (
+        provider_review_stats
+        if provider_review_stats is not None
+        else {
+            "openai": {
+                "confirmed_count": 0,
+                "diverged_count": 0,
+                "unavailable_count": 0,
+                "fallback_only_count": 0,
+                "last_status": None,
+                "last_at": None,
+            },
+            "gemini": {
+                "confirmed_count": 0,
+                "diverged_count": 0,
+                "unavailable_count": 0,
+                "fallback_only_count": 0,
+                "last_status": None,
+                "last_at": None,
+            },
+        }
     )
     openai_pool = (
         openai_pool_health
@@ -38,6 +67,8 @@ def _ok_llm_status_response(
             "requested_backend": "auto",
             "provider_chain": chain,
             "provider_health": health,
+            "provider_quality": quality,
+            "provider_review_stats": review_stats,
             "openai_account_count": 4,
             "openai_pool_health": openai_pool,
             "gemini_account_count": 2,
@@ -1431,6 +1462,174 @@ def test_learning_calibration_agent_warns_when_llm_account_pool_is_thin():
     assert result["metrics"]["llm_provider_thin_pool_count"] == 1
     assert any("当前共有 3 个 LLM 账号处于 cooldown" in row for row in result["recommendations"])
     assert any("仅剩 1 个健康账号" in row for row in result["recommendations"])
+
+
+def test_learning_calibration_agent_warns_when_llm_provider_quality_is_degraded():
+    recent_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+
+    def fake_requester(**kwargs):
+        method = str(kwargs.get("method") or "")
+        url = str(kwargs.get("url") or "")
+        if method == "GET" and url.endswith("/api/v1/config/llm_status"):
+            return _ok_llm_status_response(
+                provider_quality={"openai": "degraded", "gemini": "stable"},
+                provider_chain=["gemini", "openai"],
+            )
+        if method == "GET" and url.endswith("/api/v1/projects"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": [
+                    {
+                        "id": "p1",
+                        "name": "真实项目A",
+                        "status": "submitted_to_qingtian",
+                        "updated_at": recent_iso,
+                    }
+                ],
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/evolution/health"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "ground_truth_count": 3,
+                        "eligible_learning_ground_truth_count": 3,
+                        "matched_prediction_count": 3,
+                        "guardrail_blocked_count": 0,
+                        "has_evolved_multipliers": True,
+                        "evolution_weights_usable": True,
+                    },
+                    "drift": {"level": "low"},
+                },
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/feedback/governance"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "manual_confirmation_required": False,
+                        "few_shot_pending_review_count": 0,
+                    },
+                    "score_preview": {
+                        "current_calibrator_version": "calib_auto_existing",
+                    },
+                    "version_history": [],
+                },
+                "error": None,
+            }
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    result = oa._run_learning_calibration_agent(
+        base_url="http://127.0.0.1:8000",
+        api_key=None,
+        timeout=5.0,
+        auto_evolve=True,
+        min_samples=1,
+        requester=fake_requester,
+    )
+
+    assert result["status"] == "warn"
+    assert result["metrics"]["llm_provider_quality_degraded_count"] == 1
+    assert any("最近复核分歧偏高" in row for row in result["recommendations"])
+
+
+def test_learning_calibration_agent_warns_when_llm_provider_review_regresses():
+    recent_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+
+    def fake_requester(**kwargs):
+        method = str(kwargs.get("method") or "")
+        url = str(kwargs.get("url") or "")
+        if method == "GET" and url.endswith("/api/v1/config/llm_status"):
+            return _ok_llm_status_response(
+                provider_review_stats={
+                    "openai": {
+                        "confirmed_count": 1,
+                        "diverged_count": 3,
+                        "unavailable_count": 0,
+                        "fallback_only_count": 0,
+                        "last_status": "diverged",
+                        "last_at": 1.0,
+                    },
+                    "gemini": {
+                        "confirmed_count": 4,
+                        "diverged_count": 0,
+                        "unavailable_count": 0,
+                        "fallback_only_count": 0,
+                        "last_status": "confirmed",
+                        "last_at": 1.0,
+                    },
+                }
+            )
+        if method == "GET" and url.endswith("/api/v1/projects"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": [
+                    {
+                        "id": "p1",
+                        "name": "真实项目A",
+                        "status": "submitted_to_qingtian",
+                        "updated_at": recent_iso,
+                    }
+                ],
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/evolution/health"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "ground_truth_count": 3,
+                        "eligible_learning_ground_truth_count": 3,
+                        "matched_prediction_count": 3,
+                        "guardrail_blocked_count": 0,
+                        "has_evolved_multipliers": True,
+                        "evolution_weights_usable": True,
+                    },
+                    "drift": {"level": "low"},
+                },
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/feedback/governance"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "manual_confirmation_required": False,
+                        "few_shot_pending_review_count": 0,
+                    },
+                    "score_preview": {"current_calibrator_version": "calib_auto_existing"},
+                    "version_history": [],
+                },
+                "error": None,
+            }
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    result = oa._run_learning_calibration_agent(
+        base_url="http://127.0.0.1:8000",
+        api_key=None,
+        timeout=5.0,
+        auto_evolve=True,
+        min_samples=1,
+        requester=fake_requester,
+    )
+
+    assert result["status"] == "warn"
+    assert result["metrics"]["llm_provider_review_regression_count"] == 1
+    assert any("累计复核分歧已超过确认次数" in row for row in result["recommendations"])
 
 
 def test_ensure_agent_coverage_backfills_missing_agents():

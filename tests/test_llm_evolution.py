@@ -104,7 +104,7 @@ class TestGetEvolutionLlmBackend:
         with patch.dict(
             os.environ,
             {
-                EVOLUTION_LLM_BACKEND_ENV: "openai",
+                EVOLUTION_LLM_BACKEND_ENV: AUTO_MULTI_PROVIDER_BACKEND,
                 "GEMINI_API_KEY": "gemini-key",
             },
             clear=True,
@@ -289,6 +289,23 @@ class TestEnhanceEvolutionReportWithLlm:
         }
         assert status["provider_health"] == {"openai": "healthy", "gemini": "healthy"}
         assert status["primary_provider_reason"] == "openai_thin_pool_promoted_gemini"
+
+    def test_auto_provider_chain_promotes_gemini_when_openai_quality_is_degraded(self):
+        with patch.dict(
+            os.environ,
+            {
+                EVOLUTION_LLM_BACKEND_ENV: AUTO_MULTI_PROVIDER_BACKEND,
+                "OPENAI_API_KEY": "openai-key",
+                "GEMINI_API_KEY": "gemini-key",
+            },
+            clear=True,
+        ):
+            llm_runtime_state.set_provider_quality_degraded("openai", time.time())
+            assert get_evolution_llm_provider_chain() == ["gemini", "openai"]
+            status = get_llm_backend_status()
+
+        assert status["provider_quality"] == {"openai": "degraded", "gemini": "stable"}
+        assert status["primary_provider_reason"] == "openai_quality_degraded_promoted_gemini"
 
     def test_provider_cooldown_survives_runtime_state_reload(self):
         failed_at = time.time()
@@ -514,6 +531,57 @@ class TestEnhanceEvolutionReportWithLlm:
         assert out["high_score_logic"] == ["a"]
         assert out["writing_guidance"] == ["b"]
         assert out["enhancement_governance_notes"]
+        status = get_llm_backend_status()
+        assert status["provider_quality"]["openai"] == "degraded"
+        assert status["provider_review_stats"]["openai"]["diverged_count"] >= 1
+        assert status["provider_review_stats"]["openai"]["last_status"] == "diverged"
+
+    @patch("app.engine.llm_evolution._enhance_with_gemini")
+    @patch("app.engine.llm_evolution._enhance_with_openai")
+    def test_confirmed_review_clears_provider_quality_degradation(self, mock_openai, mock_gemini):
+        llm_runtime_state.set_provider_quality_degraded("openai", time.time())
+        mock_openai.return_value = {
+            "project_id": "p1",
+            "high_score_logic": ["质量节点闭环"],
+            "writing_guidance": ["补强验收责任分工"],
+            "sample_count": 1,
+            "updated_at": "2020-01-01T00:00:00Z",
+        }
+        mock_gemini.return_value = {
+            "project_id": "p1",
+            "high_score_logic": ["质量节点闭环"],
+            "writing_guidance": ["补强验收责任分工"],
+            "sample_count": 1,
+            "updated_at": "2020-01-01T00:00:00Z",
+        }
+        with patch.dict(
+            os.environ,
+            {
+                EVOLUTION_LLM_BACKEND_ENV: "openai",
+                "OPENAI_API_KEY": "openai-key",
+                "GEMINI_API_KEY": "gemini-key",
+            },
+            clear=True,
+        ):
+            out = enhance_evolution_report_with_llm(
+                "p1",
+                {
+                    "project_id": "p1",
+                    "high_score_logic": ["a"],
+                    "writing_guidance": ["b"],
+                    "sample_count": 1,
+                    "updated_at": "2020-01-01T00:00:00Z",
+                },
+                [],
+                "",
+            )
+            status = get_llm_backend_status()
+
+        assert out is not None
+        assert out["enhancement_review_status"] == "confirmed"
+        assert status["provider_quality"]["openai"] == "stable"
+        assert status["provider_review_stats"]["openai"]["confirmed_count"] >= 1
+        assert status["provider_review_stats"]["openai"]["last_status"] == "confirmed"
 
 
 class TestProviderAccountPooling:
