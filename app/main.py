@@ -13813,6 +13813,8 @@ def llm_status() -> LLMBackendStatus:
         openai_model=s.get("openai_model"),
         gemini_configured=s["gemini_configured"],
         gemini_account_count=int(s.get("gemini_account_count") or 0),
+        provider_health=dict(s.get("provider_health") or {}),
+        primary_provider_reason=s.get("primary_provider_reason"),
         provider_chain=list(s.get("provider_chain") or []),
         fallback_providers=list(s.get("fallback_providers") or []),
     )

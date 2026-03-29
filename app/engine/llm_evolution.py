@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import os
 import re
+import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.engine.llm_evolution_common import parse_api_key_pool
@@ -29,6 +31,10 @@ LEGACY_SPARK_ENV_KEYS = (
 )
 REAL_LLM_PROVIDERS: Tuple[str, ...] = ("openai", "gemini")
 DEFAULT_ENHANCEMENT_REVIEW_SIMILARITY_THRESHOLD = 0.35
+EVOLUTION_LLM_PROVIDER_COOLDOWN_ENV = "EVOLUTION_LLM_ACCOUNT_COOLDOWN_SECONDS"
+DEFAULT_EVOLUTION_LLM_PROVIDER_COOLDOWN_SECONDS = 300.0
+_PROVIDER_FAILURES: Dict[str, float] = {}
+_PROVIDER_FAILURES_LOCK = threading.Lock()
 
 
 def _get_requested_evolution_llm_backend() -> Optional[str]:
@@ -69,6 +75,83 @@ def _unique_provider_chain(items: List[str]) -> List[str]:
     return out
 
 
+def _provider_cooldown_seconds() -> float:
+    raw = str(os.getenv(EVOLUTION_LLM_PROVIDER_COOLDOWN_ENV) or "").strip()
+    try:
+        return max(30.0, float(raw)) if raw else DEFAULT_EVOLUTION_LLM_PROVIDER_COOLDOWN_SECONDS
+    except Exception:
+        return DEFAULT_EVOLUTION_LLM_PROVIDER_COOLDOWN_SECONDS
+
+
+def _provider_health_state(provider: str) -> str:
+    if provider not in REAL_LLM_PROVIDERS:
+        return "unknown"
+    failed_at = _PROVIDER_FAILURES.get(provider)
+    if failed_at is None:
+        return "healthy"
+    if (time.time() - failed_at) >= _provider_cooldown_seconds():
+        return "healthy"
+    return "cooldown"
+
+
+def _provider_is_healthy(provider: str) -> bool:
+    return _provider_health_state(provider) == "healthy"
+
+
+def _mark_provider_success(provider: str) -> None:
+    with _PROVIDER_FAILURES_LOCK:
+        _PROVIDER_FAILURES.pop(provider, None)
+
+
+def _mark_provider_failure(provider: str) -> None:
+    with _PROVIDER_FAILURES_LOCK:
+        _PROVIDER_FAILURES[provider] = time.time()
+
+
+def _order_provider_chain(
+    providers: List[str],
+    *,
+    requested_provider: Optional[str] = None,
+) -> List[str]:
+    base = _unique_provider_chain(providers)
+    if len(base) <= 1:
+        return base
+    healthy = [provider for provider in base if _provider_is_healthy(provider)]
+    cooling = [provider for provider in base if provider not in healthy]
+    if not healthy:
+        return base
+    if requested_provider and requested_provider in healthy:
+        return (
+            [requested_provider]
+            + [provider for provider in healthy if provider != requested_provider]
+            + cooling
+        )
+    return healthy + cooling
+
+
+def _provider_selection_reason(
+    requested_backend: Optional[str],
+    provider_chain: List[str],
+) -> str:
+    if not provider_chain:
+        return "rules_only"
+    primary = provider_chain[0]
+    normalized_backend = _normalize_evolution_llm_backend(requested_backend)
+    if normalized_backend in REAL_LLM_PROVIDERS:
+        if primary == normalized_backend:
+            return f"requested_{primary}_healthy"
+        if _provider_health_state(normalized_backend) != "healthy":
+            return f"requested_{normalized_backend}_cooldown"
+        return f"requested_{normalized_backend}_fallback_to_{primary}"
+    if normalized_backend in (None, AUTO_MULTI_PROVIDER_BACKEND):
+        if primary == "openai":
+            return "default_openai_primary"
+        if _provider_health_state("openai") != "healthy":
+            return "openai_cooldown_promoted_gemini"
+        return f"auto_selected_{primary}"
+    return f"auto_selected_{primary}"
+
+
 def get_evolution_llm_provider_chain() -> List[str]:
     """
     计算当前进化增强的 provider 编排链。
@@ -88,12 +171,13 @@ def get_evolution_llm_provider_chain() -> List[str]:
         ordered = [normalized_backend] + [
             provider for provider in configured if provider != normalized_backend
         ]
-        return _unique_provider_chain(
-            [provider for provider in ordered if _provider_configured(provider)]
+        return _order_provider_chain(
+            [provider for provider in ordered if _provider_configured(provider)],
+            requested_provider=normalized_backend,
         )
     if normalized_backend == AUTO_MULTI_PROVIDER_BACKEND or normalized_backend is None:
-        return configured
-    return configured
+        return _order_provider_chain(configured)
+    return _order_provider_chain(configured)
 
 
 def get_evolution_llm_backend() -> str:
@@ -125,6 +209,12 @@ def get_llm_backend_status() -> Dict[str, Any]:
         "openai_model": get_openai_model() if openai_configured else None,
         "gemini_configured": gemini_configured,
         "gemini_account_count": _provider_key_count("gemini"),
+        "provider_health": {
+            provider: _provider_health_state(provider)
+            for provider in REAL_LLM_PROVIDERS
+            if _provider_configured(provider)
+        },
+        "primary_provider_reason": _provider_selection_reason(requested_backend, provider_chain),
         "provider_chain": provider_chain,
         "fallback_providers": provider_chain[1:],
     }
@@ -160,6 +250,7 @@ def enhance_evolution_report_with_llm(
         )
         attempts += 1
         if result is not None:
+            _mark_provider_success(provider)
             result["enhanced_by"] = provider
             result["enhancement_provider_chain"] = list(provider_chain)
             result["enhancement_fallback_used"] = provider != primary_provider
@@ -175,6 +266,7 @@ def enhance_evolution_report_with_llm(
                 project_context=project_context,
             )
             return result
+        _mark_provider_failure(provider)
         result = _call_provider(
             provider,
             project_id=project_id,
@@ -184,6 +276,7 @@ def enhance_evolution_report_with_llm(
         )
         attempts += 1
         if result is not None:
+            _mark_provider_success(provider)
             result["enhanced_by"] = provider
             result["enhancement_provider_chain"] = list(provider_chain)
             result["enhancement_fallback_used"] = provider != primary_provider
@@ -199,6 +292,7 @@ def enhance_evolution_report_with_llm(
                 project_context=project_context,
             )
             return result
+        _mark_provider_failure(provider)
     return None
 
 
@@ -242,9 +336,11 @@ def _attach_enhancement_review(
         project_context=project_context,
     )
     if review is None:
+        _mark_provider_failure(review_provider)
         result["enhancement_review_status"] = "unavailable"
         result["enhancement_review_notes"] = [f"{review_provider} 复核未返回有效结果，保留主结果。"]
         return
+    _mark_provider_success(review_provider)
     similarity = _compare_enhancement_similarity(result, review)
     threshold = DEFAULT_ENHANCEMENT_REVIEW_SIMILARITY_THRESHOLD
     result["enhancement_review_similarity"] = similarity

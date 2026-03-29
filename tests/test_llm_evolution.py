@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import os
+import time
 from unittest.mock import patch
 
+import pytest
+
 from app.engine.llm_evolution import (
+    _PROVIDER_FAILURES,
     AUTO_MULTI_PROVIDER_BACKEND,
     EVOLUTION_LLM_BACKEND_ENV,
     enhance_evolution_report_with_llm,
@@ -15,6 +19,15 @@ from app.engine.llm_evolution import (
 )
 from app.engine.llm_evolution_common import parse_api_key_pool
 from app.engine.openai_compat import resolve_openai_model
+
+
+@pytest.fixture(autouse=True)
+def _reset_provider_failures():
+    _PROVIDER_FAILURES.clear()
+    try:
+        yield
+    finally:
+        _PROVIDER_FAILURES.clear()
 
 
 class TestGetEvolutionLlmBackend:
@@ -147,6 +160,8 @@ class TestEnhanceEvolutionReportWithLlm:
         assert status["openai_configured"] is True
         assert status["openai_account_count"] == 1
         assert status["gemini_account_count"] == 0
+        assert status["provider_health"] == {"openai": "healthy"}
+        assert status["primary_provider_reason"] == "requested_openai_healthy"
         assert status["provider_chain"] == ["openai"]
         assert status["fallback_providers"] == []
 
@@ -167,8 +182,33 @@ class TestEnhanceEvolutionReportWithLlm:
         assert status["auto_mode"] is True
         assert status["openai_account_count"] == 2
         assert status["gemini_account_count"] == 2
+        assert status["provider_health"] == {"openai": "healthy", "gemini": "healthy"}
+        assert status["primary_provider_reason"] == "default_openai_primary"
         assert status["provider_chain"] == ["openai", "gemini"]
         assert status["fallback_providers"] == ["gemini"]
+
+    def test_auto_provider_chain_promotes_gemini_when_openai_is_cooling_down(self):
+        _PROVIDER_FAILURES.clear()
+        _PROVIDER_FAILURES["openai"] = time.time()
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    EVOLUTION_LLM_BACKEND_ENV: AUTO_MULTI_PROVIDER_BACKEND,
+                    "OPENAI_API_KEY": "openai-key",
+                    "GEMINI_API_KEY": "gemini-key",
+                },
+                clear=True,
+            ):
+                assert get_evolution_llm_provider_chain() == ["gemini", "openai"]
+                status = get_llm_backend_status()
+        finally:
+            _PROVIDER_FAILURES.clear()
+
+        assert status["evolution_backend"] == "gemini"
+        assert status["provider_health"]["openai"] == "cooldown"
+        assert status["provider_health"]["gemini"] == "healthy"
+        assert status["primary_provider_reason"] == "openai_cooldown_promoted_gemini"
 
     def test_openai_stub_returns_none(self):
         with patch.dict(os.environ, {EVOLUTION_LLM_BACKEND_ENV: "openai"}):

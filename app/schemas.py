@@ -93,6 +93,14 @@ class LLMBackendStatus(BaseModel):
         0,
         description="当前 Gemini 可用账号数（GEMINI_API_KEY + GEMINI_API_KEYS 汇总）",
     )
+    provider_health: Dict[str, str] = Field(
+        default_factory=dict,
+        description="各 provider 当前健康状态：healthy | cooldown",
+    )
+    primary_provider_reason: Optional[str] = Field(
+        None,
+        description="当前主 provider 选择原因",
+    )
     provider_chain: List[str] = Field(
         default_factory=list,
         description="当前实际调用链路，按主后端到备用后端排序",
