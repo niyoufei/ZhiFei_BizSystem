@@ -5395,6 +5395,52 @@ class TestMaterialAdvancedParsing:
         assert "120" in numbers
         assert int(patterns.get("minimum_numbers") or 0) >= 1
 
+    def test_build_material_consistency_requirements_relaxes_drawing_numeric_requirement(self):
+        from app.main import _build_material_consistency_requirements
+
+        retrieval_chunks = [
+            {
+                "material_type": "drawing",
+                "dimension_id": "14",
+                "filename": "排水工程-延边路.pdf",
+                "chunk_id": "排水工程-延边路.pdf#c001",
+                "matched_terms": ["图纸"],
+                "matched_file_anchor_terms": ["排水工程", "照明工程设计说明"],
+                "matched_numeric_terms": ["28"],
+                "chunk_preview": "排水工程设计说明与节点做法。",
+            }
+        ]
+        reqs = _build_material_consistency_requirements("p1", retrieval_chunks)
+        drawing_req = next(r for r in reqs if r.get("material_type") == "drawing")
+        patterns = drawing_req.get("patterns") or {}
+        terms = patterns.get("must_hit_terms") or []
+        assert "排水工程" in terms
+        assert int(patterns.get("minimum_terms") or 0) == 1
+        assert int(patterns.get("minimum_numbers") or 0) == 0
+
+    def test_build_material_retrieval_requirements_keeps_drawing_anchor_terms(self):
+        from app.main import _build_material_retrieval_requirements
+
+        reqs = _build_material_retrieval_requirements(
+            "p1",
+            [
+                {
+                    "material_type": "drawing",
+                    "dimension_id": "14",
+                    "filename": "排水工程-延边路.pdf",
+                    "chunk_id": "排水工程-延边路.pdf#c001",
+                    "matched_terms": ["图纸"],
+                    "matched_file_anchor_terms": ["排水工程", "照明工程设计说明"],
+                    "chunk_preview": "排水工程设计说明与节点做法。",
+                }
+            ],
+        )
+        assert len(reqs) == 1
+        patterns = reqs[0].get("patterns") or {}
+        hints = patterns.get("hints") or []
+        assert "排水工程" in hints
+        assert int(patterns.get("minimum_hint_hits") or 0) == 1
+
     @patch("app.main.load_materials")
     @patch("app.main._read_uploaded_file_content")
     def test_select_material_retrieval_chunks_keeps_type_diversity(

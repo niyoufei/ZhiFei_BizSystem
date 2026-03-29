@@ -18597,13 +18597,16 @@ def _build_material_retrieval_requirements(
         mat_type = str(chunk.get("material_type") or MATERIAL_TYPE_DEFAULT)
         filename = str(chunk.get("filename") or "")
         hints = [str(x) for x in (chunk.get("matched_terms") or []) if str(x).strip()]
+        hints.extend(
+            str(x) for x in (chunk.get("matched_file_anchor_terms") or []) if str(x).strip()
+        )
         preview = str(chunk.get("chunk_preview") or "").strip()
         if preview:
             hints.append(preview[:120])
         hints = _to_text_items(hints, max_items=8)
         if not hints:
             continue
-        minimum_hint_hits = 2 if mat_type in {"tender_qa", "boq", "drawing"} else 1
+        minimum_hint_hits = 2 if mat_type in {"tender_qa", "boq"} else 1
         reqs.append(
             {
                 "id": f"runtime-rag-{project_id[:8]}-{idx}",
@@ -18673,6 +18676,10 @@ def _build_material_consistency_requirements(
                 token = str(term or "").strip()
                 if token:
                     keyword_counter[token] += 1
+            for term in chunk.get("matched_file_anchor_terms") or []:
+                token = str(term or "").strip()
+                if token:
+                    keyword_counter[token] += 2
             for token in chunk.get("matched_numeric_terms") or []:
                 numeric = _normalize_numeric_token(token)
                 if numeric:
@@ -18702,11 +18709,9 @@ def _build_material_consistency_requirements(
 
         req_index += 1
         minimum_terms = (
-            2
-            if (must_terms and mat_type in {"tender_qa", "boq", "drawing"})
-            else (1 if must_terms else 0)
+            2 if (must_terms and mat_type in {"tender_qa", "boq"}) else (1 if must_terms else 0)
         )
-        minimum_numbers = 1 if must_numbers else 0
+        minimum_numbers = 1 if (must_numbers and mat_type in {"tender_qa", "boq"}) else 0
         known_required_types = {"tender_qa", "boq", "drawing", "site_photo"}
         mandatory = mat_type in known_required_types and (
             (not normalized_available_types) or (mat_type in normalized_available_types)
