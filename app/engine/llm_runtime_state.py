@@ -11,6 +11,7 @@ _STATE_LOCK = threading.Lock()
 _KNOWN_PROVIDERS = ("openai", "gemini")
 _KNOWN_REVIEW_STATUSES = ("confirmed", "diverged", "unavailable", "fallback_only")
 _KNOWN_ACCOUNT_REQUEST_STATUSES = ("success", "failure")
+LLM_RUNTIME_STATE_MAX_HISTORY = 20
 
 
 def _empty_provider_review_stats() -> Dict[str, Any]:
@@ -143,6 +144,14 @@ def _normalize_timestamp(value: Any) -> float | None:
         return None
 
 
+def _compact_counter_row(row: Dict[str, Any], count_keys: tuple[str, ...]) -> None:
+    while sum(max(0, int(_normalize_timestamp(row.get(key)) or 0)) for key in count_keys) >= (
+        LLM_RUNTIME_STATE_MAX_HISTORY
+    ):
+        for key in count_keys:
+            row[key] = max(0, int(_normalize_timestamp(row.get(key)) or 0)) // 2
+
+
 def fingerprint_api_key(raw_key: str) -> str:
     return hashlib.sha256(str(raw_key or "").strip().encode("utf-8")).hexdigest()
 
@@ -240,6 +249,15 @@ def record_provider_review_outcome(provider: str, status: str, recorded_at: floa
         row = (state.get("provider_review_stats") or {}).setdefault(
             provider, _empty_provider_review_stats()
         )
+        _compact_counter_row(
+            row,
+            (
+                "confirmed_count",
+                "diverged_count",
+                "unavailable_count",
+                "fallback_only_count",
+            ),
+        )
         count_key = f"{normalized_status}_count"
         row[count_key] = max(0, int(_normalize_timestamp(row.get(count_key)) or 0)) + 1
         row["last_status"] = normalized_status
@@ -328,6 +346,7 @@ def record_account_request_outcome(
         state = _load_state_unlocked()
         provider_state = (state.get("account_request_stats") or {}).setdefault(provider, {})
         row = provider_state.setdefault(fingerprint_api_key(raw), _empty_account_request_stats())
+        _compact_counter_row(row, ("success_count", "failure_count"))
         count_key = f"{normalized_status}_count"
         row[count_key] = max(0, int(_normalize_timestamp(row.get(count_key)) or 0)) + 1
         row["last_status"] = normalized_status

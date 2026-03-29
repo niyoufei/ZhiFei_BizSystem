@@ -139,6 +139,33 @@ class TestApiKeyPoolParsing:
         assert keys == ["key-a", "key-b", "key-c"]
 
 
+class TestLlmRuntimeStateCompaction:
+    def test_provider_review_stats_use_bounded_history_window(self):
+        for _ in range(llm_runtime_state.LLM_RUNTIME_STATE_MAX_HISTORY + 7):
+            llm_runtime_state.record_provider_review_outcome("openai", "confirmed", time.time())
+
+        stats = llm_runtime_state.get_provider_review_stats()["openai"]
+
+        assert stats["confirmed_count"] <= llm_runtime_state.LLM_RUNTIME_STATE_MAX_HISTORY
+        assert stats["last_status"] == "confirmed"
+
+    def test_account_request_stats_use_bounded_history_window(self):
+        for _ in range(llm_runtime_state.LLM_RUNTIME_STATE_MAX_HISTORY + 9):
+            llm_runtime_state.record_account_request_outcome(
+                "openai", "openai-key-1", "success", time.time()
+            )
+
+        stats = llm_runtime_state.get_account_request_stats("openai", ["openai-key-1"])[
+            "openai-key-1"
+        ]
+
+        assert (
+            stats["success_count"] + stats["failure_count"]
+            <= llm_runtime_state.LLM_RUNTIME_STATE_MAX_HISTORY
+        )
+        assert stats["last_status"] == "success"
+
+
 class TestEnhanceEvolutionReportWithLlm:
     def test_openai_key_attempt_order_prefers_higher_quality_ready_key(self):
         llm_runtime_state.record_account_request_outcome(
