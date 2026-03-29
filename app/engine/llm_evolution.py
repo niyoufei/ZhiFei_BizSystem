@@ -4,18 +4,20 @@
 
 说明：
 - 当前真实后端为 rules / openai / gemini。
+- 支持 auto 多 provider 编排：优先主后端，失败时自动切到备用后端。
 - 历史上的 spark 配置仅作为兼容别名保留，并在运行时映射到 openai。
 """
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.engine.openai_compat import get_openai_model
 
 # 支持的真实后端: rules | openai | gemini
 EVOLUTION_LLM_BACKEND_ENV = "EVOLUTION_LLM_BACKEND"
 LEGACY_SPARK_BACKEND_ALIAS = "spark"
+AUTO_MULTI_PROVIDER_BACKEND = "auto"
 LEGACY_SPARK_ENV_KEYS = (
     "SPARK_APIPASSWORD",
     "SPARK_MODEL",
@@ -23,6 +25,7 @@ LEGACY_SPARK_ENV_KEYS = (
     "SPARK_API_KEY",
     "SPARK_API_SECRET",
 )
+REAL_LLM_PROVIDERS: Tuple[str, ...] = ("openai", "gemini")
 
 
 def _get_requested_evolution_llm_backend() -> Optional[str]:
@@ -43,14 +46,54 @@ def _list_legacy_spark_env_keys() -> List[str]:
     return [key for key in LEGACY_SPARK_ENV_KEYS if str(os.getenv(key) or "").strip()]
 
 
-def get_evolution_llm_backend() -> str:
-    """从环境变量读取进化 LLM 后端；未显式指定时优先使用已配置的 OpenAI。"""
+def _provider_configured(provider: str) -> bool:
+    if provider == "openai":
+        return bool((os.getenv("OPENAI_API_KEY") or "").strip())
+    if provider == "gemini":
+        return bool((os.getenv("GEMINI_API_KEY") or "").strip())
+    return False
+
+
+def _unique_provider_chain(items: List[str]) -> List[str]:
+    out: List[str] = []
+    for item in items:
+        if item in REAL_LLM_PROVIDERS and item not in out:
+            out.append(item)
+    return out
+
+
+def get_evolution_llm_provider_chain() -> List[str]:
+    """
+    计算当前进化增强的 provider 编排链。
+
+    规则：
+    - rules => 空链
+    - openai/gemini => 该 provider 为主；若另一 provider 已配置，则作为 fallback
+    - auto/未指定 => 按 openai -> gemini 的优先顺序启用所有已配置 provider
+    - 显式请求的 provider 若未配置，不阻断；会自动回退到其他已配置 provider
+    """
     requested_backend = _get_requested_evolution_llm_backend()
     normalized_backend = _normalize_evolution_llm_backend(requested_backend)
-    if normalized_backend:
-        return normalized_backend
-    if (os.getenv("OPENAI_API_KEY") or "").strip():
-        return "openai"
+    configured = [provider for provider in REAL_LLM_PROVIDERS if _provider_configured(provider)]
+    if normalized_backend == "rules":
+        return []
+    if normalized_backend in REAL_LLM_PROVIDERS:
+        ordered = [normalized_backend] + [
+            provider for provider in configured if provider != normalized_backend
+        ]
+        return _unique_provider_chain(
+            [provider for provider in ordered if _provider_configured(provider)]
+        )
+    if normalized_backend == AUTO_MULTI_PROVIDER_BACKEND or normalized_backend is None:
+        return configured
+    return configured
+
+
+def get_evolution_llm_backend() -> str:
+    """返回当前实际生效的主后端；若都不可用则回退为 rules。"""
+    chain = get_evolution_llm_provider_chain()
+    if chain:
+        return chain[0]
     return "rules"
 
 
@@ -58,18 +101,23 @@ def get_llm_backend_status() -> Dict[str, Any]:
     """返回各 LLM 后端的配置状态，便于运维与界面展示（不暴露密钥）。"""
     requested_backend = _get_requested_evolution_llm_backend()
     backend = get_evolution_llm_backend()
+    provider_chain = get_evolution_llm_provider_chain()
     legacy_spark_env_keys = _list_legacy_spark_env_keys()
-    openai_configured = bool((os.getenv("OPENAI_API_KEY") or "").strip())
-    gemini_configured = bool((os.getenv("GEMINI_API_KEY") or "").strip())
+    openai_configured = _provider_configured("openai")
+    gemini_configured = _provider_configured("gemini")
     return {
         "evolution_backend": backend,
         "requested_backend": requested_backend,
         "backend_alias_applied": bool(requested_backend == LEGACY_SPARK_BACKEND_ALIAS),
+        "auto_mode": _normalize_evolution_llm_backend(requested_backend)
+        in (None, AUTO_MULTI_PROVIDER_BACKEND),
         "spark_configured": bool(legacy_spark_env_keys),
         "legacy_spark_env_keys": legacy_spark_env_keys,
         "openai_configured": openai_configured,
         "openai_model": get_openai_model() if openai_configured else None,
         "gemini_configured": gemini_configured,
+        "provider_chain": provider_chain,
+        "fallback_providers": provider_chain[1:],
     }
 
 
@@ -82,26 +130,62 @@ def enhance_evolution_report_with_llm(
     """
     使用配置的 LLM 后端增强进化报告（高分逻辑、编制指导）。
     若后端为 rules 或调用失败，返回 None，调用方保留规则版报告。
-    对 openai/gemini 失败时自动重试一次，提高鲁棒性。
+    对 openai/gemini 失败时自动重试一次；若配置了多 provider，则自动切换备用后端。
 
     Returns:
         增强后的报告 dict（含 high_score_logic, writing_guidance, enhanced_by 等），或 None
     """
-    backend = get_evolution_llm_backend()
-    if backend == "rules":
+    provider_chain = get_evolution_llm_provider_chain()
+    if not provider_chain:
         return None
 
-    def _call() -> Optional[Dict[str, Any]]:
-        if backend == "openai":
-            return _enhance_with_openai(project_id, report, ground_truth_records, project_context)
-        if backend == "gemini":
-            return _enhance_with_gemini(project_id, report, ground_truth_records, project_context)
-        return None
+    attempts = 0
+    primary_provider = provider_chain[0]
+    for provider in provider_chain:
+        result = _call_provider(
+            provider,
+            project_id=project_id,
+            report=report,
+            ground_truth_records=ground_truth_records,
+            project_context=project_context,
+        )
+        attempts += 1
+        if result is not None:
+            result["enhanced_by"] = provider
+            result["enhancement_provider_chain"] = list(provider_chain)
+            result["enhancement_fallback_used"] = provider != primary_provider
+            result["enhancement_attempts"] = attempts
+            return result
+        result = _call_provider(
+            provider,
+            project_id=project_id,
+            report=report,
+            ground_truth_records=ground_truth_records,
+            project_context=project_context,
+        )
+        attempts += 1
+        if result is not None:
+            result["enhanced_by"] = provider
+            result["enhancement_provider_chain"] = list(provider_chain)
+            result["enhancement_fallback_used"] = provider != primary_provider
+            result["enhancement_attempts"] = attempts
+            return result
+    return None
 
-    result = _call()
-    if result is None and backend in ("openai", "gemini"):
-        result = _call()  # 一次重试
-    return result
+
+def _call_provider(
+    provider: str,
+    *,
+    project_id: str,
+    report: Dict[str, Any],
+    ground_truth_records: List[Dict[str, Any]],
+    project_context: str,
+) -> Optional[Dict[str, Any]]:
+    if provider == "openai":
+        return _enhance_with_openai(project_id, report, ground_truth_records, project_context)
+    if provider == "gemini":
+        return _enhance_with_gemini(project_id, report, ground_truth_records, project_context)
+    return None
 
 
 def _enhance_with_spark(

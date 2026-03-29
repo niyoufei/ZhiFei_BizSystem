@@ -73,6 +73,9 @@ class LLMBackendStatus(BaseModel):
     backend_alias_applied: bool = Field(
         False, description="是否应用了历史 spark -> openai 的兼容映射"
     )
+    auto_mode: bool = Field(
+        False, description="是否启用了自动多 provider 编排（auto 或未显式指定时）"
+    )
     spark_configured: bool = Field(
         ..., description="是否检测到历史 Spark 兼容配置；仅提示迁移，不代表真实 provider 为 Spark"
     )
@@ -82,6 +85,14 @@ class LLMBackendStatus(BaseModel):
     openai_configured: bool = Field(..., description="是否已配置 OPENAI_API_KEY")
     openai_model: Optional[str] = Field(None, description="当前 OpenAI 模型")
     gemini_configured: bool = Field(..., description="是否已配置 GEMINI_API_KEY")
+    provider_chain: List[str] = Field(
+        default_factory=list,
+        description="当前实际调用链路，按主后端到备用后端排序",
+    )
+    fallback_providers: List[str] = Field(
+        default_factory=list,
+        description="当前可用的备用 provider 列表",
+    )
 
 
 class ConfigReloadResponse(BaseModel):
@@ -1250,6 +1261,18 @@ class EvolutionReport(BaseModel):
     enhanced_by: Optional[str] = Field(
         None,
         description="若由 LLM 增强则标识真实后端：openai | gemini；仅规则时为 None",
+    )
+    enhancement_provider_chain: List[str] = Field(
+        default_factory=list,
+        description="本次增强尝试的 provider 链路",
+    )
+    enhancement_fallback_used: bool = Field(
+        False,
+        description="本次增强是否发生了 provider fallback",
+    )
+    enhancement_attempts: int = Field(
+        0,
+        description="本次增强总尝试次数（含同 provider 重试）",
     )
 
 

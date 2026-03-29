@@ -13792,11 +13792,14 @@ def llm_status() -> LLMBackendStatus:
         evolution_backend=s["evolution_backend"],
         requested_backend=s.get("requested_backend"),
         backend_alias_applied=bool(s.get("backend_alias_applied")),
+        auto_mode=bool(s.get("auto_mode")),
         spark_configured=s["spark_configured"],
         legacy_spark_env_keys=list(s.get("legacy_spark_env_keys") or []),
         openai_configured=s["openai_configured"],
         openai_model=s.get("openai_model"),
         gemini_configured=s["gemini_configured"],
+        provider_chain=list(s.get("provider_chain") or []),
+        fallback_providers=list(s.get("fallback_providers") or []),
     )
 
 
@@ -23264,6 +23267,11 @@ def evolve_project(
         report["enhanced_by"] = enhanced.get(
             "enhanced_by"
         )  # 可追溯：真实 provider（当前为 openai | gemini）
+        report["enhancement_provider_chain"] = list(
+            enhanced.get("enhancement_provider_chain") or []
+        )
+        report["enhancement_fallback_used"] = bool(enhanced.get("enhancement_fallback_used"))
+        report["enhancement_attempts"] = int(enhanced.get("enhancement_attempts") or 0)
         # 保留规则版产出的 scoring_evolution、compilation_instructions（LLM 仅增强文字部分）
     reports = load_evolution_reports()
     reports[project_id] = report

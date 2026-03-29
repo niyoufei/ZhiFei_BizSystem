@@ -9125,11 +9125,14 @@ class TestLlmStatusEndpoint:
             "evolution_backend": "openai",
             "requested_backend": "spark",
             "backend_alias_applied": True,
+            "auto_mode": False,
             "spark_configured": True,
             "legacy_spark_env_keys": ["SPARK_MODEL"],
             "openai_configured": True,
             "openai_model": "gpt-5.4",
             "gemini_configured": False,
+            "provider_chain": ["openai"],
+            "fallback_providers": [],
         }
 
         response = client.get("/api/v1/config/llm_status")
@@ -9139,11 +9142,14 @@ class TestLlmStatusEndpoint:
         assert payload["evolution_backend"] == "openai"
         assert payload["requested_backend"] == "spark"
         assert payload["backend_alias_applied"] is True
+        assert payload["auto_mode"] is False
         assert payload["spark_configured"] is True
         assert payload["legacy_spark_env_keys"] == ["SPARK_MODEL"]
         assert payload["openai_configured"] is True
         assert payload["openai_model"] == "gpt-5.4"
         assert payload["gemini_configured"] is False
+        assert payload["provider_chain"] == ["openai"]
+        assert payload["fallback_providers"] == []
 
 
 class TestDataHygieneEndpoints:
