@@ -307,6 +307,26 @@ class TestEnhanceEvolutionReportWithLlm:
         assert status["provider_quality"] == {"openai": "degraded", "gemini": "stable"}
         assert status["primary_provider_reason"] == "openai_quality_degraded_promoted_gemini"
 
+    def test_auto_provider_chain_promotes_gemini_when_openai_review_history_regresses(self):
+        llm_runtime_state.record_provider_review_outcome("openai", "diverged", time.time())
+        llm_runtime_state.record_provider_review_outcome("openai", "diverged", time.time())
+        llm_runtime_state.record_provider_review_outcome("gemini", "confirmed", time.time())
+        with patch.dict(
+            os.environ,
+            {
+                EVOLUTION_LLM_BACKEND_ENV: AUTO_MULTI_PROVIDER_BACKEND,
+                "OPENAI_API_KEY": "openai-key",
+                "GEMINI_API_KEY": "gemini-key",
+            },
+            clear=True,
+        ):
+            assert get_evolution_llm_provider_chain() == ["gemini", "openai"]
+            status = get_llm_backend_status()
+
+        assert status["provider_quality"] == {"openai": "degraded", "gemini": "stable"}
+        assert status["provider_review_stats"]["openai"]["diverged_count"] == 2
+        assert status["primary_provider_reason"] == "openai_quality_degraded_promoted_gemini"
+
     def test_provider_cooldown_survives_runtime_state_reload(self):
         failed_at = time.time()
         llm_runtime_state.set_provider_failure("openai", failed_at)

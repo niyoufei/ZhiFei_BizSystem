@@ -51,6 +51,8 @@ _PROVIDER_FAILURES: Dict[str, float] = {}
 _PROVIDER_FAILURES_LOCK = threading.Lock()
 _PROVIDER_QUALITY_DEGRADED: Dict[str, float] = {}
 _PROVIDER_QUALITY_DEGRADED_LOCK = threading.Lock()
+_PROVIDER_REVIEW_STATS: Dict[str, Dict[str, Any]] = {}
+_PROVIDER_REVIEW_STATS_LOCK = threading.Lock()
 
 
 def _to_int(value: Any, default: int = 0) -> int:
@@ -72,6 +74,15 @@ def _sync_provider_quality_from_runtime_state() -> None:
     with _PROVIDER_QUALITY_DEGRADED_LOCK:
         _PROVIDER_QUALITY_DEGRADED.clear()
         _PROVIDER_QUALITY_DEGRADED.update(persisted)
+
+
+def _sync_provider_review_stats_from_runtime_state() -> None:
+    persisted = get_provider_review_stats()
+    with _PROVIDER_REVIEW_STATS_LOCK:
+        _PROVIDER_REVIEW_STATS.clear()
+        for provider, stats in persisted.items():
+            if provider in REAL_LLM_PROVIDERS and isinstance(stats, dict):
+                _PROVIDER_REVIEW_STATS[provider] = dict(stats)
 
 
 def _get_requested_evolution_llm_backend() -> Optional[str]:
@@ -147,11 +158,22 @@ def _provider_quality_state(provider: str) -> str:
     if provider not in REAL_LLM_PROVIDERS:
         return "unknown"
     degraded_at = _PROVIDER_QUALITY_DEGRADED.get(provider)
-    if degraded_at is None:
-        return "stable"
-    if (time.time() - degraded_at) >= _provider_quality_degrade_seconds():
-        return "stable"
-    return "degraded"
+    if (
+        degraded_at is not None
+        and (time.time() - degraded_at) < _provider_quality_degrade_seconds()
+    ):
+        return "degraded"
+    if _provider_review_regressed(provider):
+        return "degraded"
+    return "stable"
+
+
+def _provider_review_regressed(provider: str) -> bool:
+    with _PROVIDER_REVIEW_STATS_LOCK:
+        stats = dict(_PROVIDER_REVIEW_STATS.get(provider) or {})
+    confirmed_count = max(0, _to_int(stats.get("confirmed_count"), 0))
+    diverged_count = max(0, _to_int(stats.get("diverged_count"), 0))
+    return diverged_count >= 2 and diverged_count > confirmed_count
 
 
 def _provider_pool_health(provider: str) -> Dict[str, int]:
@@ -265,6 +287,7 @@ def get_evolution_llm_provider_chain() -> List[str]:
     """
     _sync_provider_failures_from_runtime_state()
     _sync_provider_quality_from_runtime_state()
+    _sync_provider_review_stats_from_runtime_state()
     requested_backend = _get_requested_evolution_llm_backend()
     normalized_backend = _normalize_evolution_llm_backend(requested_backend)
     configured = [provider for provider in REAL_LLM_PROVIDERS if _provider_configured(provider)]
@@ -295,6 +318,7 @@ def get_llm_backend_status() -> Dict[str, Any]:
     """返回各 LLM 后端的配置状态，便于运维与界面展示（不暴露密钥）。"""
     _sync_provider_failures_from_runtime_state()
     _sync_provider_quality_from_runtime_state()
+    _sync_provider_review_stats_from_runtime_state()
     requested_backend = _get_requested_evolution_llm_backend()
     backend = get_evolution_llm_backend()
     provider_chain = get_evolution_llm_provider_chain()
