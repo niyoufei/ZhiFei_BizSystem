@@ -18,6 +18,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from app.engine.llm_evolution_common import parse_api_key_pool
 from app.engine.llm_evolution_gemini import get_gemini_evolution_pool_health
 from app.engine.llm_evolution_openai import get_openai_evolution_pool_health
+from app.engine.llm_runtime_state import (
+    clear_provider_failure,
+    get_provider_failure_timestamps,
+    set_provider_failure,
+)
 from app.engine.openai_compat import get_openai_model
 
 # 支持的真实后端: rules | openai | gemini
@@ -37,6 +42,13 @@ EVOLUTION_LLM_PROVIDER_COOLDOWN_ENV = "EVOLUTION_LLM_ACCOUNT_COOLDOWN_SECONDS"
 DEFAULT_EVOLUTION_LLM_PROVIDER_COOLDOWN_SECONDS = 300.0
 _PROVIDER_FAILURES: Dict[str, float] = {}
 _PROVIDER_FAILURES_LOCK = threading.Lock()
+
+
+def _sync_provider_failures_from_runtime_state() -> None:
+    persisted = get_provider_failure_timestamps()
+    with _PROVIDER_FAILURES_LOCK:
+        _PROVIDER_FAILURES.clear()
+        _PROVIDER_FAILURES.update(persisted)
 
 
 def _get_requested_evolution_llm_backend() -> Optional[str]:
@@ -103,11 +115,14 @@ def _provider_is_healthy(provider: str) -> bool:
 def _mark_provider_success(provider: str) -> None:
     with _PROVIDER_FAILURES_LOCK:
         _PROVIDER_FAILURES.pop(provider, None)
+    clear_provider_failure(provider)
 
 
 def _mark_provider_failure(provider: str) -> None:
+    failed_at = time.time()
     with _PROVIDER_FAILURES_LOCK:
-        _PROVIDER_FAILURES[provider] = time.time()
+        _PROVIDER_FAILURES[provider] = failed_at
+    set_provider_failure(provider, failed_at)
 
 
 def _order_provider_chain(
@@ -164,6 +179,7 @@ def get_evolution_llm_provider_chain() -> List[str]:
     - auto/未指定 => 按 openai -> gemini 的优先顺序启用所有已配置 provider
     - 显式请求的 provider 若未配置，不阻断；会自动回退到其他已配置 provider
     """
+    _sync_provider_failures_from_runtime_state()
     requested_backend = _get_requested_evolution_llm_backend()
     normalized_backend = _normalize_evolution_llm_backend(requested_backend)
     configured = [provider for provider in REAL_LLM_PROVIDERS if _provider_configured(provider)]
@@ -192,6 +208,7 @@ def get_evolution_llm_backend() -> str:
 
 def get_llm_backend_status() -> Dict[str, Any]:
     """返回各 LLM 后端的配置状态，便于运维与界面展示（不暴露密钥）。"""
+    _sync_provider_failures_from_runtime_state()
     requested_backend = _get_requested_evolution_llm_backend()
     backend = get_evolution_llm_backend()
     provider_chain = get_evolution_llm_provider_chain()

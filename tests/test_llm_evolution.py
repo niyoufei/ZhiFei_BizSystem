@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+import app.engine.llm_runtime_state as llm_runtime_state
 from app.engine.llm_evolution import (
     _PROVIDER_FAILURES,
     AUTO_MULTI_PROVIDER_BACKEND,
@@ -18,16 +19,37 @@ from app.engine.llm_evolution import (
     get_llm_backend_status,
 )
 from app.engine.llm_evolution_common import parse_api_key_pool
+from app.engine.llm_evolution_gemini import (
+    _GEMINI_KEY_FAILURES,
+)
+from app.engine.llm_evolution_gemini import (
+    _mark_key_failure as _mark_gemini_key_failure,
+)
+from app.engine.llm_evolution_openai import (
+    _OPENAI_KEY_FAILURES,
+)
+from app.engine.llm_evolution_openai import (
+    _mark_key_failure as _mark_openai_key_failure,
+)
 from app.engine.openai_compat import resolve_openai_model
 
 
 @pytest.fixture(autouse=True)
-def _reset_provider_failures():
+def _reset_provider_failures(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        llm_runtime_state,
+        "LLM_RUNTIME_STATE_PATH",
+        tmp_path / "llm_runtime_state.json",
+    )
     _PROVIDER_FAILURES.clear()
+    _OPENAI_KEY_FAILURES.clear()
+    _GEMINI_KEY_FAILURES.clear()
     try:
         yield
     finally:
         _PROVIDER_FAILURES.clear()
+        _OPENAI_KEY_FAILURES.clear()
+        _GEMINI_KEY_FAILURES.clear()
 
 
 class TestGetEvolutionLlmBackend:
@@ -206,6 +228,7 @@ class TestEnhanceEvolutionReportWithLlm:
     def test_auto_provider_chain_promotes_gemini_when_openai_is_cooling_down(self):
         _PROVIDER_FAILURES.clear()
         _PROVIDER_FAILURES["openai"] = time.time()
+        llm_runtime_state.set_provider_failure("openai", _PROVIDER_FAILURES["openai"])
         try:
             with patch.dict(
                 os.environ,
@@ -235,6 +258,59 @@ class TestEnhanceEvolutionReportWithLlm:
         assert status["provider_health"]["openai"] == "cooldown"
         assert status["provider_health"]["gemini"] == "healthy"
         assert status["primary_provider_reason"] == "openai_cooldown_promoted_gemini"
+
+    def test_provider_cooldown_survives_runtime_state_reload(self):
+        failed_at = time.time()
+        llm_runtime_state.set_provider_failure("openai", failed_at)
+        _PROVIDER_FAILURES.clear()
+        with patch.dict(
+            os.environ,
+            {
+                EVOLUTION_LLM_BACKEND_ENV: AUTO_MULTI_PROVIDER_BACKEND,
+                "OPENAI_API_KEY": "openai-key",
+                "GEMINI_API_KEY": "gemini-key",
+            },
+            clear=True,
+        ):
+            assert get_evolution_llm_provider_chain() == ["gemini", "openai"]
+            status = get_llm_backend_status()
+        assert status["provider_health"]["openai"] == "cooldown"
+
+    def test_account_cooldown_survives_runtime_state_reload_without_storing_raw_key(self):
+        with patch.dict(
+            os.environ,
+            {
+                "OPENAI_API_KEYS": "openai-key-1,openai-key-2",
+            },
+            clear=True,
+        ):
+            _mark_openai_key_failure("openai-key-1")
+            _OPENAI_KEY_FAILURES.clear()
+            status = get_llm_backend_status()
+        assert status["openai_pool_health"] == {
+            "total_accounts": 2,
+            "healthy_accounts": 1,
+            "cooling_accounts": 1,
+        }
+        payload = llm_runtime_state.LLM_RUNTIME_STATE_PATH.read_text(encoding="utf-8")
+        assert "openai-key-1" not in payload
+
+    def test_gemini_account_cooldown_survives_runtime_state_reload(self):
+        with patch.dict(
+            os.environ,
+            {
+                "GEMINI_API_KEYS": "gemini-key-1,gemini-key-2",
+            },
+            clear=True,
+        ):
+            _mark_gemini_key_failure("gemini-key-1")
+            _GEMINI_KEY_FAILURES.clear()
+            status = get_llm_backend_status()
+        assert status["gemini_pool_health"] == {
+            "total_accounts": 2,
+            "healthy_accounts": 1,
+            "cooling_accounts": 1,
+        }
 
     def test_openai_stub_returns_none(self):
         with patch.dict(os.environ, {EVOLUTION_LLM_BACKEND_ENV: "openai"}):

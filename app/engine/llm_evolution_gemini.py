@@ -17,6 +17,11 @@ from app.engine.llm_evolution_common import (
     parse_api_key_pool,
     parse_evolution_response,
 )
+from app.engine.llm_runtime_state import (
+    clear_account_failure,
+    get_account_failure_timestamps,
+    set_account_failure,
+)
 
 GEMINI_HTTP_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 GEMINI_DEFAULT_MODEL = "gemini-1.5-pro"
@@ -26,6 +31,14 @@ DEFAULT_EVOLUTION_LLM_ACCOUNT_COOLDOWN_SECONDS = 300.0
 _GEMINI_KEY_FAILURES: Dict[str, float] = {}
 _GEMINI_KEY_CURSOR = 0
 _GEMINI_KEY_LOCK = threading.Lock()
+
+
+def _sync_key_failures_from_runtime_state(keys: List[str] | None = None) -> None:
+    active_keys = list(keys if keys is not None else get_gemini_evolution_api_keys())
+    persisted = get_account_failure_timestamps("gemini", active_keys)
+    with _GEMINI_KEY_LOCK:
+        _GEMINI_KEY_FAILURES.clear()
+        _GEMINI_KEY_FAILURES.update(persisted)
 
 
 def _get_gemini_model() -> str:
@@ -47,6 +60,7 @@ def get_gemini_evolution_account_count() -> int:
 
 def get_gemini_evolution_pool_health() -> Dict[str, int]:
     keys = get_gemini_evolution_api_keys()
+    _sync_key_failures_from_runtime_state(keys)
     now = time.time()
     cooldown = _account_cooldown_seconds()
     healthy_accounts = 0
@@ -76,6 +90,7 @@ def _account_cooldown_seconds() -> float:
 def _build_key_attempt_order(keys: List[str]) -> List[str]:
     if not keys:
         return []
+    _sync_key_failures_from_runtime_state(keys)
     now = time.time()
     cooldown = _account_cooldown_seconds()
     global _GEMINI_KEY_CURSOR
@@ -106,11 +121,14 @@ def _mark_key_success(key: str) -> None:
             except ValueError:
                 current_index = _GEMINI_KEY_CURSOR
             _GEMINI_KEY_CURSOR = (current_index + 1) % len(keys)
+    clear_account_failure("gemini", key)
 
 
 def _mark_key_failure(key: str) -> None:
+    failed_at = time.time()
     with _GEMINI_KEY_LOCK:
-        _GEMINI_KEY_FAILURES[key] = time.time()
+        _GEMINI_KEY_FAILURES[key] = failed_at
+    set_account_failure("gemini", key, failed_at)
 
 
 def _extract_json_from_content(content: str) -> Optional[Dict[str, Any]]:
