@@ -402,6 +402,7 @@ DEFAULT_LLM_SCORE_WEIGHT = 0.3
 DEFAULT_LLM_DELTA_CAP = 35.0
 DEFAULT_SCORE_SCALE_MAX = 100
 DEFAULT_FIVE_SCALE_PRIOR_TRIGGER_DISPLAY_MAX = 1.0
+DEFAULT_HUNDRED_SCALE_PRIOR_TRIGGER_TOTAL_MAX = 40.0
 DEFAULT_ENFORCE_GB_REDLINE = False
 DEFAULT_NORM_RULE_VERSION = "v1_m=0.5+a/10_norm=sum"
 DEFAULT_ENFORCE_MATERIAL_GATE = True
@@ -8143,11 +8144,7 @@ def _extract_submission_rule_total_100(submission: Dict[str, object]) -> Optiona
     return float(score_value)
 
 
-def _build_five_scale_global_prior_calibrator(
-    project: Dict[str, object],
-) -> Optional[Dict[str, object]]:
-    if _resolve_project_score_scale_max(project) != 5:
-        return None
+def _build_global_offset_prior_stats() -> Optional[Dict[str, float]]:
     latest_qingtian = _latest_records_by_submission(load_qingtian_results())
     if not latest_qingtian:
         return None
@@ -8180,26 +8177,44 @@ def _build_five_scale_global_prior_calibrator(
     avg_actual = sum(actual_scores) / len(actual_scores)
     avg_rule = sum(rule_scores) / len(rule_scores)
     return {
+        "sample_count": float(len(deltas)),
+        "avg_actual_score_100": round(avg_actual, 2),
+        "avg_rule_total_score_100": round(avg_rule, 2),
+        "avg_delta_100": round(bias, 2),
+        "bias": round(float(bias), 6),
+        "sigma": round(max(0.5, float(sigma)), 4),
+    }
+
+
+def _build_five_scale_global_prior_calibrator(
+    project: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    if _resolve_project_score_scale_max(project) != 5:
+        return None
+    stats = _build_global_offset_prior_stats()
+    if not stats:
+        return None
+    return {
         "calibrator_version": "prior_five_scale_global_offset_v1",
         "model_type": "offset",
         "feature_schema_version": "v2",
         "train_filter": {"project_id": None, "scope": "five_scale_global_prior"},
         "metrics": {
-            "sample_count": len(deltas),
-            "avg_actual_score_100": round(avg_actual, 2),
-            "avg_rule_total_score_100": round(avg_rule, 2),
-            "avg_delta_100": round(bias, 2),
+            "sample_count": int(stats["sample_count"]),
+            "avg_actual_score_100": stats["avg_actual_score_100"],
+            "avg_rule_total_score_100": stats["avg_rule_total_score_100"],
+            "avg_delta_100": stats["avg_delta_100"],
         },
         "model_artifact": {
             "model_type": "offset",
             "feature_schema_version": "v2",
-            "bias": round(float(bias), 6),
-            "sigma": round(max(0.5, float(sigma)), 4),
+            "bias": stats["bias"],
+            "sigma": stats["sigma"],
             "metrics": {
-                "sample_count": len(deltas),
-                "avg_actual_score_100": round(avg_actual, 2),
-                "avg_rule_total_score_100": round(avg_rule, 2),
-                "avg_delta_100": round(bias, 2),
+                "sample_count": int(stats["sample_count"]),
+                "avg_actual_score_100": stats["avg_actual_score_100"],
+                "avg_rule_total_score_100": stats["avg_rule_total_score_100"],
+                "avg_delta_100": stats["avg_delta_100"],
             },
             "gate_passed": True,
         },
@@ -8209,8 +8224,50 @@ def _build_five_scale_global_prior_calibrator(
     }
 
 
+def _build_hundred_scale_global_prior_calibrator(
+    project: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    if _resolve_project_score_scale_max(project) != 100:
+        return None
+    stats = _build_global_offset_prior_stats()
+    if not stats:
+        return None
+    return {
+        "calibrator_version": "prior_hundred_scale_global_offset_v1",
+        "model_type": "offset",
+        "feature_schema_version": "v2",
+        "train_filter": {"project_id": None, "scope": "hundred_scale_global_prior"},
+        "metrics": {
+            "sample_count": int(stats["sample_count"]),
+            "avg_actual_score_100": stats["avg_actual_score_100"],
+            "avg_rule_total_score_100": stats["avg_rule_total_score_100"],
+            "avg_delta_100": stats["avg_delta_100"],
+        },
+        "model_artifact": {
+            "model_type": "offset",
+            "feature_schema_version": "v2",
+            "bias": stats["bias"],
+            "sigma": stats["sigma"],
+            "metrics": {
+                "sample_count": int(stats["sample_count"]),
+                "avg_actual_score_100": stats["avg_actual_score_100"],
+                "avg_rule_total_score_100": stats["avg_rule_total_score_100"],
+                "avg_delta_100": stats["avg_delta_100"],
+            },
+            "gate_passed": True,
+        },
+        "synthetic_prior_kind": "hundred_scale_global_prior",
+        "deployed": True,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def _is_five_scale_global_prior_model(model: Dict[str, object]) -> bool:
     return str(model.get("synthetic_prior_kind") or "").strip() == "five_scale_global_prior"
+
+
+def _is_hundred_scale_global_prior_model(model: Dict[str, object]) -> bool:
+    return str(model.get("synthetic_prior_kind") or "").strip() == "hundred_scale_global_prior"
 
 
 def _should_apply_five_scale_global_prior(
@@ -8232,6 +8289,22 @@ def _should_apply_five_scale_global_prior(
     )
 
 
+def _should_apply_hundred_scale_global_prior(
+    submission: Dict[str, object],
+    *,
+    project: Dict[str, object],
+) -> bool:
+    if _resolve_project_score_scale_max(project) != 100:
+        return False
+    report = submission.get("report") if isinstance(submission.get("report"), dict) else {}
+    if _to_float_or_none(report.get("pred_total_score")) is not None:
+        return False
+    rule_total_100 = _extract_submission_rule_total_100(submission)
+    return rule_total_100 is not None and float(rule_total_100) < float(
+        DEFAULT_HUNDRED_SCALE_PRIOR_TRIGGER_TOTAL_MAX
+    )
+
+
 def _preview_submission_with_live_prediction(
     submission: Dict[str, object],
     *,
@@ -8248,13 +8321,16 @@ def _preview_submission_with_live_prediction(
     if not model:
         return preview
     artifact = model.get("model_artifact") or model.get("artifact") or {}
-    if _to_float_or_none(
-        report_obj.get("pred_total_score")
-    ) is not None and not _is_five_scale_global_prior_model(model):
+    is_five_scale_prior = _is_five_scale_global_prior_model(model)
+    is_hundred_scale_prior = _is_hundred_scale_global_prior_model(model)
+    is_synthetic_prior = is_five_scale_prior or is_hundred_scale_prior
+    if _to_float_or_none(report_obj.get("pred_total_score")) is not None and not is_synthetic_prior:
         return preview
-    if not _is_five_scale_global_prior_model(model) and not isinstance(artifact, dict):
+    if not is_synthetic_prior and not isinstance(artifact, dict):
         return preview
-    if _is_five_scale_global_prior_model(model) and not _should_apply_five_scale_global_prior(
+    if is_five_scale_prior and not _should_apply_five_scale_global_prior(preview, project=project):
+        return preview
+    if is_hundred_scale_prior and not _should_apply_hundred_scale_global_prior(
         preview,
         project=project,
     ):
@@ -9234,12 +9310,41 @@ def _apply_prediction_to_report_with_model(
         return str(model.get("calibrator_version") or "")
 
     rule_total = float(report.get("rule_total_score", report.get("total_score", 0.0)))
-    if _is_five_scale_global_prior_model(model):
+    is_five_scale_prior = _is_five_scale_global_prior_model(model)
+    is_hundred_scale_prior = _is_hundred_scale_global_prior_model(model)
+    if is_five_scale_prior and not _should_apply_five_scale_global_prior(
+        submission_like,
+        project=project,
+    ):
+        report["pred_total_score"] = None
+        report["llm_total_score"] = None
+        report["pred_confidence"] = None
+        report["pred_dim_scores"] = None
+        report["score_blend"] = None
+        report["total_score"] = float(rule_total)
+        submission_like["total_score"] = float(rule_total)
+        return str(model.get("calibrator_version") or "")
+    if is_hundred_scale_prior and not _should_apply_hundred_scale_global_prior(
+        submission_like,
+        project=project,
+    ):
+        report["pred_total_score"] = None
+        report["llm_total_score"] = None
+        report["pred_confidence"] = None
+        report["pred_dim_scores"] = None
+        report["score_blend"] = None
+        report["total_score"] = float(rule_total)
+        submission_like["total_score"] = float(rule_total)
+        return str(model.get("calibrator_version") or "")
+    if is_five_scale_prior or is_hundred_scale_prior:
         fused_total = _clip_score(float(pred))
         llm_total = None
+        prior_kind = (
+            "five_scale_global_prior" if is_five_scale_prior else "hundred_scale_global_prior"
+        )
         blend_info = {
             "mode": "synthetic_prior",
-            "prior_kind": "five_scale_global_prior",
+            "prior_kind": prior_kind,
             "bias": round(float((artifact or {}).get("bias", 0.0)), 4),
             "sample_count": int(
                 _to_float_or_none(((artifact or {}).get("metrics") or {}).get("sample_count")) or 0
@@ -11609,7 +11714,9 @@ def _select_calibrator_model_from_rows(
     for model in models:
         if bool(model.get("deployed")) and _compatible(model):
             return model
-    return _build_five_scale_global_prior_calibrator(project)
+    return _build_five_scale_global_prior_calibrator(
+        project
+    ) or _build_hundred_scale_global_prior_calibrator(project)
 
 
 def _resolve_project_scoring_context_for_governance(

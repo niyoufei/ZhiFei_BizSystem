@@ -6328,6 +6328,132 @@ class TestSubmissionsEndpoint:
         assert data[0]["report"]["dual_track_summary"]["display_score_label"] == "逼近分"
         assert data[0]["report"]["dual_track_summary"]["display_total_score"] == 4.2865
 
+    @patch("app.main.load_qingtian_results")
+    @patch("app.main.load_projects")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_submissions_uses_hundred_scale_global_prior_when_rule_score_too_low(
+        self,
+        mock_ensure,
+        mock_load_submissions,
+        mock_load_projects,
+        mock_load_qingtian_results,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1"}]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "current.pdf",
+                "total_score": 14.54,
+                "report": {
+                    "scoring_status": "scored",
+                    "total_score": 14.54,
+                    "rule_total_score": 14.54,
+                    "meta": {},
+                },
+                "text": "current text",
+                "created_at": "2026-01-02T00:00:00Z",
+            },
+            {
+                "id": "hist1",
+                "project_id": "hist",
+                "filename": "hist.txt",
+                "total_score": 6.81,
+                "report": {
+                    "scoring_status": "scored",
+                    "total_score": 6.81,
+                    "rule_total_score": 6.81,
+                    "meta": {},
+                },
+                "text": "historical text",
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+        ]
+        mock_load_qingtian_results.return_value = [
+            {
+                "id": "qt1",
+                "submission_id": "hist1",
+                "qt_total_score": 84.0,
+                "created_at": "2026-01-03T00:00:00Z",
+            }
+        ]
+
+        response = client.get("/api/v1/projects/p1/submissions")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert round(data[0]["total_score"], 2) == 91.73
+        assert round(data[0]["report"]["pred_total_score"], 2) == 91.73
+        assert data[0]["report"]["rule_total_score"] == 14.54
+        assert data[0]["report"]["raw_rule_total_score_100"] == 14.54
+        assert data[0]["report"]["dual_track_summary"]["display_score_label"] == "逼近分"
+        assert round(data[0]["report"]["dual_track_summary"]["display_total_score"], 2) == 91.73
+
+    @patch("app.main.load_qingtian_results")
+    @patch("app.main.load_projects")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_submissions_skips_hundred_scale_global_prior_for_normal_rule_scores(
+        self,
+        mock_ensure,
+        mock_load_submissions,
+        mock_load_projects,
+        mock_load_qingtian_results,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1"}]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "current.pdf",
+                "total_score": 62.0,
+                "report": {
+                    "scoring_status": "scored",
+                    "total_score": 62.0,
+                    "rule_total_score": 62.0,
+                    "meta": {},
+                },
+                "text": "current text",
+                "created_at": "2026-01-02T00:00:00Z",
+            },
+            {
+                "id": "hist1",
+                "project_id": "hist",
+                "filename": "hist.txt",
+                "total_score": 6.81,
+                "report": {
+                    "scoring_status": "scored",
+                    "total_score": 6.81,
+                    "rule_total_score": 6.81,
+                    "meta": {},
+                },
+                "text": "historical text",
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+        ]
+        mock_load_qingtian_results.return_value = [
+            {
+                "id": "qt1",
+                "submission_id": "hist1",
+                "qt_total_score": 84.0,
+                "created_at": "2026-01-03T00:00:00Z",
+            }
+        ]
+
+        response = client.get("/api/v1/projects/p1/submissions")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["total_score"] == 62.0
+        assert data[0]["report"]["pred_total_score"] is None
+        assert data[0]["report"]["rule_total_score"] == 62.0
+        assert data[0]["report"]["dual_track_summary"]["display_score_label"] == "独立分"
+
     def test_list_submissions_includes_dual_track_summary(self, client):
         submission = {
             "id": "s1",
@@ -6902,6 +7028,72 @@ class TestCompareEndpoints:
         assert data["rankings"][0]["total_score"] == 4.2865
         assert data["rankings"][0]["pred_total_score"] == 4.2865
         assert data["rankings"][0]["rule_total_score"] == 0.427
+        assert data["rankings"][0]["score_source"] == "pred"
+
+    @patch("app.main.load_qingtian_results")
+    @patch("app.main.load_projects")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_compare_uses_hundred_scale_global_prior_for_low_scores(
+        self,
+        mock_ensure,
+        mock_load_submissions,
+        mock_load_projects,
+        mock_load_qingtian_results,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1"}]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "blocked.pdf",
+                "total_score": 14.54,
+                "report": {
+                    "scoring_status": "blocked",
+                    "total_score": 14.54,
+                    "rule_total_score": 14.54,
+                    "meta": {},
+                    "dimension_scores": {},
+                    "penalties": [],
+                },
+                "text": "current text",
+                "created_at": "2026-01-02T00:00:00Z",
+            },
+            {
+                "id": "hist1",
+                "project_id": "hist",
+                "filename": "hist.txt",
+                "total_score": 6.81,
+                "report": {
+                    "scoring_status": "scored",
+                    "total_score": 6.81,
+                    "rule_total_score": 6.81,
+                    "meta": {},
+                    "dimension_scores": {},
+                    "penalties": [],
+                },
+                "text": "historical text",
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+        ]
+        mock_load_qingtian_results.return_value = [
+            {
+                "id": "qt1",
+                "submission_id": "hist1",
+                "qt_total_score": 84.0,
+                "created_at": "2026-01-03T00:00:00Z",
+            }
+        ]
+
+        response = client.get("/api/v1/projects/p1/compare")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["rankings"][0]["filename"] == "blocked.pdf"
+        assert round(data["rankings"][0]["total_score"], 2) == 91.73
+        assert round(data["rankings"][0]["pred_total_score"], 2) == 91.73
+        assert data["rankings"][0]["rule_total_score"] == 14.54
         assert data["rankings"][0]["score_source"] == "pred"
 
 
