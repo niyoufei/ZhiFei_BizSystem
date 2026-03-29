@@ -914,6 +914,14 @@ class TestIndexEndpoint:
             assert f'id="{button_id}" class="secondary compact-hidden"' not in page
             assert f'id="{button_id}" class="compact-hidden"' not in page
 
+    def test_index_exposes_evolution_review_audit_helpers(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert "function renderEvolutionEnhancementAudit(data)" in page
+        assert "双模型分歧，已自动回退到规则版建议" in page
+        assert "已通过双模型复核" in page
+
     def test_index_compact_ui_hides_advanced_controls_by_default(self, client):
         response = client.get("/")
         assert response.status_code == 200
@@ -3952,6 +3960,51 @@ class TestMaterialsEndpoint:
         assert payload["windows"]["all"]["mae"] == pytest.approx(8.0, abs=1e-4)
         assert payload["windows"]["all"]["count"] == 1
         assert payload["drift"]["level"] in {"insufficient_data", "watch", "low", "medium", "high"}
+
+    @patch("app.main.load_projects")
+    @patch("app.main._resolve_project_scoring_context")
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_submissions")
+    def test_build_evolution_health_report_exposes_enhancement_review_state(
+        self,
+        mock_load_submissions,
+        mock_load_ground_truth,
+        mock_load_evo_reports,
+        mock_resolve_scoring_context,
+        mock_load_projects,
+    ):
+        from app.main import _build_evolution_health_report
+
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 100}}]
+        mock_load_submissions.return_value = []
+        mock_load_ground_truth.return_value = []
+        mock_load_evo_reports.return_value = {
+            "p1": {
+                "updated_at": "2026-03-29T00:00:00+00:00",
+                "enhancement_applied": False,
+                "enhancement_governed": True,
+                "enhancement_review_status": "diverged",
+                "enhancement_review_provider": "gemini",
+                "enhancement_review_similarity": 0.12,
+            }
+        }
+        mock_resolve_scoring_context.return_value = (
+            {"01": 1.0},
+            None,
+            {"id": "p1", "meta": {"score_scale_max": 100}},
+        )
+
+        payload = _build_evolution_health_report(
+            "p1", {"id": "p1", "meta": {"score_scale_max": 100}}
+        )
+
+        assert payload["summary"]["enhancement_applied"] is False
+        assert payload["summary"]["enhancement_governed"] is True
+        assert payload["summary"]["enhancement_review_status"] == "diverged"
+        assert payload["summary"]["enhancement_review_provider"] == "gemini"
+        assert payload["summary"]["enhancement_review_similarity"] == pytest.approx(0.12, abs=1e-6)
+        assert any("双模型复核分歧较大" in str(item) for item in payload["recommendations"])
 
     @patch("app.main._resolve_project_scoring_context")
     @patch("app.main.load_evolution_reports")
@@ -10877,6 +10930,44 @@ class TestGroundTruthScoreRuleRoutes:
         assert data["sample_count"] == 1
         assert data["high_score_logic"] == ["逻辑A"]
         mock_save_evolution_reports.assert_called_once()
+
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_writing_guidance_includes_enhancement_review_fields(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_evolution_reports,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_load_evolution_reports.return_value = {
+            "p1": {
+                "high_score_logic": ["逻辑A"],
+                "writing_guidance": ["建议A"],
+                "sample_count": 2,
+                "updated_at": "2026-03-29T00:00:00+00:00",
+                "enhancement_applied": False,
+                "enhancement_governed": True,
+                "enhancement_governance_notes": ["已回退到规则版建议"],
+                "enhancement_review_provider": "gemini",
+                "enhancement_review_status": "diverged",
+                "enhancement_review_similarity": 0.21,
+                "enhancement_review_notes": ["复核差异较大"],
+            }
+        }
+
+        response = client.get("/api/v1/projects/p1/writing_guidance")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["enhancement_applied"] is False
+        assert data["enhancement_governed"] is True
+        assert data["enhancement_review_provider"] == "gemini"
+        assert data["enhancement_review_status"] == "diverged"
+        assert data["enhancement_review_similarity"] == pytest.approx(0.21, abs=1e-6)
+        assert "已回退到规则版建议" in data["enhancement_governance_notes"][0]
 
 
 class TestDynamicBlendAdjustment:

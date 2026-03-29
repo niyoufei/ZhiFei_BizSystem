@@ -1140,6 +1140,81 @@ def test_learning_calibration_agent_reports_bootstrap_review_failures():
     assert any("自动阻止部署" in row for row in result["recommendations"])
 
 
+def test_learning_calibration_agent_warns_when_enhancement_review_diverged():
+    recent_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+
+    def fake_requester(**kwargs):
+        method = str(kwargs.get("method") or "")
+        url = str(kwargs.get("url") or "")
+        if method == "GET" and url.endswith("/api/v1/projects"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": [
+                    {
+                        "id": "p1",
+                        "name": "真实项目A",
+                        "status": "submitted_to_qingtian",
+                        "updated_at": recent_iso,
+                    }
+                ],
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/evolution/health"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "ground_truth_count": 3,
+                        "eligible_learning_ground_truth_count": 3,
+                        "matched_prediction_count": 3,
+                        "guardrail_blocked_count": 0,
+                        "has_evolved_multipliers": True,
+                        "evolution_weights_usable": True,
+                        "enhancement_review_status": "diverged",
+                        "enhancement_governed": True,
+                    },
+                    "drift": {"level": "low"},
+                },
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/feedback/governance"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "manual_confirmation_required": False,
+                        "few_shot_pending_review_count": 0,
+                    },
+                    "score_preview": {
+                        "current_calibrator_version": "calib_auto_existing",
+                    },
+                    "version_history": [],
+                },
+                "error": None,
+            }
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    result = oa._run_learning_calibration_agent(
+        base_url="http://127.0.0.1:8000",
+        api_key=None,
+        timeout=5.0,
+        auto_evolve=True,
+        min_samples=1,
+        requester=fake_requester,
+    )
+
+    assert result["status"] == "warn"
+    assert result["metrics"]["enhancement_review_diverged_count"] == 1
+    assert result["metrics"]["enhancement_governed_count"] == 1
+    assert any("双模型分歧" in row for row in result["recommendations"])
+
+
 def test_ensure_agent_coverage_backfills_missing_agents():
     agents = {
         "sre_watchdog": {

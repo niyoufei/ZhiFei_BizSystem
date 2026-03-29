@@ -1820,6 +1820,8 @@ def _run_learning_calibration_agent(
                 "bootstrap_active_count": 0,
                 "bootstrap_monitoring_count": 0,
                 "bootstrap_review_failed_count": 0,
+                "enhancement_review_diverged_count": 0,
+                "enhancement_governed_count": 0,
                 "patch_deployed_count": 0,
                 "patch_rollback_count": 0,
                 "post_verify_failed_count": 0,
@@ -1856,6 +1858,8 @@ def _run_learning_calibration_agent(
     bootstrap_active_count = 0
     bootstrap_monitoring_count = 0
     bootstrap_review_failed_count = 0
+    enhancement_review_diverged_count = 0
+    enhancement_governed_count = 0
     patch_deployed_count = 0
     patch_rollback_count = 0
     post_verify_failed_count = 0
@@ -2051,6 +2055,10 @@ def _run_learning_calibration_agent(
             verify_health_summary.get("has_evolved_multipliers")
             or verify_health_summary.get("evolution_weights_usable")
         )
+        if str(verify_health_summary.get("enhancement_review_status") or "").strip() == "diverged":
+            enhancement_review_diverged_count += 1
+        if bool(verify_health_summary.get("enhancement_governed")):
+            enhancement_governed_count += 1
         if str(verify_health_drift.get("level") or "").strip().lower() in (
             OPS_LEARNING_CALIBRATION_DRIFT_ALERT_LEVELS
         ):
@@ -2146,6 +2154,7 @@ def _run_learning_calibration_agent(
         and started_but_insufficient == 0
         and evolve_cooldown_skipped_count == 0
         and reflection_cooldown_skipped_count == 0
+        and enhancement_review_diverged_count == 0
     )
     warn_flag = total_failure_count == 0 and not pass_flag
 
@@ -2185,6 +2194,14 @@ def _run_learning_calibration_agent(
     if drift_alert_after_count > 0:
         recommendations.append(
             f"有 {drift_alert_after_count} 个项目误差仍处于 watch/medium/high，建议继续补录最新真实评分。"
+        )
+    if enhancement_review_diverged_count > 0:
+        recommendations.append(
+            f"有 {enhancement_review_diverged_count} 个项目最近一次学习进化出现双模型分歧，系统虽已保守回退，但建议继续补样本并复核编制指导。"
+        )
+    if enhancement_governed_count > 0:
+        recommendations.append(
+            f"有 {enhancement_governed_count} 个项目最近一次学习进化已触发保守治理回退，当前页面会展示双模型复核说明。"
         )
     if evolve_cooldown_skipped_count > 0 or reflection_cooldown_skipped_count > 0:
         recommendations.append(
@@ -2230,6 +2247,8 @@ def _run_learning_calibration_agent(
             "bootstrap_active_count": bootstrap_active_count,
             "bootstrap_monitoring_count": bootstrap_monitoring_count,
             "bootstrap_review_failed_count": bootstrap_review_failed_count,
+            "enhancement_review_diverged_count": enhancement_review_diverged_count,
+            "enhancement_governed_count": enhancement_governed_count,
             "patch_deployed_count": patch_deployed_count,
             "patch_rollback_count": patch_rollback_count,
             "post_verify_failed_count": post_verify_failed_count,

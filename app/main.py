@@ -11506,6 +11506,12 @@ def _build_evolution_health_report(
             recommendations.append("已存在进化权重，但缺少更新时间，当前不会直接启用。")
     elif not has_evolved_multipliers:
         recommendations.append("尚未形成进化维度权重，建议在录入真实评分后执行一次学习进化。")
+    enhancement_review_status = str(evo.get("enhancement_review_status") or "not_run").strip()
+    enhancement_governed = bool(evo.get("enhancement_governed"))
+    if enhancement_governed:
+        recommendations.append("最近一次学习进化的双模型复核分歧较大，系统已自动回退到规则版建议。")
+    elif enhancement_review_status == "confirmed":
+        recommendations.append("最近一次学习进化已通过备用模型复核。")
 
     return {
         "project_id": project_id,
@@ -11542,6 +11548,13 @@ def _build_evolution_health_report(
                 _to_float_or_none(evo_status.get("max_age_days")) or 0.0
             ),
             "last_evolution_updated_at": str(evo.get("updated_at") or evo.get("created_at") or ""),
+            "enhancement_applied": bool(evo.get("enhancement_applied", False)),
+            "enhancement_governed": enhancement_governed,
+            "enhancement_review_status": enhancement_review_status or "not_run",
+            "enhancement_review_provider": str(evo.get("enhancement_review_provider") or ""),
+            "enhancement_review_similarity": _to_float_or_none(
+                evo.get("enhancement_review_similarity")
+            ),
         },
         "windows": {
             "all": metrics_all,
@@ -23322,6 +23335,17 @@ def get_writing_guidance(
             high_score_logic=data.get("high_score_logic", []),
             sample_count=data.get("sample_count", 0),
             updated_at=data.get("updated_at"),
+            enhancement_applied=bool(data.get("enhancement_applied", True)),
+            enhancement_governed=bool(data.get("enhancement_governed", False)),
+            enhancement_governance_notes=list(data.get("enhancement_governance_notes") or []),
+            enhancement_review_provider=data.get("enhancement_review_provider"),
+            enhancement_review_status=str(data.get("enhancement_review_status") or "not_run"),
+            enhancement_review_similarity=(
+                float(data.get("enhancement_review_similarity"))
+                if data.get("enhancement_review_similarity") is not None
+                else None
+            ),
+            enhancement_review_notes=list(data.get("enhancement_review_notes") or []),
         )
     return WritingGuidance(
         project_id=project_id,
@@ -23331,6 +23355,7 @@ def get_writing_guidance(
         high_score_logic=[],
         sample_count=0,
         updated_at=None,
+        enhancement_applied=False,
     )
 
 
@@ -30409,9 +30434,24 @@ def index(
           const evoAge = (summary.evolution_weight_age_days != null) ? summary.evolution_weight_age_days : '-';
           const evoSamples = (summary.evolution_weight_sample_count != null) ? summary.evolution_weight_sample_count : 0;
           const evoMinSamples = (summary.evolution_weight_min_samples != null) ? summary.evolution_weight_min_samples : '-';
+          const enhancementReviewStatus = String(summary.enhancement_review_status || 'not_run');
+          const enhancementReviewProvider = String(summary.enhancement_review_provider || '').trim();
+          const enhancementReviewSimilarity = (summary.enhancement_review_similarity != null)
+            ? Number(summary.enhancement_review_similarity)
+            : null;
+          const enhancementGoverned = !!summary.enhancement_governed;
           const evoStatus = evoActive
             ? '<span class="success">已生效</span>'
             : (evoStored ? '<span class="warn">已存储未生效</span>' : '<span class="error">未产出</span>');
+          const enhancementStatus = enhancementGoverned
+            ? '<span class="warn">双模型分歧，已保守回退</span>'
+            : (enhancementReviewStatus === 'confirmed'
+              ? '<span class="success">已通过双模型复核</span>'
+              : (enhancementReviewStatus === 'fallback_only'
+                ? '<span class="warn">主模型失败，已走备用模型</span>'
+                : (enhancementReviewStatus === 'unavailable'
+                  ? '<span class="warn">复核不可用</span>'
+                  : '<span class="note">未执行双模型复核</span>')));
           let html = '<strong>进化健康度（误差趋势 / 漂移）</strong>';
           html += '<p style="margin:6px 0">漂移等级：'
             + escapeHtmlText(drift.level || 'insufficient_data')
@@ -30427,6 +30467,10 @@ def index(
           html += '<tr><td>进化权重状态</td><td>' + evoStatus + '</td></tr>';
           html += '<tr><td>进化权重样本/阈值</td><td>' + escapeHtmlText(evoSamples) + ' / ' + escapeHtmlText(evoMinSamples) + '</td></tr>';
           html += '<tr><td>进化权重时效(天)</td><td>' + escapeHtmlText(evoAge) + '</td></tr>';
+          html += '<tr><td>进化建议复核</td><td>' + enhancementStatus
+            + (enhancementReviewProvider ? ('；复核方=' + escapeHtmlText(enhancementReviewProvider)) : '')
+            + (enhancementReviewSimilarity != null ? ('；相似度=' + escapeHtmlText(enhancementReviewSimilarity.toFixed(2))) : '')
+            + '</td></tr>';
           html += '</table>';
           if (recs.length) {
             html += '<ul style="margin:6px 0 0 18px;color:#92400e">'
@@ -30435,6 +30479,47 @@ def index(
           }
           el.style.display = 'block';
           el.innerHTML = html;
+        }
+        function renderEvolutionEnhancementAudit(data) {
+          const item = (data && typeof data === 'object') ? data : {};
+          const reviewStatus = String(item.enhancement_review_status || 'not_run').trim();
+          const reviewProvider = String(item.enhancement_review_provider || '').trim();
+          const reviewSimilarity = (item.enhancement_review_similarity != null)
+            ? Number(item.enhancement_review_similarity)
+            : null;
+          const reviewNotes = Array.isArray(item.enhancement_review_notes) ? item.enhancement_review_notes : [];
+          const governNotes = Array.isArray(item.enhancement_governance_notes) ? item.enhancement_governance_notes : [];
+          const governed = !!item.enhancement_governed;
+          const applied = item.enhancement_applied !== false;
+          if (!governed && reviewStatus === 'not_run' && !reviewProvider && !reviewNotes.length && !governNotes.length) {
+            return '';
+          }
+          const statusText = governed
+            ? '双模型分歧，已自动回退到规则版建议'
+            : (reviewStatus === 'confirmed'
+              ? '已通过双模型复核'
+              : (reviewStatus === 'fallback_only'
+                ? '主模型失败，已切换备用模型'
+                : (reviewStatus === 'unavailable'
+                  ? '备用模型复核暂不可用'
+                  : '已记录复核状态')));
+          const statusColor = governed ? '#92400e' : (reviewStatus === 'confirmed' ? '#166534' : '#475569');
+          let html = '<div style="margin:10px 0 8px 0;padding:10px 12px;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc">';
+          html += '<strong>双模型复核</strong>';
+          html += '<p style="margin:6px 0 0 0;color:' + statusColor + '">' + escapeHtmlText(statusText) + '</p>';
+          html += '<p style="margin:6px 0 0 0;font-size:12px;color:#475569">当前建议'
+            + escapeHtmlText(applied ? '已应用' : '未直接应用')
+            + (reviewProvider ? ('；复核方：' + escapeHtmlText(reviewProvider)) : '')
+            + (reviewSimilarity != null ? ('；相似度：' + escapeHtmlText(reviewSimilarity.toFixed(2))) : '')
+            + '</p>';
+          if (reviewNotes.length) {
+            html += '<ul style="margin:6px 0 0 18px;color:#475569">' + reviewNotes.map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('') + '</ul>';
+          }
+          if (governNotes.length) {
+            html += '<ul style="margin:6px 0 0 18px;color:#92400e">' + governNotes.map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('') + '</ul>';
+          }
+          html += '</div>';
+          return html;
         }
         function renderFeedbackGovernancePanel(payload, options) {
           const el = document.getElementById('feedbackGovernanceResult');
@@ -33186,6 +33271,7 @@ def index(
             if (autoRecordedBeforeEvolve) {
               html += '<p style="margin:6px 0 0 0;color:#166534">本次已先自动录入当前表单中的真实评标，再执行学习进化。</p>';
             }
+            html += renderEvolutionEnhancementAudit(data);
             if (data.high_score_logic && data.high_score_logic.length) html += '<strong>高分逻辑</strong><ul>' + data.high_score_logic.map(l => '<li>' + l + '</li>').join('') + '</ul>';
             if (data.writing_guidance && data.writing_guidance.length) html += '<strong>编制指导</strong><ul>' + data.writing_guidance.map(l => '<li>' + l + '</li>').join('') + '</ul>';
             if (data.scoring_evolution && data.scoring_evolution.dimension_multipliers && Object.keys(data.scoring_evolution.dimension_multipliers).length) {
@@ -33236,6 +33322,7 @@ def index(
           el.style.display = 'block';
           if (res.ok) {
             let html = '';
+            html += renderEvolutionEnhancementAudit(data);
             if (data.high_score_logic && data.high_score_logic.length) html += '<strong>高分逻辑</strong><ul>' + data.high_score_logic.map(l => '<li>' + l + '</li>').join('') + '</ul>';
             if (data.guidance && data.guidance.length) html += '<strong>编制指导</strong><ul>' + data.guidance.map(l => '<li>' + l + '</li>').join('') + '</ul>';
             el.innerHTML = html || '<pre>' + JSON.stringify(data, null, 2) + '</pre>';

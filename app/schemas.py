@@ -1332,6 +1332,13 @@ class WritingGuidance(BaseModel):
     high_score_logic: List[str] = Field(default_factory=list, description="高分逻辑摘要")
     sample_count: int = 0
     updated_at: Optional[str] = None
+    enhancement_applied: bool = True
+    enhancement_governed: bool = False
+    enhancement_governance_notes: List[str] = Field(default_factory=list)
+    enhancement_review_provider: Optional[str] = None
+    enhancement_review_status: str = "not_run"
+    enhancement_review_similarity: Optional[float] = None
+    enhancement_review_notes: List[str] = Field(default_factory=list)
 
 
 # ==================== 历史记录与趋势分析模型 ====================
