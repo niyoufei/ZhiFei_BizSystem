@@ -612,9 +612,9 @@ def build_material_type_cards(
             )
         else:
             status = "parsed_not_used"
-            status_label = "已解析未命中"
+            status_label = "已解析待补证据"
             guidance.append(
-                f"{context.material_type_label(mat_type)}已解析，但本次评分尚未命中到有效证据。"
+                f"{context.material_type_label(mat_type)}已解析，但当前施组评分尚未命中到有效证据。"
             )
 
         if files > 0 and not meets_chars and required:
