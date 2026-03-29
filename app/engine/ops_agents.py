@@ -1826,6 +1826,7 @@ def _run_learning_calibration_agent(
                 "llm_account_cooldown_count": 0,
                 "llm_provider_thin_pool_count": 0,
                 "llm_account_low_quality_pool_count": 0,
+                "llm_deprioritized_account_count": 0,
                 "enhancement_review_diverged_count": 0,
                 "enhancement_governed_count": 0,
                 "patch_deployed_count": 0,
@@ -1907,6 +1908,7 @@ def _run_learning_calibration_agent(
     llm_account_cooldown_count = 0
     llm_provider_thin_pool_count = 0
     llm_account_low_quality_pool_count = 0
+    llm_deprioritized_account_count = 0
     if llm_status_unavailable_count == 0:
         for pool in (openai_pool_health, gemini_pool_health):
             total_accounts = _to_int(pool.get("total_accounts"))
@@ -1918,6 +1920,7 @@ def _run_learning_calibration_agent(
         for quality in (openai_pool_quality, gemini_pool_quality):
             rated_accounts = _to_int(quality.get("rated_accounts"))
             average_quality_score = float(quality.get("average_quality_score") or 0.0)
+            llm_deprioritized_account_count += _to_int(quality.get("low_quality_accounts"))
             if rated_accounts >= 2 and average_quality_score < 45.0:
                 llm_account_low_quality_pool_count += 1
 
@@ -2254,6 +2257,7 @@ def _run_learning_calibration_agent(
         and llm_account_cooldown_count == 0
         and llm_provider_thin_pool_count == 0
         and llm_account_low_quality_pool_count == 0
+        and llm_deprioritized_account_count == 0
     )
     warn_flag = total_failure_count == 0 and not pass_flag
 
@@ -2291,6 +2295,10 @@ def _run_learning_calibration_agent(
     if llm_account_low_quality_pool_count > 0:
         recommendations.append(
             f"有 {llm_account_low_quality_pool_count} 个 provider 的账号池历史质量分偏低，系统会优先避开弱 key，但建议继续补强冗余账号。"
+        )
+    if llm_deprioritized_account_count > 0:
+        recommendations.append(
+            f"当前共有 {llm_deprioritized_account_count} 个 LLM 账号已被系统自动降优先级，主链会优先选择历史表现更稳的 key。"
         )
     if total_failure_count > 0:
         recommendations.append(
@@ -2393,6 +2401,7 @@ def _run_learning_calibration_agent(
             "llm_account_cooldown_count": llm_account_cooldown_count,
             "llm_provider_thin_pool_count": llm_provider_thin_pool_count,
             "llm_account_low_quality_pool_count": llm_account_low_quality_pool_count,
+            "llm_deprioritized_account_count": llm_deprioritized_account_count,
             "enhancement_review_diverged_count": enhancement_review_diverged_count,
             "enhancement_governed_count": enhancement_governed_count,
             "patch_deployed_count": patch_deployed_count,

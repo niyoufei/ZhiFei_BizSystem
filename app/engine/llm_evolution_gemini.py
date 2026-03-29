@@ -32,6 +32,9 @@ EVOLUTION_LLM_ACCOUNT_COOLDOWN_ENV = "EVOLUTION_LLM_ACCOUNT_COOLDOWN_SECONDS"
 DEFAULT_EVOLUTION_LLM_ACCOUNT_COOLDOWN_SECONDS = 300.0
 DEFAULT_EVOLUTION_LLM_ACCOUNT_QUALITY_SCORE_PRIOR_WEIGHT = 3.0
 DEFAULT_EVOLUTION_LLM_ACCOUNT_QUALITY_SCORE_PRIOR_SUCCESS = 1.5
+DEFAULT_EVOLUTION_LLM_ACCOUNT_LOW_QUALITY_THRESHOLD = 35.0
+DEFAULT_EVOLUTION_LLM_ACCOUNT_LOW_QUALITY_MIN_HISTORY = 3
+DEFAULT_EVOLUTION_LLM_ACCOUNT_LOW_QUALITY_PROMOTION_GAP = 12.0
 _GEMINI_KEY_FAILURES: Dict[str, float] = {}
 _GEMINI_KEY_CURSOR = 0
 _GEMINI_KEY_LOCK = threading.Lock()
@@ -90,6 +93,7 @@ def get_gemini_evolution_pool_quality() -> Dict[str, float]:
     rated_scores = [
         _key_quality_score(key, stats) for key in keys if (_key_total_attempts(key, stats) > 0)
     ]
+    low_quality_accounts = sum(1 for key in keys if _key_is_low_quality(key, stats))
     if not scores:
         return {}
     return {
@@ -98,6 +102,7 @@ def get_gemini_evolution_pool_quality() -> Dict[str, float]:
         "average_quality_score": round(sum(scores) / float(len(scores)), 1),
         "best_quality_score": round(max(scores), 1),
         "worst_quality_score": round(min(scores), 1),
+        "low_quality_accounts": float(low_quality_accounts),
     }
 
 
@@ -136,6 +141,17 @@ def _build_key_attempt_order(keys: List[str]) -> List[str]:
             ),
             reverse=True,
         )
+        best_ready_score = max((_key_quality_score(key, key_stats) for key in ready), default=0.0)
+        ready_strong = [
+            key
+            for key in ready
+            if not _key_should_be_deprioritized(
+                key,
+                key_stats,
+                best_available_score=best_ready_score,
+            )
+        ]
+        ready_weak = [key for key in ready if key not in ready_strong]
         cooling = sorted(
             cooling,
             key=lambda key: (
@@ -145,7 +161,7 @@ def _build_key_attempt_order(keys: List[str]) -> List[str]:
             reverse=True,
         )
         if ready:
-            return ready
+            return ready_strong + ready_weak
         return cooling or rotated
 
 
@@ -164,6 +180,28 @@ def _key_quality_score(key: str, stats: Dict[str, Dict[str, Any]]) -> float:
         / (float(total) + DEFAULT_EVOLUTION_LLM_ACCOUNT_QUALITY_SCORE_PRIOR_WEIGHT)
     )
     return round(max(0.0, min(100.0, score)), 1)
+
+
+def _key_is_low_quality(key: str, stats: Dict[str, Dict[str, Any]]) -> bool:
+    return _key_total_attempts(
+        key, stats
+    ) >= DEFAULT_EVOLUTION_LLM_ACCOUNT_LOW_QUALITY_MIN_HISTORY and (
+        _key_quality_score(key, stats) < DEFAULT_EVOLUTION_LLM_ACCOUNT_LOW_QUALITY_THRESHOLD
+    )
+
+
+def _key_should_be_deprioritized(
+    key: str,
+    stats: Dict[str, Dict[str, Any]],
+    *,
+    best_available_score: float,
+) -> bool:
+    quality_score = _key_quality_score(key, stats)
+    if not _key_is_low_quality(key, stats):
+        return False
+    return (
+        best_available_score - quality_score
+    ) >= DEFAULT_EVOLUTION_LLM_ACCOUNT_LOW_QUALITY_PROMOTION_GAP
 
 
 def _mark_key_success(key: str) -> None:
