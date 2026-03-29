@@ -20,6 +20,8 @@ from app.engine.llm_evolution_common import (
 from app.engine.llm_runtime_state import (
     clear_account_failure,
     get_account_failure_timestamps,
+    get_account_request_stats,
+    record_account_request_outcome,
     set_account_failure,
 )
 
@@ -28,6 +30,8 @@ GEMINI_DEFAULT_MODEL = "gemini-1.5-pro"
 GEMINI_API_KEYS_ENV = "GEMINI_API_KEYS"
 EVOLUTION_LLM_ACCOUNT_COOLDOWN_ENV = "EVOLUTION_LLM_ACCOUNT_COOLDOWN_SECONDS"
 DEFAULT_EVOLUTION_LLM_ACCOUNT_COOLDOWN_SECONDS = 300.0
+DEFAULT_EVOLUTION_LLM_ACCOUNT_QUALITY_SCORE_PRIOR_WEIGHT = 3.0
+DEFAULT_EVOLUTION_LLM_ACCOUNT_QUALITY_SCORE_PRIOR_SUCCESS = 1.5
 _GEMINI_KEY_FAILURES: Dict[str, float] = {}
 _GEMINI_KEY_CURSOR = 0
 _GEMINI_KEY_LOCK = threading.Lock()
@@ -79,6 +83,24 @@ def get_gemini_evolution_pool_health() -> Dict[str, int]:
     }
 
 
+def get_gemini_evolution_pool_quality() -> Dict[str, float]:
+    keys = get_gemini_evolution_api_keys()
+    stats = get_account_request_stats("gemini", keys)
+    scores = [_key_quality_score(key, stats) for key in keys if key]
+    rated_scores = [
+        _key_quality_score(key, stats) for key in keys if (_key_total_attempts(key, stats) > 0)
+    ]
+    if not scores:
+        return {}
+    return {
+        "total_accounts": float(len(keys)),
+        "rated_accounts": float(len(rated_scores)),
+        "average_quality_score": round(sum(scores) / float(len(scores)), 1),
+        "best_quality_score": round(max(scores), 1),
+        "worst_quality_score": round(min(scores), 1),
+    }
+
+
 def _account_cooldown_seconds() -> float:
     raw = str(os.getenv(EVOLUTION_LLM_ACCOUNT_COOLDOWN_ENV) or "").strip()
     try:
@@ -93,6 +115,7 @@ def _build_key_attempt_order(keys: List[str]) -> List[str]:
     _sync_key_failures_from_runtime_state(keys)
     now = time.time()
     cooldown = _account_cooldown_seconds()
+    key_stats = get_account_request_stats("gemini", keys)
     global _GEMINI_KEY_CURSOR
     with _GEMINI_KEY_LOCK:
         start = _GEMINI_KEY_CURSOR % len(keys)
@@ -105,9 +128,42 @@ def _build_key_attempt_order(keys: List[str]) -> List[str]:
                 ready.append(key)
             else:
                 cooling.append(key)
+        ready = sorted(
+            ready,
+            key=lambda key: (
+                _key_quality_score(key, key_stats),
+                _key_total_attempts(key, key_stats),
+            ),
+            reverse=True,
+        )
+        cooling = sorted(
+            cooling,
+            key=lambda key: (
+                _key_quality_score(key, key_stats),
+                _key_total_attempts(key, key_stats),
+            ),
+            reverse=True,
+        )
         if ready:
             return ready
         return cooling or rotated
+
+
+def _key_total_attempts(key: str, stats: Dict[str, Dict[str, Any]]) -> int:
+    row = stats.get(str(key or "").strip()) or {}
+    return max(0, int(row.get("success_count") or 0)) + max(0, int(row.get("failure_count") or 0))
+
+
+def _key_quality_score(key: str, stats: Dict[str, Dict[str, Any]]) -> float:
+    row = stats.get(str(key or "").strip()) or {}
+    success_count = max(0, int(row.get("success_count") or 0))
+    failure_count = max(0, int(row.get("failure_count") or 0))
+    total = success_count + failure_count
+    score = 100.0 * (
+        (float(success_count) + DEFAULT_EVOLUTION_LLM_ACCOUNT_QUALITY_SCORE_PRIOR_SUCCESS)
+        / (float(total) + DEFAULT_EVOLUTION_LLM_ACCOUNT_QUALITY_SCORE_PRIOR_WEIGHT)
+    )
+    return round(max(0.0, min(100.0, score)), 1)
 
 
 def _mark_key_success(key: str) -> None:
@@ -122,6 +178,7 @@ def _mark_key_success(key: str) -> None:
                 current_index = _GEMINI_KEY_CURSOR
             _GEMINI_KEY_CURSOR = (current_index + 1) % len(keys)
     clear_account_failure("gemini", key)
+    record_account_request_outcome("gemini", key, "success", time.time())
 
 
 def _mark_key_failure(key: str) -> None:
@@ -129,6 +186,7 @@ def _mark_key_failure(key: str) -> None:
     with _GEMINI_KEY_LOCK:
         _GEMINI_KEY_FAILURES[key] = failed_at
     set_account_failure("gemini", key, failed_at)
+    record_account_request_outcome("gemini", key, "failure", failed_at)
 
 
 def _extract_json_from_content(content: str) -> Optional[Dict[str, Any]]:

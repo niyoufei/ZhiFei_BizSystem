@@ -21,12 +21,20 @@ from app.engine.llm_evolution import (
 from app.engine.llm_evolution_common import parse_api_key_pool
 from app.engine.llm_evolution_gemini import (
     _GEMINI_KEY_FAILURES,
+    get_gemini_evolution_pool_quality,
+)
+from app.engine.llm_evolution_gemini import (
+    _build_key_attempt_order as _build_gemini_key_attempt_order,
 )
 from app.engine.llm_evolution_gemini import (
     _mark_key_failure as _mark_gemini_key_failure,
 )
 from app.engine.llm_evolution_openai import (
     _OPENAI_KEY_FAILURES,
+    get_openai_evolution_pool_quality,
+)
+from app.engine.llm_evolution_openai import (
+    _build_key_attempt_order as _build_openai_key_attempt_order,
 )
 from app.engine.llm_evolution_openai import (
     _mark_key_failure as _mark_openai_key_failure,
@@ -132,6 +140,53 @@ class TestApiKeyPoolParsing:
 
 
 class TestEnhanceEvolutionReportWithLlm:
+    def test_openai_key_attempt_order_prefers_higher_quality_ready_key(self):
+        llm_runtime_state.record_account_request_outcome(
+            "openai", "openai-key-1", "success", time.time()
+        )
+        llm_runtime_state.record_account_request_outcome(
+            "openai", "openai-key-1", "success", time.time()
+        )
+        llm_runtime_state.record_account_request_outcome(
+            "openai", "openai-key-2", "failure", time.time()
+        )
+        with patch.dict(
+            os.environ,
+            {"OPENAI_API_KEYS": "openai-key-1,openai-key-2,openai-key-3"},
+            clear=True,
+        ):
+            assert _build_openai_key_attempt_order(
+                ["openai-key-1", "openai-key-2", "openai-key-3"]
+            ) == ["openai-key-1", "openai-key-3", "openai-key-2"]
+            quality = get_openai_evolution_pool_quality()
+
+        assert quality["rated_accounts"] == 2.0
+        assert quality["best_quality_score"] > quality["worst_quality_score"]
+
+    def test_gemini_key_attempt_order_prefers_higher_quality_ready_key(self):
+        llm_runtime_state.record_account_request_outcome(
+            "gemini", "gemini-key-1", "failure", time.time()
+        )
+        llm_runtime_state.record_account_request_outcome(
+            "gemini", "gemini-key-2", "success", time.time()
+        )
+        llm_runtime_state.record_account_request_outcome(
+            "gemini", "gemini-key-2", "success", time.time()
+        )
+        with patch.dict(
+            os.environ,
+            {"GEMINI_API_KEYS": "gemini-key-1,gemini-key-2"},
+            clear=True,
+        ):
+            assert _build_gemini_key_attempt_order(["gemini-key-1", "gemini-key-2"]) == [
+                "gemini-key-2",
+                "gemini-key-1",
+            ]
+            quality = get_gemini_evolution_pool_quality()
+
+        assert quality["rated_accounts"] == 2.0
+        assert quality["average_quality_score"] > 0.0
+
     def test_rules_backend_returns_none(self):
         with patch.dict(os.environ, {EVOLUTION_LLM_BACKEND_ENV: "rules"}):
             report = {
@@ -215,10 +270,24 @@ class TestEnhanceEvolutionReportWithLlm:
             "healthy_accounts": 2,
             "cooling_accounts": 0,
         }
+        assert status["openai_pool_quality"] == {
+            "total_accounts": 2.0,
+            "rated_accounts": 0.0,
+            "average_quality_score": 50.0,
+            "best_quality_score": 50.0,
+            "worst_quality_score": 50.0,
+        }
         assert status["gemini_pool_health"] == {
             "total_accounts": 2,
             "healthy_accounts": 2,
             "cooling_accounts": 0,
+        }
+        assert status["gemini_pool_quality"] == {
+            "total_accounts": 2.0,
+            "rated_accounts": 0.0,
+            "average_quality_score": 50.0,
+            "best_quality_score": 50.0,
+            "worst_quality_score": 50.0,
         }
         assert status["provider_health"] == {"openai": "healthy", "gemini": "healthy"}
         assert status["primary_provider_reason"] == "default_openai_primary"

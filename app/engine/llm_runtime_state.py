@@ -10,6 +10,7 @@ LLM_RUNTIME_STATE_PATH = Path(__file__).resolve().parents[2] / "build" / "llm_ru
 _STATE_LOCK = threading.Lock()
 _KNOWN_PROVIDERS = ("openai", "gemini")
 _KNOWN_REVIEW_STATUSES = ("confirmed", "diverged", "unavailable", "fallback_only")
+_KNOWN_ACCOUNT_REQUEST_STATUSES = ("success", "failure")
 
 
 def _empty_provider_review_stats() -> Dict[str, Any]:
@@ -23,6 +24,15 @@ def _empty_provider_review_stats() -> Dict[str, Any]:
     }
 
 
+def _empty_account_request_stats() -> Dict[str, Any]:
+    return {
+        "success_count": 0,
+        "failure_count": 0,
+        "last_status": None,
+        "last_at": None,
+    }
+
+
 def _empty_state() -> Dict[str, Any]:
     return {
         "provider_failures": {},
@@ -31,6 +41,7 @@ def _empty_state() -> Dict[str, Any]:
             provider: _empty_provider_review_stats() for provider in _KNOWN_PROVIDERS
         },
         "account_failures": {provider: {} for provider in _KNOWN_PROVIDERS},
+        "account_request_stats": {provider: {} for provider in _KNOWN_PROVIDERS},
     }
 
 
@@ -50,6 +61,7 @@ def _load_state_unlocked() -> Dict[str, Any]:
     provider_quality_degraded = payload.get("provider_quality_degraded")
     provider_review_stats = payload.get("provider_review_stats")
     account_failures = payload.get("account_failures")
+    account_request_stats = payload.get("account_request_stats")
     state = _empty_state()
     if isinstance(provider_failures, dict):
         for provider, failed_at in provider_failures.items():
@@ -87,6 +99,31 @@ def _load_state_unlocked() -> Dict[str, Any]:
                 normalized = _normalize_timestamp(failed_at)
                 if normalized is not None:
                     state["account_failures"][provider][fingerprint] = normalized
+    if isinstance(account_request_stats, dict):
+        for provider in _KNOWN_PROVIDERS:
+            rows = account_request_stats.get(provider)
+            if not isinstance(rows, dict):
+                continue
+            for fingerprint, stats in rows.items():
+                if (
+                    not isinstance(fingerprint, str)
+                    or not fingerprint.strip()
+                    or not isinstance(stats, dict)
+                ):
+                    continue
+                row = _empty_account_request_stats()
+                row["success_count"] = max(
+                    0, int(_normalize_timestamp(stats.get("success_count")) or 0)
+                )
+                row["failure_count"] = max(
+                    0, int(_normalize_timestamp(stats.get("failure_count")) or 0)
+                )
+                last_status = str(stats.get("last_status") or "").strip()
+                row["last_status"] = (
+                    last_status if last_status in _KNOWN_ACCOUNT_REQUEST_STATUSES else None
+                )
+                row["last_at"] = _normalize_timestamp(stats.get("last_at"))
+                state["account_request_stats"][provider][fingerprint] = row
     return state
 
 
@@ -228,6 +265,32 @@ def get_account_failure_timestamps(provider: str, keys: list[str]) -> Dict[str, 
     return out
 
 
+def get_account_request_stats(provider: str, keys: list[str]) -> Dict[str, Dict[str, Any]]:
+    if provider not in _KNOWN_PROVIDERS:
+        return {}
+    with _STATE_LOCK:
+        state = _load_state_unlocked()
+    persisted = (state.get("account_request_stats") or {}).get(provider) or {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for key in keys:
+        raw = str(key or "").strip()
+        if not raw:
+            continue
+        row = persisted.get(fingerprint_api_key(raw))
+        if not isinstance(row, dict):
+            continue
+        last_status = str(row.get("last_status") or "").strip()
+        out[raw] = {
+            "success_count": max(0, int(_normalize_timestamp(row.get("success_count")) or 0)),
+            "failure_count": max(0, int(_normalize_timestamp(row.get("failure_count")) or 0)),
+            "last_status": (
+                last_status if last_status in _KNOWN_ACCOUNT_REQUEST_STATUSES else None
+            ),
+            "last_at": _normalize_timestamp(row.get("last_at")),
+        }
+    return out
+
+
 def set_account_failure(provider: str, key: str, failed_at: float) -> None:
     raw = str(key or "").strip()
     if provider not in _KNOWN_PROVIDERS or not raw:
@@ -247,4 +310,26 @@ def clear_account_failure(provider: str, key: str) -> None:
         state = _load_state_unlocked()
         provider_state = (state.get("account_failures") or {}).setdefault(provider, {})
         provider_state.pop(fingerprint_api_key(raw), None)
+        _save_state_unlocked(state)
+
+
+def record_account_request_outcome(
+    provider: str, key: str, status: str, recorded_at: float
+) -> None:
+    raw = str(key or "").strip()
+    normalized_status = str(status or "").strip()
+    if (
+        provider not in _KNOWN_PROVIDERS
+        or not raw
+        or normalized_status not in _KNOWN_ACCOUNT_REQUEST_STATUSES
+    ):
+        return
+    with _STATE_LOCK:
+        state = _load_state_unlocked()
+        provider_state = (state.get("account_request_stats") or {}).setdefault(provider, {})
+        row = provider_state.setdefault(fingerprint_api_key(raw), _empty_account_request_stats())
+        count_key = f"{normalized_status}_count"
+        row[count_key] = max(0, int(_normalize_timestamp(row.get(count_key)) or 0)) + 1
+        row["last_status"] = normalized_status
+        row["last_at"] = float(recorded_at)
         _save_state_unlocked(state)

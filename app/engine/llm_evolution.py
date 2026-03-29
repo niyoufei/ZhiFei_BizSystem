@@ -16,8 +16,14 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.engine.llm_evolution_common import parse_api_key_pool
-from app.engine.llm_evolution_gemini import get_gemini_evolution_pool_health
-from app.engine.llm_evolution_openai import get_openai_evolution_pool_health
+from app.engine.llm_evolution_gemini import (
+    get_gemini_evolution_pool_health,
+    get_gemini_evolution_pool_quality,
+)
+from app.engine.llm_evolution_openai import (
+    get_openai_evolution_pool_health,
+    get_openai_evolution_pool_quality,
+)
 from app.engine.llm_runtime_state import (
     clear_provider_failure,
     clear_provider_quality_degraded,
@@ -223,12 +229,27 @@ def _provider_pool_health(provider: str) -> Dict[str, int]:
     return {}
 
 
-def _provider_priority_key(provider: str) -> tuple[int, int, int]:
+def _provider_pool_quality(provider: str) -> Dict[str, float]:
+    if provider == "openai":
+        return get_openai_evolution_pool_quality()
+    if provider == "gemini":
+        return get_gemini_evolution_pool_quality()
+    return {}
+
+
+def _provider_priority_key(provider: str) -> tuple[int, float, int, int]:
     pool = _provider_pool_health(provider)
+    quality = _provider_pool_quality(provider)
     healthy_accounts = max(0, _to_int(pool.get("healthy_accounts"), 0))
     total_accounts = max(0, _to_int(pool.get("total_accounts"), 0))
     cooling_accounts = max(0, _to_int(pool.get("cooling_accounts"), 0))
-    return (healthy_accounts, total_accounts - cooling_accounts, total_accounts)
+    average_quality_score = float(quality.get("average_quality_score") or 0.0)
+    return (
+        healthy_accounts,
+        average_quality_score,
+        total_accounts - cooling_accounts,
+        total_accounts,
+    )
 
 
 def _should_promote_provider_by_quality(primary: str, alternate: str) -> bool:
@@ -376,7 +397,9 @@ def get_llm_backend_status() -> Dict[str, Any]:
     openai_configured = _provider_configured("openai")
     gemini_configured = _provider_configured("gemini")
     openai_pool_health = get_openai_evolution_pool_health() if openai_configured else {}
+    openai_pool_quality = get_openai_evolution_pool_quality() if openai_configured else {}
     gemini_pool_health = get_gemini_evolution_pool_health() if gemini_configured else {}
+    gemini_pool_quality = get_gemini_evolution_pool_quality() if gemini_configured else {}
     provider_review_stats = get_provider_review_stats()
     return {
         "evolution_backend": backend,
@@ -389,10 +412,12 @@ def get_llm_backend_status() -> Dict[str, Any]:
         "openai_configured": openai_configured,
         "openai_account_count": _provider_key_count("openai"),
         "openai_pool_health": openai_pool_health,
+        "openai_pool_quality": openai_pool_quality,
         "openai_model": get_openai_model() if openai_configured else None,
         "gemini_configured": gemini_configured,
         "gemini_account_count": _provider_key_count("gemini"),
         "gemini_pool_health": gemini_pool_health,
+        "gemini_pool_quality": gemini_pool_quality,
         "provider_health": {
             provider: _provider_health_state(provider)
             for provider in REAL_LLM_PROVIDERS

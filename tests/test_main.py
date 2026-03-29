@@ -9263,10 +9263,18 @@ class TestLlmStatusEndpoint:
                 "healthy_accounts": 2,
                 "cooling_accounts": 0,
             },
+            "openai_pool_quality": {
+                "total_accounts": 2.0,
+                "rated_accounts": 1.0,
+                "average_quality_score": 80.0,
+                "best_quality_score": 95.0,
+                "worst_quality_score": 65.0,
+            },
             "openai_model": "gpt-5.4",
             "gemini_configured": False,
             "gemini_account_count": 0,
             "gemini_pool_health": {},
+            "gemini_pool_quality": {},
             "provider_quality": {"openai": "stable"},
             "provider_review_stats": {
                 "openai": {
@@ -9296,10 +9304,12 @@ class TestLlmStatusEndpoint:
         assert payload["openai_configured"] is True
         assert payload["openai_account_count"] == 2
         assert payload["openai_pool_health"]["healthy_accounts"] == 2
+        assert payload["openai_pool_quality"]["average_quality_score"] == 80.0
         assert payload["openai_model"] == "gpt-5.4"
         assert payload["gemini_configured"] is False
         assert payload["gemini_account_count"] == 0
         assert payload["gemini_pool_health"] == {}
+        assert payload["gemini_pool_quality"] == {}
         assert payload["provider_quality"] == {"openai": "stable"}
         assert payload["provider_review_stats"]["openai"]["confirmed_count"] == 2
         assert payload["provider_review_stats"]["openai"]["last_status"] == "confirmed"
