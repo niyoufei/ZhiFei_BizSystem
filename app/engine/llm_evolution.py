@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.engine.llm_evolution_common import parse_api_key_pool
@@ -27,6 +28,7 @@ LEGACY_SPARK_ENV_KEYS = (
     "SPARK_API_SECRET",
 )
 REAL_LLM_PROVIDERS: Tuple[str, ...] = ("openai", "gemini")
+DEFAULT_ENHANCEMENT_REVIEW_SIMILARITY_THRESHOLD = 0.35
 
 
 def _get_requested_evolution_llm_backend() -> Optional[str]:
@@ -162,6 +164,16 @@ def enhance_evolution_report_with_llm(
             result["enhancement_provider_chain"] = list(provider_chain)
             result["enhancement_fallback_used"] = provider != primary_provider
             result["enhancement_attempts"] = attempts
+            _attach_enhancement_review(
+                result=result,
+                provider_chain=provider_chain,
+                primary_provider=primary_provider,
+                actual_provider=provider,
+                project_id=project_id,
+                report=report,
+                ground_truth_records=ground_truth_records,
+                project_context=project_context,
+            )
             return result
         result = _call_provider(
             provider,
@@ -176,8 +188,111 @@ def enhance_evolution_report_with_llm(
             result["enhancement_provider_chain"] = list(provider_chain)
             result["enhancement_fallback_used"] = provider != primary_provider
             result["enhancement_attempts"] = attempts
+            _attach_enhancement_review(
+                result=result,
+                provider_chain=provider_chain,
+                primary_provider=primary_provider,
+                actual_provider=provider,
+                project_id=project_id,
+                report=report,
+                ground_truth_records=ground_truth_records,
+                project_context=project_context,
+            )
             return result
     return None
+
+
+def _attach_enhancement_review(
+    *,
+    result: Dict[str, Any],
+    provider_chain: List[str],
+    primary_provider: str,
+    actual_provider: str,
+    project_id: str,
+    report: Dict[str, Any],
+    ground_truth_records: List[Dict[str, Any]],
+    project_context: str,
+) -> None:
+    result["enhancement_review_provider"] = None
+    result["enhancement_review_status"] = "not_run"
+    result["enhancement_review_similarity"] = None
+    result["enhancement_review_notes"] = []
+    if len(provider_chain) < 2:
+        return
+    if actual_provider != primary_provider:
+        result["enhancement_review_status"] = "fallback_only"
+        result["enhancement_review_notes"] = [
+            "主 provider 已失败并切换到备用 provider，本次跳过备用复核。"
+        ]
+        return
+    review_provider = next((item for item in provider_chain if item != actual_provider), None)
+    if not review_provider:
+        return
+    result["enhancement_review_provider"] = review_provider
+    review = _call_provider(
+        review_provider,
+        project_id=project_id,
+        report=report,
+        ground_truth_records=ground_truth_records,
+        project_context=project_context,
+    )
+    if review is None:
+        result["enhancement_review_status"] = "unavailable"
+        result["enhancement_review_notes"] = [f"{review_provider} 复核未返回有效结果，保留主结果。"]
+        return
+    similarity = _compare_enhancement_similarity(result, review)
+    threshold = DEFAULT_ENHANCEMENT_REVIEW_SIMILARITY_THRESHOLD
+    result["enhancement_review_similarity"] = similarity
+    if similarity >= threshold:
+        result["enhancement_review_status"] = "confirmed"
+        result["enhancement_review_notes"] = [
+            f"{review_provider} 复核通过，结果相似度 {similarity:.2f}。"
+        ]
+        return
+    result["enhancement_review_status"] = "diverged"
+    result["enhancement_review_notes"] = [
+        f"{review_provider} 复核与主结果差异较大，相似度 {similarity:.2f}；建议人工复核高分逻辑与编制指导。"
+    ]
+
+
+def _compare_enhancement_similarity(primary: Dict[str, Any], review: Dict[str, Any]) -> float:
+    logic_similarity = _list_similarity(
+        primary.get("high_score_logic") or [],
+        review.get("high_score_logic") or [],
+    )
+    guidance_similarity = _list_similarity(
+        primary.get("writing_guidance") or [],
+        review.get("writing_guidance") or [],
+    )
+    return round((logic_similarity + guidance_similarity) / 2.0, 4)
+
+
+def _list_similarity(left: List[str], right: List[str]) -> float:
+    left_norm = [_normalize_review_text(item) for item in left if _normalize_review_text(item)]
+    right_norm = [_normalize_review_text(item) for item in right if _normalize_review_text(item)]
+    if not left_norm and not right_norm:
+        return 1.0
+    if not left_norm or not right_norm:
+        return 0.0
+    left_tokens = set().union(*[_tokenize_review_text(item) for item in left_norm])
+    right_tokens = set().union(*[_tokenize_review_text(item) for item in right_norm])
+    if not left_tokens and not right_tokens:
+        return 1.0
+    if not left_tokens or not right_tokens:
+        return 0.0
+    intersection = len(left_tokens & right_tokens)
+    union = len(left_tokens | right_tokens)
+    return round(intersection / union, 4) if union else 0.0
+
+
+def _normalize_review_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip().lower())
+
+
+def _tokenize_review_text(text: str) -> set[str]:
+    normalized = _normalize_review_text(text)
+    compact = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", " ", normalized)
+    return {token for token in compact.split() if token}
 
 
 def _call_provider(

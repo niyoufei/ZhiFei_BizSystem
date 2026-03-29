@@ -123,9 +123,35 @@ start_server_process() {
 }
 
 wait_until_ready() {
-  local attempts=30
+  local attempts="${RESTART_WAIT_ATTEMPTS:-120}"
   for _ in $(seq 1 "$attempts"); do
     if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+listener_pid() {
+  lsof -nP -iTCP:${PORT} -sTCP:LISTEN -t 2>/dev/null | head -n 1 || true
+}
+
+write_pid_from_listener() {
+  local active_pid
+  active_pid="$(listener_pid)"
+  if [[ -n "$active_pid" ]]; then
+    echo "$active_pid" >"$PID_FILE"
+    return 0
+  fi
+  rm -f "$PID_FILE"
+  return 1
+}
+
+confirm_ready_after_timeout() {
+  local attempts="${RESTART_POST_TIMEOUT_GRACE_ATTEMPTS:-40}"
+  for _ in $(seq 1 "$attempts"); do
+    if [[ -n "$(listener_pid)" ]] && curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.5
@@ -212,13 +238,21 @@ fi
 start_server_process
 
 if wait_until_ready; then
-  new_pid="$(lsof -nP -iTCP:${PORT} -sTCP:LISTEN -t 2>/dev/null | head -n 1 || true)"
-  if [[ -n "$new_pid" ]]; then
-    echo "$new_pid" >"$PID_FILE"
-  else
-    rm -f "$PID_FILE"
-  fi
+  new_pid="$(listener_pid)"
+  write_pid_from_listener || true
   echo "Server started successfully. pid=$new_pid"
+  echo "Start mode: $START_MODE"
+  echo "URL: http://127.0.0.1:${PORT}/"
+  echo "Log: $ROOT_DIR/$LOG_FILE"
+  post_start_data_hygiene_repair
+  check_endpoint_coverage
+  exit 0
+fi
+
+if confirm_ready_after_timeout; then
+  new_pid="$(listener_pid)"
+  write_pid_from_listener || true
+  echo "Server started successfully after extended startup. pid=$new_pid"
   echo "Start mode: $START_MODE"
   echo "URL: http://127.0.0.1:${PORT}/"
   echo "Log: $ROOT_DIR/$LOG_FILE"

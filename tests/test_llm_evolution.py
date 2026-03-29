@@ -31,13 +31,25 @@ class TestGetEvolutionLlmBackend:
             assert get_evolution_llm_backend() == "gemini"
 
     def test_env_spark_alias_maps_to_openai(self):
-        with patch.dict(os.environ, {EVOLUTION_LLM_BACKEND_ENV: "spark"}):
+        with patch.dict(
+            os.environ,
+            {EVOLUTION_LLM_BACKEND_ENV: "spark", "OPENAI_API_KEY": "test-key"},
+            clear=True,
+        ):
             assert get_evolution_llm_backend() == "openai"
 
     def test_env_openai_gemini(self):
-        with patch.dict(os.environ, {EVOLUTION_LLM_BACKEND_ENV: "openai"}):
+        with patch.dict(
+            os.environ,
+            {EVOLUTION_LLM_BACKEND_ENV: "openai", "OPENAI_API_KEY": "test-key"},
+            clear=True,
+        ):
             assert get_evolution_llm_backend() == "openai"
-        with patch.dict(os.environ, {EVOLUTION_LLM_BACKEND_ENV: "gemini"}):
+        with patch.dict(
+            os.environ,
+            {EVOLUTION_LLM_BACKEND_ENV: "gemini", "GEMINI_API_KEY": "test-key"},
+            clear=True,
+        ):
             assert get_evolution_llm_backend() == "gemini"
 
     def test_auto_provider_chain_prefers_openai_then_gemini(self):
@@ -227,6 +239,8 @@ class TestEnhanceEvolutionReportWithLlm:
         assert out["enhancement_provider_chain"] == ["openai", "gemini"]
         assert out["enhancement_fallback_used"] is True
         assert out["enhancement_attempts"] == 3
+        assert out["enhancement_review_status"] == "fallback_only"
+        assert out["enhancement_review_provider"] is None
 
     @patch("app.engine.llm_evolution._enhance_with_gemini")
     @patch("app.engine.llm_evolution._enhance_with_openai")
@@ -238,6 +252,14 @@ class TestEnhanceEvolutionReportWithLlm:
             "sample_count": 1,
             "updated_at": "2020-01-01T00:00:00Z",
             "enhanced_by": "openai",
+        }
+        mock_gemini.return_value = {
+            "project_id": "p1",
+            "high_score_logic": ["o1"],
+            "writing_guidance": ["w1"],
+            "sample_count": 1,
+            "updated_at": "2020-01-01T00:00:00Z",
+            "enhanced_by": "gemini",
         }
         with patch.dict(
             os.environ,
@@ -262,7 +284,56 @@ class TestEnhanceEvolutionReportWithLlm:
         assert out["enhancement_provider_chain"] == ["openai", "gemini"]
         assert out["enhancement_fallback_used"] is False
         assert out["enhancement_attempts"] == 1
-        mock_gemini.assert_not_called()
+        assert out["enhancement_review_provider"] == "gemini"
+        assert out["enhancement_review_status"] == "confirmed"
+        assert out["enhancement_review_similarity"] == 1.0
+        assert out["enhancement_review_notes"]
+        mock_gemini.assert_called_once()
+
+    @patch("app.engine.llm_evolution._enhance_with_gemini")
+    @patch("app.engine.llm_evolution._enhance_with_openai")
+    def test_review_marks_diverged_when_secondary_output_differs(self, mock_openai, mock_gemini):
+        mock_openai.return_value = {
+            "project_id": "p1",
+            "high_score_logic": ["安全文明施工闭环", "危险工程专项方案"],
+            "writing_guidance": ["补强验收节点和责任分工"],
+            "sample_count": 1,
+            "updated_at": "2020-01-01T00:00:00Z",
+        }
+        mock_gemini.return_value = {
+            "project_id": "p1",
+            "high_score_logic": ["质量通病治理", "信息化管理平台"],
+            "writing_guidance": ["补强 BIM 协同和智慧工地内容"],
+            "sample_count": 1,
+            "updated_at": "2020-01-01T00:00:00Z",
+        }
+        with patch.dict(
+            os.environ,
+            {
+                EVOLUTION_LLM_BACKEND_ENV: AUTO_MULTI_PROVIDER_BACKEND,
+                "OPENAI_API_KEY": "openai-key",
+                "GEMINI_API_KEY": "gemini-key",
+            },
+            clear=True,
+        ):
+            out = enhance_evolution_report_with_llm(
+                "p1",
+                {
+                    "project_id": "p1",
+                    "high_score_logic": ["a"],
+                    "writing_guidance": ["b"],
+                    "sample_count": 1,
+                    "updated_at": "2020-01-01T00:00:00Z",
+                },
+                [],
+                "",
+            )
+
+        assert out is not None
+        assert out["enhanced_by"] == "openai"
+        assert out["enhancement_review_provider"] == "gemini"
+        assert out["enhancement_review_status"] == "diverged"
+        assert (out["enhancement_review_similarity"] or 0) < 0.35
 
 
 class TestProviderAccountPooling:

@@ -23275,6 +23275,15 @@ def evolve_project(
         )
         report["enhancement_fallback_used"] = bool(enhanced.get("enhancement_fallback_used"))
         report["enhancement_attempts"] = int(enhanced.get("enhancement_attempts") or 0)
+        report["enhancement_review_provider"] = enhanced.get("enhancement_review_provider")
+        report["enhancement_review_status"] = str(
+            enhanced.get("enhancement_review_status") or "not_run"
+        )
+        review_similarity = enhanced.get("enhancement_review_similarity")
+        report["enhancement_review_similarity"] = (
+            float(review_similarity) if review_similarity is not None else None
+        )
+        report["enhancement_review_notes"] = list(enhanced.get("enhancement_review_notes") or [])
         # 保留规则版产出的 scoring_evolution、compilation_instructions（LLM 仅增强文字部分）
     reports = load_evolution_reports()
     reports[project_id] = report

@@ -1282,6 +1282,22 @@ class EvolutionReport(BaseModel):
         0,
         description="本次增强总尝试次数（含同 provider 重试）",
     )
+    enhancement_review_provider: Optional[str] = Field(
+        None,
+        description="用于复核主增强结果的备用 provider：openai | gemini",
+    )
+    enhancement_review_status: str = Field(
+        "not_run",
+        description="增强复核状态：not_run | confirmed | diverged | unavailable | fallback_only",
+    )
+    enhancement_review_similarity: Optional[float] = Field(
+        None,
+        description="主结果与复核结果的相似度（0-1）",
+    )
+    enhancement_review_notes: List[str] = Field(
+        default_factory=list,
+        description="增强复核说明",
+    )
 
 
 class CompilationInstructions(BaseModel):
