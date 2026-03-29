@@ -259,6 +259,37 @@ class TestEnhanceEvolutionReportWithLlm:
         assert status["provider_health"]["gemini"] == "healthy"
         assert status["primary_provider_reason"] == "openai_cooldown_promoted_gemini"
 
+    def test_auto_provider_chain_promotes_gemini_when_openai_pool_is_thin(self):
+        with patch.dict(
+            os.environ,
+            {
+                EVOLUTION_LLM_BACKEND_ENV: AUTO_MULTI_PROVIDER_BACKEND,
+                "OPENAI_API_KEYS": "openai-key-1,openai-key-2,openai-key-3,openai-key-4",
+                "GEMINI_API_KEYS": "gemini-key-1,gemini-key-2",
+            },
+            clear=True,
+        ):
+            _mark_openai_key_failure("openai-key-1")
+            _mark_openai_key_failure("openai-key-2")
+            _mark_openai_key_failure("openai-key-3")
+            _OPENAI_KEY_FAILURES.clear()
+            assert get_evolution_llm_provider_chain() == ["gemini", "openai"]
+            status = get_llm_backend_status()
+
+        assert status["evolution_backend"] == "gemini"
+        assert status["openai_pool_health"] == {
+            "total_accounts": 4,
+            "healthy_accounts": 1,
+            "cooling_accounts": 3,
+        }
+        assert status["gemini_pool_health"] == {
+            "total_accounts": 2,
+            "healthy_accounts": 2,
+            "cooling_accounts": 0,
+        }
+        assert status["provider_health"] == {"openai": "healthy", "gemini": "healthy"}
+        assert status["primary_provider_reason"] == "openai_thin_pool_promoted_gemini"
+
     def test_provider_cooldown_survives_runtime_state_reload(self):
         failed_at = time.time()
         llm_runtime_state.set_provider_failure("openai", failed_at)

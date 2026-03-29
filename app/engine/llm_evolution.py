@@ -44,6 +44,13 @@ _PROVIDER_FAILURES: Dict[str, float] = {}
 _PROVIDER_FAILURES_LOCK = threading.Lock()
 
 
+def _to_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
 def _sync_provider_failures_from_runtime_state() -> None:
     persisted = get_provider_failure_timestamps()
     with _PROVIDER_FAILURES_LOCK:
@@ -112,6 +119,22 @@ def _provider_is_healthy(provider: str) -> bool:
     return _provider_health_state(provider) == "healthy"
 
 
+def _provider_pool_health(provider: str) -> Dict[str, int]:
+    if provider == "openai":
+        return get_openai_evolution_pool_health()
+    if provider == "gemini":
+        return get_gemini_evolution_pool_health()
+    return {}
+
+
+def _provider_priority_key(provider: str) -> tuple[int, int, int]:
+    pool = _provider_pool_health(provider)
+    healthy_accounts = max(0, _to_int(pool.get("healthy_accounts"), 0))
+    total_accounts = max(0, _to_int(pool.get("total_accounts"), 0))
+    cooling_accounts = max(0, _to_int(pool.get("cooling_accounts"), 0))
+    return (healthy_accounts, total_accounts - cooling_accounts, total_accounts)
+
+
 def _mark_provider_success(provider: str) -> None:
     with _PROVIDER_FAILURES_LOCK:
         _PROVIDER_FAILURES.pop(provider, None)
@@ -143,7 +166,12 @@ def _order_provider_chain(
             + [provider for provider in healthy if provider != requested_provider]
             + cooling
         )
-    return healthy + cooling
+    ranked_healthy = sorted(
+        healthy,
+        key=lambda provider: (_provider_priority_key(provider), -base.index(provider)),
+        reverse=True,
+    )
+    return ranked_healthy + cooling
 
 
 def _provider_selection_reason(
@@ -165,6 +193,8 @@ def _provider_selection_reason(
             return "default_openai_primary"
         if _provider_health_state("openai") != "healthy":
             return "openai_cooldown_promoted_gemini"
+        if _provider_priority_key("gemini") > _provider_priority_key("openai"):
+            return "openai_thin_pool_promoted_gemini"
         return f"auto_selected_{primary}"
     return f"auto_selected_{primary}"
 
