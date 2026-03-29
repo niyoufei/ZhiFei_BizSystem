@@ -9278,6 +9278,7 @@ class TestLlmStatusEndpoint:
                     "last_at": 1.0,
                 }
             },
+            "provider_quality_score": {"openai": 75.0},
             "provider_chain": ["openai"],
             "fallback_providers": [],
         }
@@ -9302,6 +9303,7 @@ class TestLlmStatusEndpoint:
         assert payload["provider_quality"] == {"openai": "stable"}
         assert payload["provider_review_stats"]["openai"]["confirmed_count"] == 2
         assert payload["provider_review_stats"]["openai"]["last_status"] == "confirmed"
+        assert payload["provider_quality_score"] == {"openai": 75.0}
         assert payload["provider_chain"] == ["openai"]
         assert payload["fallback_providers"] == []
 

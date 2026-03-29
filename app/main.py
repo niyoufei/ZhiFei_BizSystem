@@ -13818,6 +13818,7 @@ def llm_status() -> LLMBackendStatus:
         provider_health=dict(s.get("provider_health") or {}),
         provider_quality=dict(s.get("provider_quality") or {}),
         provider_review_stats=dict(s.get("provider_review_stats") or {}),
+        provider_quality_score=dict(s.get("provider_quality_score") or {}),
         primary_provider_reason=s.get("primary_provider_reason"),
         provider_chain=list(s.get("provider_chain") or []),
         fallback_providers=list(s.get("fallback_providers") or []),

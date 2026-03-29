@@ -113,6 +113,10 @@ class LLMBackendStatus(BaseModel):
         default_factory=dict,
         description="各 provider 的增强复核历史摘要：confirmed/diverged/unavailable/fallback_only 计数与最近状态",
     )
+    provider_quality_score: Dict[str, float] = Field(
+        default_factory=dict,
+        description="各 provider 的历史质量分（0-100），用于在健康 provider 间择优选主",
+    )
     primary_provider_reason: Optional[str] = Field(
         None,
         description="当前主 provider 选择原因",

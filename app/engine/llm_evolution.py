@@ -47,6 +47,10 @@ EVOLUTION_LLM_PROVIDER_COOLDOWN_ENV = "EVOLUTION_LLM_ACCOUNT_COOLDOWN_SECONDS"
 DEFAULT_EVOLUTION_LLM_PROVIDER_COOLDOWN_SECONDS = 300.0
 EVOLUTION_LLM_QUALITY_DEGRADE_SECONDS_ENV = "EVOLUTION_LLM_QUALITY_DEGRADE_SECONDS"
 DEFAULT_EVOLUTION_LLM_QUALITY_DEGRADE_SECONDS = 1800.0
+DEFAULT_PROVIDER_QUALITY_SCORE_PRIOR_WEIGHT = 4.0
+DEFAULT_PROVIDER_QUALITY_SCORE_PRIOR_SUCCESS = 2.0
+DEFAULT_PROVIDER_QUALITY_PROMOTION_MIN_HISTORY = 3
+DEFAULT_PROVIDER_QUALITY_PROMOTION_MIN_GAP = 8.0
 _PROVIDER_FAILURES: Dict[str, float] = {}
 _PROVIDER_FAILURES_LOCK = threading.Lock()
 _PROVIDER_QUALITY_DEGRADED: Dict[str, float] = {}
@@ -176,6 +180,41 @@ def _provider_review_regressed(provider: str) -> bool:
     return diverged_count >= 2 and diverged_count > confirmed_count
 
 
+def _provider_review_stats(provider: str) -> Dict[str, Any]:
+    with _PROVIDER_REVIEW_STATS_LOCK:
+        return dict(_PROVIDER_REVIEW_STATS.get(provider) or {})
+
+
+def _provider_quality_score(provider: str) -> float:
+    stats = _provider_review_stats(provider)
+    confirmed_count = max(0, _to_int(stats.get("confirmed_count"), 0))
+    diverged_count = max(0, _to_int(stats.get("diverged_count"), 0))
+    unavailable_count = max(0, _to_int(stats.get("unavailable_count"), 0))
+    fallback_only_count = max(0, _to_int(stats.get("fallback_only_count"), 0))
+    weighted_success = (
+        float(confirmed_count)
+        + (0.4 * float(fallback_only_count))
+        + (0.2 * float(unavailable_count))
+    )
+    total = confirmed_count + diverged_count + unavailable_count + fallback_only_count
+    score = 100.0 * (
+        (weighted_success + DEFAULT_PROVIDER_QUALITY_SCORE_PRIOR_SUCCESS)
+        / (float(total) + DEFAULT_PROVIDER_QUALITY_SCORE_PRIOR_WEIGHT)
+    )
+    return round(max(0.0, min(100.0, score)), 1)
+
+
+def _provider_has_quality_signal(provider: str) -> bool:
+    stats = _provider_review_stats(provider)
+    total = (
+        max(0, _to_int(stats.get("confirmed_count"), 0))
+        + max(0, _to_int(stats.get("diverged_count"), 0))
+        + max(0, _to_int(stats.get("unavailable_count"), 0))
+        + max(0, _to_int(stats.get("fallback_only_count"), 0))
+    )
+    return total >= DEFAULT_PROVIDER_QUALITY_PROMOTION_MIN_HISTORY
+
+
 def _provider_pool_health(provider: str) -> Dict[str, int]:
     if provider == "openai":
         return get_openai_evolution_pool_health()
@@ -190,6 +229,14 @@ def _provider_priority_key(provider: str) -> tuple[int, int, int]:
     total_accounts = max(0, _to_int(pool.get("total_accounts"), 0))
     cooling_accounts = max(0, _to_int(pool.get("cooling_accounts"), 0))
     return (healthy_accounts, total_accounts - cooling_accounts, total_accounts)
+
+
+def _should_promote_provider_by_quality(primary: str, alternate: str) -> bool:
+    if not (_provider_has_quality_signal(primary) and _provider_has_quality_signal(alternate)):
+        return False
+    primary_score = _provider_quality_score(primary)
+    alternate_score = _provider_quality_score(alternate)
+    return (alternate_score - primary_score) >= DEFAULT_PROVIDER_QUALITY_PROMOTION_MIN_GAP
 
 
 def _mark_provider_quality_stable(provider: str) -> None:
@@ -240,6 +287,7 @@ def _order_provider_chain(
         healthy,
         key=lambda provider: (
             _provider_quality_state(provider) == "stable",
+            _provider_quality_score(provider),
             _provider_priority_key(provider),
             -base.index(provider),
         ),
@@ -269,6 +317,8 @@ def _provider_selection_reason(
             return "openai_cooldown_promoted_gemini"
         if _provider_quality_state("openai") != "stable":
             return "openai_quality_degraded_promoted_gemini"
+        if _should_promote_provider_by_quality("openai", "gemini"):
+            return "openai_low_quality_score_promoted_gemini"
         if _provider_priority_key("gemini") > _provider_priority_key("openai"):
             return "openai_thin_pool_promoted_gemini"
         return f"auto_selected_{primary}"
@@ -355,6 +405,11 @@ def get_llm_backend_status() -> Dict[str, Any]:
         },
         "provider_review_stats": {
             provider: dict(provider_review_stats.get(provider) or {})
+            for provider in REAL_LLM_PROVIDERS
+            if _provider_configured(provider)
+        },
+        "provider_quality_score": {
+            provider: _provider_quality_score(provider)
             for provider in REAL_LLM_PROVIDERS
             if _provider_configured(provider)
         },
