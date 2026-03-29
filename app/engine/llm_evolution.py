@@ -16,6 +16,8 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.engine.llm_evolution_common import parse_api_key_pool
+from app.engine.llm_evolution_gemini import get_gemini_evolution_pool_health
+from app.engine.llm_evolution_openai import get_openai_evolution_pool_health
 from app.engine.openai_compat import get_openai_model
 
 # 支持的真实后端: rules | openai | gemini
@@ -196,6 +198,8 @@ def get_llm_backend_status() -> Dict[str, Any]:
     legacy_spark_env_keys = _list_legacy_spark_env_keys()
     openai_configured = _provider_configured("openai")
     gemini_configured = _provider_configured("gemini")
+    openai_pool_health = get_openai_evolution_pool_health() if openai_configured else {}
+    gemini_pool_health = get_gemini_evolution_pool_health() if gemini_configured else {}
     return {
         "evolution_backend": backend,
         "requested_backend": requested_backend,
@@ -206,9 +210,11 @@ def get_llm_backend_status() -> Dict[str, Any]:
         "legacy_spark_env_keys": legacy_spark_env_keys,
         "openai_configured": openai_configured,
         "openai_account_count": _provider_key_count("openai"),
+        "openai_pool_health": openai_pool_health,
         "openai_model": get_openai_model() if openai_configured else None,
         "gemini_configured": gemini_configured,
         "gemini_account_count": _provider_key_count("gemini"),
+        "gemini_pool_health": gemini_pool_health,
         "provider_health": {
             provider: _provider_health_state(provider)
             for provider in REAL_LLM_PROVIDERS

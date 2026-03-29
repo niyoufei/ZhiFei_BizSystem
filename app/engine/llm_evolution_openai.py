@@ -33,6 +33,26 @@ def get_openai_evolution_account_count() -> int:
     return len(get_openai_evolution_api_keys())
 
 
+def get_openai_evolution_pool_health() -> Dict[str, int]:
+    keys = get_openai_evolution_api_keys()
+    now = time.time()
+    cooldown = _account_cooldown_seconds()
+    healthy_accounts = 0
+    cooling_accounts = 0
+    with _OPENAI_KEY_LOCK:
+        for key in keys:
+            failed_at = _OPENAI_KEY_FAILURES.get(key)
+            if failed_at is None or (now - failed_at) >= cooldown:
+                healthy_accounts += 1
+            else:
+                cooling_accounts += 1
+    return {
+        "total_accounts": len(keys),
+        "healthy_accounts": healthy_accounts,
+        "cooling_accounts": cooling_accounts,
+    }
+
+
 def _account_cooldown_seconds() -> float:
     raw = str(os.getenv(EVOLUTION_LLM_ACCOUNT_COOLDOWN_ENV) or "").strip()
     try:

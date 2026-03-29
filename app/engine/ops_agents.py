@@ -1823,6 +1823,8 @@ def _run_learning_calibration_agent(
                 "llm_status_unavailable_count": 0,
                 "llm_provider_degraded_count": 0,
                 "llm_fallback_unavailable_count": 0,
+                "llm_account_cooldown_count": 0,
+                "llm_provider_thin_pool_count": 0,
                 "enhancement_review_diverged_count": 0,
                 "enhancement_governed_count": 0,
                 "patch_deployed_count": 0,
@@ -1843,6 +1845,8 @@ def _run_learning_calibration_agent(
     llm_status_unavailable_count = 0
     llm_provider_degraded_count = 0
     llm_fallback_unavailable_count = 0
+    openai_pool_health: Dict[str, Any] = {}
+    gemini_pool_health: Dict[str, Any] = {}
     if int(llm_status_resp.get("status_code") or 0) != 200:
         llm_status_unavailable_count = 1
     else:
@@ -1851,6 +1855,8 @@ def _run_learning_calibration_agent(
             str(key): str(value or "").strip().lower()
             for key, value in _json_object(llm_status_payload.get("provider_health")).items()
         }
+        openai_pool_health = _json_object(llm_status_payload.get("openai_pool_health"))
+        gemini_pool_health = _json_object(llm_status_payload.get("gemini_pool_health"))
         llm_provider_degraded_count = sum(
             1 for value in provider_health.values() if value and value != "healthy"
         )
@@ -1859,6 +1865,16 @@ def _run_learning_calibration_agent(
         ]
         if len([item for item in provider_chain if item]) < 2:
             llm_fallback_unavailable_count = 1
+    llm_account_cooldown_count = 0
+    llm_provider_thin_pool_count = 0
+    if llm_status_unavailable_count == 0:
+        for pool in (openai_pool_health, gemini_pool_health):
+            total_accounts = _to_int(pool.get("total_accounts"))
+            healthy_accounts = _to_int(pool.get("healthy_accounts"))
+            cooling_accounts = _to_int(pool.get("cooling_accounts"))
+            llm_account_cooldown_count += cooling_accounts
+            if total_accounts > 1 and healthy_accounts <= 1:
+                llm_provider_thin_pool_count += 1
 
     evolve_actions: List[Dict[str, Any]] = []
     reflection_actions: List[Dict[str, Any]] = []
@@ -2187,6 +2203,8 @@ def _run_learning_calibration_agent(
         and llm_status_unavailable_count == 0
         and llm_provider_degraded_count == 0
         and llm_fallback_unavailable_count == 0
+        and llm_account_cooldown_count == 0
+        and llm_provider_thin_pool_count == 0
     )
     warn_flag = total_failure_count == 0 and not pass_flag
 
@@ -2200,6 +2218,14 @@ def _run_learning_calibration_agent(
     if llm_fallback_unavailable_count > 0:
         recommendations.append(
             "当前学习进化仅剩单 provider 可用，跨 provider fallback 与双模型复核暂时不可用。"
+        )
+    if llm_account_cooldown_count > 0:
+        recommendations.append(
+            f"当前共有 {llm_account_cooldown_count} 个 LLM 账号处于 cooldown，系统仍可运行，但建议继续补强账号池冗余。"
+        )
+    if llm_provider_thin_pool_count > 0:
+        recommendations.append(
+            f"有 {llm_provider_thin_pool_count} 个 provider 当前仅剩 1 个健康账号，抗抖动余量偏薄。"
         )
     if total_failure_count > 0:
         recommendations.append(
@@ -2296,6 +2322,8 @@ def _run_learning_calibration_agent(
             "llm_status_unavailable_count": llm_status_unavailable_count,
             "llm_provider_degraded_count": llm_provider_degraded_count,
             "llm_fallback_unavailable_count": llm_fallback_unavailable_count,
+            "llm_account_cooldown_count": llm_account_cooldown_count,
+            "llm_provider_thin_pool_count": llm_provider_thin_pool_count,
             "enhancement_review_diverged_count": enhancement_review_diverged_count,
             "enhancement_governed_count": enhancement_governed_count,
             "patch_deployed_count": patch_deployed_count,

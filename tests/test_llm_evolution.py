@@ -159,7 +159,13 @@ class TestEnhanceEvolutionReportWithLlm:
         assert status["legacy_spark_env_keys"] == ["SPARK_MODEL"]
         assert status["openai_configured"] is True
         assert status["openai_account_count"] == 1
+        assert status["openai_pool_health"] == {
+            "total_accounts": 1,
+            "healthy_accounts": 1,
+            "cooling_accounts": 0,
+        }
         assert status["gemini_account_count"] == 0
+        assert status["gemini_pool_health"] == {}
         assert status["provider_health"] == {"openai": "healthy"}
         assert status["primary_provider_reason"] == "requested_openai_healthy"
         assert status["provider_chain"] == ["openai"]
@@ -182,6 +188,16 @@ class TestEnhanceEvolutionReportWithLlm:
         assert status["auto_mode"] is True
         assert status["openai_account_count"] == 2
         assert status["gemini_account_count"] == 2
+        assert status["openai_pool_health"] == {
+            "total_accounts": 2,
+            "healthy_accounts": 2,
+            "cooling_accounts": 0,
+        }
+        assert status["gemini_pool_health"] == {
+            "total_accounts": 2,
+            "healthy_accounts": 2,
+            "cooling_accounts": 0,
+        }
         assert status["provider_health"] == {"openai": "healthy", "gemini": "healthy"}
         assert status["primary_provider_reason"] == "default_openai_primary"
         assert status["provider_chain"] == ["openai", "gemini"]
@@ -206,6 +222,16 @@ class TestEnhanceEvolutionReportWithLlm:
             _PROVIDER_FAILURES.clear()
 
         assert status["evolution_backend"] == "gemini"
+        assert status["openai_pool_health"] == {
+            "total_accounts": 1,
+            "healthy_accounts": 1,
+            "cooling_accounts": 0,
+        }
+        assert status["gemini_pool_health"] == {
+            "total_accounts": 1,
+            "healthy_accounts": 1,
+            "cooling_accounts": 0,
+        }
         assert status["provider_health"]["openai"] == "cooldown"
         assert status["provider_health"]["gemini"] == "healthy"
         assert status["primary_provider_reason"] == "openai_cooldown_promoted_gemini"

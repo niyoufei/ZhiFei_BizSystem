@@ -9258,9 +9258,15 @@ class TestLlmStatusEndpoint:
             "legacy_spark_env_keys": ["SPARK_MODEL"],
             "openai_configured": True,
             "openai_account_count": 2,
+            "openai_pool_health": {
+                "total_accounts": 2,
+                "healthy_accounts": 2,
+                "cooling_accounts": 0,
+            },
             "openai_model": "gpt-5.4",
             "gemini_configured": False,
             "gemini_account_count": 0,
+            "gemini_pool_health": {},
             "provider_chain": ["openai"],
             "fallback_providers": [],
         }
@@ -9277,9 +9283,11 @@ class TestLlmStatusEndpoint:
         assert payload["legacy_spark_env_keys"] == ["SPARK_MODEL"]
         assert payload["openai_configured"] is True
         assert payload["openai_account_count"] == 2
+        assert payload["openai_pool_health"]["healthy_accounts"] == 2
         assert payload["openai_model"] == "gpt-5.4"
         assert payload["gemini_configured"] is False
         assert payload["gemini_account_count"] == 0
+        assert payload["gemini_pool_health"] == {}
         assert payload["provider_chain"] == ["openai"]
         assert payload["fallback_providers"] == []
 

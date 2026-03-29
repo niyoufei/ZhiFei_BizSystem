@@ -87,11 +87,19 @@ class LLMBackendStatus(BaseModel):
         0,
         description="当前 OpenAI 可用账号数（OPENAI_API_KEY + OPENAI_API_KEYS 汇总）",
     )
+    openai_pool_health: Dict[str, int] = Field(
+        default_factory=dict,
+        description="OpenAI 账号池健康摘要：total_accounts / healthy_accounts / cooling_accounts",
+    )
     openai_model: Optional[str] = Field(None, description="当前 OpenAI 模型")
     gemini_configured: bool = Field(..., description="是否已配置 GEMINI_API_KEY")
     gemini_account_count: int = Field(
         0,
         description="当前 Gemini 可用账号数（GEMINI_API_KEY + GEMINI_API_KEYS 汇总）",
+    )
+    gemini_pool_health: Dict[str, int] = Field(
+        default_factory=dict,
+        description="Gemini 账号池健康摘要：total_accounts / healthy_accounts / cooling_accounts",
     )
     provider_health: Dict[str, str] = Field(
         default_factory=dict,
