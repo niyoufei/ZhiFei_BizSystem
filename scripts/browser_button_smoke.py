@@ -641,32 +641,6 @@ BUTTON_SMOKE_MATRIX: List[Dict[str, Any]] = [
         "expected_filename_suffix": ".md",
     },
     {
-        "id": "btnFeedbackGovernance",
-        "label": "评分治理（异常样本/校准/回退）",
-        "selector": "#btnFeedbackGovernance",
-        "kind": "result",
-        "prepare_js": """() => window.__codexRevealForSmoke('#btnFeedbackGovernance')""",
-        "result_id": "feedbackGovernanceResult",
-        "expected_text": "评分治理面板（异常样本 / few-shot / 回退快照）",
-    },
-    {
-        "id": "btnEvalSummaryV2",
-        "label": "跨项目汇总评估",
-        "selector": "#btnEvalSummaryV2",
-        "kind": "result",
-        "result_id": "evalResult",
-        "expected_text": "跨项目汇总评估完成",
-    },
-    {
-        "id": "btnEvalMetricsV2",
-        "label": "评估 规则/当前分/校准",
-        "selector": "#btnEvalMetricsV2",
-        "kind": "result",
-        "prepare_js": """() => window.__codexRevealForSmoke('#btnEvalMetricsV2')""",
-        "result_id": "evalResult",
-        "expected_text": "项目指标评估完成",
-    },
-    {
         "id": "btnAdaptive",
         "label": "自适应建议",
         "selector": "#btnAdaptive",
@@ -895,51 +869,11 @@ BUTTON_SMOKE_MATRIX: List[Dict[str, Any]] = [
     },
     {
         "id": "btnWritingGuidance",
-        "label": "查看编制指导",
+        "label": "查看高分编制指导",
         "selector": "#btnWritingGuidance",
         "kind": "result",
         "result_id": "guidanceResult",
         "expected_text": "高分逻辑",
-    },
-    {
-        "id": "btnCompilationInstructions",
-        "label": "编制系统指令",
-        "selector": "#btnCompilationInstructions",
-        "kind": "result",
-        "prepare_js": """() => window.__codexRevealForSmoke('#btnCompilationInstructions')""",
-        "result_id": "compilationInstructionsResult",
-        "expected_text": "必备章节：",
-    },
-    {
-        "id": "btnExportInstructions",
-        "label": "编制系统指令结果区导出文本",
-        "selector": "#btnExportInstructions",
-        "kind": "js_check",
-        "prepare_js": """() => window.__codexRevealForSmoke('#btnCompilationInstructions')""",
-        "prime_js": """() => {
-          if (window.__codexSmokeState && Array.isArray(window.__codexSmokeState.clipboardWrites)) {
-            window.__codexSmokeState.clipboardWrites = [];
-          }
-          return window.__codexPrimeClickForSmoke('#btnCompilationInstructions');
-        }""",
-        "prime_wait_selector": "#btnExportInstructions",
-        "verify_js": """() => Array.isArray(window.__codexSmokeState && window.__codexSmokeState.clipboardWrites)
-          && window.__codexSmokeState.clipboardWrites.length > 0""",
-        "observed_js": """() => {
-          const writes = Array.isArray(window.__codexSmokeState && window.__codexSmokeState.clipboardWrites)
-            ? window.__codexSmokeState.clipboardWrites
-            : [];
-          return writes.length ? writes[0] : '';
-        }""",
-    },
-    {
-        "id": "btnGuidancePatchBundleInlineDownload",
-        "label": "编制指导结果区下载改写补丁包(.md)",
-        "selector": "#btnGuidancePatchBundleInlineDownload",
-        "kind": "download",
-        "expected_filename_prefix": "writing_guidance_patch_bundle_",
-        "expected_filename_suffix": ".md",
-        "optional": True,
     },
     {
         "id": "btnGuidancePatchBundleInlineDownloadDocx",
@@ -951,115 +885,11 @@ BUTTON_SMOKE_MATRIX: List[Dict[str, Any]] = [
         "optional": True,
     },
     {
-        "id": "btnWritingGuidanceDownload",
-        "label": "下载编制指导(.md)",
-        "selector": "#btnWritingGuidanceDownload",
-        "kind": "download",
-        "expected_filename_prefix": "writing_guidance_",
-        "expected_filename_suffix": ".md",
-    },
-    {
-        "id": "btnWritingGuidancePatchBundleDownload",
-        "label": "下载改写补丁包(.md)",
-        "selector": "#btnWritingGuidancePatchBundleDownload",
-        "kind": "download",
-        "expected_filename_prefix": "writing_guidance_patch_bundle_",
-        "expected_filename_suffix": ".md",
-    },
-    {
         "id": "btnWritingGuidancePatchBundleDownloadDocx",
         "label": "下载改写补丁包(.docx)",
         "selector": "#btnWritingGuidancePatchBundleDownloadDocx",
         "kind": "download",
         "expected_filename_prefix": "writing_guidance_patch_bundle_",
-        "expected_filename_suffix": ".docx",
-    },
-    {
-        "id": "btnSelfCheck",
-        "label": "系统自检",
-        "selector": "#btnSelfCheck",
-        "kind": "result",
-        "result_id": "selfCheckResult",
-        "expected_text": "解析能力：",
-    },
-    {
-        "id": "btnSystemImprovementOverview",
-        "label": "系统继续完善总览",
-        "selector": "#btnSystemImprovementOverview",
-        "kind": "result",
-        "result_id": "systemImprovementResult",
-        "expected_text": "继续完善工作流",
-    },
-    {
-        "id": "btnDataHygiene",
-        "label": "数据卫生巡检",
-        "selector": "#btnDataHygiene",
-        "kind": "result",
-        "result_id": "dataHygieneResult",
-        "expected_text": "有效项目数：",
-    },
-    {
-        "id": "btnEvolutionHealth",
-        "label": "进化健康度",
-        "selector": "#btnEvolutionHealth",
-        "kind": "result",
-        "result_id": "evolutionHealthResult",
-        "expected_text": "进化健康度（误差趋势 / 漂移）",
-    },
-    {
-        "id": "btnTrialPreflight",
-        "label": "试车前综合体检",
-        "selector": "#btnTrialPreflight",
-        "kind": "result",
-        "result_id": "trialPreflightResult",
-        "expected_text": "试车记录草案（待确认）",
-    },
-    {
-        "id": "materialsTrialPreflightFollowUpAction",
-        "label": "试车后返回施组区",
-        "selector": "#materialsTrialPreflightFollowUpAction",
-        "kind": "js_check",
-        "prepare_js": """(() => window.__codexActivateTrialPreflightFollowUpForSmoke())()""",
-        "verify_js": """() => {
-          const focusedIds = Array.isArray(window.__trialPreflightEntrypointFocusIds)
-            ? window.__trialPreflightEntrypointFocusIds
-            : [];
-          const activeId = String((document.activeElement && document.activeElement.id) || '').trim();
-          const actionEl = document.getElementById('materialsTrialPreflightFollowUpAction');
-          return focusedIds.includes('section-shigong')
-            && (focusedIds.includes('btnUploadShigong') || focusedIds.includes('btnScoreShigong'))
-            && (activeId === 'btnUploadShigong' || activeId === 'btnScoreShigong')
-            && !!actionEl
-            && (
-              window.getComputedStyle(actionEl).display === 'none'
-              || !String(actionEl.textContent || '').trim()
-            );
-        }""",
-        "observed_js": """() => {
-          const actionEl = document.getElementById('materialsTrialPreflightFollowUpAction');
-          return {
-            text: String((actionEl && actionEl.textContent) || ''),
-            entrypointKey: String((actionEl && actionEl.dataset.entrypointKey) || ''),
-            entrypointLabel: String((actionEl && actionEl.dataset.entrypointLabel) || ''),
-            activeId: String((document.activeElement && document.activeElement.id) || ''),
-          };
-        }""",
-        "timeout_ms": 30000,
-    },
-    {
-        "id": "btnTrialPreflightDownload",
-        "label": "下载试车报告(.md)",
-        "selector": "#btnTrialPreflightDownload",
-        "kind": "download",
-        "expected_filename_prefix": "trial_preflight_",
-        "expected_filename_suffix": ".md",
-    },
-    {
-        "id": "btnTrialPreflightDownloadDocx",
-        "label": "下载试车报告(.docx)",
-        "selector": "#btnTrialPreflightDownloadDocx",
-        "kind": "download",
-        "expected_filename_prefix": "trial_preflight_",
         "expected_filename_suffix": ".docx",
     },
 ]
@@ -1674,7 +1504,9 @@ def capture_adaptive_apply_snapshot() -> Dict[str, Any]:
     }
 
 
-def restore_adaptive_apply_snapshot(snapshot: Dict[str, Any], *, base_url: str, api_key: str) -> None:
+def restore_adaptive_apply_snapshot(
+    snapshot: Dict[str, Any], *, base_url: str, api_key: str
+) -> None:
     if not snapshot:
         return
     LEXICON_PATH.write_text(str(snapshot.get("lexicon_text") or ""), encoding="utf-8")
@@ -1746,11 +1578,15 @@ def wait_for_projects_removed(
     return False
 
 
-def wait_for_project_removed(*, base_url: str, project_id: str, api_key: str, timeout_ms: int) -> bool:
+def wait_for_project_removed(
+    *, base_url: str, project_id: str, api_key: str, timeout_ms: int
+) -> bool:
     deadline = time.time() + max(1.0, float(timeout_ms) / 1000.0)
     while time.time() < deadline:
         try:
-            if not project_exists_via_api(base_url=base_url, project_id=project_id, api_key=api_key):
+            if not project_exists_via_api(
+                base_url=base_url, project_id=project_id, api_key=api_key
+            ):
                 return True
         except Exception:
             pass
@@ -1789,8 +1625,7 @@ def verify_config_integrity_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]
         for path in LEXICON_PATH.parent.glob(pattern)
     )
     expected_files = {
-        str(key): str(value)
-        for key, value in dict(snapshot.get("files") or {}).items()
+        str(key): str(value) for key, value in dict(snapshot.get("files") or {}).items()
     }
     expected_backups = sorted(str(item) for item in (snapshot.get("backups") or []))
     return {
@@ -2416,7 +2251,9 @@ def run_browser_smoke(
     try:
         with sync_playwright() as p:
             browser = launch_browser(p)
-            context = browser.new_context(accept_downloads=True, viewport={"width": 1600, "height": 1200})
+            context = browser.new_context(
+                accept_downloads=True, viewport={"width": 1600, "height": 1200}
+            )
             page = context.new_page()
             page.on(
                 "console",

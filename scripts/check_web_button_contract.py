@@ -48,33 +48,20 @@ VOID_TAGS = {
 }
 
 CRITICAL_EXPORT_BUTTON_IDS = [
-    "btnTrialPreflightDownload",
-    "btnTrialPreflightDownloadDocx",
-    "btnWritingGuidanceDownload",
-    "btnWritingGuidancePatchBundleDownload",
     "btnWritingGuidancePatchBundleDownloadDocx",
 ]
 
 INLINE_EXPECTED_MARKERS = {
-    "btnGuidancePatchBundleInlineDownload": "downloadWritingGuidancePatchBundle(projectId, 'guidanceResult');",
     "btnGuidancePatchBundleInlineDownloadDocx": "downloadWritingGuidancePatchBundleDocx(projectId, 'guidanceResult');",
 }
 
 DYNAMIC_BUTTON_CONTRACTS = {
     "btnEvidenceTraceDownload": {
-        "create_marker": "id=\"btnEvidenceTraceDownload\"",
+        "create_marker": 'id="btnEvidenceTraceDownload"',
         "bind_marker": "const dlBtn = document.getElementById('btnEvidenceTraceDownload');",
     },
-    "btnExportInstructions": {
-        "create_marker": "id=\"btnExportInstructions\"",
-        "bind_marker": "(document.getElementById('btnExportInstructions')||{}).onclick = () => {",
-    },
-    "btnGuidancePatchBundleInlineDownload": {
-        "create_marker": "id=\"btnGuidancePatchBundleInlineDownload\"",
-        "bind_marker": "const inlinePatchBtn = document.getElementById('btnGuidancePatchBundleInlineDownload');",
-    },
     "btnGuidancePatchBundleInlineDownloadDocx": {
-        "create_marker": "id=\"btnGuidancePatchBundleInlineDownloadDocx\"",
+        "create_marker": 'id="btnGuidancePatchBundleInlineDownloadDocx"',
         "bind_marker": "const inlinePatchDocxBtn = document.getElementById('btnGuidancePatchBundleInlineDownloadDocx');",
     },
 }
@@ -102,10 +89,23 @@ SMOKE_REQUIRED_BUTTON_IDS = [
     "btnUploadShigong",
     "btnRefreshSubmissions",
     "btnRefreshGroundTruth",
-    "materialsTrialPreflightFollowUpAction",
 ]
 
-SMOKE_ALLOWLIST_REASONS = {}
+SMOKE_ALLOWLIST_REASONS = {
+    "btnCompilationInstructions": "hidden on /developer/debug; removed from main business UI",
+    "btnDataHygiene": "hidden on /developer/debug; removed from main business UI",
+    "btnEvalSummaryV2": "hidden on /developer/debug; removed from main business UI",
+    "btnEvolutionHealth": "hidden on /developer/debug; removed from main business UI",
+    "btnFeedbackGovernance": "hidden on /developer/debug; removed from main business UI",
+    "btnSelfCheck": "hidden on /developer/debug; removed from main business UI",
+    "btnSystemImprovementOverview": "hidden on /developer/debug; removed from main business UI",
+    "btnTrialPreflight": "hidden on /developer/debug; removed from main business UI",
+    "btnTrialPreflightDownload": "hidden on /developer/debug; removed from main business UI",
+    "btnTrialPreflightDownloadDocx": "hidden on /developer/debug; removed from main business UI",
+    "btnWritingGuidanceDownload": "hidden on /developer/debug; removed from main business UI",
+    "btnWritingGuidancePatchBundleDownload": "hidden on /developer/debug; removed from main business UI",
+    "materialsTrialPreflightFollowUpAction": "hidden on /developer/debug; removed from main business UI",
+}
 
 
 class _StaticDomParser(HTMLParser):
@@ -151,7 +151,9 @@ class _StaticDomParser(HTMLParser):
             self._hidden_stack.pop()
 
 
-def _extract_static_dom(page: str) -> tuple[Set[str], Set[str], Set[str], Dict[str, str], Dict[str, bool]]:
+def _extract_static_dom(
+    page: str,
+) -> tuple[Set[str], Set[str], Set[str], Dict[str, str], Dict[str, bool]]:
     parser = _StaticDomParser()
     parser.feed(page)
     return (
@@ -225,9 +227,7 @@ def _extract_const_array_ids(page: str, const_name: str) -> Set[str]:
     if not match:
         return set()
     return {
-        str(item).strip()
-        for item in re.findall(r"'([^']+)'", match.group(1))
-        if str(item).strip()
+        str(item).strip() for item in re.findall(r"'([^']+)'", match.group(1)) if str(item).strip()
     }
 
 
@@ -338,18 +338,25 @@ def build_report_from_html(page: str) -> Dict[str, object]:
 
     dynamic_button_ids = {item["button_id"] for item in dynamic_button_contracts}
     known_actionable_ids = button_ids | dynamic_button_ids
-    known_registered_ids = known_actionable_ids | safe_click_ids | direct_button_ids | action_map_ids
+    known_registered_ids = (
+        known_actionable_ids | safe_click_ids | direct_button_ids | action_map_ids
+    )
 
     action_result_contracts = []
     action_result_contract_ok = True
     for row in action_rows:
+        allowlisted_reason = str(SMOKE_ALLOWLIST_REASONS.get(row["button_id"]) or "").strip()
         item = {
             "button_id": row["button_id"],
             "result_id": row["result_id"],
             "button_present": row["button_id"] in known_actionable_ids,
             "result_present": row["result_id"] in element_ids,
+            "allowlisted": bool(allowlisted_reason),
+            "reason": allowlisted_reason,
         }
-        item["ok"] = bool(item["button_present"] and item["result_present"])
+        item["ok"] = bool(
+            (item["button_present"] and item["result_present"]) or item["allowlisted"]
+        )
         action_result_contract_ok = action_result_contract_ok and bool(item["ok"])
         action_result_contracts.append(item)
 
@@ -394,7 +401,9 @@ def build_report_from_html(page: str) -> Dict[str, object]:
 
     actionable_button_ids = sorted(button_ids | action_map_ids)
     uncovered_actionable_ids = sorted(
-        button_id for button_id in actionable_button_ids if button_id not in read_smoke_ids | write_smoke_ids
+        button_id
+        for button_id in actionable_button_ids
+        if button_id not in read_smoke_ids | write_smoke_ids
     )
     smoke_gap_contracts = []
     smoke_gap_contract_ok = True
@@ -532,12 +541,8 @@ def to_markdown(report: Dict[str, object], *, base_url: str) -> str:
         lines.append(f"- [{flag}] `{item['button_id']}` reason={reason}")
     lines.append("")
     lines.append("## Smoke Allowlist Contract")
-    lines.append(
-        f"- ok: `{report['smoke_allowlist_contract']['ok']}`"
-    )
-    lines.append(
-        f"- stale_ids: `{report['smoke_allowlist_contract']['stale_ids']}`"
-    )
+    lines.append(f"- ok: `{report['smoke_allowlist_contract']['ok']}`")
+    lines.append(f"- stale_ids: `{report['smoke_allowlist_contract']['stale_ids']}`")
     lines.append("")
     if report["missing_bindings"]:
         lines.append("## Missing Bindings")

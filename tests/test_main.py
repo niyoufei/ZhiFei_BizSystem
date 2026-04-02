@@ -1382,13 +1382,16 @@ class TestMaterialParseWorkerLifecycle:
         ]
         try:
             _invalidate_material_parse_claim_snapshot()
-            with patch("app.main._material_parse_claim_cache_enabled", return_value=True), patch(
-                "app.main._material_parse_state_files_signature",
-                side_effect=[
-                    ((1, 1), (1, 1)),
-                    ((1, 1), (1, 1)),
-                    ((2, 2), (2, 2)),
-                ],
+            with (
+                patch("app.main._material_parse_claim_cache_enabled", return_value=True),
+                patch(
+                    "app.main._material_parse_state_files_signature",
+                    side_effect=[
+                        ((1, 1), (1, 1)),
+                        ((1, 1), (1, 1)),
+                        ((2, 2), (2, 2)),
+                    ],
+                ),
             ):
                 materials1, jobs1 = _load_material_parse_state_snapshot()
                 materials2, jobs2 = _load_material_parse_state_snapshot()
@@ -1484,25 +1487,29 @@ class TestMaterialParseWorkerLifecycle:
             (
                 main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_UP_TO_SPEED.clear()
             )
-            with patch(
-                "app.main._material_parse_claim_context_cache_enabled",
-                return_value=True,
-            ), patch(
-                "app.main._material_parse_state_files_signature",
-                side_effect=[
-                    ((1, 1), (1, 1)),
-                    ((1, 1), (1, 1)),
-                    ((1, 1), (1, 1)),
-                    ((2, 2), (2, 2)),
-                    ((2, 2), (2, 2)),
-                ],
-            ), patch(
-                "app.main._load_material_parse_state_snapshot",
-                side_effect=[
-                    ([dict(row) for row in materials_v1], [dict(job) for job in jobs_v1]),
-                    ([dict(row) for row in materials_v2], [dict(job) for job in jobs_v2]),
-                ],
-            ) as mock_load_snapshot:
+            with (
+                patch(
+                    "app.main._material_parse_claim_context_cache_enabled",
+                    return_value=True,
+                ),
+                patch(
+                    "app.main._material_parse_state_files_signature",
+                    side_effect=[
+                        ((1, 1), (1, 1)),
+                        ((1, 1), (1, 1)),
+                        ((1, 1), (1, 1)),
+                        ((2, 2), (2, 2)),
+                        ((2, 2), (2, 2)),
+                    ],
+                ),
+                patch(
+                    "app.main._load_material_parse_state_snapshot",
+                    side_effect=[
+                        ([dict(row) for row in materials_v1], [dict(job) for job in jobs_v1]),
+                        ([dict(row) for row in materials_v2], [dict(job) for job in jobs_v2]),
+                    ],
+                ) as mock_load_snapshot,
+            ):
                 (
                     materials1,
                     jobs1,
@@ -1710,33 +1717,37 @@ class TestMaterialParseWorkerLifecycle:
             (
                 main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_UP_TO_SPEED.clear()
             )
-            with patch(
-                "app.main._material_parse_claim_context_cache_enabled",
-                return_value=True,
-            ), patch(
-                "app.main._material_parse_state_files_signature",
-                return_value=((1, 1), (1, 1)),
-            ), patch(
-                "app.main._load_material_parse_state_snapshot",
-                return_value=(
-                    [
-                        {
-                            "id": "m1",
-                            "project_id": "p1",
-                            "material_type": "boq",
-                            "filename": "清单1.xlsx",
-                        }
-                    ],
-                    [
-                        {
-                            "id": "j1",
-                            "material_id": "m1",
-                            "project_id": "p1",
-                            "parse_mode": "preview",
-                        }
-                    ],
+            with (
+                patch(
+                    "app.main._material_parse_claim_context_cache_enabled",
+                    return_value=True,
                 ),
-            ) as mock_load_snapshot:
+                patch(
+                    "app.main._material_parse_state_files_signature",
+                    return_value=((1, 1), (1, 1)),
+                ),
+                patch(
+                    "app.main._load_material_parse_state_snapshot",
+                    return_value=(
+                        [
+                            {
+                                "id": "m1",
+                                "project_id": "p1",
+                                "material_type": "boq",
+                                "filename": "清单1.xlsx",
+                            }
+                        ],
+                        [
+                            {
+                                "id": "j1",
+                                "material_id": "m1",
+                                "project_id": "p1",
+                                "parse_mode": "preview",
+                            }
+                        ],
+                    ),
+                ) as mock_load_snapshot,
+            ):
                 (
                     materials1,
                     jobs1,
@@ -1861,11 +1872,12 @@ class TestMaterialParseWorkerLifecycle:
         try:
             main_module._MATERIAL_PARSE_PROJECT_STAGE_CACHE_SIGNATURE = None
             main_module._MATERIAL_PARSE_PROJECT_STAGE_CACHE_RANKS.clear()
-            with patch(
-                "app.main._material_parse_project_stage_cache_enabled", return_value=True
-            ), patch(
-                "app.main._material_parse_state_file_signature",
-                side_effect=[(1, 1), (1, 1), (1, 1), (2, 2), (2, 2)],
+            with (
+                patch("app.main._material_parse_project_stage_cache_enabled", return_value=True),
+                patch(
+                    "app.main._material_parse_state_file_signature",
+                    side_effect=[(1, 1), (1, 1), (1, 1), (2, 2), (2, 2)],
+                ),
             ):
                 ranks1 = _load_material_parse_project_stage_ranks({"p1"})
                 ranks2 = _load_material_parse_project_stage_ranks({"p1"})
@@ -1911,9 +1923,12 @@ class TestMaterialParseWorkerLifecycle:
         try:
             main_module._MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_SIGNATURE = None
             main_module._MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE.clear()
-            with patch("app.main._material_parse_priority_cache_enabled", return_value=True), patch(
-                "app.main._material_parse_priority_snapshot_signature",
-                side_effect=["sig-1", "sig-1", "sig-2"],
+            with (
+                patch("app.main._material_parse_priority_cache_enabled", return_value=True),
+                patch(
+                    "app.main._material_parse_priority_snapshot_signature",
+                    side_effect=["sig-1", "sig-1", "sig-2"],
+                ),
             ):
                 contexts1 = _load_material_parse_job_priority_contexts(
                     jobs,
@@ -1986,16 +2001,20 @@ class TestMaterialParseWorkerLifecycle:
             main_module._MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_SIGNATURE = None
             main_module._MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE.clear()
             jobs = [{"id": "j1", "material_id": "m1", "project_id": "p1", "parse_mode": "preview"}]
-            with patch(
-                "app.main._material_parse_priority_cache_enabled",
-                return_value=True,
-            ), patch(
-                "app.main._material_parse_priority_snapshot_signature",
-                return_value=(((1, 1), (1, 1)), (1, 1)),
-            ), patch(
-                "app.main._build_material_parse_job_priority_context",
-                return_value=("p1", "m1", "boq", 0, 0, 0, 1, 0, 360, 0, 1, 1, "", "", ""),
-            ) as mock_build_context:
+            with (
+                patch(
+                    "app.main._material_parse_priority_cache_enabled",
+                    return_value=True,
+                ),
+                patch(
+                    "app.main._material_parse_priority_snapshot_signature",
+                    return_value=(((1, 1), (1, 1)), (1, 1)),
+                ),
+                patch(
+                    "app.main._build_material_parse_job_priority_context",
+                    return_value=("p1", "m1", "boq", 0, 0, 0, 1, 0, 360, 0, 1, 1, "", "", ""),
+                ) as mock_build_context,
+            ):
                 contexts1 = _load_material_parse_job_priority_contexts_view(
                     jobs,
                     {"m1": {"id": "m1", "project_id": "p1", "material_type": "boq"}},
@@ -2288,19 +2307,23 @@ class TestMaterialParseWorkerLifecycle:
             main_module._MATERIAL_PARSE_JOBS_SUMMARY_CACHE_SIGNATURE = None
             main_module._MATERIAL_PARSE_JOBS_SUMMARY_CACHE_FILTERED.clear()
             main_module._MATERIAL_PARSE_JOBS_SUMMARY_CACHE_SUMMARY.clear()
-            with patch(
-                "app.main._material_parse_jobs_summary_cache_enabled",
-                return_value=True,
-            ), patch(
-                "app.main._material_parse_state_file_signature",
-                side_effect=[(1, 1), (1, 1), (1, 1), (2, 2), (2, 2)],
-            ), patch(
-                "app.main._load_material_parse_state_snapshot",
-                side_effect=[
-                    ([], [dict(job) for job in jobs_v1]),
-                    ([], [dict(job) for job in jobs_v2]),
-                ],
-            ) as mock_load_snapshot:
+            with (
+                patch(
+                    "app.main._material_parse_jobs_summary_cache_enabled",
+                    return_value=True,
+                ),
+                patch(
+                    "app.main._material_parse_state_file_signature",
+                    side_effect=[(1, 1), (1, 1), (1, 1), (2, 2), (2, 2)],
+                ),
+                patch(
+                    "app.main._load_material_parse_state_snapshot",
+                    side_effect=[
+                        ([], [dict(job) for job in jobs_v1]),
+                        ([], [dict(job) for job in jobs_v2]),
+                    ],
+                ) as mock_load_snapshot,
+            ):
                 filtered1, summary1 = _load_material_parse_jobs_summary_cached("p1")
                 filtered1[0]["status"] = "mutated"
                 summary1["backlog"] = 99
@@ -2395,28 +2418,33 @@ class TestMaterialParseWorkerLifecycle:
         try:
             main_module._MATERIAL_PARSE_STATUS_MATERIALS_CACHE_SIGNATURE = None
             main_module._MATERIAL_PARSE_STATUS_MATERIALS_CACHE.clear()
-            with patch(
-                "app.main._material_parse_status_materials_cache_enabled",
-                return_value=True,
-            ), patch(
-                "app.main._material_parse_state_files_signature",
-                side_effect=[
-                    ((1, 1), (1, 1)),
-                    ((1, 1), (1, 1)),
-                    ((1, 1), (1, 1)),
-                    ((2, 2), (2, 2)),
-                    ((2, 2), (2, 2)),
-                ],
-            ), patch(
-                "app.main._load_material_parse_state_snapshot",
-                side_effect=[
-                    ([dict(row) for row in materials_v1], []),
-                    ([dict(row) for row in materials_v2], []),
-                ],
-            ) as mock_load_snapshot, patch(
-                "app.main._build_material_parse_jobs_summary",
-                side_effect=[jobs_summary_v1, jobs_summary_v2],
-            ) as mock_build_jobs_summary:
+            with (
+                patch(
+                    "app.main._material_parse_status_materials_cache_enabled",
+                    return_value=True,
+                ),
+                patch(
+                    "app.main._material_parse_state_files_signature",
+                    side_effect=[
+                        ((1, 1), (1, 1)),
+                        ((1, 1), (1, 1)),
+                        ((1, 1), (1, 1)),
+                        ((2, 2), (2, 2)),
+                        ((2, 2), (2, 2)),
+                    ],
+                ),
+                patch(
+                    "app.main._load_material_parse_state_snapshot",
+                    side_effect=[
+                        ([dict(row) for row in materials_v1], []),
+                        ([dict(row) for row in materials_v2], []),
+                    ],
+                ) as mock_load_snapshot,
+                patch(
+                    "app.main._build_material_parse_jobs_summary",
+                    side_effect=[jobs_summary_v1, jobs_summary_v2],
+                ) as mock_build_jobs_summary,
+            ):
                 payload1 = _load_material_parse_status_materials_payload("p1")
                 payload1["enriched_materials"][0]["parse_stage_label"] = "mutated"
                 payload2 = _load_material_parse_status_materials_payload("p1")
@@ -2526,28 +2554,34 @@ class TestMaterialParseWorkerLifecycle:
         try:
             main_module._MATERIAL_PARSE_STATUS_CORE_CACHE_SIGNATURE = None
             main_module._MATERIAL_PARSE_STATUS_CORE_CACHE.clear()
-            with patch(
-                "app.main._material_parse_status_core_cache_enabled",
-                return_value=True,
-            ), patch(
-                "app.main._material_parse_state_files_signature",
-                side_effect=[
-                    ((1, 1), (1, 1)),
-                    ((1, 1), (1, 1)),
-                    ((1, 1), (1, 1)),
-                    ((2, 2), (2, 2)),
-                    ((2, 2), (2, 2)),
-                ],
-            ), patch(
-                "app.main._build_material_parse_jobs_summary",
-                side_effect=[jobs_summary_v1, jobs_summary_v2],
-            ) as mock_jobs_summary, patch(
-                "app.main._load_material_parse_status_materials_payload",
-                side_effect=[materials_payload_v1, materials_payload_v2],
-            ) as mock_materials_payload, patch(
-                "app.main._build_boq_parse_status_summary",
-                side_effect=[boq_summary_v1, boq_summary_v2],
-            ) as mock_boq_summary:
+            with (
+                patch(
+                    "app.main._material_parse_status_core_cache_enabled",
+                    return_value=True,
+                ),
+                patch(
+                    "app.main._material_parse_state_files_signature",
+                    side_effect=[
+                        ((1, 1), (1, 1)),
+                        ((1, 1), (1, 1)),
+                        ((1, 1), (1, 1)),
+                        ((2, 2), (2, 2)),
+                        ((2, 2), (2, 2)),
+                    ],
+                ),
+                patch(
+                    "app.main._build_material_parse_jobs_summary",
+                    side_effect=[jobs_summary_v1, jobs_summary_v2],
+                ) as mock_jobs_summary,
+                patch(
+                    "app.main._load_material_parse_status_materials_payload",
+                    side_effect=[materials_payload_v1, materials_payload_v2],
+                ) as mock_materials_payload,
+                patch(
+                    "app.main._build_boq_parse_status_summary",
+                    side_effect=[boq_summary_v1, boq_summary_v2],
+                ) as mock_boq_summary,
+            ):
                 payload1 = _load_material_parse_status_core_payload("p1")
                 payload1["summary"]["backlog"] = 99
                 payload1["materials"][0]["parse_stage_label"] = "mutated"
@@ -4241,17 +4275,14 @@ class TestIndexEndpoint:
         assert 'name="score_scale_max"' in response.text
         assert 'id="btnMaterialKnowledgeProfile"' in response.text
         assert 'id="btnMaterialKnowledgeProfileDownload"' in response.text
-        assert 'id="btnEvolutionHealth"' in response.text
-        assert 'id="btnSelfCheck"' in response.text
-        assert 'id="btnSystemImprovementOverview"' in response.text
-        assert 'id="btnDataHygiene"' in response.text
-        assert 'id="btnEvalSummaryV2"' in response.text
-        assert 'id="btnTrialPreflight"' in response.text
-        assert 'id="btnTrialPreflightDownload"' in response.text
-        assert 'id="btnTrialPreflightDownloadDocx"' in response.text
-        assert 'id="btnWritingGuidanceDownload"' in response.text
-        assert 'id="btnWritingGuidancePatchBundleDownload"' in response.text
+        assert 'id="evolutionCoreActions"' in response.text
+        assert 'id="btnEvolve"' in response.text
+        assert 'id="btnWritingGuidance"' in response.text
         assert 'id="btnWritingGuidancePatchBundleDownloadDocx"' in response.text
+        assert 'id="btnSelfCheck"' not in response.text
+        assert 'id="btnTrialPreflight"' not in response.text
+        assert 'id="btnWritingGuidanceDownload"' not in response.text
+        assert 'id="btnWritingGuidancePatchBundleDownload"' not in response.text
         assert 'id="btnEvidenceTrace"' in response.text
         assert 'id="btnScoringBasis"' in response.text
         assert 'id="btnScoringDiagnostic"' in response.text
@@ -4259,9 +4290,6 @@ class TestIndexEndpoint:
         assert 'id="shigongGateSummary"' in response.text
         assert 'id="scoringBasisResult"' in response.text
         assert 'id="scoringDiagnosticResult"' in response.text
-        assert 'id="systemImprovementResult"' in response.text
-        assert 'id="dataHygieneResult"' in response.text
-        assert 'id="trialPreflightResult"' in response.text
         assert "解析状态" in response.text
         assert "双轨分数" in response.text
         assert "偏差诊断" in response.text
@@ -4269,7 +4297,8 @@ class TestIndexEndpoint:
         assert 'id="groundTruthFile"' not in response.text
         assert "/ground_truth/from_submission" in response.text
         assert 'id="section-adaptive" style="display:none"' in response.text
-        assert "V2 反演校准闭环（核心能力，强烈建议执行）" in response.text
+        assert "V2 反演校准闭环（核心能力，强烈建议执行）" not in response.text
+        assert "Developer / Debug 路由工具" not in response.text
         assert ".dxf" in response.text
         assert "解析引擎快照" in response.text
 
@@ -4552,6 +4581,14 @@ class TestIndexEndpoint:
             "btnScoreShigong",
             "btnAddGroundTruth",
             "btnEvolve",
+            "btnWritingGuidance",
+            "btnWritingGuidancePatchBundleDownloadDocx",
+        ):
+            assert f'id="{button_id}"' in page
+            assert f'id="{button_id}" class="secondary compact-hidden"' not in page
+            assert f'id="{button_id}" class="compact-hidden"' not in page
+
+        for button_id in (
             "btnEvolutionHealth",
             "btnSelfCheck",
             "btnSystemImprovementOverview",
@@ -4560,14 +4597,15 @@ class TestIndexEndpoint:
             "btnTrialPreflight",
             "btnTrialPreflightDownload",
             "btnTrialPreflightDownloadDocx",
-            "btnWritingGuidance",
             "btnWritingGuidanceDownload",
             "btnWritingGuidancePatchBundleDownload",
-            "btnWritingGuidancePatchBundleDownloadDocx",
+            "btnFeedbackGovernance",
+            "btnCompilationInstructions",
+            "btnRebuildDelta",
+            "btnTrainCalibratorV2",
+            "btnAutoRunReflection",
         ):
-            assert f'id="{button_id}"' in page
-            assert f'id="{button_id}" class="secondary compact-hidden"' not in page
-            assert f'id="{button_id}" class="compact-hidden"' not in page
+            assert f'id="{button_id}"' not in page
 
     def test_index_exposes_evolution_review_audit_helpers(self, client):
         response = client.get("/")
@@ -4621,12 +4659,28 @@ class TestIndexEndpoint:
             'id="btnScoringDiagnostic" class="secondary compact-hidden"',
             'id="btnRefreshGroundTruth" class="secondary compact-hidden"',
             'id="btnRefreshGroundTruthSubmissionOptions" class="secondary compact-hidden"',
-            'id="btnFeedbackGovernance" class="secondary compact-hidden"',
-            'id="btnCompilationInstructions" class="secondary compact-hidden"',
             '<div class="section card compact-hidden">',
             '<div class="section card compact-hidden" id="section-adaptive"',
         ):
             assert hidden_fragment in page
+        assert 'id="developerEvolutionDebugPanel"' not in page
+        assert "Developer / Debug 路由工具" not in page
+
+    def test_developer_debug_route_hosts_hidden_evolution_tools(self, client):
+        response = client.get("/developer/debug")
+        assert response.status_code == 200
+        page = response.text
+        assert 'id="developerEvolutionDebugPanel"' in page
+        assert "Developer / Debug 路由工具" in page
+        assert 'id="btnSelfCheck"' in page
+        assert 'id="btnTrialPreflight"' in page
+        assert 'id="btnWritingGuidanceDownload"' in page
+        assert 'id="btnWritingGuidancePatchBundleDownload"' in page
+        assert 'id="btnCompilationInstructions"' in page
+        assert 'id="systemImprovementResult"' in page
+        assert 'id="dataHygieneResult"' in page
+        assert 'id="trialPreflightResult"' in page
+        assert "V2 反演校准闭环（开发页）" in page
 
     def test_index_renders_auth_panel_and_api_key_hidden_inputs(self, client):
         with patch.dict(os.environ, {"API_KEYS": "admin:test-admin-key"}, clear=False):
@@ -5002,9 +5056,9 @@ class TestIndexEndpoint:
             in page
         )
         assert "html += renderPendingFeedbackPatchBundleSection(" in page
-        assert "btnGuidancePatchBundleInlineDownload" in page
         assert "btnGuidancePatchBundleInlineDownloadDocx" in page
-        assert "downloadWritingGuidancePatchBundle(projectId, 'guidanceResult');" in page
+        assert "btnGuidancePatchBundleInlineDownload" not in page
+        assert "downloadWritingGuidancePatchBundle(projectId, 'guidanceResult');" not in page
         assert "downloadWritingGuidancePatchBundleDocx(projectId, 'guidanceResult');" in page
 
     def test_index_frontend_web_button_contract_is_consistent(self, client):
@@ -5016,7 +5070,7 @@ class TestIndexEndpoint:
 
         assert report["ok"] is True
         assert report["missing_bindings"] == []
-        assert report["button_count"] >= 60
+        assert report["button_count"] >= 48
         assert report["bound_button_count"] == report["button_count"]
         assert all(item["ok"] for item in report["export_contracts"])
         assert all(item["ok"] for item in report["inline_contracts"])
@@ -5025,7 +5079,7 @@ class TestIndexEndpoint:
         assert all(item["ok"] for item in report["action_result_contracts"])
         assert all(item["ok"] for item in report["guard_set_contracts"])
         assert all(item["ok"] for item in report["smoke_coverage_contracts"])
-        assert report["smoke_gap_contracts"] == []
+        assert all(item["ok"] for item in report["smoke_gap_contracts"])
         assert report["smoke_allowlist_contract"]["ok"] is True
         assert report["smoke_allowlist_contract"]["stale_ids"] == []
         covered_ids = {item["button_id"] for item in report["smoke_coverage_contracts"]}
@@ -5044,7 +5098,6 @@ class TestIndexEndpoint:
         assert "btnUploadShigong" in covered_ids
         assert "btnRefreshSubmissions" in covered_ids
         assert "btnRefreshGroundTruth" in covered_ids
-        assert "materialsTrialPreflightFollowUpAction" in covered_ids
         assert "btnCreateProject" in report["submit_bound_button_ids"]
         assert "btnCreateProjectFromTender" in report["submit_bound_button_ids"]
         assert "deleteCurrentProject" in report["submit_bound_button_ids"]
@@ -6195,65 +6248,32 @@ class TestIndexEndpoint:
         assert "btnUploadSitePhotos: { resultId: 'materialsActionStatusPhoto'" in page
         assert "btnUploadShigong: { resultId: 'shigongActionStatus'" in page
         assert "btnScoreShigong: { resultId: 'shigongActionStatus'" in page
+        assert 'id="evolutionCoreActions"' in page
         assert (
-            'id="btnSelfCheck" class="secondary" '
+            'id="btnEvolve" '
             'onclick="return window.__zhifeiFallbackClick(event, '
-            "'btnSelfCheck')\"" in page
+            "'btnEvolve')\"" in page
         )
         assert (
-            'id="btnSystemImprovementOverview" class="secondary" '
+            'id="btnWritingGuidance" class="secondary" '
             'onclick="return window.__zhifeiFallbackClick(event, '
-            "'btnSystemImprovementOverview')\"" in page
-        )
-        assert (
-            'id="btnDataHygiene" class="secondary" '
-            'onclick="return window.__zhifeiFallbackClick(event, '
-            "'btnDataHygiene')\"" in page
-        )
-        assert (
-            'id="btnEvalSummaryV2" class="secondary" '
-            'onclick="return window.__zhifeiFallbackClick(event, '
-            "'btnEvalSummaryV2')\"" in page
-        )
-        assert (
-            'id="btnTrialPreflightDownload" class="secondary" '
-            'onclick="return window.__zhifeiFallbackClick(event, '
-            "'btnTrialPreflightDownload')\"" in page
-        )
-        assert (
-            'id="btnTrialPreflightDownloadDocx" class="secondary" '
-            'onclick="return window.__zhifeiFallbackClick(event, '
-            "'btnTrialPreflightDownloadDocx')\"" in page
-        )
-        assert (
-            'id="btnWritingGuidanceDownload" class="secondary" '
-            'onclick="return window.__zhifeiFallbackClick(event, '
-            "'btnWritingGuidanceDownload')\"" in page
-        )
-        assert (
-            'id="btnWritingGuidancePatchBundleDownload" class="secondary" '
-            'onclick="return window.__zhifeiFallbackClick(event, '
-            "'btnWritingGuidancePatchBundleDownload')\"" in page
+            "'btnWritingGuidance')\"" in page
         )
         assert (
             'id="btnWritingGuidancePatchBundleDownloadDocx" class="secondary" '
             'onclick="return window.__zhifeiFallbackClick(event, '
             "'btnWritingGuidancePatchBundleDownloadDocx')\"" in page
         )
-        assert "btnSelfCheck: { resultId: 'selfCheckResult'" in page
-        assert "btnSystemImprovementOverview: { resultId: 'systemImprovementResult'" in page
-        assert "btnDataHygiene: { resultId: 'dataHygieneResult'" in page
-        assert "btnEvalSummaryV2: { resultId: 'evalResult'" in page
-        assert "btnTrialPreflightDownload: { resultId: 'trialPreflightResult'" in page
-        assert "btnTrialPreflightDownloadDocx: { resultId: 'trialPreflightResult'" in page
         assert "btnMaterialDepthReportDownload: { resultId: 'materialDepthReportResult'" in page
         assert (
             "btnMaterialKnowledgeProfileDownload: { resultId: 'materialKnowledgeProfileResult'"
             in page
         )
-        assert "btnWritingGuidanceDownload: { resultId: 'guidanceResult'" in page
-        assert "btnWritingGuidancePatchBundleDownload: { resultId: 'guidanceResult'" in page
         assert "btnWritingGuidancePatchBundleDownloadDocx: { resultId: 'guidanceResult'" in page
+        assert 'id="btnSelfCheck"' not in page
+        assert 'id="btnTrialPreflightDownload"' not in page
+        assert 'id="btnWritingGuidanceDownload"' not in page
+        assert 'id="btnWritingGuidancePatchBundleDownload"' not in page
         assert "function secureDesktopEnabled() {" in page
         assert "if (secureDesktopEnabled()) {" in page
         assert "if (!secureDesktopEnabled()) {" in page
@@ -6267,46 +6287,16 @@ class TestIndexEndpoint:
             "safeClick('btnMaterialKnowledgeProfileDownload', async () => {\n"
             "          if (secureDesktopEnabled()) {" in page
         )
-        assert "loading: '系统自检执行中...'" in page
-        assert "loading: '系统继续完善总览生成中...'" in page
-        assert "loading: '数据卫生巡检中...'" in page
-        assert "loading: '跨项目汇总评估中...'" in page
         assert "loading: '体检报告下载准备中...'" in page
         assert "loading: '知识画像下载准备中...'" in page
-        assert "loading: '试车报告下载准备中...'" in page
-        assert "loading: '试车报告 DOCX 下载准备中...'" in page
-        assert "loading: '编制指导下载准备中...'" in page
-        assert "loading: '改写补丁包下载准备中...'" in page
         assert "loading: '改写补丁包 DOCX 下载准备中...'" in page
-        assert "safeClick('btnSelfCheck'" in page
-        assert "safeClick('btnSystemImprovementOverview'" in page
-        assert "safeClick('btnDataHygiene'" in page
-        assert "safeClick('btnEvalSummaryV2'" in page
         assert "const FALLBACK_PROJECTLESS_ACTION_IDS = new Set([" in page
         assert "function fallbackActionRequiresProject(actionId) {" in page
         assert "if (fallbackActionRequiresProject(actionId) && !projectId) {" in page
-        assert "if (actionId === 'btnSelfCheck')" in page
-        assert "if (actionId === 'btnDataHygiene')" in page
-        assert "if (actionId === 'btnEvalSummaryV2')" in page
-        assert "if (actionId === 'btnTrialPreflightDownload')" in page
-        assert "if (actionId === 'btnTrialPreflightDownloadDocx')" in page
-        assert "if (actionId === 'btnWritingGuidancePatchBundleDownload')" in page
         assert "if (actionId === 'btnWritingGuidancePatchBundleDownloadDocx')" in page
-        assert "a.download = 'trial_preflight_' + projectId + '.md';" in page
-        assert "a.download = 'trial_preflight_' + projectId + '.docx';" in page
-        assert "a.download = 'writing_guidance_patch_bundle_' + projectId + '.md';" in page
         assert "a.download = 'writing_guidance_patch_bundle_' + projectId + '.docx';" in page
-        assert "setResult(cfg.resultId, '试车前综合体检报告下载已触发。', false);" in page
-        assert "setResult(cfg.resultId, '试车前综合体检 DOCX 报告下载已触发。', false);" in page
-        assert "setResult(cfg.resultId, '改写补丁包 Markdown 下载已触发。', false);" in page
         assert "setResult(cfg.resultId, '改写补丁包 DOCX 下载已触发。', false);" in page
-        assert "fallbackSetResult(cfg.resultId, '试车前综合体检报告下载已触发。', false);" in page
         assert "fallbackSetResult(cfg.resultId, '改写补丁包 DOCX 下载已触发。', false);" in page
-        assert (
-            "fallbackSetResult(cfg.resultId, '试车前综合体检 DOCX 报告下载已触发。', false);"
-            in page
-        )
-        assert "fallbackSetResult(cfg.resultId, '改写补丁包 Markdown 下载已触发。', false);" in page
         assert 'id="btnOptimizationReport" class="secondary">满分优化清单（逐页）</button>' in page
         assert "safeClick('btnUploadMaterials', uploadMaterialsAction);" not in page
         assert "safeClick('btnUploadShigong', uploadShigongAction);" not in page
@@ -6351,7 +6341,9 @@ class TestIndexEndpoint:
             in page
         )
         assert "window.rememberOptimizationReportFocus = rememberOptimizationReportFocus;" in page
-        assert "data-submission-id=\"' + esc(String(submission && submission.id || '')) + '\"" in page
+        assert (
+            "data-submission-id=\"' + esc(String(submission && submission.id || '')) + '\"" in page
+        )
         assert "renderOptimizationRecommendationTable" in page
         assert "当前仅分析你点击的这一份施组，不混入其它文件的优化建议。" in page
         assert "直接替换文本 / 原位补充内容" in page
@@ -7365,8 +7357,9 @@ class TestProjectsEndpoints:
             ]
         )
 
-        with patch("app.main.pymupdf") as mock_pymupdf, patch(
-            "app.main._score_ocr_text_candidate", return_value=5.0
+        with (
+            patch("app.main.pymupdf") as mock_pymupdf,
+            patch("app.main._score_ocr_text_candidate", return_value=5.0),
         ):
             mock_pymupdf.open.return_value = fake_doc
             preview = app_main._extract_pdf_text_preview(
@@ -7407,14 +7400,14 @@ class TestProjectsEndpoints:
                 _FakePage(
                     "项目编码 项目名称 单位 工程量 综合单价 合价\n"
                     + "\n".join(
-                        f"0101{i:03d} 土方开挖{i} m3 {100+i} {30+i} {(100+i)*(30+i)}"
+                        f"0101{i:03d} 土方开挖{i} m3 {100 + i} {30 + i} {(100 + i) * (30 + i)}"
                         for i in range(1, 18)
                     )
                 ),
                 _FakePage(
                     "项目编码 项目名称 单位 工程量 综合单价 合价\n"
                     + "\n".join(
-                        f"0201{i:03d} 混凝土{i} m3 {80+i} {40+i} {(80+i)*(40+i)}"
+                        f"0201{i:03d} 混凝土{i} m3 {80 + i} {40 + i} {(80 + i) * (40 + i)}"
                         for i in range(1, 18)
                     )
                 ),
@@ -7422,8 +7415,9 @@ class TestProjectsEndpoints:
             ]
         )
 
-        with patch("app.main.pymupdf") as mock_pymupdf, patch(
-            "app.main._score_ocr_text_candidate", return_value=4.8
+        with (
+            patch("app.main.pymupdf") as mock_pymupdf,
+            patch("app.main._score_ocr_text_candidate", return_value=4.8),
         ):
             mock_pymupdf.open.return_value = fake_doc
             preview = app_main._extract_pdf_text_preview(
@@ -7476,8 +7470,9 @@ class TestProjectsEndpoints:
             _FakePage("不应继续扫描到这一页"),
         ]
 
-        with patch("app.main.pymupdf") as mock_pymupdf, patch(
-            "app.main._score_ocr_text_candidate", return_value=4.8
+        with (
+            patch("app.main.pymupdf") as mock_pymupdf,
+            patch("app.main._score_ocr_text_candidate", return_value=4.8),
         ):
             mock_pymupdf.open.return_value = _FakeDoc(pages)
             text = app_main._extract_pdf_text(
@@ -7514,28 +7509,30 @@ class TestProjectsEndpoints:
             _FakePage(
                 "项目编码 项目名称 单位 工程量 综合单价 合价\n"
                 + "\n".join(
-                    f"0101{i:03d} 土方开挖{i} m3 {100+i} {30+i} {(100+i)*(30+i)}"
+                    f"0101{i:03d} 土方开挖{i} m3 {100 + i} {30 + i} {(100 + i) * (30 + i)}"
                     for i in range(1, 22)
                 )
             ),
             _FakePage(
                 "项目编码 项目名称 单位 工程量 综合单价 合价\n"
                 + "\n".join(
-                    f"0201{i:03d} 混凝土{i} m3 {80+i} {40+i} {(80+i)*(40+i)}" for i in range(1, 22)
+                    f"0201{i:03d} 混凝土{i} m3 {80 + i} {40 + i} {(80 + i) * (40 + i)}"
+                    for i in range(1, 22)
                 )
             ),
             _FakePage(
                 "项目编码 项目名称 单位 工程量 综合单价 合价\n"
                 + "\n".join(
-                    f"0301{i:03d} 模板工程{i} ㎡ {60+i} {25+i} {(60+i)*(25+i)}"
+                    f"0301{i:03d} 模板工程{i} ㎡ {60 + i} {25 + i} {(60 + i) * (25 + i)}"
                     for i in range(1, 22)
                 )
             ),
             _FakePage("不应继续扫描到这一页"),
         ]
 
-        with patch("app.main.pymupdf") as mock_pymupdf, patch(
-            "app.main._score_ocr_text_candidate", return_value=4.7
+        with (
+            patch("app.main.pymupdf") as mock_pymupdf,
+            patch("app.main._score_ocr_text_candidate", return_value=4.7),
         ):
             mock_pymupdf.open.return_value = _FakeDoc(pages)
             text = app_main._extract_pdf_text(
@@ -7574,29 +7571,31 @@ class TestProjectsEndpoints:
             _FakePage(
                 "项目编码 项目名称 单位 工程量 综合单价 合价\n"
                 + "\n".join(
-                    f"0101{i:03d} 土方开挖{i} m3 {100+i} {30+i} {(100+i)*(30+i)}"
+                    f"0101{i:03d} 土方开挖{i} m3 {100 + i} {30 + i} {(100 + i) * (30 + i)}"
                     for i in range(1, 22)
                 )
             ),
             _FakePage(
                 "项目编码 项目名称 单位 工程量 综合单价 合价\n"
                 + "\n".join(
-                    f"0201{i:03d} 混凝土{i} m3 {80+i} {40+i} {(80+i)*(40+i)}" for i in range(1, 22)
+                    f"0201{i:03d} 混凝土{i} m3 {80 + i} {40 + i} {(80 + i) * (40 + i)}"
+                    for i in range(1, 22)
                 )
             ),
             _FakePage(
                 "项目编码 项目名称 单位 工程量 综合单价 合价\n"
                 + "\n".join(
-                    f"0301{i:03d} 模板工程{i} ㎡ {60+i} {25+i} {(60+i)*(25+i)}"
+                    f"0301{i:03d} 模板工程{i} ㎡ {60 + i} {25 + i} {(60 + i) * (25 + i)}"
                     for i in range(1, 22)
                 )
             ),
             _FakePage("不应继续扫描到这一页"),
         ]
-        prior_text = "[PDF_BACKEND:pymupdf]\n" "[PAGE:1]\n第一页预解析\n\n" "[PAGE:2]\n第二页预解析"
+        prior_text = "[PDF_BACKEND:pymupdf]\n[PAGE:1]\n第一页预解析\n\n[PAGE:2]\n第二页预解析"
 
-        with patch("app.main.pymupdf") as mock_pymupdf, patch(
-            "app.main._score_ocr_text_candidate", return_value=4.7
+        with (
+            patch("app.main.pymupdf") as mock_pymupdf,
+            patch("app.main._score_ocr_text_candidate", return_value=4.7),
         ):
             mock_pymupdf.open.return_value = _FakeDoc(pages)
             text = _build_boq_full_parse_text(
@@ -7640,13 +7639,14 @@ class TestProjectsEndpoints:
                 "给排水 电气 暖通 设备机房"
             ),
             _FakePage(
-                "剖面图 立面图 标高6.000 节点详图 洞口 预留预埋 套管 " "消防喷淋 管径 DN100 梁板柱"
+                "剖面图 立面图 标高6.000 节点详图 洞口 预留预埋 套管 消防喷淋 管径 DN100 梁板柱"
             ),
             _FakePage("不应继续扫描到这一页"),
         ]
 
-        with patch("app.main.pymupdf") as mock_pymupdf, patch(
-            "app.main._score_ocr_text_candidate", return_value=4.8
+        with (
+            patch("app.main.pymupdf") as mock_pymupdf,
+            patch("app.main._score_ocr_text_candidate", return_value=4.8),
         ):
             mock_pymupdf.open.return_value = _FakeDoc(pages)
             text = app_main._extract_pdf_text(
@@ -7747,11 +7747,14 @@ class TestProjectsEndpoints:
         ]
         fake_doc = _FakeDoc(pages)
 
-        with patch("app.main.pymupdf") as mock_pymupdf, patch(
-            "app.main.pytesseract", MagicMock()
-        ), patch("app.main.Image", MagicMock()), patch(
-            "app.main._score_ocr_text_candidate",
-            side_effect=[4.8, 4.8, 1.4],
+        with (
+            patch("app.main.pymupdf") as mock_pymupdf,
+            patch("app.main.pytesseract", MagicMock()),
+            patch("app.main.Image", MagicMock()),
+            patch(
+                "app.main._score_ocr_text_candidate",
+                side_effect=[4.8, 4.8, 1.4],
+            ),
         ):
             mock_pymupdf.open.return_value = fake_doc
             preview = app_main._extract_pdf_text_preview(
@@ -7808,8 +7811,9 @@ class TestProjectsEndpoints:
             ]
         )
 
-        with patch("app.main.pymupdf") as mock_pymupdf, patch(
-            "app.main._score_ocr_text_candidate", return_value=5.0
+        with (
+            patch("app.main.pymupdf") as mock_pymupdf,
+            patch("app.main._score_ocr_text_candidate", return_value=5.0),
         ):
             mock_pymupdf.open.return_value = fake_doc
             preview = app_main._read_uploaded_file_preview_for_project_name(
@@ -7916,9 +7920,11 @@ class TestProjectsEndpoints:
             ]
         )
 
-        with patch("app.main.pymupdf") as mock_pymupdf, patch(
-            "app.main._should_early_stop_pdf_preview", return_value=True
-        ), patch("app.main._score_ocr_text_candidate", return_value=5.0):
+        with (
+            patch("app.main.pymupdf") as mock_pymupdf,
+            patch("app.main._should_early_stop_pdf_preview", return_value=True),
+            patch("app.main._score_ocr_text_candidate", return_value=5.0),
+        ):
             mock_pymupdf.open.return_value = fake_doc
             preview = app_main._read_uploaded_file_preview_for_project_name(
                 b"%PDF-1.4\n",
@@ -13059,10 +13065,7 @@ class TestMaterialAdvancedParsing:
             b"%PDF-1.4\n",
             "工程量清单.pdf",
             parsed_text=(
-                "[PDF_BACKEND:pymupdf]\n"
-                "[PAGE:1]\n第一页\n\n"
-                "[PAGE:2]\n第二页\n\n"
-                "[PAGE:3]\n第三页"
+                "[PDF_BACKEND:pymupdf]\n[PAGE:1]\n第一页\n\n[PAGE:2]\n第二页\n\n[PAGE:3]\n第三页"
             ),
             prior_summary={"parse_stage": "preview", "preview_last_page": 2},
         )
@@ -18364,7 +18367,7 @@ class TestProjectCalibratorDirectApply:
         assert context["id"] == "s1"
         assert context["project_id"] == "p1"
         assert context["text"] == "test text"
-        assert context["report"] is report
+        assert context["report"] == report
         assert context["total_score"] == 20.01
 
     @patch("app.main.predict_with_model", return_value=(80.74, {"sigma": 1.0}))
@@ -18458,25 +18461,11 @@ class TestProjectCalibratorDirectApply:
         from app.main import _apply_prediction_to_report_with_model
 
         report = {"rule_total_score": 20.01, "total_score": 20.01, "meta": {}}
-        submission = {
-            "id": "s1",
-            "project_id": "p1",
-            "filename": "s1.pdf",
-            "text": "test text",
-            "total_score": 20.01,
-        }
-        project = {"id": "p1", "meta": {}}
+        submission = {"id": "s1", "project_id": "p1", "filename": "s1.pdf"}
+        project = {"id": "p1", "meta": {"score_scale_max": 5}}
         model = {
             "calibrator_version": "calib-timeout",
             "deployed": True,
-            "train_filter": {"project_id": "p1"},
-            "calibrator_summary": {
-                "deployment_mode": "cv_validated",
-                "gate_passed": True,
-                "bootstrap_small_sample": False,
-                "sample_count": 7,
-                "cv_metrics": {"mae": 1.7},
-            },
             "model_artifact": {"model_type": "offset"},
         }
 
@@ -18491,6 +18480,7 @@ class TestProjectCalibratorDirectApply:
         assert mock_predict.called
         assert version == "calib-timeout"
         assert report["pred_total_score"] is None
+        assert report["score_blend"] is None
         assert report["total_score"] == 20.01
         assert submission["total_score"] == 20.01
         assert report["meta"]["calibrator_version"] == "calib-timeout"
@@ -18511,6 +18501,8 @@ class TestProjectCalibratorDirectApply:
             "project_id": "p1",
             "total_score": 20.01,
             "report": {
+                "scoring_status": "scored",
+                "total_score": 20.01,
                 "rule_total_score": 20.01,
                 "pred_total_score": None,
                 "meta": {
@@ -18526,6 +18518,7 @@ class TestProjectCalibratorDirectApply:
         summary = build_submission_dual_track_summary(
             submission,
             latest_qingtian_by_submission={},
+            allow_pred_score=True,
             score_scale_max=5,
         )
 
@@ -19044,7 +19037,7 @@ class TestPdfFallbackParser:
                 "给排水 电气 暖通 设备机房"
             ),
             _FakePage(
-                "剖面图 立面图 标高6.000 节点详图 洞口 预留预埋 套管 " "消防喷淋 管径 DN100 梁板柱"
+                "剖面图 立面图 标高6.000 节点详图 洞口 预留预埋 套管 消防喷淋 管径 DN100 梁板柱"
             ),
             _FakePage("不应继续扫描到这一页"),
         ]

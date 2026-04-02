@@ -19055,7 +19055,7 @@ def _build_manual_confirmation_audit(
         status = "clear"
         status_label = "当前无人工确认阻塞"
         detail = (
-            f"当前待人工审核 {pending_extreme_ground_truth_count} 条；" "该链路未命中人工确认阻塞。"
+            f"当前待人工审核 {pending_extreme_ground_truth_count} 条；该链路未命中人工确认阻塞。"
         )
     reverify_summary = (
         f"复验前待人工审核 {before_pending_extreme_ground_truth_count} 条、当前被拦截 "
@@ -31396,7 +31396,9 @@ def compare_report(
                 )
                 else {}
             )
-            focus_submission["score_self_awareness"] = awareness if isinstance(awareness, dict) else {}
+            focus_submission["score_self_awareness"] = (
+                awareness if isinstance(awareness, dict) else {}
+            )
     return CompareNarrative(project_id=project_id, **narrative)
 
 
@@ -33728,6 +33730,7 @@ def index_head() -> Response:
 
 
 @app.get("/", tags=["系统状态"], include_in_schema=False)
+@app.get("/developer/debug", tags=["系统状态"], include_in_schema=False)
 def index(
     request: Request,
     create_ok: Optional[str] = Query(None),
@@ -33737,6 +33740,7 @@ def index(
     msg_type: Optional[str] = Query(None),
 ) -> Response:
     ensure_data_dirs()
+    developer_debug_mode = str(request.url.path or "").rstrip("/") == "/developer/debug"
     projects = load_projects()
     if not os.environ.get("PYTEST_CURRENT_TEST"):
         active_projects = [
@@ -33935,6 +33939,74 @@ def index(
     initial_submission_dual_track_overview_display = str(
         selected_project_index_context["submission_dual_track_overview_display"] or "none"
     )
+    developer_evolution_tools_html = ""
+    developer_evolution_results_html = ""
+    if developer_debug_mode:
+        developer_evolution_tools_html = """
+        <div class="card" id="developerEvolutionDebugPanel" style="margin-top:12px;border:1px dashed #cbd5e1;background:#f8fafc">
+          <h3 style="margin:0 0 8px 0;font-size:16px;color:#334155">Developer / Debug 路由工具</h3>
+          <p style="margin:0 0 10px 0;font-size:12px;color:#64748b">当前为隐藏开发页，仅保留试车、诊断和闭环调试入口；这些按钮不会出现在主业务 UI。</p>
+          <div class="action-row" style="margin-bottom:8px">
+            <button type="button" id="btnEvolutionHealth" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnEvolutionHealth')">进化健康度</button>
+            <button type="button" id="btnSelfCheck" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnSelfCheck')">系统自检</button>
+            <button type="button" id="btnSystemImprovementOverview" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnSystemImprovementOverview')">系统继续完善总览</button>
+            <button type="button" id="btnDataHygiene" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnDataHygiene')">数据卫生巡检</button>
+            <button type="button" id="btnEvalSummaryV2" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnEvalSummaryV2')">跨项目汇总评估</button>
+            <button type="button" id="btnTrialPreflight" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnTrialPreflight')">试车前综合体检</button>
+            <button type="button" id="btnTrialPreflightDownload" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnTrialPreflightDownload')">下载试车报告(.md)</button>
+            <button type="button" id="btnTrialPreflightDownloadDocx" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnTrialPreflightDownloadDocx')">下载试车报告(.docx)</button>
+          </div>
+          <div class="action-row" style="margin-bottom:8px">
+            <button type="button" id="btnFeedbackGovernance" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnFeedbackGovernance')">评分治理（异常样本/校准/回退）</button>
+            <button type="button" id="btnWritingGuidanceDownload" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnWritingGuidanceDownload')">下载编制指导(.md)</button>
+            <button type="button" id="btnWritingGuidancePatchBundleDownload" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnWritingGuidancePatchBundleDownload')">下载改写补丁包(.md)</button>
+            <button type="button" id="btnCompilationInstructions" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnCompilationInstructions')">编制系统指令（可导出为编制约束）</button>
+          </div>
+          <details open style="margin:12px 0 0 0;padding:10px;border:2px solid #f59e0b;border-radius:8px;background:#fff7ed">
+            <summary style="cursor:pointer;color:#9a3412"><strong>V2 反演校准闭环（开发页）</strong></summary>
+            <p style="margin:8px 0 10px 0;color:#7c2d12;font-size:13px">
+              该区保留训练、回填、补丁影子评估与发布调试能力，仅用于开发/试车，不纳入主业务 UI。
+            </p>
+            <div style="margin-top:8px">
+              <button type="button" id="btnRebuildDelta" class="secondary">重建 DELTA_CASE</button>
+              <button type="button" id="btnRebuildSamples" class="secondary">重建 FEATURE_ROW</button>
+              <button type="button" id="btnTrainCalibratorV2" class="secondary">训练并部署校准器</button>
+              <button type="button" id="btnApplyCalibPredict" class="secondary">回填校准分</button>
+              <button type="button" id="btnAutoRunReflection">一键闭环执行</button>
+              <button type="button" id="btnEvalMetricsV2" class="secondary">评估 规则/当前分/校准</button>
+            </div>
+            <div style="margin-top:8px">
+              补丁类型：
+              <select id="patchType" style="margin:0 8px">
+                <option value="threshold">threshold</option>
+                <option value="requirement">requirement</option>
+                <option value="keywords">keywords</option>
+              </select>
+              <button type="button" id="btnMinePatchV2" class="secondary">挖掘 PATCH_PACKAGE</button>
+              <input id="patchIdInput" placeholder="补丁ID（可留空自动取最新）" style="width:260px;margin-left:8px" />
+              <button type="button" id="btnShadowPatchV2" class="secondary">影子评估</button>
+              <button type="button" id="btnDeployPatchV2" class="secondary">发布补丁</button>
+              <button type="button" id="btnRollbackPatchV2" class="secondary">回滚补丁</button>
+            </div>
+          </details>
+        </div>
+        """
+        developer_evolution_results_html = """
+        <div id="evolutionHealthResult" class="result-block" style="display:none"></div>
+        <div id="selfCheckResult" class="result-block" style="display:none"></div>
+        <div id="systemImprovementResult" class="result-block" style="display:none"></div>
+        <div id="dataHygieneResult" class="result-block" style="display:none"></div>
+        <div id="trialPreflightResult" class="result-block" style="display:none"></div>
+        <div id="feedbackGovernanceResult" class="result-block" style="display:none"></div>
+        <div id="compilationInstructionsResult" class="result-block" style="display:none"></div>
+        <div id="deltaResult" class="result-block" style="display:none"></div>
+        <div id="sampleResult" class="result-block" style="display:none"></div>
+        <div id="calibTrainResult" class="result-block" style="display:none"></div>
+        <div id="patchResult" class="result-block" style="display:none"></div>
+        <div id="patchShadowResult" class="result-block" style="display:none"></div>
+        <div id="patchDeployResult" class="result-block" style="display:none"></div>
+        <div id="evalResult" class="result-block" style="display:none"></div>
+        """
     html = """
     <html>
     <head>
@@ -34973,67 +35045,15 @@ def index(
           最终得分：<input type="number" id="gtFinal" class="score-number-input" step="0.01" />
         </div>
         <p id="gtFinalRuleHint" style="margin:4px 0 10px 0;font-size:12px;color:#475569">待机：正在识别招标文件中的真实评标取分规则。</p>
-        <div class="action-row" style="margin-bottom:10px">
-          <button type="button" id="btnEvolve" onclick="return window.__zhifeiFallbackClick(event, 'btnEvolve')">学习进化（根据已录入真实评标生成高分逻辑与编制指导）</button>
-          <button type="button" id="btnEvolutionHealth" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnEvolutionHealth')">进化健康度</button>
-          <button type="button" id="btnSelfCheck" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnSelfCheck')">系统自检</button>
-          <button type="button" id="btnSystemImprovementOverview" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnSystemImprovementOverview')">系统继续完善总览</button>
-          <button type="button" id="btnDataHygiene" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnDataHygiene')">数据卫生巡检</button>
-          <button type="button" id="btnEvalSummaryV2" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnEvalSummaryV2')">跨项目汇总评估</button>
-          <button type="button" id="btnTrialPreflight" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnTrialPreflight')">试车前综合体检</button>
-          <button type="button" id="btnTrialPreflightDownload" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnTrialPreflightDownload')">下载试车报告(.md)</button>
-          <button type="button" id="btnTrialPreflightDownloadDocx" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnTrialPreflightDownloadDocx')">下载试车报告(.docx)</button>
-          <button type="button" id="btnFeedbackGovernance" class="secondary compact-hidden" onclick="return window.__zhifeiFallbackClick(event, 'btnFeedbackGovernance')">评分治理（异常样本/校准/回退）</button>
-          <button type="button" id="btnWritingGuidance" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnWritingGuidance')">查看编制指导</button>
-          <button type="button" id="btnWritingGuidanceDownload" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnWritingGuidanceDownload')">下载编制指导(.md)</button>
-          <button type="button" id="btnWritingGuidancePatchBundleDownload" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnWritingGuidancePatchBundleDownload')">下载改写补丁包(.md)</button>
-          <button type="button" id="btnWritingGuidancePatchBundleDownloadDocx" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnWritingGuidancePatchBundleDownloadDocx')">下载改写补丁包(.docx)</button>
-          <button type="button" id="btnCompilationInstructions" class="secondary compact-hidden" onclick="return window.__zhifeiFallbackClick(event, 'btnCompilationInstructions')">编制系统指令（可导出为编制约束）</button>
+        <div class="action-row" id="evolutionCoreActions" style="margin:8px 0 12px 0;align-items:center">
+          <button type="button" id="btnEvolve" onclick="return window.__zhifeiFallbackClick(event, 'btnEvolve')">执行学习与校准</button>
+          <button type="button" id="btnWritingGuidance" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnWritingGuidance')">查看高分编制指导</button>
+          <button type="button" id="btnWritingGuidancePatchBundleDownloadDocx" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnWritingGuidancePatchBundleDownloadDocx')">下载改写补丁包 (.docx)</button>
         </div>
-        <details open class="compact-hidden" style="margin:12px 0 8px 0;padding:10px;border:2px solid #f59e0b;border-radius:8px;background:#fff7ed">
-          <summary style="cursor:pointer;color:#9a3412"><strong>V2 反演校准闭环（核心能力，强烈建议执行）</strong></summary>
-          <p style="margin:8px 0 10px 0;color:#7c2d12;font-size:13px">
-            该闭环会自动训练并部署校准器（CV闸门）、回填校准分，并联动补丁影子评估/发布。
-            为使系统评分持续贴近青天标准，建议每次录入真实评标后执行一次「一键闭环执行」。
-          </p>
-          <div style="margin-top:8px">
-            <button type="button" id="btnRebuildDelta" class="secondary">重建 DELTA_CASE</button>
-            <button type="button" id="btnRebuildSamples" class="secondary">重建 FEATURE_ROW</button>
-            <button type="button" id="btnTrainCalibratorV2" class="secondary">训练并部署校准器</button>
-            <button type="button" id="btnApplyCalibPredict" class="secondary">回填校准分</button>
-            <button type="button" id="btnAutoRunReflection">一键闭环执行</button>
-            <button type="button" id="btnEvalMetricsV2" class="secondary">评估 规则/当前分/校准</button>
-          </div>
-          <div style="margin-top:8px">
-            补丁类型：
-            <select id="patchType" style="margin:0 8px">
-              <option value="threshold">threshold</option>
-              <option value="requirement">requirement</option>
-              <option value="keywords">keywords</option>
-            </select>
-            <button type="button" id="btnMinePatchV2" class="secondary">挖掘 PATCH_PACKAGE</button>
-            <input id="patchIdInput" placeholder="补丁ID（可留空自动取最新）" style="width:260px;margin-left:8px" />
-            <button type="button" id="btnShadowPatchV2" class="secondary">影子评估</button>
-            <button type="button" id="btnDeployPatchV2" class="secondary">发布补丁</button>
-            <button type="button" id="btnRollbackPatchV2" class="secondary">回滚补丁</button>
-          </div>
-        </details>
+        __DEVELOPER_EVOLUTION_TOOLS_HTML__
         <div id="evolveResult" class="result-block" style="display:none"></div>
-        <div id="evolutionHealthResult" class="result-block" style="display:none"></div>
-        <div id="selfCheckResult" class="result-block" style="display:none"></div>
-        <div id="systemImprovementResult" class="result-block" style="display:none"></div>
-        <div id="dataHygieneResult" class="result-block" style="display:none"></div>
-        <div id="trialPreflightResult" class="result-block" style="display:none"></div>
-        <div id="feedbackGovernanceResult" class="result-block" style="display:none"></div>
-        <div id="compilationInstructionsResult" class="result-block" style="display:none"></div>
         <div id="guidanceResult" class="result-block" style="display:none"></div>
-        <div id="deltaResult" class="result-block" style="display:none"></div>
-        <div id="sampleResult" class="result-block" style="display:none"></div>
-        <div id="calibTrainResult" class="result-block" style="display:none"></div>
-        <div id="patchResult" class="result-block" style="display:none"></div>
-        <div id="patchShadowResult" class="result-block" style="display:none"></div>
-        <div id="patchDeployResult" class="result-block" style="display:none"></div>
-        <div id="evalResult" class="result-block" style="display:none"></div>
+        __DEVELOPER_EVOLUTION_RESULTS_HTML__
       </div>
 
       <div class="section card">
@@ -36955,31 +36975,25 @@ def index(
         const PROJECT_REQUIRED_BUTTON_IDS = [
           'deleteCurrentProject', 'btnWeightsReset', 'btnWeightsSave', 'btnWeightsApply',
           'btnMaterialDepthReport', 'btnMaterialDepthReportDownload', 'btnMaterialKnowledgeProfile', 'btnMaterialKnowledgeProfileDownload',
-          'btnTrialPreflightDownload', 'btnTrialPreflightDownloadDocx', 'btnScoringDiagnostic', 'btnOptimizationReport',
+          'btnScoringDiagnostic', 'btnOptimizationReport',
           'btnRenameProject',
           'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnAddGroundTruth',
-          'btnEvolve', 'btnEvolutionHealth', 'btnTrialPreflight', 'btnFeedbackGovernance', 'btnWritingGuidance', 'btnWritingGuidanceDownload', 'btnWritingGuidancePatchBundleDownload', 'btnWritingGuidancePatchBundleDownloadDocx', 'btnCompilationInstructions',
-          'btnRebuildDelta', 'btnRebuildSamples', 'btnTrainCalibratorV2', 'btnApplyCalibPredict',
-          'btnAutoRunReflection', 'btnEvalMetricsV2', 'btnEvalSummaryV2',
-          'btnMinePatchV2', 'btnShadowPatchV2', 'btnDeployPatchV2', 'btnRollbackPatchV2',
+          'btnEvolve', 'btnWritingGuidance', 'btnWritingGuidancePatchBundleDownloadDocx',
         ];
         const NON_BLOCKING_ACTION_BUTTON_IDS = [
           'btnUploadMaterials', 'btnUploadBoq', 'btnUploadDrawing', 'btnUploadSitePhotos', 'btnRefreshMaterials', 'btnMaterialDepthReport', 'btnMaterialDepthReportDownload', 'btnMaterialKnowledgeProfile', 'btnMaterialKnowledgeProfileDownload', 'btnUploadShigong', 'btnScoreShigong', 'btnScoringDiagnostic', 'btnRefreshSubmissions',
-          'btnTrialPreflightDownload', 'btnTrialPreflightDownloadDocx', 'btnWritingGuidanceDownload', 'btnWritingGuidancePatchBundleDownload', 'btnWritingGuidancePatchBundleDownloadDocx',
+          'btnWritingGuidancePatchBundleDownloadDocx',
           'btnOptimizationReport', 'btnCompare', 'btnCompareReport', 'btnInsights', 'btnLearning',
           'btnEvidenceTrace', 'btnScoringBasis',
           'btnAdaptive', 'btnAdaptivePatch', 'btnAdaptiveValidate', 'btnAdaptiveApply',
           'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnAddGroundTruth',
-          'btnEvolve', 'btnEvolutionHealth', 'btnSelfCheck', 'btnSystemImprovementOverview', 'btnDataHygiene', 'btnEvalSummaryV2', 'btnTrialPreflight', 'btnFeedbackGovernance', 'btnWritingGuidance', 'btnWritingGuidanceDownload', 'btnWritingGuidancePatchBundleDownload', 'btnWritingGuidancePatchBundleDownloadDocx', 'btnCompilationInstructions',
-          'btnRebuildDelta', 'btnRebuildSamples', 'btnTrainCalibratorV2', 'btnApplyCalibPredict',
-          'btnAutoRunReflection', 'btnEvalMetricsV2', 'btnEvalSummaryV2',
-          'btnMinePatchV2', 'btnShadowPatchV2', 'btnDeployPatchV2', 'btnRollbackPatchV2',
+          'btnEvolve', 'btnWritingGuidance', 'btnWritingGuidancePatchBundleDownloadDocx',
         ];
         const PROJECT_REQUIRED_INPUT_IDS = [
           'renameProjectNameInput',
           'scoreScaleSelect',
           'groundTruthSubmissionSelect', 'groundTruthScope', 'groundTruthOtherProject',
-          'gtJudgeCount', 'gtJ1', 'gtJ2', 'gtJ3', 'gtJ4', 'gtJ5', 'gtJ6', 'gtJ7', 'gtFinal', 'patchType', 'patchIdInput',
+          'gtJudgeCount', 'gtJ1', 'gtJ2', 'gtJ3', 'gtJ4', 'gtJ5', 'gtJ6', 'gtJ7', 'gtFinal',
         ];
         function setActionStatus(id, msg, isError=false) {
           const el = document.getElementById(id);
@@ -37581,341 +37595,28 @@ def index(
             return;
           }
           let tone = '#166534';
-          if (processing > 0) tone = '#92400e';
-          else if (queued > 0) tone = '#475569';
-          else if (failed > 0) tone = '#9a3412';
-          const parts = [
-            '当前解析概览：共 ' + String(total) + ' 份',
-            '已解析 ' + String(parsed) + ' 份',
-            '解析中 ' + String(processing) + ' 份',
-            '排队 ' + String(queued) + ' 份',
-            '失败 ' + String(failed) + ' 份',
-          ];
-          if (previewed > 0) {
-            parts.splice(2, 0, '预解析完成 ' + String(previewed) + ' 份');
+          if (failed > 0) tone = '#9a3412';
+          else if (processing > 0) tone = '#92400e';
+          else if (queued > 0 || previewed > 0) tone = '#475569';
+          let summaryText = '解析概览：共上传 ' + String(total) + ' 份项目资料';
+          if ((parsed + previewed) >= total && processing <= 0 && queued <= 0 && failed <= 0) {
+            if (previewed > 0) {
+              summaryText += '，预解析已完成 ' + String(previewed) + ' 份，其余资料已解析完成。';
+            } else {
+              summaryText += '，已全部解析完成。';
+            }
+          } else {
+            const parts = ['已解析 ' + String(parsed) + ' 份'];
+            if (previewed > 0) parts.push('预解析完成 ' + String(previewed) + ' 份');
+            if (processing > 0) parts.push('处理中 ' + String(processing) + ' 份');
+            if (queued > 0) parts.push('排队 ' + String(queued) + ' 份');
+            if (failed > 0) parts.push('失败 ' + String(failed) + ' 份');
+            summaryText += '；' + parts.join('，') + '。';
           }
-          if (workerCount > 0) {
-            parts.push('worker ' + String(aliveWorkerCount) + '/' + String(workerCount));
-          }
-          if (backlog > 0) {
-            parts.push('队列积压 ' + String(backlog) + ' 份');
-          }
-          let summaryText = parts.join('；') + '。';
-          if (latestFinishedAt) {
-            summaryText += ' 最近完成：'
-              + (latestFinishedFilename ? (latestFinishedFilename + ' / ') : '')
-              + latestFinishedAt + '。';
-          }
-          if (activeRoutes.length) {
-            summaryText += ' 当前路径：' + activeRoutes.slice(0, 2).join('、') + '。';
-          }
-          if (boqGuidedFull > 0 || boqSavedRows > 0 || boqSkippedTailSheets > 0) {
-            const boqParts = [];
-            if (boqGuidedFull > 0) {
-              boqParts.push('预解析引导补全 ' + String(boqGuidedFull) + ' 份');
-            }
-            if (boqGuidedFullStrong > 0) {
-              boqParts.push('强引导 ' + String(boqGuidedFullStrong) + ' 份');
-            }
-            if (boqResumedFull > 0) {
-              boqParts.push('差量续跑 ' + String(boqResumedFull) + ' 份');
-            }
-            if (boqResumedSheets > 0) {
-              boqParts.push('续跑 sheet ' + String(boqResumedSheets) + ' 张');
-            }
-            if (boqSavedRows > 0) {
-              boqParts.push('少扫 ' + String(boqSavedRows) + ' 行');
-            }
-            if (boqSkippedTailSheets > 0) {
-              boqParts.push('尾部略过 ' + String(boqSkippedTailSheets) + ' 张 sheet');
-            }
-            if (boqGuidedFull > 0 && boqResumedFull > 0) {
-              boqParts.push('差量命中率 ' + String(Math.round(boqResumeHitRate * 100)) + '%');
-            }
-            if (boqParts.length) {
-              summaryText += ' BOQ 提速：' + boqParts.join('，') + '。';
-            }
-          }
-          if (
-            schedulerProjectHits > 0
-            || schedulerFollowupHits > 0
-            || schedulerSameMaterialHits > 0
-            || schedulerActiveProjectHits > 0
-            || schedulerActiveProjectTypeHits > 0
-            || schedulerActiveProjectQuotaExhausted > 0
-            || schedulerActiveProjectTypeQuotaExhausted > 0
-          ) {
-            const schedulerParts = [];
-            if (schedulerActiveProjectHits > 0) {
-              schedulerParts.push('活跃项目命中 ' + String(schedulerActiveProjectHits) + ' 次');
-            }
-            if (schedulerActiveProjectTypeHits > 0) {
-              schedulerParts.push('活跃类型命中 ' + String(schedulerActiveProjectTypeHits) + ' 次');
-            }
-            if (schedulerProjectHits > 0) {
-              schedulerParts.push('同项目接力 ' + String(schedulerProjectHits) + ' 次');
-            }
-            if (schedulerFollowupHits > 0) {
-              schedulerParts.push('follow-up full 接力 ' + String(schedulerFollowupHits) + ' 次');
-            }
-            if (schedulerSameMaterialHits > 0) {
-              schedulerParts.push('同材料接力 ' + String(schedulerSameMaterialHits) + ' 次');
-            }
-            if (schedulerActiveProjectQuotaExhausted > 0 || schedulerActiveProjectTypeQuotaExhausted > 0) {
-              schedulerParts.push(
-                '配额耗尽 项目 '
-                  + String(schedulerActiveProjectQuotaExhausted)
-                  + ' / 类型 '
-                  + String(schedulerActiveProjectTypeQuotaExhausted)
-              );
-            }
-            if (schedulerParts.length) {
-              summaryText += ' 调度命中：' + schedulerParts.join('，') + '。';
-            }
-          }
-          if (
-            schedulerClaimSnapshotCacheHits > 0
-            || schedulerClaimContextCacheHits > 0
-            || schedulerProjectStageCacheHits > 0
-            || schedulerPriorityContextCacheHits > 0
-            || schedulerJobsSummaryCacheHits > 0
-            || schedulerStatusMaterialsCacheHits > 0
-            || schedulerStatusCoreCacheHits > 0
-            || schedulerClaimSnapshotCacheRebuilds > 0
-            || schedulerClaimContextCacheRebuilds > 0
-            || schedulerProjectStageCacheRebuilds > 0
-            || schedulerPriorityContextCacheRebuilds > 0
-            || schedulerJobsSummaryCacheRebuilds > 0
-            || schedulerStatusMaterialsCacheRebuilds > 0
-            || schedulerStatusCoreCacheRebuilds > 0
-          ) {
-            const cacheHitParts = [];
-            const cacheRebuildParts = [];
-            if (schedulerClaimContextCacheHits > 0) {
-              cacheHitParts.push('claim 上下文 ' + String(schedulerClaimContextCacheHits) + ' 次');
-            }
-            if (schedulerClaimSnapshotCacheHits > 0) {
-              cacheHitParts.push('状态快照 ' + String(schedulerClaimSnapshotCacheHits) + ' 次');
-            }
-            if (schedulerProjectStageCacheHits > 0) {
-              cacheHitParts.push('项目阶段 ' + String(schedulerProjectStageCacheHits) + ' 次');
-            }
-            if (schedulerPriorityContextCacheHits > 0) {
-              cacheHitParts.push('优先级上下文 ' + String(schedulerPriorityContextCacheHits) + ' 次');
-            }
-            if (schedulerJobsSummaryCacheHits > 0) {
-              cacheHitParts.push('作业汇总 ' + String(schedulerJobsSummaryCacheHits) + ' 次');
-            }
-            if (schedulerStatusMaterialsCacheHits > 0) {
-              cacheHitParts.push('资料状态 ' + String(schedulerStatusMaterialsCacheHits) + ' 次');
-            }
-            if (schedulerStatusCoreCacheHits > 0) {
-              cacheHitParts.push('状态核心 ' + String(schedulerStatusCoreCacheHits) + ' 次');
-            }
-            if (schedulerClaimContextCacheRebuilds > 0) {
-              cacheRebuildParts.push('claim 上下文 ' + String(schedulerClaimContextCacheRebuilds) + ' 次');
-            }
-            if (schedulerClaimSnapshotCacheRebuilds > 0) {
-              cacheRebuildParts.push('状态快照 ' + String(schedulerClaimSnapshotCacheRebuilds) + ' 次');
-            }
-            if (schedulerProjectStageCacheRebuilds > 0) {
-              cacheRebuildParts.push('项目阶段 ' + String(schedulerProjectStageCacheRebuilds) + ' 次');
-            }
-            if (schedulerPriorityContextCacheRebuilds > 0) {
-              cacheRebuildParts.push('优先级上下文 ' + String(schedulerPriorityContextCacheRebuilds) + ' 次');
-            }
-            if (schedulerJobsSummaryCacheRebuilds > 0) {
-              cacheRebuildParts.push('作业汇总 ' + String(schedulerJobsSummaryCacheRebuilds) + ' 次');
-            }
-            if (schedulerStatusMaterialsCacheRebuilds > 0) {
-              cacheRebuildParts.push('资料状态 ' + String(schedulerStatusMaterialsCacheRebuilds) + ' 次');
-            }
-            if (schedulerStatusCoreCacheRebuilds > 0) {
-              cacheRebuildParts.push('状态核心 ' + String(schedulerStatusCoreCacheRebuilds) + ' 次');
-            }
-            if (cacheHitParts.length) {
-              summaryText += ' 缓存命中：' + cacheHitParts.join('，') + '。';
-            }
-            if (cacheRebuildParts.length) {
-              summaryText += ' 缓存重建：' + cacheRebuildParts.join('，') + '。';
-            }
-          }
-          if (schedulerCacheHitTotal > 0 || schedulerCacheRebuildTotal > 0) {
-            summaryText += ' 缓存总览：命中 '
-              + String(schedulerCacheHitTotal)
-              + ' 次，重建 '
-              + String(schedulerCacheRebuildTotal)
-              + ' 次，缓存命中率 '
-              + String(Math.round(schedulerCacheHitRatio * 100))
-              + '%。';
-          }
-          if (schedulerProjectCacheHitTotal > 0 || schedulerProjectCacheRebuildTotal > 0) {
-            const projectCacheParts = [];
-            if (schedulerProjectJobsSummaryCacheHits > 0 || schedulerProjectJobsSummaryCacheRebuilds > 0) {
-              projectCacheParts.push(
-                '作业汇总 '
-                  + String(schedulerProjectJobsSummaryCacheHits)
-                  + '/'
-                  + String(schedulerProjectJobsSummaryCacheRebuilds)
-              );
-            }
-            if (schedulerProjectStatusMaterialsCacheHits > 0 || schedulerProjectStatusMaterialsCacheRebuilds > 0) {
-              projectCacheParts.push(
-                '资料状态 '
-                  + String(schedulerProjectStatusMaterialsCacheHits)
-                  + '/'
-                  + String(schedulerProjectStatusMaterialsCacheRebuilds)
-              );
-            }
-            if (schedulerProjectStatusCoreCacheHits > 0 || schedulerProjectStatusCoreCacheRebuilds > 0) {
-              projectCacheParts.push(
-                '状态核心 '
-                  + String(schedulerProjectStatusCoreCacheHits)
-                  + '/'
-                  + String(schedulerProjectStatusCoreCacheRebuilds)
-              );
-            }
-            summaryText += ' 当前项目缓存：命中 '
-              + String(schedulerProjectCacheHitTotal)
-              + ' 次，重建 '
-              + String(schedulerProjectCacheRebuildTotal)
-              + ' 次，命中率 '
-              + String(Math.round(schedulerProjectCacheHitRatio * 100))
-              + '%';
-            if (schedulerProjectCacheNetSavings !== 0) {
-              summaryText += '，净节省冷路径 '
-                + String(Math.abs(schedulerProjectCacheNetSavings))
-                + ' 次';
-            }
-            if (schedulerProjectCacheState === 'warm') {
-              summaryText += '，状态 已转热';
-            } else if (schedulerProjectCacheState === 'warming') {
-              summaryText += '，状态 预热中';
-            } else if (schedulerProjectCacheState === 'cold') {
-              summaryText += '，状态 冷启动';
-            }
-            if (projectCacheParts.length) {
-              summaryText += '（' + projectCacheParts.join('，') + '）';
-            }
+          if (latestFinishedFilename) {
+            summaryText += ' 最近处理：[' + latestFinishedFilename + ']';
+            if (latestFinishedAt) summaryText += '（' + latestFinishedAt + '）';
             summaryText += '。';
-            summaryText += ' 缓存分层：已转热 '
-              + String(schedulerProjectCacheHotLayerCount)
-              + ' 层，预热中 '
-              + String(schedulerProjectCacheWarmingLayerCount)
-              + ' 层，冷启动 '
-              + String(schedulerProjectCacheColdLayerCount)
-              + ' 层';
-            const projectCacheStateParts = [];
-            if (schedulerProjectJobsSummaryCacheState) {
-              projectCacheStateParts.push('作业汇总 ' + schedulerProjectJobsSummaryCacheState);
-            }
-            if (schedulerProjectStatusMaterialsCacheState) {
-              projectCacheStateParts.push('资料状态 ' + schedulerProjectStatusMaterialsCacheState);
-            }
-            if (schedulerProjectStatusCoreCacheState) {
-              projectCacheStateParts.push('状态核心 ' + schedulerProjectStatusCoreCacheState);
-            }
-            if (projectCacheStateParts.length) {
-              summaryText += '（' + projectCacheStateParts.join('，') + '）';
-            }
-            summaryText += '。';
-            if (schedulerProjectRecentAvoidedRebuildLayers.length) {
-              summaryText += ' 最近一轮避开重建：'
-                + schedulerProjectRecentAvoidedRebuildLayers.map(projectCacheLayerLabel).filter(Boolean).join('、')
-                + '。';
-            }
-            if (schedulerProjectRecentRebuiltLayers.length) {
-              summaryText += ' 最近一轮实际重建：'
-                + schedulerProjectRecentRebuiltLayers.map(projectCacheLayerLabel).filter(Boolean).join('、')
-                + '。';
-            }
-            if (schedulerProjectRecentAvoidedRebuildWorkUnits > 0 || schedulerProjectRecentRebuiltWorkUnits > 0) {
-              summaryText += ' 最近一轮估算链路成本：避开 '
-                + String(schedulerProjectRecentAvoidedRebuildWorkUnits)
-                + ' 单位，重建 '
-                + String(schedulerProjectRecentRebuiltWorkUnits)
-                + ' 单位。';
-            }
-            if (schedulerProjectRecentRequestWindowSize > 0) {
-              summaryText += ' 最近 '
-                + String(schedulerProjectRecentRequestWindowSize)
-                + ' 轮阶段：冷启动首轮 '
-                + String(schedulerProjectRecentColdStartRoundCount)
-                + ' 轮，预热中 '
-                + String(schedulerProjectRecentWarmingRoundCount)
-                + ' 轮，稳定轮询 '
-                + String(schedulerProjectRecentSteadyRoundCount)
-                + ' 轮';
-              if (schedulerProjectRecentWindowState === 'stable_hot') {
-                summaryText += '，窗口状态 已稳定转热';
-              } else if (schedulerProjectRecentWindowState === 'steady') {
-                summaryText += '，窗口状态 已转热';
-              } else if (schedulerProjectRecentWindowState === 'warming') {
-                summaryText += '，窗口状态 仍在预热';
-              } else if (schedulerProjectRecentWindowState === 'cold_start') {
-                summaryText += '，窗口状态 冷启动首轮';
-              } else if (schedulerProjectRecentWindowState === 'cold') {
-                summaryText += '，窗口状态 冷启动';
-              }
-              if (schedulerProjectRecentStableHotBadgeLabel) {
-                summaryText += '，热态标签 ' + schedulerProjectRecentStableHotBadgeLabel;
-              }
-              if (schedulerProjectRecentStableHotThreshold > 0) {
-                summaryText += '，连续稳定轮询 '
-                  + String(schedulerProjectRecentConsecutiveSteadyRoundCount)
-                  + '/'
-                  + String(schedulerProjectRecentStableHotThreshold)
-                  + ' 轮';
-                if (schedulerProjectRecentStableHotProgressSummaryLabel) {
-                  summaryText += '，稳定转热进度 '
-                    + schedulerProjectRecentStableHotProgressSummaryLabel;
-                } else if (schedulerProjectRecentStableHotProgressLabel) {
-                  summaryText += '，稳定转热进度 '
-                    + schedulerProjectRecentStableHotProgressLabel
-                    + '（'
-                    + (
-                      schedulerProjectRecentStableHotProgressPercentLabel
-                      || (String(schedulerProjectRecentStableHotProgressPercent) + '%')
-                    )
-                    + '）';
-                }
-                if (schedulerProjectRecentStableHotProgressSummaryLabel) {
-                  // summary label already includes progress + eta semantics
-                } else if (schedulerProjectRecentStableHotEtaHint) {
-                  summaryText += '，'
-                    + (
-                      schedulerProjectRecentStableHotEtaShortLabel
-                      || schedulerProjectRecentStableHotEtaHint
-                    );
-                } else if (schedulerProjectRecentStableHot) {
-                  summaryText += '，已达到稳定转热阈值';
-                } else {
-                  summaryText += '，未达到稳定转热阈值';
-                  if (schedulerProjectRecentStableHotRemainingRounds > 0) {
-                    summaryText += '，还差 '
-                      + String(schedulerProjectRecentStableHotRemainingRounds)
-                      + ' 轮 steady';
-                  }
-                }
-              }
-              if (schedulerProjectRecentStableHotRuleLabel) {
-                summaryText += '，规则：' + schedulerProjectRecentStableHotRuleLabel;
-              }
-              summaryText += '。';
-              summaryText += ' 最近 '
-                + String(schedulerProjectRecentRequestWindowSize)
-                + ' 轮平均链路成本：避开 '
-                + formatProjectCacheWorkUnits(schedulerProjectRecentAvoidedRebuildWorkUnitsAvg)
-                + ' 单位，重建 '
-                + formatProjectCacheWorkUnits(schedulerProjectRecentRebuiltWorkUnitsAvg)
-                + ' 单位';
-              if (schedulerProjectRecentNetSavedWorkUnitsAvg !== 0) {
-                summaryText += '，净节省 '
-                  + formatProjectCacheWorkUnits(Math.abs(schedulerProjectRecentNetSavedWorkUnitsAvg))
-                  + ' 单位';
-              }
-              summaryText += '。';
-            }
           }
           if (closureStageText) {
             summaryText += ' 系统封关阶段：' + closureStageText + '。';
@@ -41850,6 +41551,7 @@ def index(
             return;
           }
           if (!Array.isArray(mats) || mats.length === 0) {
+            materialParseSummaryState = { overview: overview, summary: summary, materials: [] };
             replaceTableRowsIfChanged('materialsTable', [], '__materials__empty__|' + String(id || ''));
             if (emptyEl) {
               emptyEl.textContent = '暂无资料，请下方添加。';
@@ -47726,23 +47428,13 @@ def index(
             );
             if (Number(pendingFeedbackPatchBundle.section_count || 0) > 0) {
               if (!secureDesktopEnabled()) {
-                html += '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="secondary" id="btnGuidancePatchBundleInlineDownload">下载改写补丁包(.md)</button><button type="button" class="secondary" id="btnGuidancePatchBundleInlineDownloadDocx">下载改写补丁包(.docx)</button></div>';
+                html += '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="secondary" id="btnGuidancePatchBundleInlineDownloadDocx">下载改写补丁包 (.docx)</button></div>';
               } else {
                 html += '<p style="font-size:12px;margin-top:8px;color:#9a3412">保密模式下已禁用改写补丁包下载。</p>';
               }
             }
             el.innerHTML = html || '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
-            const inlinePatchBtn = document.getElementById('btnGuidancePatchBundleInlineDownload');
             const inlinePatchDocxBtn = document.getElementById('btnGuidancePatchBundleInlineDownloadDocx');
-            if (inlinePatchBtn) {
-              inlinePatchBtn.onclick = () => {
-                if (secureDesktopEnabled()) {
-                  secureDesktopBlockResult('guidanceResult');
-                  return;
-                }
-                downloadWritingGuidancePatchBundle(projectId, 'guidanceResult');
-              };
-            }
             if (inlinePatchDocxBtn) {
               inlinePatchDocxBtn.onclick = () => {
                 if (secureDesktopEnabled()) {
@@ -48752,6 +48444,8 @@ def index(
         initial_submission_dual_track_overview_display,
     )
     html = html.replace("__SUBMISSIONS_EMPTY_DISPLAY__", initial_submissions_empty_display)
+    html = html.replace("__DEVELOPER_EVOLUTION_TOOLS_HTML__", developer_evolution_tools_html)
+    html = html.replace("__DEVELOPER_EVOLUTION_RESULTS_HTML__", developer_evolution_results_html)
     html = html.replace("__PROJECT_SCORE_SCALE_MAX__", str(score_scale_initial))
     html = html.replace(
         "__SECURE_DESKTOP_BODY_CLASS__",
