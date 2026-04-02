@@ -421,6 +421,7 @@ DEFAULT_DIRECT_CALIBRATOR_MAX_CV_MAE = 3.0
 DEFAULT_PROJECT_CALIBRATOR_PROMOTION_MIN_MAE_IMPROVEMENT = 0.05
 DEFAULT_SCORE_SCALE_MAX = 100
 DEFAULT_FIVE_SCALE_PRIOR_TRIGGER_DISPLAY_MAX = 1.0
+DEFAULT_FIVE_SCALE_PRIOR_TRIGGER_DISPLAY_EPSILON = 0.001
 DEFAULT_HUNDRED_SCALE_PRIOR_TRIGGER_TOTAL_MAX = 40.0
 DEFAULT_ENFORCE_GB_REDLINE = False
 DEFAULT_NORM_RULE_VERSION = "v1_m=0.5+a/10_norm=sum"
@@ -13421,8 +13422,9 @@ def _should_apply_five_scale_global_prior(
     if rule_total_100 is None:
         return False
     display_rule = _convert_score_from_100(rule_total_100, 5)
-    return display_rule is not None and float(display_rule) < float(
-        DEFAULT_FIVE_SCALE_PRIOR_TRIGGER_DISPLAY_MAX
+    return display_rule is not None and float(display_rule) <= (
+        float(DEFAULT_FIVE_SCALE_PRIOR_TRIGGER_DISPLAY_MAX)
+        + float(DEFAULT_FIVE_SCALE_PRIOR_TRIGGER_DISPLAY_EPSILON)
     )
 
 
@@ -14953,6 +14955,28 @@ def _resolve_exact_ground_truth_score_for_submission(
     return None
 
 
+def _build_submission_prediction_context(
+    *,
+    submission_id: str,
+    project_id: str,
+    text: str,
+    report: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    context: Dict[str, object] = {
+        "id": submission_id,
+        "project_id": project_id,
+        "text": text,
+    }
+    if isinstance(report, dict):
+        context["report"] = report
+        total_score = _to_float_or_none(report.get("total_score"))
+        if total_score is None:
+            total_score = _to_float_or_none(report.get("rule_total_score"))
+        if total_score is not None:
+            context["total_score"] = float(total_score)
+    return context
+
+
 def _apply_prediction_to_report_with_model(
     report: Dict[str, object],
     *,
@@ -14960,6 +14984,7 @@ def _apply_prediction_to_report_with_model(
     project: Dict[str, object],
     model_override: Optional[Dict[str, object]] = None,
 ) -> Optional[str]:
+    _clear_report_current_score_failure(report)
     project_id = str(submission_like.get("project_id") or project.get("id") or "").strip()
     exact_ground_truth_score = (
         _resolve_exact_ground_truth_score_for_submission(
@@ -15026,7 +15051,7 @@ def _apply_prediction_to_report_with_model(
     try:
         pred, conf = predict_with_model(artifact, row.get("x_features") or {})
     except Exception as e:
-        # 预测模型不应影响主流程可用性；失败时保留 rule 分并显式记录错误。
+        # 当前分层失败不应伪装成“正常仅有独立分”；保留 rule 分，同时显式标记失败。
         report["pred_total_score"] = None
         report["llm_total_score"] = None
         report["pred_confidence"] = None
@@ -15036,9 +15061,18 @@ def _apply_prediction_to_report_with_model(
             report.get("rule_total_score", report.get("total_score", 0.0))
         )
         submission_like["total_score"] = float(report.get("total_score", 0.0))
-        report.setdefault("meta", {})
-        report["meta"]["calibrator_version"] = model.get("calibrator_version")
-        report["meta"]["calibrator_error"] = f"{type(e).__name__}: {e}"
+        error_message = f"{type(e).__name__}: {e}"
+        logger.exception(
+            "current_score_prediction_failed project_id=%s submission_id=%s calibrator_version=%s",
+            project_id,
+            str(submission_like.get("id") or "").strip(),
+            str(model.get("calibrator_version") or "").strip(),
+        )
+        _set_report_current_score_failure(
+            report,
+            calibrator_version=str(model.get("calibrator_version") or "").strip(),
+            error_message=error_message,
+        )
         return str(model.get("calibrator_version") or "")
 
     rule_total = float(report.get("rule_total_score", report.get("total_score", 0.0)))
@@ -15140,6 +15174,48 @@ def _apply_prediction_to_report(
         submission_like=submission_like,
         project=project,
     )
+
+
+def _clear_report_current_score_failure(report: Optional[Dict[str, object]]) -> None:
+    if not isinstance(report, dict):
+        return
+    meta = report.get("meta") if isinstance(report.get("meta"), dict) else None
+    if not isinstance(meta, dict):
+        return
+    meta.pop("current_score_failure", None)
+    meta.pop("calibrator_error", None)
+    report["meta"] = meta
+
+
+def _set_report_current_score_failure(
+    report: Dict[str, object],
+    *,
+    calibrator_version: str,
+    error_message: str,
+) -> Dict[str, object]:
+    meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+    failure = {
+        "failed": True,
+        "message": "评分计算失败，请重试",
+        "error": str(error_message or "").strip(),
+        "calibrator_version": calibrator_version or None,
+        "failed_at": _now_iso(),
+    }
+    meta["current_score_failure"] = failure
+    meta["calibrator_version"] = calibrator_version or None
+    meta["calibrator_error"] = failure["error"]
+    report["meta"] = meta
+    return failure
+
+
+def _report_current_score_failure(report: Optional[Dict[str, object]]) -> Dict[str, object]:
+    if not isinstance(report, dict):
+        return {}
+    meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+    failure = meta.get("current_score_failure") if isinstance(meta, dict) else None
+    if isinstance(failure, dict) and bool(failure.get("failed")):
+        return dict(failure)
+    return {}
 
 
 def _to_float_or_none(value: Any) -> Optional[float]:
@@ -15540,7 +15616,12 @@ def _score_submission_for_project(
             report_meta["score_confidence_level"] = "high"
         report["meta"] = report_meta
         _apply_deployed_patch_to_report(project_id, report)
-        submission_like = {"id": submission_id, "project_id": project_id, "text": text}
+        submission_like = _build_submission_prediction_context(
+            submission_id=submission_id,
+            project_id=project_id,
+            text=text,
+            report=report,
+        )
         if _report_is_blocked(report):
             _apply_prediction_to_report(report, submission_like=submission_like, project=project)
             report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
@@ -42195,6 +42276,7 @@ def index(
           if (raw === 'await_approximation') return '已录入青天，等待当前分收敛';
           if (raw === 'await_ground_truth') return '等待青天结果验证';
           if (raw === 'ground_truth_exact') return '已命中真实评标';
+          if (raw === 'current_score_failed') return '评分计算失败，请重试';
           if (raw === 'independent_only') return '当前仅有独立评分';
           return raw || '待生成';
         }
@@ -42203,6 +42285,8 @@ def index(
           const flags = getSubmissionScoringFlags(submission);
           if (flags.isPending) return '<span class="note">待评分</span>';
           const summary = getSubmissionDualTrackSummary(submission);
+          const currentScoreFailed = !!summary.current_score_failed;
+          const currentScoreFailureMessage = String(summary.current_score_failure_message || '评分计算失败，请重试').trim();
           const detailTokens = [];
           const independentScore = toFiniteNumber(summary.independent_score);
           const approximationScore = toFiniteNumber(summary.approximation_score);
@@ -42218,7 +42302,9 @@ def index(
             ? summary.display_total_score
             : ((submission && submission.total_score != null) ? submission.total_score : null);
           let html = '-';
-          if (flags.isBlocked) {
+          if (currentScoreFailed) {
+            html = '<div class="error">' + esc(currentScoreFailureMessage) + '</div>';
+          } else if (flags.isBlocked) {
             html = '<div class="warn">已生成分数，但本施组触发资料利用预警。</div>';
           }
           if (displayTotal != null) {
@@ -42237,6 +42323,8 @@ def index(
           const flags = getSubmissionScoringFlags(submission);
           if (flags.isPending) return '<span class="note">待评分后生成双轨诊断。</span>';
           const summary = getSubmissionDualTrackSummary(submission);
+          const currentScoreFailed = !!summary.current_score_failed;
+          const currentScoreFailureMessage = String(summary.current_score_failure_message || '评分计算失败，请重试').trim();
           const utilGate = getSubmissionMaterialUtilizationGate(submission);
           const gateReasons = Array.isArray(summary.material_gate_reasons) && summary.material_gate_reasons.length
             ? summary.material_gate_reasons
@@ -42249,7 +42337,10 @@ def index(
           if (approximationDelta != null) deltaTokens.push('当前分偏差 ' + approximationDelta);
           if (improvement != null) deltaTokens.push('改善 ' + improvement);
           let html = '';
-          if (flags.isBlocked) {
+          if (currentScoreFailed) {
+            html += '<div class="error"><strong>' + esc(currentScoreFailureMessage) + '</strong></div>';
+            html += '<div class="note">当前仅保留独立分，未生成当前分层结果。</div>';
+          } else if (flags.isBlocked) {
             html += '<div class="warn"><strong>已评分，但本施组对部分项目资料未形成足够证据关联。</strong></div>';
             if (gateReasons.length) {
               html += '<div class="warn">' + esc(gateReasons.slice(0, 2).join('；')) + '</div>';

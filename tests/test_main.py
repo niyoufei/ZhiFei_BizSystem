@@ -5421,6 +5421,7 @@ class TestIndexEndpoint:
         assert "previewed_materials" in page
         assert "预解析完成" in page
         assert "后台仍在补全全文" in page
+        assert "if (raw === 'current_score_failed') return '评分计算失败，请重试';" in page
 
     def test_index_frontend_inline_scripts_are_valid_javascript(self, client):
         response = client.get("/")
@@ -15116,6 +15117,70 @@ class TestSubmissionsEndpoint:
     @patch("app.main.load_projects")
     @patch("app.main.load_submissions")
     @patch("app.main.ensure_data_dirs")
+    def test_list_submissions_uses_five_scale_global_prior_at_threshold_boundary(
+        self,
+        mock_ensure,
+        mock_load_submissions,
+        mock_load_projects,
+        mock_load_qingtian_results,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 5}}]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "current.pdf",
+                "total_score": 20.01,
+                "report": {
+                    "scoring_status": "scored",
+                    "total_score": 20.01,
+                    "rule_total_score": 20.01,
+                    "meta": {},
+                },
+                "text": "current text",
+                "created_at": "2026-01-02T00:00:00Z",
+            },
+            {
+                "id": "hist1",
+                "project_id": "hist",
+                "filename": "hist.txt",
+                "total_score": 6.81,
+                "report": {
+                    "scoring_status": "scored",
+                    "total_score": 6.81,
+                    "rule_total_score": 6.81,
+                    "meta": {},
+                },
+                "text": "historical text",
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+        ]
+        mock_load_qingtian_results.return_value = [
+            {
+                "id": "qt1",
+                "submission_id": "hist1",
+                "qt_total_score": 84.0,
+                "created_at": "2026-01-03T00:00:00Z",
+            }
+        ]
+
+        response = client.get("/api/v1/projects/p1/submissions")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["total_score"] == 4.86
+        assert data[0]["report"]["pred_total_score"] == 4.86
+        assert data[0]["report"]["rule_total_score"] == 1.0005
+        assert data[0]["report"]["raw_rule_total_score_100"] == 20.01
+        assert data[0]["report"]["dual_track_summary"]["display_score_label"] == "当前分"
+        assert data[0]["report"]["dual_track_summary"]["display_total_score"] == 4.86
+
+    @patch("app.main.load_qingtian_results")
+    @patch("app.main.load_projects")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
     def test_list_submissions_uses_hundred_scale_global_prior_when_rule_score_too_low(
         self,
         mock_ensure,
@@ -18171,6 +18236,24 @@ class TestEvolutionTotalScale:
 
 
 class TestProjectCalibratorDirectApply:
+    def test_build_submission_prediction_context_includes_report_and_total_score(self):
+        from app.main import _build_submission_prediction_context
+
+        report = {"rule_total_score": 20.01, "total_score": 20.01}
+
+        context = _build_submission_prediction_context(
+            submission_id="s1",
+            project_id="p1",
+            text="test text",
+            report=report,
+        )
+
+        assert context["id"] == "s1"
+        assert context["project_id"] == "p1"
+        assert context["text"] == "test text"
+        assert context["report"] is report
+        assert context["total_score"] == 20.01
+
     @patch("app.main.predict_with_model", return_value=(80.74, {"sigma": 1.0}))
     @patch("app.main.build_feature_row", return_value={"x_features": {}})
     def test_apply_prediction_uses_direct_project_calibrator_when_cv_validated(
@@ -18251,6 +18334,98 @@ class TestProjectCalibratorDirectApply:
         assert mock_predict.called
         assert report["pred_total_score"] < 80.74
         assert report["score_blend"].get("mode") != "project_calibrator_direct"
+
+    @patch("app.main.predict_with_model", side_effect=TimeoutError("predict timeout"))
+    @patch("app.main.build_feature_row", return_value={"x_features": {}})
+    def test_apply_prediction_marks_current_score_failure_when_prediction_errors(
+        self,
+        mock_build_row,
+        mock_predict,
+    ):
+        from app.main import _apply_prediction_to_report_with_model
+
+        report = {"rule_total_score": 20.01, "total_score": 20.01, "meta": {}}
+        submission = {
+            "id": "s1",
+            "project_id": "p1",
+            "filename": "s1.pdf",
+            "text": "test text",
+            "total_score": 20.01,
+        }
+        project = {"id": "p1", "meta": {}}
+        model = {
+            "calibrator_version": "calib-timeout",
+            "deployed": True,
+            "train_filter": {"project_id": "p1"},
+            "calibrator_summary": {
+                "deployment_mode": "cv_validated",
+                "gate_passed": True,
+                "bootstrap_small_sample": False,
+                "sample_count": 7,
+                "cv_metrics": {"mae": 1.7},
+            },
+            "model_artifact": {"model_type": "offset"},
+        }
+
+        version = _apply_prediction_to_report_with_model(
+            report,
+            submission_like=submission,
+            project=project,
+            model_override=model,
+        )
+
+        assert mock_build_row.called
+        assert mock_predict.called
+        assert version == "calib-timeout"
+        assert report["pred_total_score"] is None
+        assert report["total_score"] == 20.01
+        assert submission["total_score"] == 20.01
+        assert report["meta"]["calibrator_version"] == "calib-timeout"
+        assert "TimeoutError: predict timeout" in report["meta"]["calibrator_error"]
+        assert report["meta"]["current_score_failure"]["failed"] is True
+        assert report["meta"]["current_score_failure"]["message"] == "评分计算失败，请重试"
+        assert report["meta"]["current_score_failure"]["calibrator_version"] == "calib-timeout"
+
+    def test_submission_dual_track_summary_marks_current_score_failure(self):
+        from app.qingtian_dual_track import (
+            build_submission_dual_track_summary,
+            render_submission_dual_track_diagnostic_html,
+            render_submission_dual_track_score_html,
+        )
+
+        submission = {
+            "id": "s1",
+            "project_id": "p1",
+            "total_score": 20.01,
+            "report": {
+                "rule_total_score": 20.01,
+                "pred_total_score": None,
+                "meta": {
+                    "current_score_failure": {
+                        "failed": True,
+                        "message": "评分计算失败，请重试",
+                        "error": "TimeoutError: predict timeout",
+                    }
+                },
+            },
+        }
+
+        summary = build_submission_dual_track_summary(
+            submission,
+            latest_qingtian_by_submission={},
+            score_scale_max=5,
+        )
+
+        assert summary["alignment_status"] == "current_score_failed"
+        assert summary["governance_hint"] == "评分计算失败，请重试"
+        assert summary["current_score_failed"] is True
+        assert 'class="error"' in render_submission_dual_track_score_html(summary)
+        diagnostic_html = render_submission_dual_track_diagnostic_html(
+            summary,
+            project_id="p1",
+        )
+        assert "评分计算失败，请重试" in diagnostic_html
+        assert "当前仅保留独立分" in diagnostic_html
 
 
 class TestExactGroundTruthOverride:

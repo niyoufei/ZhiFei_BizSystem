@@ -20,6 +20,11 @@ def build_submission_dual_track_summary(
     main = _main()
     report = submission.get("report") if isinstance(submission.get("report"), dict) else {}
     report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+    current_score_failure = main._report_current_score_failure(report)
+    current_score_failed = bool(current_score_failure)
+    current_score_failure_message = (
+        str(current_score_failure.get("message") or "").strip() or "评分计算失败，请重试"
+    )
     util_gate = main._normalize_material_utilization_gate_state(
         report_meta.get("material_utilization_gate")
     )
@@ -78,7 +83,10 @@ def build_submission_dual_track_summary(
 
     alignment_status = "independent_only"
     governance_hint = "当前仅有独立评分，可继续录入真实评标并训练逼近层。"
-    if qingtian_score_100 is not None and raw_pred_total is not None:
+    if current_score_failed:
+        alignment_status = "current_score_failed"
+        governance_hint = current_score_failure_message
+    elif qingtian_score_100 is not None and raw_pred_total is not None:
         if abs_delta_improvement_100 is not None and abs_delta_improvement_100 > 0:
             alignment_status = "approximation_better"
             governance_hint = "逼近层当前更接近青天，可继续沉淀校准样本和 few-shot。"
@@ -116,6 +124,8 @@ def build_submission_dual_track_summary(
         "abs_delta_improvement_100": abs_delta_improvement_100,
         "alignment_status": alignment_status,
         "governance_hint": governance_hint,
+        "current_score_failed": current_score_failed,
+        "current_score_failure_message": current_score_failure_message if current_score_failed else None,
         "material_gate_blocked": bool(util_gate.get("blocked")),
         "material_gate_warned": bool(util_gate.get("warned")),
         "material_gate_reasons": [
@@ -224,7 +234,13 @@ def render_submission_dual_track_score_html(
     if scale_max != 100 and display_total_100 is not None:
         detail_tokens.append(f"折算100分口径: {display_total_100}")
     lines: List[str] = []
-    if is_blocked:
+    current_score_failed = bool(summary.get("current_score_failed"))
+    current_score_failure_message = (
+        str(summary.get("current_score_failure_message") or "").strip() or "评分计算失败，请重试"
+    )
+    if current_score_failed:
+        lines.append('<div class="error">' + html.escape(current_score_failure_message) + "</div>")
+    elif is_blocked:
         lines.append('<div class="error">已生成分数，但本施组触发资料利用预警。</div>')
     if display_total is not None:
         primary_text = f"{display_label}: {display_total}"
@@ -255,6 +271,7 @@ def render_submission_dual_track_diagnostic_html(
         "tracks_tied": "双轨与青天偏差相当",
         "await_approximation": "已录入青天，等待逼近层收敛",
         "await_ground_truth": "等待青天结果验证",
+        "current_score_failed": "评分计算失败，请重试",
         "independent_only": "当前仅有独立评分",
     }
     delta_tokens: List[str] = []
@@ -269,6 +286,10 @@ def render_submission_dual_track_diagnostic_html(
         delta_tokens.append(f"改善 {improvement}")
 
     lines: List[str] = []
+    current_score_failed = bool(summary.get("current_score_failed"))
+    current_score_failure_message = (
+        str(summary.get("current_score_failure_message") or "").strip() or "评分计算失败，请重试"
+    )
     gate_reasons = [
         str(item).strip()
         for item in (
@@ -278,7 +299,12 @@ def render_submission_dual_track_diagnostic_html(
         )
         if str(item).strip()
     ]
-    if is_blocked:
+    if current_score_failed:
+        lines.append(
+            '<div class="error"><strong>' + html.escape(current_score_failure_message) + "</strong></div>"
+        )
+        lines.append('<div class="note">当前仅保留独立分，未生成当前分层结果。</div>')
+    elif is_blocked:
         lines.append(
             '<div class="error"><strong>已评分，但本施组对部分项目资料未形成足够证据关联。</strong></div>'
         )
