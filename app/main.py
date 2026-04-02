@@ -33868,6 +33868,17 @@ def index(
         .upload-zone[data-health="active"] { border-color:#16a34a; background:#f0fdf4; box-shadow:0 0 0 1px rgba(22,163,74,0.08); }
         .upload-zone h4 { margin:0 0 8px 0; font-size:18px; color:#1e293b; }
         .upload-zone-state { margin:8px 0 0 0; font-size:12px; color:#64748b; min-height:1.2em; line-height:1.5; }
+        .upload-zone-files { width:100%; margin-top:8px; border-collapse:separate; border-spacing:0; background:#fff; border:1px solid #e2e8f0; border-radius:10px; overflow:hidden; }
+        .upload-zone-files th, .upload-zone-files td { padding:8px 10px; border-bottom:1px solid #e2e8f0; font-size:12px; text-align:left; vertical-align:top; }
+        .upload-zone-files th { background:#f8fafc; color:#475569; font-weight:600; }
+        .upload-zone-files tr:last-child td { border-bottom:none; }
+        .upload-zone-files .actions-cell { white-space:nowrap; }
+        .upload-zone-empty { margin:8px 0 0 0; font-size:12px; color:#64748b; }
+        .upload-zone-debug { margin-top:8px; }
+        .upload-zone-debug summary { cursor:pointer; font-size:12px; color:#475569; }
+        .upload-zone-debug-body { margin-top:8px; font-size:12px; color:#475569; }
+        .upload-zone-status-pill { display:inline-flex; align-items:center; gap:6px; color:#334155; }
+        .upload-zone-status-dot { width:8px; height:8px; border-radius:999px; background:currentColor; display:inline-block; flex:0 0 auto; }
         .upload-zone .inline-form { width:100%; }
         .visually-hidden-file { position:absolute; left:-9999px; width:1px; height:1px; opacity:0; pointer-events:none; }
         .file-picker-btn { display:inline-flex; align-items:center; justify-content:center; min-height:46px; padding:0 16px; border:1px solid #94a3b8; border-radius:10px; background:#fff; color:#0f172a; cursor:pointer; font-weight:600; font-size:15px; text-decoration:none; user-select:none; }
@@ -34580,7 +34591,7 @@ def index(
         <button type="button" id="materialsTrialPreflightFollowUpAction" class="secondary" style="display:none;margin:0 0 8px 0"></button>
         <div class="upload-box">
           <h3 class="upload-panel-title">文件上传区</h3>
-          <div class="upload-zones">
+          <div class="upload-zones" id="materialUploadZones">
             <div class="upload-zone" id="uploadZoneTenderQa" data-material-type="tender_qa" data-health="idle">
               <h4>招标文件和答疑（可多选）</h4>
               <form id="uploadMaterial" method="post" action="/web/upload_materials" enctype="multipart/form-data" class="inline-form">
@@ -34597,6 +34608,12 @@ def index(
               </form>
               <p id="materialsActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
               <p id="uploadZoneStateTenderQa" class="upload-zone-state">当前状态：未上传。</p>
+              <table id="uploadZoneFilesTenderQa" class="upload-zone-files" style="display:none"><thead><tr><th>文件名称</th><th>解析状态</th><th>操作</th></tr></thead><tbody></tbody></table>
+              <p id="uploadZoneEmptyTenderQa" class="upload-zone-empty">暂无已上传文件。</p>
+              <details id="uploadZoneDebugTenderQa" class="upload-zone-debug" style="display:none">
+                <summary>解析引擎快照</summary>
+                <div id="uploadZoneDebugInfoTenderQa" class="upload-zone-debug-body"></div>
+              </details>
             </div>
             <div class="upload-zone" id="uploadZoneBoq" data-material-type="boq" data-health="idle">
               <h4>清单（可多选）</h4>
@@ -34614,6 +34631,12 @@ def index(
               </form>
               <p id="materialsActionStatusBoq" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
               <p id="uploadZoneStateBoq" class="upload-zone-state">当前状态：未上传。</p>
+              <table id="uploadZoneFilesBoq" class="upload-zone-files" style="display:none"><thead><tr><th>文件名称</th><th>解析状态</th><th>操作</th></tr></thead><tbody></tbody></table>
+              <p id="uploadZoneEmptyBoq" class="upload-zone-empty">暂无已上传文件。</p>
+              <details id="uploadZoneDebugBoq" class="upload-zone-debug" style="display:none">
+                <summary>解析引擎快照</summary>
+                <div id="uploadZoneDebugInfoBoq" class="upload-zone-debug-body"></div>
+              </details>
             </div>
             <div class="upload-zone" id="uploadZoneDrawing" data-material-type="drawing" data-health="idle">
               <h4>图纸（可多选，支持 DXF ASCII）</h4>
@@ -34631,6 +34654,12 @@ def index(
               </form>
               <p id="materialsActionStatusDrawing" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
               <p id="uploadZoneStateDrawing" class="upload-zone-state">当前状态：未上传。</p>
+              <table id="uploadZoneFilesDrawing" class="upload-zone-files" style="display:none"><thead><tr><th>文件名称</th><th>解析状态</th><th>操作</th></tr></thead><tbody></tbody></table>
+              <p id="uploadZoneEmptyDrawing" class="upload-zone-empty">暂无已上传文件。</p>
+              <details id="uploadZoneDebugDrawing" class="upload-zone-debug" style="display:none">
+                <summary>解析引擎快照</summary>
+                <div id="uploadZoneDebugInfoDrawing" class="upload-zone-debug-body"></div>
+              </details>
             </div>
             <div class="upload-zone" id="uploadZoneSitePhoto" data-material-type="site_photo" data-health="idle">
               <h4>现场照片（可多选）</h4>
@@ -34648,6 +34677,12 @@ def index(
               </form>
               <p id="materialsActionStatusPhoto" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
               <p id="uploadZoneStateSitePhoto" class="upload-zone-state">当前状态：未上传。</p>
+              <table id="uploadZoneFilesSitePhoto" class="upload-zone-files" style="display:none"><thead><tr><th>文件名称</th><th>解析状态</th><th>操作</th></tr></thead><tbody></tbody></table>
+              <p id="uploadZoneEmptySitePhoto" class="upload-zone-empty">暂无已上传文件。</p>
+              <details id="uploadZoneDebugSitePhoto" class="upload-zone-debug" style="display:none">
+                <summary>解析引擎快照</summary>
+                <div id="uploadZoneDebugInfoSitePhoto" class="upload-zone-debug-body"></div>
+              </details>
             </div>
           </div>
         </div>
@@ -36799,6 +36834,7 @@ def index(
         let scoringReadinessPanelState = null;
         let systemClosureSummaryState = null;
         let materialParseSummaryState = { summary: null, materials: [] };
+        let materialUploadZoneDiagnosticState = { project_id: '', typeCards: [] };
         const PROJECT_REQUIRED_BUTTON_IDS = [
           'deleteCurrentProject', 'btnWeightsReset', 'btnWeightsSave', 'btnWeightsApply',
           'btnMaterialDepthReport', 'btnMaterialDepthReportDownload', 'btnMaterialKnowledgeProfile', 'btnMaterialKnowledgeProfileDownload',
@@ -37917,86 +37953,12 @@ def index(
             + '</tr>';
         }
         function applyMaterialParseZoneState(materials, summary) {
-          const cardsByType = {};
-          const rows = Array.isArray(materials) ? materials : [];
-          rows.forEach((row) => {
-            if (!row || typeof row !== 'object') return;
-            const typeKey = String(row.material_type || '').trim() || 'tender_qa';
-            if (!cardsByType[typeKey]) cardsByType[typeKey] = {
-              total: 0,
-              parsed: 0,
-              previewed: 0,
-              queued: 0,
-              processing: 0,
-              failed: 0,
-              minQueuePosition: 0,
-              routeLabels: [],
-            };
-            const bucket = cardsByType[typeKey];
-            bucket.total += 1;
-            const status = String(row.parse_effective_status || row.parse_status || 'queued').trim().toLowerCase();
-            const routeLabel = String(row.parse_route_label || '').trim();
-            const queuePosition = Number(row.queue_position || 0);
-            if (status === 'parsed') bucket.parsed += 1;
-            else if (status === 'previewed') bucket.previewed += 1;
-            else if (status === 'processing') bucket.processing += 1;
-            else if (status === 'failed') bucket.failed += 1;
-            else bucket.queued += 1;
-            if (routeLabel && !bucket.routeLabels.includes(routeLabel)) bucket.routeLabels.push(routeLabel);
-            if (queuePosition > 0 && (bucket.minQueuePosition <= 0 || queuePosition < bucket.minQueuePosition)) {
-              bucket.minQueuePosition = queuePosition;
-            }
-          });
-          ['tender_qa', 'boq', 'drawing', 'site_photo'].forEach((materialType) => {
-            const zoneEl = document.getElementById(materialTypeUploadZoneId(materialType));
-            const stateEl = document.getElementById(materialTypeUploadZoneStateId(materialType));
-            if (!zoneEl || !stateEl) return;
-            const bucket = cardsByType[materialType];
-            if (!bucket || !bucket.total) {
-              zoneEl.dataset.health = 'idle';
-              stateEl.style.color = '#64748b';
-              stateEl.textContent = '当前状态：未上传。';
-              return;
-            }
-            if (bucket.processing > 0) {
-              zoneEl.dataset.health = 'processing';
-              stateEl.style.color = '#92400e';
-              stateEl.textContent = '当前状态：解析中 ' + bucket.processing + ' 份；已解析 ' + bucket.parsed + ' 份。'
-                + (bucket.routeLabels.length ? ' 解析路径：' + String(bucket.routeLabels[0] || '') + '。' : '');
-              return;
-            }
-            if (bucket.previewed > 0) {
-              zoneEl.dataset.health = 'ready';
-              stateEl.style.color = '#0f766e';
-              stateEl.textContent = '当前状态：预解析完成 ' + bucket.previewed + ' 份；已解析 ' + bucket.parsed + ' 份。'
-                + (bucket.routeLabels.length ? ' 当前路径：' + String(bucket.routeLabels[0] || '') + '。' : '')
-                + ' 后台仍在补全全文。';
-              return;
-            }
-            if (bucket.queued > 0) {
-              zoneEl.dataset.health = 'queued';
-              stateEl.style.color = '#475569';
-              stateEl.textContent = '当前状态：排队中 ' + bucket.queued + ' 份；已解析 ' + bucket.parsed + ' 份。'
-                + (bucket.minQueuePosition > 0 ? ' 最前队列位置：第 ' + String(bucket.minQueuePosition) + ' 位。' : '')
-                + (bucket.routeLabels.length ? ' 解析路径：' + String(bucket.routeLabels[0] || '') + '。' : '');
-              return;
-            }
-            if (bucket.failed > 0 && bucket.parsed <= 0) {
-              zoneEl.dataset.health = 'failed';
-              stateEl.style.color = '#991b1b';
-              stateEl.textContent = '当前状态：解析失败 ' + bucket.failed + ' 份，请重试或更换可解析文件。';
-              return;
-            }
-            if (bucket.failed > 0) {
-              zoneEl.dataset.health = 'parsed_not_used';
-              stateEl.style.color = '#9a3412';
-              stateEl.textContent = '当前状态：已解析 ' + bucket.parsed + ' 份；失败 ' + bucket.failed + ' 份。';
-              return;
-            }
-            zoneEl.dataset.health = 'parsed';
-            stateEl.style.color = '#166534';
-            stateEl.textContent = '当前状态：已解析 ' + bucket.parsed + ' 份，可参与评分。';
-          });
+          void summary;
+          renderMaterialUploadZones(
+            Array.isArray(materials) ? materials : [],
+            materialUploadZoneDiagnosticState.typeCards || [],
+            pid()
+          );
         }
         function scheduleMaterialParsePolling(projectId, summary, switchSeq) {
           clearMaterialParsePolling();
@@ -38036,6 +37998,9 @@ def index(
           clearProjectAutoRefresh();
           clearProjectRefreshInflight();
           clearProjectScopedSystemClosureActionHints();
+          materialParseSummaryState = { overview: null, summary: null, materials: [] };
+          materialUploadZoneDiagnosticState = { project_id: '', typeCards: [] };
+          clearMaterialUploadZonePanels();
           setTableStandby(
             'materialsTable',
             'materialsEmpty',
@@ -41446,6 +41411,31 @@ def index(
               );
             });
           }
+          const materialUploadZones = document.getElementById('materialUploadZones');
+          if (materialUploadZones && !materialUploadZones.dataset.zoneRowsBound) {
+            materialUploadZones.dataset.zoneRowsBound = '1';
+            materialUploadZones.addEventListener('click', (ev) => {
+              const viewBtn = ev.target && ev.target.closest ? ev.target.closest('.js-view-material') : null;
+              if (viewBtn) {
+                ev.preventDefault();
+                viewMaterialRow(
+                  viewBtn.getAttribute('data-material-id') || '',
+                  viewBtn.getAttribute('data-filename') || '',
+                  viewBtn.getAttribute('data-project-id') || ''
+                );
+                return;
+              }
+              const btn = ev.target && ev.target.closest ? ev.target.closest('.js-delete-material') : null;
+              if (!btn) return;
+              ev.preventDefault();
+              deleteMaterialRow(
+                btn.getAttribute('data-material-id') || '',
+                btn.closest('tr'),
+                btn.getAttribute('data-filename') || '',
+                btn.getAttribute('data-project-id') || ''
+              );
+            });
+          }
         }
         async function refreshSubmissions(expectedProjectId=null, switchSeq=null, options=null) {
           const id = expectedProjectId || pid();
@@ -41687,11 +41677,11 @@ def index(
               })
             );
           }
-          const tbl = document.getElementById('materialsTable');
-          const tbody = tbl ? tbl.querySelector('tbody') : null;
           const emptyEl = document.getElementById('materialsEmpty');
           if (!id) {
             clearMaterialParsePolling();
+            materialParseSummaryState = { overview: null, summary: null, materials: [] };
+            materialUploadZoneDiagnosticState = { project_id: '', typeCards: [] };
             replaceTableRowsIfChanged('materialsTable', [], '__materials__projectless__');
             if (emptyEl) {
               emptyEl.textContent = '暂无资料，请先选择项目。';
@@ -41699,7 +41689,7 @@ def index(
             }
             setMaterialParseSummary('待机：请先选择项目。');
             clearMaterialParseDebugInfo();
-            if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState([], {});
+            clearMaterialUploadZonePanels();
             if (typeof clearScoringReadinessPanel === 'function') clearScoringReadinessPanel();
             if (typeof clearScoringDiagnosticPanel === 'function') clearScoringDiagnosticPanel();
             return;
@@ -44607,6 +44597,38 @@ def index(
           if (mt === 'site_photo') return 'uploadZoneStateSitePhoto';
           return '';
         }
+        function materialTypeUploadZoneFilesId(materialType) {
+          const mt = String(materialType || '').trim();
+          if (mt === 'tender_qa') return 'uploadZoneFilesTenderQa';
+          if (mt === 'boq') return 'uploadZoneFilesBoq';
+          if (mt === 'drawing') return 'uploadZoneFilesDrawing';
+          if (mt === 'site_photo') return 'uploadZoneFilesSitePhoto';
+          return '';
+        }
+        function materialTypeUploadZoneEmptyId(materialType) {
+          const mt = String(materialType || '').trim();
+          if (mt === 'tender_qa') return 'uploadZoneEmptyTenderQa';
+          if (mt === 'boq') return 'uploadZoneEmptyBoq';
+          if (mt === 'drawing') return 'uploadZoneEmptyDrawing';
+          if (mt === 'site_photo') return 'uploadZoneEmptySitePhoto';
+          return '';
+        }
+        function materialTypeUploadZoneDebugPanelId(materialType) {
+          const mt = String(materialType || '').trim();
+          if (mt === 'tender_qa') return 'uploadZoneDebugTenderQa';
+          if (mt === 'boq') return 'uploadZoneDebugBoq';
+          if (mt === 'drawing') return 'uploadZoneDebugDrawing';
+          if (mt === 'site_photo') return 'uploadZoneDebugSitePhoto';
+          return '';
+        }
+        function materialTypeUploadZoneDebugInfoId(materialType) {
+          const mt = String(materialType || '').trim();
+          if (mt === 'tender_qa') return 'uploadZoneDebugInfoTenderQa';
+          if (mt === 'boq') return 'uploadZoneDebugInfoBoq';
+          if (mt === 'drawing') return 'uploadZoneDebugInfoDrawing';
+          if (mt === 'site_photo') return 'uploadZoneDebugInfoSitePhoto';
+          return '';
+        }
         function materialTypeUploadButtonId(materialType) {
           const mt = String(materialType || '').trim();
           if (mt === 'tender_qa') return 'btnUploadMaterials';
@@ -44962,101 +44984,288 @@ def index(
             focusShigongWorkspaceEntrypoint(entrypointKey, entrypointLabel, entrypointReasonLabel);
           });
         }
-        function clearMaterialUploadZoneHighlights() {
+        function materialUploadZoneStatusMeta(material) {
+          const row = (material && typeof material === 'object') ? material : {};
+          const status = String(row.parse_effective_status || row.parse_status || 'queued').trim().toLowerCase();
+          if (status === 'previewed' || status === 'parsed') {
+            return { label: '已解析', tone: '#166534' };
+          }
+          if (status === 'processing') {
+            return { label: '解析中', tone: '#92400e' };
+          }
+          if (status === 'failed') {
+            return { label: '失败', tone: '#991b1b' };
+          }
+          if (status === 'queued') {
+            return { label: '排队中', tone: '#475569' };
+          }
+          return { label: '待解析', tone: '#64748b' };
+        }
+        function buildMaterialUploadZoneFileRowHtml(material, projectId) {
+          const row = (material && typeof material === 'object') ? material : {};
+          const statusMeta = materialUploadZoneStatusMeta(row);
+          const materialId = escapeHtmlText(String(row.id || ''));
+          const filename = escapeHtmlText(String(row.filename || ''));
+          const project = escapeHtmlText(String(projectId || row.project_id || ''));
+          return ''
+            + '<tr>'
+            + '<td>' + filename + '</td>'
+            + '<td><span class="upload-zone-status-pill" style="color:' + escapeHtmlText(statusMeta.tone) + '"><span class="upload-zone-status-dot"></span>' + escapeHtmlText(statusMeta.label) + '</span></td>'
+            + '<td class="actions-cell">'
+            + '<button type="button" class="secondary js-view-material" data-material-id="' + materialId + '" data-project-id="' + project + '" data-filename="' + filename + '">查看</button> '
+            + '<button type="button" class="btn-danger js-delete-material" data-material-id="' + materialId + '" data-project-id="' + project + '" data-filename="' + filename + '">删除</button>'
+            + '</td>'
+            + '</tr>';
+        }
+        function materialUploadZoneBusinessState(bucket, card) {
+          const stats = (bucket && typeof bucket === 'object') ? bucket : {};
+          const metaCard = (card && typeof card === 'object') ? card : {};
+          const total = Number(stats.total || 0);
+          const parsed = Number(stats.parsed || 0) + Number(stats.previewed || 0);
+          const processing = Number(stats.processing || 0);
+          const queued = Number(stats.queued || 0);
+          const failed = Number(stats.failed || 0);
+          const status = String(metaCard.status || '').trim();
+          const hitRequirementCount = Number(metaCard.hit_requirement_count || 0);
+          const missingNumericCount = Number(metaCard.missing_numeric_term_count || 0);
+          if (!total) {
+            return { health: 'idle', tone: '#64748b', text: '当前状态：未上传。' };
+          }
+          let health = 'active';
+          let tone = '#166534';
+          let text = '当前状态：共上传 ' + String(total) + ' 份文件';
+          if (processing > 0 || queued > 0) {
+            health = processing > 0 ? 'processing' : 'queued';
+            tone = processing > 0 ? '#92400e' : '#475569';
+            text += '，已解析 ' + String(parsed) + ' 份';
+            if (processing > 0) text += '，处理中 ' + String(processing) + ' 份';
+            if (queued > 0) text += '，排队 ' + String(queued) + ' 份';
+            text += '。';
+          } else if (failed > 0 && parsed <= 0) {
+            health = 'failed';
+            tone = '#991b1b';
+            text += '，解析失败 ' + String(failed) + ' 份，请重试或替换文件。';
+          } else if (failed > 0) {
+            health = 'parsed_not_used';
+            tone = '#9a3412';
+            text += '，已解析 ' + String(parsed) + ' 份，失败 ' + String(failed) + ' 份。';
+          } else if (status === 'parsed_not_used') {
+            health = 'parsed_not_used';
+            tone = '#9a3412';
+            text += '，已全部解析完成，待进入评分证据链。';
+          } else if (status === 'parsed_ready') {
+            health = 'parsed_ready';
+            tone = '#1d4ed8';
+            text += '，已全部解析完成，待评分时自动进入证据链。';
+          } else if (status === 'uploaded_unparsed') {
+            health = 'uploaded_unparsed';
+            tone = '#991b1b';
+            text += '，文件已上传但尚未成功解析。';
+          } else {
+            health = status === 'active' ? 'active' : 'parsed';
+            tone = '#166534';
+            text += '，已全部解析完成。';
+          }
+          if (hitRequirementCount > 0) {
+            text += ' 已命中 ' + String(hitRequirementCount) + ' 条约束。';
+          } else if (missingNumericCount > 0 && failed <= 0 && processing <= 0 && queued <= 0) {
+            text += ' 建议补齐资料后再复查证据链。';
+          }
+          return { health: health, tone: tone, text: text };
+        }
+        function buildMaterialUploadZoneDebugHtml(materialType, bucket, card) {
+          const stats = (bucket && typeof bucket === 'object') ? bucket : {};
+          const metaCard = (card && typeof card === 'object') ? card : {};
+          if (Number(stats.total || 0) <= 0) {
+            return '';
+          }
+          const parseStatusCounts = (metaCard.parse_status_counts && typeof metaCard.parse_status_counts === 'object')
+            ? metaCard.parse_status_counts
+            : {};
+          const parseBackendSummary = Array.isArray(metaCard.parse_backend_summary)
+            ? metaCard.parse_backend_summary
+            : [];
+          const missingNumericCategorySummary = Array.isArray(metaCard.missing_numeric_category_summary)
+            ? metaCard.missing_numeric_category_summary
+            : [];
+          const projectNumericCategorySummary = Array.isArray(metaCard.project_numeric_category_summary)
+            ? metaCard.project_numeric_category_summary
+            : [];
+          const parseErrorPreview = Array.isArray(metaCard.parse_error_preview)
+            ? metaCard.parse_error_preview
+            : [];
+          const routePreview = Array.isArray(stats.routeLabels) ? stats.routeLabels.filter((item) => !!item) : [];
+          const parseStatusSummary = Object.keys(parseStatusCounts).map((key) => key + ':' + String(parseStatusCounts[key] || 0)).join('，');
+          const sections = [];
+          sections.push(
+            buildMaterialParseDebugTableHtml('解析任务', [
+              ['资料类型', String(metaCard.material_type_label || materialTypeDisplayName(materialType) || materialType || '资料')],
+              ['文件总数', String(Number(stats.total || 0)) + ' 份'],
+              ['解析进度', '已解析 ' + String(Number(stats.parsed || 0) + Number(stats.previewed || 0)) + ' / 处理中 ' + String(Number(stats.processing || 0)) + ' / 排队 ' + String(Number(stats.queued || 0)) + ' / 失败 ' + String(Number(stats.failed || 0))],
+              ['解析路径', routePreview.length ? routePreview.join('、') : '-'],
+              ['解析来源', parseBackendSummary.length ? parseBackendSummary.join('、') : '-'],
+              ['状态分布', parseStatusSummary || '-'],
+            ])
+          );
+          if (Number(metaCard.hit_requirement_count || 0) > 0 || Number(metaCard.hit_filename_count || 0) > 0) {
+            sections.push(
+              buildMaterialParseDebugTableHtml('证据链快照', [
+                ['命中文件', String(Number(metaCard.hit_filename_count || 0)) + ' 份'],
+                ['命中约束', String(Number(metaCard.hit_requirement_count || 0)) + ' 条'],
+                ['已提取锚点', projectNumericCategorySummary.slice(0, 2).join('；') || '-'],
+                ['重点缺口', missingNumericCategorySummary.slice(0, 2).join('；') || '-'],
+              ])
+            );
+          }
+          if (parseErrorPreview.length) {
+            sections.push(
+              buildMaterialParseDebugTableHtml('最近异常', [
+                ['错误摘要', String(parseErrorPreview[0] || '-')],
+              ])
+            );
+          }
+          return sections.filter(Boolean).join('');
+        }
+        function clearMaterialUploadZonePanels() {
           ['tender_qa', 'boq', 'drawing', 'site_photo'].forEach((materialType) => {
-            const zoneId = materialTypeUploadZoneId(materialType);
-            const stateId = materialTypeUploadZoneStateId(materialType);
-            const zoneEl = zoneId ? document.getElementById(zoneId) : null;
-            const stateEl = stateId ? document.getElementById(stateId) : null;
+            const zoneEl = document.getElementById(materialTypeUploadZoneId(materialType));
+            const stateEl = document.getElementById(materialTypeUploadZoneStateId(materialType));
+            const tableId = materialTypeUploadZoneFilesId(materialType);
+            const tableEl = tableId ? document.getElementById(tableId) : null;
+            const emptyEl = document.getElementById(materialTypeUploadZoneEmptyId(materialType));
+            const debugPanel = document.getElementById(materialTypeUploadZoneDebugPanelId(materialType));
+            const debugBody = document.getElementById(materialTypeUploadZoneDebugInfoId(materialType));
             if (zoneEl) zoneEl.dataset.health = 'idle';
             if (stateEl) {
               stateEl.style.color = '#64748b';
               stateEl.textContent = '当前状态：未上传。';
             }
+            if (tableId) replaceTableRowsIfChanged(tableId, [], '__upload_zone__empty__|' + materialType);
+            if (tableEl) tableEl.style.display = 'none';
+            if (emptyEl) {
+              emptyEl.textContent = '暂无已上传文件。';
+              emptyEl.style.display = 'block';
+            }
+            if (debugBody) debugBody.innerHTML = '';
+            if (debugPanel) {
+              debugPanel.open = false;
+              debugPanel.style.display = 'none';
+            }
           });
         }
-        function applyMaterialUploadZoneHighlights(typeCards) {
-          clearMaterialUploadZoneHighlights();
+        function renderMaterialUploadZones(materials, typeCards, projectId='') {
+          const rows = Array.isArray(materials) ? materials : [];
           const cards = Array.isArray(typeCards) ? typeCards : [];
-          cards.forEach((card) => {
-            if (!card || typeof card !== 'object') return;
-            const materialType = String(card.material_type || '').trim();
-            const zoneId = materialTypeUploadZoneId(materialType);
-            const stateId = materialTypeUploadZoneStateId(materialType);
-            const zoneEl = zoneId ? document.getElementById(zoneId) : null;
-            const stateEl = stateId ? document.getElementById(stateId) : null;
-            if (!zoneEl || !stateEl) return;
-            const status = String(card.status || 'idle');
-            zoneEl.dataset.health = status || 'idle';
-            const hitRequirementCount = Number(card.hit_requirement_count || 0);
-            const hitFileCount = Number(card.hit_filename_count || 0);
-            const missingNumericCount = Number(card.missing_numeric_term_count || 0);
-            const missingNumericCategorySummary = Array.isArray(card.missing_numeric_category_summary)
-              ? card.missing_numeric_category_summary
-              : [];
-            const projectNumericCategorySummary = Array.isArray(card.project_numeric_category_summary)
-              ? card.project_numeric_category_summary
-              : [];
-            const parseStatusCounts = (card.parse_status_counts && typeof card.parse_status_counts === 'object')
-              ? card.parse_status_counts
-              : {};
-            const parseStatusSummary = Object.keys(parseStatusCounts).length
-              ? Object.keys(parseStatusCounts).map((key) => key + ':' + String(parseStatusCounts[key] || 0)).join('，')
-              : '';
-            const parseBackendSummary = Array.isArray(card.parse_backend_summary)
-              ? card.parse_backend_summary
-              : [];
-            const parseErrorPreview = Array.isArray(card.parse_error_preview)
-              ? card.parse_error_preview
-              : [];
-            const statusLabel = String(card.status_label || '未上传');
-            let text = '当前状态：' + statusLabel;
-            if (status === 'active') {
-              text += '；已命中文件 ' + String(hitFileCount) + ' 份';
-              if (hitRequirementCount > 0) text += '；已命中约束 ' + String(hitRequirementCount) + ' 条';
-              if (missingNumericCount > 0) text += '；仍缺数值锚点 ' + String(missingNumericCount) + ' 项';
-              if (missingNumericCategorySummary.length) text += '；重点缺口 ' + String(missingNumericCategorySummary[0] || '');
-              if (parseBackendSummary.length) text += '；解析来源 ' + String(parseBackendSummary[0] || '');
-              stateEl.style.color = '#166534';
-            } else if (status === 'processing') {
-              text += '；后台深读进行中';
-              if (parseStatusSummary) text += '；' + parseStatusSummary;
-              stateEl.style.color = '#92400e';
-            } else if (status === 'queued') {
-              text += '；已进入深读队列';
-              if (parseStatusSummary) text += '；' + parseStatusSummary;
-              stateEl.style.color = '#475569';
-            } else if (status === 'failed') {
-              text += '；请点击重新解析';
-              if (parseErrorPreview.length) text += '；最近错误 ' + String(parseErrorPreview[0] || '');
-              stateEl.style.color = '#991b1b';
-            } else if (status === 'parsed_ready') {
-              if (statusLabel.indexOf('待施组') >= 0) {
-                text += '；解析已完成，待上传施组后自动进入评分证据链';
-              } else {
-                text += '；解析已完成，待完成评分后自动进入评分证据链';
-              }
-              if (projectNumericCategorySummary.length) text += '；已提取 ' + String(projectNumericCategorySummary[0] || '');
-              if (missingNumericCount > 0) text += '；建议补充数值锚点 ' + String(missingNumericCount) + ' 项';
-              if (missingNumericCategorySummary.length) text += '；重点缺口 ' + String(missingNumericCategorySummary[0] || '');
-              stateEl.style.color = '#1d4ed8';
-            } else if (status === 'parsed_not_used') {
-              text += '；已解析但尚未进入评分证据链';
-              if (missingNumericCount > 0) text += '；建议补充数值锚点 ' + String(missingNumericCount) + ' 项';
-              if (projectNumericCategorySummary.length) text += '；已提取 ' + String(projectNumericCategorySummary[0] || '');
-              if (missingNumericCategorySummary.length) text += '；重点缺口 ' + String(missingNumericCategorySummary[0] || '');
-              stateEl.style.color = '#9a3412';
-            } else if (status === 'uploaded_unparsed') {
-              text += '；建议更换可解析版本或补传文本/PDF';
-              stateEl.style.color = '#991b1b';
-            } else if (status === 'missing') {
-              text += '；当前阻断评分';
-              stateEl.style.color = '#991b1b';
-            } else {
-              stateEl.style.color = '#64748b';
-            }
-            stateEl.textContent = text;
+          const effectiveProjectId = String(projectId || pid() || '').trim();
+          const bucketsByType = {};
+          ['tender_qa', 'boq', 'drawing', 'site_photo'].forEach((materialType) => {
+            bucketsByType[materialType] = {
+              rows: [],
+              total: 0,
+              parsed: 0,
+              previewed: 0,
+              queued: 0,
+              processing: 0,
+              failed: 0,
+              routeLabels: [],
+            };
           });
+          rows.forEach((row) => {
+            if (!row || typeof row !== 'object') return;
+            const materialType = String(row.material_type || '').trim() || 'tender_qa';
+            const bucket = bucketsByType[materialType];
+            if (!bucket) return;
+            const status = String(row.parse_effective_status || row.parse_status || 'queued').trim().toLowerCase();
+            const routeLabel = String(row.parse_route_label || '').trim();
+            bucket.rows.push(row);
+            bucket.total += 1;
+            if (status === 'parsed') bucket.parsed += 1;
+            else if (status === 'previewed') bucket.previewed += 1;
+            else if (status === 'processing') bucket.processing += 1;
+            else if (status === 'failed') bucket.failed += 1;
+            else bucket.queued += 1;
+            if (routeLabel && !bucket.routeLabels.includes(routeLabel)) bucket.routeLabels.push(routeLabel);
+          });
+          ['tender_qa', 'boq', 'drawing', 'site_photo'].forEach((materialType) => {
+            const zoneEl = document.getElementById(materialTypeUploadZoneId(materialType));
+            const stateEl = document.getElementById(materialTypeUploadZoneStateId(materialType));
+            const tableId = materialTypeUploadZoneFilesId(materialType);
+            const tableEl = tableId ? document.getElementById(tableId) : null;
+            const emptyEl = document.getElementById(materialTypeUploadZoneEmptyId(materialType));
+            const debugPanel = document.getElementById(materialTypeUploadZoneDebugPanelId(materialType));
+            const debugBody = document.getElementById(materialTypeUploadZoneDebugInfoId(materialType));
+            if (!zoneEl || !stateEl || !tableId) return;
+            const bucket = bucketsByType[materialType] || {
+              rows: [],
+              total: 0,
+              parsed: 0,
+              previewed: 0,
+              queued: 0,
+              processing: 0,
+              failed: 0,
+              routeLabels: [],
+            };
+            const card = cards.find((item) => String((item && item.material_type) || '').trim() === materialType) || null;
+            const summary = materialUploadZoneBusinessState(bucket, card);
+            zoneEl.dataset.health = summary.health || 'idle';
+            stateEl.style.color = summary.tone || '#64748b';
+            stateEl.textContent = summary.text || '当前状态：未上传。';
+            const rowHtml = bucket.rows.map((row) => buildMaterialUploadZoneFileRowHtml(row, effectiveProjectId));
+            replaceTableRowsIfChanged(
+              tableId,
+              rowHtml,
+              'upload_zone|' + effectiveProjectId + '|' + materialType + '|'
+                + buildTableRenderSignature(
+                  bucket.rows,
+                  (row) => [
+                    String((row && row.id) || ''),
+                    String((row && row.filename) || ''),
+                    String((row && row.parse_effective_status) || (row && row.parse_status) || ''),
+                    String((row && row.parse_finished_at) || (row && row.created_at) || ''),
+                  ].join('|')
+                )
+            );
+            if (tableEl) tableEl.style.display = bucket.total > 0 ? 'table' : 'none';
+            if (emptyEl) {
+              emptyEl.textContent = bucket.total > 0 ? '' : '暂无已上传文件。';
+              emptyEl.style.display = bucket.total > 0 ? 'none' : 'block';
+            }
+            const debugHtml = buildMaterialUploadZoneDebugHtml(materialType, bucket, card);
+            if (debugPanel && debugBody) {
+              if (debugHtml) {
+                debugPanel.style.display = 'block';
+                debugPanel.open = false;
+                debugBody.innerHTML = debugHtml;
+              } else {
+                debugPanel.open = false;
+                debugPanel.style.display = 'none';
+                debugBody.innerHTML = '';
+              }
+            }
+          });
+        }
+        function clearMaterialUploadZoneHighlights() {
+          materialUploadZoneDiagnosticState = { project_id: '', typeCards: [] };
+          renderMaterialUploadZones(
+            (materialParseSummaryState && Array.isArray(materialParseSummaryState.materials))
+              ? materialParseSummaryState.materials
+              : [],
+            [],
+            pid()
+          );
+        }
+        function applyMaterialUploadZoneHighlights(typeCards) {
+          materialUploadZoneDiagnosticState = {
+            project_id: String(pid() || ''),
+            typeCards: Array.isArray(typeCards) ? typeCards : [],
+          };
+          renderMaterialUploadZones(
+            (materialParseSummaryState && Array.isArray(materialParseSummaryState.materials))
+              ? materialParseSummaryState.materials
+              : [],
+            materialUploadZoneDiagnosticState.typeCards,
+            pid()
+          );
         }
         function updateShigongGateSummary(payload) {
           const el = document.getElementById('shigongGateSummary');

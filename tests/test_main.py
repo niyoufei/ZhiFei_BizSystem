@@ -4203,6 +4203,19 @@ class TestIndexEndpoint:
         assert 'id="uploadZoneStateBoq"' in response.text
         assert 'id="uploadZoneStateDrawing"' in response.text
         assert 'id="uploadZoneStateSitePhoto"' in response.text
+        assert 'id="materialUploadZones"' in response.text
+        assert 'id="uploadZoneFilesTenderQa"' in response.text
+        assert 'id="uploadZoneFilesBoq"' in response.text
+        assert 'id="uploadZoneFilesDrawing"' in response.text
+        assert 'id="uploadZoneFilesSitePhoto"' in response.text
+        assert 'id="uploadZoneEmptyTenderQa"' in response.text
+        assert 'id="uploadZoneEmptyBoq"' in response.text
+        assert 'id="uploadZoneEmptyDrawing"' in response.text
+        assert 'id="uploadZoneEmptySitePhoto"' in response.text
+        assert 'id="uploadZoneDebugTenderQa"' in response.text
+        assert 'id="uploadZoneDebugBoq"' in response.text
+        assert 'id="uploadZoneDebugDrawing"' in response.text
+        assert 'id="uploadZoneDebugSitePhoto"' in response.text
         assert 'id="uploadMaterialFile"' in response.text
         assert 'id="uploadMaterialBoqFile"' in response.text
         assert 'id="uploadMaterialDrawingFile"' in response.text
@@ -4257,6 +4270,7 @@ class TestIndexEndpoint:
         assert 'id="section-adaptive" style="display:none"' in response.text
         assert "V2 反演校准闭环（核心能力，强烈建议执行）" in response.text
         assert ".dxf" in response.text
+        assert "解析引擎快照" in response.text
 
     def test_index_replaces_server_side_placeholders(self, client):
         """Index page should not leak template placeholders."""
@@ -5828,6 +5842,9 @@ class TestIndexEndpoint:
         assert "function materialTypeUploadAnchor" in page
         assert "function applyMaterialUploadZoneHighlights" in page
         assert "function clearMaterialUploadZoneHighlights" in page
+        assert "function renderMaterialUploadZones" in page
+        assert "function buildMaterialUploadZoneDebugHtml" in page
+        assert "function buildMaterialUploadZoneFileRowHtml" in page
         assert "function clearMaterialParsePolling" in page
         assert "function applyMaterialParseZoneState" in page
         assert "function scheduleMaterialParsePolling" in page
@@ -5836,13 +5853,18 @@ class TestIndexEndpoint:
         assert "materialsDebugPanel" in page
         assert "materialsDebugInfo" in page
         assert "materialViewResult" in page
+        assert "uploadZoneFilesTenderQa" in page
+        assert "uploadZoneDebugTenderQa" in page
+        assert "uploadZoneDebugInfoTenderQa" in page
         assert "function setMaterialParseSummary" in page
         assert "function renderMaterialParseSummary" in page
         assert "function renderMaterialParseDebugInfo" in page
         assert "function viewMaterialRow" in page
         assert "底层运行监控（Debug Info）" in page
+        assert "解析引擎快照" in page
         assert "<th>资料名称</th>" in page
         assert "<th>解析完成时间</th>" in page
+        assert "<th>文件名称</th>" in page
         assert "latest_finished_at" in page
         assert "parse_stage_label" in page
         assert "parse_route_label" in page
@@ -5869,6 +5891,9 @@ class TestIndexEndpoint:
         assert "scheduler_project_recent_steady_round_count" in page
         assert "scheduler_project_recent_consecutive_steady_round_count" in page
         assert "scheduler_project_recent_stable_hot_threshold" in page
+        assert "text += '；重点缺口 '" not in page
+        assert "text += '；解析来源 '" not in page
+        assert "text += '；已提取 " not in page
         assert "scheduler_project_recent_stable_hot" in page
         assert "scheduler_project_recent_stable_hot_remaining_rounds" in page
         assert "scheduler_project_recent_stable_hot_progress_completed_rounds" in page
