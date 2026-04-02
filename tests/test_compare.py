@@ -1,6 +1,6 @@
 """Unit tests for app.engine.compare module."""
 
-from app.engine.compare import build_compare_narrative
+from app.engine.compare import _normalize_original_text, build_compare_narrative
 
 
 def test_compare_insufficient_submissions():
@@ -48,8 +48,8 @@ def test_compare_two_submissions():
     assert result["bottom_submission"]["filename"] == "施组A.txt"
     assert result["bottom_submission"]["total_score"] == 75.0
     assert len(result["key_diffs"]) == 2
-    assert "85.0分" in result["summary"]
-    assert "75.0分" in result["summary"]
+    assert "85.00分" in result["summary"]
+    assert "75.00分" in result["summary"]
 
 
 def test_compare_multiple_submissions_sorted_correctly():
@@ -237,6 +237,45 @@ def test_compare_narrative_respects_five_scale_totals():
     assert "4.6775 / 5" in result["summary"]
     assert result["submission_optimization_cards"][0]["target_score"] == 5.0
     assert result["submission_scorecards"][0]["target_full_score"] == 5.0
+
+
+def test_compare_narrative_supports_single_submission_focus():
+    submissions = [
+        {
+            "id": "s-low",
+            "filename": "待优化稿.pdf",
+            "total_score": 4.1025,
+            "text": "[PAGE:12]\n仅写加强管理，后续落实。\n",
+            "report": {
+                "dimension_scores": {"09": {"score": 1.0}},
+                "penalties": [],
+            },
+        },
+        {
+            "id": "s-high",
+            "filename": "高分稿.pdf",
+            "total_score": 4.7325,
+            "text": "[PAGE:8]\n建立总控计划、周计划和节点销项闭环。\n",
+            "report": {
+                "dimension_scores": {"09": {"score": 8.6}},
+                "penalties": [],
+            },
+        },
+    ]
+
+    result = build_compare_narrative(submissions, score_scale_max=5, focus_submission_id="s-low")
+
+    assert result["report_scope"] == "submission"
+    assert result["focus_submission"]["id"] == "s-low"
+    assert result["top_submission"] == {}
+    assert result["bottom_submission"] == {}
+    assert "当前仅分析《待优化稿.pdf》" in result["summary"]
+    cards = result.get("submission_optimization_cards") or []
+    assert len(cards) == 1
+    assert cards[0]["submission_id"] == "s-low"
+    scorecards = result.get("submission_scorecards") or []
+    assert len(scorecards) == 1
+    assert scorecards[0]["submission_id"] == "s-low"
 
 
 def test_compare_narrative_carries_score_confidence_metadata():
@@ -451,6 +490,95 @@ def test_compare_optimization_card_contains_executable_steps():
     assert any("前文" in str(r.get("evidence_context") or "") for r in recs)
     assert any("执行清单" in str(r.get("execution_checklist") or "") for r in recs)
     assert any(str(r.get("priority_reason") or "").strip() for r in recs)
+
+
+def test_compare_optimization_card_exposes_replace_and_insert_payloads():
+    submissions = [
+        {
+            "id": "s-low",
+            "filename": "待改稿.pdf",
+            "total_score": 60.0,
+            "text": "",
+            "report": {
+                "dimension_scores": {"09": {"score": 1.0}},
+                "penalties": [
+                    {"code": "P-ACTION-002", "points": 0.8, "reason": "措施缺少硬要素：role,accept"}
+                ],
+            },
+        },
+        {
+            "id": "s-high",
+            "filename": "高分稿.pdf",
+            "total_score": 86.0,
+            "text": "[PAGE:1]\n总控计划、周计划、节点销项、验收闭环。\n",
+            "report": {"dimension_scores": {"09": {"score": 8.5}}, "penalties": []},
+        },
+    ]
+
+    result = build_compare_narrative(submissions)
+    cards = result.get("submission_optimization_cards") or []
+    low_card = next((c for c in cards if c.get("submission_id") == "s-low"), {})
+    recs = low_card.get("recommendations") or []
+
+    assert any(r.get("write_mode") == "insert" for r in recs)
+    assert any(r.get("write_mode") == "replace" for r in recs)
+    insert_row = next((r for r in recs if r.get("write_mode") == "insert"), {})
+    replace_row = next((r for r in recs if r.get("write_mode") == "replace"), {})
+    assert "补充以下完整内容" in str(insert_row.get("insertion_guidance") or "")
+    assert str(insert_row.get("replacement_text") or "").strip()
+    assert str(insert_row.get("original_text") or "").strip()
+    assert replace_row.get("write_mode_label") == "原句替换"
+    assert str(replace_row.get("replacement_text") or "").strip()
+    assert "排版约束" in str(replace_row.get("layout_constraint") or "")
+
+
+def test_compare_optimization_original_text_strips_extraction_markers():
+    cleaned = _normalize_original_text(
+        "[PDF_BACKEND:pymupdf] [PAGE_OCR_MODE:1] gray_2x:psm11 score=6.9921 "
+        "[PAGE_OCR:1] 塘岗中心老旧小区改造工程施工组织设计"
+    )
+
+    assert "[PDF_BACKEND" not in cleaned
+    assert "gray_2x:psm11" not in cleaned
+    assert "塘岗中心老旧小区改造工程施工组织设计" in cleaned
+
+
+def test_compare_optimization_card_carries_material_gate_summary():
+    submissions = [
+        {
+            "id": "s-low",
+            "filename": "资料门禁稿.pdf",
+            "total_score": 60.0,
+            "text": "[PAGE:1]\n仅写加强管理，后续落实。\n",
+            "report": {
+                "dimension_scores": {"09": {"score": 1.0}},
+                "penalties": [],
+                "meta": {
+                    "material_utilization_gate": {
+                        "blocked": True,
+                        "warned": True,
+                        "reasons": ["资料检索文件覆盖率 30.8% 低于阈值 35.0%"],
+                    }
+                },
+            },
+        },
+        {
+            "id": "s-high",
+            "filename": "高分稿.pdf",
+            "total_score": 86.0,
+            "text": "[PAGE:1]\n总控计划、周计划、节点销项、验收闭环。\n",
+            "report": {"dimension_scores": {"09": {"score": 8.5}}, "penalties": []},
+        },
+    ]
+    result = build_compare_narrative(submissions)
+    cards = result.get("submission_optimization_cards") or []
+    low_card = next((c for c in cards if c.get("submission_id") == "s-low"), {})
+
+    assert low_card.get("material_gate_blocked") is True
+    assert "资料利用门禁阻断" in str(low_card.get("material_gate_summary") or "")
+    assert "资料检索文件覆盖率 30.8% 低于阈值 35.0%" in str(
+        low_card.get("material_gate_summary") or ""
+    )
 
 
 def test_compare_dimension_diagnostics_contains_weak_filenames():

@@ -31267,6 +31267,7 @@ def compare_submissions(
 def compare_report(
     project_id: str,
     score_scale_max: Optional[int] = Query(None, description="报告展示满分制（5或100）"),
+    submission_id: Optional[str] = Query(None, description="仅生成指定施组的逐页优化清单"),
     locale: str = Depends(get_locale),
 ) -> CompareNarrative:
     """
@@ -31290,6 +31291,11 @@ def compare_report(
     submissions = [s for s in submissions_all if _submission_has_generated_score(s)]
     if not submissions:
         raise HTTPException(status_code=404, detail="暂无已评分施组，请先点击“评分施组”。")
+    focused_submission_id = str(submission_id or "").strip()
+    if focused_submission_id and not any(
+        str(s.get("id") or "").strip() == focused_submission_id for s in submissions
+    ):
+        raise HTTPException(status_code=404, detail="未找到指定施组的优化清单上下文。")
     material_knowledge_snapshot = _build_material_knowledge_profile(project_id)
     submissions_for_compare = []
     by_id: Dict[str, Dict[str, object]] = {}
@@ -31325,6 +31331,7 @@ def compare_report(
     narrative = build_compare_narrative(
         submissions_for_compare,
         score_scale_max=report_score_scale_max,
+        focus_submission_id=focused_submission_id,
     )
     for key in ("top_submission", "bottom_submission"):
         row = narrative.get(key)
@@ -31366,6 +31373,30 @@ def compare_report(
             or ""
         )
         row["score_self_awareness"] = awareness if isinstance(awareness, dict) else {}
+    focus_submission = narrative.get("focus_submission")
+    if isinstance(focus_submission, dict) and focus_submission:
+        sid = str(focus_submission.get("id") or "")
+        source_submission = by_id.get(sid)
+        if source_submission:
+            focus_submission["score_confidence_level"] = str(
+                ((source_submission.get("report") or {}).get("meta") or {}).get(
+                    "score_confidence_level"
+                )
+                or ""
+            )
+            awareness = (
+                ((source_submission.get("report") or {}).get("meta") or {}).get(
+                    "score_self_awareness"
+                )
+                if isinstance(
+                    ((source_submission.get("report") or {}).get("meta") or {}).get(
+                        "score_self_awareness"
+                    ),
+                    dict,
+                )
+                else {}
+            )
+            focus_submission["score_self_awareness"] = awareness if isinstance(awareness, dict) else {}
     return CompareNarrative(project_id=project_id, **narrative)
 
 
@@ -34100,6 +34131,24 @@ def index(
             const raw = (el && el.value) ? String(el.value).trim() : '100';
             return raw === '5' ? 5 : 100;
           }
+          window.pendingOptimizationReportSubmissionId = String(window.pendingOptimizationReportSubmissionId || '');
+          window.pendingOptimizationReportFilename = String(window.pendingOptimizationReportFilename || '');
+          function rememberOptimizationReportFocus(submissionId='', filename='') {
+            window.pendingOptimizationReportSubmissionId = String(submissionId || '').trim();
+            window.pendingOptimizationReportFilename = String(filename || '').trim();
+          }
+          function clearOptimizationReportFocus() {
+            window.pendingOptimizationReportSubmissionId = '';
+            window.pendingOptimizationReportFilename = '';
+          }
+          function buildOptimizationReportPath(pid) {
+            const path = '/api/v1/projects/' + pid + '/compare_report?score_scale_max=' + selectedScoreScaleMax();
+            if (!window.pendingOptimizationReportSubmissionId) return path;
+            return path + '&submission_id=' + encodeURIComponent(window.pendingOptimizationReportSubmissionId);
+          }
+          window.rememberOptimizationReportFocus = rememberOptimizationReportFocus;
+          window.clearOptimizationReportFocus = clearOptimizationReportFocus;
+          window.buildOptimizationReportPath = buildOptimizationReportPath;
 
           const EARLY_ACTIONS = {
             btnMaterialDepthReport: { resultId: 'materialDepthReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials/depth_report', loading: '资料深读体检生成中...' },
@@ -34108,7 +34157,7 @@ def index(
             btnMaterialKnowledgeProfileDownload: { resultId: 'materialKnowledgeProfileResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials/knowledge_profile.md', loading: '知识画像下载准备中...' },
             btnScoringDiagnostic: { resultId: 'scoringDiagnosticResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/scoring_diagnostic/latest', loading: '评分证据链诊断生成中...' },
             btnCompare: { resultId: 'compareResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare', loading: '对比排名加载中...' },
-            btnCompareReport: { resultId: 'compareReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare_report?score_scale_max=' + selectedScoreScaleMax(), loading: '满分优化清单生成中...' },
+            btnCompareReport: { resultId: 'compareReportResult', method: 'GET', path: (pid) => buildOptimizationReportPath(pid), loading: '满分优化清单生成中...' },
             btnInsights: { resultId: 'insightsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/insights', loading: '洞察分析中...' },
             btnLearning: { resultId: 'learningResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/learning', loading: '学习画像生成中...' },
             btnEvidenceTrace: { resultId: 'evidenceTraceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/evidence_trace/latest', loading: '证据追溯生成中...' },
@@ -34825,7 +34874,7 @@ def index(
             <strong>锁定说明：</strong>若项目已进入青天评标阶段，点击“评分施组”后会先提示确认；确认后系统会自动解锁并继续重算，无需删除项目。
           </div>
           <p id="shigongActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
-          <p class="note" style="margin:6px 0 0 0">满分优化清单会展示定位页码、证据片段、建议改写和验收标准。</p>
+          <p class="note" style="margin:6px 0 0 0">满分优化清单会按当前施组输出页码定位、原文摘录、直接替换文本或原位补充内容，并默认控制篇幅不明显增页。</p>
           <div id="scoringReadinessResult" class="result-block" style="display:none"></div>
           <div id="scoringDiagnosticResult" class="result-block" style="display:none"></div>
           <div id="materialUtilizationResult" class="result-block" style="display:none"></div>
@@ -35027,7 +35076,7 @@ def index(
             btnScoreShigong: { resultId: 'shigongActionStatus', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/rescore', loading: '施组评分中...' },
             btnScoringDiagnostic: { resultId: 'scoringDiagnosticResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/scoring_diagnostic/latest', loading: '评分证据链诊断生成中...' },
             btnCompare: { resultId: 'compareResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare', loading: '对比排名加载中...' },
-            btnCompareReport: { resultId: 'compareReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare_report?score_scale_max=' + selectedScoreScaleMax(), loading: '满分优化清单生成中...' },
+            btnCompareReport: { resultId: 'compareReportResult', method: 'GET', path: (pid) => buildOptimizationReportPath(pid), loading: '满分优化清单生成中...' },
             btnInsights: { resultId: 'insightsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/insights', loading: '洞察分析中...' },
             btnLearning: { resultId: 'learningResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/learning', loading: '学习画像生成中...' },
             btnEvidenceTrace: { resultId: 'evidenceTraceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/evidence_trace/latest', loading: '证据追溯生成中...' },
@@ -35277,6 +35326,35 @@ def index(
             }
             if (aid === 'btnCompareReport') {
               const summary = fallbackEscapeHtml(data.summary || '');
+              const reportScope = String((data && data.report_scope) || '').trim();
+              const renderRecommendationTable = (rows) => {
+                const recs = Array.isArray(rows) ? rows : [];
+                return '<table><tr><th>写入方式</th><th>页码定位</th><th>原文内容</th><th>直接替换文本 / 原位补充内容</th></tr>'
+                  + (recs.length
+                    ? recs.map((r) => {
+                        const pageLabel = String((r && r.page_hint) || '页码未知') + (r && r.chapter_hint ? (' / ' + String(r.chapter_hint)) : '');
+                        const direct = String((r && r.write_mode) || '') === 'insert'
+                          ? fallbackEscapeHtml(String((r && r.insertion_guidance) || ''))
+                          : fallbackEscapeHtml(String((r && r.replacement_text) || ''));
+                        return '<tr><td>' + fallbackEscapeHtml(String((r && r.write_mode_label) || '')) + '</td><td>' + fallbackEscapeHtml(pageLabel) + '</td><td>' + fallbackEscapeHtml(String((r && r.original_text) || (r && r.evidence) || '')) + '</td><td>' + direct + '</td></tr>';
+                      }).join('')
+                    : '<tr><td colspan="4">暂无可执行清单。</td></tr>')
+                  + '</table>';
+              };
+              if (reportScope === 'submission') {
+                const focus = (data && typeof data.focus_submission === 'object') ? data.focus_submission : {};
+                const card = Array.isArray(data.submission_optimization_cards) && data.submission_optimization_cards.length ? data.submission_optimization_cards[0] : {};
+                const html = ''
+                  + '<p class="note">当前仅分析你点击的这一份施组，不混入其它文件的优化建议。</p>'
+                  + '<p><strong>摘要</strong>：' + summary + '</p>'
+                  + '<p><strong>文件</strong>：' + fallbackEscapeHtml(String(focus.filename || card.filename || '-')) + '</p>'
+                  + '<strong>逐页精准优化清单</strong>'
+                  + renderRecommendationTable(card.recommendations || []);
+                fallbackSetResultHtml(resultId, html);
+                flushOptimizationReportPanelScroll();
+                clearOptimizationReportFocus();
+                return true;
+              }
               const top = data.top_submission || {};
               const bottom = data.bottom_submission || {};
               const confidenceText = (row) => {
@@ -35335,6 +35413,7 @@ def index(
                 + (cardHtml || '<div style="color:#64748b">暂无优化清单。</div>');
               fallbackSetResultHtml(resultId, html);
               flushOptimizationReportPanelScroll();
+              clearOptimizationReportFocus();
               return true;
             }
             if (aid === 'btnInsights') {
@@ -41391,8 +41470,10 @@ def index(
             setResultError('compareReportResult', '请先选择项目后再查看满分优化清单。');
             return false;
           }
+          rememberOptimizationReportFocus(opts.submissionId || '', opts.filename || '');
           const triggerBtn = document.getElementById('btnCompareReport');
           if (!triggerBtn || typeof triggerBtn.click !== 'function') {
+            clearOptimizationReportFocus();
             setResultError('compareReportResult', '满分优化清单入口不可用。');
             return false;
           }
@@ -41410,7 +41491,11 @@ def index(
               if (optimizeBtn) {
                 ev.preventDefault();
                 const projectId = optimizeBtn.getAttribute('data-project-id') || resolveProjectId();
-                triggerOptimizationReportAction(projectId, { scrollIntoView: true });
+                triggerOptimizationReportAction(projectId, {
+                  scrollIntoView: true,
+                  submissionId: optimizeBtn.getAttribute('data-submission-id') || '',
+                  filename: optimizeBtn.getAttribute('data-filename') || '',
+                });
                 return;
               }
               const govBtn = ev.target && ev.target.closest ? ev.target.closest('.js-open-feedback-governance') : null;
@@ -41443,7 +41528,11 @@ def index(
               if (optimizeBtn) {
                 ev.preventDefault();
                 const projectId = optimizeBtn.getAttribute('data-project-id') || resolveProjectId();
-                triggerOptimizationReportAction(projectId, { scrollIntoView: true });
+                triggerOptimizationReportAction(projectId, {
+                  scrollIntoView: true,
+                  submissionId: optimizeBtn.getAttribute('data-submission-id') || '',
+                  filename: optimizeBtn.getAttribute('data-filename') || '',
+                });
                 return;
               }
               const govBtn = ev.target && ev.target.closest ? ev.target.closest('.js-open-feedback-governance') : null;
@@ -42367,7 +42456,7 @@ def index(
             html += '<div class="note">' + esc(governanceHint) + '</div>';
           }
           if (projectId) {
-            html += '<div style="margin-top:6px"><button type="button" class="secondary js-open-compare-report" data-project-id="' + esc(String(projectId || '')) + '">查看满分优化清单（逐页）</button></div>';
+            html += '<div style="margin-top:6px"><button type="button" class="secondary js-open-compare-report" data-project-id="' + esc(String(projectId || '')) + '" data-submission-id="' + esc(String(submission && submission.id || '')) + '" data-filename="' + esc(String(submission && submission.filename || '')) + '">查看满分优化清单（逐页）</button></div>';
           }
           return html;
         }
@@ -46534,6 +46623,7 @@ def index(
           } else {
             el.innerHTML = '<span class="error">' + (data.detail || '请求失败') + '</span>';
           }
+          clearOptimizationReportFocus();
         });
 
         safeClick('btnOptimizationReport', async () => {
@@ -46545,6 +46635,8 @@ def index(
           if (!ensureProjectForAction('compareReportResult')) return;
           setResultLoading('compareReportResult', '满分优化清单生成中...');
           const projectId = actionProjectId();
+          const focusedSubmissionId = pendingOptimizationReportSubmissionId;
+          const focusedFilename = pendingOptimizationReportFilename;
           const reportScaleMax = selectedScoreScaleMax();
           const reportScaleLabel = reportScaleMax === 5 ? '5分制' : '100分制';
           const formatScoreForReportScale = (value) => {
@@ -46555,7 +46647,7 @@ def index(
             if (value == null || value === '') return '-';
             return reportScaleMax === 5 ? String(value) : (String(value) + '分');
           };
-          const res = await fetch('/api/v1/projects/' + projectId + '/compare_report?score_scale_max=' + reportScaleMax);
+          const res = await fetch(buildOptimizationReportPath(projectId));
           const data = await res.json().catch(() => ({}));
           showJson('output', formatApiOutput(res, data));
           const el = document.getElementById('compareReportResult');
@@ -46584,6 +46676,51 @@ def index(
               const reason = Array.isArray(awareness.reasons) && awareness.reasons.length ? ('；' + awareness.reasons[0]) : '';
               return '置信等级 ' + esc(level) + score + reason;
             };
+            const renderOptimizationRecommendationTable = (rows) => {
+              const recRows = Array.isArray(rows) ? rows : [];
+              return '<table><tr><th>写入方式</th><th>页码定位</th><th>原文内容</th><th>直接替换文本 / 原位补充内容</th></tr>'
+                + (recRows.length ? recRows.map((r) => {
+                  const pageLabel = (r.page_hint || '页码未知') + ((r.chapter_hint && String(r.chapter_hint).trim()) ? (' / ' + r.chapter_hint) : '');
+                  const directText = r.write_mode === 'insert'
+                    ? (escMultiline(r.insertion_guidance || '') + ((r.insertion_content || '') ? ('<br/><span style="color:#475569;font-size:12px">' + escMultiline(r.insertion_content || '') + '</span>') : ''))
+                    : escMultiline(r.replacement_text || '');
+                  return '<tr>'
+                    + '<td>' + esc((r.priority || '') + ' ' + (r.write_mode_label || '')) + '</td>'
+                    + '<td>' + esc(pageLabel) + '</td>'
+                    + '<td>' + escMultiline(r.original_text || r.evidence || '') + '<br/><span style="color:#64748b;font-size:12px">' + escMultiline(r.issue || '') + '</span></td>'
+                    + '<td>' + directText + '<br/><span style="color:#64748b;font-size:12px">' + esc(r.layout_constraint || '') + '</span></td>'
+                    + '</tr>';
+                }).join('') : '<tr><td colspan="4">暂无可执行清单。</td></tr>')
+                + '</table>';
+            };
+            const reportScope = String(data.report_scope || (focusedSubmissionId ? 'submission' : 'project')).trim();
+            if (reportScope === 'submission') {
+              const focusRow = (data.focus_submission && typeof data.focus_submission === 'object') ? data.focus_submission : {};
+              const focusCard = Array.isArray(data.submission_optimization_cards) && data.submission_optimization_cards.length
+                ? data.submission_optimization_cards[0]
+                : {};
+              const focusScorecard = Array.isArray(data.submission_scorecards) && data.submission_scorecards.length
+                ? data.submission_scorecards[0]
+                : {};
+              const focusName = focusRow.filename || focusCard.filename || focusedFilename || '当前施组';
+              const gateSummary = String(focusCard.material_gate_summary || '').trim();
+              const gateClass = focusCard.material_gate_blocked ? 'error' : 'note';
+              let html = '<p class="note">当前仅分析你点击的这一份施组，不混入其它文件的优化建议。</p>';
+              html += '<p><strong>摘要</strong>: ' + (data.summary || '') + '</p>';
+              html += '<p><strong>文件</strong>: ' + esc(focusName) + '；<strong>当前分</strong>: ' + esc(formatScoreForReportScale(focusRow.total_score != null ? focusRow.total_score : focusCard.total_score)) + '；<strong>目标分</strong>: ' + esc(formatScoreForReportScale(focusCard.target_score)) + '；<strong>差距</strong>: ' + esc(formatDeltaForReportScale(focusCard.target_gap)) + '</p>';
+              if (focusScorecard && Object.keys(focusScorecard).length) {
+                html += '<p class="note">当前累计扣分 ' + esc(formatDeltaForReportScale(focusScorecard.total_deduction_points)) + '；主要失分维度 ' + esc((Array.isArray(focusScorecard.loss_items) ? focusScorecard.loss_items.slice(0, 2).map((x) => (x.dimension || '') + ' ' + (x.dimension_name || '')).join('、') : '暂无')) + '。</p>';
+              }
+              if (gateSummary) {
+                html += '<div class="' + gateClass + '" style="margin:8px 0"><strong>' + escMultiline(gateSummary) + '</strong></div>';
+              }
+              html += '<strong>逐页精准优化清单</strong>';
+              html += renderOptimizationRecommendationTable(focusCard.recommendations || []);
+              el.innerHTML = html;
+              flushOptimizationReportPanelScroll();
+              clearOptimizationReportFocus();
+              return;
+            }
             let html = '<p class="note">用途：定位低分页码、证据片段、建议改写和验收标准，直接支撑“如何把施组做到更高分”。</p>';
             html += '<p><strong>摘要</strong>: ' + (data.summary || '') + '</p>';
             if (data.top_submission && data.top_submission.filename)
@@ -46654,22 +46791,7 @@ def index(
                   const gateSummary = String(card.material_gate_summary || '').trim();
                   const gateClass = card.material_gate_blocked ? 'error' : 'note';
                   const rows = Array.isArray(card.recommendations) ? card.recommendations : [];
-                  const table = '<table><tr><th>优先级</th><th>类别</th><th>建议章节</th><th>定位页码</th><th>预计提分</th><th>优先理由</th><th>问题</th><th>证据片段</th><th>证据窗口（前后文）</th><th>改写前后示例</th><th>建议改写（直接执行）</th><th>验收标准</th><th>执行检查表</th></tr>' +
-                    rows.map(r => '<tr>' +
-                      '<td>' + esc(r.priority || '') + '</td>' +
-                      '<td>' + esc(r.category || '') + '</td>' +
-                      '<td>' + esc(r.chapter_hint || '') + '</td>' +
-                      '<td>' + esc(r.page_hint || '页码未知') + '</td>' +
-                      '<td>' + esc(r.target_delta_reduction == null ? '' : r.target_delta_reduction) + '</td>' +
-                      '<td>' + escMultiline(r.priority_reason || '') + '</td>' +
-                      '<td>' + escMultiline(r.issue || '') + '</td>' +
-                      '<td>' + escMultiline(r.evidence || '') + '</td>' +
-                      '<td><span style="font-size:12px;color:#334155">' + escMultiline(r.evidence_context || '') + '</span></td>' +
-                      '<td><details><summary>展开</summary><span style="font-size:12px;color:#0f172a">' + escMultiline(r.before_after_example || '') + '</span></details></td>' +
-                      '<td><details open><summary>执行步骤</summary>' + escMultiline(r.rewrite_instruction || '') + '</details></td>' +
-                      '<td><details><summary>验收标准</summary>' + escMultiline(r.acceptance_check || '') + '</details></td>' +
-                      '<td><details><summary>检查表</summary>' + escMultiline(r.execution_checklist || '') + '</details></td>' +
-                    '</tr>').join('') + '</table>';
+                  const table = renderOptimizationRecommendationTable(rows);
                   const refTop = card.reference_top_score == null ? '' : ('，项目最高 ' + esc(formatScoreForReportScale(card.reference_top_score)));
                   const title = esc(card.filename || '') + '（当前 ' + esc(formatScoreForReportScale(card.total_score)) + '，目标 ' + esc(formatScoreForReportScale(card.target_score)) + '，差距 ' + esc(formatDeltaForReportScale(card.target_gap)) + refTop + '）';
                   const gateHtml = gateSummary

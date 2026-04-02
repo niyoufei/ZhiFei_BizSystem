@@ -6351,6 +6351,20 @@ class TestIndexEndpoint:
         )
         assert "function upsertSubmissionRowsImmediately(projectId, submissions)" in page
         assert "function triggerOptimizationReportAction(projectId='', options=null)" in page
+        assert (
+            "window.pendingOptimizationReportSubmissionId = String(window.pendingOptimizationReportSubmissionId || '');"
+            in page
+        )
+        assert "function buildOptimizationReportPath(pid) {" in page
+        assert (
+            "return path + '&submission_id=' + encodeURIComponent(window.pendingOptimizationReportSubmissionId);"
+            in page
+        )
+        assert "window.rememberOptimizationReportFocus = rememberOptimizationReportFocus;" in page
+        assert "data-submission-id=\"' + esc(String(submission && submission.id || '')) + '\"" in page
+        assert "renderOptimizationRecommendationTable" in page
+        assert "当前仅分析你点击的这一份施组，不混入其它文件的优化建议。" in page
+        assert "直接替换文本 / 原位补充内容" in page
         assert "function describeSelectedFiles(files, emptyText = '未选择任何文件')" in page
         assert (
             "function updateFilePickerText(inputId, textId, emptyText = '未选择任何文件')" in page
@@ -15752,6 +15766,50 @@ class TestCompareEndpoints:
     @patch("app.main.build_compare_narrative")
     @patch("app.main.load_submissions")
     @patch("app.main.ensure_data_dirs")
+    def test_compare_report_supports_submission_scoped_optimization(
+        self, mock_ensure, mock_load, mock_narrative, client
+    ):
+        mock_load.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "focus.pdf",
+                "total_score": 81.0,
+                "report": {"total_score": 81.0, "scoring_status": "scored"},
+            },
+            {
+                "id": "s2",
+                "project_id": "p1",
+                "filename": "other.pdf",
+                "total_score": 79.0,
+                "report": {"total_score": 79.0, "scoring_status": "scored"},
+            },
+        ]
+
+        def _fake_narrative(rows, *, score_scale_max=100, focus_submission_id=""):
+            assert focus_submission_id == "s1"
+            return {
+                "summary": "focused",
+                "report_scope": "submission",
+                "focus_submission": {"id": "s1", "filename": "focus.pdf", "total_score": 81.0},
+                "top_submission": {},
+                "bottom_submission": {},
+                "key_diffs": [],
+                "submission_optimization_cards": [{"submission_id": "s1", "filename": "focus.pdf"}],
+                "submission_scorecards": [{"submission_id": "s1", "filename": "focus.pdf"}],
+            }
+
+        mock_narrative.side_effect = _fake_narrative
+        response = client.get("/api/v1/projects/p1/compare_report?submission_id=s1")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["report_scope"] == "submission"
+        assert data["focus_submission"]["id"] == "s1"
+        assert len(data["submission_optimization_cards"]) == 1
+
+    @patch("app.main.build_compare_narrative")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
     def test_compare_report_includes_blocked_generated_scores(
         self,
         mock_ensure,
@@ -15790,8 +15848,9 @@ class TestCompareEndpoints:
             },
         ]
 
-        def _fake_narrative(rows, *, score_scale_max=100):
+        def _fake_narrative(rows, *, score_scale_max=100, focus_submission_id=""):
             assert score_scale_max in (5, 100)
+            assert focus_submission_id == ""
             row_map = {str(row.get("id")): row for row in rows}
             assert "s1" in row_map
             assert "s2" in row_map
@@ -15863,8 +15922,9 @@ class TestCompareEndpoints:
             },
         ]
 
-        def _fake_narrative(rows, *, score_scale_max=100):
+        def _fake_narrative(rows, *, score_scale_max=100, focus_submission_id=""):
             assert score_scale_max == 100
+            assert focus_submission_id == ""
             row_map = {str(x.get("id")): x for x in rows}
             assert float(row_map["s1"]["total_score"]) == 65.0
             assert float(row_map["s2"]["total_score"]) == 90.0
@@ -15924,8 +15984,9 @@ class TestCompareEndpoints:
             }
         ]
 
-        def _fake_narrative(rows, *, score_scale_max=100):
+        def _fake_narrative(rows, *, score_scale_max=100, focus_submission_id=""):
             assert score_scale_max == 5
+            assert focus_submission_id == ""
             assert float(rows[0]["total_score"]) == 4.672
             assert float(rows[0]["report"]["pred_total_score"]) == 4.672
             assert float(rows[0]["report"]["rule_total_score"]) == 1.0005

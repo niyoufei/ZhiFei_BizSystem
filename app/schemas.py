@@ -1094,6 +1094,8 @@ class CompareNarrative(BaseModel):
     summary: str
     score_scale_max: int = 100
     score_scale_label: str = "100分制"
+    report_scope: str = "project"
+    focus_submission: Dict[str, Any] = Field(default_factory=dict)
     top_submission: Dict[str, Any]
     bottom_submission: Dict[str, Any]
     key_diffs: List[Dict[str, Any]]

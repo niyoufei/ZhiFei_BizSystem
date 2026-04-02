@@ -310,7 +310,7 @@ def _build_evidence_row(
     locator: str,
     text: str,
     markers: List[Tuple[int, int]],
-) -> Dict[str, str]:
+) -> Dict[str, Any]:
     clean = _clean_snippet(snippet, limit=220)
     if not clean and text:
         s, e = _char_span_from_locator(locator)
@@ -328,6 +328,7 @@ def _build_evidence_row(
         "locator": locator,
         "page_hint": page_hint,
         "context_window": context_window,
+        "synthetic": False,
     }
 
 
@@ -337,7 +338,7 @@ def _extract_dim_evidence_rows(
     markers: List[Tuple[int, int]],
     max_items: int = 2,
     dim_id: str = "",
-) -> List[Dict[str, str]]:
+) -> List[Dict[str, Any]]:
     rows: List[Dict[str, str]] = []
     seen = set()
 
@@ -388,8 +389,8 @@ def _extract_penalty_evidence_rows(
     text: str,
     markers: List[Tuple[int, int]],
     max_items: int = 2,
-) -> List[Dict[str, str]]:
-    rows: List[Dict[str, str]] = []
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
     seen = set()
     for ev in penalty.get("evidence_refs", []) or []:
         snippet = _safe_str(ev.get("text_snippet") or ev.get("text"))
@@ -608,6 +609,125 @@ def _build_penalty_before_after_example(
     )
 
 
+OPTIMIZATION_LAYOUT_CONSTRAINT = (
+    "排版约束：替换内容与原文篇幅基本对等；补充内容保持极简专业表达，避免明显增页。"
+)
+
+_DIMENSION_DIRECT_REPLACEMENT_OVERRIDES = {
+    "05": "本节改为逐项写清四新技术的应用场景、实施步骤、控制参数、验收标准和异常回退措施，并与现场关键工序直接对应。",
+    "08": "本节改为按控制点、检查方法、频次、责任人和记录表单展开，确保每个质量动作都可验收、可签认、可追溯。",
+    "10": "本节改为按方案编制、审核审批、技术交底、样板确认、实施控制和验收移交的时序链逐项写透。",
+    "12": "本节改为明确前置条件、可穿插工序、禁止交叉情形、移交条件和对应记录表单，避免只保留原则性表述。",
+    "15": "本节改为明确资源预警阈值、调配触发条件、责任岗位、补充时限和效果验证方式，不再只罗列资源数量。",
+    "16": "本节改为写清验证项目、样板部位、通过标准、验收人和推广条件，保证技术措施可执行、可复核、可复制。",
+}
+
+_DIMENSION_INSERTION_OVERRIDES = {
+    "05": "补设四新技术应用清单，逐项写明应用场景、实施步骤、控制参数、验收标准和回退措施，篇幅控制为一段或一张紧凑表。",
+    "08": "补设质量控制与 ITP 简表，至少写清控制点、检查方法、频次、责任人、合格标准和记录表单，采用紧凑字段式表达。",
+    "10": "补设重点专项工程控制表，按方案编制、审批、交底、样板、实施、验收的顺序列出节点要求，尽量压缩为一张表或两段短句。",
+    "12": "补设施工流程穿插与移交控制内容，明确前置条件、可穿插工序、禁止交叉边界和移交条件，保持短句或表格化表达。",
+    "15": "补设资源风险与调配控制条款，写清触发阈值、补充时限、责任岗位和效果验证，避免扩写成大段叙述。",
+    "16": "补设技术措施可行性验证条款，明确验证对象、通过标准、验收动作和推广条件，采用精炼段落或表格句式。",
+}
+
+
+def _shrink_generated_copy(
+    text: str,
+    original_text: str = "",
+    *,
+    insert_mode: bool = False,
+) -> str:
+    cleaned = " ".join(str(text or "").split()).strip()
+    if not cleaned:
+        return ""
+    source_len = len(_clean_snippet(original_text, limit=280))
+    limit = 150 if insert_mode else 130
+    if source_len:
+        dynamic_limit = int(source_len * (1.45 if insert_mode else 1.25))
+        limit = max(56, min(limit, dynamic_limit))
+    if len(cleaned) <= limit:
+        return cleaned
+    trimmed = cleaned[:limit].rstrip("，；、,. ")
+    return trimmed + ("" if trimmed.endswith("。") else "。")
+
+
+def _normalize_original_text(snippet: str, *, synthetic: bool = False) -> str:
+    raw = _clean_snippet(snippet, limit=320)
+    clean = re.sub(r"\[[^\]]+\]", " ", raw)
+    clean = re.sub(r"\b(?:gray|binary|rgb|localx)\S*\s+score=\d+(?:\.\d+)?", " ", clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    clean = _clean_snippet(clean, limit=220)
+    if clean and not synthetic and "未检测到有效证据片段" not in clean:
+        return clean
+    return "当前正文未检出与该要求直接对应的有效原句，需在定位章节补设完整条款。"
+
+
+def _write_location(page_hint: str, chapter_hint: str) -> str:
+    page = _safe_str(page_hint) or "页码未知"
+    chapter = _safe_str(chapter_hint) or "对应章节"
+    return f"在{page}的「{chapter}」末尾"
+
+
+def _build_dimension_replacement_text(
+    dim_id: str,
+    *,
+    evidence: str,
+) -> str:
+    parts = [
+        _materialize_template(
+            _REWRITE_TEMPLATES.get(
+                dim_id,
+                "由【责任岗位】牵头，按【频次】执行检查复核，控制指标【阈值/参数】，并完成【验收动作】闭环。",
+            )
+        )
+    ]
+    extra = _DIMENSION_DIRECT_REPLACEMENT_OVERRIDES.get(dim_id)
+    if extra:
+        parts.append(extra)
+    return _shrink_generated_copy(" ".join(parts), evidence)
+
+
+def _build_dimension_insertion_guidance(
+    dim_id: str,
+    *,
+    page_hint: str,
+    chapter_hint: str,
+    evidence: str,
+) -> Dict[str, str]:
+    content = _DIMENSION_INSERTION_OVERRIDES.get(
+        dim_id,
+        "补设一段紧凑条款，明确责任岗位、执行频次、控制参数、验收动作和记录表单，避免长篇扩写。",
+    )
+    compact = _shrink_generated_copy(content, evidence, insert_mode=True)
+    location = _write_location(page_hint, chapter_hint)
+    return {
+        "insertion_guidance": f"{location}，补充以下完整内容：{compact}",
+        "insertion_content": compact,
+    }
+
+
+def _build_penalty_replacement_text(code: str, *, evidence: str, reason: str) -> str:
+    content = _PENALTY_REWRITE_EXAMPLES.get(
+        code,
+        "由项目经理牵头明确责任岗位、执行频次、阈值参数和验收动作，形成台账留痕并闭环复验。",
+    )
+    if reason and reason not in content:
+        content = content + " 同时消除触发原因中的抽象承诺或缺失字段。"
+    return _shrink_generated_copy(content, evidence)
+
+
+def _recommendation_requires_insertion(evidence_row: Dict[str, Any], evidence: str) -> bool:
+    if bool(evidence_row.get("synthetic")):
+        return True
+    clean = _safe_str(evidence)
+    if not clean:
+        return True
+    if clean.startswith("当前正文未检出"):
+        return True
+    return "建议补充可验证证据" in clean
+
+
 _DIM_PAGE_KEYWORDS = {
     "01": ["工程概况", "项目整体", "实施路径"],
     "02": ["安全生产", "安全管理", "隐患排查"],
@@ -633,6 +753,7 @@ _PENALTY_HINT_KEYWORDS = {
     "P-EMPTY-002": ["加强", "完善", "做好", "确保", "严格", "落实"],
     "P-CONSIST-001": ["工期", "日历天", "节点", "里程碑", "前后", "冲突"],
 }
+
 
 def _chapter_hint(dim_id: str, category: str) -> str:
     if category == "扣分消减":
@@ -752,6 +873,7 @@ def _fallback_dimension_evidence(
                 "后文：（建议按定位章节补录原文证据）",
             ]
         ),
+        "synthetic": True,
     }
 
 
@@ -802,6 +924,7 @@ def _fallback_penalty_evidence(
                 "后文：（建议回到扣分触发页补录原句与整改后表述）",
             ]
         ),
+        "synthetic": True,
     }
 
 
@@ -830,17 +953,41 @@ def _build_submission_optimization_cards(
     all_dim_ids: List[str],
     *,
     total_score_scale_max: float = DEFAULT_TOTAL_SCORE_SCALE_MAX,
+    focus_submission_id: str = "",
+    isolated: bool = False,
 ) -> List[Dict[str, Any]]:
     cards: List[Dict[str, Any]] = []
     top_dims = (top.get("report") or {}).get("dimension_scores", {}) or {}
     top_total = _safe_float(top.get("total_score"))
     target_total_score = _normalize_total_score_scale(total_score_scale_max)
+    focus_id = _safe_str(focus_submission_id)
 
     for s in sorted(rankings, key=compare_sort_key):
         sid = _safe_str(s.get("id"))
+        if focus_id and sid != focus_id:
+            continue
         filename = _safe_str(s.get("filename"))
         total_score = round(_safe_float(s.get("total_score")), 2)
         report = s.get("report") or {}
+        report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+        material_gate = (
+            report_meta.get("material_utilization_gate")
+            if isinstance(report_meta.get("material_utilization_gate"), dict)
+            else {}
+        )
+        material_gate_blocked = bool(material_gate.get("blocked"))
+        material_gate_warned = bool(material_gate.get("warned")) and not material_gate_blocked
+        material_gate_reasons = [
+            _safe_str(item) for item in (material_gate.get("reasons") or []) if _safe_str(item)
+        ][:3]
+        material_gate_summary = ""
+        if material_gate_blocked:
+            if material_gate_reasons:
+                material_gate_summary = "资料利用门禁阻断：" + "；".join(material_gate_reasons[:2])
+            else:
+                material_gate_summary = "资料利用门禁阻断：该施组对部分项目资料未形成足够证据关联。"
+        elif material_gate_warned and material_gate_reasons:
+            material_gate_summary = "资料利用预警：" + "；".join(material_gate_reasons[:2])
         own_dims = report.get("dimension_scores", {}) or {}
         text = _safe_str(s.get("text"))
         markers = _build_page_markers(text)
@@ -891,8 +1038,20 @@ def _build_submission_optimization_cards(
                     "后文：（未定位）",
                 ]
             )
+            write_mode = (
+                "insert" if _recommendation_requires_insertion(dim_ev, evidence_snippet) else "replace"
+            )
+            replace_text = _build_dimension_replacement_text(dim_id, evidence=evidence_snippet)
+            insertion_bundle = _build_dimension_insertion_guidance(
+                dim_id,
+                page_hint=page_hint,
+                chapter_hint=_chapter_hint(dim_id, "维度补强"),
+                evidence=evidence_snippet,
+            )
             recommendations.append(
                 {
+                    "document_id": sid,
+                    "document_filename": filename,
                     "category": "维度补强",
                     "dimension": dim_id,
                     "dimension_name": _dim_name(dim_id),
@@ -902,12 +1061,30 @@ def _build_submission_optimization_cards(
                         f"该维度得分 {own_score:.2f}/{dim_max:.2f}，距满分目标差 {delta_to_full:.2f} 分。"
                         + (
                             f"（较当前项目最高稿低 {delta_to_top:.2f} 分）"
-                            if delta_to_top > 0
+                            if (delta_to_top > 0 and not isolated)
                             else ""
                         )
                     ),
                     "evidence": evidence_snippet,
                     "evidence_context": evidence_context,
+                    "write_mode": write_mode,
+                    "write_mode_label": "原位补充" if write_mode == "insert" else "原句替换",
+                    "original_text": _normalize_original_text(
+                        evidence_snippet,
+                        synthetic=bool(dim_ev.get("synthetic")),
+                    ),
+                    "replacement_text": (
+                        insertion_bundle["insertion_content"]
+                        if write_mode == "insert"
+                        else replace_text
+                    ),
+                    "insertion_guidance": (
+                        insertion_bundle["insertion_guidance"] if write_mode == "insert" else ""
+                    ),
+                    "insertion_content": (
+                        insertion_bundle["insertion_content"] if write_mode == "insert" else ""
+                    ),
+                    "layout_constraint": OPTIMIZATION_LAYOUT_CONSTRAINT,
                     "before_after_example": _build_dimension_before_after_example(
                         dim_id,
                         evidence=evidence_snippet,
@@ -923,12 +1100,12 @@ def _build_submission_optimization_cards(
                     "execution_checklist": _build_dimension_execution_checklist(dim_id, page_hint),
                     "target_delta_reduction": delta_to_full,
                     "target_full_score": dim_max,
-                    "reference_top_score": best_score,
+                    "reference_top_score": None if isolated else best_score,
                     "priority_reason": (
                         f"该维度距满分仍有 {delta_to_full:.2f} 分缺口"
                         + (
                             f"，且较项目最高稿落后 {delta_to_top:.2f} 分"
-                            if delta_to_top > 0
+                            if (delta_to_top > 0 and not isolated)
                             else ""
                         )
                         + "，优先补强可直接提升可审查性得分。"
@@ -961,6 +1138,8 @@ def _build_submission_optimization_cards(
             )
             recommendations.append(
                 {
+                    "document_id": sid,
+                    "document_filename": filename,
                     "category": "扣分消减",
                     "dimension": "",
                     "dimension_name": "",
@@ -969,6 +1148,20 @@ def _build_submission_optimization_cards(
                     "issue": f"{code} 扣分 {points} 分，原因：{reason}",
                     "evidence": evidence_snippet,
                     "evidence_context": evidence_context,
+                    "write_mode": "replace",
+                    "write_mode_label": "原句替换",
+                    "original_text": _normalize_original_text(
+                        evidence_snippet,
+                        synthetic=bool(ev.get("synthetic")),
+                    ),
+                    "replacement_text": _build_penalty_replacement_text(
+                        code,
+                        evidence=evidence_snippet,
+                        reason=reason,
+                    ),
+                    "insertion_guidance": "",
+                    "insertion_content": "",
+                    "layout_constraint": OPTIMIZATION_LAYOUT_CONSTRAINT,
                     "before_after_example": _build_penalty_before_after_example(
                         code,
                         evidence=evidence_snippet,
@@ -997,6 +1190,8 @@ def _build_submission_optimization_cards(
         if not recommendations:
             recommendations.append(
                 {
+                    "document_id": sid,
+                    "document_filename": filename,
                     "category": "保优",
                     "dimension": "",
                     "dimension_name": "",
@@ -1005,6 +1200,13 @@ def _build_submission_optimization_cards(
                     "issue": "当前稿件已处于项目内高分段，重点防回退。",
                     "evidence": "建议做术语一致性与阈值口径复核。",
                     "evidence_context": "页码：全篇\n前文：（无）\n命中：建议做术语一致性与阈值口径复核。\n后文：（无）",
+                    "write_mode": "replace",
+                    "write_mode_label": "原句替换",
+                    "original_text": "建议做术语一致性与阈值口径复核。",
+                    "replacement_text": "统一术语、关键参数和验收动作的口径，并在目录与对应章节同步标注复核结果。",
+                    "insertion_guidance": "",
+                    "insertion_content": "",
+                    "layout_constraint": OPTIMIZATION_LAYOUT_CONSTRAINT,
                     "before_after_example": "\n".join(
                         [
                             "定位：全篇",
@@ -1040,7 +1242,7 @@ def _build_submission_optimization_cards(
                     ),
                     "target_delta_reduction": 0.0,
                     "target_full_score": target_total_score,
-                    "reference_top_score": top_total,
+                    "reference_top_score": None if isolated else top_total,
                     "priority_reason": "当前稿件已在高分段，重点防止表述回退导致二次扣分。",
                 }
             )
@@ -1068,7 +1270,12 @@ def _build_submission_optimization_cards(
                 "total_score": total_score,
                 "target_score": target_total_score,
                 "target_gap": round(max(0.0, target_total_score - total_score), 2),
-                "reference_top_score": top_total,
+                "reference_top_score": None if isolated else top_total,
+                "reference_top_filename": "" if isolated else _safe_str(top.get("filename")),
+                "material_gate_blocked": material_gate_blocked,
+                "material_gate_warned": material_gate_warned,
+                "material_gate_reasons": material_gate_reasons,
+                "material_gate_summary": material_gate_summary,
                 "recommendations": recommendations[:12],
             }
         )
@@ -1081,13 +1288,17 @@ def _build_submission_scorecards(
     all_dim_ids: List[str],
     *,
     total_score_scale_max: float = DEFAULT_TOTAL_SCORE_SCALE_MAX,
+    focus_submission_id: str = "",
 ) -> List[Dict[str, Any]]:
     cards: List[Dict[str, Any]] = []
     top_dims = (top.get("report") or {}).get("dimension_scores", {}) or {}
     target_total_score = _normalize_total_score_scale(total_score_scale_max)
+    focus_id = _safe_str(focus_submission_id)
 
     for rank_desc, s in enumerate(rankings, start=1):
         sid = _safe_str(s.get("id"))
+        if focus_id and sid != focus_id:
+            continue
         filename = _safe_str(s.get("filename"))
         total_score = round(_safe_float(s.get("total_score")), 2)
         report = s.get("report") or {}
@@ -1207,14 +1418,18 @@ def build_compare_narrative(
     submissions: List[Dict[str, Any]],
     *,
     score_scale_max: float = DEFAULT_TOTAL_SCORE_SCALE_MAX,
+    focus_submission_id: str = "",
 ) -> Dict[str, Any]:
     normalized_scale_max = _normalize_total_score_scale(score_scale_max)
     scale_label = _total_score_scale_label(normalized_scale_max)
-    if len(submissions) < 2:
+    focus_id = _safe_str(focus_submission_id)
+    if not submissions or (len(submissions) < 2 and not focus_id):
         return {
             "summary": "施组数量不足，无法进行对比分析。",
             "score_scale_max": int(normalized_scale_max),
             "score_scale_label": scale_label,
+            "report_scope": "project",
+            "focus_submission": {},
             "top_submission": {},
             "bottom_submission": {},
             "key_diffs": [],
@@ -1478,17 +1693,21 @@ def build_compare_narrative(
             }
         )
 
+    isolated_report = bool(focus_id)
     submission_optimization_cards = _build_submission_optimization_cards(
         rankings,
         top,
         all_dim_ids,
         total_score_scale_max=normalized_scale_max,
+        focus_submission_id=focus_id,
+        isolated=isolated_report,
     )
     submission_scorecards = _build_submission_scorecards(
         rankings,
         top,
         all_dim_ids,
         total_score_scale_max=normalized_scale_max,
+        focus_submission_id=focus_id,
     )
     gap = round(_safe_float(top.get("total_score")) - _safe_float(bottom.get("total_score")), 2)
     low_confidence_files = [
@@ -1511,10 +1730,12 @@ def build_compare_narrative(
         + "报告已给出逐文件、逐页定位的优化动作，可直接用于编制迭代。"
     )
 
-    return {
+    base_payload = {
         "summary": summary,
         "score_scale_max": int(normalized_scale_max),
         "score_scale_label": scale_label,
+        "report_scope": "project",
+        "focus_submission": {},
         "top_submission": {
             "id": top.get("id"),
             "filename": top.get("filename"),
@@ -1557,6 +1778,51 @@ def build_compare_narrative(
         "priority_actions": priority_actions[:6],
         "submission_optimization_cards": submission_optimization_cards,
         "submission_scorecards": submission_scorecards,
+    }
+    if not focus_id:
+        return base_payload
+
+    focus_submission = next(
+        (item for item in rankings if _safe_str(item.get("id")) == focus_id),
+        {},
+    )
+    focus_score = round(_safe_float(focus_submission.get("total_score")), 2)
+    focus_filename = _safe_str(focus_submission.get("filename") or focus_id)
+    focus_card = submission_optimization_cards[0] if submission_optimization_cards else {}
+    isolated_summary = (
+        f"当前仅分析《{focus_filename}》的逐页优化清单，"
+        f"当前分 {_format_total_score_text(focus_score, normalized_scale_max)}，"
+        f"距满分目标 {_format_total_score_text(focus_card.get('target_gap') or 0.0, normalized_scale_max)}。"
+        f"已生成 {len(focus_card.get('recommendations') or [])} 条即插即用的替换/补充建议，"
+        f"并严格限定为当前施组上下文。{OPTIMIZATION_LAYOUT_CONSTRAINT}"
+    )
+    return {
+        "summary": isolated_summary,
+        "score_scale_max": int(normalized_scale_max),
+        "score_scale_label": scale_label,
+        "report_scope": "submission",
+        "focus_submission": {
+            "id": focus_submission.get("id"),
+            "filename": focus_submission.get("filename"),
+            "total_score": focus_submission.get("total_score"),
+            **build_compare_sort_fields(focus_submission),
+        },
+        "top_submission": {},
+        "bottom_submission": {},
+        "key_diffs": [],
+        "score_overview": {
+            "submission_count": 1,
+            "score_scale_max": int(normalized_scale_max),
+            "score_scale_label": scale_label,
+            "focus_submission_id": focus_submission.get("id"),
+            "focus_submission_filename": focus_submission.get("filename"),
+        },
+        "dimension_diagnostics": [],
+        "penalty_diagnostics": [],
+        "submission_diagnostics": [],
+        "priority_actions": [],
+        "submission_optimization_cards": submission_optimization_cards[:1],
+        "submission_scorecards": submission_scorecards[:1],
     }
 
 
