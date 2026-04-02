@@ -5896,19 +5896,18 @@ class TestIndexEndpoint:
         assert "materialsParseSummary" in page
         assert "materialsDebugPanel" in page
         assert "materialsDebugInfo" in page
-        assert "materialViewResult" in page
         assert "uploadZoneFilesTenderQa" in page
         assert "uploadZoneDebugTenderQa" in page
         assert "uploadZoneDebugInfoTenderQa" in page
         assert "function setMaterialParseSummary" in page
         assert "function renderMaterialParseSummary" in page
         assert "function renderMaterialParseDebugInfo" in page
-        assert "function viewMaterialRow" in page
         assert "底层运行监控（Debug Info）" in page
         assert "解析引擎快照" in page
         assert "<th>资料名称</th>" in page
         assert "<th>解析完成时间</th>" in page
         assert "<th>文件名称</th>" in page
+        assert "js-view-material" not in page
         assert "latest_finished_at" in page
         assert "parse_stage_label" in page
         assert "parse_route_label" in page

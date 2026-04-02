@@ -47,8 +47,7 @@ def build_selected_project_material_rows_html(project_id: str) -> str:
             + f"<td>{parse_status_label}</td>"
             + f"<td>{parse_finished_at}</td>"
             + (
-                "<td>"
-                + f'<button type="button" class="secondary js-view-material" data-material-id="{material_id}" data-project-id="{html.escape(str(normalized_item.get("project_id") or ""))}" data-filename="{html.escape(filename_raw)}">查看</button> '
+                '<td class="actions-cell">'
                 + f'<button type="button" class="btn-danger js-delete-material" data-material-id="{material_id}" data-project-id="{html.escape(str(normalized_item.get("project_id") or ""))}" data-filename="{html.escape(filename_raw)}" onclick="return window.__zhifeiFallbackDelete(event, \'material\', this.getAttribute(\'data-material-id\'), this.getAttribute(\'data-filename\'), this.getAttribute(\'data-project-id\'))">删除</button>'
                 + "</td>"
             )

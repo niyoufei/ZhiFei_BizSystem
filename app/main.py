@@ -34046,7 +34046,8 @@ def index(
         .upload-zone-files th, .upload-zone-files td { padding:8px 10px; border-bottom:1px solid #e2e8f0; font-size:12px; text-align:left; vertical-align:top; }
         .upload-zone-files th { background:#f8fafc; color:#475569; font-weight:600; }
         .upload-zone-files tr:last-child td { border-bottom:none; }
-        .upload-zone-files .actions-cell { white-space:nowrap; }
+        .upload-zone-files .actions-cell, #materialsTable .actions-cell { white-space:nowrap; text-align:center; }
+        .upload-zone-files .actions-cell .btn-danger, #materialsTable .actions-cell .btn-danger { min-width:72px; }
         .upload-zone-empty { margin:8px 0 0 0; font-size:12px; color:#64748b; }
         .upload-zone-debug { margin-top:8px; }
         .upload-zone-debug summary { cursor:pointer; font-size:12px; color:#475569; }
@@ -34776,7 +34777,6 @@ def index(
         </details>
         <table id="materialsTable"><thead><tr><th>资料名称</th><th>资料类型</th><th>解析状态</th><th>解析完成时间</th><th>操作</th></tr></thead><tbody>__MATERIAL_ROWS__</tbody></table>
         <p id="materialsEmpty" style="font-size:13px;color:#64748b;margin:6px 0 0 0;display:__MATERIALS_EMPTY_DISPLAY__">暂无资料，请下方添加。</p>
-        <div id="materialViewResult" class="result-block" style="display:none"></div>
         <div id="materialDepthReportResult" class="result-block" style="display:none"></div>
         <div id="materialKnowledgeProfileResult" class="result-block" style="display:none"></div>
         <p id="materialsTrialPreflightHint" style="display:none;margin:6px 0 8px 0;font-size:12px;color:#0f766e;min-height:1.2em"></p>
@@ -37703,8 +37703,7 @@ def index(
             + '<td>' + escapeHtmlText(materialTypeText) + '</td>'
             + '<td><span style="color:' + escapeHtmlText(parseMeta.tone || '#475569') + '">' + escapeHtmlText(parseMeta.label || '-') + '</span>' + parseDetailHtml + '</td>'
             + '<td>' + escapeHtmlText(finishedAt || '-') + '</td>'
-            + '<td>'
-            + '<button type="button" class="secondary js-view-material" data-material-id="' + escapeHtmlText(String(row.id || '')) + '" data-project-id="' + escapeHtmlText(String(projectId || '')) + '" data-filename="' + escapeHtmlText(String(row.filename || '')) + '">查看</button> '
+            + '<td class="actions-cell">'
             + '<button type="button" class="btn-danger js-delete-material" data-material-id="' + escapeHtmlText(String(row.id || '')) + '" data-project-id="' + escapeHtmlText(String(projectId || '')) + '" data-filename="' + escapeHtmlText(String(row.filename || '')) + '">删除</button>'
             + '</td>'
             + '</tr>';
@@ -37714,60 +37713,6 @@ def index(
           template.innerHTML = String(buildMaterialTableRowHtml(material, projectId) || '').trim();
           const row = template.content ? template.content.firstElementChild : null;
           return row && String(row.tagName || '').toUpperCase() === 'TR' ? row : null;
-        }
-        function renderMaterialViewResult(data) {
-          const el = document.getElementById('materialViewResult');
-          if (!el) return;
-          const row = (data && typeof data === 'object') ? data : {};
-          const previewText = String(row.parsed_text_preview || '').trim();
-          const parseFinishedAt = formatMaterialParseTimestamp(row.parse_finished_at);
-          const createdAt = formatMaterialParseTimestamp(row.created_at);
-          const parsedChars = Number(row.parsed_chars || 0);
-          let html = '<strong>资料详情</strong>';
-          html += '<table style="margin-top:8px"><tbody>';
-          html += '<tr><th>资料名称</th><td>' + escapeHtmlText(String(row.filename || '')) + '</td></tr>';
-          html += '<tr><th>资料类型</th><td>' + escapeHtmlText(typeof window.materialTypeLabel === 'function' ? window.materialTypeLabel(row.material_type || 'tender_qa') : String(row.material_type || '-')) + '</td></tr>';
-          html += '<tr><th>解析状态</th><td>' + escapeHtmlText(String(row.parse_stage_label || row.parse_status || '-')) + '</td></tr>';
-          html += '<tr><th>上传时间</th><td>' + escapeHtmlText(createdAt || '-') + '</td></tr>';
-          html += '<tr><th>解析完成时间</th><td>' + escapeHtmlText(parseFinishedAt || '-') + '</td></tr>';
-          html += '<tr><th>解析文本长度</th><td>' + escapeHtmlText(parsedChars > 0 ? (String(parsedChars) + ' 字') : '暂无') + '</td></tr>';
-          html += '</tbody></table>';
-          if (String(row.parse_note || '').trim()) {
-            html += '<p style="margin:8px 0 0 0;color:#475569">' + escapeHtmlText(String(row.parse_note || '')) + '</p>';
-          }
-          html += '<div style="margin-top:8px"><strong>解析文本预览</strong>';
-          html += '<pre style="margin:6px 0 0 0;max-height:320px;overflow:auto;white-space:pre-wrap">' + escapeHtmlText(previewText || '暂无可预览的解析文本。') + '</pre></div>';
-          el.innerHTML = html;
-          el.style.display = 'block';
-          if (typeof el.scrollIntoView === 'function') {
-            el.scrollIntoView({ behavior: 'auto', block: 'nearest' });
-          }
-        }
-        async function viewMaterialRow(materialId, filename, projectId) {
-          const effectiveProjectId = String(projectId || pid() || '').trim();
-          if (!effectiveProjectId || !materialId) {
-            setResultError('materialViewResult', '资料详情入口不可用，请刷新后重试。');
-            return;
-          }
-          setResultLoading('materialViewResult', '资料详情加载中...');
-          let res;
-          let data = {};
-          try {
-            res = await fetch('/api/v1/projects/' + encodeURIComponent(effectiveProjectId) + '/materials/' + encodeURIComponent(materialId) + '/detail', {
-              method: 'GET',
-              headers: apiHeaders(false),
-            });
-            data = await res.json().catch(() => ({}));
-          } catch (err) {
-            setResultError('materialViewResult', '查看失败：' + String((err && err.message) || err || '网络异常'));
-            return;
-          }
-          if (!res.ok) {
-            const detail = extractApiErrorMessage(res.status, '', data);
-            setResultError('materialViewResult', '查看失败：' + detail);
-            return;
-          }
-          renderMaterialViewResult(data);
         }
         function applyMaterialParseZoneState(materials, summary) {
           void summary;
@@ -37843,7 +37788,6 @@ def index(
           [
             'scoringReadinessResult',
             'scoringDiagnosticResult',
-            'materialViewResult',
             'materialDepthReportResult',
             'materialUtilizationResult',
             'compareResult', 'compareReportResult', 'insightsResult', 'learningResult',
@@ -41209,16 +41153,6 @@ def index(
           if (materialsTable && !materialsTable.dataset.deleteBound) {
             materialsTable.dataset.deleteBound = '1';
             materialsTable.addEventListener('click', (ev) => {
-              const viewBtn = ev.target && ev.target.closest ? ev.target.closest('.js-view-material') : null;
-              if (viewBtn) {
-                ev.preventDefault();
-                viewMaterialRow(
-                  viewBtn.getAttribute('data-material-id') || '',
-                  viewBtn.getAttribute('data-filename') || '',
-                  viewBtn.getAttribute('data-project-id') || ''
-                );
-                return;
-              }
               const btn = ev.target && ev.target.closest ? ev.target.closest('.js-delete-material') : null;
               if (!btn) return;
               ev.preventDefault();
@@ -41234,16 +41168,6 @@ def index(
           if (materialUploadZones && !materialUploadZones.dataset.zoneRowsBound) {
             materialUploadZones.dataset.zoneRowsBound = '1';
             materialUploadZones.addEventListener('click', (ev) => {
-              const viewBtn = ev.target && ev.target.closest ? ev.target.closest('.js-view-material') : null;
-              if (viewBtn) {
-                ev.preventDefault();
-                viewMaterialRow(
-                  viewBtn.getAttribute('data-material-id') || '',
-                  viewBtn.getAttribute('data-filename') || '',
-                  viewBtn.getAttribute('data-project-id') || ''
-                );
-                return;
-              }
               const btn = ev.target && ev.target.closest ? ev.target.closest('.js-delete-material') : null;
               if (!btn) return;
               ev.preventDefault();
@@ -44945,7 +44869,6 @@ def index(
             + '<td>' + filename + '</td>'
             + '<td><span class="upload-zone-status-pill" style="color:' + escapeHtmlText(statusMeta.tone) + '"><span class="upload-zone-status-dot"></span>' + escapeHtmlText(statusMeta.label) + '</span></td>'
             + '<td class="actions-cell">'
-            + '<button type="button" class="secondary js-view-material" data-material-id="' + materialId + '" data-project-id="' + project + '" data-filename="' + filename + '">查看</button> '
             + '<button type="button" class="btn-danger js-delete-material" data-material-id="' + materialId + '" data-project-id="' + project + '" data-filename="' + filename + '">删除</button>'
             + '</td>'
             + '</tr>';
