@@ -35341,7 +35341,7 @@ def index(
                     ? recs.map((r) => {
                         const pageLabel = String((r && r.page_hint) || '页码未知') + (r && r.chapter_hint ? (' / ' + String(r.chapter_hint)) : '');
                         const direct = String((r && r.write_mode) || '') === 'insert'
-                          ? fallbackEscapeHtml(String((r && r.insertion_guidance) || ''))
+                          ? (fallbackEscapeHtml(String((r && r.insertion_guidance) || '')) + ((r && r.insertion_content) ? ('<br/><span style="color:#475569;font-size:12px">' + fallbackEscapeHtml(String(r.insertion_content || '')) + '</span>') : ''))
                           : fallbackEscapeHtml(String((r && r.replacement_text) || ''));
                         return '<tr><td>' + fallbackEscapeHtml(String((r && r.write_mode_label) || '')) + '</td><td>' + fallbackEscapeHtml(pageLabel) + '</td><td>' + fallbackEscapeHtml(String((r && r.original_text) || (r && r.evidence) || '')) + '</td><td>' + direct + '</td></tr>';
                       }).join('')
@@ -46451,7 +46451,7 @@ def index(
                     + '<td>' + esc((r.priority || '') + ' ' + (r.write_mode_label || '')) + '</td>'
                     + '<td>' + esc(pageLabel) + '</td>'
                     + '<td>' + escMultiline(r.original_text || r.evidence || '') + '<br/><span style="color:#64748b;font-size:12px">' + escMultiline(r.issue || '') + '</span></td>'
-                    + '<td>' + directText + '<br/><span style="color:#64748b;font-size:12px">' + esc(r.layout_constraint || '') + '</span></td>'
+                    + '<td>' + directText + '</td>'
                     + '</tr>';
                 }).join('') : '<tr><td colspan="4">暂无可执行清单。</td></tr>')
                 + '</table>';

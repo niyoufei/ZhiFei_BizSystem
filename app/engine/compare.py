@@ -12,6 +12,36 @@ _CHAR_LOC_RE = re.compile(r"char:(\d+)(?:-(\d+))?")
 DEFAULT_TOTAL_SCORE_SCALE_MAX = 100.0
 DEFAULT_DIMENSION_MAX_SCORE = 10.0
 EVIDENCE_CONTEXT_RADIUS = 90
+MIN_MEANINGFUL_ORIGINAL_TEXT_CHARS = 15
+SEMANTIC_EXCERPT_TARGET_CHARS = 60
+SEMANTIC_EXCERPT_MAX_CHARS = 220
+SEMANTIC_NEIGHBOR_SCAN_STEPS = 4
+
+_OCR_NOISE_RE = re.compile(
+    r"\b(?:gray|binary|rgb|localx)\S*\s+score=\d+(?:\.\d+)?",
+    re.IGNORECASE,
+)
+_DOT_LEADER_RE = re.compile(r"[\.。．·•…]{4,}")
+_EMPTY_TEXT_RE = re.compile(r"^[\s\-—_=·•|]+$")
+_ANTI_BOILERPLATE_PREFIX_RE = re.compile(
+    r"^(?:由(?:项目经理|技术负责人|施工员|专业工程师|安全员|项目总工|生产经理)[^，。；]{0,24}[，,；;]\s*)"
+)
+
+OPTIMIZATION_SYSTEM_PROMPT = """
+你是一位拥有20年经验的资深工程标书总工。你的任务是对不合格的施组段落进行外科手术式的精准改写或原位扩写。
+必须紧紧咬住提供的【原文内容】做针对性升华与改写，绝不允许泛化套话、千篇一律的模板化起手句。
+如果判断为原句替换，直接输出可覆盖原文的完整专业段落；如果判断为原位补充，直接输出可插入原文的精炼专业内容或表格字段。
+诸如“字数对等”“避免排版膨胀”“保持精简”等约束仅用于内部思考，绝不允许出现在最终结果中。
+""".strip()
+
+OPTIMIZATION_GENERATION_FORBIDDEN_OUTPUTS = (
+    "排版约束",
+    "字数对等",
+    "避免排版膨胀",
+    "保持精简",
+    "你的优化和修改目标是",
+    "严禁长篇大论",
+)
 
 _GENERIC_REWRITE_REPLACEMENTS = {
     "【责任岗位】": "项目经理",
@@ -56,6 +86,233 @@ def _clean_snippet(text: str, limit: int = 90) -> str:
     s = " ".join(str(text).split())
     s = _PAGE_MARK_RE.sub("", s).strip()
     return s[:limit] + ("..." if len(s) > limit else "")
+
+
+def _strip_extraction_noise(text: str) -> str:
+    if not text:
+        return ""
+    clean = re.sub(r"\[[^\]]+\]", " ", str(text))
+    clean = _OCR_NOISE_RE.sub(" ", clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean
+
+
+def _clean_original_excerpt(text: str, limit: int = SEMANTIC_EXCERPT_MAX_CHARS) -> str:
+    clean = _strip_extraction_noise(text)
+    if not clean:
+        return ""
+    clean = clean[:limit].rstrip()
+    return clean
+
+
+def _looks_like_directory_entry(text: str) -> bool:
+    clean = _clean_original_excerpt(text, limit=320)
+    if not clean:
+        return True
+    if _DOT_LEADER_RE.search(clean):
+        return True
+    if re.search(r"[\.。．·•…]{3,}\s*\d+\s*$", clean):
+        return True
+    if re.fullmatch(r"[第章节目录\s\d一二三四五六七八九十百千\.\-—_（）()]+", clean):
+        return True
+    return False
+
+
+def _is_meaningful_original_text(text: str) -> bool:
+    clean = _clean_original_excerpt(text, limit=320)
+    if not clean:
+        return False
+    if _EMPTY_TEXT_RE.fullmatch(clean):
+        return False
+    if _looks_like_directory_entry(clean):
+        return False
+    dense = re.sub(r"\s+", "", clean)
+    if len(dense) < MIN_MEANINGFUL_ORIGINAL_TEXT_CHARS:
+        return False
+    alnum = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", clean)
+    return len(alnum) >= max(8, MIN_MEANINGFUL_ORIGINAL_TEXT_CHARS // 2)
+
+
+def _build_text_line_rows(text: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if not text:
+        return rows
+    cursor = 0
+    page_no = 0
+    for chunk in text.splitlines(True) or [text]:
+        raw = chunk.rstrip("\r\n")
+        start = cursor
+        cursor += len(chunk)
+        marker = _PAGE_MARK_RE.fullmatch(raw.strip())
+        if marker:
+            page_no = int(marker.group(1))
+            continue
+        rows.append(
+            {
+                "start": start,
+                "end": cursor,
+                "text": raw,
+                "page_no": page_no,
+            }
+        )
+    return rows
+
+
+def _line_is_blank(row: Dict[str, Any]) -> bool:
+    return not _safe_str(row.get("text"))
+
+
+def _line_is_table_like(row: Dict[str, Any]) -> bool:
+    text = _safe_str(row.get("text"))
+    if not text:
+        return False
+    return ("|" in text) or ("\t" in text) or bool(re.search(r"\S\s{2,}\S", text))
+
+
+def _find_line_index_for_pos(rows: List[Dict[str, Any]], pos: int) -> int:
+    if pos < 0:
+        return -1
+    for idx, row in enumerate(rows):
+        start = int(row.get("start") or 0)
+        end = int(row.get("end") or start)
+        if start <= pos < max(start + 1, end):
+            return idx
+    return -1
+
+
+def _excerpt_from_line_range(rows: List[Dict[str, Any]], start_idx: int, end_idx: int) -> str:
+    pieces = [
+        _clean_original_excerpt(rows[idx].get("text") or "", limit=SEMANTIC_EXCERPT_MAX_CHARS)
+        for idx in range(start_idx, end_idx + 1)
+        if not _line_is_blank(rows[idx])
+    ]
+    return _clean_original_excerpt(" ".join(piece for piece in pieces if piece))
+
+
+def _coalesce_excerpt_around_index(rows: List[Dict[str, Any]], idx: int) -> str:
+    row = rows[idx]
+    page_no = int(row.get("page_no") or 0)
+    if _line_is_table_like(row):
+        start_idx = idx
+        end_idx = idx
+        while start_idx > 0:
+            prev = rows[start_idx - 1]
+            if (
+                int(prev.get("page_no") or 0) != page_no
+                or _line_is_blank(prev)
+                or not _line_is_table_like(prev)
+            ):
+                break
+            start_idx -= 1
+        while end_idx + 1 < len(rows):
+            nxt = rows[end_idx + 1]
+            if (
+                int(nxt.get("page_no") or 0) != page_no
+                or _line_is_blank(nxt)
+                or not _line_is_table_like(nxt)
+            ):
+                break
+            end_idx += 1
+        return _excerpt_from_line_range(rows, start_idx, end_idx)
+
+    start_idx = idx
+    end_idx = idx
+    while start_idx > 0:
+        prev = rows[start_idx - 1]
+        if int(prev.get("page_no") or 0) != page_no or _line_is_blank(prev):
+            break
+        start_idx -= 1
+        if len(_excerpt_from_line_range(rows, start_idx, end_idx)) >= SEMANTIC_EXCERPT_TARGET_CHARS:
+            break
+    while end_idx + 1 < len(rows):
+        nxt = rows[end_idx + 1]
+        if int(nxt.get("page_no") or 0) != page_no or _line_is_blank(nxt):
+            break
+        end_idx += 1
+        if len(_excerpt_from_line_range(rows, start_idx, end_idx)) >= SEMANTIC_EXCERPT_TARGET_CHARS:
+            break
+    return _excerpt_from_line_range(rows, start_idx, end_idx)
+
+
+def _resolve_semantic_excerpt(
+    text: str,
+    *,
+    locator: str,
+    snippet: str,
+    markers: List[Tuple[int, int]],
+) -> Dict[str, Any]:
+    rows = _build_text_line_rows(text)
+    if not rows:
+        clean = _clean_original_excerpt(snippet)
+        page_hint = _resolve_page_hint(locator, clean, text, markers) if clean else "页码未知"
+        return {
+            "excerpt": clean,
+            "page_hint": page_hint,
+            "before": "（无）",
+            "after": "（无）",
+        }
+
+    pos = _char_pos_from_locator(locator)
+    if pos < 0:
+        pos = _find_pos_by_snippet(text, snippet)
+    idx = _find_line_index_for_pos(rows, pos)
+    if idx < 0:
+        idx = 0
+
+    candidate_indexes = [idx]
+    for step in range(1, SEMANTIC_NEIGHBOR_SCAN_STEPS + 1):
+        candidate_indexes.extend([idx + step, idx - step])
+    excerpt = ""
+    chosen_idx = idx
+    for candidate in candidate_indexes:
+        if candidate < 0 or candidate >= len(rows):
+            continue
+        candidate_excerpt = _coalesce_excerpt_around_index(rows, candidate)
+        if _is_meaningful_original_text(candidate_excerpt):
+            excerpt = candidate_excerpt
+            chosen_idx = candidate
+            break
+    if not excerpt:
+        clean_snippet = _clean_original_excerpt(snippet)
+        if _is_meaningful_original_text(clean_snippet):
+            excerpt = clean_snippet
+        else:
+            excerpt = clean_snippet
+
+    page_no = int(rows[chosen_idx].get("page_no") or 0)
+    page_hint = (
+        _format_page_hint(page_no, exact=True)
+        if page_no > 0
+        else _resolve_page_hint(
+            locator,
+            excerpt or snippet,
+            text,
+            markers,
+        )
+    )
+    before = "（无）"
+    after = "（无）"
+    for prev_idx in range(chosen_idx - 1, -1, -1):
+        if _line_is_blank(rows[prev_idx]):
+            break
+        prev_text = _clean_original_excerpt(rows[prev_idx].get("text") or "", limit=140)
+        if _is_meaningful_original_text(prev_text):
+            before = prev_text
+            break
+    for next_idx in range(chosen_idx + 1, len(rows)):
+        if _line_is_blank(rows[next_idx]):
+            break
+        next_text = _clean_original_excerpt(rows[next_idx].get("text") or "", limit=140)
+        if _is_meaningful_original_text(next_text):
+            after = next_text
+            break
+
+    return {
+        "excerpt": excerpt,
+        "page_hint": page_hint,
+        "before": before,
+        "after": after,
+    }
 
 
 def _materialize_template(template: str) -> str:
@@ -265,7 +522,7 @@ def _build_context_window(
 ) -> str:
     t = _safe_str(text)
     if not t:
-        fallback = _clean_snippet(snippet, limit=180) or "未提取到证据片段。"
+        fallback = _clean_original_excerpt(snippet, limit=180) or "未提取到证据片段。"
         return "\n".join(
             [
                 f"页码：{page_hint}",
@@ -274,25 +531,15 @@ def _build_context_window(
                 "后文：（无）",
             ]
         )
-
-    start, end = _char_span_from_locator(locator)
-    if start < 0:
-        pos = _find_pos_by_snippet(t, snippet)
-        if pos >= 0:
-            start = pos
-            end = pos + max(1, len(_safe_str(snippet)))
-    if start < 0:
-        start, end = 0, min(len(t), 1)
-
-    start = max(0, min(len(t) - 1, start))
-    end = max(start + 1, min(len(t), end))
-
-    left = max(0, start - EVIDENCE_CONTEXT_RADIUS)
-    right = min(len(t), end + EVIDENCE_CONTEXT_RADIUS)
-
-    before = _clean_snippet(t[left:start], limit=140) or "（无）"
-    hit = _clean_snippet(t[start:end], limit=140) or _clean_snippet(snippet, limit=140) or "（无）"
-    after = _clean_snippet(t[end:right], limit=140) or "（无）"
+    semantic = _resolve_semantic_excerpt(
+        t,
+        locator=locator,
+        snippet=snippet,
+        markers=_build_page_markers(t),
+    )
+    before = semantic.get("before") or "（无）"
+    hit = _clean_original_excerpt(semantic.get("excerpt") or snippet, limit=140) or "（无）"
+    after = semantic.get("after") or "（无）"
 
     return "\n".join(
         [
@@ -311,12 +558,20 @@ def _build_evidence_row(
     text: str,
     markers: List[Tuple[int, int]],
 ) -> Dict[str, Any]:
-    clean = _clean_snippet(snippet, limit=220)
+    semantic = _resolve_semantic_excerpt(
+        text,
+        locator=locator,
+        snippet=snippet,
+        markers=markers,
+    )
+    clean = _clean_original_excerpt(semantic.get("excerpt") or snippet, limit=220)
     if not clean and text:
         s, e = _char_span_from_locator(locator)
         if s >= 0:
-            clean = _clean_snippet(text[s:e], limit=220)
-    page_hint = _resolve_page_hint(locator, clean, text, markers)
+            clean = _clean_original_excerpt(text[s:e], limit=220)
+    page_hint = _safe_str(semantic.get("page_hint")) or _resolve_page_hint(
+        locator, clean, text, markers
+    )
     context_window = _build_context_window(
         text,
         locator=locator,
@@ -325,6 +580,7 @@ def _build_evidence_row(
     )
     return {
         "snippet": clean or _clean_snippet(snippet, limit=220),
+        "original_text": clean,
         "locator": locator,
         "page_hint": page_hint,
         "context_window": context_window,
@@ -477,7 +733,7 @@ def _build_dimension_rewrite_plan(
     dim = _dim_name(dim_id)
     template = _REWRITE_TEMPLATES.get(
         dim_id,
-        "由【责任岗位】牵头，按【频次】执行检查复核，控制指标【阈值/参数】，并完成【验收动作】闭环。",
+        "该段应明确责任岗位、执行频次、控制参数和验收动作，形成可复核的闭环表达。",
     )
     actions = _build_dimension_actions(dim_id, delta_to_full)
     lines = [
@@ -569,8 +825,8 @@ def _build_penalty_execution_checklist(code: str, page_hint: str) -> str:
 
 
 _PENALTY_REWRITE_EXAMPLES = {
-    "P-EMPTY-002": "由项目经理负责，每周组织1次过程复核，形成《周检记录表》并在48小时内完成问题闭环，验收结论由监理签认。",
-    "P-ACTION-002": "由专业工程师在每道工序开工前完成技术交底，施工中按日巡检，完工后执行报验与签认；若偏差>5%，24小时内整改并复验。",
+    "P-EMPTY-002": "本段应明确责任岗位、复核频次、闭环时限和验收记录，例如形成《周检记录表》并在48小时内完成问题闭环，由监理签认结果。",
+    "P-ACTION-002": "本段应写清开工前技术交底、施工中巡检、完工后报验签认的完整动作链；若偏差>5%，24小时内完成整改并复验。",
     "P-CONSIST-001": "全篇统一工期口径为180天（开工日期以开工令为准），并在进度计划、节点清单、违约条款中一致引用同一参数。",
 }
 
@@ -580,7 +836,7 @@ def _build_dimension_before_after_example(dim_id: str, evidence: str, page_hint:
     after = _materialize_template(
         _REWRITE_TEMPLATES.get(
             dim_id,
-            "由【责任岗位】牵头，按【频次】执行检查复核，控制指标【阈值/参数】，并完成【验收动作】闭环。",
+            "该段应明确责任岗位、执行频次、控制参数和验收动作，形成可复核的闭环表达。",
         )
     )
     return "\n".join(
@@ -598,7 +854,7 @@ def _build_penalty_before_after_example(
     before = _safe_str(evidence) or _safe_str(reason) or "（请按定位页补提触发扣分原句）"
     after = _PENALTY_REWRITE_EXAMPLES.get(
         code,
-        "由项目经理牵头明确责任岗位、执行频次、阈值参数和验收动作，形成台账留痕并闭环复验。",
+        "本段应明确责任岗位、执行频次、阈值参数和验收动作，形成台账留痕并闭环复验。",
     )
     return "\n".join(
         [
@@ -609,26 +865,22 @@ def _build_penalty_before_after_example(
     )
 
 
-OPTIMIZATION_LAYOUT_CONSTRAINT = (
-    "排版约束：替换内容与原文篇幅基本对等；补充内容保持极简专业表达，避免明显增页。"
-)
-
 _DIMENSION_DIRECT_REPLACEMENT_OVERRIDES = {
-    "05": "本节改为逐项写清四新技术的应用场景、实施步骤、控制参数、验收标准和异常回退措施，并与现场关键工序直接对应。",
-    "08": "本节改为按控制点、检查方法、频次、责任人和记录表单展开，确保每个质量动作都可验收、可签认、可追溯。",
-    "10": "本节改为按方案编制、审核审批、技术交底、样板确认、实施控制和验收移交的时序链逐项写透。",
-    "12": "本节改为明确前置条件、可穿插工序、禁止交叉情形、移交条件和对应记录表单，避免只保留原则性表述。",
-    "15": "本节改为明确资源预警阈值、调配触发条件、责任岗位、补充时限和效果验证方式，不再只罗列资源数量。",
-    "16": "本节改为写清验证项目、样板部位、通过标准、验收人和推广条件，保证技术措施可执行、可复核、可复制。",
+    "05": "补齐应用场景、实施步骤、控制参数、验收标准和回退措施，并与现场关键工序一一对应。",
+    "08": "补齐质量控制点、检查方法、频次、责任人和记录表单，所有质量动作落实到验收签认。",
+    "10": "补齐方案编制、审核审批、技术交底、样板确认、实施控制和验收移交的时序链。",
+    "12": "补齐前置条件、可穿插工序、禁止交叉情形、移交条件和对应记录表单。",
+    "15": "补齐资源预警阈值、调配触发条件、责任岗位、补充时限和效果验证方式。",
+    "16": "补齐验证项目、样板部位、通过标准、验收人和推广条件，保证内容可执行可复核。",
 }
 
 _DIMENSION_INSERTION_OVERRIDES = {
-    "05": "补设四新技术应用清单，逐项写明应用场景、实施步骤、控制参数、验收标准和回退措施，篇幅控制为一段或一张紧凑表。",
-    "08": "补设质量控制与 ITP 简表，至少写清控制点、检查方法、频次、责任人、合格标准和记录表单，采用紧凑字段式表达。",
-    "10": "补设重点专项工程控制表，按方案编制、审批、交底、样板、实施、验收的顺序列出节点要求，尽量压缩为一张表或两段短句。",
-    "12": "补设施工流程穿插与移交控制内容，明确前置条件、可穿插工序、禁止交叉边界和移交条件，保持短句或表格化表达。",
-    "15": "补设资源风险与调配控制条款，写清触发阈值、补充时限、责任岗位和效果验证，避免扩写成大段叙述。",
-    "16": "补设技术措施可行性验证条款，明确验证对象、通过标准、验收动作和推广条件，采用精炼段落或表格句式。",
+    "05": "四新技术应用按应用场景、实施步骤、控制参数、验收标准和回退措施逐项列示，并与对应工序直接关联。",
+    "08": "质量控制与 ITP 简表至少列明控制点、检查方法、频次、责任人、合格标准和记录表单，采用紧凑字段式表达。",
+    "10": "重点专项工程控制按方案编制、审批、交底、样板、实施和验收的顺序列出节点要求，优先压缩为一张表或两段短句。",
+    "12": "施工流程穿插与移交内容应明确前置条件、可穿插工序、禁止交叉边界和移交条件，保持短句或表格化表达。",
+    "15": "资源风险与调配条款应写清触发阈值、补充时限、责任岗位和效果验证，避免扩写成大段叙述。",
+    "16": "技术措施可行性验证应明确验证对象、通过标准、验收动作和推广条件，采用精炼段落或表格句式。",
 }
 
 
@@ -638,13 +890,18 @@ def _shrink_generated_copy(
     *,
     insert_mode: bool = False,
 ) -> str:
-    cleaned = " ".join(str(text or "").split()).strip()
+    cleaned = _strip_extraction_noise(text)
+    for forbidden in OPTIMIZATION_GENERATION_FORBIDDEN_OUTPUTS:
+        cleaned = cleaned.replace(forbidden, "")
+    cleaned = _ANTI_BOILERPLATE_PREFIX_RE.sub("", cleaned)
+    cleaned = re.sub(r"^(?:本节改为|补设|建议补充|直接套用模板：)\s*", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ，；")
     if not cleaned:
         return ""
     source_len = len(_clean_snippet(original_text, limit=280))
-    limit = 150 if insert_mode else 130
+    limit = 150 if insert_mode else 145
     if source_len:
-        dynamic_limit = int(source_len * (1.45 if insert_mode else 1.25))
+        dynamic_limit = int(source_len * (1.45 if insert_mode else 1.6))
         limit = max(56, min(limit, dynamic_limit))
     if len(cleaned) <= limit:
         return cleaned
@@ -653,12 +910,8 @@ def _shrink_generated_copy(
 
 
 def _normalize_original_text(snippet: str, *, synthetic: bool = False) -> str:
-    raw = _clean_snippet(snippet, limit=320)
-    clean = re.sub(r"\[[^\]]+\]", " ", raw)
-    clean = re.sub(r"\b(?:gray|binary|rgb|localx)\S*\s+score=\d+(?:\.\d+)?", " ", clean)
-    clean = re.sub(r"\s+", " ", clean).strip()
-    clean = _clean_snippet(clean, limit=220)
-    if clean and not synthetic and "未检测到有效证据片段" not in clean:
+    clean = _clean_original_excerpt(snippet, limit=220)
+    if clean and not synthetic and _is_meaningful_original_text(clean):
         return clean
     return "当前正文未检出与该要求直接对应的有效原句，需在定位章节补设完整条款。"
 
@@ -669,23 +922,49 @@ def _write_location(page_hint: str, chapter_hint: str) -> str:
     return f"在{page}的「{chapter}」末尾"
 
 
+def _append_targeted_fix_clause(original_text: str, fix_clause: str) -> str:
+    base = _normalize_original_text(original_text)
+    clause = _clean_original_excerpt(fix_clause, limit=180)
+    if not clause:
+        return base
+    if not _is_meaningful_original_text(base):
+        return clause
+    trimmed = base.rstrip("，；。 ")
+    if clause.startswith(("并", "同时", "且")):
+        return f"{trimmed}，{clause}"
+    return f"{trimmed}，并{clause}"
+
+
 def _build_dimension_replacement_text(
     dim_id: str,
     *,
     evidence: str,
+    original_text: str = "",
 ) -> str:
+    extra = _DIMENSION_DIRECT_REPLACEMENT_OVERRIDES.get(dim_id)
+    source = _normalize_original_text(original_text or evidence)
+    if _is_meaningful_original_text(source):
+        fix_clause = extra or _materialize_template(
+            _REWRITE_TEMPLATES.get(
+                dim_id,
+                "明确责任岗位、执行频次、控制参数和验收动作，形成可复核的闭环表达。",
+            )
+        )
+        return _shrink_generated_copy(
+            _append_targeted_fix_clause(source, fix_clause),
+            original_text or evidence,
+        )
     parts = [
         _materialize_template(
             _REWRITE_TEMPLATES.get(
                 dim_id,
-                "由【责任岗位】牵头，按【频次】执行检查复核，控制指标【阈值/参数】，并完成【验收动作】闭环。",
+                "该段应明确责任岗位、执行频次、控制参数和验收动作，形成可复核的闭环表达。",
             )
         )
     ]
-    extra = _DIMENSION_DIRECT_REPLACEMENT_OVERRIDES.get(dim_id)
     if extra:
         parts.append(extra)
-    return _shrink_generated_copy(" ".join(parts), evidence)
+    return _shrink_generated_copy(" ".join(parts), original_text or evidence)
 
 
 def _build_dimension_insertion_guidance(
@@ -694,12 +973,13 @@ def _build_dimension_insertion_guidance(
     page_hint: str,
     chapter_hint: str,
     evidence: str,
+    original_text: str = "",
 ) -> Dict[str, str]:
     content = _DIMENSION_INSERTION_OVERRIDES.get(
         dim_id,
-        "补设一段紧凑条款，明确责任岗位、执行频次、控制参数、验收动作和记录表单，避免长篇扩写。",
+        "补充一段紧凑条款，明确责任岗位、执行频次、控制参数、验收动作和记录表单，避免长篇扩写。",
     )
-    compact = _shrink_generated_copy(content, evidence, insert_mode=True)
+    compact = _shrink_generated_copy(content, original_text or evidence, insert_mode=True)
     location = _write_location(page_hint, chapter_hint)
     return {
         "insertion_guidance": f"{location}，补充以下完整内容：{compact}",
@@ -710,8 +990,11 @@ def _build_dimension_insertion_guidance(
 def _build_penalty_replacement_text(code: str, *, evidence: str, reason: str) -> str:
     content = _PENALTY_REWRITE_EXAMPLES.get(
         code,
-        "由项目经理牵头明确责任岗位、执行频次、阈值参数和验收动作，形成台账留痕并闭环复验。",
+        "本段应明确责任岗位、执行频次、阈值参数和验收动作，形成台账留痕并闭环复验。",
     )
+    source = _normalize_original_text(evidence)
+    if _is_meaningful_original_text(source):
+        content = _append_targeted_fix_clause(source, content)
     if reason and reason not in content:
         content = content + " 同时消除触发原因中的抽象承诺或缺失字段。"
     return _shrink_generated_copy(content, evidence)
@@ -720,10 +1003,12 @@ def _build_penalty_replacement_text(code: str, *, evidence: str, reason: str) ->
 def _recommendation_requires_insertion(evidence_row: Dict[str, Any], evidence: str) -> bool:
     if bool(evidence_row.get("synthetic")):
         return True
-    clean = _safe_str(evidence)
+    clean = _safe_str(evidence_row.get("original_text") or evidence)
     if not clean:
         return True
     if clean.startswith("当前正文未检出"):
+        return True
+    if not _is_meaningful_original_text(clean):
         return True
     return "建议补充可验证证据" in clean
 
@@ -1030,6 +1315,10 @@ def _build_submission_optimization_cards(
             evidence_snippet = (
                 _safe_str(dim_ev.get("snippet")) or "未检测到有效证据片段，请补充可验证内容。"
             )
+            original_text = _normalize_original_text(
+                _safe_str(dim_ev.get("original_text")) or evidence_snippet,
+                synthetic=bool(dim_ev.get("synthetic")),
+            )
             evidence_context = _safe_str(dim_ev.get("context_window")) or "\n".join(
                 [
                     f"页码：{page_hint}",
@@ -1039,14 +1328,21 @@ def _build_submission_optimization_cards(
                 ]
             )
             write_mode = (
-                "insert" if _recommendation_requires_insertion(dim_ev, evidence_snippet) else "replace"
+                "insert"
+                if _recommendation_requires_insertion(dim_ev, evidence_snippet)
+                else "replace"
             )
-            replace_text = _build_dimension_replacement_text(dim_id, evidence=evidence_snippet)
+            replace_text = _build_dimension_replacement_text(
+                dim_id,
+                evidence=evidence_snippet,
+                original_text=original_text,
+            )
             insertion_bundle = _build_dimension_insertion_guidance(
                 dim_id,
                 page_hint=page_hint,
                 chapter_hint=_chapter_hint(dim_id, "维度补强"),
                 evidence=evidence_snippet,
+                original_text=original_text,
             )
             recommendations.append(
                 {
@@ -1069,10 +1365,7 @@ def _build_submission_optimization_cards(
                     "evidence_context": evidence_context,
                     "write_mode": write_mode,
                     "write_mode_label": "原位补充" if write_mode == "insert" else "原句替换",
-                    "original_text": _normalize_original_text(
-                        evidence_snippet,
-                        synthetic=bool(dim_ev.get("synthetic")),
-                    ),
+                    "original_text": original_text,
                     "replacement_text": (
                         insertion_bundle["insertion_content"]
                         if write_mode == "insert"
@@ -1084,7 +1377,6 @@ def _build_submission_optimization_cards(
                     "insertion_content": (
                         insertion_bundle["insertion_content"] if write_mode == "insert" else ""
                     ),
-                    "layout_constraint": OPTIMIZATION_LAYOUT_CONSTRAINT,
                     "before_after_example": _build_dimension_before_after_example(
                         dim_id,
                         evidence=evidence_snippet,
@@ -1128,6 +1420,10 @@ def _build_submission_optimization_cards(
             reason = _safe_str(p.get("reason")) or "未提供"
             page_hint = _safe_str(ev.get("page_hint")) or "页码未知"
             evidence_snippet = _safe_str(ev.get("snippet")) or "未提取到证据片段。"
+            original_text = _normalize_original_text(
+                _safe_str(ev.get("original_text")) or evidence_snippet,
+                synthetic=bool(ev.get("synthetic")),
+            )
             evidence_context = _safe_str(ev.get("context_window")) or "\n".join(
                 [
                     f"页码：{page_hint}",
@@ -1150,18 +1446,14 @@ def _build_submission_optimization_cards(
                     "evidence_context": evidence_context,
                     "write_mode": "replace",
                     "write_mode_label": "原句替换",
-                    "original_text": _normalize_original_text(
-                        evidence_snippet,
-                        synthetic=bool(ev.get("synthetic")),
-                    ),
+                    "original_text": original_text,
                     "replacement_text": _build_penalty_replacement_text(
                         code,
-                        evidence=evidence_snippet,
+                        evidence=original_text or evidence_snippet,
                         reason=reason,
                     ),
                     "insertion_guidance": "",
                     "insertion_content": "",
-                    "layout_constraint": OPTIMIZATION_LAYOUT_CONSTRAINT,
                     "before_after_example": _build_penalty_before_after_example(
                         code,
                         evidence=evidence_snippet,
@@ -1206,7 +1498,6 @@ def _build_submission_optimization_cards(
                     "replacement_text": "统一术语、关键参数和验收动作的口径，并在目录与对应章节同步标注复核结果。",
                     "insertion_guidance": "",
                     "insertion_content": "",
-                    "layout_constraint": OPTIMIZATION_LAYOUT_CONSTRAINT,
                     "before_after_example": "\n".join(
                         [
                             "定位：全篇",
@@ -1555,7 +1846,7 @@ def build_compare_narrative(
                 ),
                 "rewrite_template": _REWRITE_TEMPLATES.get(
                     dim_id,
-                    "由【责任岗位】牵头，按【频次】执行检查复核，控制指标【阈值/参数】，并完成【验收动作】闭环。",
+                    "该段应明确责任岗位、执行频次、控制参数和验收动作，形成可复核的闭环表达。",
                 ),
                 "actions": _build_dimension_actions(dim_id, delta),
             }
@@ -1794,7 +2085,7 @@ def build_compare_narrative(
         f"当前分 {_format_total_score_text(focus_score, normalized_scale_max)}，"
         f"距满分目标 {_format_total_score_text(focus_card.get('target_gap') or 0.0, normalized_scale_max)}。"
         f"已生成 {len(focus_card.get('recommendations') or [])} 条即插即用的替换/补充建议，"
-        f"并严格限定为当前施组上下文。{OPTIMIZATION_LAYOUT_CONSTRAINT}"
+        "并严格限定为当前施组上下文。"
     )
     return {
         "summary": isolated_summary,
@@ -1846,10 +2137,10 @@ _DIM_NAMES = {
 }
 
 _REWRITE_TEMPLATES = {
-    "07": "由【责任岗位】牵头（建议：技术负责人），按【频次】执行危大清单识别与专项方案闭环，完成验算/论证并设置监测预警阈值【阈值/参数】；关键节点实施旁站/验收【验收动作】，并设置应急处置与复工条件。",
-    "09": "由【责任岗位】牵头（建议：施工员），建立总控/月/周/日计划联动，锁定关键线路与节点销项，资源调配按【频次】（建议：每日+每周）；纠偏触发阈值【阈值/参数】，执行日清周结与报验/签认闭环。",
-    "02": "由【责任岗位】牵头（建议：安全员），实施风险分级与隐患排查，频次【频次】（建议：每日+每周），危大专项按方案执行；班前教育与旁站/验收【验收动作】闭环，控制指标【阈值/参数】并落实应急预案。",
-    "03": "由【责任岗位】牵头（建议：施工员），落实围挡与出入口管理，扬尘治理采用PM10/喷淋/雾炮（如适用）并按【频次】（建议：每日+每周）巡检；噪声/光污染控制指标【阈值/参数】，场地清洁与垃圾分类按【检查动作】闭环，投诉响应限时处置。",
+    "07": "危大工程应先完成清单识别、专项方案闭环和验算/论证，监测预警阈值控制在【阈值/参数】内，关键节点按【频次】实施旁站和【验收动作】，并明确应急处置与复工条件。",
+    "09": "总控、月、周、日计划应保持联动，关键线路和节点销项同步更新；当偏差达到【阈值/参数】时，按【频次】启动纠偏、复盘和【验收动作】闭环。",
+    "02": "安全管理应按风险分级和隐患排查清单执行，检查频次为【频次】，危大作业同步落实专项方案、班前教育和【验收动作】，应急预案及控制指标控制在【阈值/参数】内。",
+    "03": "文明施工应围绕围挡管理、扬尘控制、噪声/光污染和场地清洁展开，按【频次】巡检并记录，关键控制指标保持在【阈值/参数】内，问题闭环通过【验收动作】落实。",
 }
 
 
@@ -1875,7 +2166,7 @@ def build_rewrite_suggestions(submissions: List[Dict[str, Any]]) -> Dict[str, An
         name = _DIM_NAMES.get(dim_id, dim_id)
         template = _REWRITE_TEMPLATES.get(
             dim_id,
-            "由【责任岗位】牵头，按【频次】执行检查复核，控制指标【阈值/参数】，并完成【验收动作】闭环。",
+            "该段应明确责任岗位、执行频次、控制参数和验收动作，形成可复核的闭环表达。",
         )
         suggestions.append(
             {

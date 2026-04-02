@@ -1,6 +1,11 @@
 """Unit tests for app.engine.compare module."""
 
-from app.engine.compare import _normalize_original_text, build_compare_narrative
+from app.engine.compare import (
+    _build_evidence_row,
+    _build_page_markers,
+    _normalize_original_text,
+    build_compare_narrative,
+)
 
 
 def test_compare_insufficient_submissions():
@@ -270,6 +275,7 @@ def test_compare_narrative_supports_single_submission_focus():
     assert result["top_submission"] == {}
     assert result["bottom_submission"] == {}
     assert "当前仅分析《待优化稿.pdf》" in result["summary"]
+    assert "排版约束" not in result["summary"]
     cards = result.get("submission_optimization_cards") or []
     assert len(cards) == 1
     assert cards[0]["submission_id"] == "s-low"
@@ -529,7 +535,38 @@ def test_compare_optimization_card_exposes_replace_and_insert_payloads():
     assert str(insert_row.get("original_text") or "").strip()
     assert replace_row.get("write_mode_label") == "原句替换"
     assert str(replace_row.get("replacement_text") or "").strip()
-    assert "排版约束" in str(replace_row.get("layout_constraint") or "")
+    assert not str(replace_row.get("layout_constraint") or "").strip()
+
+
+def test_compare_replacement_text_keeps_original_semantic_anchor():
+    submissions = [
+        {
+            "id": "s-low",
+            "filename": "待改稿.pdf",
+            "total_score": 60.0,
+            "text": "[PAGE:4]\n(1)组织保障：项目经理统筹，形成日巡查与晚复盘。\n",
+            "report": {
+                "dimension_scores": {"08": {"score": 0.5}},
+                "penalties": [],
+            },
+        },
+        {
+            "id": "s-high",
+            "filename": "高分稿.pdf",
+            "total_score": 86.0,
+            "text": "[PAGE:4]\n质量控制按控制点、频次、验收记录和签认闭环执行。\n",
+            "report": {"dimension_scores": {"08": {"score": 8.5}}, "penalties": []},
+        },
+    ]
+
+    result = build_compare_narrative(submissions)
+    cards = result.get("submission_optimization_cards") or []
+    low_card = next((c for c in cards if c.get("submission_id") == "s-low"), {})
+    recs = low_card.get("recommendations") or []
+    replace_row = next((r for r in recs if r.get("dimension") == "08"), {})
+
+    assert "日巡查与晚复盘" in str(replace_row.get("replacement_text") or "")
+    assert "控制点" in str(replace_row.get("replacement_text") or "")
 
 
 def test_compare_optimization_original_text_strips_extraction_markers():
@@ -541,6 +578,49 @@ def test_compare_optimization_original_text_strips_extraction_markers():
     assert "[PDF_BACKEND" not in cleaned
     assert "gray_2x:psm11" not in cleaned
     assert "塘岗中心老旧小区改造工程施工组织设计" in cleaned
+
+
+def test_build_evidence_row_expands_short_keyword_to_semantic_excerpt():
+    text = (
+        "[PAGE:3]\n"
+        "塘岗中心老旧小区改造工程招标的进度控制按总控计划、周计划和节点销项联动执行，"
+        "偏差超过5%时立即组织纠偏和复验。\n"
+    )
+    pos = text.find("塘岗")
+
+    row = _build_evidence_row(
+        snippet="塘岗",
+        locator=f"char:{pos}-{pos + 2}",
+        text=text,
+        markers=_build_page_markers(text),
+    )
+
+    assert len(str(row.get("original_text") or "")) >= 15
+    assert "总控计划" in str(row.get("original_text") or "")
+    assert "偏差超过5%" in str(row.get("original_text") or "")
+
+
+def test_build_evidence_row_rejects_directory_like_snippet():
+    text = (
+        "[PAGE:1]\n"
+        "3.2 施工组织........15\n"
+        "3.3 质量管理........18\n"
+        "[PAGE:2]\n"
+        "施工流程按分区推进、流水作业和节点验收组织实施，交叉作业前先完成移交确认。\n"
+    )
+    pos = text.find("施工组织")
+
+    row = _build_evidence_row(
+        snippet="施工组织",
+        locator=f"char:{pos}-{pos + 4}",
+        text=text,
+        markers=_build_page_markers(text),
+    )
+
+    original = str(row.get("original_text") or "")
+    assert "........" not in original
+    assert len(original) >= 15
+    assert "分区推进" in original
 
 
 def test_compare_optimization_card_carries_material_gate_summary():
