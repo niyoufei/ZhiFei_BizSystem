@@ -128,7 +128,7 @@ def test_build_dimension_support_cards_sorts_by_coverage_score():
         [
             {
                 "dimension_id": "07",
-                "dimension_name": "危大工程闭环管理",
+                "dimension_name": "重难点及危险性较大工程管控",
                 "coverage_score": 0.2,
                 "coverage_level": "low",
                 "keyword_hits": 1,
@@ -137,7 +137,7 @@ def test_build_dimension_support_cards_sorts_by_coverage_score():
             },
             {
                 "dimension_id": "01",
-                "dimension_name": "总体部署与信息化管理",
+                "dimension_name": "工程项目整体理解与实施路径",
                 "coverage_score": 0.8,
                 "coverage_level": "high",
                 "keyword_hits": 5,

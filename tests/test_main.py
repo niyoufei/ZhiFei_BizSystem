@@ -12640,14 +12640,14 @@ class TestMaterialAdvancedParsing:
             "by_dimension": [
                 {
                     "dimension_id": "09",
-                    "dimension_name": "进度计划体系与纠偏阈值",
+                    "dimension_name": "工期目标保障与进度控制措施",
                     "coverage_score": 0.81,
                     "source_file_count": 2,
                     "source_types": ["tender_qa"],
                 },
                 {
                     "dimension_id": "14",
-                    "dimension_name": "图纸会审、深化设计与变更闭环",
+                    "dimension_name": "设计协调与深化实施能力",
                     "coverage_score": 0.72,
                     "source_file_count": 1,
                     "source_types": ["drawing"],
@@ -16330,7 +16330,7 @@ class TestEvidenceTraceEndpoints:
                     "feedback_evolution_preview": [
                         {
                             "dimension_id": "09",
-                            "label": "进度计划体系与纠偏阈值",
+                            "label": "工期目标保障与进度控制措施",
                             "hints": ["关键节点", "偏差阈值"],
                             "multiplier": 1.16,
                             "sample_count": 4,
@@ -16339,7 +16339,7 @@ class TestEvidenceTraceEndpoints:
                     "feature_confidence_preview": [
                         {
                             "dimension_id": "14",
-                            "label": "图纸会审、深化设计与变更闭环",
+                            "label": "设计协调与深化实施能力",
                             "hints": ["会审问题单", "关闭条件"],
                             "feature_ids": ["feat-1"],
                             "feature_confidence_scores": [0.88],
@@ -16354,7 +16354,7 @@ class TestEvidenceTraceEndpoints:
                     "effective_multipliers_preview": [
                         {
                             "dimension_id": "09",
-                            "dimension_name": "进度计划体系与纠偏阈值",
+                            "dimension_name": "工期目标保障与进度控制措施",
                             "multiplier": 1.16,
                         }
                     ],
@@ -16452,7 +16452,7 @@ class TestEvidenceTraceEndpoints:
             "dimension_support_cards": [
                 {
                     "dimension_id": "01",
-                    "dimension_name": "总体部署与信息化管理",
+                    "dimension_name": "工程项目整体理解与实施路径",
                     "coverage_score": 0.82,
                     "coverage_level": "high",
                     "keyword_hits": 10,
@@ -16464,7 +16464,7 @@ class TestEvidenceTraceEndpoints:
                 },
                 {
                     "dimension_id": "07",
-                    "dimension_name": "危大工程闭环管理",
+                    "dimension_name": "重难点及危险性较大工程管控",
                     "coverage_score": 0.21,
                     "coverage_level": "low",
                     "keyword_hits": 1,
@@ -21086,14 +21086,14 @@ class TestGroundTruthScoreRuleRoutes:
                 "section_count": 1,
                 "sections": [
                     {
-                        "section_title": "05 四新技术应用",
+                        "section_title": "05 四新技术的应用与实施方案",
                         "operation_label": "在当前“盘扣式脚手架”相关段后插入该小节",
                         "target": "盘扣式脚手架",
                         "section_paragraphs": ["正文A", "正文B"],
-                        "copy_block": "### 05 四新技术应用\n\n写入方式：在当前“盘扣式脚手架”相关段后插入该小节",
+                        "copy_block": "### 05 四新技术的应用与实施方案\n\n写入方式：在当前“盘扣式脚手架”相关段后插入该小节",
                     }
                 ],
-                "copy_markdown": "# 待确认真实评标改写补丁包\n\n## 1. 05 四新技术应用\n",
+                "copy_markdown": "# 待确认真实评标改写补丁包\n\n## 1. 05 四新技术的应用与实施方案\n",
             },
             sample_count=1,
             updated_at="2026-04-02T10:00:00+08:00",
@@ -21147,7 +21147,7 @@ class TestGroundTruthScoreRuleRoutes:
             doc_text = "\n".join(p.text for p in doc.paragraphs if p.text)
             assert "待确认反馈改写补丁包" in doc_text
             assert "项目级补丁正文" in doc_text
-            assert "05 四新技术应用" in doc_text
+            assert "05 四新技术的应用与实施方案" in doc_text
             assert "写入方式：" in doc_text
 
 

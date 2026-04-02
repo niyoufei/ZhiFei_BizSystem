@@ -7,7 +7,7 @@ dimensions:
     weight: 5
     suggestion_threshold: 6
     suggested_gain: 1.5
-    suggestion: 补齐“总体部署与信息化管理”闭环：模块、采集项、更新频次、预警阈值、责任岗位、处置时限、记录载体。
+    suggestion: 补齐“工程项目整体理解与实施路径”闭环：模块、采集项、更新频次、预警阈值、责任岗位、处置时限、记录载体。
   "02":
     max_score: 10
     per_hit: 2.5
@@ -49,7 +49,7 @@ dimensions:
     weight: 5
     suggestion_threshold: 6
     suggested_gain: 1.5
-    suggestion: 完善危大工程闭环：清单、专项方案、监测与阈值、停复工条件、签认闭环。
+    suggestion: 完善重难点及危险性较大工程管控闭环：清单、专项方案、监测与阈值、停复工条件、签认闭环。
     sub_items:
       - id: 07-1
         name: 危大工程/重点难点识别完整

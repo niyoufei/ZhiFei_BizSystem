@@ -465,7 +465,7 @@ def build_project_requirements_from_anchors(
             )
             add_req(
                 "06",
-                "关键工序控制点需体现图纸节点与净高/碰撞控制",
+                "工程关键工序识别与控制措施需体现图纸节点与净高/碰撞控制",
                 "semantic",
                 {"hints": a.get("anchor_value")},
                 mandatory=False,
@@ -502,7 +502,7 @@ def build_project_requirements_from_anchors(
             )
             add_req(
                 "03",
-                "文明施工与绿色工地措施应对应现场照片中的扬尘/围挡/道路等实况",
+                "文明施工管理体系与实施措施应对应现场照片中的扬尘/围挡/道路等实况",
                 "presence",
                 {"keywords": ["扬尘", "围挡", "道路", "冲洗", "材料堆放", "污水"]},
                 mandatory=False,

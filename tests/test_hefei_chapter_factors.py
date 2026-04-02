@@ -115,7 +115,7 @@ def test_dim02_ppe_without_laobao_is_missing_requirement() -> None:
 
 
 def test_dim06_missing_key_process_headers_triggers_requirement() -> None:
-    text = "关键工序控制点表：工序、难点、做法、检查。" "表头未按标准四列定义。"
+    text = "工程关键工序识别与控制措施表：工序、难点、做法、检查。" "表头未按标准四列定义。"
     report = score_text_v2(
         submission_id="s-keyproc",
         text=text,

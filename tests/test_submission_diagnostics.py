@@ -38,7 +38,7 @@ def test_build_submission_evidence_trace_report_collects_dimension_rows_and_reco
             },
         },
         context=SubmissionEvidenceTraceContext(
-            dimensions={"01": {"name": "总体部署与信息化管理"}},
+            dimensions={"01": {"name": "工程项目整体理解与实施路径"}},
             build_evidence_trace_summary=lambda report: {
                 "total_requirements": 1,
                 "total_hits": 0,
@@ -75,7 +75,7 @@ def test_build_submission_evidence_trace_report_collects_dimension_rows_and_reco
     assert payload["project_id"] == "p1"
     assert payload["submission_id"] == "s1"
     assert payload["summary"]["total_requirements"] == 1
-    assert payload["by_dimension"][0]["dimension_name"] == "总体部署与信息化管理"
+    assert payload["by_dimension"][0]["dimension_name"] == "工程项目整体理解与实施路径"
     assert payload["by_dimension"][0]["mandatory_hit_rate"] == 0.0
     assert len(payload["evidence_units"]) == 1
     assert payload["evidence_units"][0]["id"] == "eu-1"
