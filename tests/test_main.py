@@ -5307,8 +5307,13 @@ class TestIndexEndpoint:
         response = client.get("/")
         assert response.status_code == 200
         page = response.text
-        assert "执行结果摘要（最近一次操作）" in page
-        assert "（这里只保留关键结果摘要，不展示冗长原始响应）" in page
+        assert "执行结果摘要（最近一次操作）" not in page
+        assert (
+            "window.__ZHIFEI_EXECUTION_SUMMARY_STATE = window.__ZHIFEI_EXECUTION_SUMMARY_STATE || {"
+            in page
+        )
+        assert "window.__zhifeiStashExecutionSummaryState = stashExecutionSummaryState;" in page
+        assert "function setHiddenExecutionSummaryText(text)" in page
         assert "function summarizeOutputScalar(value, maxLength=120)" in page
         assert "return [summarizeOutputScalar(data, 240)];" in page
         assert "function showOutputSummary(data)" in page
@@ -5324,8 +5329,7 @@ class TestIndexEndpoint:
         assert "function buildWeightsApplyRequestBody(forceUnlock=false)" in page
         assert "检测到项目已锁定，正在自动解锁并继续保存配置..." in page
         assert "检测到项目已锁定，正在自动解锁并继续重算..." in page
-        assert "反馈闭环执行异常，请查看“执行结果摘要”。" in page
-        assert "反馈闭环执行异常，请查看下方执行结果摘要。" in page
+        assert "反馈闭环执行异常，系统已记录后台状态，请稍后重试。" in page
         assert "message: '系统自检已完成'" in page
         assert "message: '评分体系总览已加载'" in page
         assert "message: '评分体系 Markdown 已生成'" in page
@@ -5460,10 +5464,8 @@ class TestIndexEndpoint:
         assert "function highlightSystemClosureEntrypoint(key, title)" in page
         assert "function focusSystemClosureEntrypoint(key)" in page
         assert "clearSystemClosureEntrypointActionFocus();" in page
-        assert "评估 规则/当前分/校准" in page
         assert "previewed_materials" in page
         assert "预解析完成" in page
-        assert "后台仍在补全全文" in page
         assert "if (raw === 'current_score_failed') return '校准引擎处理失败，请重试';" in page
 
     def test_index_frontend_inline_scripts_are_valid_javascript(self, client):

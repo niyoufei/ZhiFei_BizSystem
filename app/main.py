@@ -34192,9 +34192,31 @@ def index(
             el.style.display = 'block';
             el.innerHTML = html || '';
           }
+          window.__ZHIFEI_EXECUTION_SUMMARY_STATE = window.__ZHIFEI_EXECUTION_SUMMARY_STATE || {
+            kind: 'standby',
+            text: '',
+            data: null,
+            updated_at: '',
+          };
+          function stashExecutionSummaryState(patch) {
+            const next = (patch && typeof patch === 'object')
+              ? patch
+              : { text: String(patch || '') };
+            window.__ZHIFEI_EXECUTION_SUMMARY_STATE = Object.assign(
+              {},
+              window.__ZHIFEI_EXECUTION_SUMMARY_STATE || {},
+              next,
+              { updated_at: new Date().toISOString() }
+            );
+            return window.__ZHIFEI_EXECUTION_SUMMARY_STATE;
+          }
+          window.__zhifeiStashExecutionSummaryState = stashExecutionSummaryState;
           function setOutput(text) {
-            const out = document.getElementById('output');
-            if (out) out.textContent = String(text || '');
+            stashExecutionSummaryState({
+              kind: 'text',
+              text: String(text || ''),
+              data: null,
+            });
           }
           function parseJson(text) {
             try { return JSON.parse(text || '{}'); } catch (_) { return {}; }
@@ -34501,7 +34523,7 @@ def index(
                 msg += ' 资料门禁通过。';
               }
               if (Object.keys(closedLoop).length) {
-                if (closedLoop.ok === false) msg += ' 反馈闭环执行异常，请查看下方执行结果摘要。';
+                if (closedLoop.ok === false) msg += ' 反馈闭环执行异常，系统已记录后台状态，请稍后重试。';
                 else msg += ' 反馈闭环已执行。';
               }
               setResult(cfg.resultId, msg, blockedCount > 0);
@@ -35054,11 +35076,6 @@ def index(
         <div id="evolveResult" class="result-block" style="display:none"></div>
         <div id="guidanceResult" class="result-block" style="display:none"></div>
         __DEVELOPER_EVOLUTION_RESULTS_HTML__
-      </div>
-
-      <div class="section card">
-        <h2>执行结果摘要（最近一次操作）</h2>
-        <pre id="output">（这里只保留关键结果摘要，不展示冗长原始响应）</pre>
       </div>
 
       <script>
@@ -36314,8 +36331,28 @@ def index(
         function reportClientError(prefix, err) {
           const msg = prefix + ': ' + String((err && (err.message || err.reason || err)) || '未知错误');
           console.error(msg, err);
-          const out = document.getElementById('output');
-          if (out) out.textContent = msg;
+          setHiddenExecutionSummaryText(msg);
+        }
+        function stashExecutionSummaryState(patch) {
+          const helper = window.__zhifeiStashExecutionSummaryState;
+          if (typeof helper === 'function') return helper(patch);
+          const next = (patch && typeof patch === 'object')
+            ? patch
+            : { text: String(patch || '') };
+          window.__ZHIFEI_EXECUTION_SUMMARY_STATE = Object.assign(
+            {},
+            window.__ZHIFEI_EXECUTION_SUMMARY_STATE || {},
+            next,
+            { updated_at: new Date().toISOString() }
+          );
+          return window.__ZHIFEI_EXECUTION_SUMMARY_STATE;
+        }
+        function setHiddenExecutionSummaryText(text) {
+          stashExecutionSummaryState({
+            kind: 'text',
+            text: String(text || ''),
+            data: null,
+          });
         }
         function surfaceActionStatus(actionId, msg, isError=false) {
           const action = String(actionId || '').trim();
@@ -40772,7 +40809,7 @@ def index(
               doneMsg += ' 资料门禁通过。';
             }
             if (Object.keys(closedLoop).length) {
-              if (closedLoop.ok === false) doneMsg += ' 反馈闭环执行异常，请查看“执行结果摘要”。';
+              if (closedLoop.ok === false) doneMsg += ' 反馈闭环执行异常，系统已记录后台状态，请稍后重试。';
               else doneMsg += ' 反馈闭环已执行。';
             }
             doneMsg += ' 满分优化清单已同步刷新。';
@@ -41816,9 +41853,19 @@ def index(
           return lines.length ? lines : ['（空对象）'];
         }
         function showJson(id, data) {
-          const out = document.getElementById(id || 'output');
+          const targetId = String(id || 'output');
+          const compactText = buildCompactOutputLines(data).join('\\n');
+          if (targetId === 'output') {
+            stashExecutionSummaryState({
+              kind: 'json',
+              text: compactText,
+              data: data == null ? null : data,
+            });
+            return;
+          }
+          const out = document.getElementById(targetId);
           if (!out) return;
-          out.textContent = buildCompactOutputLines(data).join('\\n');
+          out.textContent = compactText;
         }
         function showOutputSummary(data) {
           showJson('output', data);
@@ -46609,7 +46656,7 @@ def index(
           const projectId = actionProjectId();
           const res = await fetch('/api/v1/projects/' + projectId + '/learning', { method: 'POST' });
           const text = await res.text();
-          document.getElementById('output').textContent = text;
+          setHiddenExecutionSummaryText(text);
           const el = document.getElementById('learningResult');
           el.style.display = 'block';
           document.getElementById('compareReportResult').style.display = 'none';
@@ -46877,7 +46924,7 @@ def index(
           if (apiKey) headers['X-API-Key'] = apiKey;
           const res = await fetch('/api/v1/projects/' + projectId + '/adaptive_apply', { method: 'POST', headers });
           const text = await res.text();
-          document.getElementById('output').textContent = text;
+          setHiddenExecutionSummaryText(text);
           const el = document.getElementById('adaptiveApplyResult');
           el.style.display = 'block';
           try {
@@ -47041,10 +47088,10 @@ def index(
           if (!ensureProjectForAction('evolveResult')) return;
           const projectId = actionProjectId();
           setResultLoading('evolveResult', '真实评标录入中（基于步骤4已上传施组）...');
-          document.getElementById('output').textContent = '真实评标录入中（基于步骤4已上传施组）...';
+          setHiddenExecutionSummaryText('真实评标录入中（基于步骤4已上传施组）...');
           const submissionResult = await submitGroundTruthDraft(projectId);
           if (!submissionResult.ok) {
-            document.getElementById('output').textContent = String(submissionResult.error || '真实评标录入失败');
+            setHiddenExecutionSummaryText(String(submissionResult.error || '真实评标录入失败'));
             const evolveErr = document.getElementById('evolveResult');
             evolveErr.innerHTML = '<p class="error">真实评标录入失败：' + escapeHtmlText(String(submissionResult.error || '请求失败')) + '</p>';
             evolveErr.style.display = 'block';
