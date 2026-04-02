@@ -34919,7 +34919,7 @@ def index(
 
       <div class="section card" id="section-learning-evolution">
         <h2>5) 自我学习与进化</h2>
-        <p style="font-size:13px;color:#64748b;margin:0 0 6px 0">上传项目投喂包（招标/清单/图纸等合并文本），录入交易中心真实评标结果（5/7评委+最终得分），系统学习高分逻辑并生成编制指导。</p>
+        <p style="font-size:13px;color:#64748b;margin:0 0 6px 0">在录入真实评标并执行学习进化前，先快速核对当前项目的资料上下文是否齐备；系统会基于步骤3已上传资料和本步骤录入的真实评标生成高分逻辑与编制指导。</p>
         <p style="font-size:12px;color:#475569;margin:0 0 10px 0">系统会将学习到的高分逻辑与编制指导持久保存，并用于本项目后续评分；再次执行学习进化可基于新录入的真实评标升级这些经验。</p>
         <div style="margin-bottom:10px">
           <strong>真实评标列表（本项目 / 其它项目）</strong>
@@ -34936,23 +34936,12 @@ def index(
         <table id="groundTruthTable"><thead><tr><th>序号</th><th>施组文件</th><th>评委分（5/7）</th><th>最终分</th><th>来源</th><th>操作</th></tr></thead><tbody></tbody></table>
         <p id="groundTruthEmpty" style="font-size:13px;color:#64748b;margin:6px 0 10px 0;display:none">暂无真实评标，请下方录入。</p>
         <div style="margin-bottom:10px">
-          <strong>投喂包（即本项目资料）：</strong>上传后可在下方查看文件名与上传时间。
+          <strong>前置项目资料状态：</strong>在录入真实评标前，先确认当前项目的上下文资料是否齐备。
         </div>
-        <div class="field-group">
-          <label>上传文件：</label>
-          <input type="file" id="feedFile" class="visually-hidden-file" accept=".txt,.pdf,.doc,.docx,.json,.xlsx,.xls,.dxf" multiple />
-          <label for="feedFile" class="file-picker-btn" data-file-input-id="feedFile">选择文件</label>
-          <span id="feedFileName" class="file-picker-name">未选择任何文件</span>
-          <button type="button" id="btnUploadFeed" onclick="return window.__zhifeiFallbackClick(event, 'btnUploadFeed')">上传并保存投喂包</button>
-          <span class="note">支持一次选择多个文件。</span>
-          <p id="feedActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
+        <div id="evolutionReadinessPanel" style="margin:0 0 12px 0;padding:12px;border:1px solid #e2e8f0;border-radius:10px;background:#f8fafc">
+          <div id="evolutionReadinessSummary" style="font-size:13px;color:#475569;line-height:1.6">待机：请先选择项目。</div>
+          <div id="evolutionReadinessTags" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:10px"></div>
         </div>
-        <div style="margin-bottom:10px">
-          <strong>已上传投喂包（项目资料）</strong>
-          <button type="button" id="btnRefreshFeedMaterials" class="secondary compact-hidden" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnRefreshFeedMaterials')">刷新</button>
-        </div>
-        <table id="feedMaterialsTable"><thead><tr><th>文件名</th><th>上传时间</th><th>操作</th></tr></thead><tbody></tbody></table>
-        <p id="feedMaterialsEmpty" style="font-size:13px;color:#64748b;margin:6px 0 10px 0;display:none">暂无投喂包，请在上方或「3) 项目资料」上传。</p>
         <div style="margin-bottom:10px">
           <strong>真实评标录入：</strong>从步骤4已上传施组中选择 + 评委分 + 最终分 →
           <button type="button" id="btnAddGroundTruth" onclick="return window.__zhifeiFallbackClick(event, 'btnAddGroundTruth')">录入所选文件</button>
@@ -35087,8 +35076,6 @@ def index(
             btnAdaptiveApply: { resultId: 'adaptiveApplyResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/adaptive_apply', loading: '应用补丁中...' },
             btnRefreshGroundTruth: { resultId: 'evolveResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/ground_truth', loading: '真实评标列表刷新中...' },
             btnRefreshGroundTruthSubmissionOptions: { resultId: 'evolveResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/submissions', loading: '施组选项刷新中...' },
-            btnRefreshFeedMaterials: { resultId: 'evolveResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials', loading: '投喂包列表刷新中...' },
-            btnUploadFeed: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/materials', loading: '投喂包上传中...' },
             btnAddGroundTruth: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/ground_truth/from_submission', loading: '真实评标录入中...' },
             btnEvolve: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/evolve', loading: '学习进化执行中...' },
             btnSelfCheck: { resultId: 'selfCheckResult', method: 'GET', path: (pid) => pid ? ('/api/v1/system/self_check?project_id=' + encodeURIComponent(pid)) : '/api/v1/system/self_check', loading: '系统自检执行中...' },
@@ -35678,7 +35665,7 @@ def index(
               }
               return true;
             }
-            if (aid === 'btnUploadMaterials' || aid === 'btnUploadBoq' || aid === 'btnUploadDrawing' || aid === 'btnUploadSitePhotos' || aid === 'btnUploadShigong' || aid === 'btnScoreShigong' || aid === 'btnLearning' || aid === 'btnEvolve' || aid === 'btnRefreshGroundTruth' || aid === 'btnUploadFeed' || aid === 'btnAddGroundTruth' || aid === 'btnRefreshFeedMaterials' || aid === 'btnWritingGuidance' || aid === 'btnCompilationInstructions') {
+            if (aid === 'btnUploadMaterials' || aid === 'btnUploadBoq' || aid === 'btnUploadDrawing' || aid === 'btnUploadSitePhotos' || aid === 'btnUploadShigong' || aid === 'btnScoreShigong' || aid === 'btnLearning' || aid === 'btnEvolve' || aid === 'btnRefreshGroundTruth' || aid === 'btnAddGroundTruth' || aid === 'btnWritingGuidance' || aid === 'btnCompilationInstructions') {
               fallbackSetResultHtml(resultId, '<span class="success">[' + fallbackEscapeHtml(aid) + '] 请求成功 (HTTP ' + fallbackEscapeHtml(status) + ')</span><pre>' + fallbackEscapeHtml(text || '{}') + '</pre>');
               return true;
             }
@@ -35756,6 +35743,7 @@ def index(
               return;
             }
             const rows = Array.isArray(payload && payload.materials) ? payload.materials : [];
+            const overview = (payload && typeof payload.overview === 'object') ? payload.overview : {};
             const summary = (payload && typeof payload.summary === 'object') ? payload.summary : {};
             if (!res.ok || !payload || typeof payload !== 'object') {
               if (emptyEl) {
@@ -35776,14 +35764,14 @@ def index(
                 emptyEl.style.display = 'block';
               }
               if (typeof renderMaterialParseSummary === 'function') {
-                renderMaterialParseSummary(summary, []);
+                renderMaterialParseSummary(overview, summary, []);
               }
               if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState([], summary);
               return;
             }
             if (emptyEl) emptyEl.style.display = 'none';
             if (typeof renderMaterialParseSummary === 'function') {
-              renderMaterialParseSummary(rows && summary ? summary : {}, rows);
+              renderMaterialParseSummary(overview, summary, rows);
             }
             if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState(rows, summary);
             rows.forEach((m) => {
@@ -35873,8 +35861,6 @@ def index(
             if (fallbackMaterialUploadActionConfig(actionId)) {
               if (typeof refreshMaterials === 'function') await Promise.resolve(refreshMaterials(projectId));
               else await fallbackRefreshMaterialsTable(projectId);
-              if (typeof refreshFeedMaterials === 'function') await Promise.resolve(refreshFeedMaterials(projectId));
-              else await fallbackRefreshMaterialsTable(projectId);
               if (typeof refreshScoringReadiness === 'function') await Promise.resolve(refreshScoringReadiness(projectId));
               else await fallbackFetchScoringReadiness(projectId);
               if (typeof refreshScoringDiagnostic === 'function') await Promise.resolve(refreshScoringDiagnostic(projectId));
@@ -35892,19 +35878,6 @@ def index(
               if (typeof refreshSystemClosureSummary === 'function') {
                 await Promise.resolve(refreshSystemClosureSummary({ reason: actionId, silent: true }));
               }
-              return;
-            }
-            if (actionId === 'btnUploadFeed') {
-              if (typeof refreshMaterials === 'function') await Promise.resolve(refreshMaterials(projectId));
-              else await fallbackRefreshMaterialsTable(projectId);
-              if (typeof refreshFeedMaterials === 'function') await Promise.resolve(refreshFeedMaterials(projectId));
-              else await fallbackRefreshMaterialsTable(projectId);
-              if (typeof refreshScoringDiagnostic === 'function') await Promise.resolve(refreshScoringDiagnostic(projectId));
-              return;
-            }
-            if (actionId === 'btnRefreshFeedMaterials') {
-              if (typeof refreshFeedMaterials === 'function') await Promise.resolve(refreshFeedMaterials(projectId));
-              else await fallbackRefreshMaterialsTable(projectId);
               return;
             }
             if (actionId === 'btnAddGroundTruth' || actionId === 'btnRefreshGroundTruth') {
@@ -35935,12 +35908,6 @@ def index(
             if (actionId === 'btnWeightsApply') {
               const payload = buildWeightsApplyRequestBody(false);
               return { body: JSON.stringify(payload), headers: fallbackJsonBodyHeaders() };
-            }
-            if (actionId === 'btnUploadFeed') {
-              const fd = new FormData();
-              const files = Array.from(((document.getElementById('feedFile') || {}).files) || []);
-              files.forEach((f) => fd.append('file', f));
-              return { body: fd, headers: fallbackAuthHeaders() };
             }
             const materialUploadCfg = fallbackMaterialUploadActionConfig(actionId);
             if (materialUploadCfg) {
@@ -36285,7 +36252,6 @@ def index(
             fallbackSetOutput(JSON.stringify({ ok: true, kind, id: fileId, filename: filename || '' }, null, 2));
             if (kind === 'material') {
               if (typeof refreshMaterials === 'function') refreshMaterials();
-              if (typeof refreshFeedMaterials === 'function') refreshFeedMaterials();
             } else if (kind === 'submission' && typeof refreshSubmissions === 'function') {
               refreshSubmissions();
             } else if (kind === 'ground_truth' && typeof refreshGroundTruth === 'function') {
@@ -36355,7 +36321,7 @@ def index(
           'btnTrialPreflightDownload', 'btnTrialPreflightDownloadDocx',
           'btnWritingGuidanceDownload', 'btnWritingGuidancePatchBundleDownload', 'btnWritingGuidancePatchBundleDownloadDocx',
           'btnScoringDiagnostic', 'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions',
-          'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
+          'btnAddGroundTruth',
           'btnEvolve', 'btnEvolutionHealth', 'btnTrialPreflight', 'btnFeedbackGovernance',
           'btnWritingGuidance', 'btnCompilationInstructions',
           'btnRebuildDelta', 'btnRebuildSamples', 'btnTrainCalibratorV2',
@@ -36985,12 +36951,13 @@ def index(
         let systemClosureSummaryState = null;
         let materialParseSummaryState = { summary: null, materials: [] };
         let materialUploadZoneDiagnosticState = { project_id: '', typeCards: [] };
+        const EVOLUTION_READINESS_MATERIAL_TYPES = ['tender_qa', 'boq', 'drawing', 'site_photo'];
         const PROJECT_REQUIRED_BUTTON_IDS = [
           'deleteCurrentProject', 'btnWeightsReset', 'btnWeightsSave', 'btnWeightsApply',
           'btnMaterialDepthReport', 'btnMaterialDepthReportDownload', 'btnMaterialKnowledgeProfile', 'btnMaterialKnowledgeProfileDownload',
           'btnTrialPreflightDownload', 'btnTrialPreflightDownloadDocx', 'btnScoringDiagnostic', 'btnOptimizationReport',
           'btnRenameProject',
-          'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
+          'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnAddGroundTruth',
           'btnEvolve', 'btnEvolutionHealth', 'btnTrialPreflight', 'btnFeedbackGovernance', 'btnWritingGuidance', 'btnWritingGuidanceDownload', 'btnWritingGuidancePatchBundleDownload', 'btnWritingGuidancePatchBundleDownloadDocx', 'btnCompilationInstructions',
           'btnRebuildDelta', 'btnRebuildSamples', 'btnTrainCalibratorV2', 'btnApplyCalibPredict',
           'btnAutoRunReflection', 'btnEvalMetricsV2', 'btnEvalSummaryV2',
@@ -37002,7 +36969,7 @@ def index(
           'btnOptimizationReport', 'btnCompare', 'btnCompareReport', 'btnInsights', 'btnLearning',
           'btnEvidenceTrace', 'btnScoringBasis',
           'btnAdaptive', 'btnAdaptivePatch', 'btnAdaptiveValidate', 'btnAdaptiveApply',
-          'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
+          'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnAddGroundTruth',
           'btnEvolve', 'btnEvolutionHealth', 'btnSelfCheck', 'btnSystemImprovementOverview', 'btnDataHygiene', 'btnEvalSummaryV2', 'btnTrialPreflight', 'btnFeedbackGovernance', 'btnWritingGuidance', 'btnWritingGuidanceDownload', 'btnWritingGuidancePatchBundleDownload', 'btnWritingGuidancePatchBundleDownloadDocx', 'btnCompilationInstructions',
           'btnRebuildDelta', 'btnRebuildSamples', 'btnTrainCalibratorV2', 'btnApplyCalibPredict',
           'btnAutoRunReflection', 'btnEvalMetricsV2', 'btnEvalSummaryV2',
@@ -37011,7 +36978,7 @@ def index(
         const PROJECT_REQUIRED_INPUT_IDS = [
           'renameProjectNameInput',
           'scoreScaleSelect',
-          'feedFile', 'groundTruthSubmissionSelect', 'groundTruthScope', 'groundTruthOtherProject',
+          'groundTruthSubmissionSelect', 'groundTruthScope', 'groundTruthOtherProject',
           'gtJudgeCount', 'gtJ1', 'gtJ2', 'gtJ3', 'gtJ4', 'gtJ5', 'gtJ6', 'gtJ7', 'gtFinal', 'patchType', 'patchIdInput',
         ];
         function setActionStatus(id, msg, isError=false) {
@@ -37295,7 +37262,6 @@ def index(
             setActionStatus('materialsActionStatusDrawing', '请先在「2) 选择项目」中选择项目。', true);
             setActionStatus('materialsActionStatusPhoto', '请先在「2) 选择项目」中选择项目。', true);
             setActionStatus('shigongActionStatus', '请先在「2) 选择项目」中选择项目。', true);
-            setActionStatus('feedActionStatus', '请先在「2) 选择项目」中选择项目。', true);
           }
         }
 
@@ -37583,6 +37549,13 @@ def index(
           const meta = (summary && typeof summary === 'object') ? summary : {};
           const rows = Array.isArray(materials) ? materials : [];
           materialParseSummaryState = { overview: business, summary: meta, materials: rows };
+          if (!pid()) {
+            setMaterialParseSummary('待机：请先选择项目。');
+            clearMaterialParseDebugInfo();
+            setEvolutionReadinessStandby('待机：请先选择项目。');
+            clearProjectClosureZoneHint('materialsClosureHint');
+            return;
+          }
           const total = Number(business.materials_total || meta.materials_total || rows.length || 0);
           const parsed = Number(business.parsed_materials || meta.parsed_materials || 0);
           const previewed = Number(business.previewed_materials || meta.previewed_materials || 0);
@@ -37596,6 +37569,7 @@ def index(
             let emptyText = '解析概览：当前项目暂无已上传资料。';
             if (closureStageText) emptyText += ' 系统封关阶段：' + closureStageText + '。';
             setMaterialParseSummary(emptyText);
+            renderEvolutionReadinessPanel(business, meta, rows);
             clearMaterialParseDebugInfo();
             renderProjectClosureZoneHint(
               'materials',
@@ -37947,6 +37921,7 @@ def index(
             summaryText += ' 系统封关阶段：' + closureStageText + '。';
           }
           setMaterialParseSummary(summaryText, tone);
+          renderEvolutionReadinessPanel(business, meta, rows);
           renderProjectClosureZoneHint(
             'materials',
             'materialsParseSummary',
@@ -38093,15 +38068,6 @@ def index(
           }
           renderMaterialViewResult(data);
         }
-        function buildFeedMaterialTableRowHtml(material, projectId) {
-          const row = (material && typeof material === 'object') ? material : {};
-          return ''
-            + '<tr>'
-            + '<td>' + escapeHtmlText(row.filename || '') + '</td>'
-            + '<td>' + escapeHtmlText(String(row.created_at || '').slice(0, 19)) + '</td>'
-            + '<td><button type="button" class="btn-danger js-delete-material" data-material-id="' + escapeHtmlText(String(row.id || '')) + '" data-project-id="' + escapeHtmlText(String(projectId || '')) + '" data-filename="' + escapeHtmlText(String(row.filename || '')) + '">删除</button></td>'
-            + '</tr>';
-        }
         function applyMaterialParseZoneState(materials, summary) {
           void summary;
           renderMaterialUploadZones(
@@ -38159,16 +38125,14 @@ def index(
           setMaterialParseSummary(
             hasProject ? '待机：正在加载当前项目资料解析概览…' : '待机：请先选择项目。'
           );
+          setEvolutionReadinessStandby(
+            hasProject ? '待机：正在盘点当前项目资料状态…' : '待机：请先选择项目。'
+          );
           clearMaterialParseDebugInfo();
           setTableStandby(
             'submissionsTable',
             'submissionsEmpty',
             hasProject ? '待机：正在加载当前项目施组…' : '暂无施组，请先选择项目。'
-          );
-          setTableStandby(
-            'feedMaterialsTable',
-            'feedMaterialsEmpty',
-            hasProject ? '待机：正在加载当前项目投喂包…' : '暂无投喂包，请先选择项目。'
           );
           setTableStandby(
             'groundTruthTable',
@@ -38224,7 +38188,7 @@ def index(
             gtSubmissionSel.value = '';
           }
           document.querySelectorAll(
-            '#uploadMaterial input[type="file"], #uploadMaterialBoq input[type="file"], #uploadMaterialDrawing input[type="file"], #uploadMaterialPhoto input[type="file"], #uploadShigong input[type="file"], #feedFile'
+            '#uploadMaterial input[type="file"], #uploadMaterialBoq input[type="file"], #uploadMaterialDrawing input[type="file"], #uploadMaterialPhoto input[type="file"], #uploadShigong input[type="file"]'
           ).forEach((el) => { if (el) el.value = ''; });
           refreshAllFilePickerTexts();
           setActionStatus(
@@ -38262,10 +38226,9 @@ def index(
           setShigongTrialPreflightActionBadge('', '');
           setShigongTrialPreflightHint('', '');
           setShigongTrialPreflightState('', '', '');
-          setActionStatus(
-            'feedActionStatus',
-            hasProject ? '待机：可上传投喂包或录入真实评标。' : '请先在「2) 选择项目」中选择项目。',
-            !hasProject
+          setEvolutionReadinessStandby(
+            hasProject ? '待机：正在盘点当前项目资料状态…' : '待机：请先选择项目。',
+            hasProject ? '#475569' : '#475569'
           );
           if (hasProject) {
             setExpertProfileStatus('待机：正在加载当前项目的16维关注度配置...');
@@ -40151,7 +40114,6 @@ def index(
             (typeof refreshMaterials === 'function') ? refreshMaterials(selectedId, switchSeq, { skipReadinessRefresh: true }) : Promise.resolve(),
             (typeof refreshScoringReadiness === 'function') ? refreshScoringReadiness(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshScoringDiagnostic === 'function') ? refreshScoringDiagnostic(selectedId, switchSeq) : Promise.resolve(),
-            (typeof refreshFeedMaterials === 'function') ? refreshFeedMaterials(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshGroundTruth === 'function') ? refreshGroundTruth(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshGroundTruthScoringRule === 'function') ? refreshGroundTruthScoringRule(selectedId, switchSeq) : Promise.resolve(),
           ]);
@@ -40396,7 +40358,6 @@ def index(
           await refreshProjects();
           if (typeof refreshSubmissions === 'function') refreshSubmissions();
           if (typeof refreshMaterials === 'function') refreshMaterials();
-          if (typeof refreshFeedMaterials === 'function') refreshFeedMaterials();
           if (typeof refreshGroundTruth === 'function') refreshGroundTruth();
         });
         safeClick('btnCleanupE2EProjects', async () => {
@@ -40732,7 +40693,6 @@ def index(
             ['uploadMaterialDrawingFile', 'uploadMaterialDrawingFileName'],
             ['uploadMaterialPhotoFile', 'uploadMaterialPhotoFileName'],
             ['uploadShigongFile', 'uploadShigongFileName'],
-            ['feedFile', 'feedFileName'],
           ].forEach(([inputId, textId]) => updateFilePickerText(inputId, textId));
         }
 
@@ -40849,7 +40809,6 @@ def index(
             );
             if (okCount > 0) {
               await refreshMaterials(projectId, projectSwitchSeq);
-              if (typeof refreshFeedMaterials === 'function') await refreshFeedMaterials(projectId, projectSwitchSeq);
               if (typeof refreshScoringDiagnostic === 'function') await refreshScoringDiagnostic(projectId, projectSwitchSeq);
               if (typeof refreshSystemClosureSummary === 'function') {
                 closureSummary = await refreshSystemClosureSummary({
@@ -41430,9 +41389,8 @@ def index(
           }
           if (rowEl) rowEl.remove();
           clearTableRenderSignature('materialsTable');
-          clearTableRenderSignature('feedMaterialsTable');
           updateTableEmptyState('materialsTable', 'materialsEmpty');
-          if (typeof refreshFeedMaterials === 'function') refreshFeedMaterials();
+          if (typeof refreshMaterials === 'function') await refreshMaterials(id);
           if (typeof refreshScoringReadiness === 'function') refreshScoringReadiness();
           if (typeof refreshScoringDiagnostic === 'function') refreshScoringDiagnostic();
           const out = document.getElementById('output');
@@ -41848,6 +41806,7 @@ def index(
               emptyEl.style.display = 'block';
             }
             setMaterialParseSummary('待机：请先选择项目。');
+            setEvolutionReadinessStandby('待机：请先选择项目。');
             clearMaterialParseDebugInfo();
             clearMaterialUploadZonePanels();
             if (typeof clearScoringReadinessPanel === 'function') clearScoringReadinessPanel();
@@ -41865,6 +41824,7 @@ def index(
               emptyEl.style.display = 'block';
             }
             setMaterialParseSummary('资料解析概览加载失败，请稍后重试。', '#991b1b');
+            setEvolutionReadinessStandby('前置资料状态加载失败，请稍后重试。', '#991b1b');
             clearMaterialParseDebugInfo();
             return;
           }
@@ -41880,6 +41840,10 @@ def index(
               emptyEl.style.display = 'block';
             }
             setMaterialParseSummary('资料解析概览加载失败（HTTP ' + String(res.status || 0) + '）。', '#991b1b');
+            setEvolutionReadinessStandby(
+              '前置资料状态加载失败（HTTP ' + String(res.status || 0) + '）。',
+              '#991b1b'
+            );
             clearMaterialParseDebugInfo();
             if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState([], {});
             if (!skipReadinessRefresh && typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
@@ -42015,82 +41979,6 @@ def index(
           a.remove();
           setResultSuccess('materialKnowledgeProfileResult', '资料知识画像报告下载已触发。');
         });
-
-        async function refreshFeedMaterials(expectedProjectId=null, switchSeq=null, options=null) {
-          const opts = (options && typeof options === 'object') ? options : {};
-          const id = expectedProjectId || pid();
-          if (id && !opts.skipCoalesce) {
-            return runProjectRefreshTask(
-              'feed_materials',
-              id,
-              () => refreshFeedMaterials(id, switchSeq, Object.assign({}, opts, { skipCoalesce: true }))
-            );
-          }
-          const tbl = document.getElementById('feedMaterialsTable');
-          const tbody = tbl ? tbl.querySelector('tbody') : null;
-          const emptyEl = document.getElementById('feedMaterialsEmpty');
-          if (!id) {
-            replaceTableRowsIfChanged('feedMaterialsTable', [], '__feed_materials__projectless__');
-            if (emptyEl) {
-              emptyEl.textContent = '暂无投喂包，请先选择项目。';
-              emptyEl.style.display = 'block';
-            }
-            return;
-          }
-          let res;
-          try {
-            res = await fetch('/api/v1/projects/' + id + '/materials');
-          } catch (err) {
-            if (isStaleProjectResponse(id, switchSeq)) return;
-            if (emptyEl) {
-              emptyEl.textContent = '投喂包列表加载失败，请稍后重试。';
-              emptyEl.style.display = 'block';
-            }
-            return;
-          }
-          if (isStaleProjectResponse(id, switchSeq)) return;
-          const mats = await res.json().catch(() => []);
-          if (!res.ok) {
-            if (emptyEl) {
-              emptyEl.textContent = '投喂包列表加载失败（HTTP ' + String(res.status || 0) + '）';
-              emptyEl.style.display = 'block';
-            }
-            return;
-          }
-          if (!Array.isArray(mats) || mats.length === 0) {
-            replaceTableRowsIfChanged('feedMaterialsTable', [], '__feed_materials__empty__|' + String(id || ''));
-            if (emptyEl) {
-              emptyEl.textContent = '暂无投喂包，请在上方或「3) 项目资料」上传。';
-              emptyEl.style.display = 'block';
-            }
-            return;
-          }
-          if (emptyEl) emptyEl.style.display = 'none';
-          const rowHtml = mats.map((m) => buildFeedMaterialTableRowHtml(m, id));
-          const changed = replaceTableRowsIfChanged(
-            'feedMaterialsTable',
-            rowHtml,
-            'feed_materials|' + id + '|' + buildTableRenderSignature(rowHtml)
-          );
-          if (changed && tbody) {
-            Array.from(tbody.querySelectorAll('.js-delete-material')).forEach((btn, idx) => {
-              const row = mats[idx];
-              if (!btn || !row) return;
-              btn.onclick = async () => {
-                const r = await fetch('/api/v1/projects/' + id + '/materials/' + row.id, { method: 'DELETE', headers: apiHeaders() });
-                if (r.ok) {
-                  clearTableRenderSignature('feedMaterialsTable');
-                  refreshMaterials();
-                  refreshFeedMaterials();
-                } else {
-                  const o = document.getElementById('output');
-                  if (o) o.textContent = await r.text();
-                }
-              };
-            });
-          }
-        }
-        safeClick0('btnRefreshFeedMaterials', refreshFeedMaterials);
 
         function groundTruthListProjectId() {
           const scope = document.getElementById('groundTruthScope').value;
@@ -42657,6 +42545,179 @@ def index(
           if (t === 'drawing') return '图纸';
           if (t === 'site_photo') return '现场照片';
           return t || '项目资料';
+        }
+        function evolutionReadinessTypeLabel(materialType) {
+          const t = String(materialType || '').trim();
+          if (t === 'tender_qa') return '招标文件/答疑';
+          if (t === 'boq') return '工程量清单';
+          if (t === 'drawing') return '图纸';
+          if (t === 'site_photo') return '现场照片';
+          return materialTypeDisplayName(t);
+        }
+        function setEvolutionReadinessStandby(message, tone='#475569') {
+          const panel = document.getElementById('evolutionReadinessPanel');
+          const summaryEl = document.getElementById('evolutionReadinessSummary');
+          const tagsEl = document.getElementById('evolutionReadinessTags');
+          if (panel) panel.style.display = 'block';
+          if (summaryEl) {
+            summaryEl.textContent = String(message || '').trim();
+            summaryEl.style.color = tone || '#475569';
+          }
+          if (tagsEl) tagsEl.innerHTML = '';
+        }
+        function evolutionReadinessStatusMeta(materialType, rows) {
+          const normalizedRows = Array.isArray(rows) ? rows : [];
+          const label = evolutionReadinessTypeLabel(materialType);
+          if (!normalizedRows.length) {
+            return {
+              material_type: materialType,
+              label: label,
+              icon: '❌',
+              status_key: 'missing',
+              status_label: '缺失',
+              count_text: '未上传',
+              tone: '#b91c1c',
+              bg: '#fef2f2',
+              border: '#fecaca',
+              ready: false,
+            };
+          }
+          let parsed = 0;
+          let previewed = 0;
+          let processing = 0;
+          let queued = 0;
+          let failed = 0;
+          normalizedRows.forEach((row) => {
+            const status = String((row && (row.parse_effective_status || row.parse_status)) || '').trim().toLowerCase();
+            if (status === 'parsed') parsed += 1;
+            else if (status === 'previewed') previewed += 1;
+            else if (status === 'processing') processing += 1;
+            else if (status === 'queued') queued += 1;
+            else if (status === 'failed') failed += 1;
+          });
+          const readyCount = parsed + previewed;
+          const total = normalizedRows.length;
+          if (readyCount > 0 && processing <= 0 && queued <= 0 && failed <= 0) {
+            return {
+              material_type: materialType,
+              label: label,
+              icon: '✅',
+              status_key: 'ready',
+              status_label: '已解析',
+              count_text: total + ' 份',
+              tone: '#166534',
+              bg: '#ecfdf5',
+              border: '#bbf7d0',
+              ready: true,
+            };
+          }
+          if (readyCount > 0) {
+            return {
+              material_type: materialType,
+              label: label,
+              icon: '⚠',
+              status_key: 'partial',
+              status_label: '部分就绪',
+              count_text: '已解析 ' + readyCount + '/' + total + ' 份',
+              tone: '#92400e',
+              bg: '#fff7ed',
+              border: '#fed7aa',
+              ready: true,
+            };
+          }
+          if (processing > 0 || queued > 0) {
+            return {
+              material_type: materialType,
+              label: label,
+              icon: '⏳',
+              status_key: 'processing',
+              status_label: '解析中',
+              count_text: total + ' 份待处理',
+              tone: '#1d4ed8',
+              bg: '#eff6ff',
+              border: '#bfdbfe',
+              ready: false,
+            };
+          }
+          return {
+            material_type: materialType,
+            label: label,
+            icon: '⚠',
+            status_key: 'failed',
+            status_label: '解析失败',
+            count_text: failed > 0 ? ('失败 ' + failed + ' 份') : (total + ' 份待复核'),
+            tone: '#9a3412',
+            bg: '#fff7ed',
+            border: '#fdba74',
+            ready: false,
+          };
+        }
+        function buildEvolutionReadinessTagHtml(info) {
+          const meta = (info && typeof info === 'object') ? info : {};
+          return ''
+            + '<div style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:999px;border:1px solid '
+            + escapeHtmlText(String(meta.border || '#e2e8f0'))
+            + ';background:' + escapeHtmlText(String(meta.bg || '#f8fafc'))
+            + ';color:' + escapeHtmlText(String(meta.tone || '#475569'))
+            + ';font-size:12px;line-height:1.4">'
+            + '<span style="font-size:14px">' + escapeHtmlText(String(meta.icon || '•')) + '</span>'
+            + '<span style="font-weight:600">' + escapeHtmlText(String(meta.label || '项目资料')) + '</span>'
+            + '<span style="color:#475569">' + escapeHtmlText(String(meta.status_label || '-')) + ' · '
+            + escapeHtmlText(String(meta.count_text || '-')) + '</span>'
+            + '</div>';
+        }
+        function renderEvolutionReadinessPanel(overview, summary, materials) {
+          const panel = document.getElementById('evolutionReadinessPanel');
+          const summaryEl = document.getElementById('evolutionReadinessSummary');
+          const tagsEl = document.getElementById('evolutionReadinessTags');
+          if (!panel || !summaryEl || !tagsEl) return;
+          const rows = Array.isArray(materials) ? materials : [];
+          const business = (overview && typeof overview === 'object') ? overview : {};
+          const meta = (summary && typeof summary === 'object') ? summary : {};
+          if (!pid()) {
+            setEvolutionReadinessStandby('待机：请先选择项目。');
+            return;
+          }
+          const byType = new Map();
+          rows.forEach((row) => {
+            const typeKey = String((row && row.material_type) || '').trim() || 'tender_qa';
+            if (!byType.has(typeKey)) byType.set(typeKey, []);
+            byType.get(typeKey).push(row);
+          });
+          const statusCards = EVOLUTION_READINESS_MATERIAL_TYPES.map((materialType) => (
+            evolutionReadinessStatusMeta(materialType, byType.get(materialType) || [])
+          ));
+          tagsEl.innerHTML = statusCards.map((card) => buildEvolutionReadinessTagHtml(card)).join('');
+          const uploadedLabels = statusCards.filter((card) => card.status_key !== 'missing').map((card) => card.label);
+          const missingLabels = statusCards.filter((card) => card.status_key === 'missing').map((card) => card.label);
+          const pendingLabels = statusCards
+            .filter((card) => card.status_key === 'processing' || card.status_key === 'failed' || card.status_key === 'partial')
+            .map((card) => card.label + '（' + card.status_label + '）');
+          const total = Number(business.materials_total || meta.materials_total || rows.length || 0);
+          const latestFinishedAt = formatMaterialParseTimestamp(business.latest_finished_at || meta.latest_finished_at);
+          const latestFinishedFilename = String(business.latest_finished_filename || meta.latest_finished_filename || '').trim();
+          let tone = '#166534';
+          if (!total) tone = '#92400e';
+          else if (pendingLabels.length || missingLabels.length) tone = '#92400e';
+          let text = '前置资料状态：';
+          if (!total) {
+            text += '当前项目尚未上传项目资料。缺失：' + EVOLUTION_READINESS_MATERIAL_TYPES
+              .map((materialType) => evolutionReadinessTypeLabel(materialType))
+              .join('、') + '。';
+          } else {
+            text += '共上传 ' + String(total) + ' 份项目资料';
+            if (uploadedLabels.length) text += '，已具备：' + uploadedLabels.join('、');
+            if (missingLabels.length) text += '；缺失：' + missingLabels.join('、');
+            if (pendingLabels.length) text += '；待处理：' + pendingLabels.join('、');
+            text += '。';
+            if (latestFinishedFilename) {
+              text += ' 最近处理：[' + latestFinishedFilename + ']';
+              if (latestFinishedAt) text += '（' + latestFinishedAt + '）';
+              text += '。';
+            }
+          }
+          summaryEl.textContent = text;
+          summaryEl.style.color = tone;
         }
         function renderMaterialDepthReportPanel(payload) {
           const el = document.getElementById('materialDepthReportResult');
@@ -47202,62 +47263,6 @@ def index(
           }
         });
 
-        safeClick('btnUploadFeed', async () => {
-          if (!ensureProjectForAction('evolveResult')) return;
-          const projectId = actionProjectId();
-          const feedInput = document.getElementById('feedFile');
-          const files = Array.from((feedInput && feedInput.files) || []);
-          const headers = {};
-          const apiKey = storageGet('api_key');
-          if (apiKey) headers['X-API-Key'] = apiKey;
-          const requestCount = files.length > 0 ? files.length : 1;
-          setResultLoading('evolveResult', '投喂包上传中（请求 ' + requestCount + ' 次）...');
-          document.getElementById('output').textContent = '投喂包上传中（请求 ' + requestCount + ' 次）...';
-          setActionStatus('feedActionStatus', '投喂包上传中（请求 ' + requestCount + ' 次）...', false);
-          let okCount = 0;
-          let failCount = 0;
-          const details = [];
-          const uploadTargets = files.length > 0 ? files : [null];
-          for (const f of uploadTargets) {
-            const fd = new FormData();
-            if (f) fd.append('file', f);
-            const label = f ? f.name : '（空文件请求）';
-            try {
-              const res = await fetch('/api/v1/projects/' + projectId + '/materials', { method: 'POST', headers, body: fd });
-              const text = await res.text();
-              if (res.ok) {
-                okCount += 1;
-                details.push('[成功] ' + label);
-              } else {
-                failCount += 1;
-                let detail = text || '';
-                try { const j = JSON.parse(text || '{}'); detail = (j && j.detail) || detail; } catch (_) {}
-                details.push('[失败] ' + label + ' -> HTTP ' + res.status + ' ' + String(detail).slice(0, 120));
-              }
-            } catch (err) {
-              failCount += 1;
-              details.push('[失败] ' + label + ' -> ' + String((err && err.message) || err || '网络异常'));
-            }
-          }
-          document.getElementById('output').textContent = '投喂包上传完成：成功 ' + okCount + '，失败 ' + failCount + NL + details.join(NL);
-          setActionStatus(
-            'feedActionStatus',
-            '上传完成：成功 ' + okCount + '，失败 ' + failCount + '。',
-            failCount > 0
-          );
-          const evolveEl = document.getElementById('evolveResult');
-          if (okCount > 0) {
-            evolveEl.innerHTML = '<p class="success">投喂包已保存：成功 ' + okCount + ' 个，失败 ' + failCount + ' 个。</p>';
-            evolveEl.style.display = 'block';
-            refreshMaterials();
-            refreshFeedMaterials();
-          } else {
-            evolveEl.innerHTML = '<p class="error">投喂包上传失败，请检查文件格式或网络。</p>';
-            evolveEl.style.display = 'block';
-          }
-          if (feedInput && failCount === 0) feedInput.value = '';
-          updateFilePickerText('feedFile', 'feedFileName');
-        });
         const feedbackGuardrailStates = window.__zhifeiFeedbackGuardrailStates = window.__zhifeiFeedbackGuardrailStates || {};
         const getFeedbackGuardrailState = (projectId) => {
           const state = feedbackGuardrailStates[projectId];

@@ -4221,18 +4221,19 @@ class TestIndexEndpoint:
         assert 'id="uploadMaterialDrawingFile"' in response.text
         assert 'id="uploadMaterialPhotoFile"' in response.text
         assert 'id="uploadShigongFile"' in response.text
-        assert 'id="feedFile"' in response.text
         assert 'id="uploadMaterialFileName"' in response.text
         assert 'id="uploadMaterialBoqFileName"' in response.text
         assert 'id="uploadMaterialDrawingFileName"' in response.text
         assert 'id="uploadMaterialPhotoFileName"' in response.text
         assert 'id="uploadShigongFileName"' in response.text
-        assert 'id="feedFileName"' in response.text
+        assert 'id="evolutionReadinessPanel"' in response.text
+        assert 'id="evolutionReadinessSummary"' in response.text
+        assert 'id="evolutionReadinessTags"' in response.text
+        assert "前置项目资料状态" in response.text
         assert 'for="createProjectFromTenderFile"' in response.text
         assert 'for="uploadMaterialFile"' in response.text
         assert 'for="uploadShigongFile"' in response.text
         assert 'class="file-picker-btn" data-file-input-id="uploadMaterialFile"' in response.text
-        assert 'class="file-picker-btn" data-file-input-id="feedFile"' in response.text
         assert "uploadShigong" in response.text
         assert 'id="projectDeleteSelect"' in response.text
         assert 'id="deleteSelectedProjects"' in response.text
@@ -4549,7 +4550,6 @@ class TestIndexEndpoint:
             "btnUploadSitePhotos",
             "btnUploadShigong",
             "btnScoreShigong",
-            "btnUploadFeed",
             "btnAddGroundTruth",
             "btnEvolve",
             "btnEvolutionHealth",
@@ -4620,7 +4620,6 @@ class TestIndexEndpoint:
             'id="btnRefreshSubmissions" class="secondary compact-hidden"',
             'id="btnScoringDiagnostic" class="secondary compact-hidden"',
             'id="btnRefreshGroundTruth" class="secondary compact-hidden"',
-            'id="btnRefreshFeedMaterials" class="secondary compact-hidden"',
             'id="btnRefreshGroundTruthSubmissionOptions" class="secondary compact-hidden"',
             'id="btnFeedbackGovernance" class="secondary compact-hidden"',
             'id="btnCompilationInstructions" class="secondary compact-hidden"',
@@ -4682,11 +4681,8 @@ class TestIndexEndpoint:
         assert response.status_code == 200
         page = response.text
         assert "safeClick0('refreshProjects', refreshProjects);" in page
-        assert "safeClick0('btnRefreshFeedMaterials', refreshFeedMaterials);" in page
         assert "if (elRefresh) elRefresh.onclick = () => refreshProjects();" not in page
-        assert "if (btnRefFeed) btnRefFeed.onclick = () => refreshFeedMaterials();" not in page
         assert "if (elRefresh) elRefresh.onclick = refreshProjects;" not in page
-        assert "if (btnRefFeed) btnRefFeed.onclick = refreshFeedMaterials;" not in page
 
     def test_index_frontend_clears_stale_project_refresh_after_delete(self, client):
         response = client.get("/")
@@ -4877,7 +4873,8 @@ class TestIndexEndpoint:
             """+ '<td class="submission-diagnostic-cell"><div class="submission-stack">'""" in page
         )
         assert "function createMaterialTableRowElement(material, projectId) {" in page
-        assert "function buildFeedMaterialTableRowHtml(material, projectId) {" in page
+        assert "function renderEvolutionReadinessPanel(overview, summary, materials) {" in page
+        assert "function buildEvolutionReadinessTagHtml(info) {" in page
         assert "function buildGroundTruthTableRowHtml(record, index, isCurrent) {" in page
         assert """+ '<tr>'""" in page
 
@@ -4902,18 +4899,12 @@ class TestIndexEndpoint:
             in page
         )
         assert (
-            "replaceTableRowsIfChanged(\n            'feedMaterialsTable',\n            rowHtml,"
-            in page
-        )
-        assert (
             "replaceTableRowsIfChanged(\n            'groundTruthTable',\n            rowHtml,"
             in page
         )
-        assert "function buildFeedMaterialTableRowHtml(material, projectId) {" in page
         assert "function buildGroundTruthTableRowHtml(record, index, isCurrent) {" in page
         assert "clearTableRenderSignature('submissionsTable');" in page
         assert "clearTableRenderSignature('materialsTable');" in page
-        assert "clearTableRenderSignature('feedMaterialsTable');" in page
         assert "clearTableRenderSignature('groundTruthTable');" in page
 
     def test_index_frontend_skips_noop_panel_rerenders_for_project_diagnostics(self, client):
@@ -5052,7 +5043,6 @@ class TestIndexEndpoint:
         assert "btnRefreshMaterials" in covered_ids
         assert "btnUploadShigong" in covered_ids
         assert "btnRefreshSubmissions" in covered_ids
-        assert "btnRefreshFeedMaterials" in covered_ids
         assert "btnRefreshGroundTruth" in covered_ids
         assert "materialsTrialPreflightFollowUpAction" in covered_ids
         assert "btnCreateProject" in report["submit_bound_button_ids"]
@@ -6386,8 +6376,8 @@ class TestIndexEndpoint:
             in page
         )
         assert "/api/v1/projects/create_from_tender" in page
-        assert "['feedFile', 'feedFileName']," in page
         assert "refreshAllFilePickerTexts();" in page
+        assert "setEvolutionReadinessStandby(" in page
         assert (
             "const isScoreSubmit = sid === 'btnScoreShigong' || shigongSubmitIntent === 'score';"
             in page
