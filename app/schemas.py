@@ -383,7 +383,23 @@ class MaterialParseStatusResponse(BaseModel):
     summary: Dict[str, Any] = Field(default_factory=dict)
     jobs: List[MaterialParseJobRecord] = Field(default_factory=list)
     materials: List[MaterialRecord] = Field(default_factory=list)
+    overview: Dict[str, Any] = Field(default_factory=dict)
     generated_at: str
+    debug_info: Dict[str, Any] = Field(default_factory=dict)
+
+
+class MaterialDetailResponse(BaseModel):
+    id: str
+    project_id: str
+    material_type: str
+    filename: str
+    created_at: str
+    parse_status: Optional[str] = None
+    parse_stage_label: Optional[str] = None
+    parse_note: Optional[str] = None
+    parse_finished_at: Optional[str] = None
+    parsed_chars: int = 0
+    parsed_text_preview: str = ""
 
 
 class ExpertProfileRecord(BaseModel):

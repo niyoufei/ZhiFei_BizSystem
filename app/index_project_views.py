@@ -37,15 +37,18 @@ def build_selected_project_material_rows_html(project_id: str) -> str:
                 parse_error_message=normalized_item.get("parse_error_message"),
             )
         )
-        created_at = html.escape(str(normalized_item.get("created_at", ""))[:19])
+        parse_finished_at = html.escape(
+            str(normalized_item.get("parse_finished_at", ""))[:19] or "-"
+        )
         rows.append(
             "<tr>"
-            + f"<td>{material_type_label}</td>"
             + f"<td>{html.escape(filename_raw)}</td>"
+            + f"<td>{material_type_label}</td>"
             + f"<td>{parse_status_label}</td>"
-            + f"<td>{created_at}</td>"
+            + f"<td>{parse_finished_at}</td>"
             + (
                 "<td>"
+                + f'<button type="button" class="secondary js-view-material" data-material-id="{material_id}" data-project-id="{html.escape(str(normalized_item.get("project_id") or ""))}" data-filename="{html.escape(filename_raw)}">查看</button> '
                 + f'<button type="button" class="btn-danger js-delete-material" data-material-id="{material_id}" data-project-id="{html.escape(str(normalized_item.get("project_id") or ""))}" data-filename="{html.escape(filename_raw)}" onclick="return window.__zhifeiFallbackDelete(event, \'material\', this.getAttribute(\'data-material-id\'), this.getAttribute(\'data-filename\'), this.getAttribute(\'data-project-id\'))">删除</button>'
                 + "</td>"
             )

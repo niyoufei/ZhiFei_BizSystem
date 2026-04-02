@@ -214,6 +214,7 @@ from app.schemas import (
     LLMBackendStatus,
     MaterialDepthReportMarkdownResponse,
     MaterialDepthReportResponse,
+    MaterialDetailResponse,
     MaterialKnowledgeProfileMarkdownResponse,
     MaterialKnowledgeProfileResponse,
     MaterialParseJobRecord,
@@ -1602,6 +1603,242 @@ def _compute_material_parse_status_core_payload(project_id: str) -> Dict[str, ob
         "jobs": [dict(job) for job in jobs],
         "materials": [dict(row) for row in materials_payload.get("enriched_materials") or []],
         "summary": static_summary,
+    }
+
+
+def _build_material_parse_business_overview(summary: Dict[str, object]) -> Dict[str, object]:
+    meta = dict(summary or {})
+    return {
+        "materials_total": int(_to_float_or_none(meta.get("materials_total")) or 0),
+        "parsed_materials": int(_to_float_or_none(meta.get("parsed_materials")) or 0),
+        "previewed_materials": int(_to_float_or_none(meta.get("previewed_materials")) or 0),
+        "processing_materials": int(_to_float_or_none(meta.get("processing_materials")) or 0),
+        "queued_materials": int(_to_float_or_none(meta.get("queued_materials")) or 0),
+        "failed_materials": int(_to_float_or_none(meta.get("failed_materials")) or 0),
+        "latest_finished_at": str(meta.get("latest_finished_at") or "").strip() or None,
+        "latest_finished_filename": str(meta.get("latest_finished_filename") or "").strip() or None,
+    }
+
+
+def _build_material_parse_debug_info(summary: Dict[str, object]) -> Dict[str, object]:
+    meta = dict(summary or {})
+    return {
+        "pipeline": {
+            "backlog": int(_to_float_or_none(meta.get("backlog")) or 0),
+            "worker_count": int(_to_float_or_none(meta.get("worker_count")) or 0),
+            "alive_worker_count": int(_to_float_or_none(meta.get("alive_worker_count")) or 0),
+            "preview_express_reserved_worker_count": int(
+                _to_float_or_none(meta.get("preview_express_reserved_worker_count")) or 0
+            ),
+            "preview_reserved_worker_count": int(
+                _to_float_or_none(meta.get("preview_reserved_worker_count")) or 0
+            ),
+        },
+        "boq_acceleration": {
+            "boq_guided_full_materials": int(
+                _to_float_or_none(meta.get("boq_guided_full_materials")) or 0
+            ),
+            "boq_guided_full_strong_materials": int(
+                _to_float_or_none(meta.get("boq_guided_full_strong_materials")) or 0
+            ),
+            "boq_resumed_full_materials": int(
+                _to_float_or_none(meta.get("boq_resumed_full_materials")) or 0
+            ),
+            "boq_resumed_sheet_count": int(
+                _to_float_or_none(meta.get("boq_resumed_sheet_count")) or 0
+            ),
+            "boq_saved_row_count": int(_to_float_or_none(meta.get("boq_saved_row_count")) or 0),
+            "boq_skipped_tail_sheets": int(
+                _to_float_or_none(meta.get("boq_skipped_tail_sheets")) or 0
+            ),
+            "boq_resume_hit_rate": float(_to_float_or_none(meta.get("boq_resume_hit_rate")) or 0.0),
+        },
+        "scheduler_hits": {
+            "scheduler_project_continuity_bonus_hits": int(
+                _to_float_or_none(meta.get("scheduler_project_continuity_bonus_hits")) or 0
+            ),
+            "scheduler_followup_full_bonus_hits": int(
+                _to_float_or_none(meta.get("scheduler_followup_full_bonus_hits")) or 0
+            ),
+            "scheduler_same_material_followup_bonus_hits": int(
+                _to_float_or_none(meta.get("scheduler_same_material_followup_bonus_hits")) or 0
+            ),
+            "scheduler_active_project_bonus_hits": int(
+                _to_float_or_none(meta.get("scheduler_active_project_bonus_hits")) or 0
+            ),
+            "scheduler_active_project_type_bonus_hits": int(
+                _to_float_or_none(meta.get("scheduler_active_project_type_bonus_hits")) or 0
+            ),
+            "scheduler_active_project_quota_exhausted_count": int(
+                _to_float_or_none(meta.get("scheduler_active_project_quota_exhausted_count")) or 0
+            ),
+            "scheduler_active_project_type_quota_exhausted_count": int(
+                _to_float_or_none(meta.get("scheduler_active_project_type_quota_exhausted_count"))
+                or 0
+            ),
+        },
+        "cache": {
+            "scheduler_claim_snapshot_cache_hits": int(
+                _to_float_or_none(meta.get("scheduler_claim_snapshot_cache_hits")) or 0
+            ),
+            "scheduler_claim_snapshot_cache_rebuilds": int(
+                _to_float_or_none(meta.get("scheduler_claim_snapshot_cache_rebuilds")) or 0
+            ),
+            "scheduler_claim_context_cache_hits": int(
+                _to_float_or_none(meta.get("scheduler_claim_context_cache_hits")) or 0
+            ),
+            "scheduler_claim_context_cache_rebuilds": int(
+                _to_float_or_none(meta.get("scheduler_claim_context_cache_rebuilds")) or 0
+            ),
+            "scheduler_project_stage_cache_hits": int(
+                _to_float_or_none(meta.get("scheduler_project_stage_cache_hits")) or 0
+            ),
+            "scheduler_project_stage_cache_rebuilds": int(
+                _to_float_or_none(meta.get("scheduler_project_stage_cache_rebuilds")) or 0
+            ),
+            "scheduler_priority_context_cache_hits": int(
+                _to_float_or_none(meta.get("scheduler_priority_context_cache_hits")) or 0
+            ),
+            "scheduler_priority_context_cache_rebuilds": int(
+                _to_float_or_none(meta.get("scheduler_priority_context_cache_rebuilds")) or 0
+            ),
+            "scheduler_jobs_summary_cache_hits": int(
+                _to_float_or_none(meta.get("scheduler_jobs_summary_cache_hits")) or 0
+            ),
+            "scheduler_jobs_summary_cache_rebuilds": int(
+                _to_float_or_none(meta.get("scheduler_jobs_summary_cache_rebuilds")) or 0
+            ),
+            "scheduler_status_materials_cache_hits": int(
+                _to_float_or_none(meta.get("scheduler_status_materials_cache_hits")) or 0
+            ),
+            "scheduler_status_materials_cache_rebuilds": int(
+                _to_float_or_none(meta.get("scheduler_status_materials_cache_rebuilds")) or 0
+            ),
+            "scheduler_status_core_cache_hits": int(
+                _to_float_or_none(meta.get("scheduler_status_core_cache_hits")) or 0
+            ),
+            "scheduler_status_core_cache_rebuilds": int(
+                _to_float_or_none(meta.get("scheduler_status_core_cache_rebuilds")) or 0
+            ),
+            "scheduler_cache_hit_total": int(
+                _to_float_or_none(meta.get("scheduler_cache_hit_total")) or 0
+            ),
+            "scheduler_cache_rebuild_total": int(
+                _to_float_or_none(meta.get("scheduler_cache_rebuild_total")) or 0
+            ),
+            "scheduler_cache_hit_ratio": float(
+                _to_float_or_none(meta.get("scheduler_cache_hit_ratio")) or 0.0
+            ),
+        },
+        "project_cache": {
+            "scheduler_project_jobs_summary_cache_hits": int(
+                _to_float_or_none(meta.get("scheduler_project_jobs_summary_cache_hits")) or 0
+            ),
+            "scheduler_project_jobs_summary_cache_rebuilds": int(
+                _to_float_or_none(meta.get("scheduler_project_jobs_summary_cache_rebuilds")) or 0
+            ),
+            "scheduler_project_jobs_summary_cache_state": str(
+                meta.get("scheduler_project_jobs_summary_cache_state") or ""
+            ).strip(),
+            "scheduler_project_status_materials_cache_hits": int(
+                _to_float_or_none(meta.get("scheduler_project_status_materials_cache_hits")) or 0
+            ),
+            "scheduler_project_status_materials_cache_rebuilds": int(
+                _to_float_or_none(meta.get("scheduler_project_status_materials_cache_rebuilds"))
+                or 0
+            ),
+            "scheduler_project_status_materials_cache_state": str(
+                meta.get("scheduler_project_status_materials_cache_state") or ""
+            ).strip(),
+            "scheduler_project_status_core_cache_hits": int(
+                _to_float_or_none(meta.get("scheduler_project_status_core_cache_hits")) or 0
+            ),
+            "scheduler_project_status_core_cache_rebuilds": int(
+                _to_float_or_none(meta.get("scheduler_project_status_core_cache_rebuilds")) or 0
+            ),
+            "scheduler_project_status_core_cache_state": str(
+                meta.get("scheduler_project_status_core_cache_state") or ""
+            ).strip(),
+            "scheduler_project_cache_hit_total": int(
+                _to_float_or_none(meta.get("scheduler_project_cache_hit_total")) or 0
+            ),
+            "scheduler_project_cache_rebuild_total": int(
+                _to_float_or_none(meta.get("scheduler_project_cache_rebuild_total")) or 0
+            ),
+            "scheduler_project_cache_hit_ratio": float(
+                _to_float_or_none(meta.get("scheduler_project_cache_hit_ratio")) or 0.0
+            ),
+            "scheduler_project_cache_net_savings": int(
+                _to_float_or_none(meta.get("scheduler_project_cache_net_savings")) or 0
+            ),
+            "scheduler_project_cache_state": str(
+                meta.get("scheduler_project_cache_state") or ""
+            ).strip(),
+            "scheduler_project_cache_hot_layer_count": int(
+                _to_float_or_none(meta.get("scheduler_project_cache_hot_layer_count")) or 0
+            ),
+            "scheduler_project_cache_warming_layer_count": int(
+                _to_float_or_none(meta.get("scheduler_project_cache_warming_layer_count")) or 0
+            ),
+            "scheduler_project_cache_cold_layer_count": int(
+                _to_float_or_none(meta.get("scheduler_project_cache_cold_layer_count")) or 0
+            ),
+            "scheduler_project_recent_avoided_rebuild_layers": list(
+                meta.get("scheduler_project_recent_avoided_rebuild_layers") or []
+            ),
+            "scheduler_project_recent_rebuilt_layers": list(
+                meta.get("scheduler_project_recent_rebuilt_layers") or []
+            ),
+            "scheduler_project_recent_request_window_size": int(
+                _to_float_or_none(meta.get("scheduler_project_recent_request_window_size")) or 0
+            ),
+            "scheduler_project_recent_window_state": str(
+                meta.get("scheduler_project_recent_window_state") or ""
+            ).strip(),
+            "scheduler_project_recent_avoided_rebuild_work_units": int(
+                _to_float_or_none(meta.get("scheduler_project_recent_avoided_rebuild_work_units"))
+                or 0
+            ),
+            "scheduler_project_recent_rebuilt_work_units": int(
+                _to_float_or_none(meta.get("scheduler_project_recent_rebuilt_work_units")) or 0
+            ),
+            "scheduler_project_recent_avoided_rebuild_work_units_avg": float(
+                _to_float_or_none(
+                    meta.get("scheduler_project_recent_avoided_rebuild_work_units_avg")
+                )
+                or 0.0
+            ),
+            "scheduler_project_recent_rebuilt_work_units_avg": float(
+                _to_float_or_none(meta.get("scheduler_project_recent_rebuilt_work_units_avg"))
+                or 0.0
+            ),
+            "scheduler_project_recent_net_saved_work_units_avg": float(
+                _to_float_or_none(meta.get("scheduler_project_recent_net_saved_work_units_avg"))
+                or 0.0
+            ),
+            "scheduler_project_recent_stable_hot_threshold": int(
+                _to_float_or_none(meta.get("scheduler_project_recent_stable_hot_threshold")) or 0
+            ),
+            "scheduler_project_recent_consecutive_steady_round_count": int(
+                _to_float_or_none(
+                    meta.get("scheduler_project_recent_consecutive_steady_round_count")
+                )
+                or 0
+            ),
+            "scheduler_project_recent_stable_hot": bool(
+                meta.get("scheduler_project_recent_stable_hot")
+            ),
+            "scheduler_project_recent_stable_hot_remaining_rounds": int(
+                _to_float_or_none(meta.get("scheduler_project_recent_stable_hot_remaining_rounds"))
+                or 0
+            ),
+            "scheduler_project_recent_stable_hot_progress_summary_label": str(
+                meta.get("scheduler_project_recent_stable_hot_progress_summary_label") or ""
+            ).strip(),
+            "scheduler_project_recent_stable_hot_badge_label": str(
+                meta.get("scheduler_project_recent_stable_hot_badge_label") or ""
+            ).strip(),
+        },
     }
 
 
@@ -21616,6 +21853,71 @@ def list_materials(project_id: str, locale: str = Depends(get_locale)) -> list[M
 
 
 @router.get(
+    "/projects/{project_id}/materials/{material_id}/detail",
+    response_model=MaterialDetailResponse,
+    tags=["项目管理"],
+    responses={**RESPONSES_404},
+)
+def get_material_detail(
+    project_id: str,
+    material_id: str,
+    locale: str = Depends(get_locale),
+) -> MaterialDetailResponse:
+    """返回单份项目资料的查看详情。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    if not any(p["id"] == project_id for p in projects):
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    materials = load_materials()
+    found = next(
+        (
+            dict(item)
+            for item in materials
+            if str(item.get("id") or "").strip() == str(material_id or "").strip()
+            and str(item.get("project_id") or "").strip() == str(project_id or "").strip()
+        ),
+        None,
+    )
+    if found is None:
+        raise HTTPException(status_code=404, detail="资料记录不存在")
+    normalized, _ = _normalize_material_row_for_parse(found)
+    jobs = load_material_parse_jobs()
+    _, latest_job = _find_latest_material_parse_job(
+        jobs,
+        str(normalized.get("id") or "").strip(),
+    )
+    normalized.update(
+        _build_material_parse_runtime_details(
+            normalized,
+            active_job=latest_job,
+        )
+    )
+    parsed_text = str(normalized.get("parsed_text") or "").strip()
+    preview_text = parsed_text[:1800].strip()
+    if parsed_text and len(parsed_text) > len(preview_text):
+        preview_text = preview_text + "\n\n……（预览已截断）"
+    return MaterialDetailResponse(
+        id=str(normalized.get("id") or ""),
+        project_id=str(normalized.get("project_id") or ""),
+        material_type=str(normalized.get("material_type") or ""),
+        filename=str(normalized.get("filename") or ""),
+        created_at=str(normalized.get("created_at") or ""),
+        parse_status=str(
+            normalized.get("parse_effective_status") or normalized.get("parse_status") or ""
+        )
+        or None,
+        parse_stage_label=str(normalized.get("parse_stage_label") or "").strip() or None,
+        parse_note=str(normalized.get("parse_note") or "").strip() or None,
+        parse_finished_at=str(
+            normalized.get("parse_finished_at") or (latest_job or {}).get("finished_at") or ""
+        ).strip()
+        or None,
+        parsed_chars=int(_to_float_or_none(normalized.get("parsed_chars")) or 0),
+        parsed_text_preview=preview_text,
+    )
+
+
+@router.get(
     "/projects/{project_id}/materials/parse_status",
     response_model=MaterialParseStatusResponse,
     tags=["项目管理"],
@@ -21653,9 +21955,13 @@ def get_material_parse_status(
         max(0, int(DEFAULT_MATERIAL_PARSE_PREVIEW_RESERVED_WORKER_COUNT))
     )
     summary["alive_worker_count"] = _material_parse_worker_alive_count()
+    overview = _build_material_parse_business_overview(summary)
+    debug_info = _build_material_parse_debug_info(summary)
     return MaterialParseStatusResponse(
         project_id=project_id,
+        overview=overview,
         summary=summary,
+        debug_info=debug_info,
         jobs=[MaterialParseJobRecord(**job) for job in jobs],
         materials=[MaterialRecord(**row) for row in enriched_materials],
         generated_at=_now_iso(),
@@ -34261,8 +34567,13 @@ def index(
           <button type="button" id="btnMaterialKnowledgeProfileDownload" class="secondary compact-hidden" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialKnowledgeProfileDownload')">下载知识画像(.md)</button>
         </div>
         <p id="materialsParseSummary" style="font-size:13px;color:#64748b;margin:0 0 8px 0">待机：请先选择项目。</p>
-        <table id="materialsTable"><thead><tr><th>资料类型</th><th>文件名</th><th>解析状态</th><th>上传时间</th><th>操作</th></tr></thead><tbody>__MATERIAL_ROWS__</tbody></table>
+        <details id="materialsDebugPanel" style="display:none;margin:0 0 8px 0">
+          <summary style="cursor:pointer;font-size:12px;color:#475569">底层运行监控（Debug Info）</summary>
+          <div id="materialsDebugInfo" style="margin-top:8px;font-size:12px;color:#475569"></div>
+        </details>
+        <table id="materialsTable"><thead><tr><th>资料名称</th><th>资料类型</th><th>解析状态</th><th>解析完成时间</th><th>操作</th></tr></thead><tbody>__MATERIAL_ROWS__</tbody></table>
         <p id="materialsEmpty" style="font-size:13px;color:#64748b;margin:6px 0 0 0;display:__MATERIALS_EMPTY_DISPLAY__">暂无资料，请下方添加。</p>
+        <div id="materialViewResult" class="result-block" style="display:none"></div>
         <div id="materialDepthReportResult" class="result-block" style="display:none"></div>
         <div id="materialKnowledgeProfileResult" class="result-block" style="display:none"></div>
         <p id="materialsTrialPreflightHint" style="display:none;margin:6px 0 8px 0;font-size:12px;color:#0f766e;min-height:1.2em"></p>
@@ -36986,127 +37297,120 @@ def index(
           if (!raw) return '';
           return raw.slice(0, 19).replace('T', ' ');
         }
-        function renderMaterialParseSummary(summary, materials) {
-          const meta = (summary && typeof summary === 'object') ? summary : {};
+        function clearMaterialParseDebugInfo() {
+          const panel = document.getElementById('materialsDebugPanel');
+          const body = document.getElementById('materialsDebugInfo');
+          if (body) body.innerHTML = '';
+          if (panel) {
+            panel.open = false;
+            panel.style.display = 'none';
+          }
+        }
+        function buildMaterialParseDebugTableHtml(title, rows) {
+          const safeRows = Array.isArray(rows) ? rows.filter((row) => Array.isArray(row) && row.length >= 2) : [];
+          if (!safeRows.length) return '';
+          return ''
+            + '<div style="margin:0 0 10px 0">'
+            + '<strong style="display:block;margin-bottom:4px;color:#334155">' + escapeHtmlText(title) + '</strong>'
+            + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+            + '<tbody>'
+            + safeRows.map((row) => (
+              '<tr>'
+                + '<th style="text-align:left;padding:6px 8px;border:1px solid #e2e8f0;background:#f8fafc;width:220px">' + escapeHtmlText(String(row[0] || '')) + '</th>'
+                + '<td style="padding:6px 8px;border:1px solid #e2e8f0">' + escapeHtmlText(String(row[1] || '-')) + '</td>'
+              + '</tr>'
+            )).join('')
+            + '</tbody></table></div>';
+        }
+        function renderMaterialParseDebugInfo(debugInfo, materials) {
+          const panel = document.getElementById('materialsDebugPanel');
+          const body = document.getElementById('materialsDebugInfo');
+          if (!panel || !body) return;
+          const debug = (debugInfo && typeof debugInfo === 'object') ? debugInfo : {};
+          const pipeline = (debug.pipeline && typeof debug.pipeline === 'object') ? debug.pipeline : {};
+          const boq = (debug.boq_acceleration && typeof debug.boq_acceleration === 'object') ? debug.boq_acceleration : {};
+          const schedulerHits = (debug.scheduler_hits && typeof debug.scheduler_hits === 'object') ? debug.scheduler_hits : {};
+          const cache = (debug.cache && typeof debug.cache === 'object') ? debug.cache : {};
+          const projectCache = (debug.project_cache && typeof debug.project_cache === 'object') ? debug.project_cache : {};
           const rows = Array.isArray(materials) ? materials : [];
-          materialParseSummaryState = { summary: meta, materials: rows };
-          const total = Number(meta.materials_total || rows.length || 0);
-          const parsed = Number(meta.parsed_materials || 0);
-          const previewed = Number(meta.previewed_materials || 0);
-          const processing = Number(meta.processing_materials || 0);
-          const queued = Number(meta.queued_materials || 0);
-          const failed = Number(meta.failed_materials || 0);
-          const backlog = Number(meta.backlog || (processing + queued) || 0);
-          const workerCount = Number(meta.worker_count || 0);
-          const aliveWorkerCount = Number(meta.alive_worker_count || 0);
-          const boqGuidedFull = Number(meta.boq_guided_full_materials || 0);
-          const boqGuidedFullStrong = Number(meta.boq_guided_full_strong_materials || 0);
-          const boqResumedFull = Number(meta.boq_resumed_full_materials || 0);
-          const boqResumedSheets = Number(meta.boq_resumed_sheet_count || 0);
-          const boqSavedRows = Number(meta.boq_saved_row_count || 0);
-          const boqSkippedTailSheets = Number(meta.boq_skipped_tail_sheets || 0);
-          const boqResumeHitRate = Number(meta.boq_resume_hit_rate || 0);
-          const schedulerProjectHits = Number(meta.scheduler_project_continuity_bonus_hits || 0);
-          const schedulerFollowupHits = Number(meta.scheduler_followup_full_bonus_hits || 0);
-          const schedulerSameMaterialHits = Number(meta.scheduler_same_material_followup_bonus_hits || 0);
-          const schedulerActiveProjectHits = Number(meta.scheduler_active_project_bonus_hits || 0);
-          const schedulerActiveProjectTypeHits = Number(meta.scheduler_active_project_type_bonus_hits || 0);
-          const schedulerClaimSnapshotCacheHits = Number(meta.scheduler_claim_snapshot_cache_hits || 0);
-          const schedulerClaimSnapshotCacheRebuilds = Number(meta.scheduler_claim_snapshot_cache_rebuilds || 0);
-          const schedulerClaimContextCacheHits = Number(meta.scheduler_claim_context_cache_hits || 0);
-          const schedulerClaimContextCacheRebuilds = Number(meta.scheduler_claim_context_cache_rebuilds || 0);
-          const schedulerProjectStageCacheHits = Number(meta.scheduler_project_stage_cache_hits || 0);
-          const schedulerProjectStageCacheRebuilds = Number(meta.scheduler_project_stage_cache_rebuilds || 0);
-          const schedulerPriorityContextCacheHits = Number(meta.scheduler_priority_context_cache_hits || 0);
-          const schedulerPriorityContextCacheRebuilds = Number(meta.scheduler_priority_context_cache_rebuilds || 0);
-          const schedulerJobsSummaryCacheHits = Number(meta.scheduler_jobs_summary_cache_hits || 0);
-          const schedulerJobsSummaryCacheRebuilds = Number(meta.scheduler_jobs_summary_cache_rebuilds || 0);
-          const schedulerStatusMaterialsCacheHits = Number(meta.scheduler_status_materials_cache_hits || 0);
-          const schedulerStatusMaterialsCacheRebuilds = Number(meta.scheduler_status_materials_cache_rebuilds || 0);
-          const schedulerStatusCoreCacheHits = Number(meta.scheduler_status_core_cache_hits || 0);
-          const schedulerStatusCoreCacheRebuilds = Number(meta.scheduler_status_core_cache_rebuilds || 0);
-          const schedulerCacheHitTotal = Number(meta.scheduler_cache_hit_total || 0);
-          const schedulerCacheRebuildTotal = Number(meta.scheduler_cache_rebuild_total || 0);
-          const schedulerCacheHitRatio = Number(meta.scheduler_cache_hit_ratio || 0);
-          const schedulerProjectJobsSummaryCacheHits = Number(meta.scheduler_project_jobs_summary_cache_hits || 0);
-          const schedulerProjectJobsSummaryCacheRebuilds = Number(meta.scheduler_project_jobs_summary_cache_rebuilds || 0);
-          const schedulerProjectJobsSummaryCacheState = String(meta.scheduler_project_jobs_summary_cache_state || '').trim();
-          const schedulerProjectStatusMaterialsCacheHits = Number(meta.scheduler_project_status_materials_cache_hits || 0);
-          const schedulerProjectStatusMaterialsCacheRebuilds = Number(meta.scheduler_project_status_materials_cache_rebuilds || 0);
-          const schedulerProjectStatusMaterialsCacheState = String(meta.scheduler_project_status_materials_cache_state || '').trim();
-          const schedulerProjectStatusCoreCacheHits = Number(meta.scheduler_project_status_core_cache_hits || 0);
-          const schedulerProjectStatusCoreCacheRebuilds = Number(meta.scheduler_project_status_core_cache_rebuilds || 0);
-          const schedulerProjectStatusCoreCacheState = String(meta.scheduler_project_status_core_cache_state || '').trim();
-          const schedulerProjectCacheHitTotal = Number(meta.scheduler_project_cache_hit_total || 0);
-          const schedulerProjectCacheRebuildTotal = Number(meta.scheduler_project_cache_rebuild_total || 0);
-          const schedulerProjectCacheHitRatio = Number(meta.scheduler_project_cache_hit_ratio || 0);
-          const schedulerProjectCacheNetSavings = Number(meta.scheduler_project_cache_net_savings || 0);
-          const schedulerProjectCacheState = String(meta.scheduler_project_cache_state || '').trim();
-          const schedulerProjectCacheHotLayerCount = Number(meta.scheduler_project_cache_hot_layer_count || 0);
-          const schedulerProjectCacheWarmingLayerCount = Number(meta.scheduler_project_cache_warming_layer_count || 0);
-          const schedulerProjectCacheColdLayerCount = Number(meta.scheduler_project_cache_cold_layer_count || 0);
-          const schedulerProjectRecentAvoidedRebuildLayers = Array.isArray(meta.scheduler_project_recent_avoided_rebuild_layers)
-            ? meta.scheduler_project_recent_avoided_rebuild_layers.map((value) => String(value || '').trim()).filter(Boolean)
-            : [];
-          const schedulerProjectRecentRebuiltLayers = Array.isArray(meta.scheduler_project_recent_rebuilt_layers)
-            ? meta.scheduler_project_recent_rebuilt_layers.map((value) => String(value || '').trim()).filter(Boolean)
-            : [];
-          const schedulerProjectRecentRequestWindowSize = Number(meta.scheduler_project_recent_request_window_size || 0);
-          const schedulerProjectRecentColdStartRoundCount = Number(meta.scheduler_project_recent_cold_start_round_count || 0);
-          const schedulerProjectRecentWarmingRoundCount = Number(meta.scheduler_project_recent_warming_round_count || 0);
-          const schedulerProjectRecentSteadyRoundCount = Number(meta.scheduler_project_recent_steady_round_count || 0);
-          const schedulerProjectRecentConsecutiveSteadyRoundCount = Number(meta.scheduler_project_recent_consecutive_steady_round_count || 0);
-          const schedulerProjectRecentStableHotThreshold = Number(meta.scheduler_project_recent_stable_hot_threshold || 0);
-          const schedulerProjectRecentStableHot = Boolean(meta.scheduler_project_recent_stable_hot);
-          const schedulerProjectRecentStableHotRemainingRounds = Number(meta.scheduler_project_recent_stable_hot_remaining_rounds || 0);
-          const schedulerProjectRecentStableHotProgressCompletedRounds = Number(meta.scheduler_project_recent_stable_hot_progress_completed_rounds || 0);
-          const schedulerProjectRecentStableHotProgressLabel = String(meta.scheduler_project_recent_stable_hot_progress_label || '').trim();
-          const schedulerProjectRecentStableHotProgressRatio = Number(meta.scheduler_project_recent_stable_hot_progress_ratio || 0);
-          const schedulerProjectRecentStableHotProgressPercent = Number(meta.scheduler_project_recent_stable_hot_progress_percent || 0);
-          const schedulerProjectRecentStableHotProgressPercentLabel = String(meta.scheduler_project_recent_stable_hot_progress_percent_label || '').trim();
-          const schedulerProjectRecentStableHotEtaHint = String(meta.scheduler_project_recent_stable_hot_eta_hint || '').trim();
-          const schedulerProjectRecentStableHotEtaShortLabel = String(meta.scheduler_project_recent_stable_hot_eta_short_label || '').trim();
-          const schedulerProjectRecentStableHotProgressSummaryLabel = String(meta.scheduler_project_recent_stable_hot_progress_summary_label || '').trim();
-          const schedulerProjectRecentStableHotBadgeLabel = String(meta.scheduler_project_recent_stable_hot_badge_label || '').trim();
-          const schedulerProjectRecentStableHotRuleLabel = String(meta.scheduler_project_recent_stable_hot_rule_label || '').trim();
-          const schedulerProjectRecentWindowState = String(meta.scheduler_project_recent_window_state || '').trim();
-          const schedulerProjectRecentAvoidedRebuildWorkUnits = Number(meta.scheduler_project_recent_avoided_rebuild_work_units || 0);
-          const schedulerProjectRecentRebuiltWorkUnits = Number(meta.scheduler_project_recent_rebuilt_work_units || 0);
-          const schedulerProjectRecentAvoidedRebuildWorkUnitsAvg = Number(meta.scheduler_project_recent_avoided_rebuild_work_units_avg || 0);
-          const schedulerProjectRecentRebuiltWorkUnitsAvg = Number(meta.scheduler_project_recent_rebuilt_work_units_avg || 0);
-          const schedulerProjectRecentNetSavedWorkUnitsAvg = Number(meta.scheduler_project_recent_net_saved_work_units_avg || 0);
-          const schedulerActiveProjectQuotaExhausted = Number(meta.scheduler_active_project_quota_exhausted_count || 0);
-          const schedulerActiveProjectTypeQuotaExhausted = Number(meta.scheduler_active_project_type_quota_exhausted_count || 0);
-          const latestFinishedAt = formatMaterialParseTimestamp(meta.latest_finished_at);
-          const latestFinishedFilename = String(meta.latest_finished_filename || '').trim();
-          function projectCacheLayerLabel(layerKey) {
-            if (layerKey === 'jobs_summary') return '作业汇总';
-            if (layerKey === 'status_materials') return '资料状态';
-            if (layerKey === 'status_core') return '状态核心';
-            return String(layerKey || '').trim();
-          }
-          function formatProjectCacheWorkUnits(value) {
-            const numeric = Number(value || 0);
-            return String(Math.round(numeric * 10) / 10);
-          }
           const activeRoutes = [];
           rows.forEach((row) => {
             if (!row || typeof row !== 'object') return;
-            const status = String(row.parse_effective_status || row.parse_status || 'queued').trim().toLowerCase();
-            if (status !== 'queued' && status !== 'processing' && status !== 'previewed') return;
+            const status = String(row.parse_effective_status || row.parse_status || '').trim().toLowerCase();
             const routeLabel = String(row.parse_route_label || '').trim();
-            if (routeLabel && !activeRoutes.includes(routeLabel)) activeRoutes.push(routeLabel);
+            if (!routeLabel || activeRoutes.includes(routeLabel)) return;
+            if (status === 'queued' || status === 'processing' || status === 'previewed') activeRoutes.push(routeLabel);
           });
-          const closureStageText = buildProjectClosureStageInlineText(
-            systemClosureSummaryState,
-            pid()
+          const sections = [];
+          sections.push(
+            buildMaterialParseDebugTableHtml('运行态', [
+              ['队列积压', String(Number(pipeline.backlog || 0)) + ' 份'],
+              ['Worker 存活/总数', String(Number(pipeline.alive_worker_count || 0)) + '/' + String(Number(pipeline.worker_count || 0))],
+              ['极速预解析保留 Worker', String(Number(pipeline.preview_express_reserved_worker_count || 0))],
+              ['预解析保留 Worker', String(Number(pipeline.preview_reserved_worker_count || 0))],
+              ['活跃解析路径', activeRoutes.length ? activeRoutes.join('、') : '无'],
+            ])
           );
+          sections.push(
+            buildMaterialParseDebugTableHtml('缓存与调度', [
+              ['全局缓存命中/重建', String(Number(cache.scheduler_cache_hit_total || 0)) + '/' + String(Number(cache.scheduler_cache_rebuild_total || 0))],
+              ['全局缓存命中率', String(Math.round(Number(cache.scheduler_cache_hit_ratio || 0) * 100)) + '%'],
+              ['当前项目缓存状态', String(projectCache.scheduler_project_cache_state || 'cold') || 'cold'],
+              ['当前项目缓存命中/重建', String(Number(projectCache.scheduler_project_cache_hit_total || 0)) + '/' + String(Number(projectCache.scheduler_project_cache_rebuild_total || 0))],
+              ['当前项目缓存命中率', String(Math.round(Number(projectCache.scheduler_project_cache_hit_ratio || 0) * 100)) + '%'],
+              ['缓存冷热分层', '热 ' + String(Number(projectCache.scheduler_project_cache_hot_layer_count || 0)) + ' / 预热 ' + String(Number(projectCache.scheduler_project_cache_warming_layer_count || 0)) + ' / 冷 ' + String(Number(projectCache.scheduler_project_cache_cold_layer_count || 0))],
+            ])
+          );
+          sections.push(
+            buildMaterialParseDebugTableHtml('调度命中与成本', [
+              ['同项目/同材料接力', String(Number(schedulerHits.scheduler_project_continuity_bonus_hits || 0)) + ' / ' + String(Number(schedulerHits.scheduler_same_material_followup_bonus_hits || 0))],
+              ['活跃项目/类型命中', String(Number(schedulerHits.scheduler_active_project_bonus_hits || 0)) + ' / ' + String(Number(schedulerHits.scheduler_active_project_type_bonus_hits || 0))],
+              ['配额耗尽（项目/类型）', String(Number(schedulerHits.scheduler_active_project_quota_exhausted_count || 0)) + ' / ' + String(Number(schedulerHits.scheduler_active_project_type_quota_exhausted_count || 0))],
+              ['最近窗口状态', String(projectCache.scheduler_project_recent_window_state || 'cold') || 'cold'],
+              ['最近窗口大小', String(Number(projectCache.scheduler_project_recent_request_window_size || 0)) + ' 轮'],
+              ['最近平均链路成本（避开/重建/净节省）', String(Number(projectCache.scheduler_project_recent_avoided_rebuild_work_units_avg || 0).toFixed(1)) + ' / ' + String(Number(projectCache.scheduler_project_recent_rebuilt_work_units_avg || 0).toFixed(1)) + ' / ' + String(Number(projectCache.scheduler_project_recent_net_saved_work_units_avg || 0).toFixed(1))],
+            ])
+          );
+          const boqRows = [];
+          if (Number(boq.boq_guided_full_materials || 0) > 0) boqRows.push(['预解析引导补全', String(Number(boq.boq_guided_full_materials || 0)) + ' 份']);
+          if (Number(boq.boq_guided_full_strong_materials || 0) > 0) boqRows.push(['强引导补全', String(Number(boq.boq_guided_full_strong_materials || 0)) + ' 份']);
+          if (Number(boq.boq_resumed_full_materials || 0) > 0) boqRows.push(['差量续跑', String(Number(boq.boq_resumed_full_materials || 0)) + ' 份']);
+          if (Number(boq.boq_resumed_sheet_count || 0) > 0) boqRows.push(['续跑 Sheet', String(Number(boq.boq_resumed_sheet_count || 0)) + ' 张']);
+          if (Number(boq.boq_saved_row_count || 0) > 0) boqRows.push(['少扫行数', String(Number(boq.boq_saved_row_count || 0)) + ' 行']);
+          if (Number(boq.boq_skipped_tail_sheets || 0) > 0) boqRows.push(['尾部略过', String(Number(boq.boq_skipped_tail_sheets || 0)) + ' 张 Sheet']);
+          if (Number(boq.boq_resume_hit_rate || 0) > 0) boqRows.push(['差量命中率', String(Math.round(Number(boq.boq_resume_hit_rate || 0) * 100)) + '%']);
+          if (boqRows.length) sections.push(buildMaterialParseDebugTableHtml('BOQ 解析提速', boqRows));
+          const html = sections.filter(Boolean).join('');
+          if (!html) {
+            clearMaterialParseDebugInfo();
+            return;
+          }
+          body.innerHTML = html;
+          panel.style.display = 'block';
+          if (!panel.dataset.debugInitialized) {
+            panel.open = false;
+            panel.dataset.debugInitialized = '1';
+          }
+        }
+        function renderMaterialParseSummary(overview, summary, materials) {
+          const business = (overview && typeof overview === 'object') ? overview : {};
+          const meta = (summary && typeof summary === 'object') ? summary : {};
+          const rows = Array.isArray(materials) ? materials : [];
+          materialParseSummaryState = { overview: business, summary: meta, materials: rows };
+          const total = Number(business.materials_total || meta.materials_total || rows.length || 0);
+          const parsed = Number(business.parsed_materials || meta.parsed_materials || 0);
+          const previewed = Number(business.previewed_materials || meta.previewed_materials || 0);
+          const processing = Number(business.processing_materials || meta.processing_materials || 0);
+          const queued = Number(business.queued_materials || meta.queued_materials || 0);
+          const failed = Number(business.failed_materials || meta.failed_materials || 0);
+          const latestFinishedAt = formatMaterialParseTimestamp(business.latest_finished_at || meta.latest_finished_at);
+          const latestFinishedFilename = String(business.latest_finished_filename || meta.latest_finished_filename || '').trim();
+          const closureStageText = buildProjectClosureStageInlineText(systemClosureSummaryState, pid());
           if (!total) {
-            let emptyText = '当前解析概览：暂无资料。';
-            if (closureStageText) {
-              emptyText += ' 系统封关阶段：' + closureStageText + '。';
-            }
+            let emptyText = '解析概览：当前项目暂无已上传资料。';
+            if (closureStageText) emptyText += ' 系统封关阶段：' + closureStageText + '。';
             setMaterialParseSummary(emptyText);
+            clearMaterialParseDebugInfo();
             renderProjectClosureZoneHint(
               'materials',
               'materialsParseSummary',
@@ -37527,16 +37831,20 @@ def index(
           const materialTypeText = typeof window.materialTypeLabel === 'function'
             ? window.materialTypeLabel(row.material_type || 'tender_qa')
             : '招标文件和答疑';
+          const finishedAt = formatMaterialParseTimestamp(row.parse_finished_at || row.created_at);
           const parseDetailHtml = parseMeta.detail
             ? ('<div style="margin-top:4px;font-size:12px;color:#64748b;line-height:1.5">' + escapeHtmlText(parseMeta.detail) + '</div>')
             : '';
           return ''
             + '<tr>'
-            + '<td>' + escapeHtmlText(materialTypeText) + '</td>'
             + '<td>' + escapeHtmlText(row.filename || '') + '</td>'
+            + '<td>' + escapeHtmlText(materialTypeText) + '</td>'
             + '<td><span style="color:' + escapeHtmlText(parseMeta.tone || '#475569') + '">' + escapeHtmlText(parseMeta.label || '-') + '</span>' + parseDetailHtml + '</td>'
-            + '<td>' + escapeHtmlText(String(row.created_at || '').slice(0, 19)) + '</td>'
-            + '<td><button type="button" class="btn-danger js-delete-material" data-material-id="' + escapeHtmlText(String(row.id || '')) + '" data-project-id="' + escapeHtmlText(String(projectId || '')) + '" data-filename="' + escapeHtmlText(String(row.filename || '')) + '">删除</button></td>'
+            + '<td>' + escapeHtmlText(finishedAt || '-') + '</td>'
+            + '<td>'
+            + '<button type="button" class="secondary js-view-material" data-material-id="' + escapeHtmlText(String(row.id || '')) + '" data-project-id="' + escapeHtmlText(String(projectId || '')) + '" data-filename="' + escapeHtmlText(String(row.filename || '')) + '">查看</button> '
+            + '<button type="button" class="btn-danger js-delete-material" data-material-id="' + escapeHtmlText(String(row.id || '')) + '" data-project-id="' + escapeHtmlText(String(projectId || '')) + '" data-filename="' + escapeHtmlText(String(row.filename || '')) + '">删除</button>'
+            + '</td>'
             + '</tr>';
         }
         function createMaterialTableRowElement(material, projectId) {
@@ -37544,6 +37852,60 @@ def index(
           template.innerHTML = String(buildMaterialTableRowHtml(material, projectId) || '').trim();
           const row = template.content ? template.content.firstElementChild : null;
           return row && String(row.tagName || '').toUpperCase() === 'TR' ? row : null;
+        }
+        function renderMaterialViewResult(data) {
+          const el = document.getElementById('materialViewResult');
+          if (!el) return;
+          const row = (data && typeof data === 'object') ? data : {};
+          const previewText = String(row.parsed_text_preview || '').trim();
+          const parseFinishedAt = formatMaterialParseTimestamp(row.parse_finished_at);
+          const createdAt = formatMaterialParseTimestamp(row.created_at);
+          const parsedChars = Number(row.parsed_chars || 0);
+          let html = '<strong>资料详情</strong>';
+          html += '<table style="margin-top:8px"><tbody>';
+          html += '<tr><th>资料名称</th><td>' + escapeHtmlText(String(row.filename || '')) + '</td></tr>';
+          html += '<tr><th>资料类型</th><td>' + escapeHtmlText(typeof window.materialTypeLabel === 'function' ? window.materialTypeLabel(row.material_type || 'tender_qa') : String(row.material_type || '-')) + '</td></tr>';
+          html += '<tr><th>解析状态</th><td>' + escapeHtmlText(String(row.parse_stage_label || row.parse_status || '-')) + '</td></tr>';
+          html += '<tr><th>上传时间</th><td>' + escapeHtmlText(createdAt || '-') + '</td></tr>';
+          html += '<tr><th>解析完成时间</th><td>' + escapeHtmlText(parseFinishedAt || '-') + '</td></tr>';
+          html += '<tr><th>解析文本长度</th><td>' + escapeHtmlText(parsedChars > 0 ? (String(parsedChars) + ' 字') : '暂无') + '</td></tr>';
+          html += '</tbody></table>';
+          if (String(row.parse_note || '').trim()) {
+            html += '<p style="margin:8px 0 0 0;color:#475569">' + escapeHtmlText(String(row.parse_note || '')) + '</p>';
+          }
+          html += '<div style="margin-top:8px"><strong>解析文本预览</strong>';
+          html += '<pre style="margin:6px 0 0 0;max-height:320px;overflow:auto;white-space:pre-wrap">' + escapeHtmlText(previewText || '暂无可预览的解析文本。') + '</pre></div>';
+          el.innerHTML = html;
+          el.style.display = 'block';
+          if (typeof el.scrollIntoView === 'function') {
+            el.scrollIntoView({ behavior: 'auto', block: 'nearest' });
+          }
+        }
+        async function viewMaterialRow(materialId, filename, projectId) {
+          const effectiveProjectId = String(projectId || pid() || '').trim();
+          if (!effectiveProjectId || !materialId) {
+            setResultError('materialViewResult', '资料详情入口不可用，请刷新后重试。');
+            return;
+          }
+          setResultLoading('materialViewResult', '资料详情加载中...');
+          let res;
+          let data = {};
+          try {
+            res = await fetch('/api/v1/projects/' + encodeURIComponent(effectiveProjectId) + '/materials/' + encodeURIComponent(materialId) + '/detail', {
+              method: 'GET',
+              headers: apiHeaders(false),
+            });
+            data = await res.json().catch(() => ({}));
+          } catch (err) {
+            setResultError('materialViewResult', '查看失败：' + String((err && err.message) || err || '网络异常'));
+            return;
+          }
+          if (!res.ok) {
+            const detail = extractApiErrorMessage(res.status, '', data);
+            setResultError('materialViewResult', '查看失败：' + detail);
+            return;
+          }
+          renderMaterialViewResult(data);
         }
         function buildFeedMaterialTableRowHtml(material, projectId) {
           const row = (material && typeof material === 'object') ? material : {};
@@ -37682,6 +38044,7 @@ def index(
           setMaterialParseSummary(
             hasProject ? '待机：正在加载当前项目资料解析概览…' : '待机：请先选择项目。'
           );
+          clearMaterialParseDebugInfo();
           setTableStandby(
             'submissionsTable',
             'submissionsEmpty',
@@ -37700,6 +38063,7 @@ def index(
           [
             'scoringReadinessResult',
             'scoringDiagnosticResult',
+            'materialViewResult',
             'materialDepthReportResult',
             'materialUtilizationResult',
             'compareResult', 'compareReportResult', 'insightsResult', 'learningResult',
@@ -38758,6 +39122,7 @@ def index(
           }
           if (materialParseSummaryState && typeof renderMaterialParseSummary === 'function') {
             renderMaterialParseSummary(
+              materialParseSummaryState.overview || {},
               materialParseSummaryState.summary || {},
               materialParseSummaryState.materials || []
             );
@@ -41060,6 +41425,16 @@ def index(
           if (materialsTable && !materialsTable.dataset.deleteBound) {
             materialsTable.dataset.deleteBound = '1';
             materialsTable.addEventListener('click', (ev) => {
+              const viewBtn = ev.target && ev.target.closest ? ev.target.closest('.js-view-material') : null;
+              if (viewBtn) {
+                ev.preventDefault();
+                viewMaterialRow(
+                  viewBtn.getAttribute('data-material-id') || '',
+                  viewBtn.getAttribute('data-filename') || '',
+                  viewBtn.getAttribute('data-project-id') || ''
+                );
+                return;
+              }
               const btn = ev.target && ev.target.closest ? ev.target.closest('.js-delete-material') : null;
               if (!btn) return;
               ev.preventDefault();
@@ -41323,6 +41698,7 @@ def index(
               emptyEl.style.display = 'block';
             }
             setMaterialParseSummary('待机：请先选择项目。');
+            clearMaterialParseDebugInfo();
             if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState([], {});
             if (typeof clearScoringReadinessPanel === 'function') clearScoringReadinessPanel();
             if (typeof clearScoringDiagnosticPanel === 'function') clearScoringDiagnosticPanel();
@@ -41339,18 +41715,22 @@ def index(
               emptyEl.style.display = 'block';
             }
             setMaterialParseSummary('资料解析概览加载失败，请稍后重试。', '#991b1b');
+            clearMaterialParseDebugInfo();
             return;
           }
           if (isStaleProjectResponse(id, switchSeq)) return;
           payload = await res.json().catch(() => ({}));
           const mats = Array.isArray(payload && payload.materials) ? payload.materials : [];
+          const overview = (payload && typeof payload.overview === 'object') ? payload.overview : {};
           const summary = (payload && typeof payload.summary === 'object') ? payload.summary : {};
+          const debugInfo = (payload && typeof payload.debug_info === 'object') ? payload.debug_info : {};
           if (!res.ok || !payload || typeof payload !== 'object') {
             if (emptyEl) {
               emptyEl.textContent = '资料列表加载失败（HTTP ' + String(res.status || 0) + '）';
               emptyEl.style.display = 'block';
             }
             setMaterialParseSummary('资料解析概览加载失败（HTTP ' + String(res.status || 0) + '）。', '#991b1b');
+            clearMaterialParseDebugInfo();
             if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState([], {});
             if (!skipReadinessRefresh && typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             return;
@@ -41361,14 +41741,16 @@ def index(
               emptyEl.textContent = '暂无资料，请下方添加。';
               emptyEl.style.display = 'block';
             }
-            renderMaterialParseSummary(summary, []);
+            renderMaterialParseSummary(overview, summary, []);
+            renderMaterialParseDebugInfo(debugInfo, []);
             if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState([], summary);
             scheduleMaterialParsePolling(id, summary, switchSeq);
             if (!skipReadinessRefresh && typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             return;
           }
           if (emptyEl) emptyEl.style.display = 'none';
-          renderMaterialParseSummary(summary, mats);
+          renderMaterialParseSummary(overview, summary, mats);
+          renderMaterialParseDebugInfo(debugInfo, mats);
           if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState(mats, summary);
           const rowHtml = mats.map((m) => buildMaterialTableRowHtml(m, id));
           replaceTableRowsIfChanged(

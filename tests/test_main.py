@@ -5833,8 +5833,16 @@ class TestIndexEndpoint:
         assert "function scheduleMaterialParsePolling" in page
         assert "function scheduleProjectAutoRefresh" in page
         assert "materialsParseSummary" in page
+        assert "materialsDebugPanel" in page
+        assert "materialsDebugInfo" in page
+        assert "materialViewResult" in page
         assert "function setMaterialParseSummary" in page
         assert "function renderMaterialParseSummary" in page
+        assert "function renderMaterialParseDebugInfo" in page
+        assert "function viewMaterialRow" in page
+        assert "底层运行监控（Debug Info）" in page
+        assert "<th>资料名称</th>" in page
+        assert "<th>解析完成时间</th>" in page
         assert "latest_finished_at" in page
         assert "parse_stage_label" in page
         assert "parse_route_label" in page
@@ -8872,6 +8880,9 @@ class TestMaterialsEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["project_id"] == "p1"
+        assert data["overview"]["materials_total"] == 1
+        assert data["overview"]["queued_materials"] == 1
+        assert data["overview"]["latest_finished_filename"] == "工程量清单.xlsx"
         assert data["summary"]["materials_total"] == 1
         assert data["summary"]["queued_materials"] == 1
         assert data["summary"]["worker_count"] == app_main._material_parse_total_worker_count()
@@ -8886,6 +8897,13 @@ class TestMaterialsEndpoint:
         assert data["summary"]["backlog"] == 1
         assert data["summary"]["latest_finished_at"] == "2026-03-09T00:02:03+00:00"
         assert data["summary"]["latest_finished_filename"] == "工程量清单.xlsx"
+        assert (
+            data["debug_info"]["pipeline"]["worker_count"]
+            == app_main._material_parse_total_worker_count()
+        )
+        assert data["debug_info"]["pipeline"]["backlog"] == 1
+        assert data["debug_info"]["cache"]["scheduler_cache_hit_total"] == 0
+        assert data["debug_info"]["project_cache"]["scheduler_project_cache_state"] == "cold"
         assert data["summary"]["scheduler_project_continuity_bonus_hits"] == 0
         assert data["summary"]["scheduler_followup_full_bonus_hits"] == 0
         assert data["summary"]["scheduler_same_material_followup_bonus_hits"] == 0
@@ -8974,6 +8992,49 @@ class TestMaterialsEndpoint:
         assert data["materials"][0]["parse_effective_status"] == "processing"
         assert "解析中" in str(data["materials"][0]["parse_stage_label"])
         assert data["materials"][0]["parse_route_label"] == "本地预解析，必要时 GPT 深解析"
+
+    @patch("app.main.load_material_parse_jobs")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_material_detail_success(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        mock_load_jobs,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1"}]
+        mock_load_materials.return_value = [
+            {
+                "id": "m1",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件正文.pdf",
+                "path": "/tmp/招标文件正文.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:05:00+00:00",
+                "parse_status": "parsed",
+                "parse_backend": "local",
+                "parse_finished_at": "2026-03-09T00:05:00+00:00",
+                "parsed_chars": 1280,
+                "parsed_text": "第一页文本\\n第二页文本\\n第三页文本",
+            }
+        ]
+        mock_load_jobs.return_value = []
+
+        response = client.get("/api/v1/projects/p1/materials/m1/detail")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["id"] == "m1"
+        assert data["filename"] == "招标文件正文.pdf"
+        assert data["material_type"] == "tender_qa"
+        assert data["parse_status"] == "parsed"
+        assert data["parse_finished_at"] == "2026-03-09T00:05:00+00:00"
+        assert data["parsed_chars"] == 1280
+        assert "第一页文本" in data["parsed_text_preview"]
 
     @patch("app.main.load_material_parse_jobs")
     @patch("app.main.load_materials")
@@ -9141,6 +9202,9 @@ class TestMaterialsEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["summary"]["scheduler_project_continuity_bonus_hits"] == 4
+        assert data["debug_info"]["scheduler_hits"]["scheduler_project_continuity_bonus_hits"] == 4
+        assert data["debug_info"]["cache"]["scheduler_cache_hit_total"] == 35
+        assert data["debug_info"]["project_cache"]["scheduler_project_cache_state"] == "warm"
         assert data["summary"]["scheduler_followup_full_bonus_hits"] == 3
         assert data["summary"]["scheduler_same_material_followup_bonus_hits"] == 2
         assert data["summary"]["scheduler_active_project_bonus_hits"] == 5
