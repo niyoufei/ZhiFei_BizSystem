@@ -23,7 +23,7 @@ def build_submission_dual_track_summary(
     current_score_failure = main._report_current_score_failure(report)
     current_score_failed = bool(current_score_failure)
     current_score_failure_message = (
-        str(current_score_failure.get("message") or "").strip() or "评分计算失败，请重试"
+        str(current_score_failure.get("message") or "").strip() or "校准引擎处理失败，请重试"
     )
     util_gate = main._normalize_material_utilization_gate_state(
         report_meta.get("material_utilization_gate")
@@ -236,7 +236,7 @@ def render_submission_dual_track_score_html(
     lines: List[str] = []
     current_score_failed = bool(summary.get("current_score_failed"))
     current_score_failure_message = (
-        str(summary.get("current_score_failure_message") or "").strip() or "评分计算失败，请重试"
+        str(summary.get("current_score_failure_message") or "").strip() or "校准引擎处理失败，请重试"
     )
     if current_score_failed:
         lines.append('<div class="error">' + html.escape(current_score_failure_message) + "</div>")
@@ -271,7 +271,7 @@ def render_submission_dual_track_diagnostic_html(
         "tracks_tied": "双轨与青天偏差相当",
         "await_approximation": "已录入青天，等待逼近层收敛",
         "await_ground_truth": "等待青天结果验证",
-        "current_score_failed": "评分计算失败，请重试",
+        "current_score_failed": "校准引擎处理失败，请重试",
         "independent_only": "当前仅有独立评分",
     }
     delta_tokens: List[str] = []
@@ -288,7 +288,7 @@ def render_submission_dual_track_diagnostic_html(
     lines: List[str] = []
     current_score_failed = bool(summary.get("current_score_failed"))
     current_score_failure_message = (
-        str(summary.get("current_score_failure_message") or "").strip() or "评分计算失败，请重试"
+        str(summary.get("current_score_failure_message") or "").strip() or "校准引擎处理失败，请重试"
     )
     gate_reasons = [
         str(item).strip()

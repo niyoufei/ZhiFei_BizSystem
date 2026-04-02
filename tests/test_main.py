@@ -5421,7 +5421,7 @@ class TestIndexEndpoint:
         assert "previewed_materials" in page
         assert "预解析完成" in page
         assert "后台仍在补全全文" in page
-        assert "if (raw === 'current_score_failed') return '评分计算失败，请重试';" in page
+        assert "if (raw === 'current_score_failed') return '校准引擎处理失败，请重试';" in page
 
     def test_index_frontend_inline_scripts_are_valid_javascript(self, client):
         response = client.get("/")
@@ -15790,7 +15790,8 @@ class TestCompareEndpoints:
             },
         ]
 
-        def _fake_narrative(rows):
+        def _fake_narrative(rows, *, score_scale_max=100):
+            assert score_scale_max in (5, 100)
             row_map = {str(row.get("id")): row for row in rows}
             assert "s1" in row_map
             assert "s2" in row_map
@@ -15862,7 +15863,8 @@ class TestCompareEndpoints:
             },
         ]
 
-        def _fake_narrative(rows):
+        def _fake_narrative(rows, *, score_scale_max=100):
+            assert score_scale_max == 100
             row_map = {str(x.get("id")): x for x in rows}
             assert float(row_map["s1"]["total_score"]) == 65.0
             assert float(row_map["s2"]["total_score"]) == 90.0
@@ -15882,6 +15884,66 @@ class TestCompareEndpoints:
         assert data["top_submission"]["score_source"] == "pred"
         assert data["top_submission"]["score_confidence_level"] == "high"
         assert data["top_submission"]["score_self_awareness"]["score_0_100"] == 84.0
+
+    @patch("app.main.load_calibration_models")
+    @patch("app.main.build_compare_narrative")
+    @patch("app.main.load_projects")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_compare_report_respects_requested_score_scale(
+        self,
+        mock_ensure,
+        mock_load,
+        mock_load_projects,
+        mock_narrative,
+        mock_load_models,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "calibrator_version_locked": "calib1"}]
+        mock_load_models.return_value = [
+            {
+                "calibrator_version": "calib1",
+                "deployed": True,
+                "created_at": "2026-01-02T00:00:00Z",
+                "train_filter": {"project_id": "p1"},
+            }
+        ]
+        mock_load.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "f1.txt",
+                "total_score": 93.44,
+                "report": {
+                    "scoring_status": "scored",
+                    "total_score": 93.44,
+                    "rule_total_score": 20.01,
+                    "pred_total_score": 93.44,
+                    "meta": {},
+                },
+            }
+        ]
+
+        def _fake_narrative(rows, *, score_scale_max=100):
+            assert score_scale_max == 5
+            assert float(rows[0]["total_score"]) == 4.672
+            assert float(rows[0]["report"]["pred_total_score"]) == 4.672
+            assert float(rows[0]["report"]["rule_total_score"]) == 1.0005
+            return {
+                "summary": "ok",
+                "score_scale_max": 5,
+                "score_scale_label": "5分制",
+                "top_submission": {"id": "s1", "filename": "f1.txt", "total_score": 4.672},
+                "bottom_submission": {"id": "s1", "filename": "f1.txt", "total_score": 4.672},
+                "key_diffs": [],
+            }
+
+        mock_narrative.side_effect = _fake_narrative
+        response = client.get("/api/v1/projects/p1/compare_report?score_scale_max=5")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["score_scale_max"] == 5
+        assert data["score_scale_label"] == "5分制"
 
     @patch("app.main.load_submissions")
     @patch("app.main.ensure_data_dirs")
@@ -18383,7 +18445,7 @@ class TestProjectCalibratorDirectApply:
         assert report["meta"]["calibrator_version"] == "calib-timeout"
         assert "TimeoutError: predict timeout" in report["meta"]["calibrator_error"]
         assert report["meta"]["current_score_failure"]["failed"] is True
-        assert report["meta"]["current_score_failure"]["message"] == "评分计算失败，请重试"
+        assert report["meta"]["current_score_failure"]["message"] == "校准引擎处理失败，请重试"
         assert report["meta"]["current_score_failure"]["calibrator_version"] == "calib-timeout"
 
     def test_submission_dual_track_summary_marks_current_score_failure(self):
@@ -18403,7 +18465,7 @@ class TestProjectCalibratorDirectApply:
                 "meta": {
                     "current_score_failure": {
                         "failed": True,
-                        "message": "评分计算失败，请重试",
+                        "message": "校准引擎处理失败，请重试",
                         "error": "TimeoutError: predict timeout",
                     }
                 },
@@ -18417,14 +18479,14 @@ class TestProjectCalibratorDirectApply:
         )
 
         assert summary["alignment_status"] == "current_score_failed"
-        assert summary["governance_hint"] == "评分计算失败，请重试"
+        assert summary["governance_hint"] == "校准引擎处理失败，请重试"
         assert summary["current_score_failed"] is True
         assert 'class="error"' in render_submission_dual_track_score_html(summary)
         diagnostic_html = render_submission_dual_track_diagnostic_html(
             summary,
             project_id="p1",
         )
-        assert "评分计算失败，请重试" in diagnostic_html
+        assert "校准引擎处理失败，请重试" in diagnostic_html
         assert "当前仅保留独立分" in diagnostic_html
 
 

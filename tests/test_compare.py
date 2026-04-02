@@ -214,6 +214,31 @@ def test_compare_submission_cards_with_page_hint():
     assert len(low_scorecard.get("deduction_items") or []) >= 1
 
 
+def test_compare_narrative_respects_five_scale_totals():
+    submissions = [
+        {
+            "id": "sub1",
+            "filename": "施组A.txt",
+            "total_score": 4.1125,
+            "report": {"dimension_scores": {"01": {"score": 8.0}}},
+        },
+        {
+            "id": "sub2",
+            "filename": "施组B.txt",
+            "total_score": 4.6775,
+            "report": {"dimension_scores": {"01": {"score": 9.0}}},
+        },
+    ]
+
+    result = build_compare_narrative(submissions, score_scale_max=5)
+
+    assert result["score_scale_max"] == 5
+    assert result["score_scale_label"] == "5分制"
+    assert "4.6775 / 5" in result["summary"]
+    assert result["submission_optimization_cards"][0]["target_score"] == 5.0
+    assert result["submission_scorecards"][0]["target_full_score"] == 5.0
+
+
 def test_compare_narrative_carries_score_confidence_metadata():
     submissions = [
         {

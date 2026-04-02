@@ -9,7 +9,7 @@ from app.engine.dimensions import DIMENSIONS
 
 _PAGE_MARK_RE = re.compile(r"\[PAGE:(\d+)\]")
 _CHAR_LOC_RE = re.compile(r"char:(\d+)(?:-(\d+))?")
-FULL_TARGET_TOTAL_SCORE = 100.0
+DEFAULT_TOTAL_SCORE_SCALE_MAX = 100.0
 DEFAULT_DIMENSION_MAX_SCORE = 10.0
 EVIDENCE_CONTEXT_RADIUS = 90
 
@@ -30,6 +30,24 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
 
 def _safe_str(v: Any) -> str:
     return str(v or "").strip()
+
+
+def _normalize_total_score_scale(score_scale_max: object) -> float:
+    try:
+        numeric = int(float(score_scale_max))
+    except (TypeError, ValueError):
+        numeric = int(DEFAULT_TOTAL_SCORE_SCALE_MAX)
+    return 5.0 if numeric == 5 else 100.0
+
+
+def _total_score_scale_label(score_scale_max: object) -> str:
+    return "5分制" if _normalize_total_score_scale(score_scale_max) == 5.0 else "100分制"
+
+
+def _format_total_score_text(score: object, score_scale_max: object) -> str:
+    value = _safe_float(score)
+    scale = _normalize_total_score_scale(score_scale_max)
+    return f"{value:.4f} / 5" if scale == 5.0 else f"{value:.2f}分"
 
 
 def _clean_snippet(text: str, limit: int = 90) -> str:
@@ -810,10 +828,13 @@ def _build_submission_optimization_cards(
     rankings: List[Dict[str, Any]],
     top: Dict[str, Any],
     all_dim_ids: List[str],
+    *,
+    total_score_scale_max: float = DEFAULT_TOTAL_SCORE_SCALE_MAX,
 ) -> List[Dict[str, Any]]:
     cards: List[Dict[str, Any]] = []
     top_dims = (top.get("report") or {}).get("dimension_scores", {}) or {}
     top_total = _safe_float(top.get("total_score"))
+    target_total_score = _normalize_total_score_scale(total_score_scale_max)
 
     for s in sorted(rankings, key=compare_sort_key):
         sid = _safe_str(s.get("id"))
@@ -1018,7 +1039,7 @@ def _build_submission_optimization_cards(
                         ]
                     ),
                     "target_delta_reduction": 0.0,
-                    "target_full_score": FULL_TARGET_TOTAL_SCORE,
+                    "target_full_score": target_total_score,
                     "reference_top_score": top_total,
                     "priority_reason": "当前稿件已在高分段，重点防止表述回退导致二次扣分。",
                 }
@@ -1045,8 +1066,8 @@ def _build_submission_optimization_cards(
                 "submission_id": sid,
                 "filename": filename,
                 "total_score": total_score,
-                "target_score": FULL_TARGET_TOTAL_SCORE,
-                "target_gap": round(max(0.0, FULL_TARGET_TOTAL_SCORE - total_score), 2),
+                "target_score": target_total_score,
+                "target_gap": round(max(0.0, target_total_score - total_score), 2),
                 "reference_top_score": top_total,
                 "recommendations": recommendations[:12],
             }
@@ -1058,9 +1079,12 @@ def _build_submission_scorecards(
     rankings: List[Dict[str, Any]],
     top: Dict[str, Any],
     all_dim_ids: List[str],
+    *,
+    total_score_scale_max: float = DEFAULT_TOTAL_SCORE_SCALE_MAX,
 ) -> List[Dict[str, Any]]:
     cards: List[Dict[str, Any]] = []
     top_dims = (top.get("report") or {}).get("dimension_scores", {}) or {}
+    target_total_score = _normalize_total_score_scale(total_score_scale_max)
 
     for rank_desc, s in enumerate(rankings, start=1):
         sid = _safe_str(s.get("id"))
@@ -1167,8 +1191,8 @@ def _build_submission_scorecards(
                 "score_confidence_reason": awareness.get("score_confidence_reason") or "",
                 "ranking_evidence_bonus": awareness.get("ranking_evidence_bonus"),
                 "ranking_sort_score": awareness.get("ranking_sort_score"),
-                "target_full_score": FULL_TARGET_TOTAL_SCORE,
-                "gap_to_full_total": round(max(0.0, FULL_TARGET_TOTAL_SCORE - total_score), 2),
+                "target_full_score": target_total_score,
+                "gap_to_full_total": round(max(0.0, target_total_score - total_score), 2),
                 "total_deduction_points": round(total_deduction_points, 2),
                 "dimension_score_items": dimension_score_items,
                 "loss_items": loss_items,
@@ -1179,10 +1203,18 @@ def _build_submission_scorecards(
     return cards
 
 
-def build_compare_narrative(submissions: List[Dict[str, Any]]) -> Dict[str, Any]:
+def build_compare_narrative(
+    submissions: List[Dict[str, Any]],
+    *,
+    score_scale_max: float = DEFAULT_TOTAL_SCORE_SCALE_MAX,
+) -> Dict[str, Any]:
+    normalized_scale_max = _normalize_total_score_scale(score_scale_max)
+    scale_label = _total_score_scale_label(normalized_scale_max)
     if len(submissions) < 2:
         return {
             "summary": "施组数量不足，无法进行对比分析。",
+            "score_scale_max": int(normalized_scale_max),
+            "score_scale_label": scale_label,
             "top_submission": {},
             "bottom_submission": {},
             "key_diffs": [],
@@ -1446,8 +1478,18 @@ def build_compare_narrative(submissions: List[Dict[str, Any]]) -> Dict[str, Any]
             }
         )
 
-    submission_optimization_cards = _build_submission_optimization_cards(rankings, top, all_dim_ids)
-    submission_scorecards = _build_submission_scorecards(rankings, top, all_dim_ids)
+    submission_optimization_cards = _build_submission_optimization_cards(
+        rankings,
+        top,
+        all_dim_ids,
+        total_score_scale_max=normalized_scale_max,
+    )
+    submission_scorecards = _build_submission_scorecards(
+        rankings,
+        top,
+        all_dim_ids,
+        total_score_scale_max=normalized_scale_max,
+    )
     gap = round(_safe_float(top.get("total_score")) - _safe_float(bottom.get("total_score")), 2)
     low_confidence_files = [
         _safe_str(s.get("filename"))
@@ -1455,9 +1497,9 @@ def build_compare_narrative(submissions: List[Dict[str, Any]]) -> Dict[str, Any]
         if _safe_str(_score_awareness_meta(s).get("score_confidence_level")) == "low"
     ]
     summary = (
-        f"最高分为{top.get('filename')}（{top.get('total_score')}分），"
-        f"最低分为{bottom.get('filename')}（{bottom.get('total_score')}分），"
-        f"分差 {gap} 分。"
+        f"最高分为{top.get('filename')}（{_format_total_score_text(top.get('total_score'), normalized_scale_max)}），"
+        f"最低分为{bottom.get('filename')}（{_format_total_score_text(bottom.get('total_score'), normalized_scale_max)}），"
+        f"分差 {_format_total_score_text(gap, normalized_scale_max)}。"
         f"当前建议优先处理维度：{'、'.join([str(x.get('dimension')) for x in key_diffs[:3]]) or '无'}，"
         f"并优先消减扣分项：{'、'.join([str(x.get('code')) for x in penalty_diagnostics[:2]]) or '无'}。"
         + (
@@ -1471,6 +1513,8 @@ def build_compare_narrative(submissions: List[Dict[str, Any]]) -> Dict[str, Any]
 
     return {
         "summary": summary,
+        "score_scale_max": int(normalized_scale_max),
+        "score_scale_label": scale_label,
         "top_submission": {
             "id": top.get("id"),
             "filename": top.get("filename"),
@@ -1486,6 +1530,8 @@ def build_compare_narrative(submissions: List[Dict[str, Any]]) -> Dict[str, Any]
         "key_diffs": key_diffs,
         "score_overview": {
             "submission_count": len(rankings),
+            "score_scale_max": int(normalized_scale_max),
+            "score_scale_label": scale_label,
             "top_score": round(_safe_float(top.get("total_score")), 2),
             "bottom_score": round(_safe_float(bottom.get("total_score")), 2),
             "score_gap": gap,

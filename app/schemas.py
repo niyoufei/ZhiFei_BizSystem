@@ -1092,6 +1092,8 @@ class LearningProfile(BaseModel):
 class CompareNarrative(BaseModel):
     project_id: str
     summary: str
+    score_scale_max: int = 100
+    score_scale_label: str = "100分制"
     top_submission: Dict[str, Any]
     bottom_submission: Dict[str, Any]
     key_diffs: List[Dict[str, Any]]

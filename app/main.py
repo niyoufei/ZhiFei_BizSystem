@@ -15196,7 +15196,7 @@ def _set_report_current_score_failure(
     meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
     failure = {
         "failed": True,
-        "message": "评分计算失败，请重试",
+        "message": "校准引擎处理失败，请重试",
         "error": str(error_message or "").strip(),
         "calibrator_version": calibrator_version or None,
         "failed_at": _now_iso(),
@@ -31266,6 +31266,7 @@ def compare_submissions(
 )
 def compare_report(
     project_id: str,
+    score_scale_max: Optional[int] = Query(None, description="报告展示满分制（5或100）"),
     locale: str = Depends(get_locale),
 ) -> CompareNarrative:
     """
@@ -31279,7 +31280,10 @@ def compare_report(
     projects = load_projects()
     project = next((p for p in projects if str(p.get("id")) == project_id), {"id": project_id})
     allow_pred_score = _select_calibrator_model(project) is not None
-    score_scale_max = _resolve_project_score_scale_max(project)
+    report_score_scale_max = _normalize_score_scale_max(
+        score_scale_max,
+        default=_resolve_project_score_scale_max(project),
+    )
     submissions_all = [s for s in load_submissions() if s["project_id"] == project_id]
     if not submissions_all:
         raise HTTPException(status_code=404, detail=t("api.no_submissions", locale=locale))
@@ -31298,15 +31302,10 @@ def compare_report(
         score_fields_display = _resolve_submission_score_fields(
             display_submission,
             allow_pred_score=allow_pred_score,
-            score_scale_max=score_scale_max,
-        )
-        score_fields_raw = _resolve_submission_score_fields(
-            display_submission,
-            allow_pred_score=allow_pred_score,
-            score_scale_max=100,
+            score_scale_max=report_score_scale_max,
         )
         item = dict(display_submission)
-        item["total_score"] = float(score_fields_raw["total_score"])
+        item["total_score"] = float(score_fields_display["total_score"])
         report = item.get("report")
         report = dict(report) if isinstance(report, dict) else {}
         _ensure_report_score_self_awareness(
@@ -31314,14 +31313,19 @@ def compare_report(
             project_id=project_id,
             material_knowledge_snapshot=material_knowledge_snapshot,
         )
-        report["pred_total_score"] = score_fields_raw["pred_total_score"]
-        report["rule_total_score"] = score_fields_raw["rule_total_score"]
+        report["pred_total_score"] = score_fields_display["pred_total_score"]
+        report["rule_total_score"] = score_fields_display["rule_total_score"]
+        report["score_scale_max"] = report_score_scale_max
+        report["score_scale_label"] = _score_scale_label(report_score_scale_max)
         item["report"] = report
         item["score_source"] = score_fields_display["score_source"]
         submissions_for_compare.append(item)
         by_id[str(item.get("id") or "")] = item
 
-    narrative = build_compare_narrative(submissions_for_compare)
+    narrative = build_compare_narrative(
+        submissions_for_compare,
+        score_scale_max=report_score_scale_max,
+    )
     for key in ("top_submission", "bottom_submission"):
         row = narrative.get(key)
         if not isinstance(row, dict):
@@ -31333,7 +31337,7 @@ def compare_report(
         score_fields = _resolve_submission_score_fields(
             source_submission,
             allow_pred_score=allow_pred_score,
-            score_scale_max=score_scale_max,
+            score_scale_max=report_score_scale_max,
         )
         awareness = (
             (
@@ -34104,7 +34108,7 @@ def index(
             btnMaterialKnowledgeProfileDownload: { resultId: 'materialKnowledgeProfileResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/materials/knowledge_profile.md', loading: '知识画像下载准备中...' },
             btnScoringDiagnostic: { resultId: 'scoringDiagnosticResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/scoring_diagnostic/latest', loading: '评分证据链诊断生成中...' },
             btnCompare: { resultId: 'compareResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare', loading: '对比排名加载中...' },
-            btnCompareReport: { resultId: 'compareReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare_report', loading: '满分优化清单生成中...' },
+            btnCompareReport: { resultId: 'compareReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare_report?score_scale_max=' + selectedScoreScaleMax(), loading: '满分优化清单生成中...' },
             btnInsights: { resultId: 'insightsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/insights', loading: '洞察分析中...' },
             btnLearning: { resultId: 'learningResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/learning', loading: '学习画像生成中...' },
             btnEvidenceTrace: { resultId: 'evidenceTraceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/evidence_trace/latest', loading: '证据追溯生成中...' },
@@ -35023,7 +35027,7 @@ def index(
             btnScoreShigong: { resultId: 'shigongActionStatus', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/rescore', loading: '施组评分中...' },
             btnScoringDiagnostic: { resultId: 'scoringDiagnosticResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/scoring_diagnostic/latest', loading: '评分证据链诊断生成中...' },
             btnCompare: { resultId: 'compareResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare', loading: '对比排名加载中...' },
-            btnCompareReport: { resultId: 'compareReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare_report', loading: '满分优化清单生成中...' },
+            btnCompareReport: { resultId: 'compareReportResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compare_report?score_scale_max=' + selectedScoreScaleMax(), loading: '满分优化清单生成中...' },
             btnInsights: { resultId: 'insightsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/insights', loading: '洞察分析中...' },
             btnLearning: { resultId: 'learningResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/learning', loading: '学习画像生成中...' },
             btnEvidenceTrace: { resultId: 'evidenceTraceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/evidence_trace/latest', loading: '证据追溯生成中...' },
@@ -42276,7 +42280,7 @@ def index(
           if (raw === 'await_approximation') return '已录入青天，等待当前分收敛';
           if (raw === 'await_ground_truth') return '等待青天结果验证';
           if (raw === 'ground_truth_exact') return '已命中真实评标';
-          if (raw === 'current_score_failed') return '评分计算失败，请重试';
+          if (raw === 'current_score_failed') return '校准引擎处理失败，请重试';
           if (raw === 'independent_only') return '当前仅有独立评分';
           return raw || '待生成';
         }
@@ -42286,7 +42290,7 @@ def index(
           if (flags.isPending) return '<span class="note">待评分</span>';
           const summary = getSubmissionDualTrackSummary(submission);
           const currentScoreFailed = !!summary.current_score_failed;
-          const currentScoreFailureMessage = String(summary.current_score_failure_message || '评分计算失败，请重试').trim();
+          const currentScoreFailureMessage = String(summary.current_score_failure_message || '校准引擎处理失败，请重试').trim();
           const detailTokens = [];
           const independentScore = toFiniteNumber(summary.independent_score);
           const approximationScore = toFiniteNumber(summary.approximation_score);
@@ -42324,7 +42328,7 @@ def index(
           if (flags.isPending) return '<span class="note">待评分后生成双轨诊断。</span>';
           const summary = getSubmissionDualTrackSummary(submission);
           const currentScoreFailed = !!summary.current_score_failed;
-          const currentScoreFailureMessage = String(summary.current_score_failure_message || '评分计算失败，请重试').trim();
+          const currentScoreFailureMessage = String(summary.current_score_failure_message || '校准引擎处理失败，请重试').trim();
           const utilGate = getSubmissionMaterialUtilizationGate(submission);
           const gateReasons = Array.isArray(summary.material_gate_reasons) && summary.material_gate_reasons.length
             ? summary.material_gate_reasons
@@ -46541,7 +46545,17 @@ def index(
           if (!ensureProjectForAction('compareReportResult')) return;
           setResultLoading('compareReportResult', '满分优化清单生成中...');
           const projectId = actionProjectId();
-          const res = await fetch('/api/v1/projects/' + projectId + '/compare_report');
+          const reportScaleMax = selectedScoreScaleMax();
+          const reportScaleLabel = reportScaleMax === 5 ? '5分制' : '100分制';
+          const formatScoreForReportScale = (value) => {
+            if (value == null || value === '') return '-';
+            return reportScaleMax === 5 ? (String(value) + ' / 5') : (String(value) + '分');
+          };
+          const formatDeltaForReportScale = (value) => {
+            if (value == null || value === '') return '-';
+            return reportScaleMax === 5 ? String(value) : (String(value) + '分');
+          };
+          const res = await fetch('/api/v1/projects/' + projectId + '/compare_report?score_scale_max=' + reportScaleMax);
           const data = await res.json().catch(() => ({}));
           showJson('output', formatApiOutput(res, data));
           const el = document.getElementById('compareReportResult');
@@ -46559,8 +46573,8 @@ def index(
             const scoreText = (row) => {
               if (!row) return '-';
               const source = row.score_source === 'pred' ? '校准' : (row.score_source === 'ground_truth' ? '真实' : '规则');
-              const rule = row.rule_total_score == null ? '-' : row.rule_total_score;
-              return esc(row.total_score) + ' 分（规则 ' + esc(rule) + '，来源 ' + source + '）';
+              const rule = row.rule_total_score == null ? '-' : formatScoreForReportScale(row.rule_total_score);
+              return esc(formatScoreForReportScale(row.total_score)) + '（规则 ' + esc(rule) + '，来源 ' + source + '）';
             };
             const confidenceText = (row) => {
               if (!row || typeof row !== 'object') return '置信等级 -';
@@ -46585,10 +46599,10 @@ def index(
                   const dedRows = Array.isArray(card.deduction_items) ? card.deduction_items : [];
                   const title = esc(card.filename || '') +
                     '（排名 ' + esc(card.rank_desc || '-') +
-                    '，总分 ' + esc(card.total_score) +
+                    '，总分 ' + esc(formatScoreForReportScale(card.total_score)) +
                     '，置信等级 ' + esc(card.score_confidence_level || '-') + ' / 内部指数 ' + esc(card.score_confidence_score ?? '-') + '/100' +
-                    '，距满分 ' + esc(card.gap_to_full_total) +
-                    '，累计扣分 ' + esc(card.total_deduction_points) + '）';
+                    '，距满分 ' + esc(formatDeltaForReportScale(card.gap_to_full_total)) +
+                    '，累计扣分 ' + esc(formatDeltaForReportScale(card.total_deduction_points)) + '）';
 
                   const lossTable = '<strong>主要失分项（Top5）</strong><table><tr><th>维度</th><th>得分/满分</th><th>失分</th><th>定位页码</th><th>证据片段</th></tr>' +
                     (lossRows.length ? lossRows.map(r => '<tr>' +
@@ -46656,8 +46670,8 @@ def index(
                       '<td><details><summary>验收标准</summary>' + escMultiline(r.acceptance_check || '') + '</details></td>' +
                       '<td><details><summary>检查表</summary>' + escMultiline(r.execution_checklist || '') + '</details></td>' +
                     '</tr>').join('') + '</table>';
-                  const refTop = card.reference_top_score == null ? '' : ('，项目最高 ' + esc(card.reference_top_score) + ' 分');
-                  const title = esc(card.filename || '') + '（当前 ' + esc(card.total_score) + ' 分，目标 ' + esc(card.target_score) + ' 分，差距 ' + esc(card.target_gap) + refTop + '）';
+                  const refTop = card.reference_top_score == null ? '' : ('，项目最高 ' + esc(formatScoreForReportScale(card.reference_top_score)));
+                  const title = esc(card.filename || '') + '（当前 ' + esc(formatScoreForReportScale(card.total_score)) + '，目标 ' + esc(formatScoreForReportScale(card.target_score)) + '，差距 ' + esc(formatDeltaForReportScale(card.target_gap)) + refTop + '）';
                   const gateHtml = gateSummary
                     ? '<div class="' + gateClass + '" style="margin-bottom:8px"><strong>' + escMultiline(gateSummary) + '</strong></div>'
                     : '';
@@ -46665,13 +46679,13 @@ def index(
                 }).join('');
             }
             if (data.score_overview && Object.keys(data.score_overview).length) {
-              html += '<strong>总体分布</strong><table><tr><th>施组数</th><th>最高分</th><th>最低分</th><th>分差</th><th>项目均分</th><th>波动(标准差)</th></tr><tr>' +
+              html += '<strong>总体分布（' + esc((data && data.score_scale_label) ? data.score_scale_label : reportScaleLabel) + '）</strong><table><tr><th>施组数</th><th>最高分</th><th>最低分</th><th>分差</th><th>项目均分</th><th>波动(标准差)</th></tr><tr>' +
                 '<td>' + esc(data.score_overview.submission_count) + '</td>' +
-                '<td>' + esc(data.score_overview.top_score) + '</td>' +
-                '<td>' + esc(data.score_overview.bottom_score) + '</td>' +
-                '<td>' + esc(data.score_overview.score_gap) + '</td>' +
-                '<td>' + esc(data.score_overview.project_avg_score) + '</td>' +
-                '<td>' + esc(data.score_overview.project_std_score) + '</td>' +
+                '<td>' + esc(formatScoreForReportScale(data.score_overview.top_score)) + '</td>' +
+                '<td>' + esc(formatScoreForReportScale(data.score_overview.bottom_score)) + '</td>' +
+                '<td>' + esc(formatDeltaForReportScale(data.score_overview.score_gap)) + '</td>' +
+                '<td>' + esc(formatDeltaForReportScale(data.score_overview.project_avg_score)) + '</td>' +
+                '<td>' + esc(formatDeltaForReportScale(data.score_overview.project_std_score)) + '</td>' +
                 '</tr></table>';
             }
             if (data.key_diffs && data.key_diffs.length) {
