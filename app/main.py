@@ -3,8 +3,10 @@ from __future__ import annotations
 import copy
 import csv
 import hashlib
+import heapq
 import html as html_lib
 import io
+import itertools
 import json
 import logging
 import math
@@ -16,7 +18,7 @@ import tempfile
 import threading
 import time
 import unicodedata
-from collections import Counter
+from collections import Counter, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
@@ -30,7 +32,7 @@ except ImportError:
     pass
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set
 from urllib.parse import quote_plus
 from uuid import uuid4
 
@@ -237,6 +239,8 @@ from app.schemas import (
     ProjectRequirementRecord,
     ProjectScoreHistory,
     ProjectScoringDiagnosticResponse,
+    ProjectTrialPreflightMarkdownResponse,
+    ProjectTrialPreflightResponse,
     QingTianResultCreate,
     QingTianResultRecord,
     ReadyResponse,
@@ -251,12 +255,14 @@ from app.schemas import (
     ScoringReadinessResponse,
     SelfCheckResponse,
     SubmissionRecord,
+    SystemImprovementOverviewResponse,
     TrendAnalysis,
     VersionedJsonHistoryResponse,
     VersionedJsonRollbackRequest,
     VersionedJsonRollbackResponse,
     VersionedJsonSnapshotRecord,
     WritingGuidance,
+    WritingGuidanceMarkdownResponse,
 )
 from app.scoring_diagnostics import (
     LatestSubmissionContext,
@@ -272,7 +278,10 @@ from app.storage import (
     EVOLUTION_REPORTS_PATH,
     EXPERT_PROFILES_PATH,
     HIGH_SCORE_FEATURES_PATH,
+    MATERIAL_PARSE_JOBS_PATH,
     MATERIALS_DIR,
+    MATERIALS_PATH,
+    SUBMISSIONS_PATH,
     StorageDataError,
     VersionedJsonSnapshotNotFound,
     ensure_data_dirs,
@@ -340,6 +349,12 @@ from app.system_health import (
     build_readiness_status,
     run_system_self_check,
 )
+from app.trial_preflight import (
+    build_system_improvement_overview_report,
+    build_trial_preflight_report,
+    render_trial_preflight_docx,
+    render_trial_preflight_markdown,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -400,6 +415,9 @@ DEFAULT_CALIBRATOR_LOCKED = None
 DEFAULT_RULE_SCORE_WEIGHT = 0.7
 DEFAULT_LLM_SCORE_WEIGHT = 0.3
 DEFAULT_LLM_DELTA_CAP = 35.0
+DEFAULT_DIRECT_CALIBRATOR_SAMPLE_MIN = 5
+DEFAULT_DIRECT_CALIBRATOR_MAX_CV_MAE = 3.0
+DEFAULT_PROJECT_CALIBRATOR_PROMOTION_MIN_MAE_IMPROVEMENT = 0.05
 DEFAULT_SCORE_SCALE_MAX = 100
 DEFAULT_FIVE_SCALE_PRIOR_TRIGGER_DISPLAY_MAX = 1.0
 DEFAULT_HUNDRED_SCALE_PRIOR_TRIGGER_TOTAL_MAX = 40.0
@@ -447,15 +465,119 @@ DEFAULT_MIN_UPLOADED_TYPE_COVERAGE_RATE = 1.0
 DEFAULT_MATERIAL_GATE_RATE_TOLERANCE = 0.005
 DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR = 200
 DEFAULT_PDF_OCR_MAX_PAGES = 30
+DEFAULT_PDF_NATIVE_TEXT_CONFIRM_MIN_PAGES = 2
+DEFAULT_PDF_NATIVE_TEXT_STRONG_MIN_CHARS = 700
+DEFAULT_PDF_NATIVE_TEXT_STRONG_MIN_SCORE = 4.0
+DEFAULT_PDF_NATIVE_TEXT_STRONG_MIN_CHARS_BY_TYPE = {
+    "tender_qa": DEFAULT_PDF_NATIVE_TEXT_STRONG_MIN_CHARS,
+    "drawing": 48,
+}
+DEFAULT_PDF_NATIVE_TEXT_STRONG_MIN_SCORE_BY_TYPE = {
+    "tender_qa": DEFAULT_PDF_NATIVE_TEXT_STRONG_MIN_SCORE,
+    "drawing": 3.8,
+}
+DEFAULT_PDF_TEXT_LAYER_SKIP_OCR_MIN_CHARS = 48
 DEFAULT_MATERIAL_INDEX_CACHE_SIZE = 12
 DEFAULT_MATERIAL_PARSE_VERSION = "v3-gpt-async"
 DEFAULT_MATERIAL_PARSE_JOB_POLL_SECONDS = 1.0
 DEFAULT_MATERIAL_PARSE_MAX_ATTEMPTS = 3
 DEFAULT_MATERIAL_PARSE_BACKLOG_WARN = 18
-DEFAULT_MATERIAL_PARSE_WORKER_COUNT = 2
+DEFAULT_MATERIAL_PARSE_WORKER_COUNT = 4
+DEFAULT_MATERIAL_PARSE_PREVIEW_EXPRESS_RESERVED_WORKER_COUNT = 1
+DEFAULT_MATERIAL_PARSE_PREVIEW_EXPRESS_MAX_SPEED_RANK = 1
+DEFAULT_MATERIAL_PARSE_PREVIEW_RESERVED_WORKER_COUNT = 1
+DEFAULT_MATERIAL_PARSE_ACTIVE_PROJECT_WINDOW_SECONDS = 8.0
+DEFAULT_MATERIAL_PARSE_ACTIVE_PROJECT_WINDOW_MAX_CLAIMS = 3
+DEFAULT_MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_WINDOW_MAX_CLAIMS = 2
 DEFAULT_MATERIAL_PARSE_REBUILD_DEBOUNCE_SECONDS = 2.0
+DEFAULT_MATERIAL_PARSE_PRIORITY_BY_TYPE = {
+    "tender_qa": 0,
+    "boq": 1,
+    "drawing": 2,
+    "site_photo": 3,
+}
+DEFAULT_MATERIAL_PARSE_PREVIEW_MIN_BYTES_BY_TYPE = {
+    "tender_qa": 300_000,
+    "boq": 180_000,
+    "drawing": 180_000,
+}
+DEFAULT_MATERIAL_PARSE_PREVIEW_MAX_PAGES_BY_TYPE = {
+    "tender_qa": 6,
+    "boq": 3,
+    "drawing": 2,
+}
+DEFAULT_MATERIAL_PARSE_PREVIEW_MAX_CHARS_BY_TYPE = {
+    "tender_qa": 22_000,
+    "boq": 12_000,
+    "drawing": 8_000,
+}
+DEFAULT_MATERIAL_PARSE_PREVIEW_OCR_PAGES_BY_TYPE = {
+    "tender_qa": 2,
+    "boq": 0,
+    "drawing": 1,
+}
+DEFAULT_MATERIAL_PARSE_PREVIEW_MAX_ROWS_BY_TYPE = {
+    "boq": 180,
+}
+DEFAULT_MATERIAL_PARSE_PREVIEW_MAX_SHEETS_BY_TYPE = {
+    "boq": 2,
+}
+DEFAULT_MATERIAL_PARSE_TEXT_MAX_ROWS_BY_TYPE = {
+    "boq": 600,
+}
+DEFAULT_MATERIAL_PARSE_TEXT_MAX_SHEETS_BY_TYPE = {
+    "boq": 4,
+}
+DEFAULT_BOQ_PARSE_TEXT_MERGED_MAX_CHARS = 24_000
+DEFAULT_MATERIAL_PARSE_PREVIEW_EARLY_STOP_MIN_PAGES_BY_TYPE = {
+    "tender_qa": 2,
+    "boq": 2,
+    "drawing": 1,
+}
+DEFAULT_MATERIAL_PARSE_PREVIEW_EARLY_STOP_MIN_CHARS_BY_TYPE = {
+    "tender_qa": 1000,
+    "boq": 700,
+    "drawing": 900,
+}
+DEFAULT_MATERIAL_PARSE_FULL_EARLY_STOP_MIN_PAGES_BY_TYPE = {
+    "tender_qa": 4,
+    "boq": 3,
+    "drawing": 3,
+}
+DEFAULT_MATERIAL_PARSE_FULL_EARLY_STOP_MIN_CHARS_BY_TYPE = {
+    "tender_qa": 800,
+    "boq": 1200,
+    "drawing": 150,
+}
 DEFAULT_TENDER_GPT_FASTPATH_MIN_QUALITY = 0.72
+DEFAULT_TENDER_GPT_TEXT_ONLY_MIN_QUALITY = 0.58
+DEFAULT_TENDER_GPT_TEXT_EXCERPT_MAX_CHARS = 2200
+DEFAULT_TENDER_GPT_TEXT_EXCERPT_MAX_LINES = 16
 DEFAULT_DRAWING_GPT_FASTPATH_MIN_QUALITY = 0.74
+DEFAULT_DRAWING_GPT_TEXT_ONLY_MIN_QUALITY = 0.6
+DEFAULT_DRAWING_GPT_TEXT_ONLY_RELAXED_MIN_QUALITY = 0.52
+DEFAULT_DRAWING_GPT_TEXT_ONLY_RELAXED_MIN_CHARS = 850
+DEFAULT_DRAWING_GPT_PAGE_VISION_MIN_SCORE = 4.5
+DEFAULT_DRAWING_GPT_PAGE_VISION_MIN_SCORE_DELTA = 1.2
+DEFAULT_DRAWING_GPT_TEXT_EXCERPT_MAX_CHARS = 1800
+DEFAULT_DRAWING_GPT_TEXT_EXCERPT_MAX_LINES = 14
+DEFAULT_BOQ_PARSE_MAX_ROWS_PER_SHEET = 3000
+DEFAULT_BOQ_PARSE_HEADER_SCAN_MAX_ROWS = 40
+DEFAULT_BOQ_PARSE_AUX_HEADER_SCAN_MAX_ROWS = 12
+DEFAULT_BOQ_PARSE_EARLY_STOP_MIN_PARSED_ITEMS = 36
+DEFAULT_BOQ_PARSE_EARLY_STOP_MIN_NUMERIC_ROWS = 12
+DEFAULT_BOQ_PARSE_EARLY_STOP_TRAILING_NONDATA_ROWS = 24
+DEFAULT_BOQ_PARSE_FULL_GUIDED_MIN_PARSED_ITEMS = 18
+DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_SHEET_MIN_ITEMS = 4
+DEFAULT_BOQ_PARSE_FULL_GUIDED_UNCONFIRMED_PRIMARY_SHEET_MAX_ROWS = 1200
+DEFAULT_BOQ_PARSE_FULL_GUIDED_WEAK_SHEET_MAX_ROWS = 360
+DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_PREVIEW_MIN_ITEMS = 56
+DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_PREVIEW_MIN_PRIMARY_SHEETS = 2
+DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_UNCONFIRMED_PRIMARY_SHEET_MAX_ROWS = 800
+DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_WEAK_SHEET_MAX_ROWS = 180
+DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_MAX_EMPTY_AUX_SHEETS = 2
+DEFAULT_BOQ_PARSE_FULL_GUIDED_CSV_MAX_ROWS = 1800
+DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_CSV_MAX_ROWS = 900
 DEFAULT_SITE_PHOTO_GPT_FASTPATH_MIN_QUALITY = 0.7
 DEFAULT_CALIBRATION_MIN_SAMPLES = 20
 DEFAULT_CALIBRATION_FRESHNESS_DAYS = 90
@@ -463,6 +585,7 @@ DEFAULT_CALIBRATION_MIN_RECENT_RATIO = 0.6
 DEFAULT_PROJECT_LEARNING_MIN_SAMPLES = 1
 LEGACY_PROJECT_LEARNING_MIN_SAMPLES = 3
 DEFAULT_BOOTSTRAP_CALIBRATION_MAX_AVG_DELTA_INCREASE = 0.5
+DEFAULT_PROJECT_CALIBRATOR_POST_DEPLOY_MAX_MAE_REGRESSION = 0.5
 DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO = 0.4
 DEFAULT_FEW_SHOT_MIN_HIGH_SCORE_100 = 78.0
 DEFAULT_LEARNING_MIN_AWARENESS_SCORE = 45.0
@@ -524,10 +647,98 @@ _MATERIAL_INDEX_CACHE_LOCK = threading.RLock()
 _MATERIAL_PARSE_STATE_LOCK = threading.RLock()
 _MATERIAL_PARSE_WORKER_LOCK = threading.RLock()
 _MATERIAL_PARSE_STOP_EVENT = threading.Event()
+_MATERIAL_PARSE_WAKE_EVENT = threading.Event()
 _MATERIAL_PARSE_WORKER: Optional[threading.Thread] = None
 _MATERIAL_PARSE_WORKERS: List[threading.Thread] = []
 _MATERIAL_PARSE_PENDING_REBUILDS: Dict[str, float] = {}
 _MATERIAL_PARSE_PENDING_REBUILDS_LOCK = threading.RLock()
+_MATERIAL_PARSE_ACTIVE_PROJECTS: Dict[str, float] = {}
+_MATERIAL_PARSE_ACTIVE_PROJECT_TYPES: Dict[tuple[str, str], float] = {}
+_MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS: Dict[str, int] = {}
+_MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS: Dict[tuple[str, str], int] = {}
+_MATERIAL_PARSE_ACTIVE_PROJECTS_LOCK = threading.RLock()
+_MATERIAL_PARSE_SCHEDULER_STATS_LOCK = threading.RLock()
+_MATERIAL_PARSE_SCHEDULER_STATS: Dict[str, int] = {
+    "project_continuity_bonus_hits": 0,
+    "followup_full_bonus_hits": 0,
+    "same_material_followup_bonus_hits": 0,
+    "active_project_bonus_hits": 0,
+    "active_project_type_bonus_hits": 0,
+    "claim_snapshot_cache_hits": 0,
+    "claim_snapshot_cache_rebuilds": 0,
+    "claim_context_cache_hits": 0,
+    "claim_context_cache_rebuilds": 0,
+    "project_stage_cache_hits": 0,
+    "project_stage_cache_rebuilds": 0,
+    "priority_context_cache_hits": 0,
+    "priority_context_cache_rebuilds": 0,
+    "jobs_summary_cache_hits": 0,
+    "jobs_summary_cache_rebuilds": 0,
+    "status_materials_cache_hits": 0,
+    "status_materials_cache_rebuilds": 0,
+    "status_core_cache_hits": 0,
+    "status_core_cache_rebuilds": 0,
+}
+_MATERIAL_PARSE_PROJECT_CACHE_STATS_LOCK = threading.RLock()
+_MATERIAL_PARSE_PROJECT_CACHE_STATS: Dict[str, Dict[str, int]] = {}
+# 请求级 cache 观测只需要相对成本，不直接伪造毫秒。
+# 数值表示链路深度工作量：越深的层意味着会串行触发更多上游构建。
+_MATERIAL_PARSE_PROJECT_CACHE_LAYER_WORK_UNITS: Dict[str, int] = {
+    "jobs_summary": 1,
+    "status_materials": 2,
+    "status_core": 3,
+}
+_MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY_LOCK = threading.RLock()
+_MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY_WINDOW_SIZE = 8
+_MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY: Dict[str, deque[Dict[str, int]]] = {}
+_MATERIAL_PARSE_PROJECT_CACHE_STEADY_THRESHOLD = 3
+_MATERIAL_PARSE_CLAIM_SNAPSHOT_LOCK = threading.RLock()
+_MATERIAL_PARSE_CLAIM_SNAPSHOT_SIGNATURE: Optional[tuple[tuple[int, int], tuple[int, int]]] = None
+_MATERIAL_PARSE_CLAIM_SNAPSHOT_MATERIALS: List[Dict[str, object]] = []
+_MATERIAL_PARSE_CLAIM_SNAPSHOT_JOBS: List[Dict[str, object]] = []
+_MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_LOCK = threading.RLock()
+_MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE: Optional[
+    tuple[tuple[int, int], tuple[int, int]]
+] = None
+_MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIALS: List[Dict[str, object]] = []
+_MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_JOBS: List[Dict[str, object]] = []
+_MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_BY_ID: Dict[str, Dict[str, object]] = {}
+_MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_INDEX_BY_ID: Dict[str, int] = {}
+_MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIZE_HINT_BY_MATERIAL_ID: Dict[str, int] = {}
+_MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_RETRY_DUE_AT_BY_JOB_ID: Dict[str, Optional[datetime]] = {}
+_MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SORT_KEY_BY_JOB_ID: Dict[str, tuple[str, str, str]] = {}
+_MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES: List[int] = []
+_MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE: Dict[str, List[int]] = {}
+_MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_BY_SPEED: Dict[int, List[int]] = {}
+_MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_UP_TO_SPEED: Dict[int, List[int]] = {}
+_MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_PRIORITY_BY_JOB_ID: Dict[str, tuple[int, int, int]] = {}
+_MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_QUEUED_CANDIDATES = False
+_MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_RETRYABLE_FAILED_WITHOUT_DUE = False
+_MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_EARLIEST_RETRYABLE_FAILED_AT: Optional[datetime] = None
+_MATERIAL_PARSE_PROJECT_STAGE_CACHE_LOCK = threading.RLock()
+_MATERIAL_PARSE_PROJECT_STAGE_CACHE_SIGNATURE: Optional[
+    tuple[tuple[int, int], tuple[str, ...]]
+] = None
+_MATERIAL_PARSE_PROJECT_STAGE_CACHE_RANKS: Dict[str, int] = {}
+_MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_LOCK = threading.RLock()
+_MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_SIGNATURE: Optional[
+    tuple[tuple[tuple[tuple[int, int], tuple[int, int]], tuple[int, int]], tuple[str, ...]]
+] = None
+_MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE: Dict[str, tuple[object, ...]] = {}
+_MATERIAL_PARSE_JOBS_SUMMARY_CACHE_LOCK = threading.RLock()
+_MATERIAL_PARSE_JOBS_SUMMARY_CACHE_SIGNATURE: Optional[tuple[int, int]] = None
+_MATERIAL_PARSE_JOBS_SUMMARY_CACHE_FILTERED: Dict[str, List[Dict[str, object]]] = {}
+_MATERIAL_PARSE_JOBS_SUMMARY_CACHE_SUMMARY: Dict[str, Dict[str, object]] = {}
+_MATERIAL_PARSE_STATUS_MATERIALS_CACHE_LOCK = threading.RLock()
+_MATERIAL_PARSE_STATUS_MATERIALS_CACHE_SIGNATURE: Optional[
+    tuple[tuple[int, int], tuple[int, int]]
+] = None
+_MATERIAL_PARSE_STATUS_MATERIALS_CACHE: Dict[str, Dict[str, object]] = {}
+_MATERIAL_PARSE_STATUS_CORE_CACHE_LOCK = threading.RLock()
+_MATERIAL_PARSE_STATUS_CORE_CACHE_SIGNATURE: Optional[
+    tuple[tuple[int, int], tuple[int, int]]
+] = None
+_MATERIAL_PARSE_STATUS_CORE_CACHE: Dict[str, Dict[str, object]] = {}
 
 
 class _MaterialParseWorkerHealthProbe:
@@ -538,6 +749,903 @@ class _MaterialParseWorkerHealthProbe:
 
 
 _MATERIAL_PARSE_WORKER_HEALTH_PROBE = _MaterialParseWorkerHealthProbe()
+
+
+def _material_parse_total_worker_count() -> int:
+    return (
+        max(1, int(DEFAULT_MATERIAL_PARSE_WORKER_COUNT))
+        + max(0, int(DEFAULT_MATERIAL_PARSE_PREVIEW_EXPRESS_RESERVED_WORKER_COUNT))
+        + max(0, int(DEFAULT_MATERIAL_PARSE_PREVIEW_RESERVED_WORKER_COUNT))
+    )
+
+
+def _notify_material_parse_workers() -> None:
+    _MATERIAL_PARSE_WAKE_EVENT.set()
+
+
+def _material_parse_claim_cache_enabled() -> bool:
+    return (
+        getattr(load_materials, "__module__", "") == "app.storage"
+        and getattr(load_material_parse_jobs, "__module__", "") == "app.storage"
+    )
+
+
+def _material_parse_project_stage_cache_enabled() -> bool:
+    return getattr(load_submissions, "__module__", "") == "app.storage"
+
+
+def _material_parse_priority_cache_enabled() -> bool:
+    return _material_parse_claim_cache_enabled() and _material_parse_project_stage_cache_enabled()
+
+
+def _material_parse_claim_context_cache_enabled() -> bool:
+    return _material_parse_claim_cache_enabled()
+
+
+def _material_parse_jobs_summary_cache_enabled() -> bool:
+    return getattr(load_material_parse_jobs, "__module__", "") == "app.storage"
+
+
+def _material_parse_status_materials_cache_enabled() -> bool:
+    return _material_parse_claim_cache_enabled()
+
+
+def _material_parse_status_core_cache_enabled() -> bool:
+    return _material_parse_claim_cache_enabled()
+
+
+def _material_parse_state_file_signature(path: Path) -> tuple[int, int]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return (0, 0)
+    return (int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def _material_parse_state_files_signature() -> tuple[tuple[int, int], tuple[int, int]]:
+    return (
+        _material_parse_state_file_signature(MATERIALS_PATH),
+        _material_parse_state_file_signature(MATERIAL_PARSE_JOBS_PATH),
+    )
+
+
+def _invalidate_material_parse_claim_snapshot() -> None:
+    global _MATERIAL_PARSE_CLAIM_SNAPSHOT_SIGNATURE
+    with _MATERIAL_PARSE_CLAIM_SNAPSHOT_LOCK:
+        _MATERIAL_PARSE_CLAIM_SNAPSHOT_SIGNATURE = None
+        _MATERIAL_PARSE_CLAIM_SNAPSHOT_MATERIALS.clear()
+        _MATERIAL_PARSE_CLAIM_SNAPSHOT_JOBS.clear()
+    _invalidate_material_parse_claim_context_cache()
+    _invalidate_material_parse_jobs_summary_cache()
+    _invalidate_material_parse_status_materials_cache()
+    _invalidate_material_parse_status_core_cache()
+    _invalidate_material_parse_priority_snapshot()
+
+
+def _material_parse_priority_snapshot_signature() -> (
+    tuple[tuple[tuple[int, int], tuple[int, int]], tuple[int, int]]
+):
+    return (
+        _material_parse_state_files_signature(),
+        _material_parse_state_file_signature(SUBMISSIONS_PATH),
+    )
+
+
+def _invalidate_material_parse_priority_snapshot() -> None:
+    global _MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_SIGNATURE
+    with _MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_LOCK:
+        _MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_SIGNATURE = None
+        _MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE.clear()
+
+
+def _invalidate_material_parse_claim_context_cache() -> None:
+    global _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE
+    global _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_EARLIEST_RETRYABLE_FAILED_AT
+    global _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_QUEUED_CANDIDATES
+    global _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_RETRYABLE_FAILED_WITHOUT_DUE
+    with _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_LOCK:
+        _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE = None
+        _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIALS.clear()
+        _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_JOBS.clear()
+        _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_BY_ID.clear()
+        _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_INDEX_BY_ID.clear()
+        _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIZE_HINT_BY_MATERIAL_ID.clear()
+        _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_RETRY_DUE_AT_BY_JOB_ID.clear()
+        _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SORT_KEY_BY_JOB_ID.clear()
+        _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES.clear()
+        _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE.clear()
+        _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_BY_SPEED.clear()
+        _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_UP_TO_SPEED.clear()
+        _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_PRIORITY_BY_JOB_ID.clear()
+        _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_QUEUED_CANDIDATES = False
+        _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_RETRYABLE_FAILED_WITHOUT_DUE = False
+        _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_EARLIEST_RETRYABLE_FAILED_AT = None
+
+
+def _invalidate_material_parse_jobs_summary_cache() -> None:
+    global _MATERIAL_PARSE_JOBS_SUMMARY_CACHE_SIGNATURE
+    with _MATERIAL_PARSE_JOBS_SUMMARY_CACHE_LOCK:
+        _MATERIAL_PARSE_JOBS_SUMMARY_CACHE_SIGNATURE = None
+        _MATERIAL_PARSE_JOBS_SUMMARY_CACHE_FILTERED.clear()
+        _MATERIAL_PARSE_JOBS_SUMMARY_CACHE_SUMMARY.clear()
+
+
+def _invalidate_material_parse_status_materials_cache() -> None:
+    global _MATERIAL_PARSE_STATUS_MATERIALS_CACHE_SIGNATURE
+    with _MATERIAL_PARSE_STATUS_MATERIALS_CACHE_LOCK:
+        _MATERIAL_PARSE_STATUS_MATERIALS_CACHE_SIGNATURE = None
+        _MATERIAL_PARSE_STATUS_MATERIALS_CACHE.clear()
+
+
+def _invalidate_material_parse_status_core_cache() -> None:
+    global _MATERIAL_PARSE_STATUS_CORE_CACHE_SIGNATURE
+    with _MATERIAL_PARSE_STATUS_CORE_CACHE_LOCK:
+        _MATERIAL_PARSE_STATUS_CORE_CACHE_SIGNATURE = None
+        _MATERIAL_PARSE_STATUS_CORE_CACHE.clear()
+
+
+def _load_material_parse_state_snapshot() -> (
+    tuple[List[Dict[str, object]], List[Dict[str, object]]]
+):
+    global _MATERIAL_PARSE_CLAIM_SNAPSHOT_SIGNATURE
+    if not _material_parse_claim_cache_enabled():
+        return (
+            [dict(row) for row in load_materials()],
+            [dict(job) for job in load_material_parse_jobs()],
+        )
+    signature = _material_parse_state_files_signature()
+    with _MATERIAL_PARSE_CLAIM_SNAPSHOT_LOCK:
+        if signature == _MATERIAL_PARSE_CLAIM_SNAPSHOT_SIGNATURE:
+            _increment_material_parse_scheduler_stat("claim_snapshot_cache_hits")
+            return (
+                [dict(row) for row in _MATERIAL_PARSE_CLAIM_SNAPSHOT_MATERIALS],
+                [dict(job) for job in _MATERIAL_PARSE_CLAIM_SNAPSHOT_JOBS],
+            )
+    materials = [dict(row) for row in load_materials()]
+    jobs = [dict(job) for job in load_material_parse_jobs()]
+    with _MATERIAL_PARSE_CLAIM_SNAPSHOT_LOCK:
+        _MATERIAL_PARSE_CLAIM_SNAPSHOT_SIGNATURE = signature
+        _MATERIAL_PARSE_CLAIM_SNAPSHOT_MATERIALS[:] = [dict(row) for row in materials]
+        _MATERIAL_PARSE_CLAIM_SNAPSHOT_JOBS[:] = [dict(job) for job in jobs]
+    _increment_material_parse_scheduler_stat("claim_snapshot_cache_rebuilds")
+    return materials, jobs
+
+
+def _load_material_parse_claim_context_view() -> (
+    tuple[
+        List[Dict[str, object]],
+        List[Dict[str, object]],
+        Dict[str, Dict[str, object]],
+        Dict[str, int],
+        Dict[str, int],
+        Dict[str, Optional[datetime]],
+        Dict[str, tuple[str, str, str]],
+        Dict[str, tuple[int, int, int]],
+        List[int],
+        Dict[str, List[int]],
+        Dict[int, List[int]],
+        Dict[int, List[int]],
+        bool,
+        bool,
+    ]
+):
+    global _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE
+    if _material_parse_claim_context_cache_enabled():
+        signature = _material_parse_state_files_signature()
+        with _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_LOCK:
+            if signature == _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE:
+                _increment_material_parse_scheduler_stat("claim_context_cache_hits")
+                return (
+                    _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIALS,
+                    _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_JOBS,
+                    _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_BY_ID,
+                    _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_INDEX_BY_ID,
+                    _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIZE_HINT_BY_MATERIAL_ID,
+                    _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_RETRY_DUE_AT_BY_JOB_ID,
+                    _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SORT_KEY_BY_JOB_ID,
+                    _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_PRIORITY_BY_JOB_ID,
+                    _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES,
+                    _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE,
+                    _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_BY_SPEED,
+                    _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_UP_TO_SPEED,
+                    False,
+                    False,
+                )
+    materials, jobs = _load_material_parse_state_snapshot()
+    normalized_materials: List[Dict[str, object]] = []
+    material_by_id: Dict[str, Dict[str, object]] = {}
+    material_index_by_id: Dict[str, int] = {}
+    materials_changed = False
+    for material_idx, row in enumerate(materials):
+        normalized_row, row_changed = _normalize_material_row_for_parse(row)
+        normalized_materials.append(normalized_row)
+        materials_changed = materials_changed or row_changed
+        material_id = str(normalized_row.get("id") or "").strip()
+        if material_id:
+            material_by_id[material_id] = dict(normalized_row)
+            material_index_by_id[material_id] = material_idx
+    normalized_jobs: List[Dict[str, object]] = []
+    jobs_changed = False
+    for job in jobs:
+        normalized_job, job_changed = _normalize_material_parse_job(job)
+        normalized_jobs.append(normalized_job)
+        jobs_changed = jobs_changed or job_changed
+    candidate_indices = [
+        idx
+        for idx, job in enumerate(normalized_jobs)
+        if str(job.get("status") or "queued").strip().lower() in {"queued", "failed"}
+    ]
+    has_queued_candidates = False
+    has_retryable_failed_without_due = False
+    earliest_retryable_failed_at: Optional[datetime] = None
+    retry_due_at_by_job_id: Dict[str, Optional[datetime]] = {}
+    sort_key_by_job_id: Dict[str, tuple[str, str, str]] = {}
+    for idx in candidate_indices:
+        job = normalized_jobs[idx]
+        job_id = str(job.get("id") or "").strip()
+        if job_id:
+            sort_key_by_job_id[job_id] = _material_parse_job_sort_key(job)
+        status = str(job.get("status") or "queued").strip().lower()
+        if status == "queued":
+            has_queued_candidates = True
+            continue
+        if status != "failed":
+            continue
+        if int(_to_float_or_none(job.get("attempt")) or 0) >= DEFAULT_MATERIAL_PARSE_MAX_ATTEMPTS:
+            continue
+        due_at = _parse_iso_datetime_utc(job.get("next_retry_at"))
+        if job_id:
+            retry_due_at_by_job_id[job_id] = due_at
+        if due_at is None:
+            has_retryable_failed_without_due = True
+            continue
+        if earliest_retryable_failed_at is None or due_at < earliest_retryable_failed_at:
+            earliest_retryable_failed_at = due_at
+    candidate_indices_by_mode: Dict[str, List[int]] = {}
+    for idx in candidate_indices:
+        parse_mode = str(normalized_jobs[idx].get("parse_mode") or "full").strip().lower() or "full"
+        candidate_indices_by_mode.setdefault(parse_mode, []).append(idx)
+    size_hint_by_material_id: Dict[str, int] = {}
+    for idx in candidate_indices:
+        material_id = str(normalized_jobs[idx].get("material_id") or "").strip()
+        if not material_id or material_id in size_hint_by_material_id:
+            continue
+        row = material_by_id.get(material_id) or {}
+        if not row:
+            continue
+        size_hint_by_material_id[material_id] = _material_parse_row_size_hint(row)
+    preview_candidate_indices_by_speed: Dict[int, List[int]] = {}
+    preview_priority_by_job_id: Dict[str, tuple[int, int, int]] = {}
+    for idx in candidate_indices_by_mode.get("preview", []):
+        job_id = str(normalized_jobs[idx].get("id") or "").strip()
+        material_id = str(normalized_jobs[idx].get("material_id") or "").strip()
+        preview_priority = _material_parse_preview_speed_rank(
+            normalized_jobs[idx],
+            material_by_id.get(material_id, {}) or {},
+            size_hint_override=size_hint_by_material_id.get(material_id),
+        )
+        if job_id:
+            preview_priority_by_job_id[job_id] = (
+                int(preview_priority[0]),
+                int(preview_priority[1]),
+                int(preview_priority[2]),
+            )
+        preview_candidate_indices_by_speed.setdefault(int(preview_priority[0]), []).append(idx)
+    preview_candidate_indices_up_to_speed: Dict[int, List[int]] = {}
+    if preview_candidate_indices_by_speed:
+        cumulative_preview_candidate_indices: List[int] = []
+        max_cached_preview_speed_rank = max(
+            max(preview_candidate_indices_by_speed),
+            int(DEFAULT_MATERIAL_PARSE_PREVIEW_EXPRESS_MAX_SPEED_RANK),
+        )
+        for speed_rank in range(max_cached_preview_speed_rank + 1):
+            cumulative_preview_candidate_indices.extend(
+                preview_candidate_indices_by_speed.get(speed_rank, [])
+            )
+            preview_candidate_indices_up_to_speed[int(speed_rank)] = list(
+                cumulative_preview_candidate_indices
+            )
+    if _material_parse_claim_context_cache_enabled():
+        signature = _material_parse_state_files_signature()
+        with _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_LOCK:
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE = signature
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIALS[:] = [
+                dict(row) for row in normalized_materials
+            ]
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_JOBS[:] = [dict(job) for job in normalized_jobs]
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_BY_ID.clear()
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_BY_ID.update(
+                {key: dict(value) for key, value in material_by_id.items()}
+            )
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_INDEX_BY_ID.clear()
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_INDEX_BY_ID.update(
+                {key: int(value) for key, value in material_index_by_id.items()}
+            )
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIZE_HINT_BY_MATERIAL_ID.clear()
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIZE_HINT_BY_MATERIAL_ID.update(
+                {key: int(value) for key, value in size_hint_by_material_id.items()}
+            )
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_RETRY_DUE_AT_BY_JOB_ID.clear()
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_RETRY_DUE_AT_BY_JOB_ID.update(
+                retry_due_at_by_job_id
+            )
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SORT_KEY_BY_JOB_ID.clear()
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SORT_KEY_BY_JOB_ID.update(sort_key_by_job_id)
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES[:] = list(candidate_indices)
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE.clear()
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE.update(
+                {key: list(value) for key, value in candidate_indices_by_mode.items()}
+            )
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_BY_SPEED.clear()
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_BY_SPEED.update(
+                {int(key): list(value) for key, value in preview_candidate_indices_by_speed.items()}
+            )
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_UP_TO_SPEED.clear()
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_UP_TO_SPEED.update(
+                {
+                    int(key): list(value)
+                    for key, value in preview_candidate_indices_up_to_speed.items()
+                }
+            )
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_PRIORITY_BY_JOB_ID.clear()
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_PRIORITY_BY_JOB_ID.update(
+                {key: tuple(value) for key, value in preview_priority_by_job_id.items()}
+            )
+            global _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_QUEUED_CANDIDATES
+            global _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_RETRYABLE_FAILED_WITHOUT_DUE
+            global _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_EARLIEST_RETRYABLE_FAILED_AT
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_QUEUED_CANDIDATES = has_queued_candidates
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_RETRYABLE_FAILED_WITHOUT_DUE = (
+                has_retryable_failed_without_due
+            )
+            _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_EARLIEST_RETRYABLE_FAILED_AT = (
+                earliest_retryable_failed_at
+            )
+            return (
+                _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIALS,
+                _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_JOBS,
+                _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_BY_ID,
+                _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_INDEX_BY_ID,
+                _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIZE_HINT_BY_MATERIAL_ID,
+                _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_RETRY_DUE_AT_BY_JOB_ID,
+                _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SORT_KEY_BY_JOB_ID,
+                _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_PRIORITY_BY_JOB_ID,
+                _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES,
+                _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE,
+                _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_BY_SPEED,
+                _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_UP_TO_SPEED,
+                materials_changed,
+                jobs_changed,
+            )
+    if _material_parse_claim_context_cache_enabled():
+        _increment_material_parse_scheduler_stat("claim_context_cache_rebuilds")
+    return (
+        normalized_materials,
+        normalized_jobs,
+        material_by_id,
+        material_index_by_id,
+        size_hint_by_material_id,
+        retry_due_at_by_job_id,
+        sort_key_by_job_id,
+        preview_priority_by_job_id,
+        candidate_indices,
+        candidate_indices_by_mode,
+        preview_candidate_indices_by_speed,
+        preview_candidate_indices_up_to_speed,
+        materials_changed,
+        jobs_changed,
+    )
+
+
+def _load_material_parse_claim_context() -> (
+    tuple[
+        List[Dict[str, object]],
+        List[Dict[str, object]],
+        Dict[str, Dict[str, object]],
+        Dict[str, int],
+        Dict[str, int],
+        Dict[str, Optional[datetime]],
+        Dict[str, tuple[str, str, str]],
+        Dict[str, tuple[int, int, int]],
+        List[int],
+        Dict[str, List[int]],
+        Dict[int, List[int]],
+        Dict[int, List[int]],
+        bool,
+        bool,
+    ]
+):
+    (
+        materials,
+        jobs,
+        material_by_id,
+        material_index_by_id,
+        size_hint_by_material_id,
+        retry_due_at_by_job_id,
+        sort_key_by_job_id,
+        preview_priority_by_job_id,
+        candidate_indices,
+        candidate_indices_by_mode,
+        preview_candidate_indices_by_speed,
+        preview_candidate_indices_up_to_speed,
+        materials_changed,
+        jobs_changed,
+    ) = _load_material_parse_claim_context_view()
+    return (
+        [dict(row) for row in materials],
+        [dict(job) for job in jobs],
+        {key: dict(value) for key, value in material_by_id.items()},
+        {key: int(value) for key, value in material_index_by_id.items()},
+        {key: int(value) for key, value in size_hint_by_material_id.items()},
+        dict(retry_due_at_by_job_id),
+        {key: tuple(value) for key, value in sort_key_by_job_id.items()},
+        {key: tuple(value) for key, value in preview_priority_by_job_id.items()},
+        list(candidate_indices),
+        {key: list(value) for key, value in candidate_indices_by_mode.items()},
+        {int(key): list(value) for key, value in preview_candidate_indices_by_speed.items()},
+        {int(key): list(value) for key, value in preview_candidate_indices_up_to_speed.items()},
+        materials_changed,
+        jobs_changed,
+    )
+
+
+def _load_material_parse_project_stage_ranks(project_ids: Set[str]) -> Dict[str, int]:
+    global _MATERIAL_PARSE_PROJECT_STAGE_CACHE_SIGNATURE
+    normalized_project_ids = tuple(
+        sorted(str(pid or "").strip() for pid in project_ids if str(pid or "").strip())
+    )
+    if not normalized_project_ids:
+        return {}
+    if _material_parse_project_stage_cache_enabled():
+        signature = (_material_parse_state_file_signature(SUBMISSIONS_PATH), normalized_project_ids)
+        with _MATERIAL_PARSE_PROJECT_STAGE_CACHE_LOCK:
+            if signature == _MATERIAL_PARSE_PROJECT_STAGE_CACHE_SIGNATURE:
+                _increment_material_parse_scheduler_stat("project_stage_cache_hits")
+                return dict(_MATERIAL_PARSE_PROJECT_STAGE_CACHE_RANKS)
+    submissions = load_submissions()
+    submissions_by_project: Dict[str, List[Dict[str, object]]] = {}
+    for row in submissions:
+        project_id = str(row.get("project_id") or "").strip()
+        if not project_id or project_id not in normalized_project_ids:
+            continue
+        submissions_by_project.setdefault(project_id, []).append(row)
+    ranks: Dict[str, int] = {}
+    for project_id in normalized_project_ids:
+        rows = submissions_by_project.get(project_id) or []
+        non_empty_rows = [row for row in rows if str(row.get("text") or "").strip()]
+        if not non_empty_rows:
+            ranks[project_id] = 2
+            continue
+        scored_count = sum(1 for row in non_empty_rows if _submission_is_scored(row))
+        ranks[project_id] = 0 if scored_count < len(non_empty_rows) else 1
+    if _material_parse_project_stage_cache_enabled():
+        with _MATERIAL_PARSE_PROJECT_STAGE_CACHE_LOCK:
+            _MATERIAL_PARSE_PROJECT_STAGE_CACHE_SIGNATURE = (
+                _material_parse_state_file_signature(SUBMISSIONS_PATH),
+                normalized_project_ids,
+            )
+            _MATERIAL_PARSE_PROJECT_STAGE_CACHE_RANKS.clear()
+            _MATERIAL_PARSE_PROJECT_STAGE_CACHE_RANKS.update(ranks)
+        _increment_material_parse_scheduler_stat("project_stage_cache_rebuilds")
+    return ranks
+
+
+def _build_material_parse_job_priority_context(
+    job: Dict[str, object],
+    material_by_id: Dict[str, Dict[str, object]],
+    project_stage_ranks: Dict[str, int],
+    *,
+    preview_priority_context: Optional[tuple[int, int, int]] = None,
+    size_hint_override: Optional[int] = None,
+    sort_key_override: Optional[tuple[str, str, str]] = None,
+) -> tuple[object, ...]:
+    material_id = str(job.get("material_id") or "").strip()
+    row = material_by_id.get(material_id) or {}
+    project_id = str(job.get("project_id") or row.get("project_id") or "").strip()
+    status = str(job.get("status") or "queued").strip().lower()
+    retry_penalty = 1 if status == "failed" else 0
+    project_stage_rank = int(project_stage_ranks.get(project_id, 3))
+    parse_mode_rank = _material_parse_mode_rank(job.get("parse_mode"))
+    followup_continuity_rank = (
+        0 if parse_mode_rank == 1 and bool(job.get("followup_from_preview")) else 1
+    )
+    if preview_priority_context is None:
+        (
+            preview_speed_rank,
+            preview_work_units,
+            preview_size_bucket,
+        ) = _material_parse_preview_speed_rank(job, row, size_hint_override=size_hint_override)
+    else:
+        (
+            preview_speed_rank,
+            preview_work_units,
+            preview_size_bucket,
+        ) = preview_priority_context
+    material_type = str(row.get("material_type") or "").strip()
+    if material_type:
+        normalized_material_type = material_type
+        type_rank = int(DEFAULT_MATERIAL_PARSE_PRIORITY_BY_TYPE.get(normalized_material_type, 9))
+    else:
+        material_type = job.get("material_type") or ""
+        normalized_material_type = _normalize_material_type(
+            material_type,
+            filename=row.get("filename") or job.get("filename"),
+        )
+        type_rank = _material_parse_job_priority_by_type(material_type)
+    size_hint = (
+        int(size_hint_override)
+        if size_hint_override is not None
+        else _material_parse_row_size_hint(row)
+    )
+    sort_key = (
+        tuple(sort_key_override)
+        if sort_key_override is not None
+        else _material_parse_job_sort_key(job)
+    )
+    return (
+        project_id,
+        material_id,
+        normalized_material_type,
+        project_stage_rank,
+        parse_mode_rank,
+        retry_penalty,
+        followup_continuity_rank,
+        preview_speed_rank,
+        preview_work_units,
+        preview_size_bucket,
+        type_rank,
+        size_hint,
+        sort_key[0],
+        sort_key[1],
+        sort_key[2],
+    )
+
+
+def _load_material_parse_job_priority_contexts_view(
+    jobs: List[Dict[str, object]],
+    material_by_id: Dict[str, Dict[str, object]],
+    project_stage_ranks: Dict[str, int],
+    preview_priority_by_job_id: Optional[Dict[str, tuple[int, int, int]]] = None,
+    size_hint_by_material_id: Optional[Dict[str, int]] = None,
+    sort_key_by_job_id: Optional[Dict[str, tuple[str, str, str]]] = None,
+) -> Dict[str, tuple[object, ...]]:
+    global _MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_SIGNATURE
+    scoped_jobs = [job for job in jobs if str(job.get("id") or "").strip()]
+    if not scoped_jobs:
+        return {}
+    scoped_job_ids = tuple(sorted(str(job.get("id") or "").strip() for job in scoped_jobs))
+    if not _material_parse_priority_cache_enabled():
+        return {
+            str(job.get("id") or ""): _build_material_parse_job_priority_context(
+                job,
+                material_by_id,
+                project_stage_ranks,
+                preview_priority_context=(preview_priority_by_job_id or {}).get(
+                    str(job.get("id") or "").strip()
+                ),
+                size_hint_override=(size_hint_by_material_id or {}).get(
+                    str(job.get("material_id") or "").strip()
+                ),
+                sort_key_override=(sort_key_by_job_id or {}).get(str(job.get("id") or "").strip()),
+            )
+            for job in scoped_jobs
+        }
+    signature = (_material_parse_priority_snapshot_signature(), scoped_job_ids)
+    with _MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_LOCK:
+        if signature == _MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_SIGNATURE:
+            _increment_material_parse_scheduler_stat("priority_context_cache_hits")
+            return _MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE
+    contexts = {
+        str(job.get("id") or ""): _build_material_parse_job_priority_context(
+            job,
+            material_by_id,
+            project_stage_ranks,
+            preview_priority_context=(preview_priority_by_job_id or {}).get(
+                str(job.get("id") or "").strip()
+            ),
+            size_hint_override=(size_hint_by_material_id or {}).get(
+                str(job.get("material_id") or "").strip()
+            ),
+            sort_key_override=(sort_key_by_job_id or {}).get(str(job.get("id") or "").strip()),
+        )
+        for job in scoped_jobs
+    }
+    with _MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_LOCK:
+        _MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_SIGNATURE = signature
+        _MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE.clear()
+        _MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE.update(contexts)
+        _increment_material_parse_scheduler_stat("priority_context_cache_rebuilds")
+        return _MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE
+
+
+def _load_material_parse_job_priority_contexts(
+    jobs: List[Dict[str, object]],
+    material_by_id: Dict[str, Dict[str, object]],
+    project_stage_ranks: Dict[str, int],
+    preview_priority_by_job_id: Optional[Dict[str, tuple[int, int, int]]] = None,
+    size_hint_by_material_id: Optional[Dict[str, int]] = None,
+    sort_key_by_job_id: Optional[Dict[str, tuple[str, str, str]]] = None,
+) -> Dict[str, tuple[object, ...]]:
+    return dict(
+        _load_material_parse_job_priority_contexts_view(
+            jobs,
+            material_by_id,
+            project_stage_ranks,
+            preview_priority_by_job_id,
+            size_hint_by_material_id,
+            sort_key_by_job_id,
+        )
+    )
+
+
+def _compute_material_parse_jobs_summary(
+    jobs: List[Dict[str, object]],
+    *,
+    project_id: Optional[str] = None,
+) -> tuple[List[Dict[str, object]], Dict[str, object]]:
+    normalized_project_id = str(project_id or "").strip()
+    filtered: List[Dict[str, object]] = []
+    status_counts: Dict[str, int] = {}
+    backlog = 0
+    failure_count = 0
+    gpt_jobs = 0
+    gpt_failed_jobs = 0
+    latest_finished_at = ""
+    latest_finished_filename = ""
+    for job in jobs:
+        normalized, _ = _normalize_material_parse_job(job)
+        if (
+            normalized_project_id
+            and str(normalized.get("project_id") or "").strip() != normalized_project_id
+        ):
+            continue
+        filtered.append(normalized)
+        status = str(normalized.get("status") or "queued")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if status in {"queued", "processing"}:
+            backlog += 1
+        if status == "failed":
+            failure_count += 1
+        if str(normalized.get("parse_backend") or "").startswith("gpt"):
+            gpt_jobs += 1
+            if status == "failed":
+                gpt_failed_jobs += 1
+        finished_at = str(normalized.get("finished_at") or "").strip()
+        if finished_at and finished_at > latest_finished_at:
+            latest_finished_at = finished_at
+            latest_finished_filename = str(normalized.get("filename") or "").strip()
+    total_jobs = len(filtered)
+    return filtered, {
+        "total_jobs": total_jobs,
+        "status_counts": status_counts,
+        "backlog": backlog,
+        "failed_jobs": failure_count,
+        "gpt_jobs": gpt_jobs,
+        "gpt_failed_jobs": gpt_failed_jobs,
+        "gpt_ratio": round(float(gpt_jobs) / float(total_jobs), 4) if total_jobs > 0 else 0.0,
+        "latest_finished_at": latest_finished_at or None,
+        "latest_finished_filename": latest_finished_filename or None,
+    }
+
+
+def _load_material_parse_jobs_summary_cached(
+    project_id: Optional[str] = None,
+) -> tuple[List[Dict[str, object]], Dict[str, object]]:
+    global _MATERIAL_PARSE_JOBS_SUMMARY_CACHE_SIGNATURE
+    normalized_project_id = str(project_id or "").strip()
+    cache_key = normalized_project_id or "__all__"
+    if _material_parse_jobs_summary_cache_enabled():
+        signature = _material_parse_state_file_signature(MATERIAL_PARSE_JOBS_PATH)
+        with _MATERIAL_PARSE_JOBS_SUMMARY_CACHE_LOCK:
+            if signature == _MATERIAL_PARSE_JOBS_SUMMARY_CACHE_SIGNATURE:
+                filtered = _MATERIAL_PARSE_JOBS_SUMMARY_CACHE_FILTERED.get(cache_key)
+                summary = _MATERIAL_PARSE_JOBS_SUMMARY_CACHE_SUMMARY.get(cache_key)
+                if filtered is not None and summary is not None:
+                    _increment_material_parse_scheduler_stat("jobs_summary_cache_hits")
+                    _increment_material_parse_project_cache_stat(
+                        normalized_project_id,
+                        "jobs_summary_cache_hits",
+                    )
+                    return [dict(job) for job in filtered], dict(summary)
+    _, jobs = _load_material_parse_state_snapshot()
+    filtered, summary = _compute_material_parse_jobs_summary(jobs, project_id=normalized_project_id)
+    if not _material_parse_jobs_summary_cache_enabled():
+        return filtered, summary
+    signature = _material_parse_state_file_signature(MATERIAL_PARSE_JOBS_PATH)
+    with _MATERIAL_PARSE_JOBS_SUMMARY_CACHE_LOCK:
+        if signature != _MATERIAL_PARSE_JOBS_SUMMARY_CACHE_SIGNATURE:
+            _MATERIAL_PARSE_JOBS_SUMMARY_CACHE_SIGNATURE = signature
+            _MATERIAL_PARSE_JOBS_SUMMARY_CACHE_FILTERED.clear()
+            _MATERIAL_PARSE_JOBS_SUMMARY_CACHE_SUMMARY.clear()
+        _MATERIAL_PARSE_JOBS_SUMMARY_CACHE_FILTERED[cache_key] = [dict(job) for job in filtered]
+        _MATERIAL_PARSE_JOBS_SUMMARY_CACHE_SUMMARY[cache_key] = dict(summary)
+    _increment_material_parse_scheduler_stat("jobs_summary_cache_rebuilds")
+    _increment_material_parse_project_cache_stat(
+        normalized_project_id,
+        "jobs_summary_cache_rebuilds",
+    )
+    return filtered, summary
+
+
+def _compute_material_parse_status_materials_payload(
+    project_id: str,
+    materials: List[Dict[str, object]],
+    jobs: List[Dict[str, object]],
+) -> Dict[str, object]:
+    normalized_project_id = str(project_id or "").strip()
+    project_materials = [
+        _normalize_material_row_for_parse(dict(row))[0]
+        for row in materials
+        if str(row.get("project_id") or "").strip() == normalized_project_id
+    ]
+    latest_job_by_material_id: Dict[str, Dict[str, object]] = {}
+    queued_positions: Dict[str, int] = {}
+    queued_jobs = [
+        dict(job) for job in jobs if str(job.get("status") or "").strip().lower() == "queued"
+    ]
+    queued_jobs.sort(key=_material_parse_job_sort_key)
+    for idx, job in enumerate(queued_jobs, start=1):
+        material_id = str(job.get("material_id") or "").strip()
+        if material_id and material_id not in queued_positions:
+            queued_positions[material_id] = idx
+    for job in jobs:
+        material_id = str(job.get("material_id") or "").strip()
+        if not material_id:
+            continue
+        current = latest_job_by_material_id.get(material_id)
+        if current is None or _material_parse_job_sort_key(job) > _material_parse_job_sort_key(
+            current
+        ):
+            latest_job_by_material_id[material_id] = dict(job)
+    enriched_materials: List[Dict[str, object]] = []
+    for row in project_materials:
+        material_id = str(row.get("id") or "").strip()
+        active_job = latest_job_by_material_id.get(material_id)
+        enriched = dict(row)
+        enriched.update(
+            _build_material_parse_runtime_details(
+                row,
+                active_job=active_job,
+                queue_position=queued_positions.get(material_id),
+            )
+        )
+        enriched_materials.append(enriched)
+    previewed_materials = sum(
+        1
+        for row in project_materials
+        if str(row.get("parse_phase") or "").strip().lower() == "preview"
+        and not _material_parse_ready_for_gate(row)
+    )
+    return {
+        "materials": project_materials,
+        "enriched_materials": enriched_materials,
+        "materials_total": len(project_materials),
+        "parsed_materials": sum(
+            1
+            for row in project_materials
+            if str(row.get("parse_status") or "").strip().lower() == "parsed"
+            and not (
+                str(row.get("parse_phase") or "").strip().lower() == "preview"
+                and not _material_parse_ready_for_gate(row)
+            )
+        ),
+        "failed_materials": sum(
+            1
+            for row in project_materials
+            if str(row.get("parse_status") or "").strip().lower() == "failed"
+        ),
+        "processing_materials": sum(
+            1
+            for row in project_materials
+            if str(row.get("parse_status") or "").strip().lower() == "processing"
+        ),
+        "queued_materials": sum(
+            1
+            for row in project_materials
+            if str(row.get("parse_status") or "").strip().lower() == "queued"
+        ),
+        "previewed_materials": previewed_materials,
+    }
+
+
+def _load_material_parse_status_materials_payload(project_id: str) -> Dict[str, object]:
+    global _MATERIAL_PARSE_STATUS_MATERIALS_CACHE_SIGNATURE
+    normalized_project_id = str(project_id or "").strip()
+    if _material_parse_status_materials_cache_enabled():
+        signature = _material_parse_state_files_signature()
+        with _MATERIAL_PARSE_STATUS_MATERIALS_CACHE_LOCK:
+            if signature == _MATERIAL_PARSE_STATUS_MATERIALS_CACHE_SIGNATURE:
+                cached = _MATERIAL_PARSE_STATUS_MATERIALS_CACHE.get(normalized_project_id)
+                if cached is not None:
+                    _increment_material_parse_scheduler_stat("status_materials_cache_hits")
+                    _increment_material_parse_project_cache_stat(
+                        normalized_project_id,
+                        "status_materials_cache_hits",
+                    )
+                    return copy.deepcopy(cached)
+    materials, _ = _load_material_parse_state_snapshot()
+    jobs, _ = _build_material_parse_jobs_summary(normalized_project_id)
+    payload = _compute_material_parse_status_materials_payload(
+        normalized_project_id,
+        materials,
+        jobs,
+    )
+    if not _material_parse_status_materials_cache_enabled():
+        return payload
+    signature = _material_parse_state_files_signature()
+    with _MATERIAL_PARSE_STATUS_MATERIALS_CACHE_LOCK:
+        if signature != _MATERIAL_PARSE_STATUS_MATERIALS_CACHE_SIGNATURE:
+            _MATERIAL_PARSE_STATUS_MATERIALS_CACHE_SIGNATURE = signature
+            _MATERIAL_PARSE_STATUS_MATERIALS_CACHE.clear()
+        _MATERIAL_PARSE_STATUS_MATERIALS_CACHE[normalized_project_id] = copy.deepcopy(payload)
+    _increment_material_parse_scheduler_stat("status_materials_cache_rebuilds")
+    _increment_material_parse_project_cache_stat(
+        normalized_project_id,
+        "status_materials_cache_rebuilds",
+    )
+    return payload
+
+
+def _compute_material_parse_status_core_payload(project_id: str) -> Dict[str, object]:
+    jobs, summary = _build_material_parse_jobs_summary(project_id)
+    materials_payload = _load_material_parse_status_materials_payload(project_id)
+    materials = list(materials_payload.get("materials") or [])
+    static_summary = dict(summary)
+    static_summary["materials_total"] = int(materials_payload.get("materials_total") or 0)
+    static_summary["parsed_materials"] = int(materials_payload.get("parsed_materials") or 0)
+    static_summary["failed_materials"] = int(materials_payload.get("failed_materials") or 0)
+    static_summary["processing_materials"] = int(materials_payload.get("processing_materials") or 0)
+    static_summary["queued_materials"] = int(materials_payload.get("queued_materials") or 0)
+    static_summary["previewed_materials"] = int(materials_payload.get("previewed_materials") or 0)
+    static_summary.update(_build_boq_parse_status_summary(materials))
+    return {
+        "jobs": [dict(job) for job in jobs],
+        "materials": [dict(row) for row in materials_payload.get("enriched_materials") or []],
+        "summary": static_summary,
+    }
+
+
+def _load_material_parse_status_core_payload(project_id: str) -> Dict[str, object]:
+    global _MATERIAL_PARSE_STATUS_CORE_CACHE_SIGNATURE
+    normalized_project_id = str(project_id or "").strip()
+    if _material_parse_status_core_cache_enabled():
+        signature = _material_parse_state_files_signature()
+        with _MATERIAL_PARSE_STATUS_CORE_CACHE_LOCK:
+            if signature == _MATERIAL_PARSE_STATUS_CORE_CACHE_SIGNATURE:
+                cached = _MATERIAL_PARSE_STATUS_CORE_CACHE.get(normalized_project_id)
+                if cached is not None:
+                    _increment_material_parse_scheduler_stat("status_core_cache_hits")
+                    _increment_material_parse_project_cache_stat(
+                        normalized_project_id,
+                        "status_core_cache_hits",
+                    )
+                    return copy.deepcopy(cached)
+    payload = _compute_material_parse_status_core_payload(normalized_project_id)
+    if not _material_parse_status_core_cache_enabled():
+        return payload
+    signature = _material_parse_state_files_signature()
+    with _MATERIAL_PARSE_STATUS_CORE_CACHE_LOCK:
+        if signature != _MATERIAL_PARSE_STATUS_CORE_CACHE_SIGNATURE:
+            _MATERIAL_PARSE_STATUS_CORE_CACHE_SIGNATURE = signature
+            _MATERIAL_PARSE_STATUS_CORE_CACHE.clear()
+        _MATERIAL_PARSE_STATUS_CORE_CACHE[normalized_project_id] = copy.deepcopy(payload)
+    _increment_material_parse_scheduler_stat("status_core_cache_rebuilds")
+    _increment_material_parse_project_cache_stat(
+        normalized_project_id,
+        "status_core_cache_rebuilds",
+    )
+    return payload
+
+
+def _wait_for_material_parse_work(timeout: float) -> None:
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while not _MATERIAL_PARSE_STOP_EVENT.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        if _MATERIAL_PARSE_WAKE_EVENT.wait(timeout=min(remaining, 0.1)):
+            _MATERIAL_PARSE_WAKE_EVENT.clear()
+            return
 
 
 def _refresh_material_parse_workers_locked() -> List[threading.Thread]:
@@ -558,6 +1666,756 @@ def _schedule_project_material_rebuild(project_id: str) -> None:
     due_at = time.monotonic() + DEFAULT_MATERIAL_PARSE_REBUILD_DEBOUNCE_SECONDS
     with _MATERIAL_PARSE_PENDING_REBUILDS_LOCK:
         _MATERIAL_PARSE_PENDING_REBUILDS[project_key] = due_at
+    _notify_material_parse_workers()
+
+
+def _touch_material_parse_active_window(
+    project_id: str,
+    material_type: object = None,
+    *,
+    normalized_material_type: Optional[str] = None,
+    touch_project: bool = True,
+    touch_type: bool = True,
+) -> None:
+    project_key = str(project_id or "").strip()
+    material_type_key = str(normalized_material_type or "").strip() if touch_type else ""
+    if touch_type and not material_type_key:
+        material_type_key = _normalize_material_type(material_type)
+    if not project_key or (not touch_project and not (touch_type and material_type_key)):
+        return
+    now = time.monotonic()
+    expires_at = now + DEFAULT_MATERIAL_PARSE_ACTIVE_PROJECT_WINDOW_SECONDS
+    with _MATERIAL_PARSE_ACTIVE_PROJECTS_LOCK:
+        if touch_project:
+            existing_expires_at = float(_MATERIAL_PARSE_ACTIVE_PROJECTS.get(project_key) or 0.0)
+            if existing_expires_at > now:
+                _MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS[project_key] = (
+                    int(_MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.get(project_key, 0)) + 1
+                )
+            else:
+                _MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS[project_key] = 1
+            _MATERIAL_PARSE_ACTIVE_PROJECTS[project_key] = expires_at
+        if touch_type and material_type_key:
+            key = (project_key, material_type_key)
+            existing_expires_at = float(_MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.get(key) or 0.0)
+            if existing_expires_at > now:
+                _MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS[key] = (
+                    int(_MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.get(key, 0)) + 1
+                )
+            else:
+                _MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS[key] = 1
+            _MATERIAL_PARSE_ACTIVE_PROJECT_TYPES[key] = expires_at
+
+
+def _touch_material_parse_active_project(project_id: str) -> None:
+    _touch_material_parse_active_window(project_id, touch_type=False)
+
+
+def _touch_material_parse_active_project_type(project_id: str, material_type: object) -> None:
+    _touch_material_parse_active_window(project_id, material_type, touch_project=False)
+
+
+def _collect_material_parse_active_window_state() -> (
+    tuple[
+        Set[str],
+        Set[tuple[str, str]],
+        int,
+        int,
+    ]
+):
+    now = time.monotonic()
+    with _MATERIAL_PARSE_ACTIVE_PROJECTS_LOCK:
+        expired = [
+            project_id
+            for project_id, expires_at in _MATERIAL_PARSE_ACTIVE_PROJECTS.items()
+            if expires_at <= now
+        ]
+        for project_id in expired:
+            _MATERIAL_PARSE_ACTIVE_PROJECTS.pop(project_id, None)
+            _MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.pop(project_id, None)
+        expired_types = [
+            key
+            for key, expires_at in _MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.items()
+            if expires_at <= now
+        ]
+        for key in expired_types:
+            _MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.pop(key, None)
+            _MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.pop(key, None)
+        active_project_ids = {
+            project_id
+            for project_id in _MATERIAL_PARSE_ACTIVE_PROJECTS.keys()
+            if int(_MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.get(project_id, 0))
+            <= DEFAULT_MATERIAL_PARSE_ACTIVE_PROJECT_WINDOW_MAX_CLAIMS
+        }
+        active_project_type_keys = {
+            key
+            for key in _MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.keys()
+            if int(_MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.get(key, 0))
+            <= DEFAULT_MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_WINDOW_MAX_CLAIMS
+        }
+        active_project_quota_exhausted = sum(
+            1
+            for project_id in _MATERIAL_PARSE_ACTIVE_PROJECTS.keys()
+            if project_id not in active_project_ids
+        )
+        active_project_type_quota_exhausted = sum(
+            1
+            for key in _MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.keys()
+            if key not in active_project_type_keys
+        )
+        return (
+            active_project_ids,
+            active_project_type_keys,
+            active_project_quota_exhausted,
+            active_project_type_quota_exhausted,
+        )
+
+
+def _get_material_parse_active_projects() -> Set[str]:
+    active_project_ids, _, _, _ = _collect_material_parse_active_window_state()
+    return active_project_ids
+
+
+def _get_material_parse_active_project_types() -> Set[tuple[str, str]]:
+    _, active_project_type_keys, _, _ = _collect_material_parse_active_window_state()
+    return active_project_type_keys
+
+
+def _increment_material_parse_scheduler_stat(name: str, delta: int = 1) -> None:
+    if not name or int(delta) == 0:
+        return
+    with _MATERIAL_PARSE_SCHEDULER_STATS_LOCK:
+        _MATERIAL_PARSE_SCHEDULER_STATS[name] = int(
+            _MATERIAL_PARSE_SCHEDULER_STATS.get(name, 0)
+        ) + int(delta)
+
+
+def _increment_material_parse_project_cache_stat(
+    project_id: Optional[str],
+    name: str,
+    delta: int = 1,
+) -> None:
+    normalized_project_id = str(project_id or "").strip()
+    if not normalized_project_id or not name or int(delta) == 0:
+        return
+    with _MATERIAL_PARSE_PROJECT_CACHE_STATS_LOCK:
+        bucket = _MATERIAL_PARSE_PROJECT_CACHE_STATS.setdefault(normalized_project_id, {})
+        bucket[name] = int(bucket.get(name, 0)) + int(delta)
+
+
+def _material_parse_project_cache_stats_snapshot(project_id: Optional[str]) -> Dict[str, int]:
+    normalized_project_id = str(project_id or "").strip()
+    if not normalized_project_id:
+        return {}
+    with _MATERIAL_PARSE_PROJECT_CACHE_STATS_LOCK:
+        project_cache_stats = dict(
+            _MATERIAL_PARSE_PROJECT_CACHE_STATS.get(normalized_project_id, {})
+        )
+    return {
+        "jobs_summary_cache_hits": int(project_cache_stats.get("jobs_summary_cache_hits", 0)),
+        "jobs_summary_cache_rebuilds": int(
+            project_cache_stats.get("jobs_summary_cache_rebuilds", 0)
+        ),
+        "status_materials_cache_hits": int(
+            project_cache_stats.get("status_materials_cache_hits", 0)
+        ),
+        "status_materials_cache_rebuilds": int(
+            project_cache_stats.get("status_materials_cache_rebuilds", 0)
+        ),
+        "status_core_cache_hits": int(project_cache_stats.get("status_core_cache_hits", 0)),
+        "status_core_cache_rebuilds": int(project_cache_stats.get("status_core_cache_rebuilds", 0)),
+    }
+
+
+def _record_material_parse_project_cache_request_delta(
+    project_id: Optional[str],
+    request_delta: Optional[Mapping[str, object]],
+) -> None:
+    normalized_project_id = str(project_id or "").strip()
+    if not normalized_project_id:
+        return
+    normalized_delta = dict(request_delta or {})
+    entry = {
+        "avoided_rebuild_work_units": int(
+            normalized_delta.get("scheduler_project_recent_avoided_rebuild_work_units") or 0
+        ),
+        "rebuilt_work_units": int(
+            normalized_delta.get("scheduler_project_recent_rebuilt_work_units") or 0
+        ),
+        "avoided_rebuild_layer_count": int(
+            normalized_delta.get("scheduler_project_recent_avoided_rebuild_layer_count") or 0
+        ),
+        "rebuilt_layer_count": int(
+            normalized_delta.get("scheduler_project_recent_rebuilt_layer_count") or 0
+        ),
+    }
+    if (
+        entry["avoided_rebuild_work_units"] <= 0
+        and entry["rebuilt_work_units"] <= 0
+        and entry["avoided_rebuild_layer_count"] <= 0
+        and entry["rebuilt_layer_count"] <= 0
+    ):
+        return
+    with _MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY_LOCK:
+        bucket = _MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.setdefault(
+            normalized_project_id,
+            deque(maxlen=_MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY_WINDOW_SIZE),
+        )
+        bucket.append(dict(entry))
+
+
+def _material_parse_project_cache_request_history_snapshot(
+    project_id: Optional[str],
+) -> List[Dict[str, int]]:
+    normalized_project_id = str(project_id or "").strip()
+    if not normalized_project_id:
+        return []
+    with _MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY_LOCK:
+        bucket = list(
+            _MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.get(normalized_project_id) or []
+        )
+    return [dict(item) for item in bucket]
+
+
+def _material_parse_project_cache_request_stage(
+    request_entry: Optional[Mapping[str, object]],
+) -> str:
+    normalized_entry = dict(request_entry or {})
+    avoided_rebuild_work_units = int(normalized_entry.get("avoided_rebuild_work_units", 0) or 0)
+    rebuilt_work_units = int(normalized_entry.get("rebuilt_work_units", 0) or 0)
+    full_chain_work_units = sum(
+        int(value) for value in _MATERIAL_PARSE_PROJECT_CACHE_LAYER_WORK_UNITS.values()
+    )
+    if rebuilt_work_units >= full_chain_work_units and avoided_rebuild_work_units <= 0:
+        return "cold_start"
+    if rebuilt_work_units <= 0 and avoided_rebuild_work_units > 0:
+        return "steady"
+    if rebuilt_work_units > 0 or avoided_rebuild_work_units > 0:
+        return "warming"
+    return "cold"
+
+
+def _material_parse_project_cache_recent_consecutive_stage_count(
+    request_history: Sequence[Mapping[str, object]],
+    stage: str,
+) -> int:
+    normalized_stage = str(stage or "").strip()
+    if not normalized_stage:
+        return 0
+    count = 0
+    for item in reversed(list(request_history or [])):
+        if _material_parse_project_cache_request_stage(item) != normalized_stage:
+            break
+        count += 1
+    return count
+
+
+def _material_parse_project_cache_stable_hot_rule_label() -> str:
+    return f"按连续 {_MATERIAL_PARSE_PROJECT_CACHE_STEADY_THRESHOLD} 轮 steady 判定"
+
+
+def _material_parse_project_cache_stable_hot_eta_hint(remaining_rounds: int) -> str:
+    normalized_remaining_rounds = max(0, int(remaining_rounds))
+    if normalized_remaining_rounds <= 0:
+        return "已达到稳定转热阈值"
+    return f"还需连续 {normalized_remaining_rounds} 轮 steady"
+
+
+def _material_parse_project_cache_stable_hot_eta_short_label(remaining_rounds: int) -> str:
+    normalized_remaining_rounds = max(0, int(remaining_rounds))
+    if normalized_remaining_rounds <= 0:
+        return "已达阈值"
+    return f"还需{normalized_remaining_rounds}轮"
+
+
+def _material_parse_project_cache_stable_hot_progress_percent_label(
+    progress_percent: int,
+) -> str:
+    normalized_progress_percent = max(0, min(100, int(progress_percent)))
+    return f"{normalized_progress_percent}%"
+
+
+def _material_parse_project_cache_stable_hot_progress_summary_label(
+    progress_label: object,
+    progress_percent_label: object,
+    eta_short_label: object,
+) -> str:
+    normalized_progress_label = str(progress_label or "").strip()
+    normalized_progress_percent_label = str(progress_percent_label or "").strip()
+    normalized_eta_short_label = str(eta_short_label or "").strip()
+    summary_label = normalized_progress_label
+    if normalized_progress_percent_label:
+        if summary_label:
+            summary_label += f"（{normalized_progress_percent_label}）"
+        else:
+            summary_label = normalized_progress_percent_label
+    if normalized_eta_short_label:
+        if summary_label:
+            summary_label += f"，{normalized_eta_short_label}"
+        else:
+            summary_label = normalized_eta_short_label
+    return summary_label
+
+
+def _material_parse_project_cache_stable_hot_badge_label(
+    window_state: object,
+    progress_summary_label: object,
+) -> str:
+    normalized_window_state = str(window_state or "").strip().lower()
+    normalized_progress_summary_label = str(progress_summary_label or "").strip()
+    if normalized_window_state == "stable_hot":
+        return "稳定热态"
+    if normalized_window_state == "steady":
+        return "已转热"
+    if normalized_window_state == "warming":
+        if normalized_progress_summary_label:
+            return f"预热中 {normalized_progress_summary_label}"
+        return "预热中"
+    if normalized_window_state == "cold_start":
+        return "冷启动首轮"
+    return "冷启动"
+
+
+def _build_material_parse_project_cache_request_delta(
+    before_stats: Optional[Mapping[str, object]],
+    after_stats: Optional[Mapping[str, object]],
+) -> Dict[str, object]:
+    normalized_before = dict(before_stats or {})
+    normalized_after = dict(after_stats or {})
+
+    def _delta(name: str) -> int:
+        return int(normalized_after.get(name, 0)) - int(normalized_before.get(name, 0))
+
+    jobs_summary_hit_delta = _delta("jobs_summary_cache_hits")
+    jobs_summary_rebuild_delta = _delta("jobs_summary_cache_rebuilds")
+    status_materials_hit_delta = _delta("status_materials_cache_hits")
+    status_materials_rebuild_delta = _delta("status_materials_cache_rebuilds")
+    status_core_hit_delta = _delta("status_core_cache_hits")
+    status_core_rebuild_delta = _delta("status_core_cache_rebuilds")
+    jobs_summary_saved = jobs_summary_hit_delta > 0 and jobs_summary_rebuild_delta <= 0
+    status_materials_saved = status_materials_hit_delta > 0 and status_materials_rebuild_delta <= 0
+    status_core_saved = status_core_hit_delta > 0 and status_core_rebuild_delta <= 0
+
+    recent_avoided_rebuild_layers: List[str] = []
+    if status_core_saved:
+        recent_avoided_rebuild_layers.extend(["status_core", "status_materials", "jobs_summary"])
+    else:
+        if status_materials_saved:
+            recent_avoided_rebuild_layers.append("status_materials")
+        if jobs_summary_saved:
+            recent_avoided_rebuild_layers.append("jobs_summary")
+
+    recent_rebuilt_layers = [
+        layer
+        for layer, rebuild_delta in (
+            ("status_core", status_core_rebuild_delta),
+            ("status_materials", status_materials_rebuild_delta),
+            ("jobs_summary", jobs_summary_rebuild_delta),
+        )
+        if rebuild_delta > 0
+    ]
+    recent_avoided_rebuild_work_units = sum(
+        int(_MATERIAL_PARSE_PROJECT_CACHE_LAYER_WORK_UNITS.get(layer, 0))
+        for layer in recent_avoided_rebuild_layers
+    )
+    recent_rebuilt_work_units = sum(
+        int(_MATERIAL_PARSE_PROJECT_CACHE_LAYER_WORK_UNITS.get(layer, 0))
+        for layer in recent_rebuilt_layers
+    )
+    return {
+        "scheduler_project_recent_avoided_rebuild_layers": list(recent_avoided_rebuild_layers),
+        "scheduler_project_recent_rebuilt_layers": list(recent_rebuilt_layers),
+        "scheduler_project_recent_avoided_rebuild_layer_count": len(recent_avoided_rebuild_layers),
+        "scheduler_project_recent_rebuilt_layer_count": len(recent_rebuilt_layers),
+        "scheduler_project_recent_avoided_rebuild_work_units": int(
+            recent_avoided_rebuild_work_units
+        ),
+        "scheduler_project_recent_rebuilt_work_units": int(recent_rebuilt_work_units),
+    }
+
+
+def _build_material_parse_scheduler_summary(
+    project_id: Optional[str] = None,
+    request_project_cache_delta: Optional[Mapping[str, object]] = None,
+) -> Dict[str, object]:
+    (
+        active_project_ids,
+        active_project_type_keys,
+        active_project_quota_exhausted,
+        active_project_type_quota_exhausted,
+    ) = _collect_material_parse_active_window_state()
+    with _MATERIAL_PARSE_SCHEDULER_STATS_LOCK:
+        stats = dict(_MATERIAL_PARSE_SCHEDULER_STATS)
+    normalized_project_id = str(project_id or "").strip()
+    project_cache_stats = _material_parse_project_cache_stats_snapshot(normalized_project_id)
+    project_cache_request_delta = dict(request_project_cache_delta or {})
+    project_cache_request_history = _material_parse_project_cache_request_history_snapshot(
+        normalized_project_id
+    )
+    cache_hit_total = sum(
+        int(stats.get(name, 0))
+        for name in (
+            "claim_snapshot_cache_hits",
+            "claim_context_cache_hits",
+            "project_stage_cache_hits",
+            "priority_context_cache_hits",
+            "jobs_summary_cache_hits",
+            "status_materials_cache_hits",
+            "status_core_cache_hits",
+        )
+    )
+    cache_rebuild_total = sum(
+        int(stats.get(name, 0))
+        for name in (
+            "claim_snapshot_cache_rebuilds",
+            "claim_context_cache_rebuilds",
+            "project_stage_cache_rebuilds",
+            "priority_context_cache_rebuilds",
+            "jobs_summary_cache_rebuilds",
+            "status_materials_cache_rebuilds",
+            "status_core_cache_rebuilds",
+        )
+    )
+    cache_operation_total = cache_hit_total + cache_rebuild_total
+    cache_hit_ratio = (
+        round(float(cache_hit_total) / float(cache_operation_total), 4)
+        if cache_operation_total > 0
+        else 0.0
+    )
+    project_cache_hit_total = sum(
+        int(project_cache_stats.get(name, 0))
+        for name in (
+            "jobs_summary_cache_hits",
+            "status_materials_cache_hits",
+            "status_core_cache_hits",
+        )
+    )
+    project_cache_rebuild_total = sum(
+        int(project_cache_stats.get(name, 0))
+        for name in (
+            "jobs_summary_cache_rebuilds",
+            "status_materials_cache_rebuilds",
+            "status_core_cache_rebuilds",
+        )
+    )
+    project_cache_operation_total = project_cache_hit_total + project_cache_rebuild_total
+    project_cache_hit_ratio = (
+        round(float(project_cache_hit_total) / float(project_cache_operation_total), 4)
+        if project_cache_operation_total > 0
+        else 0.0
+    )
+    project_cache_net_savings = int(project_cache_hit_total - project_cache_rebuild_total)
+    if project_cache_operation_total <= 0:
+        project_cache_state = "cold"
+    elif project_cache_hit_total >= project_cache_rebuild_total:
+        project_cache_state = "warm"
+    else:
+        project_cache_state = "warming"
+    project_jobs_summary_cache_hits = int(project_cache_stats.get("jobs_summary_cache_hits", 0))
+    project_jobs_summary_cache_rebuilds = int(
+        project_cache_stats.get("jobs_summary_cache_rebuilds", 0)
+    )
+    project_status_materials_cache_hits = int(
+        project_cache_stats.get("status_materials_cache_hits", 0)
+    )
+    project_status_materials_cache_rebuilds = int(
+        project_cache_stats.get("status_materials_cache_rebuilds", 0)
+    )
+    project_status_core_cache_hits = int(project_cache_stats.get("status_core_cache_hits", 0))
+    project_status_core_cache_rebuilds = int(
+        project_cache_stats.get("status_core_cache_rebuilds", 0)
+    )
+
+    def _project_cache_layer_state(hits: int, rebuilds: int) -> str:
+        if int(hits) + int(rebuilds) <= 0:
+            return "cold"
+        if int(hits) >= int(rebuilds):
+            return "warm"
+        return "warming"
+
+    project_jobs_summary_cache_state = _project_cache_layer_state(
+        project_jobs_summary_cache_hits,
+        project_jobs_summary_cache_rebuilds,
+    )
+    project_status_materials_cache_state = _project_cache_layer_state(
+        project_status_materials_cache_hits,
+        project_status_materials_cache_rebuilds,
+    )
+    project_status_core_cache_state = _project_cache_layer_state(
+        project_status_core_cache_hits,
+        project_status_core_cache_rebuilds,
+    )
+    project_cache_hot_layer_count = sum(
+        1
+        for value in (
+            project_jobs_summary_cache_state,
+            project_status_materials_cache_state,
+            project_status_core_cache_state,
+        )
+        if value == "warm"
+    )
+    project_cache_warming_layer_count = sum(
+        1
+        for value in (
+            project_jobs_summary_cache_state,
+            project_status_materials_cache_state,
+            project_status_core_cache_state,
+        )
+        if value == "warming"
+    )
+    project_cache_cold_layer_count = sum(
+        1
+        for value in (
+            project_jobs_summary_cache_state,
+            project_status_materials_cache_state,
+            project_status_core_cache_state,
+        )
+        if value == "cold"
+    )
+    project_cache_request_window_size = len(project_cache_request_history)
+    project_recent_cold_start_round_count = sum(
+        1
+        for item in project_cache_request_history
+        if _material_parse_project_cache_request_stage(item) == "cold_start"
+    )
+    project_recent_steady_round_count = sum(
+        1
+        for item in project_cache_request_history
+        if _material_parse_project_cache_request_stage(item) == "steady"
+    )
+    project_recent_warming_round_count = sum(
+        1
+        for item in project_cache_request_history
+        if _material_parse_project_cache_request_stage(item) == "warming"
+    )
+    project_recent_consecutive_steady_round_count = (
+        _material_parse_project_cache_recent_consecutive_stage_count(
+            project_cache_request_history,
+            "steady",
+        )
+    )
+    project_recent_stable_hot = (
+        project_recent_consecutive_steady_round_count
+        >= _MATERIAL_PARSE_PROJECT_CACHE_STEADY_THRESHOLD
+    )
+    project_recent_stable_hot_remaining_rounds = max(
+        0,
+        int(_MATERIAL_PARSE_PROJECT_CACHE_STEADY_THRESHOLD)
+        - int(project_recent_consecutive_steady_round_count),
+    )
+    project_recent_stable_hot_progress_completed_rounds = min(
+        int(project_recent_consecutive_steady_round_count),
+        int(_MATERIAL_PARSE_PROJECT_CACHE_STEADY_THRESHOLD),
+    )
+    project_recent_stable_hot_progress_label = (
+        f"{project_recent_stable_hot_progress_completed_rounds}/"
+        f"{int(_MATERIAL_PARSE_PROJECT_CACHE_STEADY_THRESHOLD)}"
+    )
+    project_recent_stable_hot_progress_ratio = (
+        round(
+            float(project_recent_stable_hot_progress_completed_rounds)
+            / float(_MATERIAL_PARSE_PROJECT_CACHE_STEADY_THRESHOLD),
+            4,
+        )
+        if int(_MATERIAL_PARSE_PROJECT_CACHE_STEADY_THRESHOLD) > 0
+        else 0.0
+    )
+    project_recent_stable_hot_progress_percent = int(
+        round(float(project_recent_stable_hot_progress_ratio) * 100)
+    )
+    project_recent_stable_hot_progress_percent_label = (
+        _material_parse_project_cache_stable_hot_progress_percent_label(
+            project_recent_stable_hot_progress_percent
+        )
+    )
+    project_recent_stable_hot_eta_hint = _material_parse_project_cache_stable_hot_eta_hint(
+        project_recent_stable_hot_remaining_rounds
+    )
+    project_recent_stable_hot_eta_short_label = (
+        _material_parse_project_cache_stable_hot_eta_short_label(
+            project_recent_stable_hot_remaining_rounds
+        )
+    )
+    project_recent_stable_hot_progress_summary_label = (
+        _material_parse_project_cache_stable_hot_progress_summary_label(
+            project_recent_stable_hot_progress_label,
+            project_recent_stable_hot_progress_percent_label,
+            project_recent_stable_hot_eta_short_label,
+        )
+    )
+    if project_cache_request_window_size <= 0:
+        project_recent_window_state = "cold"
+    elif project_recent_stable_hot:
+        project_recent_window_state = "stable_hot"
+    elif project_recent_steady_round_count >= project_cache_request_window_size:
+        project_recent_window_state = "steady"
+    elif project_recent_cold_start_round_count >= project_cache_request_window_size:
+        project_recent_window_state = "cold_start"
+    else:
+        project_recent_window_state = "warming"
+    project_recent_avoided_rebuild_work_units_avg = (
+        round(
+            sum(
+                int(item.get("avoided_rebuild_work_units", 0))
+                for item in project_cache_request_history
+            )
+            / float(project_cache_request_window_size),
+            4,
+        )
+        if project_cache_request_window_size > 0
+        else 0.0
+    )
+    project_recent_rebuilt_work_units_avg = (
+        round(
+            sum(int(item.get("rebuilt_work_units", 0)) for item in project_cache_request_history)
+            / float(project_cache_request_window_size),
+            4,
+        )
+        if project_cache_request_window_size > 0
+        else 0.0
+    )
+    project_recent_net_saved_work_units_avg = round(
+        float(project_recent_avoided_rebuild_work_units_avg)
+        - float(project_recent_rebuilt_work_units_avg),
+        4,
+    )
+    project_recent_stable_hot_badge_label = _material_parse_project_cache_stable_hot_badge_label(
+        project_recent_window_state,
+        project_recent_stable_hot_progress_summary_label,
+    )
+    return {
+        "scheduler_project_continuity_bonus_hits": int(
+            stats.get("project_continuity_bonus_hits", 0)
+        ),
+        "scheduler_followup_full_bonus_hits": int(stats.get("followup_full_bonus_hits", 0)),
+        "scheduler_same_material_followup_bonus_hits": int(
+            stats.get("same_material_followup_bonus_hits", 0)
+        ),
+        "scheduler_active_project_bonus_hits": int(stats.get("active_project_bonus_hits", 0)),
+        "scheduler_active_project_type_bonus_hits": int(
+            stats.get("active_project_type_bonus_hits", 0)
+        ),
+        "scheduler_claim_snapshot_cache_hits": int(stats.get("claim_snapshot_cache_hits", 0)),
+        "scheduler_claim_snapshot_cache_rebuilds": int(
+            stats.get("claim_snapshot_cache_rebuilds", 0)
+        ),
+        "scheduler_claim_context_cache_hits": int(stats.get("claim_context_cache_hits", 0)),
+        "scheduler_claim_context_cache_rebuilds": int(stats.get("claim_context_cache_rebuilds", 0)),
+        "scheduler_project_stage_cache_hits": int(stats.get("project_stage_cache_hits", 0)),
+        "scheduler_project_stage_cache_rebuilds": int(stats.get("project_stage_cache_rebuilds", 0)),
+        "scheduler_priority_context_cache_hits": int(stats.get("priority_context_cache_hits", 0)),
+        "scheduler_priority_context_cache_rebuilds": int(
+            stats.get("priority_context_cache_rebuilds", 0)
+        ),
+        "scheduler_jobs_summary_cache_hits": int(stats.get("jobs_summary_cache_hits", 0)),
+        "scheduler_jobs_summary_cache_rebuilds": int(stats.get("jobs_summary_cache_rebuilds", 0)),
+        "scheduler_status_materials_cache_hits": int(stats.get("status_materials_cache_hits", 0)),
+        "scheduler_status_materials_cache_rebuilds": int(
+            stats.get("status_materials_cache_rebuilds", 0)
+        ),
+        "scheduler_status_core_cache_hits": int(stats.get("status_core_cache_hits", 0)),
+        "scheduler_status_core_cache_rebuilds": int(stats.get("status_core_cache_rebuilds", 0)),
+        "scheduler_cache_hit_total": int(cache_hit_total),
+        "scheduler_cache_rebuild_total": int(cache_rebuild_total),
+        "scheduler_cache_hit_ratio": float(cache_hit_ratio),
+        "scheduler_project_jobs_summary_cache_hits": int(project_jobs_summary_cache_hits),
+        "scheduler_project_jobs_summary_cache_rebuilds": int(project_jobs_summary_cache_rebuilds),
+        "scheduler_project_jobs_summary_cache_state": project_jobs_summary_cache_state,
+        "scheduler_project_status_materials_cache_hits": int(project_status_materials_cache_hits),
+        "scheduler_project_status_materials_cache_rebuilds": int(
+            project_status_materials_cache_rebuilds
+        ),
+        "scheduler_project_status_materials_cache_state": project_status_materials_cache_state,
+        "scheduler_project_status_core_cache_hits": int(project_status_core_cache_hits),
+        "scheduler_project_status_core_cache_rebuilds": int(project_status_core_cache_rebuilds),
+        "scheduler_project_status_core_cache_state": project_status_core_cache_state,
+        "scheduler_project_cache_hit_total": int(project_cache_hit_total),
+        "scheduler_project_cache_rebuild_total": int(project_cache_rebuild_total),
+        "scheduler_project_cache_hit_ratio": float(project_cache_hit_ratio),
+        "scheduler_project_cache_net_savings": int(project_cache_net_savings),
+        "scheduler_project_cache_state": project_cache_state,
+        "scheduler_project_cache_hot_layer_count": int(project_cache_hot_layer_count),
+        "scheduler_project_cache_warming_layer_count": int(project_cache_warming_layer_count),
+        "scheduler_project_cache_cold_layer_count": int(project_cache_cold_layer_count),
+        "scheduler_project_recent_avoided_rebuild_layers": list(
+            project_cache_request_delta.get("scheduler_project_recent_avoided_rebuild_layers") or []
+        ),
+        "scheduler_project_recent_rebuilt_layers": list(
+            project_cache_request_delta.get("scheduler_project_recent_rebuilt_layers") or []
+        ),
+        "scheduler_project_recent_avoided_rebuild_layer_count": int(
+            project_cache_request_delta.get("scheduler_project_recent_avoided_rebuild_layer_count")
+            or 0
+        ),
+        "scheduler_project_recent_rebuilt_layer_count": int(
+            project_cache_request_delta.get("scheduler_project_recent_rebuilt_layer_count") or 0
+        ),
+        "scheduler_project_recent_avoided_rebuild_work_units": int(
+            project_cache_request_delta.get("scheduler_project_recent_avoided_rebuild_work_units")
+            or 0
+        ),
+        "scheduler_project_recent_rebuilt_work_units": int(
+            project_cache_request_delta.get("scheduler_project_recent_rebuilt_work_units") or 0
+        ),
+        "scheduler_project_recent_request_window_size": int(project_cache_request_window_size),
+        "scheduler_project_recent_cold_start_round_count": int(
+            project_recent_cold_start_round_count
+        ),
+        "scheduler_project_recent_warming_round_count": int(project_recent_warming_round_count),
+        "scheduler_project_recent_steady_round_count": int(project_recent_steady_round_count),
+        "scheduler_project_recent_consecutive_steady_round_count": int(
+            project_recent_consecutive_steady_round_count
+        ),
+        "scheduler_project_recent_stable_hot_threshold": int(
+            _MATERIAL_PARSE_PROJECT_CACHE_STEADY_THRESHOLD
+        ),
+        "scheduler_project_recent_stable_hot": bool(project_recent_stable_hot),
+        "scheduler_project_recent_stable_hot_remaining_rounds": int(
+            project_recent_stable_hot_remaining_rounds
+        ),
+        "scheduler_project_recent_stable_hot_progress_completed_rounds": int(
+            project_recent_stable_hot_progress_completed_rounds
+        ),
+        "scheduler_project_recent_stable_hot_progress_label": (
+            project_recent_stable_hot_progress_label
+        ),
+        "scheduler_project_recent_stable_hot_progress_ratio": float(
+            project_recent_stable_hot_progress_ratio
+        ),
+        "scheduler_project_recent_stable_hot_progress_percent": int(
+            project_recent_stable_hot_progress_percent
+        ),
+        "scheduler_project_recent_stable_hot_progress_percent_label": (
+            project_recent_stable_hot_progress_percent_label
+        ),
+        "scheduler_project_recent_stable_hot_eta_hint": project_recent_stable_hot_eta_hint,
+        "scheduler_project_recent_stable_hot_eta_short_label": (
+            project_recent_stable_hot_eta_short_label
+        ),
+        "scheduler_project_recent_stable_hot_progress_summary_label": (
+            project_recent_stable_hot_progress_summary_label
+        ),
+        "scheduler_project_recent_stable_hot_badge_label": (project_recent_stable_hot_badge_label),
+        "scheduler_project_recent_stable_hot_rule_label": (
+            _material_parse_project_cache_stable_hot_rule_label()
+        ),
+        "scheduler_project_recent_window_state": project_recent_window_state,
+        "scheduler_project_recent_avoided_rebuild_work_units_avg": float(
+            project_recent_avoided_rebuild_work_units_avg
+        ),
+        "scheduler_project_recent_rebuilt_work_units_avg": float(
+            project_recent_rebuilt_work_units_avg
+        ),
+        "scheduler_project_recent_net_saved_work_units_avg": float(
+            project_recent_net_saved_work_units_avg
+        ),
+        "scheduler_active_project_window_count": len(active_project_ids),
+        "scheduler_active_project_type_window_count": len(active_project_type_keys),
+        "scheduler_active_project_quota_exhausted_count": int(active_project_quota_exhausted),
+        "scheduler_active_project_type_quota_exhausted_count": int(
+            active_project_type_quota_exhausted
+        ),
+    }
 
 
 def _claim_due_project_material_rebuilds(*, limit: int = 1) -> List[str]:
@@ -575,7 +2433,57 @@ def _claim_due_project_material_rebuilds(*, limit: int = 1) -> List[str]:
     return claimed
 
 
-def _drain_due_project_material_rebuilds(*, limit: int = 1) -> int:
+def _has_pending_material_parse_jobs() -> bool:
+    now = datetime.now(timezone.utc)
+    if _material_parse_claim_context_cache_enabled():
+        signature = _material_parse_state_files_signature()
+        with _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_LOCK:
+            if signature == _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE:
+                if _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_QUEUED_CANDIDATES:
+                    return True
+                if _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_RETRYABLE_FAILED_WITHOUT_DUE:
+                    return True
+                earliest_retryable_failed_at = (
+                    _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_EARLIEST_RETRYABLE_FAILED_AT
+                )
+                return bool(earliest_retryable_failed_at and earliest_retryable_failed_at <= now)
+
+    (
+        _,
+        jobs,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        candidate_indices,
+        _,
+        _,
+        _,
+        _,
+        _,
+    ) = _load_material_parse_claim_context_view()
+    for idx in candidate_indices:
+        job = jobs[idx]
+        status = str(job.get("status") or "queued").strip().lower()
+        if status == "queued":
+            return True
+        if status != "failed":
+            continue
+        if int(_to_float_or_none(job.get("attempt")) or 0) >= DEFAULT_MATERIAL_PARSE_MAX_ATTEMPTS:
+            continue
+        due_at = _parse_iso_datetime_utc(job.get("next_retry_at"))
+        if due_at is None or due_at <= now:
+            return True
+    return False
+
+
+def _drain_due_project_material_rebuilds(
+    *, limit: int = 1, skip_if_parse_backlog: bool = False
+) -> int:
+    if skip_if_parse_backlog and _has_pending_material_parse_jobs():
+        return 0
     rebuilt = 0
     for project_id in _claim_due_project_material_rebuilds(limit=limit):
         try:
@@ -649,6 +2557,9 @@ def _default_material_parse_state(material_type: str, *, path: str = "") -> Dict
     return {
         "parse_status": "queued" if has_path else "failed",
         "parse_backend": "queued" if has_path else "none",
+        "content_hash": None,
+        "parse_phase": None,
+        "parse_ready_for_gate": False,
         "parse_confidence": 0.0,
         "parse_error_class": None if has_path else "missing_path",
         "parse_error_message": None if has_path else "missing_path",
@@ -669,6 +2580,8 @@ def _default_material_parse_state(material_type: str, *, path: str = "") -> Dict
 def _normalize_material_row_for_parse(row: Dict[str, object]) -> tuple[Dict[str, object], bool]:
     normalized = dict(row)
     changed = False
+    missing_parse_phase = "parse_phase" not in normalized
+    missing_parse_ready_for_gate = "parse_ready_for_gate" not in normalized
     filename = str(normalized.get("filename") or "")
     material_type = _normalize_material_type(normalized.get("material_type"), filename=filename)
     if str(normalized.get("material_type") or "") != material_type:
@@ -679,6 +2592,15 @@ def _normalize_material_row_for_parse(row: Dict[str, object]) -> tuple[Dict[str,
         if key not in normalized:
             normalized[key] = value
             changed = True
+    parse_status = str(normalized.get("parse_status") or "").strip().lower()
+    parse_phase = str(normalized.get("parse_phase") or "").strip().lower()
+    if missing_parse_phase and parse_status == "parsed" and parse_phase != "preview":
+        normalized["parse_phase"] = "full"
+        parse_phase = "full"
+        changed = True
+    if missing_parse_ready_for_gate and parse_status == "parsed" and parse_phase != "preview":
+        normalized["parse_ready_for_gate"] = True
+        changed = True
     if str(normalized.get("parse_status") or "") == "processing":
         normalized["parse_status"] = "queued"
         normalized["parse_backend"] = "queued"
@@ -688,6 +2610,162 @@ def _normalize_material_row_for_parse(row: Dict[str, object]) -> tuple[Dict[str,
         normalized["updated_at"] = _now_iso()
         changed = True
     return normalized, changed
+
+
+def _material_parse_ready_for_gate(material_row: Dict[str, object]) -> bool:
+    if "parse_ready_for_gate" in material_row:
+        return bool(material_row.get("parse_ready_for_gate"))
+    parse_status = str(material_row.get("parse_status") or "").strip().lower()
+    parse_phase = str(material_row.get("parse_phase") or "").strip().lower()
+    return parse_status == "parsed" and parse_phase != "preview"
+
+
+def _material_parse_has_terminal_payload(material_row: Dict[str, object]) -> bool:
+    if str(material_row.get("parsed_text") or "").strip():
+        return True
+    if isinstance(material_row.get("structured_summary"), dict) and material_row.get(
+        "structured_summary"
+    ):
+        return True
+    if int(_to_float_or_none(material_row.get("parsed_chars")) or 0) > 0:
+        return True
+    if isinstance(material_row.get("parsed_chunks"), list) and material_row.get("parsed_chunks"):
+        return True
+    if isinstance(material_row.get("numeric_terms_norm"), list) and material_row.get(
+        "numeric_terms_norm"
+    ):
+        return True
+    if isinstance(material_row.get("lexical_terms"), list) and material_row.get("lexical_terms"):
+        return True
+    return False
+
+
+def _compute_material_content_hash(content: bytes) -> str:
+    return hashlib.sha1(bytes(content)).hexdigest()
+
+
+def _material_parse_cache_key(
+    *,
+    content_hash: object,
+    material_type: object,
+    parse_mode: object,
+    parse_version: object,
+) -> str:
+    return "|".join(
+        [
+            str(content_hash or "").strip(),
+            _normalize_material_type(material_type),
+            str(parse_mode or "full").strip().lower() or "full",
+            str(parse_version or DEFAULT_MATERIAL_PARSE_VERSION).strip()
+            or DEFAULT_MATERIAL_PARSE_VERSION,
+        ]
+    )
+
+
+def _material_parse_row_cache_key(material_row: Dict[str, object], *, parse_mode: str) -> str:
+    content_hash = str(material_row.get("content_hash") or "").strip()
+    if not content_hash:
+        return ""
+    return _material_parse_cache_key(
+        content_hash=content_hash,
+        material_type=material_row.get("material_type"),
+        parse_mode=parse_mode,
+        parse_version=material_row.get("parse_version"),
+    )
+
+
+def _build_material_parse_payload_from_cached_row(
+    source_row: Dict[str, object],
+) -> Dict[str, object]:
+    payload: Dict[str, object] = {
+        "parse_backend": source_row.get("parse_backend") or "local",
+        "content_hash": source_row.get("content_hash"),
+        "parse_phase": source_row.get("parse_phase") or "full",
+        "parse_ready_for_gate": _material_parse_ready_for_gate(source_row),
+        "parse_confidence": float(_to_float_or_none(source_row.get("parse_confidence")) or 0.0),
+        "parse_error_class": None,
+        "parse_error_message": None,
+        "parse_finished_at": _now_iso(),
+        "parse_version": source_row.get("parse_version") or DEFAULT_MATERIAL_PARSE_VERSION,
+        "structured_summary": copy.deepcopy(source_row.get("structured_summary"))
+        if isinstance(source_row.get("structured_summary"), dict)
+        else source_row.get("structured_summary"),
+        "parsed_text": str(source_row.get("parsed_text") or ""),
+        "parsed_chars": int(_to_float_or_none(source_row.get("parsed_chars")) or 0),
+        "parsed_chunks": copy.deepcopy(source_row.get("parsed_chunks"))
+        if isinstance(source_row.get("parsed_chunks"), list)
+        else [],
+        "numeric_terms_norm": copy.deepcopy(source_row.get("numeric_terms_norm"))
+        if isinstance(source_row.get("numeric_terms_norm"), list)
+        else [],
+        "lexical_terms": copy.deepcopy(source_row.get("lexical_terms"))
+        if isinstance(source_row.get("lexical_terms"), list)
+        else [],
+    }
+    for key in (
+        "tender_qa_structured_summary",
+        "boq_structured_summary",
+        "drawing_structured_summary",
+        "site_photo_structured_summary",
+    ):
+        value = source_row.get(key)
+        if isinstance(value, dict):
+            payload[key] = copy.deepcopy(value)
+    return payload
+
+
+def _find_reusable_material_parse_result(
+    material_row: Dict[str, object],
+    *,
+    materials: List[Dict[str, object]],
+    parse_mode: str,
+) -> Optional[Dict[str, object]]:
+    desired_mode = str(parse_mode or "full").strip().lower() or "full"
+    preferred_keys: List[str] = []
+    if desired_mode == "preview":
+        preferred_keys.append(_material_parse_row_cache_key(material_row, parse_mode="preview"))
+        preferred_keys.append(_material_parse_row_cache_key(material_row, parse_mode="full"))
+    else:
+        preferred_keys.append(_material_parse_row_cache_key(material_row, parse_mode="full"))
+    preferred_keys = [key for key in preferred_keys if key]
+    if not preferred_keys:
+        return None
+    source_id = str(material_row.get("id") or "").strip()
+    best_by_key: Dict[str, Dict[str, object]] = {}
+    for raw_row in materials:
+        candidate, _ = _normalize_material_row_for_parse(raw_row)
+        if str(candidate.get("id") or "").strip() == source_id:
+            continue
+        if str(candidate.get("parse_status") or "").strip().lower() != "parsed":
+            continue
+        if str(candidate.get("parse_error_class") or "").strip():
+            continue
+        candidate_key_preview = _material_parse_row_cache_key(candidate, parse_mode="preview")
+        candidate_key_full = _material_parse_row_cache_key(candidate, parse_mode="full")
+        candidate_keys = {
+            candidate_key_preview: candidate if candidate_key_preview else None,
+            candidate_key_full: candidate if candidate_key_full else None,
+        }
+        for key in preferred_keys:
+            matched = candidate_keys.get(key)
+            if not matched:
+                continue
+            current = best_by_key.get(key)
+            candidate_updated_at = _parse_iso_datetime_utc(
+                candidate.get("updated_at")
+            ) or datetime.min.replace(tzinfo=timezone.utc)
+            current_updated_at = (
+                _parse_iso_datetime_utc(current.get("updated_at"))
+                if current is not None
+                else datetime.min.replace(tzinfo=timezone.utc)
+            )
+            if current is None or candidate_updated_at >= current_updated_at:
+                best_by_key[key] = candidate
+    for key in preferred_keys:
+        matched = best_by_key.get(key)
+        if matched:
+            return _build_material_parse_payload_from_cached_row(matched)
+    return None
 
 
 def _normalize_material_parse_job(job: Dict[str, object]) -> tuple[Dict[str, object], bool]:
@@ -706,6 +2784,8 @@ def _normalize_material_parse_job(job: Dict[str, object]) -> tuple[Dict[str, obj
         "error_class": None,
         "error_message": None,
         "parse_confidence": 0.0,
+        "parse_mode": "full",
+        "followup_from_preview": False,
     }
     for key, value in defaults.items():
         if key not in normalized:
@@ -719,6 +2799,211 @@ def _material_parse_job_sort_key(job: Dict[str, object]) -> tuple[str, str, str]
         str(job.get("updated_at") or job.get("created_at") or ""),
         str(job.get("created_at") or ""),
         str(job.get("id") or ""),
+    )
+
+
+def _material_parse_job_priority_by_type(material_type: object) -> int:
+    normalized = _normalize_material_type(material_type)
+    return int(DEFAULT_MATERIAL_PARSE_PRIORITY_BY_TYPE.get(normalized, 9))
+
+
+def _material_parse_mode_rank(parse_mode: object) -> int:
+    return 0 if str(parse_mode or "").strip().lower() == "preview" else 1
+
+
+def _material_parse_preview_speed_rank(
+    job: Dict[str, object],
+    row: Dict[str, object],
+    *,
+    size_hint_override: Optional[int] = None,
+) -> tuple[int, int, int]:
+    parse_mode = str(job.get("parse_mode") or "").strip().lower()
+    if parse_mode != "preview":
+        return (9, 10**9, 9)
+    filename = row.get("filename") or job.get("filename") or ""
+    material_type = _normalize_material_type(
+        row.get("material_type") or job.get("material_type"),
+        filename=filename,
+    )
+    ext = Path(str(filename or "")).suffix.lower()
+    preview_work_units = 10**9
+    if material_type == "boq" and ext in {".xlsx", ".xls", ".xlsm", ".csv"}:
+        base_rank = 0
+        preview_work_units = int(
+            DEFAULT_MATERIAL_PARSE_PREVIEW_MAX_SHEETS_BY_TYPE.get("boq", 2)
+        ) * int(DEFAULT_MATERIAL_PARSE_PREVIEW_MAX_ROWS_BY_TYPE.get("boq", 180))
+    elif ext == ".pdf":
+        preview_max_pages = int(
+            DEFAULT_MATERIAL_PARSE_PREVIEW_MAX_PAGES_BY_TYPE.get(material_type, 4)
+        )
+        preview_ocr_pages = int(
+            DEFAULT_MATERIAL_PARSE_PREVIEW_OCR_PAGES_BY_TYPE.get(material_type, 2)
+        )
+        preview_max_chars = int(
+            DEFAULT_MATERIAL_PARSE_PREVIEW_MAX_CHARS_BY_TYPE.get(material_type, 16000)
+        )
+        if preview_ocr_pages <= 0:
+            base_rank = 0
+        elif preview_ocr_pages <= 1:
+            base_rank = 1
+        else:
+            base_rank = 2
+        preview_work_units = (
+            preview_ocr_pages * 10_000
+            + preview_max_pages * 1_000
+            + max(0, preview_max_chars) // 100
+        )
+    else:
+        base_rank = 3
+        preview_work_units = 10**8
+    size_hint = (
+        int(size_hint_override)
+        if size_hint_override is not None
+        else _material_parse_row_size_hint(row)
+    )
+    if size_hint <= 400_000:
+        size_bucket = 0
+    elif size_hint <= 1_500_000:
+        size_bucket = 1
+    else:
+        size_bucket = 2
+    return (base_rank, preview_work_units, size_bucket)
+
+
+def _material_parse_row_size_hint(row: Dict[str, object]) -> int:
+    path_text = str(row.get("path") or "").strip()
+    if not path_text:
+        return 10**12
+    try:
+        return int(Path(path_text).stat().st_size)
+    except OSError:
+        return 10**12
+
+
+def _build_material_parse_project_stage_rank(
+    material_by_id: Dict[str, Dict[str, object]],
+    jobs: Optional[List[Dict[str, object]]] = None,
+) -> Dict[str, int]:
+    project_ids: Set[str] = set()
+    if jobs:
+        for job in jobs:
+            project_id = str(job.get("project_id") or "").strip()
+            if not project_id:
+                material_id = str(job.get("material_id") or "").strip()
+                row = material_by_id.get(material_id) or {}
+                project_id = str(row.get("project_id") or "").strip()
+            if project_id:
+                project_ids.add(project_id)
+    else:
+        project_ids = {
+            str(row.get("project_id") or "").strip()
+            for row in material_by_id.values()
+            if str(row.get("project_id") or "").strip()
+        }
+    if not project_ids:
+        return {}
+    return _load_material_parse_project_stage_ranks(project_ids)
+
+
+def _material_parse_job_project_id(
+    job: Dict[str, object],
+    material_by_id: Dict[str, Dict[str, object]],
+) -> str:
+    project_id = str(job.get("project_id") or "").strip()
+    if project_id:
+        return project_id
+    material_id = str(job.get("material_id") or "").strip()
+    row = material_by_id.get(material_id) or {}
+    return str(row.get("project_id") or "").strip()
+
+
+def _material_parse_job_priority_key(
+    job: Dict[str, object],
+    material_by_id: Dict[str, Dict[str, object]],
+    project_stage_ranks: Dict[str, int],
+    *,
+    preferred_project_id: Optional[str] = None,
+    preferred_material_id: Optional[str] = None,
+    active_project_ids: Optional[Set[str]] = None,
+    active_project_type_keys: Optional[Set[tuple[str, str]]] = None,
+    priority_context: Optional[tuple[object, ...]] = None,
+) -> tuple[int, int, int, int, int, int, int, int, int, int, int, int, int, str, str, str]:
+    if priority_context is None:
+        priority_context = _build_material_parse_job_priority_context(
+            job,
+            material_by_id,
+            project_stage_ranks,
+        )
+    (
+        project_id,
+        material_id,
+        normalized_material_type,
+        project_stage_rank,
+        parse_mode_rank,
+        retry_penalty,
+        followup_continuity_rank,
+        preview_speed_rank,
+        preview_work_units,
+        preview_size_bucket,
+        type_rank,
+        size_hint,
+        sort_key_0,
+        sort_key_1,
+        sort_key_2,
+    ) = priority_context
+    material_continuity_rank = (
+        0
+        if (
+            int(parse_mode_rank) == 1
+            and bool(job.get("followup_from_preview"))
+            and str(material_id or "").strip()
+            and preferred_material_id
+            and str(material_id or "").strip() == preferred_material_id
+        )
+        else 1
+    )
+    project_continuity_rank = (
+        0
+        if str(project_id or "").strip()
+        and preferred_project_id
+        and str(project_id or "").strip() == preferred_project_id
+        else 1
+    )
+    active_project_rank = (
+        0
+        if str(project_id or "").strip()
+        and active_project_ids
+        and str(project_id or "").strip() in active_project_ids
+        else 1
+    )
+    active_project_type_rank = (
+        0
+        if (
+            str(project_id or "").strip()
+            and str(normalized_material_type or "").strip()
+            and active_project_type_keys
+            and (str(project_id or "").strip(), str(normalized_material_type or "").strip())
+            in active_project_type_keys
+        )
+        else 1
+    )
+    return (
+        project_stage_rank,
+        parse_mode_rank,
+        retry_penalty,
+        followup_continuity_rank,
+        material_continuity_rank,
+        preview_speed_rank,
+        preview_work_units,
+        preview_size_bucket,
+        project_continuity_rank,
+        active_project_rank,
+        active_project_type_rank,
+        int(type_rank),
+        int(size_hint),
+        str(sort_key_0),
+        str(sort_key_1),
+        str(sort_key_2),
     )
 
 
@@ -839,6 +3124,8 @@ def _ensure_material_parse_job(
     material_row: Dict[str, object],
     *,
     force_requeue: bool = False,
+    parse_mode: str = "full",
+    followup_from_preview: bool = False,
 ) -> tuple[List[Dict[str, object]], Optional[str], bool]:
     material_id = str(material_row.get("id") or "").strip()
     if not material_id:
@@ -846,7 +3133,9 @@ def _ensure_material_parse_job(
     _, latest_job = _find_latest_material_parse_job(jobs, material_id)
     if latest_job and not force_requeue:
         status = str(latest_job.get("status") or "")
-        if status in {"queued", "processing", "parsed"}:
+        latest_parse_mode = str(latest_job.get("parse_mode") or "full").strip().lower()
+        desired_parse_mode = str(parse_mode or "full").strip().lower() or "full"
+        if latest_parse_mode == desired_parse_mode and status in {"queued", "processing", "parsed"}:
             return jobs, str(latest_job.get("id") or ""), False
 
     job_id = str(uuid4())
@@ -870,6 +3159,8 @@ def _ensure_material_parse_job(
         "error_class": None,
         "error_message": None,
         "parse_confidence": 0.0,
+        "parse_mode": str(parse_mode or "full").strip().lower() or "full",
+        "followup_from_preview": bool(followup_from_preview),
     }
     jobs.append(job)
     return jobs, job_id, True
@@ -878,31 +3169,47 @@ def _ensure_material_parse_job(
 def _requeue_material_parse_job(
     jobs: List[Dict[str, object]],
     material_row: Dict[str, object],
+    *,
+    parse_mode: str = "full",
 ) -> tuple[List[Dict[str, object]], Optional[str], bool, bool]:
     material_id = str(material_row.get("id") or "").strip()
     if not material_id:
         return jobs, None, False, False
     latest_idx, latest_job = _find_latest_material_parse_job(jobs, material_id)
     if latest_job is None:
-        jobs, job_id, created = _ensure_material_parse_job(jobs, material_row, force_requeue=True)
+        jobs, job_id, created = _ensure_material_parse_job(
+            jobs,
+            material_row,
+            force_requeue=True,
+            parse_mode=parse_mode,
+        )
         return jobs, job_id, created, created
     status = str(latest_job.get("status") or "")
-    if status in {"queued", "processing", "failed"}:
+    latest_parse_mode = str(latest_job.get("parse_mode") or "full").strip().lower()
+    desired_parse_mode = str(parse_mode or "full").strip().lower() or "full"
+    if latest_parse_mode == desired_parse_mode and status in {"queued", "processing", "failed"}:
         changed = _mark_material_parse_job_queued(
             latest_job,
             reason="worker_recovered" if status == "processing" else None,
             reset_attempt=status == "failed",
         )
+        if latest_job.get("parse_mode") != desired_parse_mode:
+            latest_job["parse_mode"] = desired_parse_mode
+            changed = True
         if latest_idx is not None:
             jobs[latest_idx] = latest_job
         return jobs, str(latest_job.get("id") or ""), False, changed
-    jobs, job_id, created = _ensure_material_parse_job(jobs, material_row, force_requeue=True)
+    jobs, job_id, created = _ensure_material_parse_job(
+        jobs,
+        material_row,
+        force_requeue=True,
+        parse_mode=parse_mode,
+    )
     return jobs, job_id, created, created
 
 
 def _bootstrap_material_parse_state() -> Dict[str, int]:
-    materials = load_materials()
-    raw_jobs = load_material_parse_jobs()
+    materials, raw_jobs = _load_material_parse_state_snapshot()
     materials_changed = False
     jobs_changed = False
     queued_count = 0
@@ -915,6 +3222,7 @@ def _bootstrap_material_parse_state() -> Dict[str, int]:
     jobs_changed = jobs_changed or deduplicated_jobs > 0
     recovered_jobs = 0
     terminal_synced_jobs = 0
+    requeued_terminal_jobs = 0
     for idx, row in enumerate(materials):
         normalized, row_changed = _normalize_material_row_for_parse(row)
         job_id = str(normalized.get("job_id") or "")
@@ -923,14 +3231,14 @@ def _bootstrap_material_parse_state() -> Dict[str, int]:
         material_status = str(normalized.get("parse_status") or "").strip().lower()
         latest_idx, latest_job = _find_latest_material_parse_job(jobs, material_id)
         latest_status = str((latest_job or {}).get("status") or "")
+        material_ready_for_gate = _material_parse_ready_for_gate(normalized)
         if (
             latest_job
             and latest_status in {"queued", "processing"}
-            and material_status
-            in {
-                "parsed",
-                "failed",
-            }
+            and (
+                material_status == "failed"
+                or (material_status == "parsed" and material_ready_for_gate)
+            )
         ):
             if _mark_material_parse_job_terminal(latest_job, normalized):
                 if latest_idx is not None:
@@ -938,6 +3246,56 @@ def _bootstrap_material_parse_state() -> Dict[str, int]:
                 jobs_changed = True
                 terminal_synced_jobs += 1
                 job_id = str(latest_job.get("id") or "")
+        elif latest_job and latest_status == "parsed" and material_status != "parsed":
+            if _material_parse_has_terminal_payload(normalized):
+                normalized["parse_status"] = "parsed"
+                normalized["parse_backend"] = (
+                    normalized.get("parse_backend") or latest_job.get("parse_backend") or "local"
+                )
+                if not str(normalized.get("parse_phase") or "").strip():
+                    normalized["parse_phase"] = "full"
+                normalized["parse_ready_for_gate"] = (
+                    str(normalized.get("parse_phase") or "").strip().lower() != "preview"
+                )
+                normalized["parse_confidence"] = float(
+                    _to_float_or_none(
+                        normalized.get("parse_confidence") or latest_job.get("parse_confidence")
+                    )
+                    or 0.0
+                )
+                normalized["parse_finished_at"] = str(
+                    normalized.get("parse_finished_at")
+                    or latest_job.get("finished_at")
+                    or normalized.get("updated_at")
+                    or _now_iso()
+                )
+                normalized["parse_error_class"] = None
+                normalized["parse_error_message"] = None
+                normalized["job_id"] = str(latest_job.get("id") or "")
+                normalized["updated_at"] = _now_iso()
+                row_changed = True
+                terminal_synced_jobs += 1
+            else:
+                jobs, job_id, created, requeued = _requeue_material_parse_job(
+                    jobs,
+                    normalized,
+                    parse_mode=str(latest_job.get("parse_mode") or "full"),
+                )
+                if requeued:
+                    jobs_changed = True
+                    requeued_terminal_jobs += 1
+                normalized["job_id"] = job_id
+                normalized["parse_status"] = "queued"
+                normalized["parse_backend"] = "queued"
+                normalized["parse_phase"] = None
+                normalized["parse_ready_for_gate"] = False
+                normalized["parse_confidence"] = 0.0
+                normalized["parse_started_at"] = None
+                normalized["parse_finished_at"] = None
+                normalized["parse_error_class"] = "stale_terminal_job_without_material_payload"
+                normalized["parse_error_message"] = "stale_terminal_job_without_material_payload"
+                normalized["updated_at"] = _now_iso()
+                row_changed = True
         elif material_status != "parsed":
             if latest_job and latest_status == "processing":
                 if _mark_material_parse_job_queued(latest_job, reason="worker_recovered"):
@@ -970,8 +3328,11 @@ def _bootstrap_material_parse_state() -> Dict[str, int]:
             materials_changed = True
     if materials_changed:
         save_materials(materials)
+        _invalidate_material_parse_claim_snapshot()
     if jobs_changed:
         save_material_parse_jobs(jobs)
+        _invalidate_material_parse_claim_snapshot()
+        _notify_material_parse_workers()
     return {
         "materials_changed": int(materials_changed),
         "jobs_changed": int(jobs_changed),
@@ -979,52 +3340,14 @@ def _bootstrap_material_parse_state() -> Dict[str, int]:
         "deduplicated_jobs": int(deduplicated_jobs),
         "recovered_jobs": int(recovered_jobs),
         "terminal_synced_jobs": int(terminal_synced_jobs),
+        "requeued_terminal_jobs": int(requeued_terminal_jobs),
     }
 
 
 def _build_material_parse_jobs_summary(
     project_id: Optional[str] = None,
 ) -> tuple[List[Dict[str, object]], Dict[str, object]]:
-    jobs = load_material_parse_jobs()
-    filtered: List[Dict[str, object]] = []
-    status_counts: Dict[str, int] = {}
-    backlog = 0
-    failure_count = 0
-    gpt_jobs = 0
-    gpt_failed_jobs = 0
-    latest_finished_at = ""
-    latest_finished_filename = ""
-    for job in jobs:
-        normalized, _ = _normalize_material_parse_job(job)
-        if project_id and str(normalized.get("project_id") or "") != str(project_id):
-            continue
-        filtered.append(normalized)
-        status = str(normalized.get("status") or "queued")
-        status_counts[status] = status_counts.get(status, 0) + 1
-        if status in {"queued", "processing"}:
-            backlog += 1
-        if status == "failed":
-            failure_count += 1
-        if str(normalized.get("parse_backend") or "").startswith("gpt"):
-            gpt_jobs += 1
-            if status == "failed":
-                gpt_failed_jobs += 1
-        finished_at = str(normalized.get("finished_at") or "").strip()
-        if finished_at and finished_at > latest_finished_at:
-            latest_finished_at = finished_at
-            latest_finished_filename = str(normalized.get("filename") or "").strip()
-    total_jobs = len(filtered)
-    return filtered, {
-        "total_jobs": total_jobs,
-        "status_counts": status_counts,
-        "backlog": backlog,
-        "failed_jobs": failure_count,
-        "gpt_jobs": gpt_jobs,
-        "gpt_failed_jobs": gpt_failed_jobs,
-        "gpt_ratio": round(float(gpt_jobs) / float(total_jobs), 4) if total_jobs > 0 else 0.0,
-        "latest_finished_at": latest_finished_at or None,
-        "latest_finished_filename": latest_finished_filename or None,
-    }
+    return _load_material_parse_jobs_summary_cached(project_id)
 
 
 def _material_parse_status_label(
@@ -1035,6 +3358,8 @@ def _material_parse_status_label(
 ) -> str:
     status = str(parse_status or "").strip().lower()
     backend = str(parse_backend or "").strip()
+    if status == "previewed":
+        return "预解析完成"
     if status == "parsed":
         if backend.startswith("gpt"):
             return "已解析（GPT-5.4）"
@@ -1074,11 +3399,15 @@ def _material_parse_route_label(
     backend = str(
         material_row.get("parse_backend") or (active_job or {}).get("parse_backend") or ""
     ).strip()
+    parse_phase = str(material_row.get("parse_phase") or "").strip().lower()
+    parse_ready_for_gate = _material_parse_ready_for_gate(material_row)
     summary = (
         material_row.get("structured_summary")
         if isinstance(material_row.get("structured_summary"), dict)
         else {}
     )
+    if parse_phase == "preview" and not parse_ready_for_gate:
+        return "本地极速预解析，后台补全全文"
     if status in {"queued", "processing"} and _material_supports_gpt_deep_parse(material_type):
         return "本地预解析，必要时 GPT 深解析"
     if str(summary.get("gpt_skip_reason") or "").strip() == "local_summary_strong":
@@ -1103,7 +3432,13 @@ def _build_material_parse_runtime_details(
     row = dict(material_row)
     row_status = str(row.get("parse_status") or "queued").strip().lower()
     job_status = str((active_job or {}).get("status") or "").strip().lower()
+    parse_phase = str(row.get("parse_phase") or "").strip().lower()
+    parse_ready_for_gate = _material_parse_ready_for_gate(row)
+    job_parse_mode = str((active_job or {}).get("parse_mode") or "full").strip().lower()
+    preview_only = parse_phase == "preview" and not parse_ready_for_gate
     effective_status = job_status if job_status in {"queued", "processing"} else row_status
+    if preview_only:
+        effective_status = "previewed"
     parse_route_label = _material_parse_route_label(
         row,
         effective_status=effective_status,
@@ -1111,7 +3446,22 @@ def _build_material_parse_runtime_details(
     )
     error_text = str(row.get("parse_error_message") or row.get("parse_error_class") or "").strip()
     note = ""
-    if effective_status == "queued":
+    if preview_only:
+        if job_status == "processing" and job_parse_mode == "full":
+            stage_label = "预解析完成（正在补全全文）"
+            note = "极速预解析已完成；后台正在补全全文，评分门禁仍会等待全文解析完成。"
+        elif job_status == "queued" and job_parse_mode == "full":
+            if queue_position == 1:
+                stage_label = "预解析完成（全文补全即将开始）"
+            elif isinstance(queue_position, int) and queue_position > 1:
+                stage_label = f"预解析完成（全文补全排队中，第 {queue_position} 位）"
+            else:
+                stage_label = "预解析完成（待补全全文）"
+            note = "极速预解析已完成；后台会继续补全全文，评分门禁仍会等待全文解析完成。"
+        else:
+            stage_label = "预解析完成（待补全全文）"
+            note = "极速预解析已完成；后台会继续补全全文，评分门禁仍会等待全文解析完成。"
+    elif effective_status == "queued":
         if queue_position == 1:
             stage_label = "排队中（即将开始）"
         elif isinstance(queue_position, int) and queue_position > 1:
@@ -1159,6 +3509,9 @@ def _build_material_parse_runtime_details(
             parse_backend=row.get("parse_backend"),
             parse_error_message=row.get("parse_error_message"),
         )
+    boq_note = _build_boq_parse_runtime_note(row)
+    if boq_note:
+        note = (note + " " + boq_note).strip() if note else boq_note
     return {
         "parse_effective_status": effective_status,
         "parse_stage_label": stage_label,
@@ -1168,6 +3521,129 @@ def _build_material_parse_runtime_details(
         if isinstance(queue_position, int) and queue_position > 0
         else None,
     }
+
+
+def _build_boq_parse_runtime_note(material_row: Dict[str, object]) -> str:
+    if str(material_row.get("material_type") or "").strip().lower() != "boq":
+        return ""
+    summary = (
+        material_row.get("boq_structured_summary")
+        if isinstance(material_row.get("boq_structured_summary"), dict)
+        else {}
+    )
+    if not summary:
+        return ""
+    detected_format = (
+        str(
+            summary.get("detected_format")
+            or Path(str(material_row.get("filename") or "")).suffix.lower().lstrip(".")
+        )
+        .strip()
+        .lower()
+    )
+    sheet_summaries = [sheet for sheet in summary.get("sheets") or [] if isinstance(sheet, dict)]
+    parse_stage = str(summary.get("parse_stage") or "").strip().lower()
+    if parse_stage == "preview":
+        scanned_sheet_count = len(sheet_summaries)
+        scanned_row_count = sum(
+            int(_to_float_or_none(sheet.get("scanned_rows")) or 0) for sheet in sheet_summaries
+        )
+        parts = ["BOQ 已完成轻量预解析"]
+        if scanned_sheet_count > 0:
+            parts.append(f"已先扫 {scanned_sheet_count} 张 sheet")
+        preview_last_page = int(_to_float_or_none(summary.get("preview_last_page")) or 0)
+        if preview_last_page > 0:
+            parts.append(f"已先扫 {preview_last_page} 页")
+        if scanned_row_count > 0:
+            parts.append(f"约 {scanned_row_count} 行")
+        parts.append("后台会继续补全 full 解析")
+        return "；".join(parts) + "。"
+    if str(summary.get("scan_strategy") or "").strip().lower() == "preview_guided_full_pdf":
+        resume_from_page = int(_to_float_or_none(summary.get("resume_from_page")) or 0)
+        saved_page_count = int(_to_float_or_none(summary.get("saved_page_count")) or 0)
+        parts = ["已复用预解析前页，full 仅补后续页"]
+        if resume_from_page > 1:
+            parts.append(f"从第 {resume_from_page} 页继续")
+        if saved_page_count > 0:
+            parts.append(f"少扫前 {saved_page_count} 页")
+        return "；".join(parts) + "。"
+    if (
+        detected_format == "pdf"
+        and str(summary.get("scan_strategy") or "").strip().lower() != "preview_guided_full"
+    ):
+        return "当前为 PDF 清单，走文本文档解析，未进入表格型 BOQ 的 preview/full 差量补全路径。"
+    if str(summary.get("scan_strategy") or "").strip().lower() != "preview_guided_full":
+        return ""
+    resumed_sheet_count = sum(
+        1 for sheet in sheet_summaries if bool(sheet.get("resumed_from_prior_summary"))
+    )
+    saved_row_count = sum(
+        max(0, int(_to_float_or_none(sheet.get("resume_from_row")) or 0) - 1)
+        for sheet in sheet_summaries
+        if bool(sheet.get("resumed_from_prior_summary"))
+    )
+    skipped_tail_sheets = int(_to_float_or_none(summary.get("skipped_tail_sheets")) or 0)
+    parts = ["已复用预解析前段，full 仅补差量"]
+    if str(summary.get("scan_guidance_strength") or "").strip().lower() == "strong":
+        parts.append("当前命中强引导")
+    if resumed_sheet_count > 0:
+        parts.append(f"续跑 {resumed_sheet_count} 张 sheet")
+    if saved_row_count > 0:
+        parts.append(f"少扫 {saved_row_count} 行")
+    if skipped_tail_sheets > 0:
+        parts.append(f"尾部略过 {skipped_tail_sheets} 张辅助 sheet")
+    return "；".join(parts) + "。"
+
+
+def _build_boq_parse_status_summary(materials: Sequence[Dict[str, object]]) -> Dict[str, object]:
+    metrics = {
+        "boq_guided_full_materials": 0,
+        "boq_guided_full_strong_materials": 0,
+        "boq_resumed_full_materials": 0,
+        "boq_resumed_sheet_count": 0,
+        "boq_saved_row_count": 0,
+        "boq_skipped_tail_sheets": 0,
+        "boq_resume_hit_rate": 0.0,
+    }
+    for row in materials:
+        if str(row.get("material_type") or "").strip().lower() != "boq":
+            continue
+        summary = (
+            row.get("boq_structured_summary")
+            if isinstance(row.get("boq_structured_summary"), dict)
+            else {}
+        )
+        if not summary:
+            continue
+        if str(summary.get("detected_format") or "").strip().lower() == "pdf":
+            continue
+        if str(summary.get("scan_strategy") or "").strip().lower() == "preview_guided_full":
+            metrics["boq_guided_full_materials"] += 1
+            if str(summary.get("scan_guidance_strength") or "").strip().lower() == "strong":
+                metrics["boq_guided_full_strong_materials"] += 1
+        resumed_sheet_count = 0
+        saved_row_count = 0
+        for sheet in summary.get("sheets") if isinstance(summary.get("sheets"), list) else []:
+            if not isinstance(sheet, dict) or not bool(sheet.get("resumed_from_prior_summary")):
+                continue
+            resumed_sheet_count += 1
+            resume_from_row = int(_to_float_or_none(sheet.get("resume_from_row")) or 0)
+            if resume_from_row > 1:
+                saved_row_count += resume_from_row - 1
+        if resumed_sheet_count > 0:
+            metrics["boq_resumed_full_materials"] += 1
+            metrics["boq_resumed_sheet_count"] += resumed_sheet_count
+            metrics["boq_saved_row_count"] += saved_row_count
+        metrics["boq_skipped_tail_sheets"] += int(
+            _to_float_or_none(summary.get("skipped_tail_sheets")) or 0
+        )
+    guided_full_materials = int(metrics["boq_guided_full_materials"])
+    if guided_full_materials > 0:
+        metrics["boq_resume_hit_rate"] = round(
+            float(metrics["boq_resumed_full_materials"]) / float(guided_full_materials),
+            4,
+        )
+    return metrics
 
 
 def _build_project_material_index(project_id: str) -> Dict[str, object]:
@@ -1210,7 +3686,11 @@ def _build_project_material_index(project_id: str) -> Dict[str, object]:
         if filename and filename not in available_filenames:
             available_filenames.append(filename)
         counts_by_type[mat_type] = counts_by_type.get(mat_type, 0) + 1
-        parse_status = str(row.get("parse_status") or "queued")
+        parse_phase = str(row.get("parse_phase") or "").strip().lower()
+        parse_ready_for_gate = _material_parse_ready_for_gate(row)
+        stored_parse_status = str(row.get("parse_status") or "queued").strip().lower()
+        preview_only = parse_phase == "preview" and not parse_ready_for_gate
+        parse_status = "previewed" if preview_only else stored_parse_status
         parse_status_by_type.setdefault(mat_type, {})
         parse_status_by_type[mat_type][parse_status] = (
             parse_status_by_type[mat_type].get(parse_status, 0) + 1
@@ -1233,6 +3713,8 @@ def _build_project_material_index(project_id: str) -> Dict[str, object]:
             "text": "",
             "parse_error": "",
             "parse_status": parse_status,
+            "parse_phase": parse_phase or None,
+            "parse_ready_for_gate": parse_ready_for_gate,
             "parse_backend": str(row.get("parse_backend") or ""),
             "parse_confidence": float(_to_float_or_none(row.get("parse_confidence")) or 0.0),
             "job_id": str(row.get("job_id") or ""),
@@ -1260,7 +3742,7 @@ def _build_project_material_index(project_id: str) -> Dict[str, object]:
             files.append(entry)
             continue
 
-        if parse_status == "parsed":
+        if stored_parse_status == "parsed" and not preview_only:
             text_value = str(row.get("parsed_text") or row.get("text") or "")
             chars = int(_to_float_or_none(row.get("parsed_chars")) or len(text_value.strip()))
             chunks = (
@@ -1331,6 +3813,17 @@ def _build_project_material_index(project_id: str) -> Dict[str, object]:
             total_parsed_chunks += len(chunks)
             total_numeric_terms += len(numeric_terms_norm)
             total_lexical_terms += len(lexical_terms)
+        elif preview_only:
+            entry["text"] = str(row.get("parsed_text") or "")
+            entry["chars"] = int(_to_float_or_none(row.get("parsed_chars")) or 0)
+            entry["chunks"] = (
+                row.get("parsed_chunks") if isinstance(row.get("parsed_chunks"), list) else []
+            )
+            entry["structured_summary"] = (
+                row.get("structured_summary")
+                if isinstance(row.get("structured_summary"), dict)
+                else {}
+            )
         elif legacy_sync_parse:
             try:
                 content = read_bytes(p)
@@ -1437,6 +3930,9 @@ def _build_project_material_index(project_id: str) -> Dict[str, object]:
         "processing_files": sum(
             int(statuses.get("processing", 0)) for statuses in parse_status_by_type.values()
         ),
+        "previewed_files": sum(
+            int(statuses.get("previewed", 0)) for statuses in parse_status_by_type.values()
+        ),
         "parsed_ok_by_type": parsed_ok_by_type,
         "parsed_fail_by_type": parsed_fail_by_type,
         "chars_by_type": chars_by_type,
@@ -1482,33 +3978,456 @@ def _merge_numeric_values(*groups: object, limit: int = 18) -> List[str]:
     return _limit_unique_numeric_tokens(merged, limit=limit)
 
 
+def _build_drawing_gpt_focus_tokens(local_summary: Dict[str, object]) -> List[str]:
+    return _limit_unique_texts(
+        _merge_unique_text_values(
+            local_summary.get("structured_terms"),
+            local_summary.get("discipline_keywords"),
+            local_summary.get("sheet_type_tags"),
+            local_summary.get("risk_keywords"),
+            local_summary.get("constraint_terms"),
+            local_summary.get("layout_tags"),
+            local_summary.get("space_tags"),
+            local_summary.get("component_tags"),
+            local_summary.get("dimension_markers"),
+            local_summary.get("binary_marker_terms"),
+            limit=24,
+        )
+        + _merge_numeric_values(
+            local_summary.get("top_numeric_terms"),
+            local_summary.get("numeric_constraints"),
+            local_summary.get("focused_dimensions"),
+            limit=10,
+        ),
+        limit=18,
+    )
+
+
+def _should_use_text_only_gpt_for_drawing_summary(
+    local_summary: Dict[str, object],
+    *,
+    filename: str,
+    parsed_text: str,
+    parse_confidence: float,
+    drawing_focus_tokens: List[str],
+) -> bool:
+    if Path(filename).suffix.lower() != ".pdf":
+        return False
+    parsed_chars = len(str(parsed_text or "").strip())
+    structured_terms = _to_text_items(local_summary.get("structured_terms"), max_items=18)
+    sheet_type_tags = _to_text_items(local_summary.get("sheet_type_tags"), max_items=8)
+    discipline_keywords = _to_text_items(local_summary.get("discipline_keywords"), max_items=8)
+    risk_keywords = _to_text_items(local_summary.get("risk_keywords"), max_items=8)
+    numeric_terms = _merge_numeric_values(local_summary.get("top_numeric_terms"), limit=12)
+    if (
+        parse_confidence >= DEFAULT_DRAWING_GPT_TEXT_ONLY_MIN_QUALITY
+        and parsed_chars >= 1000
+        and len(structured_terms) >= 6
+        and (len(sheet_type_tags) >= 1 or len(discipline_keywords) >= 2 or len(numeric_terms) >= 4)
+    ):
+        return True
+    return bool(
+        parse_confidence >= DEFAULT_DRAWING_GPT_TEXT_ONLY_RELAXED_MIN_QUALITY
+        and parsed_chars >= DEFAULT_DRAWING_GPT_TEXT_ONLY_RELAXED_MIN_CHARS
+        and len(structured_terms) >= 5
+        and len(drawing_focus_tokens) >= 8
+        and (
+            (
+                len(sheet_type_tags) >= 1
+                and (
+                    len(discipline_keywords) >= 1
+                    or len(risk_keywords) >= 1
+                    or len(numeric_terms) >= 3
+                )
+            )
+            or (len(discipline_keywords) >= 2 and len(numeric_terms) >= 3)
+        )
+    )
+
+
+def _score_pdf_page_for_gpt(
+    page_text: str,
+    *,
+    page_no: int,
+    focus_tokens: List[str],
+    always_include_first_pages: int,
+) -> float:
+    normalized = _normalize_ocr_text_block(page_text)
+    lower = normalized.lower()
+    stripped = normalized.strip()
+    focus_hits = 0
+    for token in focus_tokens:
+        key = str(token or "").strip().lower()
+        if key and key in lower:
+            focus_hits += 1
+    generic_hits = sum(
+        1
+        for token in (
+            "评分",
+            "评审",
+            "得分",
+            "加分",
+            "扣分",
+            "目录",
+            "答疑",
+            "补遗",
+            "工期",
+            "质量",
+        )
+        if token in lower
+    )
+    numeric_hits = len(_extract_numeric_terms(normalized, max_terms=16))
+    section_hits = len(_extract_tender_qa_section_titles(normalized, limit=4))
+    score = 0.0
+    if int(always_include_first_pages) > 0 and page_no <= int(always_include_first_pages):
+        score += 2.5
+    if len(stripped) < 200:
+        score += 2.0
+    score += min(5.0, focus_hits * 1.4)
+    score += min(4.5, generic_hits * 1.2)
+    score += min(1.8, numeric_hits * 0.2)
+    score += min(2.0, section_hits * 0.5)
+    return round(score, 4)
+
+
+def _collect_pdf_page_candidates_for_gpt(
+    content: bytes,
+    *,
+    preferred_tokens: Optional[List[str]] = None,
+    always_include_first_pages: int = 2,
+) -> List[Dict[str, object]]:
+    if pymupdf is None:
+        return []
+    focus_tokens = _limit_unique_texts(preferred_tokens or [], limit=16)
+    doc = pymupdf.open(stream=content, filetype="pdf")
+    try:
+        page_candidates: List[Dict[str, object]] = []
+        for idx, page in enumerate(doc, start=1):
+            page_text = _normalize_ocr_text_block(page.get_text() or "")
+            page_candidates.append(
+                {
+                    "page_no": idx,
+                    "text": page_text[:4000],
+                    "score": _score_pdf_page_for_gpt(
+                        page_text,
+                        page_no=idx,
+                        focus_tokens=focus_tokens,
+                        always_include_first_pages=always_include_first_pages,
+                    ),
+                }
+            )
+        return page_candidates
+    finally:
+        doc.close()
+
+
+def _select_pdf_page_numbers_for_gpt(
+    page_candidates: List[Dict[str, object]],
+    *,
+    max_pages: int,
+    always_include_first_pages: int,
+) -> List[int]:
+    if not page_candidates:
+        return []
+    limit = max(1, int(max_pages))
+    forced_limit = max(0, int(always_include_first_pages))
+    forced_pages = {
+        int(item["page_no"])
+        for item in page_candidates
+        if forced_limit > 0 and int(item["page_no"]) <= forced_limit
+    }
+    ranked = sorted(
+        page_candidates,
+        key=lambda item: (
+            -float(_to_float_or_none(item.get("score")) or 0.0),
+            int(_to_float_or_none(item.get("page_no")) or 0),
+        ),
+    )
+    selected_page_nos: List[int] = sorted(forced_pages)
+    for candidate in ranked:
+        page_no = int(_to_float_or_none(candidate.get("page_no")) or 0)
+        if page_no <= 0 or page_no in forced_pages or page_no in selected_page_nos:
+            continue
+        selected_page_nos.append(page_no)
+        if len(selected_page_nos) >= limit:
+            break
+    if not selected_page_nos:
+        selected_page_nos = [int(page_candidates[0]["page_no"])]
+    return sorted(selected_page_nos[:limit])
+
+
+def _should_use_page_vision_for_drawing_summary(
+    page_candidates: List[Dict[str, object]],
+    *,
+    drawing_focus_tokens: List[str],
+) -> bool:
+    if not page_candidates:
+        return False
+    if not drawing_focus_tokens:
+        return True
+    ranked = sorted(
+        page_candidates,
+        key=lambda item: (
+            -float(_to_float_or_none(item.get("score")) or 0.0),
+            int(_to_float_or_none(item.get("page_no")) or 0),
+        ),
+    )
+    if not ranked:
+        return False
+    first_page = next(
+        (item for item in page_candidates if int(_to_float_or_none(item.get("page_no")) or 0) == 1),
+        None,
+    )
+    best_page = ranked[0]
+    best_page_no = int(_to_float_or_none(best_page.get("page_no")) or 0)
+    best_score = float(_to_float_or_none(best_page.get("score")) or 0.0)
+    first_score = float(_to_float_or_none((first_page or {}).get("score")) or 0.0)
+    if best_page_no <= 0:
+        return False
+    if best_page_no == 1:
+        return False
+    return bool(
+        best_score >= DEFAULT_DRAWING_GPT_PAGE_VISION_MIN_SCORE
+        and (best_score - first_score) >= DEFAULT_DRAWING_GPT_PAGE_VISION_MIN_SCORE_DELTA
+    )
+
+
+def _score_drawing_gpt_text_line(line: str, *, focus_tokens: List[str]) -> float:
+    normalized = _normalize_ocr_text_block(line)
+    if not normalized:
+        return 0.0
+    lower = normalized.lower()
+    focus_hits = 0
+    for token in focus_tokens:
+        key = str(token or "").strip().lower()
+        if key and key in lower:
+            focus_hits += 1
+    drawing_hits = sum(
+        1 for token in _structured_signal_material_keywords("drawing") if token and token in lower
+    )
+    numeric_hits = len(_extract_numeric_terms(normalized, max_terms=12))
+    score = 0.0
+    score += min(6.0, focus_hits * 1.25)
+    score += min(3.0, drawing_hits * 0.35)
+    score += min(1.8, numeric_hits * 0.3)
+    if 6 <= len(normalized) <= 120:
+        score += 0.6
+    elif len(normalized) <= 220:
+        score += 0.3
+    return round(score, 4)
+
+
+def _build_drawing_gpt_text_excerpt(
+    local_text: str,
+    local_summary: Dict[str, object],
+    *,
+    max_chars: int = DEFAULT_DRAWING_GPT_TEXT_EXCERPT_MAX_CHARS,
+    max_lines: int = DEFAULT_DRAWING_GPT_TEXT_EXCERPT_MAX_LINES,
+) -> str:
+    focus_tokens = _build_drawing_gpt_focus_tokens(local_summary)
+    source_lines: List[str] = []
+    seen_lines: set[str] = set()
+    raw_text = str(local_text or "").replace("；", "\n").replace(";", "\n")
+    for raw_line in raw_text.splitlines():
+        line = _normalize_ocr_text_block(raw_line)
+        if not line:
+            continue
+        key = line.lower()
+        if key in seen_lines:
+            continue
+        seen_lines.add(key)
+        source_lines.append(line)
+    if not source_lines:
+        normalized = _normalize_ocr_text_block(local_text)
+        return normalized[: max(1, int(max_chars))]
+
+    scored_lines: List[Dict[str, object]] = []
+    for idx, line in enumerate(source_lines):
+        score = _score_drawing_gpt_text_line(line, focus_tokens=focus_tokens)
+        if score < 1.0:
+            continue
+        scored_lines.append({"idx": idx, "line": line, "score": score})
+    if scored_lines:
+        ranked = sorted(
+            scored_lines,
+            key=lambda item: (
+                -float(_to_float_or_none(item.get("score")) or 0.0),
+                int(_to_float_or_none(item.get("idx")) or 0),
+            ),
+        )
+        selected = sorted(
+            ranked[: max(1, int(max_lines))],
+            key=lambda item: int(_to_float_or_none(item.get("idx")) or 0),
+        )
+        excerpt_lines = [
+            str(item.get("line") or "") for item in selected if str(item.get("line") or "")
+        ]
+    else:
+        excerpt_lines = source_lines[: max(1, int(max_lines))]
+
+    prefix_lines: List[str] = []
+    discipline_keywords = _to_text_items(local_summary.get("discipline_keywords"), max_items=4)
+    sheet_type_tags = _to_text_items(local_summary.get("sheet_type_tags"), max_items=4)
+    risk_keywords = _to_text_items(local_summary.get("risk_keywords"), max_items=4)
+    numeric_terms = _merge_numeric_values(
+        local_summary.get("top_numeric_terms"),
+        local_summary.get("numeric_constraints"),
+        limit=6,
+    )
+    if discipline_keywords:
+        prefix_lines.append("识别专业：" + "、".join(discipline_keywords))
+    if sheet_type_tags:
+        prefix_lines.append("图纸类型：" + "、".join(sheet_type_tags))
+    if risk_keywords:
+        prefix_lines.append("风险关注：" + "、".join(risk_keywords))
+    if numeric_terms:
+        prefix_lines.append("关键参数：" + "、".join(numeric_terms))
+
+    excerpt = "\n".join(prefix_lines + excerpt_lines).strip()
+    if not excerpt:
+        excerpt = "\n".join(source_lines[: max(1, int(max_lines))]).strip()
+    return excerpt[: max(1, int(max_chars))]
+
+
+def _score_tender_gpt_text_line(line: str, *, focus_tokens: List[str]) -> float:
+    normalized = _normalize_ocr_text_block(line)
+    if not normalized:
+        return 0.0
+    lower = normalized.lower()
+    focus_hits = 0
+    for token in focus_tokens:
+        key = str(token or "").strip().lower()
+        if key and key in lower:
+            focus_hits += 1
+    tender_hits = sum(
+        1 for token in _structured_signal_material_keywords("tender_qa") if token and token in lower
+    )
+    numeric_hits = len(_extract_numeric_terms(normalized, max_terms=12))
+    clause_hits = sum(
+        1 for token in ("必须", "不得", "严禁", "应", "需", "须", "否决") if token in normalized
+    )
+    score = 0.0
+    score += min(6.0, focus_hits * 1.2)
+    score += min(3.2, tender_hits * 0.3)
+    score += min(2.0, numeric_hits * 0.25)
+    score += min(1.6, clause_hits * 0.45)
+    if re.search(r"(?:第[一二三四五六七八九十百零两0-9]+章|[0-9]+[.．][0-9]+)", normalized):
+        score += 0.8
+    if 6 <= len(normalized) <= 120:
+        score += 0.6
+    elif len(normalized) <= 220:
+        score += 0.3
+    return round(score, 4)
+
+
+def _build_tender_gpt_text_excerpt(
+    local_text: str,
+    local_summary: Dict[str, object],
+    *,
+    max_chars: int = DEFAULT_TENDER_GPT_TEXT_EXCERPT_MAX_CHARS,
+    max_lines: int = DEFAULT_TENDER_GPT_TEXT_EXCERPT_MAX_LINES,
+) -> str:
+    section_titles = _to_text_items(local_summary.get("section_titles"), max_items=10)
+    scoring_terms = _to_text_items(local_summary.get("scoring_point_terms"), max_items=10)
+    mandatory_terms = _to_text_items(local_summary.get("mandatory_clause_terms"), max_items=8)
+    numeric_terms = _merge_numeric_values(local_summary.get("top_numeric_terms"), limit=8)
+    focus_tokens = _limit_unique_texts(
+        section_titles + scoring_terms + mandatory_terms + numeric_terms,
+        limit=18,
+    )
+    source_lines: List[str] = []
+    seen_lines: set[str] = set()
+    raw_text = str(local_text or "").replace("；", "\n").replace(";", "\n")
+    for raw_line in raw_text.splitlines():
+        line = _normalize_ocr_text_block(raw_line)
+        if not line:
+            continue
+        key = line.lower()
+        if key in seen_lines:
+            continue
+        seen_lines.add(key)
+        source_lines.append(line)
+    if not source_lines:
+        normalized = _normalize_ocr_text_block(local_text)
+        return normalized[: max(1, int(max_chars))]
+
+    scored_lines: List[Dict[str, object]] = []
+    for idx, line in enumerate(source_lines):
+        score = _score_tender_gpt_text_line(line, focus_tokens=focus_tokens)
+        if score < 1.0:
+            continue
+        scored_lines.append({"idx": idx, "line": line, "score": score})
+    if scored_lines:
+        ranked = sorted(
+            scored_lines,
+            key=lambda item: (
+                -float(_to_float_or_none(item.get("score")) or 0.0),
+                int(_to_float_or_none(item.get("idx")) or 0),
+            ),
+        )
+        selected = sorted(
+            ranked[: max(1, int(max_lines))],
+            key=lambda item: int(_to_float_or_none(item.get("idx")) or 0),
+        )
+        excerpt_lines = [
+            str(item.get("line") or "") for item in selected if str(item.get("line") or "")
+        ]
+    else:
+        excerpt_lines = source_lines[: max(1, int(max_lines))]
+
+    prefix_lines: List[str] = []
+    if section_titles:
+        prefix_lines.append("章节线索：" + "、".join(section_titles[:4]))
+    if scoring_terms:
+        prefix_lines.append("评分线索：" + "、".join(scoring_terms[:6]))
+    if mandatory_terms:
+        prefix_lines.append("强制条款：" + "、".join(mandatory_terms[:4]))
+    if numeric_terms:
+        prefix_lines.append("关键参数：" + "、".join(numeric_terms[:6]))
+
+    excerpt = "\n".join(prefix_lines + excerpt_lines).strip()
+    if not excerpt:
+        excerpt = "\n".join(source_lines[: max(1, int(max_lines))]).strip()
+    return excerpt[: max(1, int(max_chars))]
+
+
 def _render_pdf_page_pngs_for_gpt(
     content: bytes,
     *,
     max_pages: int = 8,
+    preferred_tokens: Optional[List[str]] = None,
+    always_include_first_pages: int = 2,
+    page_candidates: Optional[List[Dict[str, object]]] = None,
 ) -> List[Dict[str, object]]:
     if pymupdf is None:
         return []
+
     pages: List[Dict[str, object]] = []
+    page_candidates = list(page_candidates or [])
+    if not page_candidates:
+        page_candidates = _collect_pdf_page_candidates_for_gpt(
+            content,
+            preferred_tokens=preferred_tokens,
+            always_include_first_pages=always_include_first_pages,
+        )
+    if not page_candidates:
+        return []
     doc = pymupdf.open(stream=content, filetype="pdf")
     try:
-        for idx, page in enumerate(doc, start=1):
-            if len(pages) >= max_pages:
-                break
-            page_text = _normalize_ocr_text_block(page.get_text() or "")
-            should_pick = idx <= 4 or len(page_text.strip()) < 200
-            if not should_pick and any(
-                token in page_text.lower()
-                for token in ("评分", "评审", "得分", "加分", "扣分", "目录", "答疑", "补遗")
-            ):
-                should_pick = True
-            if not should_pick:
-                continue
+        selected_page_nos = _select_pdf_page_numbers_for_gpt(
+            page_candidates,
+            max_pages=max_pages,
+            always_include_first_pages=always_include_first_pages,
+        )
+
+        for page_no in selected_page_nos:
             try:
+                page = doc[page_no - 1]
+                page_text = _normalize_ocr_text_block(page.get_text() or "")
                 pix = page.get_pixmap(matrix=pymupdf.Matrix(1.8, 1.8), alpha=False)
                 pages.append(
                     {
-                        "page_no": idx,
+                        "page_no": page_no,
                         "text": page_text[:4000],
                         "image_bytes": pix.tobytes("png"),
                         "image_mime": "image/png",
@@ -1922,12 +4841,42 @@ def _augment_tender_summary_with_gpt(
     if _should_fastpath_tender_local_summary(local_summary, parsed_text=parsed_text):
         merged["gpt_skip_reason"] = "local_summary_strong"
         return merged, gpt_backend, round(parse_confidence, 4), gpt_error
+    parsed_chars = len(str(parsed_text or "").strip())
+    section_titles = _to_text_items(local_summary.get("section_titles"), max_items=12)
+    scoring_terms = _to_text_items(local_summary.get("scoring_point_terms"), max_items=12)
+    mandatory_terms = _to_text_items(local_summary.get("mandatory_clause_terms"), max_items=10)
+    tender_focus_tokens = _limit_unique_texts(
+        section_titles + scoring_terms + mandatory_terms,
+        limit=16,
+    )
+    text_only_gpt_ok = bool(
+        filename.lower().endswith(".pdf")
+        and parse_confidence >= DEFAULT_TENDER_GPT_TEXT_ONLY_MIN_QUALITY
+        and parsed_chars >= 1800
+        and len(section_titles) >= 3
+        and (len(scoring_terms) >= 2 or len(mandatory_terms) >= 2 or len(tender_focus_tokens) >= 6)
+    )
+    if parse_confidence >= 0.64 and parsed_chars >= 1800 and len(tender_focus_tokens) >= 5:
+        tender_pdf_page_budget = 3
+    elif parse_confidence >= 0.54 and parsed_chars >= 1200 and len(tender_focus_tokens) >= 3:
+        tender_pdf_page_budget = 4
+    elif parse_confidence >= 0.42:
+        tender_pdf_page_budget = 6
+    else:
+        tender_pdf_page_budget = 8
     page_structures: List[Dict[str, object]] = []
     pages = (
-        _render_pdf_page_pngs_for_gpt(content, max_pages=8)
-        if filename.lower().endswith(".pdf")
+        _render_pdf_page_pngs_for_gpt(
+            content,
+            max_pages=tender_pdf_page_budget,
+            preferred_tokens=tender_focus_tokens,
+            always_include_first_pages=1,
+        )
+        if filename.lower().endswith(".pdf") and not text_only_gpt_ok
         else []
     )
+    if text_only_gpt_ok:
+        merged["gpt_page_vision_skip_reason"] = "local_summary_text_only"
     if pages:
         for page in pages:
             ok, payload, err = _call_gpt_material_parser(
@@ -2012,7 +4961,10 @@ def _augment_tender_summary_with_gpt(
             )
             return merged, gpt_backend, parse_confidence, gpt_error
 
-    ok, payload, err = _call_gpt_material_parser(_build_gpt_tender_prompt(filename, parsed_text))
+    tender_prompt_text = _build_tender_gpt_text_excerpt(parsed_text, merged)
+    ok, payload, err = _call_gpt_material_parser(
+        _build_gpt_tender_prompt(filename, tender_prompt_text)
+    )
     if ok:
         gpt_backend = "hybrid"
         merged["section_titles"] = _merge_unique_text_values(
@@ -2077,14 +5029,44 @@ def _augment_drawing_summary_with_gpt(
     image_bytes: Optional[bytes] = None
     image_mime = "image/png"
     ext = Path(filename).suffix.lower()
+    drawing_focus_tokens = _build_drawing_gpt_focus_tokens(local_summary)
+    text_only_gpt_ok = _should_use_text_only_gpt_for_drawing_summary(
+        local_summary,
+        filename=filename,
+        parsed_text=parsed_text,
+        parse_confidence=parse_confidence,
+        drawing_focus_tokens=drawing_focus_tokens,
+    )
     if ext == ".pdf":
-        previews = _render_pdf_page_pngs_for_gpt(content, max_pages=1)
-        if previews:
-            image_bytes = (
-                previews[0].get("image_bytes")
-                if isinstance(previews[0].get("image_bytes"), (bytes, bytearray))
-                else None
-            )
+        if text_only_gpt_ok:
+            merged["gpt_page_vision_skip_reason"] = "local_summary_text_only"
+        else:
+            page_candidates: Optional[List[Dict[str, object]]] = None
+            if drawing_focus_tokens:
+                page_candidates = _collect_pdf_page_candidates_for_gpt(
+                    content,
+                    preferred_tokens=drawing_focus_tokens,
+                    always_include_first_pages=0,
+                )
+            if drawing_focus_tokens and not _should_use_page_vision_for_drawing_summary(
+                page_candidates or [],
+                drawing_focus_tokens=drawing_focus_tokens,
+            ):
+                merged["gpt_page_vision_skip_reason"] = "focus_page_not_distinct_enough"
+            else:
+                previews = _render_pdf_page_pngs_for_gpt(
+                    content,
+                    max_pages=1,
+                    preferred_tokens=drawing_focus_tokens,
+                    always_include_first_pages=0 if drawing_focus_tokens else 1,
+                    page_candidates=page_candidates,
+                )
+                if previews:
+                    image_bytes = (
+                        previews[0].get("image_bytes")
+                        if isinstance(previews[0].get("image_bytes"), (bytes, bytearray))
+                        else None
+                    )
     elif ext in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
         image_bytes = content
         image_mime = f"image/{'jpeg' if ext in {'.jpg', '.jpeg'} else ext.lstrip('.')}"
@@ -2103,16 +5085,20 @@ def _augment_drawing_summary_with_gpt(
                 )
                 if image_bytes:
                     image_mime = "image/png"
+    drawing_prompt_text = _build_drawing_gpt_text_excerpt(
+        parsed_text
+        + (
+            "\nDWG二进制标识提取："
+            + "、".join(str(x) for x in (merged.get("dwg_binary_markers") or [])[:12])
+            if ext == ".dwg"
+            else ""
+        ),
+        merged,
+    )
     ok, payload, err = _call_gpt_material_parser(
         _build_gpt_drawing_prompt(
             filename,
-            parsed_text
-            + (
-                "\nDWG二进制标识提取："
-                + "、".join(str(x) for x in (merged.get("dwg_binary_markers") or [])[:12])
-                if ext == ".dwg"
-                else ""
-            ),
+            drawing_prompt_text,
         ),
         image_bytes=image_bytes,
         image_mime=image_mime,
@@ -2313,14 +5299,43 @@ def _should_fastpath_site_photo_local_summary(
     )
 
 
-def _parse_material_record_payload(row: Dict[str, object]) -> Dict[str, object]:
+def _parse_material_record_payload(
+    row: Dict[str, object],
+    *,
+    parse_mode: str = "full",
+) -> Dict[str, object]:
     path = Path(str(row.get("path") or "").strip())
     if not path.exists():
         raise FileNotFoundError("path_not_exists")
     content = read_bytes(path)
+    content_hash = str(row.get("content_hash") or "").strip() or _compute_material_content_hash(
+        content
+    )
     filename = path.name
     material_type = _normalize_material_type(row.get("material_type"), filename=filename)
-    parsed_text = _read_uploaded_file_content(content, filename)
+    normalized_parse_mode = str(parse_mode or "full").strip().lower() or "full"
+    preview_only = normalized_parse_mode == "preview"
+    prior_boq_summary = None
+    if material_type == "boq" and not preview_only:
+        preview_candidate = row.get("boq_structured_summary")
+        if isinstance(preview_candidate, dict) and (
+            str(preview_candidate.get("parse_stage") or "").strip().lower() == "preview"
+        ):
+            prior_boq_summary = preview_candidate
+    if material_type == "boq" and not preview_only and prior_boq_summary is not None:
+        parsed_text = _build_boq_full_parse_text(
+            content,
+            filename,
+            prior_text=str(row.get("parsed_text") or ""),
+            prior_summary=prior_boq_summary,
+        )
+    else:
+        parsed_text = _read_uploaded_file_content_for_parse_mode(
+            content,
+            filename,
+            material_type=material_type,
+            parse_mode=normalized_parse_mode,
+        )
     text_value = str(parsed_text or "")
     chunks = _split_material_text_chunks(text_value, max_chars=900)
     numeric_terms_norm = sorted(
@@ -2344,41 +5359,69 @@ def _parse_material_record_payload(row: Dict[str, object]) -> Dict[str, object]:
         local_summary = _build_tender_qa_structured_summary(
             content, filename, parsed_text=text_value
         )
-        structured_summary, backend, parse_confidence, gpt_error = _augment_tender_summary_with_gpt(
-            content,
-            filename,
-            text_value,
-            local_summary,
-        )
+        if preview_only:
+            structured_summary = local_summary
+            backend = "local_preview"
+            parse_confidence = float(
+                _clip_score01(structured_summary.get("structured_quality_score") or 0.0)
+            )
+            structured_summary["parse_stage"] = "preview"
+        else:
+            (
+                structured_summary,
+                backend,
+                parse_confidence,
+                gpt_error,
+            ) = _augment_tender_summary_with_gpt(
+                content,
+                filename,
+                text_value,
+                local_summary,
+            )
+            if gpt_error and backend == "local":
+                parse_error_class = "gpt_parse_failed"
+                parse_error_message = gpt_error
         type_specific["tender_qa_structured_summary"] = structured_summary
-        if gpt_error and backend == "local":
-            parse_error_class = "gpt_parse_failed"
-            parse_error_message = gpt_error
     elif material_type == "boq":
         structured_summary = _build_boq_structured_summary(
-            content, filename, parsed_text=text_value
+            content,
+            filename,
+            parsed_text=text_value,
+            preview_only=preview_only,
+            prior_summary=prior_boq_summary,
         )
+        if preview_only:
+            backend = "local_preview"
+            structured_summary["parse_stage"] = "preview"
         parse_confidence = float(
             _clip_score01(structured_summary.get("structured_quality_score") or 0.0)
         )
         type_specific["boq_structured_summary"] = structured_summary
     elif material_type == "drawing":
         local_summary = _build_drawing_structured_summary(content, filename, parsed_text=text_value)
-        (
-            structured_summary,
-            backend,
-            parse_confidence,
-            gpt_error,
-        ) = _augment_drawing_summary_with_gpt(
-            content,
-            filename,
-            text_value,
-            local_summary,
-        )
+        if preview_only:
+            structured_summary = local_summary
+            backend = "local_preview"
+            parse_confidence = float(
+                _clip_score01(structured_summary.get("structured_quality_score") or 0.0)
+            )
+            structured_summary["parse_stage"] = "preview"
+        else:
+            (
+                structured_summary,
+                backend,
+                parse_confidence,
+                gpt_error,
+            ) = _augment_drawing_summary_with_gpt(
+                content,
+                filename,
+                text_value,
+                local_summary,
+            )
+            if gpt_error and backend == "local":
+                parse_error_class = "gpt_parse_failed"
+                parse_error_message = gpt_error
         type_specific["drawing_structured_summary"] = structured_summary
-        if gpt_error and backend == "local":
-            parse_error_class = "gpt_parse_failed"
-            parse_error_message = gpt_error
     elif material_type == "site_photo":
         local_summary = _build_site_photo_structured_summary(
             content, filename, parsed_text=text_value
@@ -2412,6 +5455,9 @@ def _parse_material_record_payload(row: Dict[str, object]) -> Dict[str, object]:
     return {
         "parse_status": "parsed",
         "parse_backend": backend,
+        "content_hash": content_hash,
+        "parse_phase": "preview" if preview_only else "full",
+        "parse_ready_for_gate": not preview_only,
         "parse_confidence": round(parse_confidence, 4),
         "parse_error_class": parse_error_class,
         "parse_error_message": parse_error_message,
@@ -2427,72 +5473,312 @@ def _parse_material_record_payload(row: Dict[str, object]) -> Dict[str, object]:
     }
 
 
-def _claim_next_material_parse_job() -> Optional[Dict[str, object]]:
+def _claim_next_material_parse_job(
+    *,
+    preferred_parse_mode: Optional[str] = None,
+    allow_fallback: bool = True,
+    max_preview_speed_rank: Optional[int] = None,
+    preferred_project_id: Optional[str] = None,
+    preferred_material_id: Optional[str] = None,
+    prefer_active_projects: bool = False,
+) -> Optional[Dict[str, object]]:
     with _MATERIAL_PARSE_STATE_LOCK:
-        jobs = load_material_parse_jobs()
-        materials = load_materials()
+        (
+            materials_view,
+            jobs_view,
+            material_by_id,
+            material_index_by_id,
+            size_hint_by_material_id,
+            retry_due_at_by_job_id,
+            sort_key_by_job_id,
+            preview_priority_by_job_id,
+            candidate_indices,
+            candidate_indices_by_mode,
+            preview_candidate_indices_by_speed,
+            preview_candidate_indices_up_to_speed,
+            materials_changed,
+            jobs_changed,
+        ) = _load_material_parse_claim_context_view()
         now = datetime.now(timezone.utc)
-        material_by_id = {str(row.get("id") or ""): dict(row) for row in materials}
-        jobs_changed = False
-        materials_changed = False
+        active_project_ids: Optional[Set[str]] = None
+        active_project_type_keys: Optional[Set[tuple[str, str]]] = None
         claimed: Optional[Dict[str, object]] = None
-        for idx, job in enumerate(jobs):
-            job, normalized = _normalize_material_parse_job(job)
-            jobs[idx] = job
-            jobs_changed = jobs_changed or normalized
-            status = str(job.get("status") or "queued")
-            due_at = _parse_iso_datetime_utc(job.get("next_retry_at"))
-            if status == "processing":
-                continue
-            if status == "failed":
-                if (
-                    int(_to_float_or_none(job.get("attempt")) or 0)
-                    >= DEFAULT_MATERIAL_PARSE_MAX_ATTEMPTS
-                ):
-                    continue
-                if due_at and due_at > now:
-                    continue
-            if status not in {"queued", "failed"}:
-                continue
+        materials: Optional[List[Dict[str, object]]] = None
+        jobs: Optional[List[Dict[str, object]]] = None
+        normalized_preferred_parse_mode = str(preferred_parse_mode or "").strip().lower() or None
+        scan_candidate_indices = (
+            list(candidate_indices_by_mode.get(normalized_preferred_parse_mode, []))
+            if normalized_preferred_parse_mode
+            else list(candidate_indices)
+        )
+        dynamic_eligible_candidate_index_set: Optional[Set[int]] = None
+
+        def _dynamic_eligible_candidate_indices() -> Set[int]:
+            nonlocal dynamic_eligible_candidate_index_set
+            if dynamic_eligible_candidate_index_set is None:
+                dynamic_eligible_candidate_index_set = set()
+                for idx in candidate_indices:
+                    job = jobs_view[idx]
+                    status = str(job.get("status") or "queued")
+                    if status == "processing":
+                        continue
+                    if status == "failed":
+                        if (
+                            int(_to_float_or_none(job.get("attempt")) or 0)
+                            >= DEFAULT_MATERIAL_PARSE_MAX_ATTEMPTS
+                        ):
+                            continue
+                        job_id = str(job.get("id") or "").strip()
+                        due_at = retry_due_at_by_job_id.get(job_id)
+                        if not job_id or job_id not in retry_due_at_by_job_id:
+                            due_at = _parse_iso_datetime_utc(job.get("next_retry_at"))
+                        if due_at and due_at > now:
+                            continue
+                    elif status != "queued":
+                        continue
+                    material_id = str(job.get("material_id") or "")
+                    material = material_by_id.get(material_id)
+                    if not material:
+                        continue
+                    dynamic_eligible_candidate_index_set.add(idx)
+            return dynamic_eligible_candidate_index_set
+
+        def _filter_dynamic_claim_candidates(source_indices: List[int]) -> List[int]:
+            eligible_candidate_index_set = _dynamic_eligible_candidate_indices()
+            return [idx for idx in source_indices if idx in eligible_candidate_index_set]
+
+        def _mutable_jobs() -> List[Dict[str, object]]:
+            nonlocal jobs
+            if jobs is None:
+                jobs = list(jobs_view)
+            return jobs
+
+        def _mutable_materials() -> List[Dict[str, object]]:
+            nonlocal materials
+            if materials is None:
+                materials = list(materials_view)
+            return materials
+
+        def _return_unclaimed() -> None:
+            state_persisted = False
+            try:
+                if jobs_changed:
+                    save_material_parse_jobs(jobs_view)
+                    state_persisted = True
+                if materials_changed:
+                    save_materials(materials_view)
+                    state_persisted = True
+                    _invalidate_material_index_cache(None)
+            finally:
+                if state_persisted:
+                    _invalidate_material_parse_claim_snapshot()
+
+        speed_limited_scan_candidate_indices: List[int] = []
+        speed_limited_candidate_indices: List[int] = []
+        if normalized_preferred_parse_mode == "preview" and max_preview_speed_rank is not None:
+            requested_preview_speed_rank = int(max_preview_speed_rank)
+            speed_limited_scan_candidate_indices = list(
+                preview_candidate_indices_up_to_speed.get(requested_preview_speed_rank, [])
+            )
+            if (
+                not speed_limited_scan_candidate_indices
+                and preview_candidate_indices_up_to_speed
+                and requested_preview_speed_rank >= 0
+            ):
+                fallback_preview_speed_rank = max(
+                    (
+                        speed_rank
+                        for speed_rank in preview_candidate_indices_up_to_speed
+                        if speed_rank <= requested_preview_speed_rank
+                    ),
+                    default=None,
+                )
+                if fallback_preview_speed_rank is not None:
+                    speed_limited_scan_candidate_indices = list(
+                        preview_candidate_indices_up_to_speed[fallback_preview_speed_rank]
+                    )
+            if speed_limited_scan_candidate_indices:
+                speed_limited_candidate_indices = _filter_dynamic_claim_candidates(
+                    speed_limited_scan_candidate_indices
+                )
+                eligible_candidate_indices = list(speed_limited_candidate_indices)
+            elif not allow_fallback:
+                _return_unclaimed()
+                return None
+            else:
+                eligible_candidate_indices = _filter_dynamic_claim_candidates(
+                    scan_candidate_indices
+                )
+        else:
+            eligible_candidate_indices = _filter_dynamic_claim_candidates(scan_candidate_indices)
+        if normalized_preferred_parse_mode and not eligible_candidate_indices:
+            if allow_fallback:
+                eligible_candidate_indices = _filter_dynamic_claim_candidates(
+                    list(candidate_indices)
+                )
+            else:
+                _return_unclaimed()
+                return None
+        if normalized_preferred_parse_mode == "preview" and max_preview_speed_rank is not None:
+            if speed_limited_candidate_indices:
+                eligible_candidate_indices = speed_limited_candidate_indices
+            elif speed_limited_scan_candidate_indices and not allow_fallback:
+                _return_unclaimed()
+                return None
+        if not eligible_candidate_indices:
+            _return_unclaimed()
+            return None
+        selected_candidate_indices = (
+            [eligible_candidate_indices[0]] if len(eligible_candidate_indices) == 1 else []
+        )
+        if not selected_candidate_indices:
+            scoped_candidate_jobs = [jobs_view[item_idx] for item_idx in eligible_candidate_indices]
+            if prefer_active_projects:
+                (
+                    active_project_ids,
+                    active_project_type_keys,
+                    _active_project_quota_exhausted,
+                    _active_project_type_quota_exhausted,
+                ) = _collect_material_parse_active_window_state()
+            scoped_candidate_project_ids: Set[str] = set()
+            for scoped_job in scoped_candidate_jobs:
+                project_id = _material_parse_job_project_id(scoped_job, material_by_id)
+                if project_id:
+                    scoped_candidate_project_ids.add(project_id)
+            project_stage_ranks = (
+                {}
+                if len(scoped_candidate_project_ids) <= 1
+                else _build_material_parse_project_stage_rank(
+                    material_by_id,
+                    scoped_candidate_jobs,
+                )
+            )
+            priority_contexts = _load_material_parse_job_priority_contexts_view(
+                scoped_candidate_jobs,
+                material_by_id,
+                project_stage_ranks,
+                preview_priority_by_job_id,
+                size_hint_by_material_id,
+                sort_key_by_job_id,
+            )
+            best_candidate_index: Optional[int] = None
+            best_priority_key: Optional[tuple[object, ...]] = None
+            for item_idx in eligible_candidate_indices:
+                item_job = jobs_view[item_idx]
+                priority_key = _material_parse_job_priority_key(
+                    item_job,
+                    material_by_id,
+                    project_stage_ranks,
+                    preferred_project_id=preferred_project_id,
+                    preferred_material_id=preferred_material_id,
+                    active_project_ids=active_project_ids,
+                    active_project_type_keys=active_project_type_keys,
+                    priority_context=priority_contexts.get(str(item_job.get("id") or "").strip()),
+                )
+                if best_priority_key is None or priority_key < best_priority_key:
+                    best_candidate_index = item_idx
+                    best_priority_key = priority_key
+            selected_candidate_indices = (
+                [best_candidate_index] if best_candidate_index is not None else []
+            )
+        for idx in selected_candidate_indices:
+            job = dict(jobs_view[idx])
             material_id = str(job.get("material_id") or "")
             material = material_by_id.get(material_id)
             if not material:
                 continue
+            parse_mode = str(job.get("parse_mode") or "full").strip().lower() or "full"
+            preview_ready = str(
+                material.get("parse_phase") or ""
+            ).strip().lower() == "preview" and not _material_parse_ready_for_gate(material)
             started_at = _now_iso()
             job["status"] = "processing"
             job["started_at"] = started_at
             job["updated_at"] = started_at
-            jobs[idx] = job
-            material, _ = _normalize_material_row_for_parse(material)
-            material["parse_status"] = "processing"
-            material["parse_backend"] = "gpt-5.4" if get_openai_api_key() else "local"
+            _mutable_jobs()[idx] = job
+            material = dict(material)
+            if not (parse_mode == "full" and preview_ready):
+                material["parse_status"] = "processing"
+            material["parse_backend"] = (
+                "local_preview"
+                if parse_mode == "preview"
+                else ("gpt-5.4" if get_openai_api_key() else "local")
+            )
             material["parse_started_at"] = started_at
             material["parse_error_class"] = None
             material["parse_error_message"] = None
             material["updated_at"] = started_at
-            for m_idx, raw_row in enumerate(materials):
-                if str(raw_row.get("id") or "") == material_id:
-                    materials[m_idx] = material
-                    materials_changed = True
-                    break
+            material["job_id"] = str(job.get("id") or "")
+            material_idx = material_index_by_id.get(material_id)
+            if material_idx is not None:
+                _mutable_materials()[material_idx] = material
+                materials_changed = True
+            else:
+                for fallback_material_idx, raw_row in enumerate(materials_view):
+                    if str(raw_row.get("id") or "") == material_id:
+                        _mutable_materials()[fallback_material_idx] = material
+                        materials_changed = True
+                        break
             claimed = dict(job)
+            job_project_id = str(job.get("project_id") or material.get("project_id") or "").strip()
+            material_type = str(material.get("material_type") or "").strip()
+            if material_type:
+                normalized_material_type = material_type
+            else:
+                normalized_material_type = _normalize_material_type(
+                    job.get("material_type"),
+                    filename=material.get("filename") or job.get("filename"),
+                )
+            if preferred_project_id and job_project_id and job_project_id == preferred_project_id:
+                _increment_material_parse_scheduler_stat("project_continuity_bonus_hits")
+            if bool(job.get("followup_from_preview")):
+                _increment_material_parse_scheduler_stat("followup_full_bonus_hits")
+                if preferred_material_id and material_id and material_id == preferred_material_id:
+                    _increment_material_parse_scheduler_stat("same_material_followup_bonus_hits")
+            if active_project_ids and job_project_id and job_project_id in active_project_ids:
+                _increment_material_parse_scheduler_stat("active_project_bonus_hits")
+            if (
+                active_project_type_keys
+                and job_project_id
+                and normalized_material_type
+                and (job_project_id, normalized_material_type) in active_project_type_keys
+            ):
+                _increment_material_parse_scheduler_stat("active_project_type_bonus_hits")
+            if prefer_active_projects:
+                _touch_material_parse_active_window(
+                    job_project_id,
+                    material_type or job.get("material_type"),
+                    normalized_material_type=normalized_material_type,
+                )
             break
-        if jobs_changed or claimed is not None:
-            save_material_parse_jobs(jobs)
-        if materials_changed:
-            save_materials(materials)
-            _invalidate_material_index_cache(claimed.get("project_id") if claimed else None)
+        state_persisted = False
+        try:
+            if jobs_changed or claimed is not None:
+                save_material_parse_jobs(jobs if jobs is not None else jobs_view)
+                state_persisted = True
+            if materials_changed:
+                save_materials(materials if materials is not None else materials_view)
+                state_persisted = True
+                _invalidate_material_index_cache(claimed.get("project_id") if claimed else None)
+        finally:
+            if state_persisted:
+                _invalidate_material_parse_claim_snapshot()
         return claimed
 
 
 def _complete_material_parse_job(
-    job_id: str, updates: Dict[str, object], *, failed: bool = False
+    job_id: str,
+    updates: Dict[str, object],
+    *,
+    failed: bool = False,
+    followup_parse_mode: Optional[str] = None,
 ) -> None:
     with _MATERIAL_PARSE_STATE_LOCK:
-        jobs = load_material_parse_jobs()
-        materials = load_materials()
+        materials, jobs = _load_material_parse_state_snapshot()
         target_job: Optional[Dict[str, object]] = None
         target_material_id = ""
+        project_id = str(updates.get("project_id") or "")
+        parse_ready_for_gate = False
         for idx, job in enumerate(jobs):
             if str(job.get("id") or "") != job_id:
                 continue
@@ -2533,13 +5819,26 @@ def _complete_material_parse_job(
             normalized.update(updates)
             normalized["parse_status"] = "failed" if failed else "parsed"
             normalized["updated_at"] = _now_iso()
+            project_id = str(normalized.get("project_id") or project_id)
+            parse_ready_for_gate = _material_parse_ready_for_gate(normalized)
+            if not failed and followup_parse_mode:
+                jobs, followup_job_id, _ = _ensure_material_parse_job(
+                    jobs,
+                    normalized,
+                    force_requeue=True,
+                    parse_mode=followup_parse_mode,
+                    followup_from_preview=followup_parse_mode == "full",
+                )
+                normalized["job_id"] = followup_job_id
             materials[idx] = normalized
-            _invalidate_material_index_cache(str(normalized.get("project_id") or ""))
+            _invalidate_material_index_cache(project_id)
             break
         save_material_parse_jobs(jobs)
         save_materials(materials)
-    project_id = str(updates.get("project_id") or "")
-    if project_id and not failed:
+        _invalidate_material_parse_claim_snapshot()
+        if followup_parse_mode:
+            _notify_material_parse_workers()
+    if project_id and not failed and parse_ready_for_gate:
         _schedule_project_material_rebuild(project_id)
 
 
@@ -2558,9 +5857,26 @@ def _process_material_parse_job(job: Dict[str, object]) -> None:
         )
         return
     try:
-        payload = _parse_material_record_payload(row)
+        parse_mode = str(job.get("parse_mode") or "full").strip().lower() or "full"
+        payload = _find_reusable_material_parse_result(
+            row,
+            materials=materials,
+            parse_mode=parse_mode,
+        )
+        if payload is None:
+            payload = _parse_material_record_payload(row, parse_mode=parse_mode)
         payload["project_id"] = str(row.get("project_id") or "")
-        _complete_material_parse_job(str(job.get("id") or ""), payload, failed=False)
+        followup_parse_mode = (
+            "full"
+            if parse_mode == "preview" and not bool(payload.get("parse_ready_for_gate"))
+            else None
+        )
+        _complete_material_parse_job(
+            str(job.get("id") or ""),
+            payload,
+            failed=False,
+            followup_parse_mode=followup_parse_mode,
+        )
     except Exception as exc:
         _complete_material_parse_job(
             str(job.get("id") or ""),
@@ -2577,16 +5893,32 @@ def _process_material_parse_job(job: Dict[str, object]) -> None:
         )
 
 
-def _material_parse_worker_loop() -> None:
+def _material_parse_worker_loop(
+    *,
+    preferred_parse_mode: Optional[str] = None,
+    allow_fallback: bool = True,
+    max_preview_speed_rank: Optional[int] = None,
+) -> None:
+    preferred_project_id: Optional[str] = None
+    preferred_material_id: Optional[str] = None
     while not _MATERIAL_PARSE_STOP_EVENT.is_set():
-        job = _claim_next_material_parse_job()
+        job = _claim_next_material_parse_job(
+            preferred_parse_mode=preferred_parse_mode,
+            allow_fallback=allow_fallback,
+            max_preview_speed_rank=max_preview_speed_rank,
+            preferred_project_id=preferred_project_id,
+            preferred_material_id=preferred_material_id,
+            prefer_active_projects=True,
+        )
         if not job:
-            if _drain_due_project_material_rebuilds(limit=1) > 0:
+            if _drain_due_project_material_rebuilds(limit=1, skip_if_parse_backlog=True) > 0:
                 continue
-            _MATERIAL_PARSE_STOP_EVENT.wait(DEFAULT_MATERIAL_PARSE_JOB_POLL_SECONDS)
+            _wait_for_material_parse_work(DEFAULT_MATERIAL_PARSE_JOB_POLL_SECONDS)
             continue
         _process_material_parse_job(job)
-        _drain_due_project_material_rebuilds(limit=1)
+        preferred_project_id = str(job.get("project_id") or "").strip() or None
+        preferred_material_id = str(job.get("material_id") or "").strip() or None
+        _drain_due_project_material_rebuilds(limit=1, skip_if_parse_backlog=True)
 
 
 def _start_material_parse_worker() -> None:
@@ -2596,11 +5928,51 @@ def _start_material_parse_worker() -> None:
         if active_workers:
             return
         _MATERIAL_PARSE_STOP_EVENT.clear()
+        _MATERIAL_PARSE_WAKE_EVENT.clear()
         _bootstrap_material_parse_state()
-        for index in range(DEFAULT_MATERIAL_PARSE_WORKER_COUNT):
+        reserved_preview_express_workers = min(
+            max(0, int(DEFAULT_MATERIAL_PARSE_PREVIEW_EXPRESS_RESERVED_WORKER_COUNT)),
+            _material_parse_total_worker_count(),
+        )
+        reserved_preview_workers = min(
+            max(0, int(DEFAULT_MATERIAL_PARSE_PREVIEW_RESERVED_WORKER_COUNT)),
+            max(0, _material_parse_total_worker_count() - reserved_preview_express_workers),
+        )
+        total_worker_count = _material_parse_total_worker_count()
+        for index in range(total_worker_count):
+            is_preview_express_reserved = index < reserved_preview_express_workers
+            is_preview_reserved = (
+                not is_preview_express_reserved
+                and index < reserved_preview_express_workers + reserved_preview_workers
+            )
             worker = threading.Thread(
                 target=_material_parse_worker_loop,
-                name=f"material-parse-worker-{index + 1}",
+                kwargs={
+                    "preferred_parse_mode": (
+                        "preview" if is_preview_express_reserved or is_preview_reserved else None
+                    ),
+                    "allow_fallback": (
+                        True
+                        if is_preview_express_reserved
+                        else (False if is_preview_reserved else True)
+                    ),
+                    "max_preview_speed_rank": (
+                        int(DEFAULT_MATERIAL_PARSE_PREVIEW_EXPRESS_MAX_SPEED_RANK)
+                        if is_preview_express_reserved
+                        else None
+                    ),
+                },
+                name=(
+                    f"material-parse-preview-express-worker-{index + 1}"
+                    if is_preview_express_reserved
+                    else (
+                        f"material-parse-preview-worker-{index + 1 - reserved_preview_express_workers}"
+                        if is_preview_reserved
+                        else (
+                            f"material-parse-worker-{index + 1 - reserved_preview_express_workers - reserved_preview_workers}"
+                        )
+                    )
+                ),
                 daemon=True,
             )
             worker.start()
@@ -2975,6 +6347,9 @@ _GENERIC_PROJECT_NAME_EXACT = {
     "合肥市房屋建筑和市政基础设施工程总承包",
     "合肥市房屋建筑和市政基础设施工程施工",
 }
+_PROJECT_NAME_CONTEXTUAL_CORRECTIONS = {
+    "塘册中心": "塘岗中心",
+}
 
 
 def _strip_inferred_project_name_noise(name: object) -> str:
@@ -3016,6 +6391,72 @@ def _clean_project_name_candidate(name: object) -> str:
         text,
     )
     return text[:120].rstrip()
+
+
+def _apply_contextual_project_name_corrections(
+    candidate: object,
+    *,
+    filename: str = "",
+    context_text: object = "",
+) -> str:
+    text = _clean_project_name_candidate(candidate)
+    if not text:
+        return ""
+    context_value = unicodedata.normalize("NFKC", str(context_text or "")).replace("\u3000", " ")
+    filename_candidate = _candidate_project_name_from_filename(filename)
+    for wrong, correct in _PROJECT_NAME_CONTEXTUAL_CORRECTIONS.items():
+        if wrong not in text:
+            continue
+        if correct in context_value or (filename_candidate and correct in filename_candidate):
+            text = text.replace(wrong, correct)
+    return _clean_project_name_candidate(text)
+
+
+def _project_name_semantic_base(name: object) -> str:
+    text = _normalize_project_name_key(name)
+    if not text:
+        return ""
+    text = re.sub(
+        r"(?:EPC工程总承包|EPC总承包|工程总承包|施工总承包|总承包|工程招标公告|招标公告|工程招标|招标文件|招标)$",
+        "",
+        text,
+    )
+    text = re.sub(r"(?:工程|项目|标段)$", "", text)
+    return _clean_project_name_candidate(text)
+
+
+def _project_name_specificity_score(name: object) -> int:
+    text = _clean_project_name_candidate(name)
+    if not text:
+        return 0
+    score = len(text)
+    if "招标" in text:
+        score += 20
+    if "总承包" in text:
+        score += 15
+    if "工程" in text:
+        score += 8
+    if text.endswith(("工程招标", "工程总承包", "施工总承包")):
+        score += 12
+    return score
+
+
+def _prefer_more_specific_project_name(
+    primary_candidate: object,
+    *,
+    title_candidate: object = "",
+) -> str:
+    primary = _clean_project_name_candidate(primary_candidate)
+    title = _clean_project_name_candidate(title_candidate)
+    if not primary:
+        return title
+    if not title:
+        return primary
+    if _project_name_semantic_base(primary) != _project_name_semantic_base(title):
+        return primary
+    if _project_name_specificity_score(title) > _project_name_specificity_score(primary):
+        return title
+    return primary
 
 
 def _is_valid_project_name_candidate(name: str, *, require_project_token: bool = True) -> bool:
@@ -3117,7 +6558,7 @@ def _infer_project_name_from_title_lines(text: str) -> str:
         if not any(hint in raw_line for hint in title_hints):
             continue
         candidate = _strip_inferred_project_name_noise(raw_line)
-        candidate = _clean_project_name_candidate(candidate)
+        candidate = _apply_contextual_project_name_corrections(candidate, context_text=text)
         if _is_valid_project_name_candidate(candidate):
             return candidate
     return ""
@@ -3128,46 +6569,71 @@ def _infer_project_name_from_tender_text(text: str, filename: str) -> str:
     scan_text = normalized_text[:40000]
     generic_candidate_seen = False
     scan_lines = [line.strip() for line in scan_text.splitlines()]
+    title_line_candidate = _infer_project_name_from_title_lines(scan_text)
     for line_index, raw_line in enumerate(scan_lines[:500]):
         match = _PROJECT_NAME_FIELD_LINE_RE.match(raw_line)
         if not match:
             continue
         candidate = _collect_multiline_project_name_field(scan_lines, line_index, match.group(1))
         candidate = _strip_inferred_project_name_noise(candidate)
-        candidate = _clean_project_name_candidate(candidate)
+        candidate = _apply_contextual_project_name_corrections(
+            candidate,
+            filename=filename,
+            context_text=scan_text,
+        )
         if _looks_like_generic_project_name_candidate(candidate):
             generic_candidate_seen = True
             continue
         if _is_valid_project_name_candidate(candidate, require_project_token=False):
-            return candidate
+            return _prefer_more_specific_project_name(
+                candidate,
+                title_candidate=title_line_candidate,
+            )
     for pattern in _PROJECT_NAME_FIELD_PATTERNS:
         for match in pattern.finditer(scan_text):
             candidate = _strip_inferred_project_name_noise(match.group(1))
-            candidate = _clean_project_name_candidate(candidate)
+            candidate = _apply_contextual_project_name_corrections(
+                candidate,
+                filename=filename,
+                context_text=scan_text,
+            )
             if _looks_like_generic_project_name_candidate(candidate):
                 generic_candidate_seen = True
                 continue
             if _is_valid_project_name_candidate(candidate, require_project_token=False):
-                return candidate
+                return _prefer_more_specific_project_name(
+                    candidate,
+                    title_candidate=title_line_candidate,
+                )
     for raw_line in scan_lines[:500]:
         if not any(marker in raw_line for marker in ("项目名称", "工程名称", "标段名称")):
             continue
         candidate = _strip_inferred_project_name_noise(
             raw_line.split("：", 1)[-1].split(":", 1)[-1]
         )
-        candidate = _clean_project_name_candidate(candidate)
+        candidate = _apply_contextual_project_name_corrections(
+            candidate,
+            filename=filename,
+            context_text=scan_text,
+        )
         if _looks_like_generic_project_name_candidate(candidate):
             generic_candidate_seen = True
             continue
         if _is_valid_project_name_candidate(candidate, require_project_token=False):
-            return candidate
-    title_line_candidate = _infer_project_name_from_title_lines(scan_text)
+            return _prefer_more_specific_project_name(
+                candidate,
+                title_candidate=title_line_candidate,
+            )
     if title_line_candidate:
         return title_line_candidate
-    fallback_candidate = _candidate_project_name_from_filename(filename)
+    fallback_candidate = _apply_contextual_project_name_corrections(
+        _candidate_project_name_from_filename(filename),
+        filename=filename,
+        context_text=scan_text,
+    )
     if _looks_like_generic_project_name_candidate(fallback_candidate):
         generic_candidate_seen = True
-    fallback = _infer_project_name_from_filename(filename)
+    fallback = fallback_candidate if _is_valid_project_name_candidate(fallback_candidate) else ""
     if fallback:
         return fallback
     if generic_candidate_seen:
@@ -3284,6 +6750,33 @@ def _ensure_project_expert_profile(
     _mark_project_expert_profile_read_only(project, source="auto_default")
     project["updated_at"] = _now_iso()
     return created, True
+
+
+def _sync_default_project_profile_name(
+    project: Dict[str, object],
+    all_profiles: List[Dict[str, object]],
+    *,
+    old_project_name: object,
+) -> bool:
+    profile_id = str(project.get("expert_profile_id") or "").strip()
+    if not profile_id:
+        return False
+    old_name = _normalize_project_name_key(old_project_name)
+    new_name = _normalize_project_name_key(project.get("name"))
+    if not old_name or not new_name or old_name == new_name:
+        return False
+    expected_old_profile_name = f"{old_name} 默认配置"
+    expected_new_profile_name = f"{new_name} 默认配置"
+    for profile in all_profiles:
+        if str(profile.get("id") or "").strip() != profile_id:
+            continue
+        current_name = str(profile.get("name") or "").strip()
+        if current_name != expected_old_profile_name:
+            return False
+        profile["name"] = expected_new_profile_name
+        profile["updated_at"] = _now_iso()
+        return True
+    return False
 
 
 def _resolve_versioned_json_artifact_path(artifact: str) -> Path:
@@ -3577,11 +7070,31 @@ PROJECT_PICKER_HIDDEN_PREFIXES = (
     "ops_smoke_",
     "e2e_",
 )
+TOTAL_CLOSURE_EMPTY_PROJECT_CANDIDATE_MAX_AGE_HOURS = 24.0
 
 
 def _project_is_hidden_from_picker(project: Dict[str, object]) -> bool:
     name = str(project.get("name") or project.get("id") or "").strip().lower()
     return any(name.startswith(prefix) for prefix in PROJECT_PICKER_HIDDEN_PREFIXES)
+
+
+def _project_is_recent_empty_closure_candidate(
+    project: Dict[str, object],
+    *,
+    now_utc: Optional[datetime] = None,
+) -> bool:
+    if _project_is_hidden_from_picker(project):
+        return False
+    timestamp = _parse_iso_datetime(project.get("updated_at") or project.get("created_at"))
+    if timestamp is None:
+        return False
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    current_time = now_utc or datetime.now(timezone.utc)
+    age_seconds = (current_time - timestamp.astimezone(timezone.utc)).total_seconds()
+    if age_seconds < 0:
+        return True
+    return age_seconds <= TOTAL_CLOSURE_EMPTY_PROJECT_CANDIDATE_MAX_AGE_HOURS * 3600.0
 
 
 def _project_picker_month_key(project: Dict[str, object]) -> str:
@@ -4384,6 +7897,48 @@ def _logic_skeleton_to_runtime_hints(raw_lines: object, *, limit: int = 8) -> Li
     return merged[: max(1, int(limit))]
 
 
+def _feedback_guidance_matches_dimension(text: object, dim_id: str) -> bool:
+    content = str(text or "").strip()
+    normalized_dim = str(dim_id or "").zfill(2)
+    if not content or normalized_dim not in DIMENSION_IDS:
+        return False
+    lowered = content.lower()
+    dimension_name = str((DIMENSIONS.get(normalized_dim) or {}).get("name") or "").strip().lower()
+    if dimension_name and dimension_name in lowered:
+        return True
+    for token in DIMENSION_RAG_KEYWORDS.get(normalized_dim) or []:
+        keyword = str(token or "").strip().lower()
+        if keyword and keyword in lowered:
+            return True
+    return False
+
+
+def _collect_feedback_guidance_lines(
+    project_id: str,
+    dim_id: str,
+    *,
+    limit: int = 4,
+) -> List[str]:
+    evo = load_evolution_reports().get(project_id) or {}
+    compilation = (
+        evo.get("compilation_instructions")
+        if isinstance(evo.get("compilation_instructions"), dict)
+        else {}
+    )
+    candidate_lines: List[str] = []
+    for raw_line in (
+        list(evo.get("high_score_logic") or [])
+        + list(evo.get("writing_guidance") or [])
+        + list(compilation.get("high_score_summary") or [])
+        + list(compilation.get("guidance_items") or [])
+    ):
+        line = str(raw_line or "").strip()
+        if not line or not _feedback_guidance_matches_dimension(line, dim_id):
+            continue
+        candidate_lines.append(line)
+    return _to_text_items(candidate_lines, max_items=limit)
+
+
 def _build_runtime_feature_requirements(
     project_id: str,
     *,
@@ -4816,6 +8371,8 @@ def _build_runtime_feedback_requirements(
             _extract_terms(rationale_text, max_terms=8),
             limit=6,
         )
+        guidance_lines = _collect_feedback_guidance_lines(project_id, dim_id, limit=4)
+        guidance_hints = _logic_skeleton_to_runtime_hints(guidance_lines, limit=6)
         material_hints = [
             str(x)
             for x in (material_dim_row.get("suggested_keywords") or [])[:4]
@@ -4829,16 +8386,19 @@ def _build_runtime_feedback_requirements(
         ]
         hints = _to_text_items(
             rationale_hints
+            + guidance_hints
             + material_hints
             + feedback_hints
             + list((DIMENSION_RAG_KEYWORDS.get(dim_id) or [])[:4]),
-            max_items=10,
+            max_items=12,
         )
         if len(hints) < 2:
             continue
         minimum_hint_hits = 2 if (sample_count >= 3 or effective_multiplier >= 1.12) else 1
         if feedback_positive_count >= 2 or avg_delta_100 >= 4.0:
             minimum_hint_hits = max(minimum_hint_hits, 3)
+        if guidance_hints:
+            minimum_hint_hits = max(minimum_hint_hits, 2)
         req_index += 1
         reqs.append(
             {
@@ -4858,6 +8418,8 @@ def _build_runtime_feedback_requirements(
                     "sample_count": sample_count,
                     "material_coverage_score": round(coverage_score, 4),
                     "rationale": rationale_text,
+                    "guidance_lines": guidance_lines,
+                    "guidance_hints": guidance_hints[:6],
                     "recent_feedback_count": feedback_sample_count,
                     "recent_feedback_positive_count": feedback_positive_count,
                     "recent_feedback_negative_count": feedback_negative_count,
@@ -4881,6 +8443,7 @@ def _build_runtime_feedback_requirements(
                         + min(0.22, (effective_multiplier - 1.0) * 0.9)
                         + (0.06 if sample_count >= 3 else 0.0)
                         + (0.04 if coverage_score < 0.35 else 0.0)
+                        + min(0.08, len(guidance_hints) * 0.02)
                         + min(
                             0.12,
                             max(0.0, avg_strength) * 0.18 + feedback_positive_count * 0.02,
@@ -4894,7 +8457,7 @@ def _build_runtime_feedback_requirements(
                 ),
                 "source_anchor_id": None,
                 "source_pack_id": "runtime_feedback_evolution",
-                "source_pack_version": "v2-feedback-boost",
+                "source_pack_version": "v3-feedback-guidance",
                 "priority": 87.5,
                 "override_key": f"runtime::feedback_evolution::{dim_id}",
                 "lint": {},
@@ -6703,6 +10266,69 @@ def _build_project_scoring_diagnostic(
     }
 
 
+def _build_project_trial_preflight(
+    project_id: str,
+    project: Dict[str, object],
+) -> Dict[str, object]:
+    project_name = str(project.get("name") or project_id).strip() or project_id
+    return build_trial_preflight_report(
+        base_url="/api/v1",
+        project_id=project_id,
+        project_name=project_name,
+        self_check=_run_system_self_check(project_id),
+        scoring_readiness=_build_scoring_readiness(project_id, project),
+        mece_audit=_build_project_mece_audit(project_id, project),
+        evolution_health=_build_evolution_health_report(project_id, project),
+        scoring_diagnostic=_build_project_scoring_diagnostic(project_id, project),
+        evaluation_summary=get_evaluation_summary().model_dump(),
+        data_hygiene=_build_data_hygiene_report(apply=False),
+    )
+
+
+def _build_system_improvement_overview() -> Dict[str, object]:
+    return build_system_improvement_overview_report(
+        base_url="/api/v1",
+        self_check=_run_system_self_check(None),
+        data_hygiene=_build_data_hygiene_report(apply=False),
+        evaluation_summary=get_evaluation_summary().model_dump(),
+        ops_agents_status=_load_ops_agents_status_snapshot(),
+        ops_agents_history=_load_ops_agents_history_snapshot(),
+    )
+
+
+def _load_ops_agents_status_snapshot() -> Dict[str, object]:
+    status_path = Path(__file__).resolve().parents[1] / "build" / "ops_agents_status.json"
+    payload: Dict[str, object] = {
+        "snapshot_path": str(status_path),
+        "snapshot_exists": status_path.exists(),
+    }
+    if not status_path.exists():
+        return payload
+    try:
+        raw = json.loads(status_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        payload["load_error"] = f"{type(exc).__name__}: {exc}"
+        return payload
+    if isinstance(raw, dict):
+        payload.update(raw)
+    else:
+        payload["load_error"] = "snapshot_not_object"
+    return payload
+
+
+def _load_ops_agents_history_snapshot() -> List[Dict[str, object]]:
+    history_path = Path(__file__).resolve().parents[1] / "build" / "ops_agents_history.json"
+    if not history_path.exists():
+        return []
+    try:
+        raw = json.loads(history_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [dict(item) for item in raw if isinstance(item, dict)]
+
+
 def _render_evidence_trace_markdown(payload: Dict[str, object]) -> str:
     summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
     by_dimension = (
@@ -7632,6 +11258,1020 @@ def _get_rubric_dim_cfg(rubric_dimensions: Dict[str, object], dim_id: str) -> Di
     return {}
 
 
+def _adaptive_scoring_point_source_meta(source_pack_id: str) -> tuple[str, str]:
+    normalized = str(source_pack_id or "").strip()
+    mapping = {
+        "runtime_material_dimension": ("material_dimension", "上传资料维度锚点"),
+        "runtime_material_consensus": ("material_consensus", "跨资料一致性锚点"),
+        "runtime_site_photo_visual": ("site_photo_visual", "现场照片实况锚点"),
+        "runtime_feedback_evolution": ("feedback_evolution", "真实评标反馈锚点"),
+        "runtime_feature_confidence": ("feature_confidence", "高置信学习骨架"),
+        "runtime_custom": ("compilation_instruction", "编制系统指令锚点"),
+    }
+    return mapping.get(normalized, ("other", normalized or "other"))
+
+
+def _build_project_adaptive_scoring_points(
+    project_id: str,
+    *,
+    project: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    current_project = (
+        dict(project)
+        if isinstance(project, dict)
+        else next((p for p in load_projects() if str(p.get("id") or "") == project_id), None)
+    )
+    if not isinstance(current_project, dict):
+        return {"summary": {"total_points": 0}, "adaptive_scoring_points": []}
+
+    _, profile_snapshot, _ = _resolve_project_scoring_context(project_id)
+    weights_norm = (
+        dict(profile_snapshot.get("weights_norm") or {})
+        if isinstance(profile_snapshot, dict)
+        else None
+    )
+    runtime_requirements, _ = _build_runtime_custom_requirements(
+        project_id,
+        project=current_project,
+        submission_text="",
+        weights_norm=weights_norm,
+    )
+
+    points: List[Dict[str, object]] = []
+    source_counts: Dict[str, int] = {}
+    material_source_types: List[str] = []
+    seen_titles: set[tuple[str, str, str]] = set()
+    for req in runtime_requirements:
+        if not isinstance(req, dict):
+            continue
+        source_pack_id = str(req.get("source_pack_id") or "").strip()
+        source_key, source_label = _adaptive_scoring_point_source_meta(source_pack_id)
+        if source_key == "other":
+            continue
+        dim_id = str(req.get("dimension_id") or "").zfill(2)
+        patterns = req.get("patterns") if isinstance(req.get("patterns"), dict) else {}
+        title = str(req.get("req_label") or "").strip()
+        uniq_key = (source_key, dim_id, title)
+        if not title or uniq_key in seen_titles:
+            continue
+        seen_titles.add(uniq_key)
+        hint_preview = _to_text_items(
+            (patterns.get("hints") or []) or (patterns.get("must_hit_terms") or []),
+            max_items=6,
+        )
+        numeric_preview = _to_text_items(
+            patterns.get("must_hit_numbers") or patterns.get("top_numeric_terms") or [],
+            max_items=4,
+        )
+        source_types = _to_text_items(patterns.get("source_types") or [], max_items=4)
+        for item in source_types:
+            if item not in material_source_types:
+                material_source_types.append(item)
+        row = {
+            "source_key": source_key,
+            "source_label": source_label,
+            "dimension_id": dim_id,
+            "dimension_name": str((DIMENSIONS.get(dim_id) or {}).get("name") or dim_id),
+            "title": title,
+            "req_type": str(req.get("req_type") or ""),
+            "mandatory": bool(req.get("mandatory")),
+            "weight": round(float(_to_float_or_none(req.get("weight")) or 0.0), 2),
+            "priority": round(float(_to_float_or_none(req.get("priority")) or 0.0), 2),
+            "hint_preview": hint_preview,
+            "numeric_preview": numeric_preview,
+            "source_types": source_types,
+            "minimum_hint_hits": int(_to_float_or_none(patterns.get("minimum_hint_hits")) or 0),
+            "coverage_score": _to_float_or_none(
+                patterns.get("source_coverage_score") or patterns.get("material_coverage_score")
+            ),
+            "sample_count": int(_to_float_or_none(patterns.get("sample_count")) or 0),
+            "guidance_preview": _to_text_items(patterns.get("guidance_lines") or [], max_items=2),
+        }
+        points.append(row)
+        source_counts[source_key] = int(source_counts.get(source_key, 0)) + 1
+
+    points.sort(
+        key=lambda item: (
+            -float(_to_float_or_none(item.get("priority")) or 0.0),
+            -float(_to_float_or_none(item.get("weight")) or 0.0),
+            str(item.get("dimension_id") or ""),
+            str(item.get("title") or ""),
+        )
+    )
+    return {
+        "summary": {
+            "total_points": len(points),
+            "material_points": int(
+                source_counts.get("material_dimension", 0)
+                + source_counts.get("material_consensus", 0)
+                + source_counts.get("site_photo_visual", 0)
+            ),
+            "feedback_points": int(source_counts.get("feedback_evolution", 0)),
+            "feature_points": int(source_counts.get("feature_confidence", 0)),
+            "compilation_points": int(source_counts.get("compilation_instruction", 0)),
+            "material_source_types": material_source_types[:8],
+        },
+        "adaptive_scoring_points": points[:24],
+    }
+
+
+def _normalize_known_dimension_id(raw_dim_id: object) -> Optional[str]:
+    value = str(raw_dim_id or "").strip().upper()
+    if value.startswith("D") and len(value) == 3 and value[1:].isdigit():
+        value = value[1:]
+    if value.isdigit() and len(value) == 1:
+        value = f"0{value}"
+    if value in DIMENSION_IDS:
+        return value
+    return None
+
+
+def _collect_pending_feedback_suggestion_hints(
+    report: Dict[str, object],
+    *,
+    dimension_id: str,
+    limit: int = 4,
+) -> List[str]:
+    suggestions = report.get("suggestions")
+    if not isinstance(suggestions, list):
+        return []
+    scoped: List[Dict[str, object]] = []
+    fallback: List[Dict[str, object]] = []
+    for item in suggestions:
+        if not isinstance(item, dict):
+            continue
+        expected_gain = float(_to_float_or_none(item.get("expected_gain")) or 0.0)
+        normalized_dim = _normalize_known_dimension_id(item.get("dimension_id"))
+        if normalized_dim == dimension_id:
+            scoped.append({"payload": item, "expected_gain": expected_gain})
+        elif not normalized_dim:
+            fallback.append({"payload": item, "expected_gain": expected_gain})
+    ranked = sorted(scoped or fallback, key=lambda item: -float(item.get("expected_gain") or 0.0))
+    out: List[str] = []
+    seen: set[str] = set()
+    for wrapped in ranked:
+        payload = wrapped.get("payload") if isinstance(wrapped, dict) else None
+        if not isinstance(payload, dict):
+            continue
+        for raw in (
+            [payload.get("title")]
+            + list(payload.get("action_steps") or [])
+            + list(payload.get("evidence_to_add") or [])
+            + list(payload.get("references") or [])
+        ):
+            clean = str(raw or "").strip()
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            out.append(clean)
+            if len(out) >= max(1, int(limit)):
+                return out
+    return out
+
+
+def _collect_pending_feedback_suggestion_payload(
+    report: Dict[str, object],
+    *,
+    dimension_id: str,
+) -> Dict[str, object]:
+    suggestions = report.get("suggestions")
+    if not isinstance(suggestions, list):
+        return {}
+    scoped: List[tuple[float, Dict[str, object]]] = []
+    fallback: List[tuple[float, Dict[str, object]]] = []
+    for item in suggestions:
+        if not isinstance(item, dict):
+            continue
+        normalized_dim = _normalize_known_dimension_id(item.get("dimension_id"))
+        expected_gain = float(_to_float_or_none(item.get("expected_gain")) or 0.0)
+        if normalized_dim == dimension_id:
+            scoped.append((expected_gain, item))
+        elif not normalized_dim:
+            fallback.append((expected_gain, item))
+    ranked = sorted(scoped or fallback, key=lambda item: -item[0])
+    return dict(ranked[0][1]) if ranked else {}
+
+
+def _resolve_pending_feedback_recommended_section(
+    *,
+    chapter_requirements: Dict[str, object],
+    dimension_id: str,
+    dimension_name: str,
+) -> str:
+    chapter_overrides = {
+        "02": "第02章 安全生产管理体系与控制措施",
+        "03": "第03章 文明施工管理体系与实施措施",
+        "04": "第04章 材料部品采购及管理机制",
+        "05": "第05章 四新技术的应用与实施方案",
+        "07": "第07章 重难点及危险性较大工程管控",
+        "08": "第08章 工程质量管理体系与保证措施",
+        "09": "第09章 工期目标保障与进度控制措施",
+        "10": "第10章 重点专项工程控制",
+        "14": "第14章 设计协调与深化实施能力",
+        "15": "第15章 总体资源配置与实施计划",
+        "16": "第16章 技术措施的可行性与落地性",
+    }
+    sections = _to_text_items(chapter_requirements.get("required_sections") or [], max_items=20)
+    direct_markers = [f"维度{dimension_id}", f"对应维度{dimension_id}", dimension_name]
+    for section in sections:
+        if any(marker in section for marker in direct_markers):
+            return section
+    module_name = str((DIMENSIONS.get(dimension_id) or {}).get("module") or "").strip()
+    for section in sections:
+        if module_name and module_name in section:
+            return section
+    if dimension_id in chapter_overrides:
+        return chapter_overrides[dimension_id]
+    return f"建议新增小节：{dimension_name}"
+
+
+def _resolve_pending_feedback_recommended_subsection(
+    *,
+    dimension_id: str,
+    dimension_name: str,
+) -> str:
+    subsection_overrides = {
+        "02": "02-2 安全重点风险控制表",
+        "03": "03-2 文明施工重点风险控制表",
+        "04": "04-1 材料供应与验收风险控制表",
+        "05": "05-1 四新技术应用清单",
+        "07": "07-1 危大工程闭环控制表",
+        "08": "08-1 质量重点风险与ITP控制表",
+        "09": "09-1 进度偏差阈值与纠偏表",
+        "10": "10-1 专项工程控制目录表",
+        "14": "14-1 设计问题闭环表",
+        "15": "15-1 资源风险与调配控制表",
+        "16": "16-1 技术措施可行性验证表",
+    }
+    return subsection_overrides.get(dimension_id) or f"{dimension_name}补强段"
+
+
+def _normalize_submission_heading(line: object) -> str:
+    text = str(line or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"[.．·…]{2,}\s*\d+\s*$", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _extract_submission_chapter_headings(text: object, *, max_items: int = 20) -> List[str]:
+    body = str(text or "")
+    if not body:
+        return []
+    pattern = re.compile(r"^第[一二三四五六七八九十0-9]+章[、,，:：]?.{0,80}$")
+    headings: List[str] = []
+    seen: set[str] = set()
+    for raw_line in body.splitlines():
+        normalized = _normalize_submission_heading(raw_line)
+        if not normalized or normalized in seen:
+            continue
+        if not pattern.match(normalized):
+            continue
+        seen.add(normalized)
+        headings.append(normalized)
+        if len(headings) >= max(1, int(max_items)):
+            break
+    return headings
+
+
+def _extract_submission_anchor_excerpt(
+    text: object,
+    *,
+    anchor_heading: str,
+    max_lines: int = 4,
+    max_chars: int = 220,
+) -> str:
+    body = str(text or "")
+    if not body or not str(anchor_heading or "").strip():
+        return ""
+    lines = [str(line or "").strip() for line in body.splitlines() if str(line or "").strip()]
+    for idx, raw_line in enumerate(lines):
+        if _normalize_submission_heading(raw_line) != anchor_heading:
+            continue
+        excerpt = " ".join(lines[idx : idx + max(1, int(max_lines))]).strip()
+        excerpt = re.sub(r"\s+", " ", excerpt)
+        if len(excerpt) <= max_chars:
+            return excerpt
+        return excerpt[: max(1, int(max_chars))].rstrip() + "..."
+    return ""
+
+
+def _extract_submission_keyword_excerpt(
+    text: object,
+    *,
+    keywords: List[str],
+    radius: int = 140,
+) -> Dict[str, str]:
+    body = str(text or "")
+    for keyword in keywords:
+        clean = str(keyword or "").strip()
+        if not clean:
+            continue
+        idx = body.find(clean)
+        if idx < 0:
+            continue
+        excerpt = body[max(0, idx - radius) : idx + radius].replace("\n", " ").strip()
+        excerpt = re.sub(r"\s+", " ", excerpt)
+        return {
+            "keyword": clean,
+            "excerpt": excerpt[: max(1, int(radius * 2))].rstrip()
+            + ("..." if len(excerpt) > radius * 2 else ""),
+        }
+    return {}
+
+
+def _build_pending_feedback_insertion_context(
+    *,
+    dimension_id: str,
+    dimension_name: str,
+    submission_text: object,
+    recommended_section: str,
+    recommended_subsection: str,
+) -> Dict[str, str]:
+    headings = _extract_submission_chapter_headings(submission_text, max_items=20)
+    heading_set = set(headings)
+    preferred_heading_map = {
+        "02": ["第六章、确保安全文明生产的管理体系与措施"],
+        "03": ["第六章、确保安全文明生产的管理体系与措施"],
+        "04": ["第五章、确保人、材、机的保障体系与措施"],
+        "05": ["第三章、拟采用的新技术、新工艺"],
+        "07": ["第二章、工程重点难点及危大工程的保障体系与措施"],
+        "08": ["第四章、确保工期与质量的保障体系与措施"],
+        "09": ["第四章、确保工期与质量的保障体系与措施"],
+        "10": ["第二章、工程重点难点及危大工程的保障体系与措施"],
+        "14": ["第二章、工程重点难点及危大工程的保障体系与措施"],
+        "15": ["第五章、确保人、材、机的保障体系与措施"],
+        "16": ["第四章、确保工期与质量的保障体系与措施"],
+    }
+    keyword_fallback_map = {
+        "04": ["材料", "部品", "设备", "机械"],
+        "05": ["新技术", "新工艺", "BIM", "盘扣式脚手架"],
+        "07": ["危大工程", "专家论证", "专项方案"],
+        "08": ["质量", "样板", "验收"],
+        "09": ["进度", "工期", "纠偏"],
+        "10": ["专项方案", "审批", "专家论证", "验收"],
+        "14": ["图纸", "深化", "设计", "优化"],
+        "15": ["资源配置", "人、材、机", "材料", "机械"],
+        "16": ["可行性", "验证", "落地"],
+    }
+    anchor_heading = ""
+    for candidate in preferred_heading_map.get(dimension_id, []):
+        if candidate in heading_set:
+            anchor_heading = candidate
+            break
+    if not anchor_heading:
+        for heading in headings:
+            if recommended_section and recommended_section in heading:
+                anchor_heading = heading
+                break
+    anchor_excerpt = _extract_submission_anchor_excerpt(
+        submission_text,
+        anchor_heading=anchor_heading,
+        max_lines=4,
+        max_chars=220,
+    )
+    if anchor_heading:
+        return {
+            "current_submission_anchor": anchor_heading,
+            "current_submission_excerpt": anchor_excerpt,
+            "gap_summary": (
+                f"当前施组已存在「{anchor_heading}」，但尚缺与「{recommended_subsection}」对应的参数化闭环表达。"
+            ),
+            "insertion_hint": (
+                f"建议优先在当前施组的「{anchor_heading}」下新增「{recommended_subsection}」，"
+                f"插在现有措施段后、附图附表前，并与「{recommended_section}」要求对齐。"
+            ),
+        }
+    keyword_hit = _extract_submission_keyword_excerpt(
+        submission_text,
+        keywords=keyword_fallback_map.get(dimension_id, []),
+        radius=140,
+    )
+    if keyword_hit:
+        keyword = str(keyword_hit.get("keyword") or "").strip()
+        excerpt = str(keyword_hit.get("excerpt") or "").strip()
+        return {
+            "current_submission_anchor": f"关键词命中：{keyword}",
+            "current_submission_excerpt": excerpt,
+            "gap_summary": (
+                f"当前施组正文已出现“{keyword}”相关内容，但尚未整理成「{recommended_subsection}」所需的参数化闭环表达。"
+            ),
+            "insertion_hint": (
+                f"建议紧贴当前“{keyword}”相关段落，就近补入「{recommended_subsection}」内容，"
+                f"把零散描述改写为参数、频次、责任和验收动作齐备的独立小节。"
+            ),
+        }
+    return {
+        "current_submission_anchor": "",
+        "current_submission_excerpt": "",
+        "gap_summary": (
+            f"当前施组未检出与「{recommended_section}」直接对应的章标题，建议补设「{recommended_subsection}」独立小节。"
+        ),
+        "insertion_hint": (
+            f"建议直接新增「{recommended_section} / {recommended_subsection}」，"
+            f"并把“{dimension_name}”写成可执行的参数、频次、责任和验收闭环。"
+        ),
+    }
+
+
+def _build_pending_feedback_rewrite_template(
+    *,
+    dimension_name: str,
+    recommended_section: str,
+    recommended_subsection: str,
+    action_steps: List[str],
+    evidence_to_add: List[str],
+    mandatory_elements: List[str],
+) -> str:
+    action_text = "；".join(str(item) for item in action_steps[:2] if str(item).strip())
+    evidence_items = [str(item).strip() for item in evidence_to_add if str(item).strip()]
+    if not evidence_items:
+        evidence_items = [str(item).strip() for item in mandatory_elements[:4] if str(item).strip()]
+    evidence_text = "、".join(evidence_items[:4]) or "控制参数、执行频次、责任岗位、验收动作"
+    if not action_text:
+        action_text = "补齐与项目锚点一致的参数化动作链"
+    return (
+        f"建议在「{recommended_section}」下的「{recommended_subsection}」中围绕“{dimension_name}”补写："
+        f"{action_text}；并至少写明 {evidence_text}。"
+    )
+
+
+def _build_pending_feedback_rewrite_sentences(
+    *,
+    dimension_id: str,
+    dimension_name: str,
+    recommended_section: str,
+    recommended_subsection: str,
+    action_steps: List[str],
+    evidence_to_add: List[str],
+    mandatory_elements: List[str],
+) -> List[str]:
+    evidence_items = [str(item).strip() for item in evidence_to_add if str(item).strip()]
+    if not evidence_items:
+        evidence_items = [str(item).strip() for item in mandatory_elements[:4] if str(item).strip()]
+    evidence_text = "、".join(evidence_items[:4]) or "控制参数、执行频次、责任岗位、验收动作"
+    action_text = "；".join(str(item).strip() for item in action_steps[:2] if str(item).strip())
+    if not action_text:
+        action_text = "补齐与项目锚点一致的参数化动作链"
+    templates = [
+        f"在{recommended_section}的{recommended_subsection}中，围绕“{dimension_name}”明确{action_text}，并同步写明{evidence_text}。",
+        "措施表述应改成“触发条件-执行频次-责任岗位-验收动作”的闭环句式，避免只写原则性承诺或空泛目标。",
+    ]
+    dimension_sentence_overrides = {
+        "05": "每项四新技术需写清应用场景、前置条件、实施步骤、验收标准和回退措施，并与项目痛点或关键工序直接对应。",
+        "07": "危大工程或重难点内容需写清专项方案、过程监测、预警阈值、停工条件、复验流程和复工审批链。",
+        "08": "质量控制内容需把ITP停点、见证点、检查方法、放行条件和记录表单一起写全，不能只列制度名称。",
+        "09": "进度纠偏内容需写清偏差阈值、触发情形、纠偏资源、责任岗位和验证结果，形成可执行的赶工闭环。",
+        "10": "专项工程目录需把方案编制、审核审批、技术交底、样板确认、实施控制和验收节点按时序写透。",
+        "14": "设计协调内容需围绕“提出-确认-整改-复核-关闭”建立问题闭环，并把深化交付节点与施工时点对齐。",
+        "15": "资源调配内容需写清何种情形触发、由谁决策、如何补充和何时验证效果，避免仅罗列资源数量。",
+        "16": "可行性验证内容需写明前提条件、验证方法、评价指标、结论和推广条件，确保措施能落地复核。",
+    }
+    extra = dimension_sentence_overrides.get(dimension_id)
+    if extra:
+        templates.append(extra)
+    return templates[:3]
+
+
+def _build_pending_feedback_insertable_paragraphs(
+    *,
+    dimension_id: str,
+    dimension_name: str,
+    recommended_subsection: str,
+    action_steps: List[str],
+    evidence_to_add: List[str],
+    mandatory_elements: List[str],
+) -> List[str]:
+    evidence_items = [str(item).strip() for item in evidence_to_add if str(item).strip()]
+    if not evidence_items:
+        evidence_items = [str(item).strip() for item in mandatory_elements[:4] if str(item).strip()]
+    evidence_text = "、".join(evidence_items[:4]) or "控制参数、执行频次、责任岗位、验收动作"
+    action_items = [str(item).strip() for item in action_steps if str(item).strip()]
+    action_text = "，".join(action_items[:2]) or "补齐与项目锚点一致的参数化动作链"
+    paragraphs = [
+        (
+            f"{recommended_subsection}应围绕{dimension_name}建立可执行的控制闭环，"
+            f"结合本项目实际施工条件明确{action_text}，并同步写明{evidence_text}。"
+        ),
+        (
+            "实施过程中由项目管理班子牵头组织交底、复核和验收，"
+            "按“触发条件-执行频次-责任岗位-验收动作”的顺序固化过程记录，"
+            "确保相关措施在施工阶段可检查、可签认、可追溯。"
+        ),
+    ]
+    dimension_paragraph_overrides = {
+        "05": (
+            "对拟采用的四新技术应逐项写明适用场景、前置条件、实施步骤、质量控制要点、"
+            "验收标准及异常回退措施，并与档案馆改造的关键工序和场地约束直接对应。"
+        ),
+        "07": (
+            "涉及危大工程或重难点施工时，应同步明确专项方案编制、专家论证、监测预警、停工条件、"
+            "复验复工和审批流转要求，形成完整的风险闭环。"
+        ),
+        "08": (
+            "质量管理内容应把ITP停点、见证点、检查方法、放行条件和记录表单对应起来，"
+            "避免仅保留制度性表述而缺少实际检查动作。"
+        ),
+        "09": (
+            "进度保障内容应明确偏差阈值、预警触发条件、资源补充方式、责任岗位和验证结果，"
+            "确保赶工措施可在工期受压时立即启动。"
+        ),
+        "10": (
+            "专项工程控制内容应按“方案编制-审核审批-技术交底-样板确认-实施控制-验收移交”的顺序展开，"
+            "并把每个节点的责任岗位和签认动作写实。"
+        ),
+        "14": (
+            "设计协调与深化内容应围绕“提出问题-确认责任-深化出图-现场复核-关闭归档”展开，"
+            "同步写明各专业接口与交付节点。"
+        ),
+        "15": (
+            "资源调配内容应写清触发情形、决策机制、补充时限、资源来源和效果验证方式，"
+            "不能只停留在资源数量罗列或原则性表态。"
+        ),
+        "16": (
+            "技术措施落地性内容应明确实施前提、验证方法、评价指标、复核结论和推广条件，"
+            "确保措施真正具备执行与复盘基础。"
+        ),
+    }
+    extra = dimension_paragraph_overrides.get(dimension_id)
+    if extra:
+        paragraphs.append(extra)
+    return paragraphs[:3]
+
+
+def _build_pending_feedback_section_draft(
+    *,
+    dimension_name: str,
+    recommended_subsection: str,
+    current_submission_anchor: str,
+    insertable_paragraphs: List[str],
+) -> Dict[str, object]:
+    anchor = str(current_submission_anchor or "").strip()
+    anchor_label = anchor.replace("关键词命中：", "").strip() if anchor else ""
+    intro = ""
+    if anchor_label:
+        intro = (
+            f"{recommended_subsection}建议承接当前施组中与“{anchor_label}”相关的表述，"
+            f"围绕{dimension_name}补成独立小节，并把原则性描述改写成可执行的控制闭环。"
+        )
+    else:
+        intro = (
+            f"{recommended_subsection}应围绕{dimension_name}单独成段，"
+            "把原有零散描述收敛为可执行、可检查、可签认的闭环条款。"
+        )
+    paragraphs: List[str] = []
+    seen: set[str] = set()
+    for item in [intro] + list(insertable_paragraphs or []):
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        paragraphs.append(text)
+        if len(paragraphs) >= 3:
+            break
+    return {
+        "title": recommended_subsection,
+        "paragraphs": paragraphs,
+    }
+
+
+def _build_pending_feedback_auto_rewrite_paragraphs(
+    *,
+    dimension_id: str,
+    dimension_name: str,
+    recommended_subsection: str,
+    current_submission_anchor: str,
+    insertable_paragraphs: List[str],
+) -> List[str]:
+    anchor = str(current_submission_anchor or "").strip()
+    anchor_label = anchor.replace("关键词命中：", "").strip() if anchor else ""
+    if anchor_label:
+        lead = (
+            f"结合当前施组中与“{anchor_label}”相关的施工安排，本节围绕{dimension_name}补齐参数化控制要求，"
+            "将原有原则性表述落实为可执行、可检查、可签认的闭环条款。"
+        )
+    else:
+        lead = (
+            f"本节围绕{dimension_name}补齐参数化控制要求，"
+            "将原有零散表述收敛为可执行、可检查、可签认的闭环条款。"
+        )
+    paragraphs: List[str] = []
+    seen: set[str] = set()
+    for item in [lead] + list(insertable_paragraphs or []):
+        text = str(item or "").strip()
+        if not text:
+            continue
+        if text.startswith(recommended_subsection):
+            text = "本节" + text[len(recommended_subsection) :]
+        text = text.replace("本节应围绕", "本节围绕", 1)
+        text = text.replace("建议", "")
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        paragraphs.append(text)
+        if len(paragraphs) >= 3:
+            break
+    dimension_override = {
+        "05": "对四新技术的适用场景、实施步骤、质量控制点、验收标准和异常回退措施同步落表，并与现场关键工序逐项对应。",
+        "10": "专项工程控制节点按“方案编制、审核审批、技术交底、样板确认、实施控制、验收移交”的顺序展开，每个节点明确责任岗位和签认动作。",
+        "15": "资源调配内容同步写明触发阈值、补充时限、资源来源、审批责任和效果验证方式，保证工期受压时可立即启动纠偏。",
+    }.get(dimension_id)
+    if dimension_override and dimension_override not in seen:
+        paragraphs.append(dimension_override)
+    return paragraphs[:3]
+
+
+def _build_pending_feedback_auto_rewrite_draft(
+    *,
+    dimension_id: str,
+    dimension_name: str,
+    recommended_section: str,
+    recommended_subsection: str,
+    current_submission_anchor: str,
+    current_submission_excerpt: str,
+    insertable_paragraphs: List[str],
+) -> Dict[str, object]:
+    anchor = str(current_submission_anchor or "").strip()
+    anchor_label = anchor.replace("关键词命中：", "").strip() if anchor else ""
+    if anchor and not anchor.startswith("关键词命中："):
+        operation = "insert_after_anchor"
+        operation_label = f"在「{anchor}」后插入该小节"
+        target = anchor
+    elif anchor_label:
+        operation = "insert_after_keyword_anchor"
+        operation_label = f"在当前“{anchor_label}”相关段后插入该小节"
+        target = anchor_label
+    else:
+        operation = "append_new_subsection"
+        operation_label = f"在「{recommended_section}」下新增该小节"
+        target = recommended_section
+    return {
+        "operation": operation,
+        "operation_label": operation_label,
+        "target": target,
+        "before_excerpt": str(current_submission_excerpt or "").strip(),
+        "section_title": recommended_subsection,
+        "section_paragraphs": _build_pending_feedback_auto_rewrite_paragraphs(
+            dimension_id=dimension_id,
+            dimension_name=dimension_name,
+            recommended_subsection=recommended_subsection,
+            current_submission_anchor=current_submission_anchor,
+            insertable_paragraphs=insertable_paragraphs,
+        ),
+    }
+
+
+def _build_pending_feedback_patch_bundle(
+    project_id: str,
+    points: List[Dict[str, object]],
+) -> Dict[str, object]:
+    sections: List[Dict[str, object]] = []
+    mode_counts = {
+        "insert_after_anchor": 0,
+        "insert_after_keyword_anchor": 0,
+        "append_new_subsection": 0,
+    }
+    markdown_lines = [
+        "# 待确认真实评标改写补丁包",
+        "",
+        f"- 项目ID：`{project_id or '-'}`",
+        f"- 待确认反馈点：`{len(points)}`",
+        "",
+    ]
+    for idx, item in enumerate(points, 1):
+        if not isinstance(item, dict):
+            continue
+        operation = str(item.get("auto_rewrite_operation") or "").strip()
+        if operation in mode_counts:
+            mode_counts[operation] += 1
+        section_title = str(
+            item.get("auto_rewrite_section_title")
+            or item.get("draft_section_title")
+            or item.get("recommended_subsection")
+            or ""
+        ).strip()
+        section_paragraphs = [
+            str(part or "").strip()
+            for part in (item.get("auto_rewrite_section_paragraphs") or [])
+            if str(part or "").strip()
+        ]
+        copy_block = "\n".join([section_title] + section_paragraphs).strip()
+        section_payload = {
+            "dimension_id": str(item.get("dimension_id") or ""),
+            "dimension_name": str(item.get("dimension_name") or ""),
+            "source_submission_filename": str(item.get("source_submission_filename") or ""),
+            "operation": operation,
+            "operation_label": str(item.get("auto_rewrite_operation_label") or ""),
+            "target": str(item.get("auto_rewrite_target") or ""),
+            "before_excerpt": str(item.get("auto_rewrite_before_excerpt") or ""),
+            "section_title": section_title,
+            "section_paragraphs": section_paragraphs[:3],
+            "copy_block": copy_block,
+        }
+        sections.append(section_payload)
+        markdown_lines.extend(
+            [
+                f"## {idx}. {section_payload['dimension_id']} {section_payload['dimension_name']}".rstrip(),
+                "",
+                f"- 样本：`{section_payload['source_submission_filename'] or '-'}'",
+                f"- 写入方式：{section_payload['operation_label'] or '-'}",
+                f"- 写入位置：{section_payload['target'] or '-'}",
+            ]
+        )
+        if section_payload["before_excerpt"]:
+            markdown_lines.append(f"- 原文摘录：{section_payload['before_excerpt']}")
+        markdown_lines.extend(
+            [
+                "",
+                f"### {section_title or '改写小节'}",
+                "",
+            ]
+        )
+        markdown_lines.extend(section_paragraphs[:3] or ["（当前无可用正文）"])
+        markdown_lines.append("")
+    return {
+        "section_count": len(sections),
+        "insert_after_anchor_count": mode_counts["insert_after_anchor"],
+        "keyword_anchor_count": mode_counts["insert_after_keyword_anchor"],
+        "append_new_section_count": mode_counts["append_new_subsection"],
+        "sections": sections,
+        "copy_markdown": "\n".join(markdown_lines).strip(),
+    }
+
+
+def _select_pending_feedback_dimensions(
+    *,
+    report: Dict[str, object],
+    feature_confidence_update: Dict[str, object],
+    max_dimensions: int = 3,
+) -> List[str]:
+    selected: List[str] = []
+    suggestions = report.get("suggestions")
+    if isinstance(suggestions, list):
+        ranked: List[tuple[float, str]] = []
+        for item in suggestions:
+            if not isinstance(item, dict):
+                continue
+            dim_id = _normalize_known_dimension_id(item.get("dimension_id"))
+            if not dim_id:
+                continue
+            ranked.append((float(_to_float_or_none(item.get("expected_gain")) or 0.0), dim_id))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        for _, dim_id in ranked:
+            if dim_id not in selected:
+                selected.append(dim_id)
+            if len(selected) >= max(1, int(max_dimensions)):
+                return selected
+    for dim_id in _select_ground_truth_few_shot_dimensions(
+        report=report,
+        feature_confidence_update=feature_confidence_update,
+        max_dimensions=max_dimensions,
+    ):
+        if dim_id not in selected:
+            selected.append(dim_id)
+        if len(selected) >= max(1, int(max_dimensions)):
+            break
+    return selected
+
+
+def _build_pending_feedback_scoring_points(project_id: str) -> Dict[str, object]:
+    evo = load_evolution_reports().get(project_id) or {}
+    compilation = (
+        evo.get("compilation_instructions")
+        if isinstance(evo.get("compilation_instructions"), dict)
+        else {}
+    )
+    chapter_requirements = {
+        "required_sections": _to_text_items(
+            compilation.get("required_sections")
+            or DEFAULT_CHAPTER_REQUIREMENTS.get("required_sections"),
+            max_items=20,
+        ),
+        "mandatory_elements": _to_text_items(
+            compilation.get("mandatory_elements")
+            or DEFAULT_CHAPTER_REQUIREMENTS.get("mandatory_elements"),
+            max_items=12,
+        ),
+    }
+    rows = _enrich_ground_truth_submission_metadata(
+        project_id,
+        _list_project_ground_truth_records(project_id, include_guardrail_blocked=True),
+    )
+    submissions = [s for s in load_submissions() if str(s.get("project_id") or "") == project_id]
+    submissions_by_id: Dict[str, Dict[str, object]] = {
+        str(s.get("id") or "").strip(): s for s in submissions if str(s.get("id") or "").strip()
+    }
+    submissions_by_text: Dict[str, Dict[str, object]] = {}
+    submissions_by_filename: Dict[str, Dict[str, object]] = {}
+    for submission in submissions:
+        text = str(submission.get("text") or "").strip()
+        if text and text not in submissions_by_text:
+            submissions_by_text[text] = submission
+        normalized_filename = _normalize_uploaded_filename(str(submission.get("filename") or ""))
+        if normalized_filename and normalized_filename not in submissions_by_filename:
+            submissions_by_filename[normalized_filename] = submission
+
+    points: List[Dict[str, object]] = []
+    pending_sample_ids: set[str] = set()
+    seen_titles: set[tuple[str, str, str, str]] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        guardrail = _normalize_feedback_guardrail_state(row.get("feedback_guardrail"))
+        if not bool(guardrail.get("blocked")):
+            continue
+        if str(guardrail.get("manual_review_status") or "").strip().lower() != "pending":
+            continue
+        submission = _resolve_ground_truth_source_submission(
+            row,
+            submissions_by_id=submissions_by_id,
+            submissions_by_text=submissions_by_text,
+            submissions_by_filename=submissions_by_filename,
+        )
+        report = submission.get("report") if isinstance(submission, dict) else None
+        if not isinstance(report, dict):
+            continue
+        feature_update = (
+            row.get("feature_confidence_update")
+            if isinstance(row.get("feature_confidence_update"), dict)
+            else {}
+        )
+        distillation = _normalize_few_shot_distillation_state(row.get("few_shot_distillation"))
+        candidate_dimensions = [
+            str(item or "").zfill(2)
+            for item in (distillation.get("dimension_ids") or [])
+            if str(item or "").zfill(2) in DIMENSION_IDS
+        ]
+        if not candidate_dimensions:
+            candidate_dimensions = _select_pending_feedback_dimensions(
+                report=report,
+                feature_confidence_update=feature_update,
+                max_dimensions=3,
+            )
+        if not candidate_dimensions:
+            continue
+        pending_sample_ids.add(str(row.get("id") or ""))
+        qualitative_tags = _flatten_ground_truth_qualitative_tags(row, limit=4)
+        source_submission_name = str(
+            row.get("source_submission_filename")
+            or (submission or {}).get("filename")
+            or "真实评标样本"
+        ).strip()
+        submission_text = str((submission or {}).get("text") or "")
+        guardrail_reason = str(guardrail.get("warning_message") or "").strip()
+        for dim_id in candidate_dimensions[:3]:
+            dim_name = str((DIMENSIONS.get(dim_id) or {}).get("name") or dim_id)
+            evidence_texts = _collect_dimension_evidence_texts(report, dimension_id=dim_id, limit=3)
+            guidance_texts = _collect_dimension_guidance_texts(report, dimension_id=dim_id, limit=2)
+            suggestion_payload = _collect_pending_feedback_suggestion_payload(
+                report,
+                dimension_id=dim_id,
+            )
+            suggestion_hints = _collect_pending_feedback_suggestion_hints(
+                report,
+                dimension_id=dim_id,
+                limit=4,
+            )
+            action_steps = _to_text_items(suggestion_payload.get("action_steps") or [], max_items=4)
+            evidence_to_add = _to_text_items(
+                suggestion_payload.get("evidence_to_add") or [],
+                max_items=4,
+            )
+            recommended_section = _resolve_pending_feedback_recommended_section(
+                chapter_requirements=chapter_requirements,
+                dimension_id=dim_id,
+                dimension_name=dim_name,
+            )
+            recommended_subsection = _resolve_pending_feedback_recommended_subsection(
+                dimension_id=dim_id,
+                dimension_name=dim_name,
+            )
+            insertion_context = _build_pending_feedback_insertion_context(
+                dimension_id=dim_id,
+                dimension_name=dim_name,
+                submission_text=submission_text,
+                recommended_section=recommended_section,
+                recommended_subsection=recommended_subsection,
+            )
+            rewrite_template = _build_pending_feedback_rewrite_template(
+                dimension_name=dim_name,
+                recommended_section=recommended_section,
+                recommended_subsection=recommended_subsection,
+                action_steps=action_steps,
+                evidence_to_add=evidence_to_add,
+                mandatory_elements=chapter_requirements.get("mandatory_elements") or [],
+            )
+            rewrite_sentences = _build_pending_feedback_rewrite_sentences(
+                dimension_id=dim_id,
+                dimension_name=dim_name,
+                recommended_section=recommended_section,
+                recommended_subsection=recommended_subsection,
+                action_steps=action_steps,
+                evidence_to_add=evidence_to_add,
+                mandatory_elements=chapter_requirements.get("mandatory_elements") or [],
+            )
+            insertable_paragraphs = _build_pending_feedback_insertable_paragraphs(
+                dimension_id=dim_id,
+                dimension_name=dim_name,
+                recommended_subsection=recommended_subsection,
+                action_steps=action_steps,
+                evidence_to_add=evidence_to_add,
+                mandatory_elements=chapter_requirements.get("mandatory_elements") or [],
+            )
+            section_draft = _build_pending_feedback_section_draft(
+                dimension_name=dim_name,
+                recommended_subsection=recommended_subsection,
+                current_submission_anchor=insertion_context.get("current_submission_anchor") or "",
+                insertable_paragraphs=insertable_paragraphs,
+            )
+            auto_rewrite_draft = _build_pending_feedback_auto_rewrite_draft(
+                dimension_id=dim_id,
+                dimension_name=dim_name,
+                recommended_section=recommended_section,
+                recommended_subsection=recommended_subsection,
+                current_submission_anchor=insertion_context.get("current_submission_anchor") or "",
+                current_submission_excerpt=insertion_context.get("current_submission_excerpt")
+                or "",
+                insertable_paragraphs=insertable_paragraphs,
+            )
+            title = f"待确认反馈：{dim_name}需向真实高分表达靠拢"
+            uniq_key = ("pending_feedback_review", dim_id, title, source_submission_name)
+            if uniq_key in seen_titles:
+                continue
+            seen_titles.add(uniq_key)
+            points.append(
+                {
+                    "source_key": "pending_feedback_review",
+                    "source_label": "待确认真实评标反馈",
+                    "dimension_id": dim_id,
+                    "dimension_name": dim_name,
+                    "title": title,
+                    "hint_preview": _to_text_items(
+                        qualitative_tags + evidence_texts + suggestion_hints,
+                        max_items=4,
+                    ),
+                    "guidance_preview": _to_text_items(
+                        guidance_texts + suggestion_hints,
+                        max_items=2,
+                    ),
+                    "recommended_section": recommended_section,
+                    "recommended_subsection": recommended_subsection,
+                    "current_submission_anchor": insertion_context.get("current_submission_anchor")
+                    or "",
+                    "current_submission_excerpt": insertion_context.get(
+                        "current_submission_excerpt"
+                    )
+                    or "",
+                    "gap_summary": insertion_context.get("gap_summary") or "",
+                    "insertion_hint": insertion_context.get("insertion_hint") or "",
+                    "action_steps": action_steps,
+                    "evidence_to_add": evidence_to_add,
+                    "rewrite_template": rewrite_template,
+                    "rewrite_sentences": rewrite_sentences,
+                    "insertable_paragraphs": insertable_paragraphs,
+                    "draft_section_title": str(section_draft.get("title") or ""),
+                    "draft_section_paragraphs": list(section_draft.get("paragraphs") or []),
+                    "auto_rewrite_operation": str(auto_rewrite_draft.get("operation") or ""),
+                    "auto_rewrite_operation_label": str(
+                        auto_rewrite_draft.get("operation_label") or ""
+                    ),
+                    "auto_rewrite_target": str(auto_rewrite_draft.get("target") or ""),
+                    "auto_rewrite_before_excerpt": str(
+                        auto_rewrite_draft.get("before_excerpt") or ""
+                    ),
+                    "auto_rewrite_section_title": str(
+                        auto_rewrite_draft.get("section_title") or ""
+                    ),
+                    "auto_rewrite_section_paragraphs": list(
+                        auto_rewrite_draft.get("section_paragraphs") or []
+                    ),
+                    "source_submission_filename": source_submission_name,
+                    "sample_record_id": str(row.get("id") or ""),
+                    "review_status": "pending",
+                    "guardrail_reason": guardrail_reason or None,
+                }
+            )
+
+    points.sort(
+        key=lambda item: (
+            str(item.get("dimension_id") or ""),
+            str(item.get("source_submission_filename") or ""),
+            str(item.get("title") or ""),
+        )
+    )
+    bundle = _build_pending_feedback_patch_bundle(project_id, points[:12])
+    return {
+        "summary": {
+            "pending_sample_count": len(pending_sample_ids),
+            "pending_point_count": len(points),
+        },
+        "pending_feedback_scoring_points": points[:12],
+        "patch_bundle": bundle,
+    }
+
+
 def _build_scoring_factors_overview(project_id: Optional[str]) -> Dict[str, object]:
     config = load_config()
     rubric = config.rubric if isinstance(config.rubric, dict) else {}
@@ -7728,8 +12368,29 @@ def _build_scoring_factors_overview(project_id: Optional[str]) -> Dict[str, obje
 
     chapter_requirements = dict(DEFAULT_CHAPTER_REQUIREMENTS)
     chapter_source = "default"
+    adaptive_payload: Dict[str, object] = {
+        "summary": {"total_points": 0},
+        "adaptive_scoring_points": [],
+    }
+    pending_feedback_payload: Dict[str, object] = {
+        "summary": {"pending_sample_count": 0, "pending_point_count": 0},
+        "pending_feedback_scoring_points": [],
+        "patch_bundle": {
+            "section_count": 0,
+            "insert_after_anchor_count": 0,
+            "keyword_anchor_count": 0,
+            "append_new_section_count": 0,
+            "sections": [],
+            "copy_markdown": "",
+        },
+    }
+    current_project: Optional[Dict[str, object]] = None
     if project_id:
         evo = load_evolution_reports().get(project_id) or {}
+        current_project = next(
+            (p for p in load_projects() if str(p.get("id") or "") == project_id),
+            None,
+        )
         ci = (
             evo.get("compilation_instructions")
             if isinstance(evo.get("compilation_instructions"), dict)
@@ -7745,6 +12406,12 @@ def _build_scoring_factors_overview(project_id: Optional[str]) -> Dict[str, obje
                 "forbidden_patterns": [str(x) for x in (ci.get("forbidden_patterns") or [])],
             }
             chapter_source = "project_evolution"
+        if isinstance(current_project, dict):
+            adaptive_payload = _build_project_adaptive_scoring_points(
+                project_id,
+                project=current_project,
+            )
+            pending_feedback_payload = _build_pending_feedback_scoring_points(project_id)
 
     if project_id:
         anchors = [a for a in load_project_anchors() if str(a.get("project_id")) == project_id]
@@ -7794,10 +12461,43 @@ def _build_scoring_factors_overview(project_id: Optional[str]) -> Dict[str, obje
         ],
         "consistency_anchors": consistency_anchors,
         "chapter_requirements": chapter_requirements,
+        "adaptive_summary": (
+            adaptive_payload.get("summary")
+            if isinstance(adaptive_payload.get("summary"), dict)
+            else {"total_points": 0}
+        ),
+        "adaptive_scoring_points": (
+            adaptive_payload.get("adaptive_scoring_points")
+            if isinstance(adaptive_payload.get("adaptive_scoring_points"), list)
+            else []
+        ),
+        "pending_feedback_summary": (
+            pending_feedback_payload.get("summary")
+            if isinstance(pending_feedback_payload.get("summary"), dict)
+            else {"pending_sample_count": 0, "pending_point_count": 0}
+        ),
+        "pending_feedback_scoring_points": (
+            pending_feedback_payload.get("pending_feedback_scoring_points")
+            if isinstance(pending_feedback_payload.get("pending_feedback_scoring_points"), list)
+            else []
+        ),
+        "pending_feedback_patch_bundle": (
+            pending_feedback_payload.get("patch_bundle")
+            if isinstance(pending_feedback_payload.get("patch_bundle"), dict)
+            else {
+                "section_count": 0,
+                "insert_after_anchor_count": 0,
+                "keyword_anchor_count": 0,
+                "append_new_section_count": 0,
+                "sections": [],
+                "copy_markdown": "",
+            }
+        ),
         "capability_flags": capability_flags,
         "source": {
             "rubric_version": str(rubric.get("version", "unknown")),
             "chapter_requirements": chapter_source,
+            "adaptive_scoring_points": "runtime_material_feedback" if project_id else "none",
         },
         "updated_at": _now_iso(),
     }
@@ -7807,6 +12507,29 @@ def _render_scoring_factors_markdown(payload: Dict[str, object]) -> str:
     dims = payload.get("dimensions") or []
     penalties = payload.get("penalty_rules") or []
     chapter = payload.get("chapter_requirements") or {}
+    adaptive_summary = (
+        payload.get("adaptive_summary") if isinstance(payload.get("adaptive_summary"), dict) else {}
+    )
+    adaptive_points = (
+        payload.get("adaptive_scoring_points")
+        if isinstance(payload.get("adaptive_scoring_points"), list)
+        else []
+    )
+    pending_feedback_summary = (
+        payload.get("pending_feedback_summary")
+        if isinstance(payload.get("pending_feedback_summary"), dict)
+        else {}
+    )
+    pending_feedback_points = (
+        payload.get("pending_feedback_scoring_points")
+        if isinstance(payload.get("pending_feedback_scoring_points"), list)
+        else []
+    )
+    pending_feedback_patch_bundle = (
+        payload.get("pending_feedback_patch_bundle")
+        if isinstance(payload.get("pending_feedback_patch_bundle"), dict)
+        else {}
+    )
     flags = payload.get("capability_flags") or {}
     lines = [
         "# 评分体系总览",
@@ -7864,6 +12587,119 @@ def _render_scoring_factors_markdown(payload: Dict[str, object]) -> str:
     for x in chapter.get("forbidden_patterns") or []:
         lines.append(f"- {x}")
 
+    if adaptive_points:
+        lines.extend(
+            [
+                "",
+                "## 动态评分点（结合上传资料与真实评标）",
+                "",
+                f"- 动态评分点总数：`{adaptive_summary.get('total_points', 0)}`",
+                f"- 资料驱动评分点：`{adaptive_summary.get('material_points', 0)}`",
+                f"- 真实评标反馈评分点：`{adaptive_summary.get('feedback_points', 0)}`",
+                f"- 高置信学习骨架评分点：`{adaptive_summary.get('feature_points', 0)}`",
+                "",
+                "| 来源 | 维度 | 评分点 | 命中提示 | 权重 |",
+                "|---|---|---|---|---:|",
+            ]
+        )
+        for item in adaptive_points:
+            hints = "；".join(str(x) for x in (item.get("hint_preview") or [])[:4]) or "-"
+            lines.append(
+                f"| {item.get('source_label', '')} | "
+                f"{item.get('dimension_id', '')} {item.get('dimension_name', '')} | "
+                f"{item.get('title', '')} | {hints} | {item.get('weight', 0)} |"
+            )
+
+    if pending_feedback_points:
+        lines.extend(
+            [
+                "",
+                "## 待确认真实评标反馈点（未正式生效）",
+                "",
+                f"- 待人工确认样本：`{pending_feedback_summary.get('pending_sample_count', 0)}`",
+                f"- 待确认反馈点：`{pending_feedback_summary.get('pending_point_count', 0)}`",
+                "- 说明：这些点来自已录入真实评标，但当前仍处于人工确认门内，尚未自动纳入正式评分主链。",
+                "",
+                "| 维度 | 推荐章节 | 推荐小节 | 来自样本 | 阻断原因 |",
+                "|---|---|---|---|---|",
+            ]
+        )
+        for item in pending_feedback_points:
+            lines.append(
+                f"| {item.get('dimension_id', '')} {item.get('dimension_name', '')} | "
+                f"{item.get('recommended_section', '') or '-'} | "
+                f"{item.get('recommended_subsection', '') or '-'} | "
+                f"{item.get('source_submission_filename', '')} | "
+                f"{item.get('guardrail_reason', '') or '-'} |"
+            )
+        lines.extend(["", "### 待确认反馈改写模板", ""])
+        for item in pending_feedback_points:
+            action_text = "；".join(str(x) for x in (item.get("action_steps") or [])[:3]) or "-"
+            rewrite_sentences = item.get("rewrite_sentences") or []
+            insertable_paragraphs = item.get("insertable_paragraphs") or []
+            draft_section_title = str(item.get("draft_section_title") or "").strip()
+            draft_section_paragraphs = item.get("draft_section_paragraphs") or []
+            auto_rewrite_operation_label = str(
+                item.get("auto_rewrite_operation_label") or ""
+            ).strip()
+            auto_rewrite_target = str(item.get("auto_rewrite_target") or "").strip()
+            auto_rewrite_before_excerpt = str(item.get("auto_rewrite_before_excerpt") or "").strip()
+            auto_rewrite_section_title = str(item.get("auto_rewrite_section_title") or "").strip()
+            auto_rewrite_section_paragraphs = item.get("auto_rewrite_section_paragraphs") or []
+            lines.extend(
+                [
+                    f"- `{item.get('dimension_id', '')} {item.get('dimension_name', '')}` / `{item.get('source_submission_filename', '')}`",
+                    f"  章节：{item.get('recommended_section', '') or '-'}",
+                    f"  小节：{item.get('recommended_subsection', '') or '-'}",
+                    f"  当前施组锚点：{item.get('current_submission_anchor', '') or '-'}",
+                    f"  缺口：{item.get('gap_summary', '') or '-'}",
+                    f"  插入建议：{item.get('insertion_hint', '') or '-'}",
+                    f"  动作：{action_text}",
+                    f"  模板：{item.get('rewrite_template', '') or '-'}",
+                ]
+            )
+            excerpt = str(item.get("current_submission_excerpt") or "").strip()
+            if excerpt:
+                lines.append(f"  当前摘录：{excerpt}")
+            if isinstance(rewrite_sentences, list):
+                for sentence in rewrite_sentences[:3]:
+                    lines.append(f"  句式：{sentence}")
+            if isinstance(insertable_paragraphs, list):
+                lines.append("  可直接贴入正文：")
+                for paragraph in insertable_paragraphs[:3]:
+                    lines.append(f"  正文：{paragraph}")
+            if draft_section_title or isinstance(draft_section_paragraphs, list):
+                lines.append("  可直接插入小节草稿：")
+                lines.append(f"  草稿标题：{draft_section_title or '-'}")
+                if isinstance(draft_section_paragraphs, list):
+                    for paragraph in draft_section_paragraphs[:3]:
+                        lines.append(f"  草稿正文：{paragraph}")
+            if auto_rewrite_operation_label or auto_rewrite_section_title:
+                lines.append("  自动改写草案：")
+                lines.append(f"  写入方式：{auto_rewrite_operation_label or '-'}")
+                lines.append(f"  写入位置：{auto_rewrite_target or '-'}")
+                if auto_rewrite_before_excerpt:
+                    lines.append(f"  原文摘录：{auto_rewrite_before_excerpt}")
+                lines.append(f"  改写标题：{auto_rewrite_section_title or '-'}")
+                if isinstance(auto_rewrite_section_paragraphs, list):
+                    for paragraph in auto_rewrite_section_paragraphs[:3]:
+                        lines.append(f"  改写正文：{paragraph}")
+        bundle_markdown = str(pending_feedback_patch_bundle.get("copy_markdown") or "").strip()
+        if bundle_markdown:
+            lines.extend(
+                [
+                    "",
+                    "## 待确认反馈改写补丁包",
+                    "",
+                    f"- 补丁小节数：`{pending_feedback_patch_bundle.get('section_count', 0)}`",
+                    f"- 章节锚点插入：`{pending_feedback_patch_bundle.get('insert_after_anchor_count', 0)}`",
+                    f"- 关键词锚点插入：`{pending_feedback_patch_bundle.get('keyword_anchor_count', 0)}`",
+                    f"- 新增小节：`{pending_feedback_patch_bundle.get('append_new_section_count', 0)}`",
+                    "",
+                    bundle_markdown,
+                ]
+            )
+
     lines.extend(
         [
             "",
@@ -7890,6 +12726,7 @@ def _render_project_analysis_bundle_markdown(
     factors_md = _render_scoring_factors_markdown(factors_payload)
     variants = evaluation_payload.get("variants") or {}
     acceptance = evaluation_payload.get("acceptance") or {}
+    closure = evaluation_payload.get("phase1_closure_readiness") or {}
     project_name = str(project.get("name") or project.get("id") or "")
 
     lines = [
@@ -7899,12 +12736,17 @@ def _render_project_analysis_bundle_markdown(
         f"- 生成时间：`{_now_iso()}`",
         f"- 青天样本数：`{evaluation_payload.get('sample_count_qt', 0)}`",
         "",
-        "## 验收指标（V1 / V2 / V2+Calib）",
+        "## 验收指标（V1 / V2 / 当前分 / V2+Calib）",
         "",
         "| 版本 | 样本数 | MAE | RMSE | Spearman | 画像相似度 | 扣分命中率 |",
         "|---|---:|---:|---:|---:|---:|---:|",
     ]
-    for key, name in (("v1", "V1"), ("v2", "V2"), ("v2_calib", "V2+Calib")):
+    for key, name in (
+        ("v1", "V1"),
+        ("v2", "V2"),
+        ("current", "当前分"),
+        ("v2_calib", "V2+Calib"),
+    ):
         v = variants.get(key) or {}
         lines.append(
             f"| {name} | {v.get('sample_count', 0)} | {v.get('mae', 0)} | {v.get('rmse', 0)} | "
@@ -7917,8 +12759,18 @@ def _render_project_analysis_bundle_markdown(
             "",
             f"- MAE/RMSE 优于 V1：`{bool(acceptance.get('mae_rmse_improved_vs_v1'))}`",
             f"- 排序相关性不劣于 V1：`{bool(acceptance.get('rank_corr_not_worse_vs_v1'))}`",
-            f"- 画像相似度优于 V1：`{bool(acceptance.get('profile_similarity_improved_vs_v1'))}`",
-            f"- 扣分命中率优于 V1：`{bool(acceptance.get('penalty_hit_rate_improved_vs_v1'))}`",
+            f"- 画像相似度优于 V1：`{bool(acceptance.get('profile_similarity_improved_v2_vs_v1'))}`",
+            f"- 扣分命中率优于 V1：`{bool(acceptance.get('penalty_hit_rate_improved_v2_vs_v1'))}`",
+            f"- 当前分 MAE/RMSE 不劣于 V2：`{bool(acceptance.get('current_mae_rmse_not_worse_than_v2'))}`",
+            f"- 当前分排序相关性不劣于 V2：`{bool(acceptance.get('current_rank_corr_not_worse_vs_v2'))}`",
+            f"- 当前分已与青天结果对齐：`{bool(acceptance.get('current_display_matches_qt'))}`",
+            "",
+            "### 第一阶段封关 readiness",
+            "",
+            f"- 状态：`{str(closure.get('status_label') or '暂不可封第一阶段')}`",
+            f"- 通过门数：`{closure.get('passed_gate_count', 0)}` / `10`",
+            f"- 未通过门：`{', '.join(closure.get('failed_gates') or []) or '-'}`",
+            f"- 建议：`{str(closure.get('recommendation') or '-')}`",
             "",
             "## 评分体系（当前生效）",
             "",
@@ -8660,6 +13512,101 @@ def _convert_score_to_100(score: object, score_scale_max: int) -> Optional[float
     return _quantize_decimal_score(clipped_normalized, score_scale_max=100)
 
 
+def _format_score_value_for_scale(score: object, score_scale_max: int) -> Optional[str]:
+    value = _to_float_or_none(score)
+    if value is None:
+        return None
+    scale = _normalize_score_scale_max(score_scale_max, default=DEFAULT_SCORE_SCALE_MAX)
+    quantized = _quantize_decimal_score(Decimal(str(value)), score_scale_max=scale)
+    return f"{quantized:.{_score_scale_decimal_places(scale)}f}"
+
+
+def _normalize_feedback_guardrail_display_metrics(
+    payload: object,
+    *,
+    default_score_scale_max: int = DEFAULT_SCORE_SCALE_MAX,
+) -> Dict[str, object]:
+    normalized = dict(payload) if isinstance(payload, dict) else {}
+    score_scale_max = _normalize_score_scale_max(
+        normalized.get("score_scale_max"),
+        default=default_score_scale_max,
+    )
+    normalized["score_scale_max"] = score_scale_max
+    normalized["score_scale_label"] = _score_scale_label(score_scale_max)
+
+    actual_score_raw = _to_float_or_none(normalized.get("actual_score_raw"))
+    if actual_score_raw is None:
+        actual_score_raw = _convert_score_from_100(
+            normalized.get("actual_score_100"), score_scale_max
+        )
+    predicted_score_raw = _to_float_or_none(normalized.get("predicted_score_raw"))
+    if predicted_score_raw is None:
+        predicted_score_raw = _convert_score_from_100(
+            normalized.get("predicted_score_100"),
+            score_scale_max,
+        )
+    current_score_raw = _to_float_or_none(normalized.get("current_score_raw"))
+    if current_score_raw is None:
+        current_score_raw = _convert_score_from_100(
+            normalized.get("current_score_100"),
+            score_scale_max,
+        )
+    if current_score_raw is None:
+        current_score_raw = predicted_score_raw
+    abs_delta_raw = _to_float_or_none(normalized.get("abs_delta_raw"))
+    if abs_delta_raw is None:
+        if actual_score_raw is not None and current_score_raw is not None:
+            abs_delta_raw = abs(float(actual_score_raw) - float(current_score_raw))
+        else:
+            abs_delta_raw = _convert_score_from_100(
+                normalized.get("abs_delta_100"),
+                score_scale_max,
+            )
+
+    if actual_score_raw is not None:
+        normalized["actual_score_raw"] = _quantize_decimal_score(
+            Decimal(str(actual_score_raw)),
+            score_scale_max=score_scale_max,
+        )
+    if predicted_score_raw is not None:
+        normalized["predicted_score_raw"] = _quantize_decimal_score(
+            Decimal(str(predicted_score_raw)),
+            score_scale_max=score_scale_max,
+        )
+    if current_score_raw is not None:
+        normalized["current_score_raw"] = _quantize_decimal_score(
+            Decimal(str(current_score_raw)),
+            score_scale_max=score_scale_max,
+        )
+    if abs_delta_raw is not None:
+        normalized["abs_delta_raw"] = _quantize_decimal_score(
+            Decimal(str(abs_delta_raw)),
+            score_scale_max=score_scale_max,
+        )
+    return normalized
+
+
+def _build_feedback_guardrail_delta_text(
+    payload: object,
+    *,
+    default_score_scale_max: int = DEFAULT_SCORE_SCALE_MAX,
+) -> str:
+    normalized = _normalize_feedback_guardrail_display_metrics(
+        payload,
+        default_score_scale_max=default_score_scale_max,
+    )
+    abs_delta_raw = _to_float_or_none(normalized.get("abs_delta_raw"))
+    if abs_delta_raw is None or abs_delta_raw <= 0:
+        return ""
+    score_scale_max = _normalize_score_scale_max(
+        normalized.get("score_scale_max"),
+        default=default_score_scale_max,
+    )
+    ratio = float(_to_float_or_none(normalized.get("relative_delta_ratio")) or 0.0) * 100.0
+    abs_delta_text = _format_score_value_for_scale(abs_delta_raw, score_scale_max) or "0.00"
+    return f"{abs_delta_text} 分（{_score_scale_label(score_scale_max)}，{ratio:.1f}%）"
+
+
 def _quantize_ground_truth_final_score(value: object, *, digits: int = 2) -> Optional[float]:
     numeric = _to_float_or_none(value)
     if numeric is None:
@@ -8671,12 +13618,41 @@ def _quantize_ground_truth_final_score(value: object, *, digits: int = 2) -> Opt
 
 def _extract_ground_truth_rule_page_hint(text: str, start: int, end: int) -> Optional[str]:
     window = str(text or "")[max(0, int(start) - 200) : max(int(end), int(start)) + 260]
-    page_match = re.search(r"\[PAGE:(\d+)\]", window)
-    if not page_match:
-        page_match = re.search(r"\[PAGE_SECTION_HINTS:(\d+)\]", window)
-    if not page_match:
+    page_matches = re.findall(r"\[PAGE:(\d+)\]|\[PAGE_SECTION_HINTS:(\d+)\]", window)
+    if not page_matches:
         return None
-    return f"第{page_match.group(1)}页"
+    for page_match, section_match in reversed(page_matches):
+        page_no = str(page_match or section_match).strip()
+        if page_no:
+            return f"第{page_no}页"
+    return None
+
+
+def _ground_truth_score_rule_excerpt_is_judge_scoring(excerpt: object) -> bool:
+    normalized_excerpt = re.sub(r"\s+", " ", str(excerpt or "")).strip()
+    if not normalized_excerpt:
+        return False
+    strong_positive_tokens = (
+        "打分",
+        "得分",
+        "评委",
+        "评标委员会各成员",
+        "成员评分",
+        "专家评分",
+    )
+    negative_price_tokens = (
+        "评标价",
+        "有效评标价",
+        "投标报价",
+        "报价",
+        "基准价",
+        "价格分",
+    )
+    has_strong_positive = any(token in normalized_excerpt for token in strong_positive_tokens)
+    has_negative_price = any(token in normalized_excerpt for token in negative_price_tokens)
+    if has_negative_price and not has_strong_positive:
+        return False
+    return True
 
 
 def _extract_ground_truth_score_rule_from_text(
@@ -8736,6 +13712,8 @@ def _extract_ground_truth_score_rule_from_text(
             continue
         start, end = match.span()
         excerpt = re.sub(r"\s+", " ", cleaned_text[max(0, start - 60) : end + 100]).strip()
+        if not _ground_truth_score_rule_excerpt_is_judge_scoring(excerpt):
+            continue
         page_hint = _extract_ground_truth_rule_page_hint(cleaned_text, start, end)
         matched_rule = {
             "formula": formula,
@@ -8751,6 +13729,73 @@ def _extract_ground_truth_score_rule_from_text(
         }
         break
     return matched_rule
+
+
+def _extract_ground_truth_score_rule_from_pdf_content(
+    content: bytes,
+    *,
+    filename: str,
+) -> Optional[Dict[str, object]]:
+    def _build_page_block(page_no: int, page_text: str) -> str:
+        lines = [f"[PAGE:{page_no}]"]
+        section_hints = _extract_tender_qa_section_titles(page_text, limit=4)
+        if section_hints:
+            lines.append(f"[PAGE_SECTION_HINTS:{page_no}] " + "、".join(section_hints[:4]))
+        lines.append(page_text)
+        return "\n".join(lines).strip()
+
+    parts: List[str] = []
+    best_candidate: Optional[Dict[str, object]] = None
+
+    def _update_best_candidate() -> Optional[Dict[str, object]]:
+        nonlocal best_candidate
+        candidate = _extract_ground_truth_score_rule_from_text(
+            "\n\n".join(parts),
+            filename=filename,
+        )
+        if not candidate:
+            return None
+        if best_candidate is None or (
+            int(_to_float_or_none(candidate.get("confidence")) or 0)
+            > int(_to_float_or_none(best_candidate.get("confidence")) or 0)
+        ):
+            best_candidate = candidate
+        if int(_to_float_or_none(candidate.get("confidence")) or 0) >= 100:
+            return candidate
+        return None
+
+    if pymupdf is not None:
+        doc = pymupdf.open(stream=content, filetype="pdf")
+        try:
+            for idx, page in enumerate(doc, start=1):
+                page_text = _normalize_ocr_text_block(page.get_text() or "")
+                if not page_text.strip():
+                    continue
+                parts.append(_build_page_block(idx, page_text))
+                candidate = _update_best_candidate()
+                if candidate:
+                    return candidate
+        finally:
+            doc.close()
+    if PdfReader is not None and bytes(content or b"").lstrip().startswith(b"%PDF"):
+        try:
+            reader = PdfReader(io.BytesIO(content))
+        except Exception:
+            reader = None
+        if reader is not None:
+            for idx, page in enumerate(getattr(reader, "pages", []) or [], start=1):
+                try:
+                    page_text = str(page.extract_text() or "")
+                except Exception:
+                    page_text = ""
+                page_text = _normalize_ocr_text_block(page_text)
+                if not page_text.strip():
+                    continue
+                parts.append(_build_page_block(idx, page_text))
+                candidate = _update_best_candidate()
+                if candidate:
+                    return candidate
+    return best_candidate
 
 
 def _default_ground_truth_score_rule(
@@ -8772,6 +13817,42 @@ def _default_ground_truth_score_rule(
         "source_page_hint": None,
         "source_excerpt": None,
     }
+
+
+def _extract_ground_truth_score_rule_from_material(
+    material: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    if not isinstance(material, dict):
+        return None
+    filename = str(material.get("filename") or "").strip()
+    parsed_text = str(material.get("parsed_text") or "").strip()
+    if parsed_text:
+        candidate = _extract_ground_truth_score_rule_from_text(parsed_text, filename=filename)
+        if candidate:
+            return candidate
+    material_path_raw = str(material.get("path") or "").strip()
+    if not material_path_raw:
+        return None
+    material_path = Path(material_path_raw)
+    if not material_path.exists() or not material_path.is_file():
+        return None
+    parsed_text_early_stopped = "[PDF_EARLY_STOP_AFTER_PAGE:" in parsed_text
+    if material_path.suffix.lower() != ".pdf" or not (parsed_text_early_stopped or not parsed_text):
+        return None
+    resolved_filename = filename or material_path.name
+    try:
+        content = read_bytes(material_path)
+        return _extract_ground_truth_score_rule_from_pdf_content(
+            content,
+            filename=resolved_filename,
+        )
+    except Exception as exc:
+        logger.warning(
+            "ground_truth_score_rule_fallback_parse_failed file=%s error=%s",
+            str(material_path),
+            str(exc),
+        )
+        return None
 
 
 def _resolve_project_ground_truth_score_rule(
@@ -8808,12 +13889,14 @@ def _resolve_project_ground_truth_score_rule(
             }
         )
         return override_rule
+    tender_materials = [
+        material
+        for material in load_materials()
+        if str(material.get("project_id") or "") == str(project_id)
+        and str(material.get("material_type") or "") == "tender_qa"
+    ]
     candidates: List[Dict[str, object]] = []
-    for material in load_materials():
-        if str(material.get("project_id") or "") != str(project_id):
-            continue
-        if str(material.get("material_type") or "") != "tender_qa":
-            continue
+    for material in tender_materials:
         parsed_text = str(material.get("parsed_text") or "").strip()
         if not parsed_text:
             continue
@@ -8823,6 +13906,11 @@ def _resolve_project_ground_truth_score_rule(
         )
         if candidate:
             candidates.append(candidate)
+    if not candidates:
+        for material in tender_materials:
+            candidate = _extract_ground_truth_score_rule_from_material(material)
+            if candidate:
+                candidates.append(candidate)
     if not candidates:
         return default_rule
     candidates.sort(
@@ -8856,6 +13944,178 @@ def _calculate_ground_truth_final_score(
     return float(quantized if quantized is not None else 0.0)
 
 
+def _auto_compute_ground_truth_final_score_if_needed(
+    project_id: str,
+    *,
+    judge_scores: object,
+    final_score: object,
+    project: Optional[Dict[str, object]] = None,
+) -> float:
+    provided_score = _to_float_or_none(final_score)
+    if provided_score is None:
+        raise HTTPException(status_code=422, detail="最终得分格式错误。")
+    if float(provided_score) > 0.0:
+        return float(provided_score)
+    project_row = project
+    if project_row is None:
+        project_row = next(
+            (item for item in load_projects() if str(item.get("id") or "") == str(project_id)),
+            None,
+        )
+    if not isinstance(project_row, dict):
+        return float(provided_score)
+    try:
+        scoring_rule = _resolve_project_ground_truth_score_rule(project_id, project=project_row)
+    except HTTPException:
+        return float(provided_score)
+    if not bool(scoring_rule.get("auto_compute")):
+        return float(provided_score)
+    try:
+        computed_score = _calculate_ground_truth_final_score(
+            judge_scores,
+            scoring_rule=scoring_rule,
+        )
+    except HTTPException:
+        return float(provided_score)
+    if float(computed_score) <= 0.0:
+        return float(provided_score)
+    return float(computed_score)
+
+
+def _repair_ground_truth_record_final_score_if_needed(
+    project_id: str,
+    record: Dict[str, object],
+    *,
+    project: Optional[Dict[str, object]] = None,
+    locale: str = "zh",
+) -> Dict[str, object]:
+    if not isinstance(record, dict):
+        return {}
+    judge_scores = record.get("judge_scores")
+    if not isinstance(judge_scores, list) or not judge_scores:
+        return record
+    project_row = project
+    if project_row is None:
+        project_row = next(
+            (item for item in load_projects() if str(item.get("id") or "") == str(project_id)),
+            None,
+        )
+    if not isinstance(project_row, dict):
+        return record
+
+    def _sync_qingtian_snapshot_if_needed(target_record: Dict[str, object]) -> Dict[str, object]:
+        record_id = str(target_record.get("id") or "").strip()
+        if not record_id:
+            return target_record
+        normalized_learning_record = _ground_truth_record_for_learning(
+            target_record,
+            default_score_scale_max=_resolve_project_score_scale_max(project_row),
+        )
+        expected_final_score_100 = float(normalized_learning_record.get("final_score", 0.0) or 0.0)
+        expected_final_score_raw = float(
+            normalized_learning_record.get("final_score_raw", 0.0) or 0.0
+        )
+        if expected_final_score_100 <= 0.0 or expected_final_score_raw <= 0.0:
+            return target_record
+        linked_qingtian_row = next(
+            (
+                row
+                for row in load_qingtian_results()
+                if str((row.get("raw_payload") or {}).get("ground_truth_record_id") or "").strip()
+                == record_id
+            ),
+            None,
+        )
+        if isinstance(linked_qingtian_row, dict):
+            raw_payload = (
+                linked_qingtian_row.get("raw_payload")
+                if isinstance(linked_qingtian_row.get("raw_payload"), dict)
+                else {}
+            )
+            current_qingtian_score = _to_float_or_none(linked_qingtian_row.get("qt_total_score"))
+            current_final_score_raw = _to_float_or_none(raw_payload.get("final_score_raw"))
+            if current_final_score_raw is None:
+                current_final_score_raw = _to_float_or_none(raw_payload.get("final_score"))
+            current_final_score_100 = _to_float_or_none(raw_payload.get("final_score_100"))
+            qingtian_in_sync = (
+                current_qingtian_score is not None
+                and abs(float(current_qingtian_score) - expected_final_score_100) <= 1e-6
+                and current_final_score_raw is not None
+                and abs(float(current_final_score_raw) - expected_final_score_raw) <= 1e-6
+                and current_final_score_100 is not None
+                and abs(float(current_final_score_100) - expected_final_score_100) <= 1e-6
+            )
+            if qingtian_in_sync:
+                return target_record
+        try:
+            _sync_ground_truth_record_to_qingtian(project_id, target_record)
+        except Exception as exc:
+            logger.warning(
+                "ground_truth_qingtian_snapshot_repair_failed project_id=%s record_id=%s error=%s",
+                project_id,
+                record_id,
+                str(exc),
+            )
+            return target_record
+        repaired_record = next(
+            (
+                row
+                for row in load_ground_truth()
+                if str(row.get("project_id") or "") == str(project_id)
+                and str(row.get("id") or "") == record_id
+            ),
+            None,
+        )
+        return repaired_record if isinstance(repaired_record, dict) else target_record
+
+    stored_raw = _to_float_or_none(record.get("final_score_raw"))
+    if stored_raw is None:
+        stored_raw = _to_float_or_none(record.get("final_score"))
+    stored_100 = _to_float_or_none(record.get("final_score_100"))
+    if float(stored_raw or 0.0) > 0.0 or float(stored_100 or 0.0) > 0.0:
+        return _sync_qingtian_snapshot_if_needed(record)
+    repaired_raw = _auto_compute_ground_truth_final_score_if_needed(
+        project_id,
+        judge_scores=judge_scores,
+        final_score=stored_raw or 0.0,
+        project=project_row,
+    )
+    if float(repaired_raw) <= 0.0:
+        return record
+    score_scale_max = _normalize_score_scale_max(
+        record.get("score_scale_max"),
+        default=_resolve_project_score_scale_max(project_row),
+    )
+    repaired_100 = float(_convert_score_to_100(repaired_raw, score_scale_max) or 0.0)
+    updates = {
+        "score_scale_max": score_scale_max,
+        "final_score": round(float(repaired_raw), 2),
+        "final_score_raw": round(float(repaired_raw), 2),
+        "final_score_100": round(float(repaired_100), 2),
+    }
+    persisted_row = _persist_ground_truth_record_fields(
+        project_id,
+        str(record.get("id") or ""),
+        updates=updates,
+    )
+    try:
+        repaired_record = _finalize_ground_truth_learning_record(
+            project_id,
+            persisted_row,
+            locale=locale,
+            trigger="ground_truth_auto_repair",
+        )
+        return _sync_qingtian_snapshot_if_needed(repaired_record)
+    except Exception as exc:
+        logger.warning(
+            "ground_truth_auto_repair_finalize_failed project_id=%s record_id=%s error=%s",
+            project_id,
+            str(record.get("id") or ""),
+            str(exc),
+        )
+        return _sync_qingtian_snapshot_if_needed(persisted_row)
+
+
 def _resolve_score_blend_weights(project: Dict[str, object]) -> tuple[float, float, float]:
     meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
     blend_raw = meta.get("score_blend") if isinstance(meta, dict) else {}
@@ -8887,6 +14147,16 @@ def _resolve_score_blend_weights(project: Dict[str, object]) -> tuple[float, flo
     llm_w /= total
     delta_cap = max(0.0, delta_cap)
     return rule_w, llm_w, delta_cap
+
+
+def _report_uses_exact_ground_truth_score(report: Dict[str, object]) -> bool:
+    if not isinstance(report, dict):
+        return False
+    blend = report.get("score_blend") if isinstance(report.get("score_blend"), dict) else {}
+    if str(blend.get("mode") or "").strip().lower() == "ground_truth_exact":
+        return True
+    meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+    return bool(meta.get("ground_truth_exact_match"))
 
 
 def _resolve_dynamic_blend_adjustment(
@@ -9180,9 +14450,56 @@ def _build_score_self_awareness(
     if numeric_category_count <= 0:
         reasons.append("资料中的数值约束簇不足")
     if sigma is not None and sigma > 6:
-        reasons.append(f"预测波动偏大（sigma={sigma:.2f}）")
+        reasons.append(f"校准分波动偏大（sigma={sigma:.2f}）")
     if ci_width is not None and ci_width > 18:
-        reasons.append(f"预测区间过宽（95%区间宽度={ci_width:.2f}）")
+        reasons.append(f"校准区间过宽（95%区间宽度={ci_width:.2f}）")
+
+    if _report_uses_exact_ground_truth_score(report):
+        overall_score = 1.0
+        level = "high"
+        exact_reason = "已命中真实评标，当前总分直接采用真实分"
+        if exact_reason not in reasons:
+            reasons.insert(0, exact_reason)
+        reasons = reasons[:8]
+        return {
+            "level": level,
+            "score_0_1": 1.0,
+            "score_0_100": 100.0,
+            "data_score_0_1": 1.0,
+            "model_score_0_1": 1.0,
+            "retrieval_file_coverage_rate": retrieval_file_coverage_rate,
+            "retrieval_hit_rate": retrieval_hit_rate,
+            "material_dimension_hit_rate": material_dimension_hit_rate,
+            "mandatory_hit_rate": mandatory_hit_rate,
+            "dimension_coverage_rate": dimension_coverage_rate,
+            "structured_signal_total": structured_signal_total,
+            "structured_signal_score": (
+                round(float(structured_signal_score), 4)
+                if structured_signal_score is not None
+                else None
+            ),
+            "structured_quality_avg": (
+                round(float(structured_quality_avg), 4)
+                if structured_quality_avg is not None
+                else None
+            ),
+            "structured_quality_type_rate": (
+                round(float(structured_quality_type_rate), 4)
+                if structured_quality_type_rate is not None
+                else None
+            ),
+            "structured_type_coverage_rate": (
+                round(float(structured_type_coverage_rate), 4)
+                if structured_type_coverage_rate is not None
+                else None
+            ),
+            "source_files_hit_count": source_files_hit_count,
+            "numeric_category_count": numeric_category_count,
+            "calibrator_sigma": 0.0,
+            "confidence_interval_width": 0.0,
+            "state": "ground_truth_exact",
+            "reasons": reasons,
+        }
 
     overall_score = max(0.0, min(1.0, float(overall_score)))
     if overall_score >= 0.72:
@@ -9268,10 +14585,15 @@ def _ensure_report_score_self_awareness(
     if isinstance(awareness, dict) and awareness:
         existing_state = str(awareness.get("state") or "").strip().lower()
         stale_gate_state = existing_state not in {"", expected_gate_state}
+        stale_exact_state = _report_uses_exact_ground_truth_score(report) and (
+            existing_state != "ground_truth_exact"
+            or str(awareness.get("level") or "").strip().lower() != "high"
+            or float(_to_float_or_none(awareness.get("score_0_100")) or 0.0) < 99.9
+        )
         stale_block_reason = expected_gate_state != "blocked" and any(
             "资料利用门禁阻断" in str(item or "") for item in (awareness.get("reasons") or [])
         )
-        if not stale_gate_state and not stale_block_reason:
+        if not stale_gate_state and not stale_block_reason and not stale_exact_state:
             if not meta.get("score_confidence_level"):
                 meta["score_confidence_level"] = str(awareness.get("level") or "low")
             return awareness
@@ -9324,6 +14646,76 @@ def _fuse_rule_and_llm_scores(
     return round(fused, 2), round(llm_bounded, 2), blend_info
 
 
+def _should_direct_apply_calibrator_prediction(model: Dict[str, object]) -> bool:
+    if not isinstance(model, dict):
+        return False
+    train_filter = model.get("train_filter") if isinstance(model.get("train_filter"), dict) else {}
+    if not str(train_filter.get("project_id") or "").strip():
+        return False
+    summary = (
+        model.get("calibrator_summary") if isinstance(model.get("calibrator_summary"), dict) else {}
+    )
+    if not summary:
+        return False
+    if str(summary.get("deployment_mode") or "").strip().lower() != "cv_validated":
+        return False
+    if bool(summary.get("bootstrap_small_sample")):
+        return False
+    if not bool(summary.get("gate_passed")):
+        return False
+    sample_count = _to_float_or_none(summary.get("sample_count"))
+    if sample_count is None or sample_count < float(DEFAULT_DIRECT_CALIBRATOR_SAMPLE_MIN):
+        return False
+    cv_metrics = summary.get("cv_metrics") if isinstance(summary.get("cv_metrics"), dict) else {}
+    cv_mae = _to_float_or_none(cv_metrics.get("mae"))
+    if cv_mae is None or cv_mae > float(DEFAULT_DIRECT_CALIBRATOR_MAX_CV_MAE):
+        return False
+    return True
+
+
+def _resolve_exact_ground_truth_score_for_submission(
+    *,
+    project_id: str,
+    project: Dict[str, object],
+    submission_like: Dict[str, object],
+) -> Optional[float]:
+    submission_id = str(submission_like.get("id") or "").strip()
+    submission_text = str(submission_like.get("text") or "").strip()
+    normalized_filename = _normalize_uploaded_filename(str(submission_like.get("filename") or ""))
+    if not submission_id and not submission_text and not normalized_filename:
+        return None
+    project_score_scale = _resolve_project_score_scale_max(project)
+    for row in _list_project_ground_truth_records(project_id, include_guardrail_blocked=True):
+        if not isinstance(row, dict):
+            continue
+        matched = False
+        if submission_id and submission_id == str(row.get("source_submission_id") or "").strip():
+            matched = True
+        elif submission_text and submission_text == str(row.get("shigong_text") or "").strip():
+            matched = True
+        elif normalized_filename:
+            row_filename = _normalize_uploaded_filename(
+                str(row.get("source_submission_filename") or "")
+            )
+            if row_filename and row_filename == normalized_filename:
+                matched = True
+        if not matched:
+            continue
+        repaired_row = _repair_ground_truth_record_final_score_if_needed(
+            project_id,
+            row,
+            project=project,
+        )
+        normalized = _ground_truth_record_for_learning(
+            repaired_row,
+            default_score_scale_max=project_score_scale,
+        )
+        final_score = _to_float_or_none(normalized.get("final_score"))
+        if final_score is not None:
+            return round(float(final_score), 2)
+    return None
+
+
 def _apply_prediction_to_report_with_model(
     report: Dict[str, object],
     *,
@@ -9331,6 +14723,41 @@ def _apply_prediction_to_report_with_model(
     project: Dict[str, object],
     model_override: Optional[Dict[str, object]] = None,
 ) -> Optional[str]:
+    project_id = str(submission_like.get("project_id") or project.get("id") or "").strip()
+    exact_ground_truth_score = (
+        _resolve_exact_ground_truth_score_for_submission(
+            project_id=project_id,
+            project=project,
+            submission_like=submission_like,
+        )
+        if project_id
+        else None
+    )
+    if exact_ground_truth_score is not None:
+        report["pred_total_score"] = float(exact_ground_truth_score)
+        report["llm_total_score"] = None
+        report["pred_confidence"] = {
+            "sigma": 0.0,
+            "lower": float(exact_ground_truth_score),
+            "upper": float(exact_ground_truth_score),
+            "raw_llm_score": None,
+            "bounded_llm_score": None,
+            "fused_ci95_lower": float(exact_ground_truth_score),
+            "fused_ci95_upper": float(exact_ground_truth_score),
+            "fused_sigma": 0.0,
+            "source": "ground_truth_exact",
+        }
+        report["pred_dim_scores"] = None
+        report["score_blend"] = {
+            "mode": "ground_truth_exact",
+            "reason": "approved_exact_submission_match",
+        }
+        report["total_score"] = float(exact_ground_truth_score)
+        submission_like["total_score"] = float(exact_ground_truth_score)
+        report.setdefault("meta", {})
+        report["meta"]["ground_truth_exact_match"] = True
+        report["meta"]["ground_truth_exact_match_score"] = float(exact_ground_truth_score)
+        return None
     model = (
         model_override if isinstance(model_override, dict) else _select_calibrator_model(project)
     )
@@ -9418,6 +14845,23 @@ def _apply_prediction_to_report_with_model(
                 _to_float_or_none(((artifact or {}).get("metrics") or {}).get("sample_count")) or 0
             ),
         }
+    elif _should_direct_apply_calibrator_prediction(model):
+        summary = (
+            model.get("calibrator_summary")
+            if isinstance(model.get("calibrator_summary"), dict)
+            else {}
+        )
+        cv_metrics = (
+            summary.get("cv_metrics") if isinstance(summary.get("cv_metrics"), dict) else {}
+        )
+        fused_total = _clip_score(float(pred))
+        llm_total = None
+        blend_info = {
+            "mode": "project_calibrator_direct",
+            "reason": "cv_validated_project_calibrator",
+            "sample_count": int(_to_float_or_none(summary.get("sample_count")) or 0),
+            "cv_mae": round(float(_to_float_or_none(cv_metrics.get("mae")) or 0.0), 4),
+        }
     else:
         fused_total, llm_total, blend_info = _fuse_rule_and_llm_scores(
             rule_total=rule_total,
@@ -9482,6 +14926,20 @@ def _load_evidence_units_safe() -> List[Dict[str, object]]:
     return [row for row in rows if isinstance(row, dict)]
 
 
+def _load_submissions_safe() -> List[Dict[str, object]]:
+    try:
+        rows = load_submissions()
+    except StorageDataError as exc:
+        logger.warning(
+            "submissions_storage_fallback path=%s code=%s detail=%s",
+            exc.path,
+            exc.code,
+            exc.detail,
+        )
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
 def _load_calibration_models_safe() -> List[Dict[str, object]]:
     try:
         rows = load_calibration_models()
@@ -9505,6 +14963,7 @@ def _resolve_submission_score_fields(
     report = submission.get("report")
     pred_total = None
     rule_total = None
+    score_source = "rule"
     if isinstance(report, dict):
         pred_total = _to_float_or_none(report.get("pred_total_score"))
         if not allow_pred_score:
@@ -9512,6 +14971,10 @@ def _resolve_submission_score_fields(
         rule_total = _to_float_or_none(report.get("rule_total_score"))
         if rule_total is None:
             rule_total = _to_float_or_none(report.get("total_score"))
+        if _report_uses_exact_ground_truth_score(report):
+            score_source = "ground_truth"
+        elif pred_total is not None:
+            score_source = "pred"
     fallback_total = _to_float_or_none(submission.get("total_score"))
     if rule_total is None:
         rule_total = fallback_total
@@ -9527,7 +14990,7 @@ def _resolve_submission_score_fields(
         "total_score": float(total_display),
         "pred_total_score": float(pred_display) if pred_display is not None else None,
         "rule_total_score": float(rule_display) if rule_display is not None else None,
-        "score_source": "pred" if pred_total is not None else "rule",
+        "score_source": score_source,
     }
 
 
@@ -10063,6 +15526,272 @@ def _calibrator_auto_review_state(model: Dict[str, object]) -> Dict[str, Any]:
     return _normalize_calibrator_auto_review_state(summary.get("auto_review"))
 
 
+def _calibrator_train_scope_project_id(model: Dict[str, object]) -> str:
+    return str(((model.get("train_filter") or {}).get("project_id") or "")).strip()
+
+
+def _calibrator_gate_passed(model: Dict[str, object]) -> Optional[bool]:
+    summary = _calibrator_summary_dict(model)
+    if "gate_passed" in summary:
+        return bool(summary.get("gate_passed"))
+    metrics = model.get("metrics") if isinstance(model.get("metrics"), dict) else {}
+    if "gate_passed" in metrics:
+        return bool(metrics.get("gate_passed"))
+    raw = model.get("gate_passed")
+    if raw is None:
+        return None
+    return bool(raw)
+
+
+def _calibrator_cv_mae(model: Dict[str, object]) -> Optional[float]:
+    summary = _calibrator_summary_dict(model)
+    cv_metrics = summary.get("cv_metrics") if isinstance(summary.get("cv_metrics"), dict) else {}
+    value = _to_float_or_none(cv_metrics.get("mae"))
+    if value is not None:
+        return float(value)
+    metrics = model.get("metrics") if isinstance(model.get("metrics"), dict) else {}
+    return _to_float_or_none(metrics.get("cv_mae") or metrics.get("mae"))
+
+
+def _current_project_calibrator_record(
+    project: Dict[str, object],
+    rows: List[Dict[str, object]],
+) -> Optional[Dict[str, object]]:
+    current = _select_calibrator_model_from_rows(project, rows or [])
+    if not isinstance(current, dict):
+        return None
+    if not _calibrator_train_scope_project_id(current):
+        return None
+    if str(current.get("calibrator_version") or "").strip().startswith("prior_"):
+        return None
+    return current
+
+
+def _find_project_calibrator_rollback_candidate(
+    project: Dict[str, object],
+    rows: List[Dict[str, object]],
+) -> Optional[Dict[str, object]]:
+    current = _current_project_calibrator_record(project, rows or [])
+    if not isinstance(current, dict):
+        return None
+    project_id = str(project.get("id") or "").strip()
+    current_version = str(current.get("calibrator_version") or "").strip()
+    current_cv_mae = _calibrator_cv_mae(current)
+    candidates: List[Dict[str, object]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        if _calibrator_train_scope_project_id(row) != project_id:
+            continue
+        version = str(row.get("calibrator_version") or "").strip()
+        if not version or version == current_version or version.startswith("prior_"):
+            continue
+        deployment_mode = _calibrator_deployment_mode(row)
+        if deployment_mode not in {"cv_validated", "bootstrap_auto_deploy"}:
+            continue
+        gate_passed = _calibrator_gate_passed(row)
+        # Older historical rows can lose `deployed=True` after a newer model is promoted,
+        # while still retaining a deployed-mode summary but no explicit gate flag.
+        if gate_passed is False:
+            continue
+        if gate_passed is None and deployment_mode not in {"cv_validated", "bootstrap_auto_deploy"}:
+            continue
+        candidate_cv_mae = _calibrator_cv_mae(row)
+        if (
+            current_cv_mae is not None
+            and candidate_cv_mae is not None
+            and candidate_cv_mae
+            > current_cv_mae - float(DEFAULT_PROJECT_CALIBRATOR_PROMOTION_MIN_MAE_IMPROVEMENT)
+        ):
+            continue
+        candidates.append(row)
+    if not candidates:
+        return None
+
+    def _candidate_priority(row: Dict[str, object]) -> tuple[int, float, str]:
+        mode = _calibrator_deployment_mode(row)
+        mode_priority = 0 if mode == "cv_validated" else 1
+        cv_mae = _calibrator_cv_mae(row)
+        return (
+            mode_priority,
+            float(cv_mae) if cv_mae is not None else 9999.0,
+            str(row.get("updated_at") or row.get("created_at") or ""),
+        )
+
+    return sorted(candidates, key=_candidate_priority)[0]
+
+
+def _auto_recover_degraded_project_calibrator(
+    *,
+    project_id: str,
+    project: Dict[str, object],
+    locale: str,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "checked": False,
+        "degraded_before": False,
+        "degraded_after": None,
+        "recovered_after": None,
+        "action": "skip",
+        "reason": "not_checked",
+        "rollback_candidate_version": None,
+        "matched_submission_count": 0,
+        "avg_abs_delta_stored": None,
+        "avg_abs_delta_preview": None,
+        "avg_abs_delta_improvement": None,
+        "mae_after": None,
+        "rule_mae_after": None,
+        "mae_delta_vs_rule_after": None,
+        "updated_reports": 0,
+        "updated_submissions": 0,
+        "active_calibrator_version_after": None,
+    }
+    health = _build_evolution_health_report(project_id, project)
+    summary = health.get("summary") if isinstance(health, dict) else {}
+    if not isinstance(summary, dict):
+        return result
+    result["checked"] = True
+    result["degraded_before"] = bool(summary.get("current_calibrator_degraded"))
+    result["active_calibrator_version_after"] = summary.get("current_calibrator_version")
+    rollback_version = str(
+        summary.get("current_calibrator_rollback_candidate_version") or ""
+    ).strip()
+    result["rollback_candidate_version"] = rollback_version or None
+    if not bool(summary.get("current_calibrator_degraded")):
+        result["reason"] = "current_calibrator_healthy"
+        return result
+    if not rollback_version:
+        result["reason"] = "no_rollback_candidate"
+        return result
+
+    models = load_calibration_models()
+    candidate = next(
+        (
+            row
+            for row in models
+            if str(row.get("calibrator_version") or "").strip() == rollback_version
+        ),
+        None,
+    )
+    if not isinstance(candidate, dict):
+        result["reason"] = "rollback_candidate_missing"
+        return result
+
+    override_rows = _build_calibration_models_preview_override(project, models, candidate)
+    preview_project = dict(project)
+    preview_project["calibrator_version_locked"] = rollback_version
+    preview = _build_governance_score_preview(
+        project_id,
+        preview_project,
+        [],
+        artifact_payload_overrides={"calibration_models": override_rows},
+    )
+    matched_submission_count = int(_to_float_or_none(preview.get("matched_submission_count")) or 0)
+    avg_abs_delta_stored = _to_float_or_none(preview.get("avg_abs_delta_stored"))
+    avg_abs_delta_preview = _to_float_or_none(preview.get("avg_abs_delta_preview"))
+    avg_abs_delta_improvement = _to_float_or_none(preview.get("avg_abs_delta_improvement"))
+    result.update(
+        {
+            "matched_submission_count": matched_submission_count,
+            "avg_abs_delta_stored": avg_abs_delta_stored,
+            "avg_abs_delta_preview": avg_abs_delta_preview,
+            "avg_abs_delta_improvement": avg_abs_delta_improvement,
+        }
+    )
+    if (
+        matched_submission_count <= 0
+        or avg_abs_delta_stored is None
+        or avg_abs_delta_preview is None
+    ):
+        result["reason"] = "no_comparable_rows"
+        return result
+
+    tolerance = float(DEFAULT_BOOTSTRAP_CALIBRATION_MAX_AVG_DELTA_INCREASE)
+    if float(avg_abs_delta_preview) > float(avg_abs_delta_stored) + tolerance:
+        result["reason"] = "rollback_preview_worsened_beyond_tolerance"
+        return result
+    if float(avg_abs_delta_preview) >= float(avg_abs_delta_stored) - 0.01:
+        result["reason"] = "rollback_preview_not_improved"
+        return result
+
+    deploy_calibrator(
+        CalibratorDeployRequest(
+            calibrator_version=rollback_version,
+            project_id=project_id,
+        ),
+        api_key=None,
+    )
+    prediction_result = apply_calibration_prediction(
+        project_id,
+        api_key=None,
+        locale=locale,
+    )
+    result["action"] = "rollback"
+    result["reason"] = "rollback_preview_improved"
+    result["updated_reports"] = int(prediction_result.updated_reports or 0)
+    result["updated_submissions"] = int(prediction_result.updated_submissions or 0)
+    refreshed_projects = load_projects()
+    refreshed_project = next(
+        (row for row in refreshed_projects if str(row.get("id") or "").strip() == project_id),
+        None,
+    )
+    verify_health = _build_evolution_health_report(project_id, refreshed_project or project)
+    verify_summary = verify_health.get("summary") if isinstance(verify_health, dict) else {}
+    if isinstance(verify_summary, dict):
+        degraded_after = bool(verify_summary.get("current_calibrator_degraded"))
+        result["degraded_after"] = degraded_after
+        result["recovered_after"] = not degraded_after
+        result["mae_after"] = _to_float_or_none(verify_summary.get("current_calibrator_recent_mae"))
+        result["rule_mae_after"] = _to_float_or_none(
+            verify_summary.get("current_calibrator_recent_rule_mae")
+        )
+        result["mae_delta_vs_rule_after"] = _to_float_or_none(
+            verify_summary.get("current_calibrator_recent_mae_delta_vs_rule")
+        )
+        result["active_calibrator_version_after"] = (
+            str(verify_summary.get("current_calibrator_version") or "").strip() or rollback_version
+        )
+    else:
+        result["active_calibrator_version_after"] = rollback_version
+    return result
+
+
+def _should_keep_existing_project_calibrator(
+    *,
+    project: Dict[str, object],
+    existing_models: List[Dict[str, object]],
+    candidate_record: Dict[str, object],
+) -> bool:
+    current = _current_project_calibrator_record(project, existing_models)
+    if current is None:
+        return False
+    project_id = str(project.get("id") or "").strip()
+    if not project_id:
+        return False
+    if _calibrator_train_scope_project_id(current) != project_id:
+        return False
+
+    current_gate_passed = _calibrator_gate_passed(current)
+    candidate_gate_passed = _calibrator_gate_passed(candidate_record)
+    if current_gate_passed is not True or candidate_gate_passed is not True:
+        return False
+
+    current_mode = _calibrator_deployment_mode(current)
+    candidate_mode = _calibrator_deployment_mode(candidate_record)
+    if current_mode == "cv_validated" and candidate_mode != "cv_validated":
+        return True
+
+    current_cv_mae = _calibrator_cv_mae(current)
+    candidate_cv_mae = _calibrator_cv_mae(candidate_record)
+    if current_cv_mae is not None and candidate_cv_mae is None:
+        return True
+    if current_cv_mae is None or candidate_cv_mae is None:
+        return False
+    return candidate_cv_mae > (
+        current_cv_mae - float(DEFAULT_PROJECT_CALIBRATOR_PROMOTION_MIN_MAE_IMPROVEMENT)
+    )
+
+
 def _project_calibrator_rows(
     project: Dict[str, object],
     rows: List[Dict[str, object]],
@@ -10147,12 +15876,13 @@ def _build_calibrator_auto_review(
 ) -> Dict[str, Any]:
     bootstrap_small_sample = _calibrator_bootstrap_small_sample(candidate_record)
     default_action = "keep_with_monitoring" if bootstrap_small_sample else "keep"
+    review_mode = "bootstrap_preview" if bootstrap_small_sample else "deployment_preview"
     result: Dict[str, Any] = {
         "checked": False,
         "passed": None,
         "action": default_action,
         "reason": "not_required",
-        "review_mode": "bootstrap_preview",
+        "review_mode": review_mode,
         "reviewed_at": _now_iso(),
         "matched_submission_count": 0,
         "avg_abs_delta_stored": None,
@@ -10165,9 +15895,6 @@ def _build_calibrator_auto_review(
     if not bool(candidate_record.get("deployed")):
         result["action"] = "skip"
         result["reason"] = "candidate_not_deployed"
-        return result
-    if not bootstrap_small_sample:
-        result["reason"] = "full_validation_not_required"
         return result
 
     override_rows = _build_calibration_models_preview_override(
@@ -10205,7 +15932,7 @@ def _build_calibrator_auto_review(
         or avg_abs_delta_stored is None
         or avg_abs_delta_preview is None
     ):
-        result["action"] = "keep_with_monitoring"
+        result["action"] = default_action
         result["reason"] = "no_comparable_rows"
         return result
 
@@ -10222,7 +15949,7 @@ def _build_calibrator_auto_review(
         result["reason"] = "preview_improved"
     else:
         result["passed"] = True
-        result["action"] = "keep_with_monitoring"
+        result["action"] = default_action
         result["reason"] = "preview_non_inferior_within_tolerance"
     return result
 
@@ -10252,22 +15979,45 @@ def _finalize_calibrator_record_for_deploy(
         and isinstance(project, dict)
         and str(project.get("id") or "").strip()
     ):
-        auto_review = _build_calibrator_auto_review(
-            project_id=str(project.get("id") or ""),
+        if _should_keep_existing_project_calibrator(
             project=project,
             existing_models=existing_models,
             candidate_record=record,
-        )
-        if bool(auto_review.get("checked")) and str(auto_review.get("action") or "") == "rollback":
+        ):
+            auto_review = _normalize_calibrator_auto_review_state(
+                {
+                    "checked": True,
+                    "passed": True,
+                    "action": "keep_existing",
+                    "reason": "existing_better_project_calibrator_kept",
+                    "review_mode": "deployment_guard",
+                    "reviewed_at": _now_iso(),
+                }
+            )
             record["deployed"] = False
             deployment_mode = (
                 "bootstrap_candidate_only" if bootstrap_small_sample else "candidate_only"
             )
-        elif (
-            bootstrap_small_sample
-            and str(auto_review.get("action") or "") == "keep_with_monitoring"
-        ):
-            deployment_mode = "bootstrap_auto_deploy"
+        else:
+            auto_review = _build_calibrator_auto_review(
+                project_id=str(project.get("id") or ""),
+                project=project,
+                existing_models=existing_models,
+                candidate_record=record,
+            )
+            if (
+                bool(auto_review.get("checked"))
+                and str(auto_review.get("action") or "") == "rollback"
+            ):
+                record["deployed"] = False
+                deployment_mode = (
+                    "bootstrap_candidate_only" if bootstrap_small_sample else "candidate_only"
+                )
+            elif (
+                bootstrap_small_sample
+                and str(auto_review.get("action") or "") == "keep_with_monitoring"
+            ):
+                deployment_mode = "bootstrap_auto_deploy"
 
     summary["bootstrap_small_sample"] = bool(bootstrap_small_sample)
     summary["full_validation_min_samples"] = LEGACY_PROJECT_LEARNING_MIN_SAMPLES
@@ -10306,6 +16056,40 @@ def _build_calibration_baseline_metrics(
         for row in labeled_rows
     ]
     return calc_metrics(y_true, baseline_pred)
+
+
+def _compute_calibration_label_score_span(
+    feature_rows: List[Dict[str, Any]],
+) -> float:
+    labeled_rows = [row for row in feature_rows if row.get("y_label") is not None]
+    y_true = [float(row.get("y_label")) for row in labeled_rows]
+    if len(y_true) < 2:
+        return 0.0
+    return round(max(y_true) - min(y_true), 4)
+
+
+def _should_allow_clustered_score_gate_override(
+    *,
+    feature_rows: List[Dict[str, Any]],
+    baseline_metrics: Dict[str, Any],
+    cv_metrics: Dict[str, Any],
+    sample_count: int,
+    improve_threshold: float,
+) -> bool:
+    baseline_mae = float(baseline_metrics.get("mae") or 0.0)
+    cv_mae = float(cv_metrics.get("mae") or 0.0)
+    label_score_span = _compute_calibration_label_score_span(feature_rows)
+    if sample_count < 5:
+        return False
+    if label_score_span > 6.0:
+        return False
+    if baseline_mae < 10.0:
+        return False
+    if cv_mae > baseline_mae - float(improve_threshold):
+        return False
+    if cv_mae > min(3.0, baseline_mae * 0.08):
+        return False
+    return True
 
 
 def _train_calibrator_with_gate(
@@ -10376,6 +16160,18 @@ def _train_calibrator_with_gate(
             and float(cv_metrics.get("spearman") or 0.0)
             >= float(baseline_metrics.get("spearman") or 0.0) - spearman_tolerance
         )
+        clustered_score_override = bool(
+            cv.get("ok")
+        ) and _should_allow_clustered_score_gate_override(
+            feature_rows=labeled_rows,
+            baseline_metrics=baseline_metrics,
+            cv_metrics=cv_metrics,
+            sample_count=sample_count,
+            improve_threshold=improve_threshold,
+        )
+        gate_passed = gate_passed or clustered_score_override
+    label_score_span = _compute_calibration_label_score_span(labeled_rows)
+    clustered_score_override = bool(locals().get("clustered_score_override", False))
 
     cv_metrics = (
         (cv.get("metrics") or {})
@@ -10391,8 +16187,10 @@ def _train_calibrator_with_gate(
     model_artifact["metrics"]["baseline_mae"] = baseline_metrics.get("mae")
     model_artifact["metrics"]["baseline_rmse"] = baseline_metrics.get("rmse")
     model_artifact["metrics"]["baseline_spearman"] = baseline_metrics.get("spearman")
+    model_artifact["metrics"]["label_score_span"] = label_score_span
     model_artifact["metrics"]["gate_improve_threshold"] = round(improve_threshold, 4)
     model_artifact["metrics"]["gate_spearman_tolerance"] = spearman_tolerance
+    model_artifact["metrics"]["gate_clustered_score_override"] = bool(clustered_score_override)
     if bootstrap_small_sample:
         model_artifact["metrics"]["bootstrap_small_sample"] = True
         model_artifact["metrics"]["bootstrap_sample_count"] = sample_count
@@ -10433,6 +16231,10 @@ def _train_calibrator_with_gate(
         deployment_mode="candidate_only",
         auto_review=_normalize_calibrator_auto_review_state({}),
     )
+    gate_payload = summary.get("gate") if isinstance(summary.get("gate"), dict) else {}
+    gate_payload["label_score_span"] = label_score_span
+    gate_payload["clustered_score_override"] = bool(clustered_score_override)
+    summary["gate"] = gate_payload
     return {
         "model_artifact": model_artifact,
         "selected_type": selected_type,
@@ -10923,11 +16725,75 @@ def _refresh_evolution_report_from_ground_truth(
     # 自动闭环刷新时仅更新规则进化结果与编制指导；保留已有 LLM 增强来源标记。
     if isinstance(prev.get("enhanced_by"), str):
         report["enhanced_by"] = prev.get("enhanced_by")
+    if isinstance(prev.get("calibrator_runtime_governance"), dict):
+        report["calibrator_runtime_governance"] = dict(
+            prev.get("calibrator_runtime_governance") or {}
+        )
     reports[project_id] = report
     save_evolution_reports(reports)
     return {
         "refreshed": True,
         "sample_count": int(report.get("sample_count", 0) or 0),
+    }
+
+
+def _persist_calibrator_runtime_governance(
+    project_id: str,
+    governance: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    payload = dict(governance or {})
+    if not payload:
+        return {}
+    payload["recorded_at"] = _now_iso()
+    reports = load_evolution_reports()
+    report = dict(reports.get(project_id) or {})
+    report["project_id"] = project_id
+    report["calibrator_runtime_governance"] = payload
+    reports[project_id] = report
+    save_evolution_reports(reports)
+    return payload
+
+
+def _build_reflection_post_run_health_summary(
+    project_id: str,
+    project: Dict[str, object],
+) -> Dict[str, Any]:
+    health = _build_evolution_health_report(project_id, project)
+    summary = health.get("summary") if isinstance(health, dict) else {}
+    if not isinstance(summary, dict):
+        return {}
+    return {
+        "current_calibrator_version": str(summary.get("current_calibrator_version") or "").strip()
+        or None,
+        "current_calibrator_source": str(summary.get("current_calibrator_source") or "").strip()
+        or None,
+        "current_calibrator_deployment_mode": (
+            str(summary.get("current_calibrator_deployment_mode") or "").strip() or None
+        ),
+        "current_calibrator_degraded": bool(summary.get("current_calibrator_degraded")),
+        "current_calibrator_recent_mae": _to_float_or_none(
+            summary.get("current_calibrator_recent_mae")
+        ),
+        "current_calibrator_recent_rule_mae": _to_float_or_none(
+            summary.get("current_calibrator_recent_rule_mae")
+        ),
+        "current_calibrator_recent_mae_delta_vs_rule": _to_float_or_none(
+            summary.get("current_calibrator_recent_mae_delta_vs_rule")
+        ),
+        "current_calibrator_has_rollback_candidate": bool(
+            summary.get("current_calibrator_has_rollback_candidate")
+        ),
+        "current_calibrator_rollback_candidate_version": (
+            str(summary.get("current_calibrator_rollback_candidate_version") or "").strip() or None
+        ),
+        "last_calibrator_runtime_governance_action": (
+            str(summary.get("last_calibrator_runtime_governance_action") or "").strip() or None
+        ),
+        "last_calibrator_runtime_governance_recovered_after": (
+            summary.get("last_calibrator_runtime_governance_recovered_after")
+            if isinstance(summary.get("last_calibrator_runtime_governance_recovered_after"), bool)
+            else None
+        ),
     }
 
 
@@ -10944,11 +16810,28 @@ def _extract_feedback_guardrail(payload: object) -> Dict[str, object]:
     if not isinstance(payload, dict):
         return {}
     guardrail = payload.get("feedback_guardrail")
+    if isinstance(guardrail, dict):
+        merged_guardrail = dict(guardrail)
+        if merged_guardrail.get("score_scale_max") is None:
+            merged_guardrail["score_scale_max"] = payload.get("score_scale_max")
+        if merged_guardrail.get("actual_score_raw") is None:
+            merged_guardrail["actual_score_raw"] = (
+                payload.get("final_score_raw")
+                if payload.get("final_score_raw") is not None
+                else payload.get("final_score")
+            )
+        if merged_guardrail.get("actual_score_100") is None:
+            merged_guardrail["actual_score_100"] = payload.get("final_score_100")
+        guardrail = merged_guardrail
     return _normalize_feedback_guardrail_state(guardrail)
 
 
 def _normalize_feedback_guardrail_state(payload: object) -> Dict[str, object]:
     guardrail = dict(payload) if isinstance(payload, dict) else {}
+    current_score_100 = _to_float_or_none(guardrail.get("current_score_100"))
+    predicted_score_100 = _to_float_or_none(guardrail.get("predicted_score_100"))
+    if current_score_100 is None and predicted_score_100 is not None:
+        guardrail["current_score_100"] = predicted_score_100
     threshold_blocked = bool(guardrail.get("threshold_blocked", guardrail.get("blocked")))
     manual_review = (
         dict(guardrail.get("manual_review"))
@@ -10982,7 +16865,7 @@ def _normalize_feedback_guardrail_state(payload: object) -> Dict[str, object]:
     else:
         status = str(guardrail.get("status") or "accepted").strip() or "accepted"
 
-    normalized = dict(guardrail)
+    normalized = _normalize_feedback_guardrail_display_metrics(guardrail)
     normalized["threshold_blocked"] = threshold_blocked
     normalized["manual_review"] = {
         "status": review_status,
@@ -10998,18 +16881,29 @@ def _normalize_feedback_guardrail_state(payload: object) -> Dict[str, object]:
         threshold_blocked and review_status == "pending"
     )
     normalized["manual_override_hint"] = "confirm_extreme_sample=1" if blocked else None
-    if threshold_blocked and not str(normalized.get("warning_message") or "").strip():
-        abs_delta = float(_to_float_or_none(normalized.get("abs_delta_100")) or 0.0)
-        ratio = float(_to_float_or_none(normalized.get("relative_delta_ratio")) or 0.0) * 100.0
-        if abs_delta > 0:
-            normalized["warning_message"] = (
-                f"预测与真实总分偏差 {abs_delta:.2f} 分（100分口径，{ratio:.1f}%），"
-                "已暂停自动调权/自动校准，请人工确认后再执行「学习进化」或「一键闭环执行」。"
+    if threshold_blocked:
+        existing_warning = str(normalized.get("warning_message") or "").strip()
+        should_refresh_warning = not existing_warning or (
+            int(_to_float_or_none(normalized.get("score_scale_max")) or DEFAULT_SCORE_SCALE_MAX)
+            == 5
+            and "100分口径" in existing_warning
+        )
+        if should_refresh_warning:
+            delta_text = _build_feedback_guardrail_delta_text(
+                normalized,
+                default_score_scale_max=int(
+                    _to_float_or_none(normalized.get("score_scale_max")) or DEFAULT_SCORE_SCALE_MAX
+                ),
             )
-        else:
-            normalized[
-                "warning_message"
-            ] = "检测到极端偏差样本，已暂停自动调权/自动校准，请人工确认后再执行。"
+            if delta_text:
+                normalized["warning_message"] = (
+                    f"当前分与真实总分偏差 {delta_text}，"
+                    "已暂停自动调权/自动校准，请人工确认后再执行「学习进化」或「一键闭环执行」。"
+                )
+            else:
+                normalized[
+                    "warning_message"
+                ] = "检测到极端偏差样本，已暂停自动调权/自动校准，请人工确认后再执行。"
     return normalized
 
 
@@ -11125,6 +17019,7 @@ def _resolve_ground_truth_source_submission(
     *,
     submissions_by_id: Dict[str, Dict[str, object]],
     submissions_by_text: Dict[str, Dict[str, object]],
+    submissions_by_filename: Dict[str, Dict[str, object]],
 ) -> Optional[Dict[str, object]]:
     source_submission_id = str(row.get("source_submission_id") or "").strip()
     if source_submission_id:
@@ -11132,9 +17027,17 @@ def _resolve_ground_truth_source_submission(
         if matched is not None:
             return matched
     shigong_text = str(row.get("shigong_text") or "").strip()
-    if not shigong_text:
+    if shigong_text:
+        matched = submissions_by_text.get(shigong_text)
+        if matched is not None:
+            return matched
+    source_submission_filename = str(row.get("source_submission_filename") or "").strip()
+    if not source_submission_filename:
         return None
-    return submissions_by_text.get(shigong_text)
+    normalized_filename = _normalize_uploaded_filename(source_submission_filename)
+    if not normalized_filename:
+        return None
+    return submissions_by_filename.get(normalized_filename)
 
 
 def _enrich_ground_truth_submission_metadata(
@@ -11146,10 +17049,14 @@ def _enrich_ground_truth_submission_metadata(
         str(s.get("id") or "").strip(): s for s in submissions if str(s.get("id") or "").strip()
     }
     submissions_by_text: Dict[str, Dict[str, object]] = {}
+    submissions_by_filename: Dict[str, Dict[str, object]] = {}
     for submission in submissions:
         text = str(submission.get("text") or "").strip()
         if text and text not in submissions_by_text:
             submissions_by_text[text] = submission
+        normalized_filename = _normalize_uploaded_filename(str(submission.get("filename") or ""))
+        if normalized_filename and normalized_filename not in submissions_by_filename:
+            submissions_by_filename[normalized_filename] = submission
 
     enriched_rows: List[Dict[str, object]] = []
     for row in rows:
@@ -11160,6 +17067,7 @@ def _enrich_ground_truth_submission_metadata(
             enriched,
             submissions_by_id=submissions_by_id,
             submissions_by_text=submissions_by_text,
+            submissions_by_filename=submissions_by_filename,
         )
         if submission is not None:
             submission_id = str(submission.get("id") or "").strip()
@@ -11242,6 +17150,16 @@ def _summarize_project_feedback_guardrail(
         float(_to_float_or_none((item.get("feedback_guardrail") or {}).get("abs_delta_100")) or 0.0)
         for item in blocked_rows
     )
+    scale_max = _normalize_score_scale_max(
+        (
+            (pending_rows[0] if pending_rows else blocked_rows[0]).get("feedback_guardrail") or {}
+        ).get("score_scale_max"),
+        default=DEFAULT_SCORE_SCALE_MAX,
+    )
+    max_abs_delta_raw = max(
+        float(_to_float_or_none((item.get("feedback_guardrail") or {}).get("abs_delta_raw")) or 0.0)
+        for item in blocked_rows
+    )
     warning_message = str(
         (
             (
@@ -11262,6 +17180,14 @@ def _summarize_project_feedback_guardrail(
         "blocked_count": len(blocked_rows),
         "pending_blocked_count": len(pending_rows),
         "max_abs_delta_100": round(max_abs_delta, 2),
+        "max_abs_delta_raw": _quantize_decimal_score(
+            Decimal(str(max_abs_delta_raw)),
+            score_scale_max=scale_max,
+        )
+        if max_abs_delta_raw > 0
+        else 0.0,
+        "score_scale_max": scale_max,
+        "score_scale_label": _score_scale_label(scale_max),
         "requires_manual_confirmation": bool(pending_rows),
         "warning_message": warning_message,
         "manual_override_hint": "confirm_extreme_sample=1" if pending_rows else None,
@@ -11275,9 +17201,20 @@ def _build_manual_confirmation_detail(
 ) -> str:
     summary = _summarize_project_feedback_guardrail(project_id)
     blocked_count = int(_to_float_or_none(summary.get("blocked_count")) or 0)
-    max_abs_delta = float(_to_float_or_none(summary.get("max_abs_delta_100")) or 0.0)
+    max_abs_delta = _build_feedback_guardrail_delta_text(
+        {
+            "abs_delta_raw": summary.get("max_abs_delta_raw"),
+            "relative_delta_ratio": (
+                float(_to_float_or_none(summary.get("max_abs_delta_100")) or 0.0) / 100.0
+            ),
+            "score_scale_max": summary.get("score_scale_max"),
+        },
+        default_score_scale_max=int(
+            _to_float_or_none(summary.get("score_scale_max")) or DEFAULT_SCORE_SCALE_MAX
+        ),
+    )
     return (
-        f"检测到 {blocked_count} 条极端偏差样本（最大偏差 {max_abs_delta:.2f} 分，100分口径），"
+        f"检测到 {blocked_count} 条极端偏差样本（最大偏差 {max_abs_delta or '未提供'}），"
         f"已暂停自动纳入 {action_label}。请人工确认后重试，并附带 confirm_extreme_sample=1。"
     )
 
@@ -11317,13 +17254,31 @@ def _build_evolution_health_report(
 ) -> Dict[str, object]:
     """
     构建项目进化健康度报告：
-    - 统计系统预测分与真实分误差（全量/30天/90天）
+    - 统计系统评分记录与真实分误差（全量/30天/90天）
     - 用时间衰减评估样本新鲜度
     - 给出概念漂移风险等级和建议动作
     """
     project_score_scale = _resolve_project_score_scale_max(project)
+    calibration_models = load_calibration_models()
+    calibrator_state = _summarize_project_calibrator_state(project, calibration_models)
+    current_calibrator_version = str(
+        calibrator_state.get("current_calibrator_version") or ""
+    ).strip()
+    current_calibrator_source = str(calibrator_state.get("current_calibrator_source") or "").strip()
+    has_project_calibrator = (
+        bool(current_calibrator_version) and current_calibrator_source == "project"
+    )
+    rollback_candidate = _find_project_calibrator_rollback_candidate(project, calibration_models)
     submissions = [s for s in load_submissions() if str(s.get("project_id")) == project_id]
     submissions_by_id = {str(s.get("id") or ""): s for s in submissions if str(s.get("id") or "")}
+    submissions_by_text = {
+        text: s for s in submissions if (text := str(s.get("text") or "").strip())
+    }
+    submissions_by_filename = {
+        normalized_filename: s
+        for s in submissions
+        if (normalized_filename := _normalize_uploaded_filename(str(s.get("filename") or "")))
+    }
     all_ground_truth_rows = [
         row for row in load_ground_truth() if str(row.get("project_id") or "") == project_id
     ]
@@ -11352,50 +17307,57 @@ def _build_evolution_health_report(
         if final_score is None:
             continue
 
-        source_submission_id = str(row.get("source_submission_id") or "").strip()
-        submission = submissions_by_id.get(source_submission_id) if source_submission_id else None
-        if submission is None:
-            gt_text = str(row.get("shigong_text") or "").strip()
-            if gt_text:
-                submission = next(
-                    (s for s in submissions if str(s.get("text") or "").strip() == gt_text),
-                    None,
-                )
+        submission = _resolve_ground_truth_source_submission(
+            row,
+            submissions_by_id=submissions_by_id,
+            submissions_by_text=submissions_by_text,
+            submissions_by_filename=submissions_by_filename,
+        )
         if submission is None:
             unmatched_ground_truth += 1
             continue
 
         report = submission.get("report") if isinstance(submission.get("report"), dict) else {}
-        pred_score_raw = _to_float_or_none(report.get("pred_total_score"))
-        if pred_score_raw is None:
-            pred_score_raw = _to_float_or_none(report.get("rule_total_score"))
-        if pred_score_raw is None:
-            pred_score_raw = _to_float_or_none(report.get("total_score"))
-        if pred_score_raw is None:
-            pred_score_raw = _to_float_or_none(submission.get("total_score"))
-        if pred_score_raw is None:
+        current_score_raw = _to_float_or_none(report.get("total_score"))
+        if current_score_raw is None:
+            current_score_raw = _to_float_or_none(report.get("pred_total_score"))
+        if current_score_raw is None:
+            current_score_raw = _to_float_or_none(report.get("rule_total_score"))
+        if current_score_raw is None:
+            current_score_raw = _to_float_or_none(submission.get("total_score"))
+        if current_score_raw is None:
             unmatched_ground_truth += 1
             continue
+        rule_score_raw = _to_float_or_none(report.get("rule_total_score"))
+        if rule_score_raw is None:
+            rule_score_raw = current_score_raw
 
         report_scale_max = _normalize_score_scale_max(
             report.get("score_scale_max"),
             default=project_score_scale,
         )
-        pred_score_100 = _convert_score_to_100(pred_score_raw, report_scale_max)
-        if pred_score_100 is None:
+        current_score_100 = _convert_score_to_100(current_score_raw, report_scale_max)
+        if current_score_100 is None:
             unmatched_ground_truth += 1
             continue
+        rule_score_100 = _convert_score_to_100(rule_score_raw, report_scale_max)
 
         created_at_dt = _parse_iso_datetime_utc(row.get("created_at")) or now_utc
         age_days = max(0.0, (now_utc - created_at_dt).total_seconds() / 86400.0)
-        abs_error = abs(float(pred_score_100) - float(final_score))
+        abs_error = abs(float(current_score_100) - float(final_score))
+        rule_abs_error = (
+            abs(float(rule_score_100) - float(final_score)) if rule_score_100 is not None else None
+        )
         matched_rows.append(
             {
                 "ground_truth_id": str(row.get("id") or ""),
                 "submission_id": str(submission.get("id") or ""),
-                "predicted_score": float(pred_score_100),
+                "predicted_score": float(current_score_100),
+                "current_score": float(current_score_100),
+                "rule_score": float(rule_score_100) if rule_score_100 is not None else None,
                 "actual_score": float(final_score),
                 "abs_error": float(abs_error),
+                "rule_abs_error": float(rule_abs_error) if rule_abs_error is not None else None,
                 "age_days": float(age_days),
                 "time_decay": float(
                     compute_time_decay_weight(
@@ -11412,6 +17374,7 @@ def _build_evolution_health_report(
         *,
         min_age_days: Optional[float] = None,
         max_age_days: Optional[float] = None,
+        error_key: str = "abs_error",
     ) -> Dict[str, object]:
         scoped: List[Dict[str, object]] = []
         for item in rows:
@@ -11419,6 +17382,8 @@ def _build_evolution_health_report(
             if min_age_days is not None and age_days < float(min_age_days):
                 continue
             if max_age_days is not None and age_days > float(max_age_days):
+                continue
+            if _to_float_or_none(item.get(error_key)) is None:
                 continue
             scoped.append(item)
         count = len(scoped)
@@ -11435,7 +17400,7 @@ def _build_evolution_health_report(
         max_abs_error = 0.0
         decay_sum = 0.0
         for item in scoped:
-            abs_error = float(_to_float_or_none(item.get("abs_error")) or 0.0)
+            abs_error = float(_to_float_or_none(item.get(error_key)) or 0.0)
             err_abs_sum += abs_error
             err_sq_sum += abs_error * abs_error
             max_abs_error = max(max_abs_error, abs_error)
@@ -11452,9 +17417,14 @@ def _build_evolution_health_report(
     metrics_recent_30 = _window_metrics(matched_rows, max_age_days=30.0)
     metrics_recent_90 = _window_metrics(matched_rows, max_age_days=90.0)
     metrics_prev_30_90 = _window_metrics(matched_rows, min_age_days=30.0, max_age_days=90.0)
+    metrics_recent_30_rule = _window_metrics(
+        matched_rows, max_age_days=30.0, error_key="rule_abs_error"
+    )
 
     recent_mae = _to_float_or_none(metrics_recent_30.get("mae"))
     prev_mae = _to_float_or_none(metrics_prev_30_90.get("mae"))
+    recent_max_abs_error = _to_float_or_none(metrics_recent_30.get("max_abs_error"))
+    recent_rule_mae = _to_float_or_none(metrics_recent_30_rule.get("mae"))
     mae_delta_recent_vs_prev = None
     drift_level = "insufficient_data"
     if recent_mae is not None and prev_mae is not None:
@@ -11466,7 +17436,36 @@ def _build_evolution_health_report(
         else:
             drift_level = "low"
     elif int(metrics_recent_30.get("count") or 0) >= 3:
-        drift_level = "watch"
+        if (
+            recent_mae is not None
+            and recent_mae <= 0.5
+            and (recent_max_abs_error is None or recent_max_abs_error <= 1.0)
+        ):
+            drift_level = "low"
+        else:
+            drift_level = "watch"
+    current_calibrator_recent_mae_delta_vs_rule = None
+    current_calibrator_degraded = False
+    current_calibrator_degradation_reason = ""
+    current_calibrator_rollback_candidate_version = (
+        str(rollback_candidate.get("calibrator_version") or "").strip()
+        if isinstance(rollback_candidate, dict)
+        else ""
+    )
+    if (
+        has_project_calibrator
+        and int(metrics_recent_30.get("count") or 0) >= 3
+        and recent_mae is not None
+        and recent_rule_mae is not None
+    ):
+        current_calibrator_recent_mae_delta_vs_rule = round(
+            float(recent_mae) - float(recent_rule_mae), 4
+        )
+        if current_calibrator_recent_mae_delta_vs_rule > float(
+            DEFAULT_PROJECT_CALIBRATOR_POST_DEPLOY_MAX_MAE_REGRESSION
+        ):
+            current_calibrator_degraded = True
+            current_calibrator_degradation_reason = "current_calibrator_recent_mae_worse_than_rule"
 
     multipliers, profile_snapshot, _ = _resolve_project_scoring_context(project_id)
     evo = load_evolution_reports().get(project_id) or {}
@@ -11488,9 +17487,17 @@ def _build_evolution_health_report(
         recommendations.append("近30天无真实反馈，建议补录最新项目评分以避免概念漂移。")
     if drift_level in {"high", "medium"}:
         recommendations.append("近期误差上升，建议立即执行「学习进化」并触发 V2 一键闭环。")
+    if current_calibrator_degraded:
+        recommendations.append(
+            "当前项目级校准器近期误差已明显劣于规则基线，建议立即重新执行 V2 一键闭环。"
+        )
+        if current_calibrator_rollback_candidate_version:
+            recommendations.append(
+                f"如需保守降级，可优先回退到历史项目级校准器 {current_calibrator_rollback_candidate_version}。"
+            )
     if int(unmatched_ground_truth) > 0:
         recommendations.append(
-            f"有 {unmatched_ground_truth} 条真实评分未关联到施组预测记录，建议使用“从步骤4施组下拉选择”录入。"
+            f"有 {unmatched_ground_truth} 条真实评分未关联到施组评分记录，建议使用“从步骤4施组下拉选择”录入。"
         )
     inactive_reason = str(evo_status.get("inactive_reason") or "").strip()
     if stored_evolved_multipliers and not has_evolved_multipliers:
@@ -11508,10 +17515,55 @@ def _build_evolution_health_report(
         recommendations.append("尚未形成进化维度权重，建议在录入真实评分后执行一次学习进化。")
     enhancement_review_status = str(evo.get("enhancement_review_status") or "not_run").strip()
     enhancement_governed = bool(evo.get("enhancement_governed"))
+    runtime_governance = (
+        evo.get("calibrator_runtime_governance")
+        if isinstance(evo.get("calibrator_runtime_governance"), dict)
+        else {}
+    )
+    runtime_governance_action = str(runtime_governance.get("action") or "").strip()
+    runtime_governance_reason = str(runtime_governance.get("reason") or "").strip()
+    runtime_governance_recorded_at = str(runtime_governance.get("recorded_at") or "").strip()
+    runtime_governance_candidate = str(
+        runtime_governance.get("rollback_candidate_version") or ""
+    ).strip()
+    runtime_governance_updated_reports = int(
+        _to_float_or_none(runtime_governance.get("updated_reports")) or 0
+    )
+    runtime_governance_updated_submissions = int(
+        _to_float_or_none(runtime_governance.get("updated_submissions")) or 0
+    )
+    runtime_governance_active_version_after = str(
+        runtime_governance.get("active_calibrator_version_after") or ""
+    ).strip()
+    runtime_governance_degraded_after_raw = runtime_governance.get("degraded_after")
+    runtime_governance_degraded_after = (
+        runtime_governance_degraded_after_raw
+        if isinstance(runtime_governance_degraded_after_raw, bool)
+        else None
+    )
+    runtime_governance_recovered_after_raw = runtime_governance.get("recovered_after")
+    runtime_governance_recovered_after = (
+        runtime_governance_recovered_after_raw
+        if isinstance(runtime_governance_recovered_after_raw, bool)
+        else None
+    )
     if enhancement_governed:
         recommendations.append("最近一次学习进化的双模型复核分歧较大，系统已自动回退到规则版建议。")
     elif enhancement_review_status == "confirmed":
         recommendations.append("最近一次学习进化已通过备用模型复核。")
+    if runtime_governance_action == "rollback":
+        if runtime_governance_recovered_after is True:
+            recommendations.append(
+                "最近一次运行时校准治理已自动切回历史更稳版本并完成评分回填，当前项目级校准器已恢复稳定。"
+            )
+        elif runtime_governance_degraded_after is True:
+            recommendations.append(
+                "最近一次运行时校准治理虽已自动回退并完成评分回填，但当前项目级校准器仍显示退化，建议立即人工复核。"
+            )
+        else:
+            recommendations.append("最近一次运行时校准治理已自动切回历史更稳版本并完成评分回填。")
+    elif runtime_governance_action == "skip" and runtime_governance_reason:
+        recommendations.append(f"最近一次运行时校准治理未触发回退（{runtime_governance_reason}）。")
 
     return {
         "project_id": project_id,
@@ -11520,9 +17572,46 @@ def _build_evolution_health_report(
             "ground_truth_count": len(all_ground_truth_rows),
             "eligible_learning_ground_truth_count": len(eligible_ground_truth_rows),
             "matched_prediction_count": len(matched_rows),
+            "matched_score_record_count": len(matched_rows),
             "unmatched_ground_truth_count": unmatched_ground_truth,
             "guardrail_blocked_count": guardrail_blocked_count,
             "learning_quality_blocked_count": learning_quality_blocked_count,
+            "current_calibrator_version": current_calibrator_version or None,
+            "current_calibrator_source": current_calibrator_source or None,
+            "current_calibrator_deployment_mode": calibrator_state.get(
+                "current_calibrator_deployment_mode"
+            ),
+            "current_calibrator_degraded": current_calibrator_degraded,
+            "current_calibrator_degradation_reason": (
+                current_calibrator_degradation_reason or None
+            ),
+            "current_calibrator_recent_mae": recent_mae,
+            "current_calibrator_recent_rule_mae": recent_rule_mae,
+            "current_calibrator_recent_mae_delta_vs_rule": (
+                current_calibrator_recent_mae_delta_vs_rule
+            ),
+            "current_calibrator_has_rollback_candidate": bool(
+                current_calibrator_rollback_candidate_version
+            ),
+            "current_calibrator_rollback_candidate_version": (
+                current_calibrator_rollback_candidate_version or None
+            ),
+            "current_calibrator_rollback_candidate_model_type": (
+                str(rollback_candidate.get("model_type") or "")
+                if isinstance(rollback_candidate, dict)
+                else None
+            )
+            or None,
+            "current_calibrator_rollback_candidate_deployment_mode": (
+                _calibrator_deployment_mode(rollback_candidate)
+                if isinstance(rollback_candidate, dict)
+                else None
+            ),
+            "current_calibrator_rollback_candidate_cv_mae": (
+                _calibrator_cv_mae(rollback_candidate)
+                if isinstance(rollback_candidate, dict)
+                else None
+            ),
             "current_weights_source": _infer_weights_source(
                 project_id,
                 profile_snapshot,
@@ -11554,6 +17643,25 @@ def _build_evolution_health_report(
             "enhancement_review_provider": str(evo.get("enhancement_review_provider") or ""),
             "enhancement_review_similarity": _to_float_or_none(
                 evo.get("enhancement_review_similarity")
+            ),
+            "last_calibrator_runtime_governance_action": runtime_governance_action or None,
+            "last_calibrator_runtime_governance_reason": runtime_governance_reason or None,
+            "last_calibrator_runtime_governance_recorded_at": (
+                runtime_governance_recorded_at or None
+            ),
+            "last_calibrator_runtime_governance_candidate": (runtime_governance_candidate or None),
+            "last_calibrator_runtime_governance_active_version_after": (
+                runtime_governance_active_version_after or None
+            ),
+            "last_calibrator_runtime_governance_degraded_after": (
+                runtime_governance_degraded_after
+            ),
+            "last_calibrator_runtime_governance_recovered_after": (
+                runtime_governance_recovered_after
+            ),
+            "last_calibrator_runtime_governance_updated_reports": runtime_governance_updated_reports,
+            "last_calibrator_runtime_governance_updated_submissions": (
+                runtime_governance_updated_submissions
             ),
         },
         "windows": {
@@ -12544,6 +18652,230 @@ def _execute_feedback_few_shot_review(
     )
 
 
+def _build_manual_confirmation_audit(
+    project_id: str,
+    project: Dict[str, object],
+    *,
+    action_label: str,
+    confirm_extreme_sample_used: bool,
+    governance_payload: Optional[Dict[str, object]] = None,
+    before_payload: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    before_summary = (
+        before_payload.get("summary")
+        if isinstance(before_payload, dict) and isinstance(before_payload.get("summary"), dict)
+        else {}
+    )
+    governance = (
+        governance_payload
+        if isinstance(governance_payload, dict)
+        else _build_feedback_governance_report(project_id, project)
+    )
+    summary = (
+        governance.get("summary")
+        if isinstance(governance, dict) and isinstance(governance.get("summary"), dict)
+        else {}
+    )
+    recommendations = [
+        str(item).strip()
+        for item in (governance.get("recommendations") if isinstance(governance, dict) else [])
+        or []
+        if str(item).strip()
+    ]
+    manual_confirmation_required = bool(summary.get("manual_confirmation_required"))
+    pending_extreme_ground_truth_count = int(
+        _to_float_or_none(summary.get("pending_extreme_ground_truth_count")) or 0
+    )
+    blocked_ground_truth_count = int(
+        _to_float_or_none(summary.get("blocked_ground_truth_count")) or 0
+    )
+    approved_extreme_ground_truth_count = int(
+        _to_float_or_none(summary.get("approved_extreme_ground_truth_count")) or 0
+    )
+    before_manual_confirmation_required = bool(before_summary.get("manual_confirmation_required"))
+    before_pending_extreme_ground_truth_count = int(
+        _to_float_or_none(before_summary.get("pending_extreme_ground_truth_count")) or 0
+    )
+    before_blocked_ground_truth_count = int(
+        _to_float_or_none(before_summary.get("blocked_ground_truth_count")) or 0
+    )
+    before_approved_extreme_ground_truth_count = int(
+        _to_float_or_none(before_summary.get("approved_extreme_ground_truth_count")) or 0
+    )
+    delta_pending_extreme_ground_truth_count = (
+        pending_extreme_ground_truth_count - before_pending_extreme_ground_truth_count
+    )
+    delta_blocked_ground_truth_count = (
+        blocked_ground_truth_count - before_blocked_ground_truth_count
+    )
+    delta_approved_extreme_ground_truth_count = (
+        approved_extreme_ground_truth_count - before_approved_extreme_ground_truth_count
+    )
+    gate_cleared_after_reverify = (
+        before_manual_confirmation_required and not manual_confirmation_required
+    )
+    manual_override_hint = str(summary.get("manual_override_hint") or "").strip()
+    current_calibrator_deployment_mode = str(
+        summary.get("current_calibrator_deployment_mode") or ""
+    ).strip()
+    if manual_confirmation_required:
+        status = "blocked"
+        status_label = "人工确认门仍未清除"
+        detail = (
+            f"当前仍有 {pending_extreme_ground_truth_count} 条极端偏差样本待人工确认，"
+            "自动学习/闭环链路仍被阻塞。"
+        )
+    elif confirm_extreme_sample_used:
+        status = "cleared"
+        status_label = "人工确认门已清除"
+        detail = (
+            f"本次已按 confirm_extreme_sample=1 继续执行；当前待人工审核 "
+            f"{pending_extreme_ground_truth_count} 条，已人工放行 "
+            f"{approved_extreme_ground_truth_count} 条。"
+        )
+    else:
+        status = "clear"
+        status_label = "当前无人工确认阻塞"
+        detail = (
+            f"当前待人工审核 {pending_extreme_ground_truth_count} 条；" "该链路未命中人工确认阻塞。"
+        )
+    reverify_summary = (
+        f"复验前待人工审核 {before_pending_extreme_ground_truth_count} 条、当前被拦截 "
+        f"{before_blocked_ground_truth_count} 条、已人工放行 "
+        f"{before_approved_extreme_ground_truth_count} 条；复验后分别为 "
+        f"{pending_extreme_ground_truth_count} / {blocked_ground_truth_count} / "
+        f"{approved_extreme_ground_truth_count} 条。"
+    )
+    return {
+        "project_id": project_id,
+        "project_name": str(project.get("name") or project_id).strip() or project_id,
+        "action_label": str(action_label or "").strip() or "继续执行",
+        "override_used": bool(confirm_extreme_sample_used),
+        "reverified_after_action": True,
+        "status": status,
+        "status_label": status_label,
+        "detail": detail,
+        "manual_confirmation_required": manual_confirmation_required,
+        "before_manual_confirmation_required": before_manual_confirmation_required,
+        "pending_extreme_ground_truth_count": pending_extreme_ground_truth_count,
+        "blocked_ground_truth_count": blocked_ground_truth_count,
+        "approved_extreme_ground_truth_count": approved_extreme_ground_truth_count,
+        "before_pending_extreme_ground_truth_count": before_pending_extreme_ground_truth_count,
+        "before_blocked_ground_truth_count": before_blocked_ground_truth_count,
+        "before_approved_extreme_ground_truth_count": before_approved_extreme_ground_truth_count,
+        "delta_pending_extreme_ground_truth_count": delta_pending_extreme_ground_truth_count,
+        "delta_blocked_ground_truth_count": delta_blocked_ground_truth_count,
+        "delta_approved_extreme_ground_truth_count": delta_approved_extreme_ground_truth_count,
+        "gate_cleared_after_reverify": gate_cleared_after_reverify,
+        "reverify_summary": reverify_summary,
+        "manual_override_hint": manual_override_hint or None,
+        "current_calibrator_deployment_mode": current_calibrator_deployment_mode or None,
+        "recommendation": recommendations[0] if recommendations else "",
+    }
+
+
+def _build_manual_confirmation_audit_payload(
+    project_id: str,
+    project: Dict[str, object],
+    *,
+    ground_truth_rows_override: Optional[List[Dict[str, object]]] = None,
+    blocked_guardrails_override: Optional[List[Dict[str, object]]] = None,
+    post_run_health_summary: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    if isinstance(ground_truth_rows_override, list):
+        all_rows = _list_project_ground_truth_records(
+            project_id,
+            include_guardrail_blocked=True,
+            rows_override=ground_truth_rows_override,
+        )
+    else:
+        all_rows = _list_project_ground_truth_records(project_id, include_guardrail_blocked=True)
+    blocked_rows: List[Dict[str, object]]
+    if isinstance(blocked_guardrails_override, list):
+        blocked_rows = [item for item in blocked_guardrails_override if isinstance(item, dict)]
+        pending_blocked_count = 0
+        for item in blocked_rows:
+            guardrail = (
+                item.get("feedback_guardrail")
+                if isinstance(item.get("feedback_guardrail"), dict)
+                else {}
+            )
+            if str(guardrail.get("manual_review_status") or "pending") == "pending":
+                pending_blocked_count += 1
+        summary_guardrail = {
+            "blocked": bool(pending_blocked_count),
+            "blocked_count": len(blocked_rows),
+            "pending_blocked_count": pending_blocked_count,
+            "manual_override_hint": "confirm_extreme_sample=1" if pending_blocked_count else None,
+        }
+    elif isinstance(ground_truth_rows_override, list):
+        summary_guardrail = _summarize_project_feedback_guardrail(
+            project_id,
+            rows_override=ground_truth_rows_override,
+        )
+    else:
+        summary_guardrail = _summarize_project_feedback_guardrail(project_id)
+    approved_extreme_count = 0
+    pending_extreme_count = 0
+    rejected_extreme_count = 0
+    for row in all_rows:
+        guardrail = _extract_feedback_guardrail(row)
+        if not bool(guardrail.get("threshold_blocked")):
+            continue
+        review_status = str(guardrail.get("manual_review_status") or "pending")
+        if review_status == "approved":
+            approved_extreme_count += 1
+        elif review_status == "rejected":
+            rejected_extreme_count += 1
+        else:
+            pending_extreme_count += 1
+    blocked_count = int(_to_float_or_none(summary_guardrail.get("blocked_count")) or 0)
+    pending_blocked_count = int(
+        _to_float_or_none(summary_guardrail.get("pending_blocked_count")) or 0
+    )
+    if (
+        isinstance(blocked_guardrails_override, list)
+        and blocked_count > 0
+        and approved_extreme_count == 0
+        and rejected_extreme_count == 0
+        and pending_extreme_count == 0
+    ):
+        pending_extreme_count = pending_blocked_count or blocked_count
+    current_calibrator_deployment_mode = ""
+    if isinstance(post_run_health_summary, dict):
+        current_calibrator_deployment_mode = str(
+            post_run_health_summary.get("current_calibrator_deployment_mode") or ""
+        ).strip()
+    if not current_calibrator_deployment_mode:
+        calibrator_state = _summarize_project_calibrator_state(project, load_calibration_models())
+        current_calibrator_deployment_mode = str(
+            calibrator_state.get("current_calibrator_deployment_mode") or ""
+        ).strip()
+    recommendations: List[str] = []
+    if blocked_count > 0:
+        recommendations.append(
+            f"存在 {blocked_count} 条极端偏差样本，自动调权/自动校准已被暂停；人工确认后再执行学习进化或一键闭环。"
+        )
+    elif approved_extreme_count > 0:
+        recommendations.append(
+            "当前已存在人工确认放行的极端偏差样本，可结合复验结果继续观察自动学习与闭环效果。"
+        )
+    else:
+        recommendations.append("当前链路未命中人工确认阻塞。")
+    return {
+        "summary": {
+            "blocked_ground_truth_count": blocked_count,
+            "approved_extreme_ground_truth_count": approved_extreme_count,
+            "rejected_extreme_ground_truth_count": rejected_extreme_count,
+            "pending_extreme_ground_truth_count": pending_extreme_count,
+            "manual_confirmation_required": bool(summary_guardrail.get("blocked")),
+            "manual_override_hint": summary_guardrail.get("manual_override_hint"),
+            "current_calibrator_deployment_mode": current_calibrator_deployment_mode or None,
+        },
+        "recommendations": recommendations,
+    }
+
+
 def _collect_applied_feature_ids_from_report(
     report: Dict[str, object],
     *,
@@ -12952,6 +19284,12 @@ def _finalize_ground_truth_batch_learning_records(
         locale=locale,
         trigger=trigger,
     )
+
+
+def _refresh_project_ground_truth_learning_records(
+    project_id: str,
+) -> Dict[str, object]:
+    return feedback_learning_module.refresh_project_ground_truth_learning_records(project_id)
 
 
 def _build_ground_truth_record(
@@ -13887,7 +20225,7 @@ def project_analysis_bundle(
 ) -> AnalysisBundleResponse:
     """
     导出项目分析包（Markdown），包含：
-    - 项目级 V1/V2/V2+Calib 指标
+    - 项目级 V1/V2/当前分/V2+Calib 指标
     - 当前评分体系与章节要求
     """
     assert_secure_desktop_allows_export("project_analysis_bundle")
@@ -14013,6 +20351,18 @@ def repair_system_data_hygiene(
     ensure_data_dirs()
     payload = _build_data_hygiene_report(apply=True)
     return DataHygieneResponse(**payload)
+
+
+@router.get(
+    "/system/improvement_overview",
+    response_model=SystemImprovementOverviewResponse,
+    tags=["系统状态"],
+)
+def system_improvement_overview() -> SystemImprovementOverviewResponse:
+    """系统级继续完善总览：汇总运行稳定性、数据卫生、学习对齐与总封关缺口。"""
+    ensure_data_dirs()
+    payload = _build_system_improvement_overview()
+    return SystemImprovementOverviewResponse(**payload)
 
 
 @router.post(
@@ -14218,8 +20568,18 @@ def rename_project(
     for project in projects:
         if isinstance(project, dict):
             _ensure_project_v2_fields(project)
+    current_project = _find_project(project_id, projects)
+    old_name = str(current_project.get("name") or "")
     project = _rename_project_record(projects, project_id, new_name=payload.name)
+    profiles = load_expert_profiles()
+    profile_changed = _sync_default_project_profile_name(
+        project,
+        profiles,
+        old_project_name=old_name,
+    )
     save_projects(projects)
+    if profile_changed:
+        save_expert_profiles(profiles)
     return ProjectRecord(**project)
 
 
@@ -14306,17 +20666,13 @@ def update_project_expert_profile(
     )
 
 
-@router.post(
-    "/projects/{project_id}/rescore",
-    response_model=RescoreResponse,
-    tags=["项目管理"],
-    responses={**RESPONSES_401, **RESPONSES_404, **RESPONSES_409},
-)
-def rescore_project_submissions(
+def _rescore_project_submissions_internal(
     project_id: str,
     payload: RescoreRequest,
-    api_key: Optional[str] = Depends(verify_api_key),
-    locale: str = Depends(get_locale),
+    *,
+    locale: str,
+    run_feedback_closed_loop: bool = True,
+    history_trigger: str = "manual_rescore",
 ) -> RescoreResponse:
     """按当前生效专家配置重算项目施组评分。"""
     ensure_data_dirs()
@@ -14424,7 +20780,7 @@ def rescore_project_submissions(
             new_units=evidence_units,
         )
         if not _report_is_blocked(report):
-            _mark_report_scored(report, trigger="manual_rescore")
+            _mark_report_scored(report, trigger=history_trigger)
         report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
         report_meta = dict(report_meta or {})
         report_meta["score_scale_max"] = score_scale_max
@@ -14494,12 +20850,14 @@ def rescore_project_submissions(
     save_evidence_units(all_evidence_units)
     project["updated_at"] = _now_iso()
     save_projects(projects)
-    # 重评分属于有效反馈信号：自动刷新样本并触发校准/调权重闭环。
-    feedback_closed_loop = _run_feedback_closed_loop_safe(
-        project_id,
-        locale=locale,
-        trigger="rescore",
-    )
+    feedback_closed_loop: Dict[str, object] = {}
+    if run_feedback_closed_loop:
+        # 重评分属于有效反馈信号：自动刷新样本并触发校准/调权重闭环。
+        feedback_closed_loop = _run_feedback_closed_loop_safe(
+            project_id,
+            locale=locale,
+            trigger="rescore",
+        )
     material_utilization = _aggregate_material_utilization_summaries(material_utilization_summaries)
     material_gate = (
         material_quality_snapshot.get("gate")
@@ -14530,6 +20888,27 @@ def rescore_project_submissions(
         feedback_closed_loop=feedback_closed_loop,
         started_at=started_at,
         finished_at=_now_iso(),
+    )
+
+
+@router.post(
+    "/projects/{project_id}/rescore",
+    response_model=RescoreResponse,
+    tags=["项目管理"],
+    responses={**RESPONSES_401, **RESPONSES_404, **RESPONSES_409},
+)
+def rescore_project_submissions(
+    project_id: str,
+    payload: RescoreRequest,
+    api_key: Optional[str] = Depends(verify_api_key),
+    locale: str = Depends(get_locale),
+) -> RescoreResponse:
+    return _rescore_project_submissions_internal(
+        project_id,
+        payload,
+        locale=locale,
+        run_feedback_closed_loop=True,
+        history_trigger="manual_rescore",
     )
 
 
@@ -15127,37 +21506,30 @@ def upload_material(
     target = project_dir / normalized_name
     content = file.file.read()
     save_bytes(target, content)
-
-    materials = load_materials()
-    existing_ids = [
-        str(m.get("id"))
-        for m in materials
-        if m.get("project_id") == project_id
-        and _normalize_material_type(m.get("material_type"), filename=m.get("filename"))
-        == normalized_material_type
-        and _normalize_uploaded_filename(m.get("filename", "")) == normalized_name
-        and m.get("id")
-    ]
-    materials = [
-        m
-        for m in materials
-        if not (
-            m.get("project_id") == project_id
-            and _normalize_material_type(m.get("material_type"), filename=m.get("filename"))
-            == normalized_material_type
-            and _normalize_uploaded_filename(m.get("filename", "")) == normalized_name
+    content_hash = _compute_material_content_hash(content)
+    initial_parse_mode = (
+        "preview"
+        if _material_should_use_preview_stage(
+            content,
+            normalized_name,
+            material_type=normalized_material_type,
         )
-    ]
+        else "full"
+    )
+
     record = {
-        "id": existing_ids[0] if existing_ids else str(uuid4()),
+        "id": str(uuid4()),
         "project_id": project_id,
         "material_type": normalized_material_type,
         "filename": normalized_name,
         "path": str(target),
+        "content_hash": content_hash,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "parse_status": "queued",
         "parse_backend": "queued",
+        "parse_phase": None,
+        "parse_ready_for_gate": False,
         "parse_confidence": 0.0,
         "parse_error_class": None,
         "parse_error_message": None,
@@ -15171,12 +21543,40 @@ def upload_material(
         "numeric_terms_norm": [],
         "lexical_terms": [],
     }
-    jobs = load_material_parse_jobs()
-    jobs, job_id, _, _ = _requeue_material_parse_job(jobs, record)
-    record["job_id"] = job_id
-    materials.append(record)
-    save_materials(materials)
-    save_material_parse_jobs(jobs)
+    with _MATERIAL_PARSE_STATE_LOCK:
+        materials = load_materials()
+        existing_ids = [
+            str(m.get("id"))
+            for m in materials
+            if m.get("project_id") == project_id
+            and _normalize_material_type(m.get("material_type"), filename=m.get("filename"))
+            == normalized_material_type
+            and _normalize_uploaded_filename(m.get("filename", "")) == normalized_name
+            and m.get("id")
+        ]
+        materials = [
+            m
+            for m in materials
+            if not (
+                m.get("project_id") == project_id
+                and _normalize_material_type(m.get("material_type"), filename=m.get("filename"))
+                == normalized_material_type
+                and _normalize_uploaded_filename(m.get("filename", "")) == normalized_name
+            )
+        ]
+        record["id"] = existing_ids[0] if existing_ids else str(uuid4())
+        jobs = load_material_parse_jobs()
+        jobs, job_id, _, _ = _requeue_material_parse_job(
+            jobs,
+            record,
+            parse_mode=initial_parse_mode,
+        )
+        record["job_id"] = job_id
+        materials.append(record)
+        save_materials(materials)
+        save_material_parse_jobs(jobs)
+        _invalidate_material_parse_claim_snapshot()
+    _notify_material_parse_workers()
     _invalidate_material_index_cache(project_id)
     return {
         "status": "ok",
@@ -15229,58 +21629,29 @@ def get_material_parse_status(
     projects = load_projects()
     if not any(p["id"] == project_id for p in projects):
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    materials = [
-        _normalize_material_row_for_parse(dict(m))[0]
-        for m in load_materials()
-        if str(m.get("project_id") or "") == str(project_id)
-    ]
-    jobs, summary = _build_material_parse_jobs_summary(project_id)
-    latest_job_by_material_id: Dict[str, Dict[str, object]] = {}
-    queued_positions: Dict[str, int] = {}
-    queued_jobs = [
-        dict(job) for job in jobs if str(job.get("status") or "").strip().lower() == "queued"
-    ]
-    queued_jobs.sort(key=_material_parse_job_sort_key)
-    for idx, job in enumerate(queued_jobs, start=1):
-        material_id = str(job.get("material_id") or "").strip()
-        if material_id and material_id not in queued_positions:
-            queued_positions[material_id] = idx
-    for job in jobs:
-        material_id = str(job.get("material_id") or "").strip()
-        if not material_id:
-            continue
-        current = latest_job_by_material_id.get(material_id)
-        if current is None or _material_parse_job_sort_key(job) > _material_parse_job_sort_key(
-            current
-        ):
-            latest_job_by_material_id[material_id] = dict(job)
-    enriched_materials: List[Dict[str, object]] = []
-    for row in materials:
-        material_id = str(row.get("id") or "").strip()
-        active_job = latest_job_by_material_id.get(material_id)
-        enriched = dict(row)
-        enriched.update(
-            _build_material_parse_runtime_details(
-                row,
-                active_job=active_job,
-                queue_position=queued_positions.get(material_id),
-            )
+    project_cache_stats_before = _material_parse_project_cache_stats_snapshot(project_id)
+    core_payload = _load_material_parse_status_core_payload(project_id)
+    project_cache_request_delta = _build_material_parse_project_cache_request_delta(
+        project_cache_stats_before,
+        _material_parse_project_cache_stats_snapshot(project_id),
+    )
+    _record_material_parse_project_cache_request_delta(project_id, project_cache_request_delta)
+    jobs = list(core_payload.get("jobs") or [])
+    enriched_materials = list(core_payload.get("materials") or [])
+    summary = dict(core_payload.get("summary") or {})
+    summary.update(
+        _build_material_parse_scheduler_summary(
+            project_id,
+            request_project_cache_delta=project_cache_request_delta,
         )
-        enriched_materials.append(enriched)
-    summary["materials_total"] = len(materials)
-    summary["parsed_materials"] = sum(
-        1 for row in materials if str(row.get("parse_status") or "") == "parsed"
     )
-    summary["failed_materials"] = sum(
-        1 for row in materials if str(row.get("parse_status") or "") == "failed"
+    summary["worker_count"] = _material_parse_total_worker_count()
+    summary["preview_express_reserved_worker_count"] = int(
+        max(0, int(DEFAULT_MATERIAL_PARSE_PREVIEW_EXPRESS_RESERVED_WORKER_COUNT))
     )
-    summary["processing_materials"] = sum(
-        1 for row in materials if str(row.get("parse_status") or "") == "processing"
+    summary["preview_reserved_worker_count"] = int(
+        max(0, int(DEFAULT_MATERIAL_PARSE_PREVIEW_RESERVED_WORKER_COUNT))
     )
-    summary["queued_materials"] = sum(
-        1 for row in materials if str(row.get("parse_status") or "") == "queued"
-    )
-    summary["worker_count"] = DEFAULT_MATERIAL_PARSE_WORKER_COUNT
     summary["alive_worker_count"] = _material_parse_worker_alive_count()
     return MaterialParseStatusResponse(
         project_id=project_id,
@@ -15313,10 +21684,33 @@ def reparse_project_materials(
         if str(row.get("project_id") or "") != str(project_id):
             continue
         normalized, _ = _normalize_material_row_for_parse(dict(row))
-        jobs, job_id, _, _ = _requeue_material_parse_job(jobs, normalized)
+        try:
+            parse_content = read_bytes(Path(str(normalized.get("path") or "").strip()))
+        except OSError:
+            parse_mode = "full"
+            content_hash = str(normalized.get("content_hash") or "").strip() or None
+        else:
+            content_hash = _compute_material_content_hash(parse_content)
+            parse_mode = (
+                "preview"
+                if _material_should_use_preview_stage(
+                    parse_content,
+                    str(normalized.get("filename") or ""),
+                    material_type=normalized.get("material_type"),
+                )
+                else "full"
+            )
+        jobs, job_id, _, _ = _requeue_material_parse_job(
+            jobs,
+            normalized,
+            parse_mode=parse_mode,
+        )
         normalized["job_id"] = job_id
+        normalized["content_hash"] = content_hash
         normalized["parse_status"] = "queued"
         normalized["parse_backend"] = "queued"
+        normalized["parse_phase"] = None
+        normalized["parse_ready_for_gate"] = False
         normalized["parse_error_class"] = None
         normalized["parse_error_message"] = None
         normalized["parse_started_at"] = None
@@ -15327,6 +21721,7 @@ def reparse_project_materials(
     if changed:
         save_materials(materials)
         save_material_parse_jobs(jobs)
+        _notify_material_parse_workers()
         _invalidate_material_index_cache(project_id)
     return get_material_parse_status(project_id, locale)
 
@@ -15406,6 +21801,100 @@ def get_project_evolution_health(
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
     payload = _build_evolution_health_report(project_id, project)
     return EvolutionHealthResponse(**payload)
+
+
+@router.get(
+    "/projects/{project_id}/trial_preflight",
+    response_model=ProjectTrialPreflightResponse,
+    tags=["系统诊断"],
+    responses={**RESPONSES_404},
+)
+def get_project_trial_preflight(
+    project_id: str, locale: str = Depends(get_locale)
+) -> ProjectTrialPreflightResponse:
+    """项目试车前综合体检：汇总运行、自检、评分、学习与总封关状态。"""
+    ensure_data_dirs()
+    projects = load_projects()
+    try:
+        project = _find_project(project_id, projects)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    payload = _build_project_trial_preflight(project_id, project)
+    return ProjectTrialPreflightResponse(**payload)
+
+
+@router.get(
+    "/projects/{project_id}/trial_preflight/markdown",
+    response_model=ProjectTrialPreflightMarkdownResponse,
+    tags=["系统诊断"],
+    responses={**RESPONSES_404},
+)
+def get_project_trial_preflight_markdown(
+    project_id: str, locale: str = Depends(get_locale)
+) -> ProjectTrialPreflightMarkdownResponse:
+    """项目试车前综合体检 Markdown 文本。"""
+    assert_secure_desktop_allows_export("project_trial_preflight_markdown")
+    ensure_data_dirs()
+    projects = load_projects()
+    try:
+        project = _find_project(project_id, projects)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    payload = _build_project_trial_preflight(project_id, project)
+    markdown = render_trial_preflight_markdown(payload)
+    return ProjectTrialPreflightMarkdownResponse(
+        project_id=project_id,
+        markdown=markdown,
+        generated_at=str(payload.get("generated_at") or _now_iso()),
+    )
+
+
+@router.get(
+    "/projects/{project_id}/trial_preflight.md",
+    tags=["系统诊断"],
+    responses={**RESPONSES_404},
+)
+def download_project_trial_preflight_markdown(
+    project_id: str, locale: str = Depends(get_locale)
+) -> Response:
+    """下载项目试车前综合体检 Markdown 文件。"""
+    assert_secure_desktop_allows_export("project_trial_preflight_markdown_file")
+    result = get_project_trial_preflight_markdown(project_id=project_id, locale=locale)
+    filename = f"trial_preflight_{project_id}.md"
+    return Response(
+        content=str(result.markdown or ""),
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get(
+    "/projects/{project_id}/trial_preflight.docx",
+    tags=["系统诊断"],
+    responses={**RESPONSES_404},
+)
+def download_project_trial_preflight_docx(
+    project_id: str, locale: str = Depends(get_locale)
+) -> Response:
+    """下载项目试车前综合体检 DOCX 文件。"""
+    assert_secure_desktop_allows_export("project_trial_preflight_docx_file")
+    ensure_data_dirs()
+    projects = load_projects()
+    try:
+        project = _find_project(project_id, projects)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    payload = _build_project_trial_preflight(project_id, project)
+    try:
+        docx_bytes = render_trial_preflight_docx(payload)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    filename = f"trial_preflight_{project_id}.docx"
+    return Response(
+        content=docx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get(
@@ -16423,6 +22912,45 @@ BOQ_STRUCTURE_HINTS: Dict[str, List[str]] = {
     "措施项目/抢工": ["措施项目", "脚手架", "模板", "垂直运输", "二次搬运", "夜间施工", "抢工"],
 }
 
+BOQ_PRIMARY_SHEET_HINTS = (
+    "工程量清单",
+    "分部分项",
+    "措施项目",
+    "其他项目",
+    "专业工程",
+    "土建",
+    "安装",
+    "装修",
+    "装饰",
+    "电气",
+    "给排水",
+    "暖通",
+    "消防",
+    "清单",
+)
+
+BOQ_PRIMARY_SHEET_PRIORITY_HINTS = (
+    "分部分项",
+    "措施项目",
+    "其他项目",
+    "工程量清单",
+)
+
+BOQ_AUXILIARY_SHEET_HINTS = (
+    "封面",
+    "目录",
+    "说明",
+    "总说明",
+    "编制说明",
+    "前言",
+    "附录",
+    "索引",
+    "审核",
+    "审定",
+    "签署",
+    "声明",
+)
+
 TENDER_QA_CONSTRAINT_HINTS: Dict[str, List[str]] = {
     "招标范围/界面": ["招标范围", "承包范围", "界面", "工作内容", "施工范围", "实施范围"],
     "答疑/补遗/澄清": ["答疑", "补遗", "澄清", "变更", "补充通知", "修正", "更正"],
@@ -17315,6 +23843,14 @@ def _finalize_boq_structured_summary(
     *,
     parsed_text: str,
 ) -> Dict[str, object]:
+    detected_format = str(summary.get("detected_format") or "").strip().lower()
+    parsed_page_count = (
+        _extract_pdf_last_page_marker(parsed_text) if detected_format == "pdf" else 0
+    )
+    if parsed_page_count > 0:
+        summary["parsed_page_count"] = parsed_page_count
+        if str(summary.get("parse_stage") or "").strip().lower() == "preview":
+            summary["preview_last_page"] = parsed_page_count
     structured_terms: List[object] = []
     numeric_terms: List[object] = []
     column_labels = {
@@ -17624,11 +24160,403 @@ def _build_site_photo_structured_summary(
     }
 
 
+def _boq_sheet_priority_key(sheet_name: object) -> tuple[int, str]:
+    normalized = _normalize_ocr_text_block(sheet_name).lower()
+    if not normalized:
+        return (1, "")
+    for idx, token in enumerate(BOQ_PRIMARY_SHEET_PRIORITY_HINTS):
+        if token in normalized:
+            return (0, f"{idx:02d}:{normalized}")
+    if any(token in normalized for token in BOQ_PRIMARY_SHEET_HINTS):
+        return (0, f"99:{normalized}")
+    if any(token in normalized for token in BOQ_AUXILIARY_SHEET_HINTS):
+        return (2, normalized)
+    return (1, normalized)
+
+
+def _boq_sheet_header_scan_limit(sheet_name: object) -> int:
+    normalized = _normalize_ocr_text_block(sheet_name).lower()
+    if normalized and any(token in normalized for token in BOQ_AUXILIARY_SHEET_HINTS):
+        return DEFAULT_BOQ_PARSE_AUX_HEADER_SCAN_MAX_ROWS
+    return DEFAULT_BOQ_PARSE_HEADER_SCAN_MAX_ROWS
+
+
+def _build_boq_full_scan_guidance(
+    prior_summary: object,
+) -> Optional[Dict[str, object]]:
+    if not isinstance(prior_summary, dict):
+        return None
+    if str(prior_summary.get("parse_stage") or "").strip().lower() != "preview":
+        return None
+    preview_sheets = prior_summary.get("sheets")
+    if not isinstance(preview_sheets, list) or not preview_sheets:
+        return None
+    total_preview_items = int(_to_float_or_none(prior_summary.get("total_parsed_items")) or 0)
+    if total_preview_items < DEFAULT_BOQ_PARSE_FULL_GUIDED_MIN_PARSED_ITEMS:
+        return None
+    confirmed_sheet_names: set[str] = set()
+    confirmed_primary_sheet_count = 0
+    for sheet in preview_sheets:
+        if not isinstance(sheet, dict):
+            continue
+        normalized_name = _normalize_ocr_text_block(sheet.get("sheet")).lower()
+        if not normalized_name:
+            continue
+        parsed_items = int(_to_float_or_none(sheet.get("parsed_items")) or 0)
+        detected_columns = (
+            sheet.get("detected_columns") if isinstance(sheet.get("detected_columns"), dict) else {}
+        )
+        if (
+            not detected_columns
+            and parsed_items < DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_SHEET_MIN_ITEMS
+        ):
+            continue
+        confirmed_sheet_names.add(normalized_name)
+        if _boq_sheet_priority_key(normalized_name)[0] == 0:
+            confirmed_primary_sheet_count += 1
+    if not confirmed_sheet_names:
+        return None
+    has_strong_preview_primary_signal = (
+        confirmed_primary_sheet_count
+        >= DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_PREVIEW_MIN_PRIMARY_SHEETS
+    )
+    has_strong_preview_csv_signal = "csv" in confirmed_sheet_names
+    guidance_level = (
+        "strong"
+        if (
+            total_preview_items >= DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_PREVIEW_MIN_ITEMS
+            and (has_strong_preview_primary_signal or has_strong_preview_csv_signal)
+        )
+        else "standard"
+    )
+    return {
+        "confirmed_sheet_names": confirmed_sheet_names,
+        "confirmed_primary_sheet_count": confirmed_primary_sheet_count,
+        "total_preview_items": total_preview_items,
+        "guidance_level": guidance_level,
+        "unconfirmed_primary_sheet_max_rows": (
+            DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_UNCONFIRMED_PRIMARY_SHEET_MAX_ROWS
+            if guidance_level == "strong"
+            else DEFAULT_BOQ_PARSE_FULL_GUIDED_UNCONFIRMED_PRIMARY_SHEET_MAX_ROWS
+        ),
+        "weak_sheet_max_rows": (
+            DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_WEAK_SHEET_MAX_ROWS
+            if guidance_level == "strong"
+            else DEFAULT_BOQ_PARSE_FULL_GUIDED_WEAK_SHEET_MAX_ROWS
+        ),
+    }
+
+
+def _boq_full_sheet_row_budget(
+    sheet_name: object,
+    *,
+    full_scan_guidance: Optional[Dict[str, object]],
+) -> int:
+    if not isinstance(full_scan_guidance, dict):
+        return DEFAULT_BOQ_PARSE_MAX_ROWS_PER_SHEET
+    normalized_name = _normalize_ocr_text_block(sheet_name).lower()
+    confirmed_sheet_names = full_scan_guidance.get("confirmed_sheet_names")
+    if isinstance(confirmed_sheet_names, set) and normalized_name in confirmed_sheet_names:
+        return DEFAULT_BOQ_PARSE_MAX_ROWS_PER_SHEET
+    weak_sheet_max_rows = int(
+        _to_float_or_none(full_scan_guidance.get("weak_sheet_max_rows"))
+        or DEFAULT_BOQ_PARSE_FULL_GUIDED_WEAK_SHEET_MAX_ROWS
+    )
+    unconfirmed_primary_sheet_max_rows = int(
+        _to_float_or_none(full_scan_guidance.get("unconfirmed_primary_sheet_max_rows"))
+        or DEFAULT_BOQ_PARSE_FULL_GUIDED_UNCONFIRMED_PRIMARY_SHEET_MAX_ROWS
+    )
+    priority_bucket = _boq_sheet_priority_key(sheet_name)[0]
+    if priority_bucket == 2:
+        return weak_sheet_max_rows
+    if (
+        priority_bucket == 0
+        and int(full_scan_guidance.get("confirmed_primary_sheet_count") or 0) >= 2
+    ):
+        return unconfirmed_primary_sheet_max_rows
+    if priority_bucket >= 1:
+        return weak_sheet_max_rows
+    return DEFAULT_BOQ_PARSE_MAX_ROWS_PER_SHEET
+
+
+def _boq_full_csv_row_budget(
+    *,
+    full_scan_guidance: Optional[Dict[str, object]],
+) -> int:
+    if not isinstance(full_scan_guidance, dict):
+        return DEFAULT_BOQ_PARSE_MAX_ROWS_PER_SHEET
+    guidance_level = str(full_scan_guidance.get("guidance_level") or "").strip().lower()
+    if guidance_level == "strong":
+        return DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_CSV_MAX_ROWS
+    return DEFAULT_BOQ_PARSE_FULL_GUIDED_CSV_MAX_ROWS
+
+
+def _should_stop_boq_full_scan_after_aux_tail(
+    *,
+    full_scan_guidance: Optional[Dict[str, object]],
+    sheet_name: object,
+    sheet_summary: Dict[str, object],
+    consecutive_empty_aux_sheets: int,
+) -> bool:
+    if not isinstance(full_scan_guidance, dict):
+        return False
+    if str(full_scan_guidance.get("guidance_level") or "").strip().lower() != "strong":
+        return False
+    if _boq_sheet_priority_key(sheet_name)[0] != 2:
+        return False
+    detected_columns = (
+        sheet_summary.get("detected_columns")
+        if isinstance(sheet_summary.get("detected_columns"), dict)
+        else {}
+    )
+    if detected_columns:
+        return False
+    if int(_to_float_or_none(sheet_summary.get("parsed_items")) or 0) > 0:
+        return False
+    return consecutive_empty_aux_sheets >= DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_MAX_EMPTY_AUX_SHEETS
+
+
+def _extract_boq_tabular_preview_text(
+    content: bytes,
+    filename: str,
+    *,
+    max_sheets: int,
+    max_rows_per_sheet: int,
+) -> str:
+    ext = Path(filename).suffix.lower()
+    parts: List[str] = []
+    if ext in {".xlsx", ".xls", ".xlsm"}:
+        try:
+            import openpyxl
+
+            wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+            try:
+                sorted_worksheets = sorted(
+                    wb.worksheets,
+                    key=lambda item: _boq_sheet_priority_key(getattr(item, "title", "")),
+                )
+                for sheet in sorted_worksheets[: max(1, int(max_sheets))]:
+                    parts.append(f"[SHEET:{sheet.title}]")
+                    for idx, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+                        if idx > max(1, int(max_rows_per_sheet)):
+                            break
+                        line = "\t".join(
+                            str(cell) if cell is not None else "" for cell in list(row or [])
+                        ).strip()
+                        if line:
+                            parts.append(line)
+            finally:
+                wb.close()
+        except Exception:
+            return ""
+        return "\n".join(parts).strip()
+    if ext == ".csv":
+        try:
+            decoded = content.decode("utf-8", errors="ignore")
+            reader = csv.reader(io.StringIO(decoded))
+            for idx, row in enumerate(reader, start=1):
+                if idx > max(1, int(max_rows_per_sheet)):
+                    break
+                line = "\t".join(str(cell or "") for cell in row).strip()
+                if line:
+                    parts.append(line)
+        except Exception:
+            return ""
+        return "\n".join(parts).strip()
+    return ""
+
+
+def _extract_boq_tabular_resume_text(
+    content: bytes,
+    filename: str,
+    *,
+    prior_summary: Optional[Dict[str, object]],
+    max_sheets: int,
+    max_rows_per_sheet: int,
+) -> str:
+    if not isinstance(prior_summary, dict):
+        return ""
+    ext = Path(filename).suffix.lower()
+    full_scan_guidance = _build_boq_full_scan_guidance(prior_summary)
+    parts: List[str] = []
+    if ext in {".xlsx", ".xls", ".xlsm"}:
+        try:
+            import openpyxl
+
+            wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+            try:
+                prior_sheet_summaries: Dict[str, Dict[str, object]] = {}
+                for prior_sheet in prior_summary.get("sheets") or []:
+                    if not isinstance(prior_sheet, dict):
+                        continue
+                    normalized_name = _normalize_ocr_text_block(prior_sheet.get("sheet")).lower()
+                    if normalized_name:
+                        prior_sheet_summaries[normalized_name] = prior_sheet
+                sorted_worksheets = sorted(
+                    wb.worksheets,
+                    key=lambda item: _boq_sheet_priority_key(getattr(item, "title", "")),
+                )
+                if full_scan_guidance:
+                    confirmed_sheet_names = full_scan_guidance.get("confirmed_sheet_names")
+                    if isinstance(confirmed_sheet_names, set):
+                        sorted_worksheets = sorted(
+                            sorted_worksheets,
+                            key=lambda item: (
+                                0
+                                if _normalize_ocr_text_block(getattr(item, "title", "")).lower()
+                                in confirmed_sheet_names
+                                else 1,
+                                _boq_sheet_priority_key(getattr(item, "title", "")),
+                            ),
+                        )
+                for sheet in sorted_worksheets[: max(1, int(max_sheets))]:
+                    normalized_sheet_name = _normalize_ocr_text_block(sheet.title).lower()
+                    prior_sheet_summary = prior_sheet_summaries.get(normalized_sheet_name)
+                    resume_from_row = int(
+                        _to_float_or_none(
+                            prior_sheet_summary.get("scanned_rows") if prior_sheet_summary else 0
+                        )
+                        or 0
+                    )
+                    row_budget = min(
+                        int(max_rows_per_sheet),
+                        int(
+                            _boq_full_sheet_row_budget(
+                                sheet.title,
+                                full_scan_guidance=full_scan_guidance,
+                            )
+                        ),
+                    )
+                    if resume_from_row >= row_budget:
+                        continue
+                    sheet_lines: List[str] = []
+                    for absolute_row_index, row in enumerate(
+                        _iter_boq_excel_rows(sheet, start_row=resume_from_row + 1),
+                        start=resume_from_row + 1,
+                    ):
+                        if absolute_row_index > row_budget:
+                            break
+                        line = "\t".join(
+                            str(cell) if cell is not None else "" for cell in list(row or [])
+                        ).strip()
+                        if line:
+                            sheet_lines.append(line)
+                    if sheet_lines:
+                        parts.append(f"[SHEET:{sheet.title}]")
+                        parts.extend(sheet_lines)
+            finally:
+                wb.close()
+        except Exception:
+            return ""
+        return "\n".join(parts).strip()
+    if ext == ".csv":
+        try:
+            prior_csv_summary = None
+            for prior_sheet in prior_summary.get("sheets") or []:
+                if not isinstance(prior_sheet, dict):
+                    continue
+                if _normalize_ocr_text_block(prior_sheet.get("sheet")).lower() == "csv":
+                    prior_csv_summary = prior_sheet
+                    break
+            resume_from_row = int(
+                _to_float_or_none(prior_csv_summary.get("scanned_rows") if prior_csv_summary else 0)
+                or 0
+            )
+            row_budget = min(
+                int(max_rows_per_sheet),
+                int(_boq_full_csv_row_budget(full_scan_guidance=full_scan_guidance)),
+            )
+            if resume_from_row >= row_budget:
+                return ""
+            decoded = content.decode("utf-8", errors="ignore")
+            reader = csv.reader(io.StringIO(decoded))
+            if resume_from_row > 0:
+                reader = itertools.islice(reader, resume_from_row, None)
+            for absolute_row_index, row in enumerate(reader, start=resume_from_row + 1):
+                if absolute_row_index > row_budget:
+                    break
+                line = "\t".join(str(cell or "") for cell in row).strip()
+                if line:
+                    parts.append(line)
+        except Exception:
+            return ""
+        return "\n".join(parts).strip()
+    return ""
+
+
+def _build_boq_full_parse_text(
+    content: bytes,
+    filename: str,
+    *,
+    prior_text: str = "",
+    prior_summary: Optional[Dict[str, object]] = None,
+) -> str:
+    ext = Path(filename).suffix.lower()
+    if ext == ".pdf":
+        preview_last_page = 0
+        if isinstance(prior_summary, dict):
+            preview_last_page = int(_to_float_or_none(prior_summary.get("preview_last_page")) or 0)
+        if preview_last_page <= 0:
+            preview_last_page = _extract_pdf_last_page_marker(prior_text)
+        if preview_last_page > 0:
+            delta_text = _strip_pdf_backend_prefix(
+                _extract_pdf_text(
+                    content,
+                    filename,
+                    material_type="boq",
+                    start_page=preview_last_page + 1,
+                    prior_text=prior_text,
+                )
+            )
+            merged_text = "\n\n".join(
+                segment
+                for segment in [str(prior_text or "").strip(), str(delta_text or "").strip()]
+                if segment
+            )
+            if merged_text:
+                return merged_text[:DEFAULT_BOQ_PARSE_TEXT_MERGED_MAX_CHARS]
+    delta_text = _extract_boq_tabular_resume_text(
+        content,
+        filename,
+        prior_summary=prior_summary,
+        max_sheets=int(DEFAULT_MATERIAL_PARSE_TEXT_MAX_SHEETS_BY_TYPE.get("boq", 4)),
+        max_rows_per_sheet=int(DEFAULT_MATERIAL_PARSE_TEXT_MAX_ROWS_BY_TYPE.get("boq", 600)),
+    )
+    segments = [str(prior_text or "").strip(), str(delta_text or "").strip()]
+    merged_text = "\n".join(segment for segment in segments if segment)
+    if merged_text:
+        return merged_text[:DEFAULT_BOQ_PARSE_TEXT_MERGED_MAX_CHARS]
+    boq_excerpt = _extract_boq_tabular_preview_text(
+        content,
+        filename,
+        max_sheets=int(DEFAULT_MATERIAL_PARSE_TEXT_MAX_SHEETS_BY_TYPE.get("boq", 4)),
+        max_rows_per_sheet=int(DEFAULT_MATERIAL_PARSE_TEXT_MAX_ROWS_BY_TYPE.get("boq", 600)),
+    )
+    if boq_excerpt:
+        return boq_excerpt[:DEFAULT_BOQ_PARSE_TEXT_MERGED_MAX_CHARS]
+    return _read_uploaded_file_content(content, filename, material_type="boq")
+
+
+def _iter_boq_excel_rows(sheet: Any, *, start_row: int = 1) -> Any:
+    normalized_start_row = max(1, int(start_row))
+    try:
+        yield from sheet.iter_rows(values_only=True, min_row=normalized_start_row)
+        return
+    except TypeError:
+        pass
+    for row_index, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+        if row_index < normalized_start_row:
+            continue
+        yield row
+
+
 def _build_boq_structured_summary(
     content: bytes,
     filename: str,
     *,
     parsed_text: str = "",
+    preview_only: bool = False,
+    prior_summary: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     summary: Dict[str, object] = {
         "filename": filename,
@@ -17657,33 +24585,112 @@ def _build_boq_structured_summary(
                     out[field] = idx
         return out
 
-    def _sheet_struct_from_rows(rows: List[List[object]], sheet_name: str) -> Dict[str, object]:
+    def _looks_like_boq_summary_tail_row(row_text: object) -> bool:
+        normalized = _normalize_ocr_text_block(row_text)
+        if not normalized:
+            return False
+        return bool(
+            re.search(
+                r"(本页|本章|本表|本项|本专业|本分部)?(小计|合计|总计|汇总)|合价合计|金额合计|税金合计|规费合计|分部分项合计",
+                normalized,
+            )
+        )
+
+    def _should_early_stop_boq_row_scan(
+        *,
+        parsed_items: int,
+        quantity_rows: int,
+        amount_rows: int,
+        trailing_nondata_rows: int,
+        summary_tail_hits: int,
+    ) -> bool:
+        if parsed_items < DEFAULT_BOQ_PARSE_EARLY_STOP_MIN_PARSED_ITEMS:
+            return False
+        if max(quantity_rows, amount_rows) < DEFAULT_BOQ_PARSE_EARLY_STOP_MIN_NUMERIC_ROWS:
+            return False
+        if summary_tail_hits >= 2 and trailing_nondata_rows >= 2:
+            return True
+        if summary_tail_hits >= 1 and trailing_nondata_rows >= 8:
+            return True
+        return trailing_nondata_rows >= DEFAULT_BOQ_PARSE_EARLY_STOP_TRAILING_NONDATA_ROWS
+
+    def _sheet_struct_from_row_iter(
+        row_iter: Any,
+        sheet_name: str,
+        *,
+        header_scan_limit: int = DEFAULT_BOQ_PARSE_HEADER_SCAN_MAX_ROWS,
+        max_rows_per_sheet: int = DEFAULT_BOQ_PARSE_MAX_ROWS_PER_SHEET,
+        seed_summary: Optional[Dict[str, object]] = None,
+        resume_from_row: int = 1,
+    ) -> Dict[str, object]:
+        seeded = False
         header_idx = -1
         col_map: Dict[str, int] = {}
-        for i, row in enumerate(rows[:40]):
-            str_row = [str(x or "").strip() for x in row]
-            maybe = _find_col_map(str_row)
-            if len(maybe) >= 2:
-                header_idx = i
-                col_map = maybe
-                break
-        if header_idx < 0:
-            return {
-                "sheet": sheet_name,
-                "parsed_items": 0,
-                "detected_columns": {},
-                "quantity_sum": 0.0,
-                "amount_sum": 0.0,
-                "top_items_by_amount": [],
-            }
-
+        scanned_rows = 0
         parsed_items = 0
         quantity_sum = 0.0
         amount_sum = 0.0
+        quantity_rows = 0
+        amount_rows = 0
+        trailing_nondata_rows = 0
+        summary_tail_hits = 0
         unit_set: set[str] = set()
-        top_items: List[Dict[str, object]] = []
-        for row in rows[header_idx + 1 :]:
-            if not row:
+        top_items_heap: List[tuple[tuple[float, int], Dict[str, object]]] = []
+        row_scan_stopped_early = False
+        header_row_index: Optional[int] = None
+        normalized_resume_from_row = max(1, int(resume_from_row))
+
+        if isinstance(seed_summary, dict):
+            seeded_columns = (
+                seed_summary.get("detected_columns")
+                if isinstance(seed_summary.get("detected_columns"), dict)
+                else {}
+            )
+            if seeded_columns and normalized_resume_from_row > 1:
+                seeded = True
+                header_idx = int(_to_float_or_none(seed_summary.get("header_row_index")) or 1)
+                col_map = {str(key): int(value) for key, value in seeded_columns.items()}
+                scanned_rows = max(
+                    normalized_resume_from_row - 1,
+                    int(_to_float_or_none(seed_summary.get("scanned_rows")) or 0),
+                )
+                header_row_index = header_idx
+                parsed_items = int(_to_float_or_none(seed_summary.get("parsed_items")) or 0)
+                quantity_sum = float(_to_float_or_none(seed_summary.get("quantity_sum")) or 0.0)
+                amount_sum = float(_to_float_or_none(seed_summary.get("amount_sum")) or 0.0)
+                quantity_rows = int(_to_float_or_none(seed_summary.get("quantity_rows")) or 0)
+                amount_rows = int(_to_float_or_none(seed_summary.get("amount_rows")) or 0)
+                unit_set = {
+                    str(item).strip()
+                    for item in (seed_summary.get("units") or [])
+                    if str(item).strip()
+                }
+                for item in (seed_summary.get("top_items_by_amount") or [])[:10]:
+                    if not isinstance(item, dict):
+                        continue
+                    amount_key = float(_to_float_or_none(item.get("amount")) or 0.0)
+                    heap_entry = ((amount_key, -len(top_items_heap)), dict(item))
+                    if len(top_items_heap) < 10:
+                        heapq.heappush(top_items_heap, heap_entry)
+                    elif heap_entry[0] > top_items_heap[0][0]:
+                        heapq.heapreplace(top_items_heap, heap_entry)
+
+        for row_index, raw_row in enumerate(row_iter, start=1):
+            absolute_row_index = normalized_resume_from_row + row_index - 1
+            if absolute_row_index > max(1, int(max_rows_per_sheet)):
+                break
+            scanned_rows = absolute_row_index
+            row = list(raw_row or [])
+            if header_idx < 0:
+                str_row = [str(x or "").strip() for x in row]
+                maybe = _find_col_map(str_row)
+                if len(maybe) >= 2:
+                    header_idx = absolute_row_index
+                    col_map = maybe
+                    header_row_index = absolute_row_index
+                    continue
+                if absolute_row_index >= max(1, int(header_scan_limit)):
+                    break
                 continue
 
             def _cell(name: str) -> object:
@@ -17692,10 +24699,40 @@ def _build_boq_structured_summary(
                     return ""
                 return row[idx]
 
+            row_text = " ".join(str(cell or "").strip() for cell in row if str(cell or "").strip())
+            is_summary_tail = _looks_like_boq_summary_tail_row(row_text)
+            if is_summary_tail and parsed_items >= max(
+                12, DEFAULT_BOQ_PARSE_EARLY_STOP_MIN_PARSED_ITEMS // 2
+            ):
+                summary_tail_hits += 1
+                trailing_nondata_rows += 1
+                if _should_early_stop_boq_row_scan(
+                    parsed_items=parsed_items,
+                    quantity_rows=quantity_rows,
+                    amount_rows=amount_rows,
+                    trailing_nondata_rows=trailing_nondata_rows,
+                    summary_tail_hits=summary_tail_hits,
+                ):
+                    row_scan_stopped_early = True
+                    break
+                continue
+
             code = str(_cell("code") or "").strip()
             name = str(_cell("name") or "").strip()
             if not code and not name:
+                trailing_nondata_rows += 1
+                if _should_early_stop_boq_row_scan(
+                    parsed_items=parsed_items,
+                    quantity_rows=quantity_rows,
+                    amount_rows=amount_rows,
+                    trailing_nondata_rows=trailing_nondata_rows,
+                    summary_tail_hits=summary_tail_hits,
+                ):
+                    row_scan_stopped_early = True
+                    break
                 continue
+
+            trailing_nondata_rows = 0
             parsed_items += 1
             unit = str(_cell("unit") or "").strip()
             if unit:
@@ -17704,25 +24741,64 @@ def _build_boq_structured_summary(
             amt = _safe_float_from_cell(_cell("amount"))
             if qty is not None:
                 quantity_sum += qty
+                quantity_rows += 1
             if amt is not None:
                 amount_sum += amt
-            if name or code:
-                top_items.append(
-                    {
-                        "code": code,
-                        "name": name,
-                        "unit": unit,
-                        "quantity": round(float(qty), 4) if qty is not None else None,
-                        "amount": round(float(amt), 2) if amt is not None else None,
-                    }
-                )
-        top_items.sort(key=lambda x: float(x.get("amount") or 0.0), reverse=True)
+                amount_rows += 1
+            item = {
+                "code": code,
+                "name": name,
+                "unit": unit,
+                "quantity": round(float(qty), 4) if qty is not None else None,
+                "amount": round(float(amt), 2) if amt is not None else None,
+            }
+            amount_key = float(amt) if amt is not None else 0.0
+            heap_entry = ((amount_key, -parsed_items), item)
+            if len(top_items_heap) < 10:
+                heapq.heappush(top_items_heap, heap_entry)
+            elif heap_entry[0] > top_items_heap[0][0]:
+                heapq.heapreplace(top_items_heap, heap_entry)
+
+        if header_idx < 0:
+            return {
+                "sheet": sheet_name,
+                "scanned_rows": scanned_rows,
+                "row_scan_budget": max_rows_per_sheet,
+                "resume_from_row": normalized_resume_from_row,
+                "resumed_from_prior_summary": seeded,
+                "row_scan_stopped_early": False,
+                "header_row_index": header_row_index,
+                "parsed_items": 0,
+                "detected_columns": {},
+                "quantity_sum": 0.0,
+                "amount_sum": 0.0,
+                "quantity_rows": 0,
+                "amount_rows": 0,
+                "top_items_by_amount": [],
+            }
+
+        top_items = [
+            item
+            for _, item in sorted(
+                top_items_heap,
+                key=lambda pair: pair[0],
+                reverse=True,
+            )
+        ]
         return {
             "sheet": sheet_name,
+            "scanned_rows": scanned_rows,
+            "row_scan_budget": max_rows_per_sheet,
+            "resume_from_row": normalized_resume_from_row,
+            "resumed_from_prior_summary": seeded,
+            "row_scan_stopped_early": row_scan_stopped_early,
+            "header_row_index": header_row_index,
             "parsed_items": parsed_items,
             "detected_columns": col_map,
             "quantity_sum": round(quantity_sum, 4),
             "amount_sum": round(amount_sum, 2),
+            "quantity_rows": quantity_rows,
+            "amount_rows": amount_rows,
             "units": sorted(unit_set)[:20],
             "top_items_by_amount": top_items[:10],
         }
@@ -17736,39 +24812,183 @@ def _build_boq_structured_summary(
             total_items = 0
             total_qty = 0.0
             total_amt = 0.0
-            for sheet in wb.worksheets:
-                rows: List[List[object]] = []
-                for idx, row in enumerate(sheet.iter_rows(values_only=True), start=1):
-                    rows.append(list(row))
-                    if idx >= 3000:
-                        break
-                sheet_summary = _sheet_struct_from_rows(rows, sheet.title)
+            skipped_tail_sheets = 0
+            consecutive_empty_aux_sheets = 0
+            full_scan_guidance = (
+                None if preview_only else _build_boq_full_scan_guidance(prior_summary)
+            )
+            sorted_worksheets = sorted(
+                wb.worksheets,
+                key=lambda item: _boq_sheet_priority_key(getattr(item, "title", "")),
+            )
+            prior_sheet_summaries: Dict[str, Dict[str, object]] = {}
+            if isinstance(prior_summary, dict):
+                for prior_sheet in prior_summary.get("sheets") or []:
+                    if not isinstance(prior_sheet, dict):
+                        continue
+                    normalized_sheet_name = _normalize_ocr_text_block(
+                        prior_sheet.get("sheet")
+                    ).lower()
+                    if normalized_sheet_name:
+                        prior_sheet_summaries[normalized_sheet_name] = prior_sheet
+            if full_scan_guidance:
+                confirmed_sheet_names = full_scan_guidance.get("confirmed_sheet_names")
+                if isinstance(confirmed_sheet_names, set):
+                    sorted_worksheets = sorted(
+                        sorted_worksheets,
+                        key=lambda item: (
+                            0
+                            if _normalize_ocr_text_block(getattr(item, "title", "")).lower()
+                            in confirmed_sheet_names
+                            else 1,
+                            _boq_sheet_priority_key(getattr(item, "title", "")),
+                        ),
+                    )
+            if preview_only:
+                sorted_worksheets = sorted_worksheets[
+                    : max(
+                        1,
+                        int(DEFAULT_MATERIAL_PARSE_PREVIEW_MAX_SHEETS_BY_TYPE.get("boq", 2)),
+                    )
+                ]
+            for sheet_index, sheet in enumerate(sorted_worksheets):
+                normalized_sheet_name = _normalize_ocr_text_block(sheet.title).lower()
+                prior_sheet_summary = (
+                    None if preview_only else prior_sheet_summaries.get(normalized_sheet_name)
+                )
+                resume_from_row = int(
+                    _to_float_or_none(
+                        prior_sheet_summary.get("scanned_rows") if prior_sheet_summary else 0
+                    )
+                    or 0
+                )
+                if resume_from_row > 0:
+                    row_iter = _iter_boq_excel_rows(sheet, start_row=resume_from_row + 1)
+                else:
+                    row_iter = _iter_boq_excel_rows(sheet, start_row=1)
+                sheet_summary = _sheet_struct_from_row_iter(
+                    row_iter,
+                    sheet.title,
+                    header_scan_limit=_boq_sheet_header_scan_limit(sheet.title),
+                    max_rows_per_sheet=(
+                        int(DEFAULT_MATERIAL_PARSE_PREVIEW_MAX_ROWS_BY_TYPE.get("boq", 180))
+                        if preview_only
+                        else _boq_full_sheet_row_budget(
+                            sheet.title,
+                            full_scan_guidance=full_scan_guidance,
+                        )
+                    ),
+                    seed_summary=prior_sheet_summary,
+                    resume_from_row=(resume_from_row + 1 if resume_from_row > 0 else 1),
+                )
                 sheet_summaries.append(sheet_summary)
                 total_items += int(sheet_summary.get("parsed_items", 0))
                 total_qty += float(sheet_summary.get("quantity_sum", 0.0))
                 total_amt += float(sheet_summary.get("amount_sum", 0.0))
+                if _boq_sheet_priority_key(sheet.title)[0] == 2:
+                    detected_columns = (
+                        sheet_summary.get("detected_columns")
+                        if isinstance(sheet_summary.get("detected_columns"), dict)
+                        else {}
+                    )
+                    if (
+                        not detected_columns
+                        and int(_to_float_or_none(sheet_summary.get("parsed_items")) or 0) <= 0
+                    ):
+                        consecutive_empty_aux_sheets += 1
+                    else:
+                        consecutive_empty_aux_sheets = 0
+                else:
+                    consecutive_empty_aux_sheets = 0
+                if _should_stop_boq_full_scan_after_aux_tail(
+                    full_scan_guidance=full_scan_guidance,
+                    sheet_name=sheet.title,
+                    sheet_summary=sheet_summary,
+                    consecutive_empty_aux_sheets=consecutive_empty_aux_sheets,
+                ):
+                    skipped_tail_sheets = max(0, len(sorted_worksheets) - sheet_index - 1)
+                    break
             wb.close()
             summary["sheets"] = sheet_summaries
             summary["total_parsed_items"] = total_items
             summary["total_quantity"] = round(total_qty, 4)
             summary["total_amount"] = round(total_amt, 2)
+            if preview_only:
+                summary["parse_stage"] = "preview"
+            elif full_scan_guidance:
+                summary["scan_strategy"] = "preview_guided_full"
+                summary["scan_guidance_strength"] = str(
+                    full_scan_guidance.get("guidance_level") or "standard"
+                )
+                if skipped_tail_sheets > 0:
+                    summary["skipped_tail_sheets"] = skipped_tail_sheets
+                    summary["scan_tail_stop_reason"] = "strong_preview_empty_aux_tail"
             return _finalize_boq_structured_summary(summary, parsed_text=parsed_text)
         except Exception as exc:
             summary["parse_error"] = f"excel_parse_failed: {type(exc).__name__}: {exc}"
 
     if ext == ".csv":
         try:
+            full_scan_guidance = (
+                None if preview_only else _build_boq_full_scan_guidance(prior_summary)
+            )
+            prior_csv_summary = None
+            if isinstance(prior_summary, dict):
+                for prior_sheet in prior_summary.get("sheets") or []:
+                    if not isinstance(prior_sheet, dict):
+                        continue
+                    if _normalize_ocr_text_block(prior_sheet.get("sheet")).lower() == "csv":
+                        prior_csv_summary = prior_sheet
+                        break
+            resume_from_row = int(
+                _to_float_or_none(prior_csv_summary.get("scanned_rows") if prior_csv_summary else 0)
+                or 0
+            )
             decoded = content.decode("utf-8", errors="ignore")
             reader = csv.reader(io.StringIO(decoded))
-            rows = [list(r) for _, r in zip(range(3000), reader)]
-            csv_summary = _sheet_struct_from_rows(rows, "csv")
+            if resume_from_row > 0:
+                reader = itertools.islice(reader, resume_from_row, None)
+            csv_summary = _sheet_struct_from_row_iter(
+                reader,
+                "csv",
+                max_rows_per_sheet=(
+                    int(DEFAULT_MATERIAL_PARSE_PREVIEW_MAX_ROWS_BY_TYPE.get("boq", 180))
+                    if preview_only
+                    else _boq_full_csv_row_budget(full_scan_guidance=full_scan_guidance)
+                ),
+                seed_summary=(None if preview_only else prior_csv_summary),
+                resume_from_row=(resume_from_row + 1 if resume_from_row > 0 else 1),
+            )
             summary["sheets"] = [csv_summary]
             summary["total_parsed_items"] = int(csv_summary.get("parsed_items", 0))
             summary["total_quantity"] = float(csv_summary.get("quantity_sum", 0.0))
             summary["total_amount"] = float(csv_summary.get("amount_sum", 0.0))
+            if preview_only:
+                summary["parse_stage"] = "preview"
+            elif full_scan_guidance:
+                summary["scan_strategy"] = "preview_guided_full"
+                summary["scan_guidance_strength"] = str(
+                    full_scan_guidance.get("guidance_level") or "standard"
+                )
             return _finalize_boq_structured_summary(summary, parsed_text=parsed_text)
         except Exception as exc:
             summary["parse_error"] = f"csv_parse_failed: {type(exc).__name__}: {exc}"
+
+    if (
+        ext == ".pdf"
+        and not preview_only
+        and isinstance(prior_summary, dict)
+        and str(prior_summary.get("parse_stage") or "").strip().lower() == "preview"
+    ):
+        preview_last_page = int(_to_float_or_none(prior_summary.get("preview_last_page")) or 0)
+        if preview_last_page <= 0:
+            preview_last_page = _extract_pdf_last_page_marker(parsed_text)
+        if preview_last_page > 0:
+            summary["scan_strategy"] = "preview_guided_full_pdf"
+            summary["resume_from_page"] = preview_last_page + 1
+            summary["saved_page_count"] = preview_last_page
+    if preview_only:
+        summary["parse_stage"] = "preview"
 
     # 兜底：从已解析文本里识别关键信号，至少提供结构化可见性。
     text = str(parsed_text or "")
@@ -17834,52 +25054,348 @@ def _pdf_backend_name() -> str:
     return "none"
 
 
-def _extract_pdf_text_with_pypdf(content: bytes) -> str:
+def _extract_pdf_text_with_pypdf(
+    content: bytes,
+    *,
+    filename: str = "",
+    material_type: object = None,
+    preview: bool = False,
+    max_pages: Optional[int] = None,
+    max_chars: Optional[int] = None,
+    stop_when_project_name_found: bool = False,
+    start_page: int = 1,
+    prior_text: str = "",
+    allow_early_stop: bool = True,
+) -> str:
     if PdfReader is None:
         return ""
     if not bytes(content or b"").lstrip().startswith(b"%PDF"):
         return ""
+    normalized_type = _normalize_material_type(material_type, filename=filename)
     try:
         reader = PdfReader(io.BytesIO(content))
     except Exception:
         return ""
     parts: List[str] = []
+    filename_terms = _extract_terms(filename, max_terms=10)
+    strong_native_pages = 0
+    normalized_start_page = max(1, int(start_page))
+    normalized_prior_text = _strip_pdf_backend_prefix(prior_text)
     for idx, page in enumerate(getattr(reader, "pages", []) or [], start=1):
+        if idx < normalized_start_page:
+            continue
+        if preview and idx > max(1, int(max_pages or 1)):
+            break
         try:
             page_text = str(page.extract_text() or "")
         except Exception:
             page_text = ""
         page_text = page_text.strip()
-        if page_text:
-            parts.append(f"[PAGE:{idx}]\n{page_text}")
+        if not page_text:
+            continue
+        page_analysis = _analyze_pdf_native_page_text(
+            page_text,
+            context_tokens=filename_terms,
+        )
+        if _is_strong_native_pdf_text(page_analysis, material_type=normalized_type):
+            strong_native_pages += 1
+        parts.append(f"[PAGE:{idx}]\n{page_text}")
+        current_segments = [normalized_prior_text] if normalized_prior_text else []
+        current_segments.extend(part for part in parts if part.strip())
+        current_text = "\n\n".join(current_segments).strip()
+        if not current_text:
+            continue
+        if preview:
+            if stop_when_project_name_found:
+                if any(marker in current_text for marker in ("项目名称", "工程名称", "标段名称")):
+                    try:
+                        current_project_name = _infer_project_name_from_tender_text(
+                            current_text, ""
+                        )
+                    except HTTPException:
+                        current_project_name = ""
+                    if current_project_name:
+                        break
+            if (
+                not stop_when_project_name_found
+                and allow_early_stop
+                and _should_early_stop_pdf_preview(
+                    current_text,
+                    material_type=normalized_type,
+                    pages_seen=idx,
+                )
+            ):
+                break
+            if sum(len(part) for part in parts) >= max(4000, int(max_chars or 4000)):
+                break
+            continue
+        if allow_early_stop and _should_early_stop_pdf_full_parse(
+            current_text,
+            material_type=normalized_type,
+            pages_seen=idx,
+            text_layer_confirmed=(strong_native_pages >= DEFAULT_PDF_NATIVE_TEXT_CONFIRM_MIN_PAGES),
+        ):
+            parts.append(f"[PDF_EARLY_STOP_AFTER_PAGE:{idx}] {normalized_type}_enough_signals")
+            break
     return "\n\n".join(parts).strip()
 
 
-def _extract_pdf_text(content: bytes, filename: str) -> str:
+def _strip_pdf_backend_prefix(text: object) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    return re.sub(r"^\[PDF_BACKEND:[^\]]+\]\s*", "", value, count=1).strip()
+
+
+def _extract_pdf_last_page_marker(text: object) -> int:
+    matches = re.findall(r"\[PAGE:(\d+)\]", str(text or ""))
+    if not matches:
+        return 0
+    return max(int(item) for item in matches)
+
+
+def _analyze_pdf_native_page_text(
+    page_text: object,
+    *,
+    context_tokens: Optional[List[str]] = None,
+) -> Dict[str, object]:
+    normalized = _normalize_ocr_text_block(page_text)
+    compact = normalized.replace("\n", "").strip()
+    return {
+        "text": normalized,
+        "char_count": len(compact),
+        "score": _score_ocr_text_candidate(normalized, context_tokens=context_tokens),
+    }
+
+
+def _is_strong_native_pdf_text(
+    page_analysis: Dict[str, object],
+    *,
+    material_type: object = None,
+) -> bool:
+    normalized_type = _normalize_material_type(material_type)
+    min_chars = int(
+        DEFAULT_PDF_NATIVE_TEXT_STRONG_MIN_CHARS_BY_TYPE.get(
+            normalized_type,
+            DEFAULT_PDF_NATIVE_TEXT_STRONG_MIN_CHARS,
+        )
+    )
+    min_score = float(
+        DEFAULT_PDF_NATIVE_TEXT_STRONG_MIN_SCORE_BY_TYPE.get(
+            normalized_type,
+            DEFAULT_PDF_NATIVE_TEXT_STRONG_MIN_SCORE,
+        )
+    )
+    return bool(
+        int(_to_float_or_none(page_analysis.get("char_count")) or 0) >= min_chars
+        and float(_to_float_or_none(page_analysis.get("score")) or 0.0) >= min_score
+    )
+
+
+def _should_run_pdf_page_ocr(
+    *,
+    page_index: int,
+    page_analysis: Dict[str, object],
+    max_ocr_pages: int,
+    text_layer_confirmed: bool,
+) -> bool:
+    page_char_count = int(_to_float_or_none(page_analysis.get("char_count")) or 0)
+    page_score = float(_to_float_or_none(page_analysis.get("score")) or 0.0)
+    if page_index > max(1, int(max_ocr_pages)):
+        return False
+    if text_layer_confirmed and page_char_count >= DEFAULT_PDF_TEXT_LAYER_SKIP_OCR_MIN_CHARS:
+        return False
+    return bool(page_char_count < DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR or page_score < 2.2)
+
+
+def _should_early_stop_tender_pdf_full_parse(
+    text: str,
+    *,
+    pages_seen: int,
+    text_layer_confirmed: bool,
+) -> bool:
+    if not text_layer_confirmed:
+        return False
+    if pages_seen < int(DEFAULT_MATERIAL_PARSE_FULL_EARLY_STOP_MIN_PAGES_BY_TYPE["tender_qa"]):
+        return False
+    normalized = _normalize_ocr_text_block(text)
+    normalized_lines = [line for line in normalized.splitlines() if str(line).strip()]
+    if (
+        len(normalized) < int(DEFAULT_MATERIAL_PARSE_FULL_EARLY_STOP_MIN_CHARS_BY_TYPE["tender_qa"])
+        and len(normalized_lines) < 18
+    ):
+        return False
+    section_titles = _extract_tender_qa_section_titles(normalized, limit=10)
+    scoring_terms = _extract_tender_qa_scoring_point_terms(normalized, limit=12)
+    mandatory_terms = _extract_tender_qa_mandatory_clauses(normalized, limit=10)
+    numeric_terms = _extract_numeric_terms(normalized, max_terms=24)
+    lower_text = normalized.lower()
+    keyword_hits = sum(
+        1
+        for token in ("评分", "评审", "得分", "加分", "扣分", "工期", "质量", "安全", "专项方案")
+        if token in lower_text
+    )
+    return bool(
+        len(section_titles) >= 4
+        and len(numeric_terms) >= 3
+        and keyword_hits >= 5
+        and (
+            len(scoring_terms) >= 2
+            or len(mandatory_terms) >= 2
+            or (len(scoring_terms) + len(mandatory_terms) >= 4)
+        )
+    )
+
+
+def _should_early_stop_drawing_pdf_full_parse(
+    text: str,
+    *,
+    pages_seen: int,
+    text_layer_confirmed: bool,
+) -> bool:
+    if pages_seen < int(DEFAULT_MATERIAL_PARSE_FULL_EARLY_STOP_MIN_PAGES_BY_TYPE["drawing"]):
+        return False
+    normalized = _normalize_ocr_text_block(text)
+    normalized_lines = [line for line in normalized.splitlines() if str(line).strip()]
+    if (
+        len(normalized) < int(DEFAULT_MATERIAL_PARSE_FULL_EARLY_STOP_MIN_CHARS_BY_TYPE["drawing"])
+        and len(normalized_lines) < 6
+    ):
+        return False
+    discipline_keywords = _collect_keyword_labels(normalized, DRAWING_DISCIPLINE_HINTS, limit=8)
+    sheet_type_tags = _collect_keyword_labels(normalized, DRAWING_SHEET_TYPE_HINTS, limit=6)
+    risk_keywords = _collect_keyword_labels(normalized, DRAWING_RISK_HINTS, limit=8)
+    numeric_terms = _extract_numeric_terms(normalized, max_terms=20)
+    lexical_terms = _extract_terms(normalized, max_terms=36)
+    lower_text = normalized.lower()
+    keyword_hits = sum(
+        1
+        for token in ("图纸", "总图", "平面", "立面", "剖面", "节点", "详图", "轴线", "标高")
+        if token in lower_text
+    )
+    # 图纸单页常常文本很短，`text_layer_confirmed` 不是足够稳的早停前置条件；
+    # 这里改为依赖累计的结构化信号，避免 full parse 为了等文本层确认而继续扫尾页。
+    return bool(
+        len(numeric_terms) >= 3
+        and len(lexical_terms) >= 14
+        and keyword_hits >= 3
+        and (
+            len(discipline_keywords) >= 1
+            or len(sheet_type_tags) >= 1
+            or len(risk_keywords) >= 1
+            or len(discipline_keywords) + len(sheet_type_tags) + len(risk_keywords) >= 2
+        )
+    )
+
+
+def _should_early_stop_boq_pdf_full_parse(
+    text: str,
+    *,
+    pages_seen: int,
+    text_layer_confirmed: bool,
+) -> bool:
+    if pages_seen < int(DEFAULT_MATERIAL_PARSE_FULL_EARLY_STOP_MIN_PAGES_BY_TYPE["boq"]):
+        return False
+    normalized = _normalize_ocr_text_block(text)
+    normalized_lines = [line for line in normalized.splitlines() if str(line).strip()]
+    if (
+        len(normalized) < int(DEFAULT_MATERIAL_PARSE_FULL_EARLY_STOP_MIN_CHARS_BY_TYPE["boq"])
+        and len(normalized_lines) < 20
+    ):
+        return False
+    numeric_terms = _extract_numeric_terms(normalized, max_terms=48)
+    table_like_lines = sum(
+        1
+        for line in normalized_lines
+        if len(re.findall(r"\d+(?:\.\d+)?", line)) >= 2 and len(str(line).strip()) >= 8
+    )
+    keyword_hits = sum(
+        1
+        for token in (
+            "工程量",
+            "项目编码",
+            "项目名称",
+            "单位",
+            "综合单价",
+            "单价",
+            "合价",
+            "金额",
+            "清单",
+        )
+        if token in normalized
+    )
+    return bool(len(numeric_terms) >= 12 and table_like_lines >= 18 and keyword_hits >= 4)
+
+
+def _should_early_stop_pdf_full_parse(
+    text: str,
+    *,
+    material_type: object,
+    pages_seen: int,
+    text_layer_confirmed: bool,
+) -> bool:
+    normalized_type = _normalize_material_type(material_type)
+    if normalized_type == "tender_qa":
+        return _should_early_stop_tender_pdf_full_parse(
+            text,
+            pages_seen=pages_seen,
+            text_layer_confirmed=text_layer_confirmed,
+        )
+    if normalized_type == "drawing":
+        return _should_early_stop_drawing_pdf_full_parse(
+            text,
+            pages_seen=pages_seen,
+            text_layer_confirmed=text_layer_confirmed,
+        )
+    if normalized_type == "boq":
+        return _should_early_stop_boq_pdf_full_parse(
+            text,
+            pages_seen=pages_seen,
+            text_layer_confirmed=text_layer_confirmed,
+        )
+    return False
+
+
+def _extract_pdf_text(
+    content: bytes,
+    filename: str,
+    *,
+    material_type: object = None,
+    start_page: int = 1,
+    prior_text: str = "",
+    allow_early_stop: bool = True,
+) -> str:
+    normalized_type = _normalize_material_type(material_type, filename=filename)
+    normalized_start_page = max(1, int(start_page))
+    normalized_prior_text = _strip_pdf_backend_prefix(prior_text)
     if pymupdf is not None:
         doc = pymupdf.open(stream=content, filetype="pdf")
         try:
             parts: List[str] = []
             filename_terms = _extract_terms(filename, max_terms=10)
+            strong_native_pages = 0
             for idx, page in enumerate(doc, start=1):
+                if idx < normalized_start_page:
+                    continue
                 # Embed stable page markers so downstream diagnostics can map evidence to pages.
-                page_text = _normalize_ocr_text_block(page.get_text() or "")
+                page_analysis = _analyze_pdf_native_page_text(
+                    page.get_text() or "",
+                    context_tokens=filename_terms,
+                )
+                page_text = str(page_analysis.get("text") or "")
+                if _is_strong_native_pdf_text(page_analysis, material_type=normalized_type):
+                    strong_native_pages += 1
                 page_lines: List[str] = [f"[PAGE:{idx}]"]
                 ocr_result: Dict[str, object] = {"text": "", "mode": "", "score": 0.0}
-                need_page_ocr = (
-                    len(page_text.replace("\n", "").strip()) < DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR
-                    or _score_ocr_text_candidate(
-                        page_text,
-                        context_tokens=filename_terms,
-                    )
-                    < 2.2
+                need_page_ocr = _should_run_pdf_page_ocr(
+                    page_index=idx,
+                    page_analysis=page_analysis,
+                    max_ocr_pages=DEFAULT_PDF_OCR_MAX_PAGES,
+                    text_layer_confirmed=(
+                        strong_native_pages >= DEFAULT_PDF_NATIVE_TEXT_CONFIRM_MIN_PAGES
+                    ),
                 )
-                if (
-                    need_page_ocr
-                    and idx <= DEFAULT_PDF_OCR_MAX_PAGES
-                    and pytesseract is not None
-                    and Image is not None
-                ):
+                if need_page_ocr and pytesseract is not None and Image is not None:
                     try:
                         pix = page.get_pixmap(matrix=pymupdf.Matrix(2.0, 2.0), alpha=False)
                         with Image.open(io.BytesIO(pix.tobytes("png"))) as img:
@@ -17912,13 +25428,35 @@ def _extract_pdf_text(content: bytes, filename: str) -> str:
                 elif page_ocr_text:
                     page_lines.append(page_ocr_text[:5000])
                 parts.append("\n".join(page_lines).strip())
+                current_segments = [normalized_prior_text] if normalized_prior_text else []
+                current_segments.extend(part for part in parts if part.strip())
+                current_text = "\n\n".join(current_segments).strip()
+                if allow_early_stop and _should_early_stop_pdf_full_parse(
+                    current_text,
+                    material_type=normalized_type,
+                    pages_seen=idx,
+                    text_layer_confirmed=(
+                        strong_native_pages >= DEFAULT_PDF_NATIVE_TEXT_CONFIRM_MIN_PAGES
+                    ),
+                ):
+                    parts.append(
+                        f"[PDF_EARLY_STOP_AFTER_PAGE:{idx}] {normalized_type}_enough_signals"
+                    )
+                    break
             merged_pdf_text = "\n\n".join(part for part in parts if part.strip()).strip()
             if merged_pdf_text:
                 return f"[PDF_BACKEND:pymupdf]\n{merged_pdf_text}"
         finally:
             doc.close()
 
-    pypdf_text = _extract_pdf_text_with_pypdf(content)
+    pypdf_text = _extract_pdf_text_with_pypdf(
+        content,
+        filename=filename,
+        material_type=normalized_type,
+        start_page=normalized_start_page,
+        prior_text=normalized_prior_text,
+        allow_early_stop=allow_early_stop,
+    )
     if pypdf_text:
         return f"[PDF_BACKEND:pypdf]\n{pypdf_text}"
 
@@ -17929,40 +25467,156 @@ def _extract_pdf_text(content: bytes, filename: str) -> str:
     return f"[PDF资料] 文件: {filename}（未提取到有效文本）"
 
 
+def _should_early_stop_tender_pdf_preview(
+    text: str,
+    *,
+    pages_seen: int,
+) -> bool:
+    if pages_seen < int(DEFAULT_MATERIAL_PARSE_PREVIEW_EARLY_STOP_MIN_PAGES_BY_TYPE["tender_qa"]):
+        return False
+    normalized = _normalize_ocr_text_block(text)
+    normalized_lines = [line for line in normalized.splitlines() if str(line).strip()]
+    if (
+        len(normalized)
+        < int(DEFAULT_MATERIAL_PARSE_PREVIEW_EARLY_STOP_MIN_CHARS_BY_TYPE["tender_qa"])
+        and len(normalized_lines) < 6
+    ):
+        return False
+    section_titles = _extract_tender_qa_section_titles(normalized, limit=8)
+    scoring_terms = _extract_tender_qa_scoring_point_terms(normalized, limit=10)
+    mandatory_terms = _extract_tender_qa_mandatory_clauses(normalized, limit=8)
+    numeric_terms = _extract_numeric_terms(normalized, max_terms=20)
+    lower_text = normalized.lower()
+    keyword_hits = sum(
+        1
+        for token in ("评分", "评审", "得分", "加分", "扣分", "工期", "质量", "安全", "专项方案")
+        if token in lower_text
+    )
+    return bool(
+        len(section_titles) >= 3
+        and len(numeric_terms) >= 3
+        and (len(scoring_terms) >= 3 or len(mandatory_terms) >= 2 or keyword_hits >= 4)
+    )
+
+
+def _should_early_stop_drawing_pdf_preview(
+    text: str,
+    *,
+    pages_seen: int,
+) -> bool:
+    if pages_seen < int(DEFAULT_MATERIAL_PARSE_PREVIEW_EARLY_STOP_MIN_PAGES_BY_TYPE["drawing"]):
+        return False
+    normalized = _normalize_ocr_text_block(text)
+    normalized_lines = [line for line in normalized.splitlines() if str(line).strip()]
+    if (
+        len(normalized)
+        < int(DEFAULT_MATERIAL_PARSE_PREVIEW_EARLY_STOP_MIN_CHARS_BY_TYPE["drawing"])
+        and len(normalized_lines) < 4
+    ):
+        return False
+    numeric_terms = _extract_numeric_terms(normalized, max_terms=18)
+    lexical_terms = _extract_terms(normalized, max_terms=40)
+    lower_text = normalized.lower()
+    keyword_hits = sum(
+        1
+        for token in ("图纸", "总图", "平面", "立面", "剖面", "节点", "详图", "轴线", "标高")
+        if token in lower_text
+    )
+    return bool(keyword_hits >= 2 and len(numeric_terms) >= 4 and len(lexical_terms) >= 14)
+
+
+def _should_early_stop_boq_pdf_preview(
+    text: str,
+    *,
+    pages_seen: int,
+) -> bool:
+    if pages_seen < int(DEFAULT_MATERIAL_PARSE_PREVIEW_EARLY_STOP_MIN_PAGES_BY_TYPE["boq"]):
+        return False
+    normalized = _normalize_ocr_text_block(text)
+    normalized_lines = [line for line in normalized.splitlines() if str(line).strip()]
+    if (
+        len(normalized) < int(DEFAULT_MATERIAL_PARSE_PREVIEW_EARLY_STOP_MIN_CHARS_BY_TYPE["boq"])
+        and len(normalized_lines) < 10
+    ):
+        return False
+    numeric_terms = _extract_numeric_terms(normalized, max_terms=36)
+    table_like_lines = sum(
+        1
+        for line in normalized_lines
+        if len(re.findall(r"\d+(?:\.\d+)?", line)) >= 2 and len(str(line).strip()) >= 8
+    )
+    keyword_hits = sum(
+        1
+        for token in (
+            "工程量",
+            "项目编码",
+            "项目名称",
+            "单位",
+            "综合单价",
+            "单价",
+            "合价",
+            "金额",
+            "清单",
+        )
+        if token in normalized
+    )
+    return bool(len(numeric_terms) >= 8 and table_like_lines >= 10 and keyword_hits >= 3)
+
+
+def _should_early_stop_pdf_preview(
+    text: str,
+    *,
+    material_type: object,
+    pages_seen: int,
+) -> bool:
+    normalized_type = _normalize_material_type(material_type)
+    if normalized_type == "tender_qa":
+        return _should_early_stop_tender_pdf_preview(text, pages_seen=pages_seen)
+    if normalized_type == "drawing":
+        return _should_early_stop_drawing_pdf_preview(text, pages_seen=pages_seen)
+    if normalized_type == "boq":
+        return _should_early_stop_boq_pdf_preview(text, pages_seen=pages_seen)
+    return False
+
+
 def _extract_pdf_text_preview(
     content: bytes,
     filename: str,
     *,
+    material_type: object = "tender_qa",
     max_pages: int = 4,
     max_chars: int = 16000,
     ocr_pages: int = 2,
     stop_when_project_name_found: bool = False,
 ) -> str:
+    normalized_type = _normalize_material_type(material_type, filename=filename)
     if pymupdf is not None:
         doc = pymupdf.open(stream=content, filetype="pdf")
         try:
             parts: List[str] = []
             filename_terms = _extract_terms(filename, max_terms=10)
+            strong_native_pages = 0
             for idx, page in enumerate(doc, start=1):
                 if idx > max(1, int(max_pages)):
                     break
-                page_text = _normalize_ocr_text_block(page.get_text() or "")
+                page_analysis = _analyze_pdf_native_page_text(
+                    page.get_text() or "",
+                    context_tokens=filename_terms,
+                )
+                page_text = str(page_analysis.get("text") or "")
+                if _is_strong_native_pdf_text(page_analysis, material_type=normalized_type):
+                    strong_native_pages += 1
                 page_lines: List[str] = [f"[PAGE:{idx}]"]
                 ocr_result: Dict[str, object] = {"text": "", "mode": "", "score": 0.0}
-                need_page_ocr = (
-                    len(page_text.replace("\n", "").strip()) < DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR
-                    or _score_ocr_text_candidate(
-                        page_text,
-                        context_tokens=filename_terms,
-                    )
-                    < 2.2
+                need_page_ocr = _should_run_pdf_page_ocr(
+                    page_index=idx,
+                    page_analysis=page_analysis,
+                    max_ocr_pages=ocr_pages,
+                    text_layer_confirmed=(
+                        strong_native_pages >= DEFAULT_PDF_NATIVE_TEXT_CONFIRM_MIN_PAGES
+                    ),
                 )
-                if (
-                    need_page_ocr
-                    and idx <= max(1, int(ocr_pages))
-                    and pytesseract is not None
-                    and Image is not None
-                ):
+                if need_page_ocr and pytesseract is not None and Image is not None:
                     try:
                         pix = page.get_pixmap(matrix=pymupdf.Matrix(2.0, 2.0), alpha=False)
                         with Image.open(io.BytesIO(pix.tobytes("png"))) as img:
@@ -17997,8 +25651,8 @@ def _extract_pdf_text_preview(
                 chunk = "\n".join(page_lines).strip()
                 if chunk:
                     parts.append(chunk)
+                current_preview = "\n\n".join(part for part in parts if part.strip()).strip()
                 if stop_when_project_name_found:
-                    current_preview = "\n\n".join(part for part in parts if part.strip()).strip()
                     if any(
                         marker in current_preview for marker in ("项目名称", "工程名称", "标段名称")
                     ):
@@ -18010,6 +25664,12 @@ def _extract_pdf_text_preview(
                             current_project_name = ""
                         if current_project_name:
                             break
+                if not stop_when_project_name_found and _should_early_stop_pdf_preview(
+                    current_preview,
+                    material_type=normalized_type,
+                    pages_seen=idx,
+                ):
+                    break
                 if sum(len(part) for part in parts) >= max(4000, int(max_chars)):
                     break
             merged_pdf_text = "\n\n".join(part for part in parts if part.strip()).strip()
@@ -18018,20 +25678,17 @@ def _extract_pdf_text_preview(
         finally:
             doc.close()
 
-    pypdf_text = _extract_pdf_text_with_pypdf(content)
+    pypdf_text = _extract_pdf_text_with_pypdf(
+        content,
+        filename=filename,
+        material_type=normalized_type,
+        preview=True,
+        max_pages=max_pages,
+        max_chars=max_chars,
+        stop_when_project_name_found=stop_when_project_name_found,
+    )
     if pypdf_text:
-        limited_parts: List[str] = []
-        for idx, chunk in enumerate(re.split(r"\n\s*\n", pypdf_text), start=1):
-            if idx > max(1, int(max_pages)):
-                break
-            if not chunk.strip():
-                continue
-            limited_parts.append(chunk.strip())
-            if sum(len(part) for part in limited_parts) >= max(4000, int(max_chars)):
-                break
-        preview = "\n\n".join(limited_parts).strip()
-        if preview:
-            return f"[PDF_BACKEND:pypdf]\n{preview[: max(4000, int(max_chars))]}"
+        return f"[PDF_BACKEND:pypdf]\n{pypdf_text[: max(4000, int(max_chars))]}"
 
     snippet = _extract_binary_text_snippet(content, max_chars=max_chars)
     if snippet:
@@ -18039,7 +25696,12 @@ def _extract_pdf_text_preview(
     return f"[PDF资料] 文件: {filename}（预览未提取到有效文本）"
 
 
-def _read_uploaded_file_content(content: bytes, filename: str) -> str:
+def _read_uploaded_file_content(
+    content: bytes,
+    filename: str,
+    *,
+    material_type: object = None,
+) -> str:
     """根据文件名解析上传文件为文本，覆盖招标/清单/图纸/现场照片常见格式。"""
     name = filename.lower()
     if name.endswith(".txt") or name.endswith(".md") or name.endswith(".csv"):
@@ -18055,7 +25717,7 @@ def _read_uploaded_file_content(content: bytes, filename: str) -> str:
             return snippet
         return f"[DOC资料] 文件: {filename}（当前环境未启用结构化解析，已纳入文件元信息）"
     if name.endswith(".pdf"):
-        return _extract_pdf_text(content, filename)
+        return _extract_pdf_text(content, filename, material_type=material_type)
     if name.endswith(".json"):
         return content.decode("utf-8", errors="ignore")
     if name.endswith(".xlsx") or name.endswith(".xls") or name.endswith(".xlsm"):
@@ -18124,6 +25786,7 @@ def _read_uploaded_file_preview_for_project_name(content: bytes, filename: str) 
         return _extract_pdf_text_preview(
             content,
             filename,
+            material_type="tender_qa",
             max_pages=10,
             max_chars=32000,
             ocr_pages=3,
@@ -18141,6 +25804,74 @@ def _read_uploaded_file_preview_for_project_name(content: bytes, filename: str) 
     raise ValueError(
         "仅支持 .txt、.md、.csv、.doc/.docx/.docm、.pdf、.json、.xlsx/.xls/.xlsm、.dxf/.dwg、图片格式"
     )
+
+
+def _material_should_use_preview_stage(
+    content: bytes,
+    filename: str,
+    *,
+    material_type: object,
+) -> bool:
+    normalized_type = _normalize_material_type(material_type, filename=filename)
+    ext = Path(str(filename or "")).suffix.lower()
+    size_bytes = len(content or b"")
+    min_bytes = int(DEFAULT_MATERIAL_PARSE_PREVIEW_MIN_BYTES_BY_TYPE.get(normalized_type, 0))
+    if min_bytes <= 0 or size_bytes < min_bytes:
+        return False
+    return bool(
+        (normalized_type in {"tender_qa", "drawing", "boq"} and ext == ".pdf")
+        or (normalized_type == "boq" and ext in {".xlsx", ".xls", ".xlsm", ".csv"})
+    )
+
+
+def _read_uploaded_file_content_for_parse_mode(
+    content: bytes,
+    filename: str,
+    *,
+    material_type: object,
+    parse_mode: str = "full",
+) -> str:
+    normalized_mode = str(parse_mode or "full").strip().lower()
+    normalized_type = _normalize_material_type(material_type, filename=filename)
+    ext = Path(str(filename or "")).suffix.lower()
+    if normalized_mode == "preview":
+        max_pages = int(DEFAULT_MATERIAL_PARSE_PREVIEW_MAX_PAGES_BY_TYPE.get(normalized_type, 4))
+        max_chars = int(
+            DEFAULT_MATERIAL_PARSE_PREVIEW_MAX_CHARS_BY_TYPE.get(normalized_type, 16000)
+        )
+        ocr_pages = int(DEFAULT_MATERIAL_PARSE_PREVIEW_OCR_PAGES_BY_TYPE.get(normalized_type, 2))
+        if ext == ".pdf" and normalized_type in {"tender_qa", "drawing", "boq"}:
+            return _extract_pdf_text_preview(
+                content,
+                filename,
+                material_type=normalized_type,
+                max_pages=max_pages,
+                max_chars=max_chars,
+                ocr_pages=ocr_pages,
+                stop_when_project_name_found=False,
+            )
+        if normalized_type == "boq" and ext in {".xlsx", ".xls", ".xlsm", ".csv"}:
+            preview_text = _extract_boq_tabular_preview_text(
+                content,
+                filename,
+                max_sheets=int(DEFAULT_MATERIAL_PARSE_PREVIEW_MAX_SHEETS_BY_TYPE.get("boq", 2)),
+                max_rows_per_sheet=int(
+                    DEFAULT_MATERIAL_PARSE_PREVIEW_MAX_ROWS_BY_TYPE.get("boq", 180)
+                ),
+            )
+            if preview_text:
+                return preview_text[:max_chars]
+        return _read_uploaded_file_content(content, filename, material_type=material_type)
+    if normalized_type == "boq" and ext in {".xlsx", ".xls", ".xlsm", ".csv"}:
+        boq_excerpt = _extract_boq_tabular_preview_text(
+            content,
+            filename,
+            max_sheets=int(DEFAULT_MATERIAL_PARSE_TEXT_MAX_SHEETS_BY_TYPE.get("boq", 4)),
+            max_rows_per_sheet=int(DEFAULT_MATERIAL_PARSE_TEXT_MAX_ROWS_BY_TYPE.get("boq", 600)),
+        )
+        if boq_excerpt:
+            return boq_excerpt
+    return _read_uploaded_file_content(content, filename, material_type=material_type)
 
 
 def _merge_materials_text(project_id: str) -> str:
@@ -19081,6 +26812,7 @@ def _validate_material_gate_for_scoring(
         )
         queued_count = int(_to_float_or_none(status_counts.get("queued")) or 0)
         processing_count = int(_to_float_or_none(status_counts.get("processing")) or 0)
+        previewed_count = int(_to_float_or_none(status_counts.get("previewed")) or 0)
         parsed_count = int(_to_float_or_none(status_counts.get("parsed")) or 0)
         failed_count = int(_to_float_or_none(status_counts.get("failed")) or 0)
         if parsed_count <= 0:
@@ -19088,6 +26820,10 @@ def _validate_material_gate_for_scoring(
                 issues.append(f"{label}正在深读解析中：{processing_count} 份，请稍后再评分。")
             elif queued_count > 0:
                 issues.append(f"{label}已上传但尚未开始深读：{queued_count} 份，请等待解析完成。")
+            elif previewed_count > 0:
+                issues.append(
+                    f"{label}已完成极速预解析：{previewed_count} 份，后台仍在补全全文，请稍后再评分。"
+                )
             elif failed_count > 0:
                 issues.append(f"{label}解析失败：{failed_count} 份，请重试或更换文件后再评分。")
             else:
@@ -19400,7 +27136,12 @@ def _build_project_mece_audit(project_id: str, project: Dict[str, object]) -> Di
 
     gt_summary = evo_health.get("summary") if isinstance(evo_health.get("summary"), dict) else {}
     gt_count = int(_to_float_or_none(gt_summary.get("ground_truth_count")) or 0)
-    matched_pred_count = int(_to_float_or_none(gt_summary.get("matched_prediction_count")) or 0)
+    matched_pred_count = int(
+        _to_float_or_none(
+            gt_summary.get("matched_score_record_count", gt_summary.get("matched_prediction_count"))
+        )
+        or 0
+    )
     has_evolved_multipliers = bool(gt_summary.get("has_evolved_multipliers"))
     stored_evolved_multipliers = bool(gt_summary.get("stored_evolved_multipliers"))
     evo_fail_reasons: List[str] = []
@@ -19413,7 +27154,7 @@ def _build_project_mece_audit(project_id: str, project: Dict[str, object]) -> Di
             f"真实评标样本仅 {gt_count} 条，建议至少 {min_learning_samples} 条以上。"
         )
     if gt_count > 0 and matched_pred_count <= 0:
-        evo_fail_reasons.append("真实评标与系统预测未形成有效匹配，闭环训练不可用。")
+        evo_fail_reasons.append("真实评标与系统评分记录未形成有效匹配，闭环训练不可用。")
     if gt_count >= min_learning_samples and not has_evolved_multipliers:
         evo_warnings.append("已具备样本但尚未产出进化权重，建议执行“学习进化”。")
     if stored_evolved_multipliers and not has_evolved_multipliers:
@@ -19424,6 +27165,7 @@ def _build_project_mece_audit(project_id: str, project: Dict[str, object]) -> Di
         checks={
             "ground_truth_count": gt_count,
             "matched_prediction_count": matched_pred_count,
+            "matched_score_record_count": matched_pred_count,
             "has_evolved_multipliers": has_evolved_multipliers,
             "stored_evolved_multipliers": stored_evolved_multipliers,
             "weights_source": str(gt_summary.get("current_weights_source") or "-"),
@@ -19504,6 +27246,7 @@ def _build_project_mece_audit(project_id: str, project: Dict[str, object]) -> Di
             "score_std_100": round(std_score, 4),
             "ground_truth_count": gt_count,
             "matched_prediction_count": matched_pred_count,
+            "matched_score_record_count": matched_pred_count,
             "self_check_ok": bool(self_check.get("ok")),
         },
         "recommendations": recommendations[:20],
@@ -20558,8 +28301,22 @@ def _get_evolution_total_score_scale(project_id: str) -> float | None:
     return None
 
 
+def _should_skip_evolution_total_scale(report: Dict[str, object]) -> bool:
+    if not isinstance(report, dict):
+        return False
+    blend = report.get("score_blend") if isinstance(report.get("score_blend"), dict) else {}
+    if str(blend.get("mode") or "").strip().lower() in {
+        "project_calibrator_direct",
+        "ground_truth_exact",
+    }:
+        return True
+    return False
+
+
 def _apply_evolution_total_scale(project_id: str, report: Dict[str, object]) -> None:
     """若进化报告有 total_score_scale，对总分进行缩放（原地修改 report）。"""
+    if _should_skip_evolution_total_scale(report):
+        return
     scale = _get_evolution_total_score_scale(project_id)
     if scale is None or abs(scale - 1.0) < 1e-6:
         return
@@ -21767,7 +29524,7 @@ def auto_run_reflection_pipeline(
     一键执行反演闭环：
     1) 刷新 DELTA_CASE + FEATURE_ROW
     2) 训练并自动部署校准器（闸门通过）
-    3) 回填预测分
+    3) 回填校准分
     4) 挖掘/影子评估/发布补丁（闸门通过）
     """
     ensure_data_dirs()
@@ -21780,7 +29537,13 @@ def auto_run_reflection_pipeline(
     if project is None:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
 
+    _refresh_project_ground_truth_learning_records(project_id)
     blocked_guardrails = _collect_blocked_ground_truth_guardrails(project_id)
+    before_manual_confirmation_payload = _build_manual_confirmation_audit_payload(
+        project_id,
+        project,
+        blocked_guardrails_override=blocked_guardrails,
+    )
     if blocked_guardrails and not bool(confirm_extreme_sample):
         raise HTTPException(
             status_code=409,
@@ -21921,6 +29684,17 @@ def auto_run_reflection_pipeline(
             updated_submissions += 1
         save_submissions(submissions)
 
+    calibrator_runtime_governance = _auto_recover_degraded_project_calibrator(
+        project_id=project_id,
+        project=project,
+        locale=locale,
+    )
+    if calibrator_runtime_governance:
+        calibrator_runtime_governance = _persist_calibrator_runtime_governance(
+            project_id,
+            calibrator_runtime_governance,
+        )
+
     patch_id = None
     patch_gate_passed = None
     patch_deployed = False
@@ -21978,6 +29752,29 @@ def auto_run_reflection_pipeline(
         packages.append(patch)
         save_patch_packages(packages)
 
+    refreshed_projects = load_projects()
+    refreshed_project = next(
+        (row for row in refreshed_projects if str(row.get("id") or "").strip() == project_id),
+        None,
+    )
+    post_run_health_summary = _build_reflection_post_run_health_summary(
+        project_id,
+        refreshed_project or project,
+    )
+    governance_payload = _build_manual_confirmation_audit_payload(
+        project_id,
+        refreshed_project or project,
+        post_run_health_summary=post_run_health_summary,
+    )
+    manual_confirmation_audit = _build_manual_confirmation_audit(
+        project_id,
+        refreshed_project or project,
+        action_label="一键闭环执行",
+        confirm_extreme_sample_used=bool(confirm_extreme_sample),
+        governance_payload=governance_payload,
+        before_payload=before_manual_confirmation_payload,
+    )
+
     return ReflectionAutoRunResponse(
         ok=True,
         project_id=project_id,
@@ -21993,13 +29790,860 @@ def auto_run_reflection_pipeline(
         calibrator_gate=calibrator_gate,
         calibrator_auto_candidates=calibrator_auto_candidates,
         calibrator_auto_review=calibrator_auto_review,
+        calibrator_runtime_governance=calibrator_runtime_governance,
+        post_run_health_summary=post_run_health_summary,
         prediction_updated_reports=updated_reports,
         prediction_updated_submissions=updated_submissions,
         patch_id=patch_id,
         patch_gate_passed=patch_gate_passed,
         patch_deployed=patch_deployed,
         patch_auto_govern=patch_auto_govern,
+        manual_confirmation_audit=manual_confirmation_audit,
     )
+
+
+def _build_phase1_closure_readiness(
+    *,
+    project_id: str,
+    project: Dict[str, object],
+    evaluation_payload: Dict[str, Any],
+    evolution_health: Optional[Dict[str, Any]] = None,
+    governance_payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    health_payload = (
+        evolution_health
+        if isinstance(evolution_health, dict)
+        else _build_evolution_health_report(project_id, project)
+    )
+    governance = (
+        governance_payload
+        if isinstance(governance_payload, dict)
+        else _build_feedback_governance_report(project_id, project)
+    )
+    evaluation = evaluation_payload if isinstance(evaluation_payload, dict) else {}
+    acceptance = (
+        evaluation.get("acceptance") if isinstance(evaluation.get("acceptance"), dict) else {}
+    )
+    health_summary = (
+        health_payload.get("summary")
+        if isinstance(health_payload, dict) and isinstance(health_payload.get("summary"), dict)
+        else {}
+    )
+    drift = (
+        health_payload.get("drift")
+        if isinstance(health_payload, dict) and isinstance(health_payload.get("drift"), dict)
+        else {}
+    )
+    governance_summary = (
+        governance.get("summary")
+        if isinstance(governance, dict) and isinstance(governance.get("summary"), dict)
+        else {}
+    )
+
+    min_samples = int(LEGACY_PROJECT_LEARNING_MIN_SAMPLES)
+    current_variant = (
+        evaluation.get("variants", {}).get("current")
+        if isinstance(evaluation.get("variants"), dict)
+        else {}
+    )
+    current_sample_count = int(_to_float_or_none((current_variant or {}).get("sample_count")) or 0)
+    matched_score_record_count = int(
+        _to_float_or_none(health_summary.get("matched_score_record_count")) or 0
+    )
+    current_calibrator_version = str(health_summary.get("current_calibrator_version") or "").strip()
+    current_calibrator_degraded = bool(health_summary.get("current_calibrator_degraded"))
+    drift_level = str(drift.get("level") or "").strip().lower()
+    manual_confirmation_required = bool(governance_summary.get("manual_confirmation_required"))
+    few_shot_pending_review_count = int(
+        _to_float_or_none(governance_summary.get("few_shot_pending_review_count")) or 0
+    )
+
+    gates = [
+        {
+            "id": "minimum_ground_truth_samples",
+            "label": f"当前分样本数达到 {min_samples} 条",
+            "passed": current_sample_count >= min_samples,
+            "detail": f"{current_sample_count}/{min_samples}",
+        },
+        {
+            "id": "matched_score_records",
+            "label": f"已关联评分记录达到 {min_samples} 条",
+            "passed": matched_score_record_count >= min_samples,
+            "detail": f"{matched_score_record_count}/{min_samples}",
+        },
+        {
+            "id": "current_display_matches_qt",
+            "label": "当前分已与青天结果对齐",
+            "passed": bool(acceptance.get("current_display_matches_qt")),
+            "detail": str(bool(acceptance.get("current_display_matches_qt"))).lower(),
+        },
+        {
+            "id": "current_mae_rmse_not_worse_than_v2",
+            "label": "当前分 MAE/RMSE 不劣于 V2",
+            "passed": bool(acceptance.get("current_mae_rmse_not_worse_than_v2")),
+            "detail": str(bool(acceptance.get("current_mae_rmse_not_worse_than_v2"))).lower(),
+        },
+        {
+            "id": "current_rank_corr_not_worse_than_v2",
+            "label": "当前分排序相关性不劣于 V2",
+            "passed": bool(acceptance.get("current_rank_corr_not_worse_vs_v2")),
+            "detail": str(bool(acceptance.get("current_rank_corr_not_worse_vs_v2"))).lower(),
+        },
+        {
+            "id": "project_calibrator_active",
+            "label": "已部署项目级校准器",
+            "passed": bool(current_calibrator_version),
+            "detail": current_calibrator_version or "missing",
+        },
+        {
+            "id": "project_calibrator_stable",
+            "label": "当前项目级校准器稳定",
+            "passed": bool(current_calibrator_version) and not current_calibrator_degraded,
+            "detail": "stable"
+            if current_calibrator_version and not current_calibrator_degraded
+            else ("degraded" if current_calibrator_version else "missing"),
+        },
+        {
+            "id": "drift_low",
+            "label": "近30天漂移等级为 low",
+            "passed": drift_level == "low",
+            "detail": drift_level or "unknown",
+        },
+        {
+            "id": "manual_confirmation_clear",
+            "label": "无极端偏差人工确认阻塞",
+            "passed": not manual_confirmation_required,
+            "detail": "clear" if not manual_confirmation_required else "blocked",
+        },
+        {
+            "id": "few_shot_review_clear",
+            "label": "无 few-shot 待审核样本",
+            "passed": few_shot_pending_review_count <= 0,
+            "detail": str(few_shot_pending_review_count),
+        },
+    ]
+    failed_gates = [row["id"] for row in gates if not bool(row["passed"])]
+    passed_gates = [row["id"] for row in gates if bool(row["passed"])]
+    ready = len(failed_gates) == 0
+    status = "ready" if ready else "not_ready"
+    status_label = "可封第一阶段" if ready else "暂不可封第一阶段"
+    recommendation = (
+        "当前项目已满足第一阶段封关条件，可进入封关核查。"
+        if ready
+        else "当前项目尚未满足第一阶段封关条件，优先收口未通过门。"
+    )
+    return {
+        "ready": ready,
+        "status": status,
+        "status_label": status_label,
+        "minimum_ground_truth_samples": min_samples,
+        "passed_gate_count": len(passed_gates),
+        "failed_gate_count": len(failed_gates),
+        "passed_gates": passed_gates,
+        "failed_gates": failed_gates,
+        "gates": gates,
+        "recommendation": recommendation,
+    }
+
+
+def _build_total_closure_readiness(
+    project_metrics: List[Dict[str, Any]],
+    *,
+    projects_by_id: Optional[Dict[str, Dict[str, object]]] = None,
+    calibration_models: Optional[List[Dict[str, object]]] = None,
+    ground_truth_rows: Optional[List[Dict[str, object]]] = None,
+    materials: Optional[List[Dict[str, object]]] = None,
+    submissions: Optional[List[Dict[str, object]]] = None,
+    score_reports: Optional[List[Dict[str, object]]] = None,
+    qingtian_results: Optional[List[Dict[str, object]]] = None,
+) -> Dict[str, Any]:
+    ground_truth_by_project: Dict[str, List[Dict[str, object]]] = {}
+    for row in ground_truth_rows if isinstance(ground_truth_rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        pid = str(row.get("project_id") or "").strip()
+        if not pid:
+            continue
+        ground_truth_by_project.setdefault(pid, []).append(row)
+    material_count_by_project: Dict[str, int] = {}
+    for row in materials if isinstance(materials, list) else []:
+        if not isinstance(row, dict):
+            continue
+        pid = str(row.get("project_id") or "").strip()
+        if not pid:
+            continue
+        material_count_by_project[pid] = material_count_by_project.get(pid, 0) + 1
+    submission_count_by_project: Dict[str, int] = {}
+    for row in submissions if isinstance(submissions, list) else []:
+        if not isinstance(row, dict):
+            continue
+        pid = str(row.get("project_id") or "").strip()
+        if not pid:
+            continue
+        submission_count_by_project[pid] = submission_count_by_project.get(pid, 0) + 1
+    report_count_by_project: Dict[str, int] = {}
+    for row in score_reports if isinstance(score_reports, list) else []:
+        if not isinstance(row, dict):
+            continue
+        pid = str(row.get("project_id") or "").strip()
+        if not pid:
+            continue
+        report_count_by_project[pid] = report_count_by_project.get(pid, 0) + 1
+    submission_project_by_id: Dict[str, str] = {}
+    for row in submissions if isinstance(submissions, list) else []:
+        if not isinstance(row, dict):
+            continue
+        sid = str(row.get("id") or "").strip()
+        pid = str(row.get("project_id") or "").strip()
+        if sid and pid:
+            submission_project_by_id[sid] = pid
+    qingtian_count_by_project: Dict[str, int] = {}
+    for row in qingtian_results if isinstance(qingtian_results, list) else []:
+        if not isinstance(row, dict):
+            continue
+        pid = str(row.get("project_id") or "").strip()
+        if not pid:
+            pid = submission_project_by_id.get(str(row.get("submission_id") or "").strip(), "")
+        if not pid:
+            continue
+        qingtian_count_by_project[pid] = qingtian_count_by_project.get(pid, 0) + 1
+
+    def _build_light_phase1_closure(pid: str, evaluation_item: Dict[str, Any]) -> Dict[str, Any]:
+        project = (projects_by_id or {}).get(pid) if isinstance(projects_by_id, dict) else {}
+        variants = (
+            evaluation_item.get("variants")
+            if isinstance(evaluation_item.get("variants"), dict)
+            else {}
+        )
+        current_variant = (
+            variants.get("current") if isinstance(variants.get("current"), dict) else {}
+        )
+        v2_variant = variants.get("v2") if isinstance(variants.get("v2"), dict) else {}
+        current_sample_count = int(_to_float_or_none(current_variant.get("sample_count")) or 0)
+        matched_score_record_count = current_sample_count
+        current_mae = _to_float_or_none(current_variant.get("mae"))
+        current_calibrator_version = ""
+        current_calibrator_degraded = False
+        if isinstance(project, dict) and isinstance(calibration_models, list):
+            calibrator_state = _summarize_project_calibrator_state(project, calibration_models)
+            current_calibrator_version = str(
+                calibrator_state.get("current_calibrator_version") or ""
+            ).strip()
+            current_calibrator_source = str(
+                calibrator_state.get("current_calibrator_source") or ""
+            ).strip()
+            has_project_calibrator = (
+                bool(current_calibrator_version) and current_calibrator_source == "project"
+            )
+            v2_mae = _to_float_or_none(v2_variant.get("mae"))
+            if (
+                has_project_calibrator
+                and current_sample_count >= int(LEGACY_PROJECT_LEARNING_MIN_SAMPLES)
+                and current_mae is not None
+                and v2_mae is not None
+                and (float(current_mae) - float(v2_mae))
+                > float(DEFAULT_PROJECT_CALIBRATOR_POST_DEPLOY_MAX_MAE_REGRESSION)
+            ):
+                current_calibrator_degraded = True
+
+        manual_confirmation_required = False
+        few_shot_pending_review_count = 0
+        for row in ground_truth_by_project.get(pid, []):
+            if _feedback_guardrail_is_blocked(row):
+                manual_confirmation_required = True
+            distill = _normalize_few_shot_distillation_state(row.get("few_shot_distillation"))
+            captured = int(_to_float_or_none(distill.get("captured")) or 0)
+            review_status = str(distill.get("manual_review_status") or "pending").strip().lower()
+            if captured > 0 and review_status not in {"adopted", "ignored"}:
+                few_shot_pending_review_count += 1
+
+        drift_level = (
+            "low"
+            if current_sample_count >= int(LEGACY_PROJECT_LEARNING_MIN_SAMPLES)
+            and current_mae is not None
+            and float(current_mae) <= 0.5
+            else "watch"
+        )
+        return _build_phase1_closure_readiness(
+            project_id=pid,
+            project=project if isinstance(project, dict) else {"id": pid},
+            evaluation_payload=evaluation_item,
+            evolution_health={
+                "summary": {
+                    "matched_score_record_count": matched_score_record_count,
+                    "current_calibrator_version": current_calibrator_version or None,
+                    "current_calibrator_degraded": current_calibrator_degraded,
+                },
+                "drift": {"level": drift_level},
+            },
+            governance_payload={
+                "summary": {
+                    "manual_confirmation_required": manual_confirmation_required,
+                    "few_shot_pending_review_count": few_shot_pending_review_count,
+                }
+            },
+        )
+
+    minimum_ready_projects = 2
+    evaluated_projects: List[str] = []
+    ready_projects: List[str] = []
+    current_display_matched_projects: List[str] = []
+    stable_calibrator_projects: List[str] = []
+    evaluated_project_summaries: List[Dict[str, Any]] = []
+    not_ready_project_summaries: List[Dict[str, Any]] = []
+
+    def _build_project_gap_entrypoint(
+        failed_gate_ids: Sequence[str],
+    ) -> Dict[str, str]:
+        failed_gate_set = {
+            str(gid or "").strip() for gid in failed_gate_ids if str(gid or "").strip()
+        }
+        if {"minimum_ground_truth_samples", "matched_score_records"} & failed_gate_set:
+            return {
+                "entrypoint_key": "ground_truth",
+                "entrypoint_label": "前往「5) 自我学习与进化」录入真实评标",
+                "entrypoint_detail": "先补录真实评标并刷新评分记录关联，再重新评估该项目。",
+                "action_label": "录入真实评标",
+            }
+        if {"manual_confirmation_clear", "few_shot_review_clear"} & failed_gate_set:
+            return {
+                "entrypoint_key": "feedback_governance",
+                "entrypoint_label": "前往「5) 自我学习与进化」查看“评分治理（异常样本/校准/回退）”",
+                "entrypoint_detail": "先清理极端偏差人工确认或 few-shot 待审核阻塞。",
+                "action_label": "查看评分治理",
+            }
+        if {
+            "project_calibrator_active",
+            "project_calibrator_stable",
+            "drift_low",
+            "current_display_matches_qt",
+            "current_mae_rmse_not_worse_than_v2",
+            "current_rank_corr_not_worse_than_v2",
+        } & failed_gate_set:
+            return {
+                "entrypoint_key": "auto_run_reflection",
+                "entrypoint_label": "前往「5) 自我学习与进化」执行“一键闭环执行”",
+                "entrypoint_detail": "先重跑 V2 一键闭环，收口当前分、校准器和漂移状态。",
+                "action_label": "执行一键闭环",
+            }
+        return {
+            "entrypoint_key": "project_evaluation",
+            "entrypoint_label": "前往「5) 自我学习与进化」执行“项目指标评估”",
+            "entrypoint_detail": "先查看该项目未通过门，再针对性收口。",
+            "action_label": "查看项目评估",
+        }
+
+    for item in project_metrics:
+        if not isinstance(item, dict):
+            continue
+        project_id = str(item.get("project_id") or "").strip()
+        if not project_id:
+            continue
+        sample_count_qt = int(_to_float_or_none(item.get("sample_count_qt")) or 0)
+        current_variant = (
+            item.get("variants", {}).get("current")
+            if isinstance(item.get("variants"), dict)
+            else {}
+        )
+        current_sample_count = int(
+            _to_float_or_none((current_variant or {}).get("sample_count")) or 0
+        )
+        if sample_count_qt <= 0 and current_sample_count <= 0:
+            continue
+        evaluated_projects.append(project_id)
+        project = (projects_by_id or {}).get(project_id) if isinstance(projects_by_id, dict) else {}
+        project_name = (
+            str((project or {}).get("name") or "").strip() if isinstance(project, dict) else ""
+        ) or project_id
+
+        closure = (
+            item.get("phase1_closure_readiness")
+            if isinstance(item.get("phase1_closure_readiness"), dict)
+            else {}
+        )
+        if not closure:
+            closure = _build_light_phase1_closure(project_id, item)
+        if bool(closure.get("ready")):
+            ready_projects.append(project_id)
+        acceptance = item.get("acceptance") if isinstance(item.get("acceptance"), dict) else {}
+        failed_gate_ids = [
+            str(gid or "").strip()
+            for gid in (
+                closure.get("failed_gates") if isinstance(closure.get("failed_gates"), list) else []
+            )
+            if str(gid or "").strip()
+        ]
+        failed_gate_details: List[Dict[str, str]] = []
+        for gate in closure.get("gates") if isinstance(closure.get("gates"), list) else []:
+            if not isinstance(gate, dict) or bool(gate.get("passed")):
+                continue
+            gate_id = str(gate.get("id") or "").strip()
+            if not gate_id:
+                continue
+            gate_entrypoint = _build_project_gap_entrypoint([gate_id])
+            failed_gate_details.append(
+                {
+                    "id": gate_id,
+                    "label": str(gate.get("label") or gate_id).strip() or gate_id,
+                    "detail": str(gate.get("detail") or "").strip(),
+                    "entrypoint_key": gate_entrypoint["entrypoint_key"],
+                    "entrypoint_label": gate_entrypoint["entrypoint_label"],
+                    "entrypoint_detail": gate_entrypoint["entrypoint_detail"],
+                    "action_label": gate_entrypoint["action_label"],
+                }
+            )
+        project_gap_entrypoint = _build_project_gap_entrypoint(failed_gate_ids)
+        project_summary = {
+            "project_id": project_id,
+            "project_name": project_name,
+            "ready": bool(closure.get("ready")),
+            "status": str(closure.get("status") or "").strip() or "not_ready",
+            "status_label": str(closure.get("status_label") or "").strip() or "暂不可封第一阶段",
+            "failed_gates": failed_gate_ids,
+            "failed_gate_details": failed_gate_details,
+            "failed_gate_count": len(failed_gate_ids),
+            "sample_count_qt": sample_count_qt,
+            "current_sample_count": current_sample_count,
+            "current_display_matches_qt": bool(acceptance.get("current_display_matches_qt")),
+            "current_mae_rmse_not_worse_than_v2": bool(
+                acceptance.get("current_mae_rmse_not_worse_than_v2")
+            ),
+            "current_rank_corr_not_worse_than_v2": bool(
+                acceptance.get("current_rank_corr_not_worse_vs_v2")
+            ),
+            "recommendation": str(closure.get("recommendation") or "").strip(),
+            "entrypoint_key": project_gap_entrypoint["entrypoint_key"],
+            "entrypoint_label": project_gap_entrypoint["entrypoint_label"],
+            "entrypoint_detail": project_gap_entrypoint["entrypoint_detail"],
+            "action_label": project_gap_entrypoint["action_label"],
+        }
+        evaluated_project_summaries.append(project_summary)
+        if not project_summary["ready"]:
+            not_ready_project_summaries.append(project_summary)
+
+        if bool(acceptance.get("current_display_matches_qt")):
+            current_display_matched_projects.append(project_id)
+
+        gates = closure.get("gates") if isinstance(closure.get("gates"), list) else []
+        calibrator_stable = any(
+            isinstance(row, dict)
+            and str(row.get("id") or "") == "project_calibrator_stable"
+            and bool(row.get("passed"))
+            for row in gates
+        )
+        if calibrator_stable:
+            stable_calibrator_projects.append(project_id)
+
+    evaluated_project_count = len(evaluated_projects)
+    ready_project_count = len(ready_projects)
+    evaluated_project_id_set = set(evaluated_projects)
+    not_ready_projects = [pid for pid in evaluated_projects if pid not in set(ready_projects)]
+    display_matched_count = len(current_display_matched_projects)
+    stable_calibrator_count = len(stable_calibrator_projects)
+    candidate_projects: List[Dict[str, Any]] = []
+    if isinstance(projects_by_id, dict):
+        now_utc = datetime.now(timezone.utc)
+        for project_id, project in projects_by_id.items():
+            pid = str(project_id or "").strip()
+            if not pid or pid in evaluated_project_id_set:
+                continue
+            if not isinstance(project, dict):
+                continue
+            if _project_is_hidden_from_picker(project):
+                continue
+            material_count = int(material_count_by_project.get(pid, 0) or 0)
+            submission_count = int(submission_count_by_project.get(pid, 0) or 0)
+            report_count = int(report_count_by_project.get(pid, 0) or 0)
+            qingtian_count = int(qingtian_count_by_project.get(pid, 0) or 0)
+            if qingtian_count > 0:
+                stage = "已录入真实结果，待修复评分记录关联"
+                action_hint = "优先补齐施组/评分记录关联，让该项目进入可评估状态。"
+            elif report_count > 0:
+                stage = "已进评分链，待录入真实结果"
+                action_hint = "优先录入该项目真实评标结果，完成可评估闭环。"
+            elif submission_count > 0:
+                stage = "已有施组，待执行评分并录入真实结果"
+                action_hint = "先执行整项目评分，再录入真实评标结果。"
+            elif material_count > 0:
+                stage = "已有资料，待上传施组并进入评分链"
+                action_hint = "先补上传施组并执行评分，再录入真实评标结果。"
+            else:
+                if not _project_is_recent_empty_closure_candidate(project, now_utc=now_utc):
+                    continue
+                stage = "空项目，待上传资料"
+                action_hint = "先上传至少 1 份项目资料，再补施组并进入评分链。"
+            candidate_projects.append(
+                {
+                    "project_id": pid,
+                    "project_name": (
+                        str((project or {}).get("name") or "").strip()
+                        if isinstance(project, dict)
+                        else ""
+                    )
+                    or pid,
+                    "material_count": material_count,
+                    "submission_count": submission_count,
+                    "report_count": report_count,
+                    "qingtian_count": qingtian_count,
+                    "stage": stage,
+                    "action_hint": action_hint,
+                    "readiness_score": (
+                        qingtian_count * 1000
+                        + report_count * 100
+                        + submission_count * 10
+                        + material_count
+                    ),
+                }
+            )
+    candidate_projects = sorted(
+        candidate_projects,
+        key=lambda row: (
+            int(row.get("readiness_score") or 0),
+            int(row.get("report_count") or 0),
+            int(row.get("submission_count") or 0),
+            int(row.get("material_count") or 0),
+            str(row.get("project_name") or ""),
+            str(row.get("project_id") or ""),
+        ),
+        reverse=True,
+    )
+    next_candidate_project = candidate_projects[0] if candidate_projects else None
+
+    def _build_candidate_closure_path(candidate: Optional[Dict[str, Any]]) -> List[str]:
+        if not isinstance(candidate, dict):
+            return [
+                "新增并建立至少 1 个真实业务项目。",
+                "上传至少 1 份项目资料并补齐至少 1 份施组文件。",
+                "执行整项目评分，生成评分记录。",
+                "录入真实评标结果。",
+                "执行 V2 一键闭环，直到该项目达到第一阶段 ready。",
+                "重新执行跨项目汇总评估，确认系统总封关 readiness。",
+            ]
+        project_name = (
+            str(candidate.get("project_name") or "").strip()
+            or str(candidate.get("project_id") or "").strip()
+        )
+        stage = str(candidate.get("stage") or "").strip()
+        if stage == "已有资料，待上传施组并进入评分链":
+            steps = [
+                f"在项目“{project_name}”上传至少 1 份施组文件。",
+                f"对项目“{project_name}”执行整项目评分，生成评分记录。",
+                f"录入项目“{project_name}”的真实评标结果。",
+                f"执行项目“{project_name}”的 V2 一键闭环，直到达到第一阶段 ready。",
+            ]
+        elif stage == "空项目，待上传资料":
+            steps = [
+                f"在项目“{project_name}”上传至少 1 份项目资料。",
+                f"在项目“{project_name}”补上传至少 1 份施组文件。",
+                f"对项目“{project_name}”执行整项目评分，生成评分记录。",
+                f"录入项目“{project_name}”的真实评标结果。",
+                f"执行项目“{project_name}”的 V2 一键闭环，直到达到第一阶段 ready。",
+            ]
+        elif stage == "已有施组，待执行评分并录入真实结果":
+            steps = [
+                f"对项目“{project_name}”执行整项目评分，生成评分记录。",
+                f"录入项目“{project_name}”的真实评标结果。",
+                f"执行项目“{project_name}”的 V2 一键闭环，直到达到第一阶段 ready。",
+            ]
+        elif stage == "已进评分链，待录入真实结果":
+            steps = [
+                f"录入项目“{project_name}”的真实评标结果。",
+                f"执行项目“{project_name}”的 V2 一键闭环，直到达到第一阶段 ready。",
+            ]
+        elif stage == "已录入真实结果，待修复评分记录关联":
+            steps = [
+                f"修复项目“{project_name}”的评分记录与真实结果关联。",
+                f"重新计算项目“{project_name}”评估结果，确认进入第一阶段 ready。",
+            ]
+        else:
+            steps = (
+                [str(candidate.get("action_hint") or "").strip()]
+                if str(candidate.get("action_hint") or "").strip()
+                else []
+            )
+        steps.append("重新执行跨项目汇总评估，确认系统总封关 readiness。")
+        return steps
+
+    gates = [
+        {
+            "id": "minimum_evaluated_projects",
+            "label": f"具备真实样本的项目数达到 {minimum_ready_projects} 个",
+            "passed": evaluated_project_count >= minimum_ready_projects,
+            "detail": f"{evaluated_project_count}/{minimum_ready_projects}",
+        },
+        {
+            "id": "minimum_ready_projects",
+            "label": f"达到第一阶段 ready 的项目数达到 {minimum_ready_projects} 个",
+            "passed": ready_project_count >= minimum_ready_projects,
+            "detail": f"{ready_project_count}/{minimum_ready_projects}",
+        },
+        {
+            "id": "all_evaluated_projects_phase1_ready",
+            "label": "所有具备真实样本的项目均已达到第一阶段 ready",
+            "passed": evaluated_project_count > 0
+            and ready_project_count == evaluated_project_count,
+            "detail": f"{ready_project_count}/{evaluated_project_count or 0}",
+        },
+        {
+            "id": "all_evaluated_projects_current_display_match_qt",
+            "label": "所有具备真实样本的项目当前分均已对齐青天结果",
+            "passed": evaluated_project_count > 0
+            and display_matched_count == evaluated_project_count,
+            "detail": f"{display_matched_count}/{evaluated_project_count or 0}",
+        },
+        {
+            "id": "all_evaluated_projects_calibrator_stable",
+            "label": "所有具备真实样本的项目当前项目级校准器均稳定",
+            "passed": evaluated_project_count > 0
+            and stable_calibrator_count == evaluated_project_count,
+            "detail": f"{stable_calibrator_count}/{evaluated_project_count or 0}",
+        },
+    ]
+    failed_gates = [row["id"] for row in gates if not bool(row["passed"])]
+    passed_gates = [row["id"] for row in gates if bool(row["passed"])]
+    ready = len(failed_gates) == 0
+    next_priority_project: Optional[Dict[str, Any]] = None
+    if not_ready_project_summaries:
+        next_priority_project = sorted(
+            not_ready_project_summaries,
+            key=lambda row: (
+                int(row.get("failed_gate_count") or 0),
+                -int(row.get("sample_count_qt") or 0),
+                -int(row.get("current_sample_count") or 0),
+                str(row.get("project_id") or ""),
+            ),
+        )[0]
+    if ready:
+        recommended_next_action = "当前系统已满足总封关前置条件，可进入跨项目总封关核查。"
+    elif evaluated_project_count < minimum_ready_projects:
+        if next_candidate_project:
+            candidate_name = (
+                str(next_candidate_project.get("project_name") or "").strip()
+                or str(next_candidate_project.get("project_id") or "").strip()
+            )
+            candidate_action = str(next_candidate_project.get("action_hint") or "").strip()
+            recommended_next_action = f"优先推进候选项目“{candidate_name}”，{candidate_action}"
+        else:
+            recommended_next_action = "当前没有任何已导入但未闭环的候选项目，需新增并录入至少 1 个真实样本项目，才能继续推进系统总封关。"
+    elif next_priority_project:
+        recommended_next_action = "优先收口下一优先项目的未通过门，再重新执行系统总封关核查。"
+    else:
+        recommended_next_action = (
+            "当前系统尚未满足总封关条件，优先补齐更多真实项目闭环并收口未 ready 项目。"
+        )
+    if ready:
+        system_closure_path = [
+            "执行跨项目总封关核查。",
+            "固化当前系统评分、校准器、规则与模型版本。",
+            "记录本次系统总封关结论并进入下一个真实样本周期监测。",
+        ]
+    elif evaluated_project_count < minimum_ready_projects:
+        system_closure_path = _build_candidate_closure_path(next_candidate_project)
+    elif next_priority_project:
+        next_priority_name = (
+            str(next_priority_project.get("project_name") or "").strip()
+            or str(next_priority_project.get("project_id") or "").strip()
+        )
+        next_priority_failed = [
+            str(gid or "").strip()
+            for gid in (next_priority_project.get("failed_gates") or [])
+            if str(gid or "").strip()
+        ]
+        system_closure_path = [
+            f"优先收口项目“{next_priority_name}”的未通过门：{', '.join(next_priority_failed) if next_priority_failed else '-'}。",
+            f"重新执行项目“{next_priority_name}”的 V2 一键闭环。",
+            f"确认项目“{next_priority_name}”达到第一阶段 ready。",
+            "重新执行跨项目汇总评估，确认系统总封关 readiness。",
+        ]
+    else:
+        system_closure_path = [
+            "补齐未满足的系统总封关前置条件。",
+            "重新执行跨项目汇总评估，确认系统总封关 readiness。",
+        ]
+    if ready:
+        blocker_kind = "ready"
+        next_step_title = "执行系统总封关核查"
+        next_step_detail = "当前系统已满足系统总封关前置条件，可进入跨项目总封关核查。"
+    elif evaluated_project_count < minimum_ready_projects:
+        if next_candidate_project:
+            candidate_name = (
+                str(next_candidate_project.get("project_name") or "").strip()
+                or str(next_candidate_project.get("project_id") or "").strip()
+            )
+            blocker_kind = "advance_candidate_project"
+            next_step_title = f"优先推进候选项目“{candidate_name}”"
+            next_step_detail = str(next_candidate_project.get("action_hint") or "").strip() or (
+                recommended_next_action
+            )
+        else:
+            blocker_kind = "need_new_project"
+            next_step_title = "新增第二个真实样本项目"
+            next_step_detail = recommended_next_action
+    elif next_priority_project:
+        next_priority_name = (
+            str(next_priority_project.get("project_name") or "").strip()
+            or str(next_priority_project.get("project_id") or "").strip()
+        )
+        blocker_kind = "close_not_ready_project"
+        next_step_title = f"优先收口项目“{next_priority_name}”"
+        next_step_detail = recommended_next_action
+    else:
+        blocker_kind = "general_not_ready"
+        next_step_title = "补齐系统总封关前置条件"
+        next_step_detail = recommended_next_action
+
+    next_step_action_label = "查看跨项目汇总"
+    if blocker_kind == "ready":
+        next_step_entrypoint_key = "evaluation_summary"
+        next_step_entrypoint_label = "前往「5) 自我学习与进化」点击“跨项目汇总评估”"
+        next_step_entrypoint_detail = "执行系统总封关核查并固化当前总封关结论。"
+        next_step_action_label = "执行跨项目汇总评估"
+    elif blocker_kind == "need_new_project":
+        next_step_entrypoint_key = "create_project"
+        next_step_entrypoint_label = "前往「1) 创建项目」开始新项目"
+        next_step_entrypoint_detail = "先新增第二个真实业务项目，再上传资料与施组。"
+        next_step_action_label = "创建第二个项目"
+    elif blocker_kind == "advance_candidate_project":
+        candidate_stage = (
+            str(next_candidate_project.get("stage") or "").strip() if next_candidate_project else ""
+        )
+        if candidate_stage == "空项目，待上传资料":
+            next_step_entrypoint_key = "upload_materials"
+            next_step_entrypoint_label = "前往「3) 项目资料」上传资料"
+            next_step_entrypoint_detail = "先补上传至少 1 份项目资料，再补施组并执行评分。"
+            next_step_action_label = "上传资料"
+        elif candidate_stage == "已有资料，待上传施组并进入评分链":
+            next_step_entrypoint_key = "upload_shigong"
+            next_step_entrypoint_label = "前往「4) 项目施组」上传施组"
+            next_step_entrypoint_detail = "先补上传至少 1 份施组，再执行评分。"
+            next_step_action_label = "上传施组"
+        elif candidate_stage == "已有施组，待执行评分并录入真实结果":
+            next_step_entrypoint_key = "score_shigong"
+            next_step_entrypoint_label = "前往「4) 项目施组」点击“评分施组”"
+            next_step_entrypoint_detail = "先完成整项目评分，再录入真实评标结果。"
+            next_step_action_label = "评分施组"
+        elif candidate_stage == "已进评分链，待录入真实结果":
+            next_step_entrypoint_key = "ground_truth"
+            next_step_entrypoint_label = "前往「5) 自我学习与进化」录入真实评标"
+            next_step_entrypoint_detail = "先补录真实评标结果，形成可评估闭环。"
+            next_step_action_label = "录入真实评标"
+        else:
+            next_step_entrypoint_key = "auto_run_reflection"
+            next_step_entrypoint_label = "前往「5) 自我学习与进化」执行“一键闭环执行”"
+            next_step_entrypoint_detail = "先修复评分记录关联，再让该项目进入第一阶段 ready。"
+            next_step_action_label = "执行一键闭环"
+    elif blocker_kind == "close_not_ready_project":
+        next_priority_failed_gate_set = set(
+            str(gid or "").strip()
+            for gid in (next_priority_project.get("failed_gates") or [])
+            if str(gid or "").strip()
+        )
+        if {
+            "minimum_ground_truth_samples",
+            "matched_score_records",
+        } & next_priority_failed_gate_set:
+            next_step_entrypoint_key = "ground_truth"
+            next_step_entrypoint_label = "前往「5) 自我学习与进化」录入真实评标"
+            next_step_entrypoint_detail = "先补录真实评标并刷新评分记录关联，再重新评估该项目。"
+            next_step_action_label = "录入真实评标"
+        elif {"manual_confirmation_clear", "few_shot_review_clear"} & next_priority_failed_gate_set:
+            next_step_entrypoint_key = "feedback_governance"
+            next_step_entrypoint_label = (
+                "前往「5) 自我学习与进化」查看“评分治理（异常样本/校准/回退）”"
+            )
+            next_step_entrypoint_detail = "先清理极端偏差人工确认或 few-shot 待审核阻塞。"
+            next_step_action_label = "查看评分治理"
+        elif {
+            "project_calibrator_active",
+            "project_calibrator_stable",
+            "drift_low",
+            "current_display_matches_qt",
+            "current_mae_rmse_not_worse_than_v2",
+            "current_rank_corr_not_worse_than_v2",
+        } & next_priority_failed_gate_set:
+            next_step_entrypoint_key = "auto_run_reflection"
+            next_step_entrypoint_label = "前往「5) 自我学习与进化」执行“一键闭环执行”"
+            next_step_entrypoint_detail = "先重跑 V2 一键闭环，收口当前分、校准器和漂移状态。"
+            next_step_action_label = "执行一键闭环"
+        else:
+            next_step_entrypoint_key = "project_evaluation"
+            next_step_entrypoint_label = "前往「5) 自我学习与进化」执行“项目指标评估”"
+            next_step_entrypoint_detail = "先查看该项目未通过门，再针对性收口。"
+            next_step_action_label = "查看项目评估"
+    else:
+        next_step_entrypoint_key = "evaluation_summary"
+        next_step_entrypoint_label = "前往「5) 自我学习与进化」执行“跨项目汇总评估”"
+        next_step_entrypoint_detail = "重新汇总当前系统状态，确认还缺哪类前置条件。"
+        next_step_action_label = "查看跨项目汇总"
+
+    return {
+        "ready": ready,
+        "status": "ready" if ready else "not_ready",
+        "status_label": "可进入系统总封关核查" if ready else "暂不可封系统总关",
+        "minimum_ready_projects": minimum_ready_projects,
+        "evaluated_project_count": evaluated_project_count,
+        "ready_project_count": ready_project_count,
+        "not_ready_project_count": len(not_ready_projects),
+        "evaluated_project_ids": evaluated_projects,
+        "ready_project_ids": ready_projects,
+        "not_ready_project_ids": not_ready_projects,
+        "passed_gate_count": len(passed_gates),
+        "failed_gate_count": len(failed_gates),
+        "passed_gates": passed_gates,
+        "failed_gates": failed_gates,
+        "gates": gates,
+        "evaluated_project_summaries": evaluated_project_summaries,
+        "not_ready_project_summaries": not_ready_project_summaries,
+        "candidate_project_count": len(candidate_projects),
+        "candidate_projects": candidate_projects[:5],
+        "next_candidate_project_id": (
+            str(next_candidate_project.get("project_id") or "").strip()
+            if next_candidate_project
+            else None
+        ),
+        "next_candidate_project_name": (
+            str(next_candidate_project.get("project_name") or "").strip()
+            if next_candidate_project
+            else None
+        ),
+        "next_candidate_stage": (
+            str(next_candidate_project.get("stage") or "").strip()
+            if next_candidate_project
+            else None
+        ),
+        "next_candidate_action_hint": (
+            str(next_candidate_project.get("action_hint") or "").strip()
+            if next_candidate_project
+            else None
+        ),
+        "next_priority_project_id": (
+            str(next_priority_project.get("project_id") or "").strip()
+            if next_priority_project
+            else None
+        ),
+        "next_priority_project_name": (
+            str(next_priority_project.get("project_name") or "").strip()
+            if next_priority_project
+            else None
+        ),
+        "next_priority_failed_gates": (
+            list(next_priority_project.get("failed_gates") or []) if next_priority_project else []
+        ),
+        "next_priority_recommendation": (
+            str(next_priority_project.get("recommendation") or "").strip()
+            if next_priority_project
+            else None
+        ),
+        "blocker_kind": blocker_kind,
+        "next_step_title": next_step_title,
+        "next_step_detail": next_step_detail,
+        "next_step_entrypoint_key": next_step_entrypoint_key,
+        "next_step_entrypoint_label": next_step_entrypoint_label,
+        "next_step_entrypoint_detail": next_step_entrypoint_detail,
+        "next_step_action_label": next_step_action_label,
+        "system_closure_path": system_closure_path,
+        "recommendation": recommended_next_action,
+    }
 
 
 @router.get(
@@ -22012,16 +30656,26 @@ def get_project_evaluation(
     project_id: str,
     locale: str = Depends(get_locale),
 ) -> ProjectEvaluationResponse:
-    """输出项目级 V1/V2/V2+Calib 对比指标。"""
+    """输出项目级 V1/V2/当前分/V2+Calib 对比指标。"""
     ensure_data_dirs()
     projects = load_projects()
-    if not any(str(p.get("id")) == project_id for p in projects):
+    project = next((p for p in projects if str(p.get("id")) == project_id), None)
+    if project is None:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
     data = evaluate_project_variants(
         project_id=project_id,
         submissions=load_submissions(),
         score_reports=load_score_reports(),
         qingtian_results=load_qingtian_results(),
+    )
+    evolution_health = _build_evolution_health_report(project_id, project)
+    governance_payload = _build_feedback_governance_report(project_id, project)
+    data["phase1_closure_readiness"] = _build_phase1_closure_readiness(
+        project_id=project_id,
+        project=project,
+        evaluation_payload=data,
+        evolution_health=evolution_health,
+        governance_payload=governance_payload,
     )
     return ProjectEvaluationResponse(**data)
 
@@ -22032,16 +30686,21 @@ def get_project_evaluation(
     tags=["洞察与学习"],
 )
 def get_evaluation_summary() -> EvaluationSummaryResponse:
-    """跨项目汇总 V1/V2/V2+Calib 验收指标。"""
+    """跨项目汇总 V1/V2/当前分/V2+Calib 验收指标。"""
     ensure_data_dirs()
     projects = load_projects()
+    materials = load_materials()
     submissions = load_submissions()
     reports = load_score_reports()
     qts = load_qingtian_results()
+    calibration_models = load_calibration_models()
+    ground_truth_rows = load_ground_truth()
 
-    project_ids = [str(p.get("id")) for p in projects if str(p.get("id") or "")]
+    project_rows = [p for p in projects if str(p.get("id") or "")]
+    project_ids = [str(p.get("id")) for p in project_rows]
     project_metrics = []
-    for pid in project_ids:
+    for project in project_rows:
+        pid = str(project.get("id") or "")
         project_metrics.append(
             evaluate_project_variants(
                 project_id=pid,
@@ -22057,7 +30716,7 @@ def get_evaluation_summary() -> EvaluationSummaryResponse:
         return round(sum(values) / len(values), 4)
 
     agg: Dict[str, Dict[str, Any]] = {}
-    for variant in ("v1", "v2", "v2_calib"):
+    for variant in ("v1", "v2", "current", "v2_calib"):
         maes, rmses, cors = [], [], []
         profile_sims, hit_rates, sample_counts = [], [], []
         for item in project_metrics:
@@ -22087,6 +30746,9 @@ def get_evaluation_summary() -> EvaluationSummaryResponse:
         "rank_corr_not_worse_vs_v1": 0,
         "profile_similarity_improved_v2_vs_v1": 0,
         "penalty_hit_rate_improved_v2_vs_v1": 0,
+        "current_mae_rmse_not_worse_than_v2": 0,
+        "current_rank_corr_not_worse_vs_v2": 0,
+        "current_display_matches_qt": 0,
     }
     for item in project_metrics:
         acc = item.get("acceptance") or {}
@@ -22099,6 +30761,16 @@ def get_evaluation_summary() -> EvaluationSummaryResponse:
         project_ids=project_ids,
         aggregate=agg,
         acceptance_pass_count=pass_count,
+        total_closure_readiness=_build_total_closure_readiness(
+            project_metrics,
+            projects_by_id={str(p.get("id")): p for p in project_rows},
+            calibration_models=calibration_models,
+            ground_truth_rows=ground_truth_rows,
+            materials=materials,
+            submissions=submissions,
+            score_reports=reports,
+            qingtian_results=qts,
+        ),
         computed_at=_now_iso(),
     )
 
@@ -23157,9 +31829,19 @@ def list_ground_truth(
     """列出本项目的所有真实评标记录。"""
     ensure_data_dirs()
     projects = load_projects()
-    if not any(p["id"] == project_id for p in projects):
+    project = next((p for p in projects if p["id"] == project_id), None)
+    if project is None:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
     records = [r for r in load_ground_truth() if r.get("project_id") == project_id]
+    records = [
+        _repair_ground_truth_record_final_score_if_needed(
+            project_id,
+            r if isinstance(r, dict) else {},
+            project=project,
+            locale=locale,
+        )
+        for r in records
+    ]
     records = _enrich_ground_truth_submission_metadata(project_id, records)
     return [GroundTruthRecord(**r) for r in records]
 
@@ -23254,7 +31936,13 @@ def evolve_project(
     project = next((p for p in projects if p["id"] == project_id), None)
     if project is None:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    _refresh_project_ground_truth_learning_records(project_id)
     blocked_guardrails = _collect_blocked_ground_truth_guardrails(project_id)
+    before_manual_confirmation_payload = _build_manual_confirmation_audit_payload(
+        project_id,
+        project,
+        blocked_guardrails_override=blocked_guardrails,
+    )
     if blocked_guardrails and not bool(confirm_extreme_sample):
         raise HTTPException(
             status_code=409,
@@ -23313,6 +32001,15 @@ def evolve_project(
         report["enhancement_review_notes"] = list(enhanced.get("enhancement_review_notes") or [])
         # 保留规则版产出的 scoring_evolution、compilation_instructions（LLM 仅增强文字部分）
     reports = load_evolution_reports()
+    governance_payload = _build_feedback_governance_report(project_id, project)
+    report["manual_confirmation_audit"] = _build_manual_confirmation_audit(
+        project_id,
+        project,
+        action_label="学习进化",
+        confirm_extreme_sample_used=bool(confirm_extreme_sample),
+        governance_payload=governance_payload,
+        before_payload=before_manual_confirmation_payload,
+    )
     reports[project_id] = report
     save_evolution_reports(reports)
     return EvolutionReport(**report)
@@ -23337,11 +32034,24 @@ def get_writing_guidance(
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
     reports = load_evolution_reports()
     data = reports.get(project_id)
+    pending_feedback_payload = _build_pending_feedback_scoring_points(project_id)
+    pending_feedback_summary = (
+        pending_feedback_payload.get("summary")
+        if isinstance(pending_feedback_payload.get("summary"), dict)
+        else {}
+    )
+    pending_feedback_patch_bundle = (
+        pending_feedback_payload.get("patch_bundle")
+        if isinstance(pending_feedback_payload.get("patch_bundle"), dict)
+        else {}
+    )
     if data:
         return WritingGuidance(
             project_id=project_id,
             guidance=data.get("writing_guidance", []),
             high_score_logic=data.get("high_score_logic", []),
+            pending_feedback_summary=pending_feedback_summary,
+            pending_feedback_patch_bundle=pending_feedback_patch_bundle,
             sample_count=data.get("sample_count", 0),
             updated_at=data.get("updated_at"),
             enhancement_applied=bool(data.get("enhancement_applied", True)),
@@ -23362,9 +32072,281 @@ def get_writing_guidance(
             "请先录入「真实评标结果」（施组+5/7评委得分+最终得分），再点击「学习进化」生成编制指导。"
         ],
         high_score_logic=[],
+        pending_feedback_summary=pending_feedback_summary,
+        pending_feedback_patch_bundle=pending_feedback_patch_bundle,
         sample_count=0,
         updated_at=None,
         enhancement_applied=False,
+    )
+
+
+def _render_writing_guidance_markdown(payload: Dict[str, object]) -> str:
+    data = payload if isinstance(payload, dict) else {}
+    pending_feedback_summary = (
+        data.get("pending_feedback_summary")
+        if isinstance(data.get("pending_feedback_summary"), dict)
+        else {}
+    )
+    pending_feedback_patch_bundle = (
+        data.get("pending_feedback_patch_bundle")
+        if isinstance(data.get("pending_feedback_patch_bundle"), dict)
+        else {}
+    )
+    lines = [
+        "# 编制指导",
+        "",
+        f"- 项目ID：`{data.get('project_id') or '-'}`",
+        f"- 已生效样本数：`{data.get('sample_count', 0)}`",
+        f"- 更新时间：`{data.get('updated_at') or '-'}`",
+        "",
+    ]
+    high_score_logic = data.get("high_score_logic") or []
+    if isinstance(high_score_logic, list) and high_score_logic:
+        lines.extend(["## 高分逻辑", ""])
+        for item in high_score_logic:
+            lines.append(f"- {item}")
+        lines.append("")
+    guidance = data.get("guidance") or []
+    if isinstance(guidance, list) and guidance:
+        lines.extend(["## 编制指导", ""])
+        for item in guidance:
+            lines.append(f"- {item}")
+        lines.append("")
+    if pending_feedback_summary or pending_feedback_patch_bundle:
+        lines.extend(
+            [
+                "## 待确认反馈改写补丁包",
+                "",
+                f"- 待人工确认样本：`{pending_feedback_summary.get('pending_sample_count', 0)}`",
+                f"- 待确认反馈点：`{pending_feedback_summary.get('pending_point_count', 0)}`",
+                f"- 补丁小节数：`{pending_feedback_patch_bundle.get('section_count', 0)}`",
+                "",
+            ]
+        )
+        bundle_markdown = str(pending_feedback_patch_bundle.get("copy_markdown") or "").strip()
+        if bundle_markdown:
+            lines.append(bundle_markdown)
+            lines.append("")
+    notes = data.get("enhancement_governance_notes") or []
+    if isinstance(notes, list) and notes:
+        lines.extend(["## 进化治理备注", ""])
+        for item in notes:
+            lines.append(f"- {item}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _render_pending_feedback_patch_bundle_markdown(payload: Dict[str, object]) -> str:
+    data = payload if isinstance(payload, dict) else {}
+    pending_feedback_summary = (
+        data.get("pending_feedback_summary")
+        if isinstance(data.get("pending_feedback_summary"), dict)
+        else {}
+    )
+    pending_feedback_patch_bundle = (
+        data.get("pending_feedback_patch_bundle")
+        if isinstance(data.get("pending_feedback_patch_bundle"), dict)
+        else {}
+    )
+    lines = [
+        "# 待确认反馈改写补丁包",
+        "",
+        f"- 项目ID：`{data.get('project_id') or '-'}`",
+        f"- 待人工确认样本：`{pending_feedback_summary.get('pending_sample_count', 0)}`",
+        f"- 待确认反馈点：`{pending_feedback_summary.get('pending_point_count', 0)}`",
+        f"- 补丁小节数：`{pending_feedback_patch_bundle.get('section_count', 0)}`",
+        f"- 章节锚点插入：`{pending_feedback_patch_bundle.get('insert_after_anchor_count', 0)}`",
+        f"- 关键词锚点插入：`{pending_feedback_patch_bundle.get('keyword_anchor_count', 0)}`",
+        f"- 新增小节：`{pending_feedback_patch_bundle.get('append_new_section_count', 0)}`",
+        "",
+        "> 以下内容来自待人工确认样本整理出的项目级改写补丁，尚未正式进入评分主链。",
+        "",
+    ]
+    bundle_markdown = str(pending_feedback_patch_bundle.get("copy_markdown") or "").strip()
+    if bundle_markdown:
+        lines.extend(["## 项目级补丁正文", "", bundle_markdown, ""])
+    else:
+        lines.extend(["> 当前暂无可导出的改写补丁。", ""])
+    return "\n".join(lines).strip()
+
+
+def _render_pending_feedback_patch_bundle_docx(payload: Dict[str, object]) -> bytes:
+    if Document is None:
+        raise RuntimeError("python-docx 不可用，无法导出改写补丁包 DOCX。")
+
+    data = payload if isinstance(payload, dict) else {}
+    pending_feedback_summary = (
+        data.get("pending_feedback_summary")
+        if isinstance(data.get("pending_feedback_summary"), dict)
+        else {}
+    )
+    pending_feedback_patch_bundle = (
+        data.get("pending_feedback_patch_bundle")
+        if isinstance(data.get("pending_feedback_patch_bundle"), dict)
+        else {}
+    )
+    sections = [
+        item
+        for item in (pending_feedback_patch_bundle.get("sections") or [])
+        if isinstance(item, dict)
+    ]
+
+    doc = Document()
+    doc.add_heading("待确认反馈改写补丁包", level=0)
+    doc.add_paragraph(f"项目ID：{data.get('project_id') or '-'}")
+    doc.add_paragraph(f"待人工确认样本：{pending_feedback_summary.get('pending_sample_count', 0)}")
+    doc.add_paragraph(f"待确认反馈点：{pending_feedback_summary.get('pending_point_count', 0)}")
+    doc.add_paragraph(f"补丁小节数：{pending_feedback_patch_bundle.get('section_count', 0)}")
+    doc.add_paragraph(
+        f"章节锚点插入：{pending_feedback_patch_bundle.get('insert_after_anchor_count', 0)}"
+    )
+    doc.add_paragraph(
+        f"关键词锚点插入：{pending_feedback_patch_bundle.get('keyword_anchor_count', 0)}"
+    )
+    doc.add_paragraph(
+        f"新增小节：{pending_feedback_patch_bundle.get('append_new_section_count', 0)}"
+    )
+    doc.add_paragraph(
+        "说明：以下内容来自待人工确认样本整理出的项目级改写补丁，尚未正式进入评分主链。"
+    )
+
+    if sections:
+        doc.add_heading("项目级补丁正文", level=1)
+        for idx, section in enumerate(sections, start=1):
+            title = str(section.get("section_title") or "").strip() or f"补丁 {idx}"
+            doc.add_heading(f"{idx}. {title}", level=2)
+            dimension_label = str(section.get("dimension_label") or "").strip()
+            if dimension_label:
+                doc.add_paragraph(f"维度：{dimension_label}")
+            operation_label = str(section.get("operation_label") or "").strip()
+            if operation_label:
+                doc.add_paragraph(f"写入方式：{operation_label}")
+            target = str(section.get("target") or "").strip()
+            if target:
+                doc.add_paragraph(f"写入位置：{target}")
+            doc.add_paragraph("改写正文：")
+            section_paragraphs = [
+                str(item or "").strip()
+                for item in (section.get("section_paragraphs") or [])
+                if str(item or "").strip()
+            ]
+            if section_paragraphs:
+                for paragraph in section_paragraphs:
+                    doc.add_paragraph(paragraph)
+            else:
+                doc.add_paragraph("当前暂无可导出的改写正文。")
+            copy_block = str(section.get("copy_block") or "").strip()
+            if copy_block:
+                doc.add_paragraph("可复制补丁：")
+                for line in copy_block.splitlines():
+                    text = str(line or "").strip()
+                    if text:
+                        doc.add_paragraph(text)
+    else:
+        doc.add_paragraph("当前暂无可导出的改写补丁。")
+
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    return buffer.getvalue()
+
+
+@router.get(
+    "/projects/{project_id}/writing_guidance/markdown",
+    response_model=WritingGuidanceMarkdownResponse,
+    tags=["自我学习与进化"],
+    responses=RESPONSES_404,
+)
+def get_project_writing_guidance_markdown(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> WritingGuidanceMarkdownResponse:
+    """导出项目编制指导 Markdown 文本。"""
+    assert_secure_desktop_allows_export("project_writing_guidance_markdown")
+    payload = get_writing_guidance(project_id=project_id, locale=locale)
+    markdown = _render_writing_guidance_markdown(payload.model_dump())
+    return WritingGuidanceMarkdownResponse(project_id=project_id, markdown=markdown)
+
+
+@router.get(
+    "/projects/{project_id}/writing_guidance_patch_bundle/markdown",
+    response_model=WritingGuidanceMarkdownResponse,
+    tags=["自我学习与进化"],
+    responses=RESPONSES_404,
+)
+def get_project_writing_guidance_patch_bundle_markdown(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> WritingGuidanceMarkdownResponse:
+    """导出待确认反馈改写补丁包 Markdown 文本。"""
+    assert_secure_desktop_allows_export("project_writing_guidance_patch_bundle_markdown")
+    payload = get_writing_guidance(project_id=project_id, locale=locale)
+    markdown = _render_pending_feedback_patch_bundle_markdown(payload.model_dump())
+    return WritingGuidanceMarkdownResponse(project_id=project_id, markdown=markdown)
+
+
+@router.get(
+    "/projects/{project_id}/writing_guidance.md",
+    tags=["自我学习与进化"],
+    responses=RESPONSES_404,
+)
+def download_project_writing_guidance_markdown(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> Response:
+    """下载项目编制指导 Markdown 文件。"""
+    assert_secure_desktop_allows_export("project_writing_guidance_markdown_file")
+    result = get_project_writing_guidance_markdown(project_id=project_id, locale=locale)
+    filename = f"writing_guidance_{project_id}.md"
+    return Response(
+        content=str(result.markdown or ""),
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get(
+    "/projects/{project_id}/writing_guidance_patch_bundle.md",
+    tags=["自我学习与进化"],
+    responses=RESPONSES_404,
+)
+def download_project_writing_guidance_patch_bundle_markdown(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> Response:
+    """下载待确认反馈改写补丁包 Markdown 文件。"""
+    assert_secure_desktop_allows_export("project_writing_guidance_patch_bundle_file")
+    result = get_project_writing_guidance_patch_bundle_markdown(
+        project_id=project_id, locale=locale
+    )
+    filename = f"writing_guidance_patch_bundle_{project_id}.md"
+    return Response(
+        content=str(result.markdown or ""),
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get(
+    "/projects/{project_id}/writing_guidance_patch_bundle.docx",
+    tags=["自我学习与进化"],
+    responses=RESPONSES_404,
+)
+def download_project_writing_guidance_patch_bundle_docx(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> Response:
+    """下载待确认反馈改写补丁包 DOCX 文件。"""
+    assert_secure_desktop_allows_export("project_writing_guidance_patch_bundle_docx_file")
+    result = get_writing_guidance(project_id=project_id, locale=locale)
+    try:
+        docx_bytes = _render_pending_feedback_patch_bundle_docx(result.model_dump())
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    filename = f"writing_guidance_patch_bundle_{project_id}.docx"
+    return Response(
+        content=docx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
@@ -23498,6 +32480,15 @@ def compat_system_data_hygiene() -> DataHygieneResponse:
     return system_data_hygiene()
 
 
+@compat_router.get(
+    "/system/improvement_overview",
+    response_model=SystemImprovementOverviewResponse,
+    tags=["系统状态"],
+)
+def compat_system_improvement_overview() -> SystemImprovementOverviewResponse:
+    return system_improvement_overview()
+
+
 @compat_router.post(
     "/system/data_hygiene/repair",
     response_model=DataHygieneResponse,
@@ -23528,6 +32519,64 @@ def compat_project_analysis_bundle_markdown_file(
     locale: str = Depends(get_locale),
 ) -> Response:
     return project_analysis_bundle_markdown_file(project_id=project_id, locale=locale)
+
+
+@compat_router.get(
+    "/projects/{project_id}/writing_guidance/markdown",
+    response_model=WritingGuidanceMarkdownResponse,
+    tags=["自我学习与进化"],
+)
+def compat_project_writing_guidance_markdown(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> WritingGuidanceMarkdownResponse:
+    return get_project_writing_guidance_markdown(project_id=project_id, locale=locale)
+
+
+@compat_router.get(
+    "/projects/{project_id}/writing_guidance_patch_bundle/markdown",
+    response_model=WritingGuidanceMarkdownResponse,
+    tags=["自我学习与进化"],
+)
+def compat_project_writing_guidance_patch_bundle_markdown(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> WritingGuidanceMarkdownResponse:
+    return get_project_writing_guidance_patch_bundle_markdown(project_id=project_id, locale=locale)
+
+
+@compat_router.get("/projects/{project_id}/writing_guidance.md", tags=["自我学习与进化"])
+def compat_download_project_writing_guidance_markdown(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> Response:
+    return download_project_writing_guidance_markdown(project_id=project_id, locale=locale)
+
+
+@compat_router.get(
+    "/projects/{project_id}/writing_guidance_patch_bundle.md", tags=["自我学习与进化"]
+)
+def compat_download_project_writing_guidance_patch_bundle_markdown(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> Response:
+    return download_project_writing_guidance_patch_bundle_markdown(
+        project_id=project_id,
+        locale=locale,
+    )
+
+
+@compat_router.get(
+    "/projects/{project_id}/writing_guidance_patch_bundle.docx", tags=["自我学习与进化"]
+)
+def compat_download_project_writing_guidance_patch_bundle_docx(
+    project_id: str,
+    locale: str = Depends(get_locale),
+) -> Response:
+    return download_project_writing_guidance_patch_bundle_docx(
+        project_id=project_id,
+        locale=locale,
+    )
 
 
 @compat_router.get(
@@ -24492,6 +33541,8 @@ def index(
         button { min-height: 48px; padding: 0 18px; background: var(--primary); color: #fff; border: none; border-radius: 10px; cursor: pointer; font-weight: 600; font-size:16px; line-height:1; white-space:nowrap; }
         button:hover { opacity: 0.9; }
         button:disabled { opacity: 0.45; cursor: not-allowed; }
+        button.button-busy,
+        button.button-busy:hover { opacity: 0.65; cursor: progress; }
         button.secondary { background: #64748b; }
         button.btn-danger { background: #dc2626; color: #fff; position:relative; z-index:2; pointer-events:auto; }
         pre { white-space: pre-wrap; font-size: 12px; margin: 0; line-height: 1.45; }
@@ -24532,6 +33583,11 @@ def index(
         .score-number-input { width:88px !important; min-width:88px !important; min-height:42px; padding:8px 10px; margin-left:4px; font-size:15px; }
         .current-project-text { font-size:16px; font-weight:600; color:#0f172a; }
         .note { font-size:12px; color:#64748b; }
+        .status-callout { margin:8px 0 0 0; padding:10px 12px; border-radius:10px; font-size:13px; line-height:1.55; border:1px solid #fdba74; background:#fff7ed; color:#9a3412; }
+        .status-callout strong { color:#7c2d12; }
+        .status-badge-warning { display:inline-flex; align-items:center; min-height:32px; padding:0 10px; border-radius:999px; border:1px solid #fdba74; background:#fff7ed; color:#9a3412; font-size:12px; font-weight:600; line-height:1; white-space:nowrap; }
+        button.secondary.button-lock-emphasis { border:1px solid #f59e0b; box-shadow:0 0 0 3px rgba(245,158,11,0.18); }
+        button.trial-follow-up-promoted { box-shadow:0 0 0 3px rgba(37,99,235,0.18); }
         .muted { margin:4px 0 0 0; font-size:13px; color:#64748b; }
         .result-block { margin-top: 10px; padding: 12px; background: #f8fafc; border-radius: 8px; border-left: 3px solid var(--primary); overflow-x:auto; }
         .compact-hidden { display:none !important; }
@@ -24539,7 +33595,40 @@ def index(
         th, td { border: 1px solid var(--border); padding: 10px 12px; text-align: left; vertical-align: top; }
         th { background: #e2e8f0; }
         tbody tr:nth-child(even) { background: #f8fafc; }
+        .table-scroll { width:100%; overflow-x:auto; overflow-y:hidden; }
+        .submission-table { table-layout:fixed; min-width:1120px; }
+        .submission-table col.submission-col-file { width:24%; }
+        .submission-table col.submission-col-score { width:26%; }
+        .submission-table col.submission-col-diagnostic { width:28%; }
+        .submission-table col.submission-col-created { width:12%; }
+        .submission-table col.submission-col-actions { width:10%; }
+        .submission-table th, .submission-table td { overflow-wrap:anywhere; word-break:break-word; }
+        .submission-table td { line-height:1.55; }
+        .submission-table .submission-filename { font-weight:600; color:#0f172a; line-height:1.65; }
+        .submission-table .submission-stack { display:flex; flex-direction:column; gap:6px; min-width:0; }
+        .submission-table .submission-stack > * { margin:0; }
+        .submission-table .submission-created-cell { white-space:nowrap; color:#475569; font-size:13px; }
+        .submission-table .submission-actions-cell { white-space:nowrap; }
+        .submission-table .submission-actions-cell .btn-danger { min-width:72px; }
+        .scoring-factors-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:10px; margin-top:10px; }
+        .scoring-factors-stat { padding:12px; border:1px solid var(--border); border-radius:10px; background:#fff; }
+        .scoring-factors-stat strong { display:block; font-size:24px; color:#0f172a; line-height:1.1; }
+        .scoring-factors-stat span { display:block; margin-top:6px; font-size:12px; color:#475569; }
+        .scoring-factors-columns { display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px; margin-top:10px; }
+        .scoring-factors-section { margin-top:14px; }
+        .scoring-factors-section h4 { margin:0 0 8px 0; font-size:15px; color:#0f172a; }
+        .scoring-factors-card-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(300px, 1fr)); gap:12px; margin-top:10px; }
+        .scoring-factors-card { padding:12px; border:1px solid var(--border); border-radius:10px; background:#fff; }
+        .scoring-factors-card h4 { margin:0 0 6px 0; font-size:15px; line-height:1.55; color:#0f172a; }
+        .scoring-factors-card.pending { border-left:3px solid #b45309; }
+        .scoring-factors-card.adaptive { border-left:3px solid #2563eb; }
+        .scoring-factors-meta { margin:0 0 8px 0; font-size:12px; color:#475569; line-height:1.6; }
+        .scoring-factors-list { margin:6px 0 0 18px; color:#334155; }
+        .scoring-factors-pills { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+        .scoring-factors-pill { display:inline-flex; align-items:center; min-height:28px; padding:0 10px; border-radius:999px; background:#eff6ff; color:#1d4ed8; font-size:12px; font-weight:600; line-height:1; }
+        .scoring-factors-template { margin-top:6px; padding:8px 10px; border-radius:8px; background:#f8fafc; color:#334155; line-height:1.6; }
         .error { color: #b91c1c; }
+        .warn { color: #9a3412; }
         .success { color: #15803d; }
         details { margin-top: 8px; }
         summary { cursor: pointer; font-weight: 600; }
@@ -24559,7 +33648,7 @@ def index(
     <body class="__SECURE_DESKTOP_BODY_CLASS__">
       <h1>青天评标系统</h1>
       <p style="margin:-8px 0 16px 0;padding:10px;background:#e0f2fe;border-radius:6px;font-size:14px;">
-        <strong>主流程：</strong>创建项目 → 选择项目 → 调整16维权重 → 上传资料 → 上传施组 → 评分 → 录入真实评标 → 学习进化。页面已默认隐藏高级诊断与维护按钮，聚焦试车操作。
+        <strong>主流程：</strong>创建项目 → 选择项目 → 调整16维权重 → 上传资料 → 上传施组 → 评分 → 录入真实评标 → 学习进化。页面默认精简高级维护按钮，仅保留评分体系与分析包等关键入口，聚焦试车操作。
       </p>
       __GLOBAL_NOTICE_HTML__
       <div class="section card" id="authPanel" style="display:__AUTH_PANEL_DISPLAY__">
@@ -24643,20 +33732,39 @@ def index(
             btnRefreshGroundTruth: { resultId: 'evolveResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/ground_truth', loading: '真实评标列表刷新中...' },
             btnRefreshGroundTruthSubmissionOptions: { resultId: 'evolveResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/submissions', loading: '施组选项刷新中...' },
             btnEvolve: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/evolve', loading: '学习进化执行中...' },
+            btnSelfCheck: { resultId: 'selfCheckResult', method: 'GET', path: (pid) => pid ? ('/api/v1/system/self_check?project_id=' + encodeURIComponent(pid)) : '/api/v1/system/self_check', loading: '系统自检执行中...' },
+            btnSystemImprovementOverview: { resultId: 'systemImprovementResult', method: 'GET', path: () => '/api/v1/system/improvement_overview', loading: '系统继续完善总览生成中...' },
+            btnDataHygiene: { resultId: 'dataHygieneResult', method: 'GET', path: () => '/api/v1/system/data_hygiene', loading: '数据卫生巡检中...' },
+            btnEvalSummaryV2: { resultId: 'evalResult', method: 'GET', path: () => '/api/v1/evaluation/summary', loading: '跨项目汇总评估中...' },
             btnEvolutionHealth: { resultId: 'evolutionHealthResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/evolution/health', loading: '进化健康度分析中...' },
+            btnTrialPreflight: { resultId: 'trialPreflightResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/trial_preflight', loading: '试车前综合体检生成中...' },
+            btnTrialPreflightDownload: { resultId: 'trialPreflightResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/trial_preflight.md', loading: '试车报告下载准备中...' },
+            btnTrialPreflightDownloadDocx: { resultId: 'trialPreflightResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/trial_preflight.docx', loading: '试车报告 DOCX 下载准备中...' },
             btnFeedbackGovernance: { resultId: 'feedbackGovernanceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/feedback/governance', loading: '闭环治理分析中...' },
             btnWritingGuidance: { resultId: 'guidanceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/writing_guidance', loading: '正在生成编制指导...' },
+            btnWritingGuidanceDownload: { resultId: 'guidanceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/writing_guidance.md', loading: '编制指导下载准备中...' },
+            btnWritingGuidancePatchBundleDownload: { resultId: 'guidanceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/writing_guidance_patch_bundle.md', loading: '改写补丁包下载准备中...' },
+            btnWritingGuidancePatchBundleDownloadDocx: { resultId: 'guidanceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/writing_guidance_patch_bundle.docx', loading: '改写补丁包 DOCX 下载准备中...' },
             btnCompilationInstructions: { resultId: 'compilationInstructionsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compilation_instructions', loading: '正在生成编制系统指令...' },
             btnScoreShigong: { resultId: 'shigongActionStatus', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/rescore', loading: '施组评分中...' },
           };
           window.__ZHIFEI_FALLBACK_ACTIONS = window.__ZHIFEI_FALLBACK_ACTIONS || {};
           Object.keys(EARLY_ACTIONS).forEach((k) => { window.__ZHIFEI_FALLBACK_ACTIONS[k] = EARLY_ACTIONS[k]; });
+          const PROJECTLESS_ACTION_IDS = new Set([
+            'btnSelfCheck',
+            'btnSystemImprovementOverview',
+            'btnDataHygiene',
+            'btnEvalSummaryV2',
+          ]);
+          function actionRequiresProject(actionId) {
+            return !PROJECTLESS_ACTION_IDS.has(String(actionId || '').trim());
+          }
 
           async function runEarlyAction(actionId) {
             const cfg = EARLY_ACTIONS[String(actionId || '')];
             if (!cfg) return true;
             const projectId = pickProjectId();
-            if (!projectId) {
+            if (actionRequiresProject(actionId) && !projectId) {
               setResult(cfg.resultId, '请先在「2) 选择项目」中选择项目', true);
               setOutput('[' + actionId + '] 缺少项目ID');
               return false;
@@ -24682,6 +33790,66 @@ def index(
               a.click();
               a.remove();
               setResult(cfg.resultId, '资料知识画像报告下载已触发。', false);
+              setOutput('[' + actionId + '] download ' + dlUrl);
+              return true;
+            }
+            if (actionId === 'btnTrialPreflightDownload') {
+              const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/trial_preflight.md';
+              const a = document.createElement('a');
+              a.href = dlUrl;
+              a.download = 'trial_preflight_' + projectId + '.md';
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              setResult(cfg.resultId, '试车前综合体检报告下载已触发。', false);
+              setOutput('[' + actionId + '] download ' + dlUrl);
+              return true;
+            }
+            if (actionId === 'btnTrialPreflightDownloadDocx') {
+              const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/trial_preflight.docx';
+              const a = document.createElement('a');
+              a.href = dlUrl;
+              a.download = 'trial_preflight_' + projectId + '.docx';
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              setResult(cfg.resultId, '试车前综合体检 DOCX 报告下载已触发。', false);
+              setOutput('[' + actionId + '] download ' + dlUrl);
+              return true;
+            }
+            if (actionId === 'btnWritingGuidanceDownload') {
+              const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/writing_guidance.md';
+              const a = document.createElement('a');
+              a.href = dlUrl;
+              a.download = 'writing_guidance_' + projectId + '.md';
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              setResult(cfg.resultId, '编制指导 Markdown 下载已触发。', false);
+              setOutput('[' + actionId + '] download ' + dlUrl);
+              return true;
+            }
+            if (actionId === 'btnWritingGuidancePatchBundleDownload') {
+              const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/writing_guidance_patch_bundle.md';
+              const a = document.createElement('a');
+              a.href = dlUrl;
+              a.download = 'writing_guidance_patch_bundle_' + projectId + '.md';
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              setResult(cfg.resultId, '改写补丁包 Markdown 下载已触发。', false);
+              setOutput('[' + actionId + '] download ' + dlUrl);
+              return true;
+            }
+            if (actionId === 'btnWritingGuidancePatchBundleDownloadDocx') {
+              const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/writing_guidance_patch_bundle.docx';
+              const a = document.createElement('a');
+              a.href = dlUrl;
+              a.download = 'writing_guidance_patch_bundle_' + projectId + '.docx';
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              setResult(cfg.resultId, '改写补丁包 DOCX 下载已触发。', false);
               setOutput('[' + actionId + '] download ' + dlUrl);
               return true;
             }
@@ -24823,7 +33991,7 @@ def index(
                 msg += ' 资料门禁通过。';
               }
               if (Object.keys(closedLoop).length) {
-                if (closedLoop.ok === false) msg += ' 反馈闭环执行异常，请查看下方原始输出。';
+                if (closedLoop.ok === false) msg += ' 反馈闭环执行异常，请查看下方执行结果摘要。';
                 else msg += ' 反馈闭环已执行。';
               }
               setResult(cfg.resultId, msg, blockedCount > 0);
@@ -24887,6 +34055,43 @@ def index(
               setResultHtml(cfg.resultId, html);
               return true;
             }
+            if (actionId === 'btnSystemImprovementOverview') {
+              if (window.renderSystemImprovementOverviewPanel && typeof window.renderSystemImprovementOverviewPanel === 'function') {
+                window.renderSystemImprovementOverviewPanel(data || {});
+              } else {
+                setResultHtml(cfg.resultId, '<strong>系统继续完善总览</strong><pre>' + esc(JSON.stringify(data || {}, null, 2)) + '</pre>');
+              }
+              return true;
+            }
+            if (actionId === 'btnSelfCheck') {
+              if (typeof renderSelfCheckPanel === 'function') {
+                renderSelfCheckPanel(data || {});
+              } else {
+                setResultHtml(cfg.resultId, '<strong>系统自检</strong><pre>' + esc(JSON.stringify(data || {}, null, 2)) + '</pre>');
+              }
+              return true;
+            }
+            if (actionId === 'btnDataHygiene') {
+              if (window.renderDataHygienePanel && typeof window.renderDataHygienePanel === 'function') {
+                window.renderDataHygienePanel(data || {});
+              } else {
+                setResultHtml(cfg.resultId, '<strong>数据卫生巡检</strong><pre>' + esc(JSON.stringify(data || {}, null, 2)) + '</pre>');
+              }
+              return true;
+            }
+            if (actionId === 'btnEvalSummaryV2') {
+              renderEvaluationAggregateSummaryBlock('evalResult', true, '跨项目汇总评估完成', data || {});
+              renderSystemClosureSummaryPanel(data || {}, { refreshReason: 'manual_eval_summary' });
+              return true;
+            }
+            if (actionId === 'btnTrialPreflight') {
+              if (window.renderTrialPreflightPanel && typeof window.renderTrialPreflightPanel === 'function') {
+                window.renderTrialPreflightPanel(data || {});
+              } else {
+                setResultHtml(cfg.resultId, '<strong>试车前综合体检</strong><pre>' + esc(JSON.stringify(data || {}, null, 2)) + '</pre>');
+              }
+              return true;
+            }
             if (actionId === 'btnEvolutionHealth') {
               const summary = (data && typeof data.summary === 'object') ? data.summary : {};
               const drift = (data && typeof data.drift === 'object') ? data.drift : {};
@@ -24898,20 +34103,47 @@ def index(
               const evoAge = (summary && summary.evolution_weight_age_days != null) ? summary.evolution_weight_age_days : '-';
               const evoSamples = (summary && summary.evolution_weight_sample_count != null) ? summary.evolution_weight_sample_count : 0;
               const evoMinSamples = (summary && summary.evolution_weight_min_samples != null) ? summary.evolution_weight_min_samples : '-';
+              const calibratorVersion = String((summary && summary.current_calibrator_version) || '').trim();
+              const calibratorMode = String((summary && summary.current_calibrator_deployment_mode) || '').trim();
+              const calibratorDegraded = !!(summary && summary.current_calibrator_degraded);
+              const calibratorRecentMae = (summary && summary.current_calibrator_recent_mae != null)
+                ? summary.current_calibrator_recent_mae
+                : '-';
+              const calibratorRecentRuleMae = (summary && summary.current_calibrator_recent_rule_mae != null)
+                ? summary.current_calibrator_recent_rule_mae
+                : '-';
+              const rollbackCandidateVersion = String((summary && summary.current_calibrator_rollback_candidate_version) || '').trim();
+              const rollbackCandidateMode = String((summary && summary.current_calibrator_rollback_candidate_deployment_mode) || '').trim();
+              const rollbackCandidateCvMae = (summary && summary.current_calibrator_rollback_candidate_cv_mae != null)
+                ? summary.current_calibrator_rollback_candidate_cv_mae
+                : null;
               const evoStatus = evoActive
                 ? '<span class="success">已生效</span>'
                 : (evoStored ? '<span class="warn">已存储未生效</span>' : '<span class="error">未产出</span>');
+              const calibratorStatus = calibratorVersion
+                ? ((calibratorDegraded ? '<span class="warn">已退化</span>' : '<span class="success">稳定</span>')
+                  + '；版本=' + esc(calibratorVersion)
+                  + (calibratorMode ? ('；模式=' + esc(calibratorMode)) : ''))
+                : '<span class="note">未部署项目级校准器</span>';
+              const rollbackStatus = rollbackCandidateVersion
+                ? ('版本=' + esc(rollbackCandidateVersion)
+                  + (rollbackCandidateMode ? ('；模式=' + esc(rollbackCandidateMode)) : '')
+                  + (rollbackCandidateCvMae != null ? ('；CV MAE=' + esc(rollbackCandidateCvMae)) : ''))
+                : '无';
               const html = ''
                 + '<strong>进化健康度</strong>'
                 + '<p style="margin:6px 0">漂移等级：'
                 + esc((drift && drift.level) || 'insufficient_data')
-                + '；近30天 MAE=' + esc((w30 && w30.mae) != null ? w30.mae : '-')
-                + '；全量 MAE=' + esc((wall && wall.mae) != null ? wall.mae : '-')
+                + '；近30天内部校准 MAE=' + esc((w30 && w30.mae) != null ? w30.mae : '-')
+                + '；全量内部校准 MAE=' + esc((wall && wall.mae) != null ? wall.mae : '-')
                 + '</p>'
                 + '<table><tr><th>指标</th><th>值</th></tr>'
                 + '<tr><td>真实评分样本</td><td>' + esc((summary && summary.ground_truth_count) || 0) + '</td></tr>'
-                + '<tr><td>已匹配预测</td><td>' + esc((summary && summary.matched_prediction_count) || 0) + '</td></tr>'
+                + '<tr><td>已关联评分记录</td><td>' + esc((summary && (summary.matched_score_record_count ?? summary.matched_prediction_count)) || 0) + '</td></tr>'
                 + '<tr><td>未匹配样本</td><td>' + esc((summary && summary.unmatched_ground_truth_count) || 0) + '</td></tr>'
+                + '<tr><td>当前项目级校准器</td><td>' + calibratorStatus + '</td></tr>'
+                + '<tr><td>近30天校准器/规则 MAE（内部校准指标）</td><td>' + esc(calibratorRecentMae) + ' / ' + esc(calibratorRecentRuleMae) + '</td></tr>'
+                + '<tr><td>历史回退候选</td><td>' + rollbackStatus + '</td></tr>'
                 + '<tr><td>当前权重来源</td><td>' + esc((summary && summary.current_weights_source) || '-') + '</td></tr>'
                 + '<tr><td>进化权重状态</td><td>' + evoStatus + '</td></tr>'
                 + '<tr><td>进化权重样本/阈值</td><td>' + esc(evoSamples) + ' / ' + esc(evoMinSamples) + '</td></tr>'
@@ -24939,7 +34171,7 @@ def index(
         })();
       </script>
 
-      <div class="section card">
+      <div class="section card" id="section-create-project">
         <h2>1) 创建项目</h2>
         <div class="toolbar" style="margin-bottom:8px">
           <button type="button" id="btnStartNewProject" class="secondary">开始新项目</button>
@@ -24947,7 +34179,7 @@ def index(
         <form id="createProject" method="post" action="/web/create_project" class="create-project-form">
           <input type="hidden" name="api_key" id="createProjectApiKey" value="" />
           <span class="field-label">项目名称：</span><input id="createProjectNameInput" class="project-name-input primary-input" name="name" placeholder="例如：XX标段施组评审" autocomplete="off" value="__CREATE_PROJECT_NAME_VALUE__" title="__CREATE_PROJECT_NAME_VALUE__" />
-          <button type="submit" id="btnCreateProject">创建</button>
+          <button type="submit" id="btnCreateProject" data-loading-label="创建中...">创建</button>
         </form>
         <form id="createProjectFromTender" method="post" action="/web/create_project_from_tender" enctype="multipart/form-data" class="inline-form" style="margin-top:10px;gap:8px;flex-wrap:wrap">
           <input type="hidden" name="api_key" id="createProjectFromTenderApiKey" value="" />
@@ -24956,7 +34188,7 @@ def index(
           <input id="createProjectFromTenderFile" class="visually-hidden-file" type="file" name="file" accept=".txt,.md,.pdf,.doc,.docx,.docm,.json" />
           <label for="createProjectFromTenderFile" class="file-picker-btn" data-file-input-id="createProjectFromTenderFile">选择招标文件</label>
           <span id="createProjectFromTenderFileName" class="file-picker-name">未选择任何文件</span>
-          <button type="submit" id="btnCreateProjectFromTender" class="secondary">自动创建</button>
+          <button type="submit" id="btnCreateProjectFromTender" class="secondary" data-loading-label="自动创建中...">自动创建</button>
         </form>
         __CREATE_NOTICE_HTML__
         __CREATE_PROJECT_RECOGNIZED_NAME_HTML__
@@ -24964,7 +34196,7 @@ def index(
         <p style="margin:4px 0 0 0;font-size:13px;color:#64748b">可手动输入项目名称，或直接上传招标文件自动识别创建。若自动识别不稳定，可先在上方补齐项目名称后继续点“自动创建”。若识别到同名项目，系统会直接切换到现有项目并把招标文件归档进去。</p>
       </div>
 
-      <div class="section card">
+      <div class="section card" id="section-project-select">
         <h2>2) 选择项目</h2>
         <div class="toolbar">
           <button type="button" id="refreshProjects" class="compact-hidden">刷新项目列表</button>
@@ -24998,10 +34230,9 @@ def index(
         </div>
         <p id="projectListMeta" style="margin:8px 0 0 0;font-size:12px;color:#64748b"></p>
         <p id="currentProjectTag" class="current-project-text" style="margin:6px 0 0 0"></p>
-        <details class="compact-hidden" style="margin-top:8px">
+        <details style="margin-top:8px">
           <summary style="cursor:pointer;color:#334155;font-size:13px">高级工具（系统诊断 / 评分体系 / 分析包）</summary>
           <div class="toolbar" style="margin-top:8px">
-            <button type="button" id="btnSelfCheck" class="secondary">系统自检</button>
             <button type="button" id="btnScoringFactors" class="secondary">评分体系一览</button>
             <button type="button" id="btnScoringFactorsMd" class="secondary">评分体系Markdown</button>
             <button type="button" id="btnAnalysisBundle" class="secondary">项目分析包</button>
@@ -25010,8 +34241,11 @@ def index(
           </div>
         </details>
         <p id="selectProjectMessage" style="margin:8px 0 0 0;font-size:13px;min-height:1.2em"></p>
-        <div id="selfCheckResult" class="result-block" style="display:none"></div>
         <div id="scoringFactorsResult" class="result-block" style="display:none"></div>
+        <div id="systemClosureSummaryResult" class="result-block" style="display:block">
+          <strong>系统封关推进摘要</strong>
+          <p style="margin:6px 0 0 0;color:#475569">待机：正在汇总系统总封关状态…</p>
+        </div>
         <p class="muted">下方所有操作将使用选中的项目。需要开始新项目时，请回到「1) 创建项目」点击“开始新项目”。历史项目会保留在列表中但自动隐藏。删除资料不会直接删除已学习权重、校准器或真实评标记录，但会影响该项目后续重评分和证据链；删除整个项目或施组会同步删除对应记录。</p>
       </div>
 
@@ -25031,6 +34265,8 @@ def index(
         <p id="materialsEmpty" style="font-size:13px;color:#64748b;margin:6px 0 0 0;display:__MATERIALS_EMPTY_DISPLAY__">暂无资料，请下方添加。</p>
         <div id="materialDepthReportResult" class="result-block" style="display:none"></div>
         <div id="materialKnowledgeProfileResult" class="result-block" style="display:none"></div>
+        <p id="materialsTrialPreflightHint" style="display:none;margin:6px 0 8px 0;font-size:12px;color:#0f766e;min-height:1.2em"></p>
+        <button type="button" id="materialsTrialPreflightFollowUpAction" class="secondary" style="display:none;margin:0 0 8px 0"></button>
         <div class="upload-box">
           <h3 class="upload-panel-title">文件上传区</h3>
           <div class="upload-zones">
@@ -25043,7 +34279,9 @@ def index(
                 <input id="uploadMaterialFile" class="visually-hidden-file" type="file" name="file" accept=".txt,.md,.pdf,.doc,.docx,.docm,.json" multiple />
                 <label for="uploadMaterialFile" class="file-picker-btn" data-file-input-id="uploadMaterialFile">选择文件</label>
                 <span id="uploadMaterialFileName" class="file-picker-name">未选择任何文件</span>
-                <button type="submit" id="btnUploadMaterials">上传资料</button>
+                <button type="submit" id="btnUploadMaterials" data-loading-label="上传资料中...">上传资料</button>
+                <span id="btnUploadMaterialsBadge" class="status-badge-warning" style="display:none"></span>
+                <span id="btnUploadMaterialsHint" class="note" style="display:none"></span>
                 <span class="note">支持：TXT/MD/PDF/DOC/DOCX/DOCM/JSON，支持一次选择多个文件。</span>
               </form>
               <p id="materialsActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
@@ -25058,7 +34296,9 @@ def index(
                 <input id="uploadMaterialBoqFile" class="visually-hidden-file" type="file" name="file" accept=".xlsx,.xls,.xlsm,.csv,.pdf,.doc,.docx,.txt,.json" multiple />
                 <label for="uploadMaterialBoqFile" class="file-picker-btn" data-file-input-id="uploadMaterialBoqFile">选择文件</label>
                 <span id="uploadMaterialBoqFileName" class="file-picker-name">未选择任何文件</span>
-                <button type="submit" id="btnUploadBoq">上传清单</button>
+                <button type="submit" id="btnUploadBoq" data-loading-label="上传清单中...">上传清单</button>
+                <span id="btnUploadBoqBadge" class="status-badge-warning" style="display:none"></span>
+                <span id="btnUploadBoqHint" class="note" style="display:none"></span>
                 <span class="note">支持：XLSX/XLS/XLSM/CSV/PDF/DOC/DOCX/TXT/JSON，支持一次选择多个文件。</span>
               </form>
               <p id="materialsActionStatusBoq" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
@@ -25073,7 +34313,9 @@ def index(
                 <input id="uploadMaterialDrawingFile" class="visually-hidden-file" type="file" name="file" accept=".pdf,.doc,.docx,.xlsx,.xls,.dxf,.dwg,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff,.json,.txt" multiple />
                 <label for="uploadMaterialDrawingFile" class="file-picker-btn" data-file-input-id="uploadMaterialDrawingFile">选择文件</label>
                 <span id="uploadMaterialDrawingFileName" class="file-picker-name">未选择任何文件</span>
-                <button type="submit" id="btnUploadDrawing">上传图纸</button>
+                <button type="submit" id="btnUploadDrawing" data-loading-label="上传图纸中...">上传图纸</button>
+                <span id="btnUploadDrawingBadge" class="status-badge-warning" style="display:none"></span>
+                <span id="btnUploadDrawingHint" class="note" style="display:none"></span>
                 <span class="note">支持：PDF/DOC/DOCX/XLSX/XLS/DXF/DWG/图片/JSON/TXT，支持一次选择多个文件。</span>
               </form>
               <p id="materialsActionStatusDrawing" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
@@ -25088,7 +34330,9 @@ def index(
                 <input id="uploadMaterialPhotoFile" class="visually-hidden-file" type="file" name="file" accept=".png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff" multiple />
                 <label for="uploadMaterialPhotoFile" class="file-picker-btn" data-file-input-id="uploadMaterialPhotoFile">选择文件</label>
                 <span id="uploadMaterialPhotoFileName" class="file-picker-name">未选择任何文件</span>
-                <button type="submit" id="btnUploadSitePhotos">上传照片</button>
+                <button type="submit" id="btnUploadSitePhotos" data-loading-label="上传照片中...">上传照片</button>
+                <span id="btnUploadSitePhotosBadge" class="status-badge-warning" style="display:none"></span>
+                <span id="btnUploadSitePhotosHint" class="note" style="display:none"></span>
                 <span class="note">支持：PNG/JPG/JPEG/WEBP/BMP/TIF/TIFF，支持一次选择多个文件。</span>
               </form>
               <p id="materialsActionStatusPhoto" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
@@ -25098,7 +34342,7 @@ def index(
         </div>
       </div>
 
-      <div class="section card">
+      <div class="section card" id="section-expert-profile">
         <h2>2.5) 青天评标关注度（16维）</h2>
         <p style="font-size:12px;color:#64748b;margin:-4px 0 10px 0">先设置16维关注度，再点击“应用到本项目并重算”。同一项目内所有施组将统一按该配置重算，历史快照会保留。</p>
         <div id="expertProfileStatus" style="font-size:13px;color:#334155;margin-bottom:8px">__EXPERT_PROFILE_STATUS__</div>
@@ -25121,7 +34365,19 @@ def index(
           <button type="button" id="btnRefreshSubmissions" class="secondary compact-hidden" style="margin-left:8px">刷新</button>
         </div>
         <div id="submissionDualTrackOverview" class="result-block" style="display:__SUBMISSION_DUAL_TRACK_OVERVIEW_DISPLAY__">__SUBMISSION_DUAL_TRACK_OVERVIEW_HTML__</div>
-        <table id="submissionsTable"><thead><tr><th>文件名</th><th>双轨分数</th><th>偏差诊断</th><th>上传时间</th><th>操作</th></tr></thead><tbody>__SUBMISSION_ROWS__</tbody></table>
+        <div class="table-scroll submission-table-wrap">
+          <table id="submissionsTable" class="submission-table">
+            <colgroup>
+              <col class="submission-col-file" />
+              <col class="submission-col-score" />
+              <col class="submission-col-diagnostic" />
+              <col class="submission-col-created" />
+              <col class="submission-col-actions" />
+            </colgroup>
+            <thead><tr><th>文件名</th><th>双轨分数</th><th>偏差诊断</th><th>上传时间</th><th>操作</th></tr></thead>
+            <tbody>__SUBMISSION_ROWS__</tbody>
+          </table>
+        </div>
         <p id="submissionsEmpty" style="font-size:13px;color:#64748b;margin:6px 0 0 0;display:__SUBMISSIONS_EMPTY_DISPLAY__">暂无施组，请下方添加。</p>
         <div class="upload-box">
           <form id="uploadShigong" method="post" action="/web/upload_shigong" enctype="multipart/form-data" class="inline-form">
@@ -25131,8 +34387,12 @@ def index(
             <input id="uploadShigongFile" class="visually-hidden-file" type="file" name="file" accept=".txt,.docx,.pdf,.json,.xlsx,.xls,.dxf" multiple />
             <label for="uploadShigongFile" class="file-picker-btn" data-file-input-id="uploadShigongFile">选择文件</label>
             <span id="uploadShigongFileName" class="file-picker-name">未选择任何文件</span>
-            <button type="submit" id="btnUploadShigong" name="submit_action" value="upload">上传施组</button>
-            <button type="submit" id="btnScoreShigong" class="secondary" formaction="/web/score_shigong" name="submit_action" value="score">评分施组</button>
+            <button type="submit" id="btnUploadShigong" name="submit_action" value="upload" data-loading-label="上传施组中...">上传施组</button>
+            <span id="btnUploadShigongHint" class="note" style="display:none"></span>
+            <button type="submit" id="btnScoreShigong" class="secondary" formaction="/web/score_shigong" name="submit_action" value="score" data-default-label="评分施组" data-locked-label="评分施组（确认后重算）" data-loading-label="评分施组中...">评分施组</button>
+            <span id="btnScoreShigongHint" class="note" style="display:none"></span>
+            <span id="shigongTrialPreflightBadge" class="status-badge-warning" style="display:none"></span>
+            <span id="shigongScoreLockBadge" class="status-badge-warning" style="display:none">锁定项目可确认后重算</span>
             <span style="margin-left:8px;color:#334155;font-size:13px">满分标准：</span>
             <select id="scoreScaleSelect" class="compact-select" name="score_scale_max" style="margin-left:4px">
               <option value="100">100分制</option>
@@ -25143,6 +34403,10 @@ def index(
             <span class="note">支持一次选择多个文件（Mac 按 Command，Windows 按 Ctrl）。</span>
           </form>
           <p id="shigongGateSummary" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
+          <p id="shigongTrialPreflightHint" style="display:none;margin:6px 0 0 0;font-size:12px;color:#92400e;min-height:1.2em"></p>
+          <div id="shigongScoreLockHint" class="status-callout" style="display:none">
+            <strong>锁定说明：</strong>若项目已进入青天评标阶段，点击“评分施组”后会先提示确认；确认后系统会自动解锁并继续重算，无需删除项目。
+          </div>
           <p id="shigongActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
           <p class="note" style="margin:6px 0 0 0">满分优化清单会展示定位页码、证据片段、建议改写和验收标准。</p>
           <div id="scoringReadinessResult" class="result-block" style="display:none"></div>
@@ -25187,7 +34451,7 @@ def index(
         <div id="adaptiveApplyResult" class="result-block" style="display:none"></div>
       </div>
 
-      <div class="section card">
+      <div class="section card" id="section-learning-evolution">
         <h2>5) 自我学习与进化</h2>
         <p style="font-size:13px;color:#64748b;margin:0 0 6px 0">上传项目投喂包（招标/清单/图纸等合并文本），录入交易中心真实评标结果（5/7评委+最终得分），系统学习高分逻辑并生成编制指导。</p>
         <p style="font-size:12px;color:#475569;margin:0 0 10px 0">系统会将学习到的高分逻辑与编制指导持久保存，并用于本项目后续评分；再次执行学习进化可基于新录入的真实评标升级这些经验。</p>
@@ -25257,24 +34521,33 @@ def index(
         <div class="action-row" style="margin-bottom:10px">
           <button type="button" id="btnEvolve" onclick="return window.__zhifeiFallbackClick(event, 'btnEvolve')">学习进化（根据已录入真实评标生成高分逻辑与编制指导）</button>
           <button type="button" id="btnEvolutionHealth" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnEvolutionHealth')">进化健康度</button>
+          <button type="button" id="btnSelfCheck" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnSelfCheck')">系统自检</button>
+          <button type="button" id="btnSystemImprovementOverview" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnSystemImprovementOverview')">系统继续完善总览</button>
+          <button type="button" id="btnDataHygiene" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnDataHygiene')">数据卫生巡检</button>
+          <button type="button" id="btnEvalSummaryV2" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnEvalSummaryV2')">跨项目汇总评估</button>
+          <button type="button" id="btnTrialPreflight" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnTrialPreflight')">试车前综合体检</button>
+          <button type="button" id="btnTrialPreflightDownload" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnTrialPreflightDownload')">下载试车报告(.md)</button>
+          <button type="button" id="btnTrialPreflightDownloadDocx" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnTrialPreflightDownloadDocx')">下载试车报告(.docx)</button>
           <button type="button" id="btnFeedbackGovernance" class="secondary compact-hidden" onclick="return window.__zhifeiFallbackClick(event, 'btnFeedbackGovernance')">评分治理（异常样本/校准/回退）</button>
           <button type="button" id="btnWritingGuidance" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnWritingGuidance')">查看编制指导</button>
+          <button type="button" id="btnWritingGuidanceDownload" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnWritingGuidanceDownload')">下载编制指导(.md)</button>
+          <button type="button" id="btnWritingGuidancePatchBundleDownload" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnWritingGuidancePatchBundleDownload')">下载改写补丁包(.md)</button>
+          <button type="button" id="btnWritingGuidancePatchBundleDownloadDocx" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnWritingGuidancePatchBundleDownloadDocx')">下载改写补丁包(.docx)</button>
           <button type="button" id="btnCompilationInstructions" class="secondary compact-hidden" onclick="return window.__zhifeiFallbackClick(event, 'btnCompilationInstructions')">编制系统指令（可导出为编制约束）</button>
         </div>
         <details open class="compact-hidden" style="margin:12px 0 8px 0;padding:10px;border:2px solid #f59e0b;border-radius:8px;background:#fff7ed">
           <summary style="cursor:pointer;color:#9a3412"><strong>V2 反演校准闭环（核心能力，强烈建议执行）</strong></summary>
           <p style="margin:8px 0 10px 0;color:#7c2d12;font-size:13px">
-            该闭环会自动训练并部署校准器（CV闸门）、回填预测分，并联动补丁影子评估/发布。
-            为使系统评分持续逼近青天标准，建议每次录入真实评标后执行一次「一键闭环执行」。
+            该闭环会自动训练并部署校准器（CV闸门）、回填校准分，并联动补丁影子评估/发布。
+            为使系统评分持续贴近青天标准，建议每次录入真实评标后执行一次「一键闭环执行」。
           </p>
           <div style="margin-top:8px">
             <button type="button" id="btnRebuildDelta" class="secondary">重建 DELTA_CASE</button>
             <button type="button" id="btnRebuildSamples" class="secondary">重建 FEATURE_ROW</button>
             <button type="button" id="btnTrainCalibratorV2" class="secondary">训练并部署校准器</button>
-            <button type="button" id="btnApplyCalibPredict" class="secondary">回填预测分</button>
+            <button type="button" id="btnApplyCalibPredict" class="secondary">回填校准分</button>
             <button type="button" id="btnAutoRunReflection">一键闭环执行</button>
-            <button type="button" id="btnEvalMetricsV2" class="secondary">评估 V1/V2/校准</button>
-            <button type="button" id="btnEvalSummaryV2" class="secondary">跨项目汇总评估</button>
+            <button type="button" id="btnEvalMetricsV2" class="secondary">评估 规则/当前分/校准</button>
           </div>
           <div style="margin-top:8px">
             补丁类型：
@@ -25292,6 +34565,10 @@ def index(
         </details>
         <div id="evolveResult" class="result-block" style="display:none"></div>
         <div id="evolutionHealthResult" class="result-block" style="display:none"></div>
+        <div id="selfCheckResult" class="result-block" style="display:none"></div>
+        <div id="systemImprovementResult" class="result-block" style="display:none"></div>
+        <div id="dataHygieneResult" class="result-block" style="display:none"></div>
+        <div id="trialPreflightResult" class="result-block" style="display:none"></div>
         <div id="feedbackGovernanceResult" class="result-block" style="display:none"></div>
         <div id="compilationInstructionsResult" class="result-block" style="display:none"></div>
         <div id="guidanceResult" class="result-block" style="display:none"></div>
@@ -25305,8 +34582,8 @@ def index(
       </div>
 
       <div class="section card">
-        <h2>原始输出（最后一次请求）</h2>
-        <pre id="output">（操作后这里显示原始 JSON）</pre>
+        <h2>执行结果摘要（最近一次操作）</h2>
+        <pre id="output">（这里只保留关键结果摘要，不展示冗长原始响应）</pre>
       </div>
 
       <script>
@@ -25348,9 +34625,19 @@ def index(
             btnUploadFeed: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/materials', loading: '投喂包上传中...' },
             btnAddGroundTruth: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/ground_truth/from_submission', loading: '真实评标录入中...' },
             btnEvolve: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/evolve', loading: '学习进化执行中...' },
+            btnSelfCheck: { resultId: 'selfCheckResult', method: 'GET', path: (pid) => pid ? ('/api/v1/system/self_check?project_id=' + encodeURIComponent(pid)) : '/api/v1/system/self_check', loading: '系统自检执行中...' },
+            btnSystemImprovementOverview: { resultId: 'systemImprovementResult', method: 'GET', path: () => '/api/v1/system/improvement_overview', loading: '系统继续完善总览生成中...' },
+            btnDataHygiene: { resultId: 'dataHygieneResult', method: 'GET', path: () => '/api/v1/system/data_hygiene', loading: '数据卫生巡检中...' },
+            btnEvalSummaryV2: { resultId: 'evalResult', method: 'GET', path: () => '/api/v1/evaluation/summary', loading: '跨项目汇总评估中...' },
             btnEvolutionHealth: { resultId: 'evolutionHealthResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/evolution/health', loading: '进化健康度分析中...' },
+            btnTrialPreflight: { resultId: 'trialPreflightResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/trial_preflight', loading: '试车前综合体检生成中...' },
+            btnTrialPreflightDownload: { resultId: 'trialPreflightResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/trial_preflight.md', loading: '试车报告下载准备中...' },
+            btnTrialPreflightDownloadDocx: { resultId: 'trialPreflightResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/trial_preflight.docx', loading: '试车报告 DOCX 下载准备中...' },
             btnFeedbackGovernance: { resultId: 'feedbackGovernanceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/feedback/governance', loading: '闭环治理分析中...' },
             btnWritingGuidance: { resultId: 'guidanceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/writing_guidance', loading: '正在生成编制指导...' },
+            btnWritingGuidanceDownload: { resultId: 'guidanceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/writing_guidance.md', loading: '编制指导下载准备中...' },
+            btnWritingGuidancePatchBundleDownload: { resultId: 'guidanceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/writing_guidance_patch_bundle.md', loading: '改写补丁包下载准备中...' },
+            btnWritingGuidancePatchBundleDownloadDocx: { resultId: 'guidanceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/writing_guidance_patch_bundle.docx', loading: '改写补丁包 DOCX 下载准备中...' },
             btnCompilationInstructions: { resultId: 'compilationInstructionsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compilation_instructions', loading: '正在生成编制系统指令...' },
           });
           window.__ZHIFEI_FALLBACK_ACTIONS = FALLBACK_ACTIONS;
@@ -25360,9 +34647,14 @@ def index(
             'btnAnalysisBundleDownload',
             'btnMaterialDepthReportDownload',
             'btnMaterialKnowledgeProfileDownload',
+            'btnTrialPreflightDownload',
+            'btnTrialPreflightDownloadDocx',
+            'btnWritingGuidanceDownload',
+            'btnWritingGuidancePatchBundleDownload',
+            'btnWritingGuidancePatchBundleDownloadDocx',
           ];
           function secureDesktopNoticeText() {
-            return '保密模式已启用：当前版本禁用 Markdown 导出、下载与复制。';
+            return '保密模式已启用：当前版本禁用文档导出、下载与复制。';
           }
           function secureDesktopBlockResult(resultId, fallbackText) {
             const message = fallbackText || secureDesktopNoticeText();
@@ -25571,12 +34863,12 @@ def index(
               const top = data.top_submission || {};
               const bottom = data.bottom_submission || {};
               const confidenceText = (row) => {
-                if (!row || typeof row !== 'object') return '置信度 -';
+                if (!row || typeof row !== 'object') return '置信等级 -';
                 const awareness = row.score_self_awareness && typeof row.score_self_awareness === 'object' ? row.score_self_awareness : {};
                 const level = row.score_confidence_level || awareness.level || '-';
-                const score = awareness.score_0_100 == null ? '' : (' / ' + fallbackEscapeHtml(awareness.score_0_100) + '分');
+                const score = awareness.score_0_100 == null ? '' : ('（内部指数 ' + fallbackEscapeHtml(awareness.score_0_100) + '/100）');
                 const reason = Array.isArray(awareness.reasons) && awareness.reasons.length ? ('；' + fallbackEscapeHtml(awareness.reasons[0])) : '';
-                return '置信度 ' + fallbackEscapeHtml(level) + score + reason;
+                return '置信等级 ' + fallbackEscapeHtml(level) + score + reason;
               };
               const keyDiffs = (Array.isArray(data.key_diffs) ? data.key_diffs : []).slice(0, 5);
               const rankings = Array.isArray(data.rankings) ? data.rankings : [];
@@ -25625,6 +34917,7 @@ def index(
                 + '<strong>逐文件优化清单（精简执行版）</strong>'
                 + (cardHtml || '<div style="color:#64748b">暂无优化清单。</div>');
               fallbackSetResultHtml(resultId, html);
+              flushOptimizationReportPanelScroll();
               return true;
             }
             if (aid === 'btnInsights') {
@@ -25647,19 +34940,46 @@ def index(
               const evoAge = (summary && summary.evolution_weight_age_days != null) ? summary.evolution_weight_age_days : '-';
               const evoSamples = (summary && summary.evolution_weight_sample_count != null) ? summary.evolution_weight_sample_count : 0;
               const evoMinSamples = (summary && summary.evolution_weight_min_samples != null) ? summary.evolution_weight_min_samples : '-';
+              const calibratorVersion = String((summary && summary.current_calibrator_version) || '').trim();
+              const calibratorMode = String((summary && summary.current_calibrator_deployment_mode) || '').trim();
+              const calibratorDegraded = !!(summary && summary.current_calibrator_degraded);
+              const calibratorRecentMae = (summary && summary.current_calibrator_recent_mae != null)
+                ? summary.current_calibrator_recent_mae
+                : '-';
+              const calibratorRecentRuleMae = (summary && summary.current_calibrator_recent_rule_mae != null)
+                ? summary.current_calibrator_recent_rule_mae
+                : '-';
+              const rollbackCandidateVersion = String((summary && summary.current_calibrator_rollback_candidate_version) || '').trim();
+              const rollbackCandidateMode = String((summary && summary.current_calibrator_rollback_candidate_deployment_mode) || '').trim();
+              const rollbackCandidateCvMae = (summary && summary.current_calibrator_rollback_candidate_cv_mae != null)
+                ? summary.current_calibrator_rollback_candidate_cv_mae
+                : null;
               const evoStatus = evoActive
                 ? '<span class="success">已生效</span>'
                 : (evoStored ? '<span class="warn">已存储未生效</span>' : '<span class="error">未产出</span>');
+              const calibratorStatus = calibratorVersion
+                ? ((calibratorDegraded ? '<span class="warn">已退化</span>' : '<span class="success">稳定</span>')
+                  + '；版本=' + fallbackEscapeHtml(calibratorVersion)
+                  + (calibratorMode ? ('；模式=' + fallbackEscapeHtml(calibratorMode)) : ''))
+                : '<span class="note">未部署项目级校准器</span>';
+              const rollbackStatus = rollbackCandidateVersion
+                ? ('版本=' + fallbackEscapeHtml(rollbackCandidateVersion)
+                  + (rollbackCandidateMode ? ('；模式=' + fallbackEscapeHtml(rollbackCandidateMode)) : '')
+                  + (rollbackCandidateCvMae != null ? ('；CV MAE=' + fallbackEscapeHtml(rollbackCandidateCvMae)) : ''))
+                : '无';
               const html = '<strong>进化健康度</strong>'
                 + '<p style="margin:6px 0">漂移等级：'
                 + fallbackEscapeHtml((drift && drift.level) || 'insufficient_data')
-                + '；近30天 MAE=' + fallbackEscapeHtml((w30 && w30.mae) != null ? w30.mae : '-')
-                + '；全量 MAE=' + fallbackEscapeHtml((wall && wall.mae) != null ? wall.mae : '-')
+                + '；近30天内部校准 MAE=' + fallbackEscapeHtml((w30 && w30.mae) != null ? w30.mae : '-')
+                + '；全量内部校准 MAE=' + fallbackEscapeHtml((wall && wall.mae) != null ? wall.mae : '-')
                 + '</p>'
                 + '<table><tr><th>指标</th><th>值</th></tr>'
                 + '<tr><td>真实评分样本</td><td>' + fallbackEscapeHtml((summary && summary.ground_truth_count) || 0) + '</td></tr>'
-                + '<tr><td>已匹配预测</td><td>' + fallbackEscapeHtml((summary && summary.matched_prediction_count) || 0) + '</td></tr>'
+                + '<tr><td>已关联评分记录</td><td>' + fallbackEscapeHtml((summary && (summary.matched_score_record_count ?? summary.matched_prediction_count)) || 0) + '</td></tr>'
                 + '<tr><td>未匹配样本</td><td>' + fallbackEscapeHtml((summary && summary.unmatched_ground_truth_count) || 0) + '</td></tr>'
+                + '<tr><td>当前项目级校准器</td><td>' + calibratorStatus + '</td></tr>'
+                + '<tr><td>近30天校准器/规则 MAE（内部校准指标）</td><td>' + fallbackEscapeHtml(calibratorRecentMae) + ' / ' + fallbackEscapeHtml(calibratorRecentRuleMae) + '</td></tr>'
+                + '<tr><td>历史回退候选</td><td>' + rollbackStatus + '</td></tr>'
                 + '<tr><td>当前权重来源</td><td>' + fallbackEscapeHtml((summary && summary.current_weights_source) || '-') + '</td></tr>'
                 + '<tr><td>进化权重状态</td><td>' + evoStatus + '</td></tr>'
                 + '<tr><td>进化权重样本/阈值</td><td>' + fallbackEscapeHtml(evoSamples) + ' / ' + fallbackEscapeHtml(evoMinSamples) + '</td></tr>'
@@ -25677,6 +34997,30 @@ def index(
               const fewShotRecent = Array.isArray(data.few_shot_recent) ? data.few_shot_recent : [];
               const versions = Array.isArray(data.version_history) ? data.version_history : [];
               const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
+              const currentCalibratorVersion = String((summary && summary.current_calibrator_version) || '').trim();
+              const currentCalibratorMode = String((summary && summary.current_calibrator_deployment_mode) || '').trim();
+              const currentCalibratorDegraded = !!(summary && summary.current_calibrator_degraded);
+              const currentCalibratorRecentMae = (summary && summary.current_calibrator_recent_mae != null)
+                ? summary.current_calibrator_recent_mae
+                : '-';
+              const currentCalibratorRecentRuleMae = (summary && summary.current_calibrator_recent_rule_mae != null)
+                ? summary.current_calibrator_recent_rule_mae
+                : '-';
+              const rollbackCandidateVersion = String((summary && summary.current_calibrator_rollback_candidate_version) || '').trim();
+              const rollbackCandidateMode = String((summary && summary.current_calibrator_rollback_candidate_deployment_mode) || '').trim();
+              const rollbackCandidateCvMae = (summary && summary.current_calibrator_rollback_candidate_cv_mae != null)
+                ? summary.current_calibrator_rollback_candidate_cv_mae
+                : null;
+              const currentCalibratorStatus = currentCalibratorVersion
+                ? ((currentCalibratorDegraded ? '已退化' : '稳定')
+                  + '；版本=' + fallbackEscapeHtml(currentCalibratorVersion)
+                  + (currentCalibratorMode ? ('；模式=' + fallbackEscapeHtml(currentCalibratorMode)) : ''))
+                : '未部署项目级校准器';
+              const rollbackCandidateStatus = rollbackCandidateVersion
+                ? ('版本=' + fallbackEscapeHtml(rollbackCandidateVersion)
+                  + (rollbackCandidateMode ? ('；模式=' + fallbackEscapeHtml(rollbackCandidateMode)) : '')
+                  + (rollbackCandidateCvMae != null ? ('；CV MAE=' + fallbackEscapeHtml(rollbackCandidateCvMae)) : ''))
+                : '无';
               const html = '<strong>评分治理面板（异常样本 / few-shot / 回退快照）</strong>'
                 + '<p class="note" style="margin:6px 0">用途：处理真实评分闭环中的异常样本、few-shot 采纳/忽略、版本预演与回退；它不是逐页编制优化清单。</p>'
                 + '<table><tr><th>指标</th><th>值</th></tr>'
@@ -25685,10 +35029,13 @@ def index(
                 + '<tr><td>被拦截样本</td><td>' + fallbackEscapeHtml((summary && summary.blocked_ground_truth_count) || 0) + '</td></tr>'
                 + '<tr><td>需人工确认</td><td>' + fallbackEscapeHtml(!!(summary && summary.manual_confirmation_required)) + '</td></tr>'
                 + '<tr><td>近期 few-shot 捕获数</td><td>' + fallbackEscapeHtml((summary && summary.few_shot_recent_capture_count) || 0) + '</td></tr>'
+                + '<tr><td>当前校准器状态</td><td>' + currentCalibratorStatus + '</td></tr>'
+                + '<tr><td>近30天校准器/规则 MAE（内部校准指标）</td><td>' + fallbackEscapeHtml(currentCalibratorRecentMae) + ' / ' + fallbackEscapeHtml(currentCalibratorRecentRuleMae) + '</td></tr>'
+                + '<tr><td>历史回退候选</td><td>' + rollbackCandidateStatus + '</td></tr>'
                 + '</table>'
                 + (blockedSamples.length
-                  ? '<strong>被拦截样本</strong><table><tr><th>ID</th><th>偏差(100分)</th><th>说明</th></tr>'
-                    + blockedSamples.slice(0, 6).map((row) => '<tr><td>' + fallbackEscapeHtml(row.record_id || '-') + '</td><td>' + fallbackEscapeHtml(row.abs_delta_100 || '-') + '</td><td>' + fallbackEscapeHtml(row.warning_message || '-') + '</td></tr>').join('')
+                  ? '<strong>被拦截样本</strong><table><tr><th>ID</th><th>偏差</th><th>说明</th></tr>'
+                    + blockedSamples.slice(0, 6).map((row) => '<tr><td>' + fallbackEscapeHtml(row.record_id || '-') + '</td><td>' + fallbackEscapeHtml(row.abs_delta != null ? row.abs_delta : (row.abs_delta_100 || '-')) + '</td><td>' + fallbackEscapeHtml(row.warning_message || '-') + '</td></tr>').join('')
                     + '</table>'
                   : '<p style="color:#166534">当前无被拦截的极端偏差样本。</p>')
                 + (fewShotRecent.length
@@ -25705,6 +35052,43 @@ def index(
                   ? '<ul style="margin:6px 0 0 18px;color:#92400e">' + recs.slice(0, 6).map((x) => '<li>' + fallbackEscapeHtml(x) + '</li>').join('') + '</ul>'
                   : '');
               fallbackSetResultHtml(resultId, html);
+              return true;
+            }
+            if (aid === 'btnSystemImprovementOverview') {
+              if (window.renderSystemImprovementOverviewPanel && typeof window.renderSystemImprovementOverviewPanel === 'function') {
+                window.renderSystemImprovementOverviewPanel(data || {});
+              } else {
+                fallbackSetResultHtml(resultId, '<strong>系统继续完善总览</strong><pre>' + fallbackEscapeHtml(text || '{}') + '</pre>');
+              }
+              return true;
+            }
+            if (aid === 'btnSelfCheck') {
+              if (typeof renderSelfCheckPanel === 'function') {
+                renderSelfCheckPanel(data || {});
+              } else {
+                fallbackSetResultHtml(resultId, '<strong>系统自检</strong><pre>' + fallbackEscapeHtml(text || '{}') + '</pre>');
+              }
+              return true;
+            }
+            if (aid === 'btnDataHygiene') {
+              if (window.renderDataHygienePanel && typeof window.renderDataHygienePanel === 'function') {
+                window.renderDataHygienePanel(data || {});
+              } else {
+                fallbackSetResultHtml(resultId, '<strong>数据卫生巡检</strong><pre>' + fallbackEscapeHtml(text || '{}') + '</pre>');
+              }
+              return true;
+            }
+            if (aid === 'btnEvalSummaryV2') {
+              renderEvaluationAggregateSummaryBlock('evalResult', true, '跨项目汇总评估完成', data || {});
+              renderSystemClosureSummaryPanel(data || {}, { refreshReason: 'manual_eval_summary' });
+              return true;
+            }
+            if (aid === 'btnTrialPreflight') {
+              if (window.renderTrialPreflightPanel && typeof window.renderTrialPreflightPanel === 'function') {
+                window.renderTrialPreflightPanel(data || {});
+              } else {
+                fallbackSetResultHtml(resultId, '<strong>试车前综合体检</strong><pre>' + fallbackEscapeHtml(text || '{}') + '</pre>');
+              }
               return true;
             }
             if (aid === 'btnScoringDiagnostic') {
@@ -25907,9 +35291,8 @@ def index(
             }
             if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState(rows, summary);
             rows.forEach((m) => {
-              const tr = document.createElement('tr');
-              tr.innerHTML = buildMaterialTableRowHtml(m, pid);
-              if (tbody) tbody.appendChild(tr);
+              const tr = createMaterialTableRowElement(m, pid);
+              if (tbody && tr) tbody.appendChild(tr);
             });
             scheduleMaterialParsePolling(pid, summary, null);
           }
@@ -25962,9 +35345,8 @@ def index(
             }
             if (emptyEl) emptyEl.style.display = 'none';
             rows.forEach((s) => {
-              const tr = document.createElement('tr');
-              tr.innerHTML = buildSubmissionTableRowHtml(s, pid, fallbackEscapeHtml);
-              if (tbody) tbody.appendChild(tr);
+              const tr = createSubmissionTableRowElement(s, pid, fallbackEscapeHtml);
+              if (tbody && tr) tbody.appendChild(tr);
             });
             renderSubmissionDualTrackOverview(rows, pid, fallbackEscapeHtml);
             if (window.renderMaterialUtilizationPanel && typeof window.renderMaterialUtilizationPanel === 'function') {
@@ -26000,6 +35382,9 @@ def index(
               if (typeof refreshScoringReadiness === 'function') await Promise.resolve(refreshScoringReadiness(projectId));
               else await fallbackFetchScoringReadiness(projectId);
               if (typeof refreshScoringDiagnostic === 'function') await Promise.resolve(refreshScoringDiagnostic(projectId));
+              if (typeof refreshSystemClosureSummary === 'function') {
+                await Promise.resolve(refreshSystemClosureSummary({ reason: actionId, silent: true }));
+              }
               return;
             }
             if (actionId === 'btnUploadShigong' || actionId === 'btnScoreShigong') {
@@ -26008,6 +35393,9 @@ def index(
               if (typeof refreshScoringReadiness === 'function') await Promise.resolve(refreshScoringReadiness(projectId));
               else await fallbackFetchScoringReadiness(projectId);
               if (typeof refreshScoringDiagnostic === 'function') await Promise.resolve(refreshScoringDiagnostic(projectId));
+              if (typeof refreshSystemClosureSummary === 'function') {
+                await Promise.resolve(refreshSystemClosureSummary({ reason: actionId, silent: true }));
+              }
               return;
             }
             if (actionId === 'btnUploadFeed') {
@@ -26025,6 +35413,9 @@ def index(
             }
             if (actionId === 'btnAddGroundTruth' || actionId === 'btnRefreshGroundTruth') {
               if (typeof refreshGroundTruth === 'function') await Promise.resolve(refreshGroundTruth(projectId));
+              if (typeof refreshSystemClosureSummary === 'function') {
+                await Promise.resolve(refreshSystemClosureSummary({ reason: actionId, silent: true }));
+              }
               return;
             }
             if (actionId === 'btnRefreshGroundTruthSubmissionOptions') {
@@ -26035,6 +35426,9 @@ def index(
             }
             if (actionId === 'btnEvolve') {
               if (typeof refreshGroundTruth === 'function') await Promise.resolve(refreshGroundTruth(projectId));
+              if (typeof refreshSystemClosureSummary === 'function') {
+                await Promise.resolve(refreshSystemClosureSummary({ reason: actionId, silent: true }));
+              }
             }
           }
           function fallbackRenderPayloadForAction(actionId, projectId) {
@@ -26043,15 +35437,7 @@ def index(
               return { body: JSON.stringify(payload), headers: fallbackJsonBodyHeaders() };
             }
             if (actionId === 'btnWeightsApply') {
-              const payload = {
-                scoring_engine_version: 'v2',
-                scope: 'project',
-                score_scale_max: selectedScoreScaleMax(),
-                rebuild_anchors: false,
-                rebuild_requirements: false,
-                retrain_calibrator: false,
-                force_unlock: false,
-              };
+              const payload = buildWeightsApplyRequestBody(false);
               return { body: JSON.stringify(payload), headers: fallbackJsonBodyHeaders() };
             }
             if (actionId === 'btnUploadFeed') {
@@ -26125,21 +35511,30 @@ def index(
             }
             return { body: null, headers: fallbackAuthHeaders() };
           }
-          async function fallbackRunAction(actionId) {
-            actionId = String(actionId || '').trim();
-            if (actionId === 'btnWeightsReset') {
-              fallbackApplyWeightUi({});
-              fallbackSetOutput('[btnWeightsReset] 已重置16维关注度到默认值(全部=5)');
-              return true;
-            }
-            const cfg = FALLBACK_ACTIONS[actionId];
-            if (!cfg) return false;
-            const projectId = fallbackGetProjectId();
-            if (!projectId) {
-              fallbackSetResult(cfg.resultId, '请先在「2) 选择项目」中选择项目', true);
-              fallbackSetOutput('[' + actionId + '] 缺少项目ID');
-              return false;
-            }
+        const FALLBACK_PROJECTLESS_ACTION_IDS = new Set([
+          'btnSelfCheck',
+          'btnSystemImprovementOverview',
+          'btnDataHygiene',
+          'btnEvalSummaryV2',
+        ]);
+        function fallbackActionRequiresProject(actionId) {
+          return !FALLBACK_PROJECTLESS_ACTION_IDS.has(String(actionId || '').trim());
+        }
+        async function fallbackRunAction(actionId) {
+          actionId = String(actionId || '').trim();
+          if (actionId === 'btnWeightsReset') {
+            fallbackApplyWeightUi({});
+            fallbackSetOutput('[btnWeightsReset] 已重置16维关注度到默认值(全部=5)');
+            return true;
+          }
+          const cfg = FALLBACK_ACTIONS[actionId];
+          if (!cfg) return false;
+          const projectId = fallbackGetProjectId();
+          if (fallbackActionRequiresProject(actionId) && !projectId) {
+            fallbackSetResult(cfg.resultId, '请先在「2) 选择项目」中选择项目', true);
+            fallbackSetOutput('[' + actionId + '] 缺少项目ID');
+            return false;
+          }
             fallbackSetLoading(cfg.resultId, cfg.loading);
             if (actionId === 'btnWeightsApply') {
               const saved = await fallbackRunAction('btnWeightsSave');
@@ -26228,6 +35623,66 @@ def index(
               fallbackSetOutput('[' + actionId + '] download ' + dlUrl);
               return true;
             }
+            if (actionId === 'btnTrialPreflightDownload') {
+              const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/trial_preflight.md';
+              const a = document.createElement('a');
+              a.href = dlUrl;
+              a.download = 'trial_preflight_' + projectId + '.md';
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              fallbackSetResult(cfg.resultId, '试车前综合体检报告下载已触发。', false);
+              fallbackSetOutput('[' + actionId + '] download ' + dlUrl);
+              return true;
+            }
+            if (actionId === 'btnTrialPreflightDownloadDocx') {
+              const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/trial_preflight.docx';
+              const a = document.createElement('a');
+              a.href = dlUrl;
+              a.download = 'trial_preflight_' + projectId + '.docx';
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              fallbackSetResult(cfg.resultId, '试车前综合体检 DOCX 报告下载已触发。', false);
+              fallbackSetOutput('[' + actionId + '] download ' + dlUrl);
+              return true;
+            }
+            if (actionId === 'btnWritingGuidanceDownload') {
+              const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/writing_guidance.md';
+              const a = document.createElement('a');
+              a.href = dlUrl;
+              a.download = 'writing_guidance_' + projectId + '.md';
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              fallbackSetResult(cfg.resultId, '编制指导 Markdown 下载已触发。', false);
+              fallbackSetOutput('[' + actionId + '] download ' + dlUrl);
+              return true;
+            }
+            if (actionId === 'btnWritingGuidancePatchBundleDownload') {
+              const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/writing_guidance_patch_bundle.md';
+              const a = document.createElement('a');
+              a.href = dlUrl;
+              a.download = 'writing_guidance_patch_bundle_' + projectId + '.md';
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              fallbackSetResult(cfg.resultId, '改写补丁包 Markdown 下载已触发。', false);
+              fallbackSetOutput('[' + actionId + '] download ' + dlUrl);
+              return true;
+            }
+            if (actionId === 'btnWritingGuidancePatchBundleDownloadDocx') {
+              const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/writing_guidance_patch_bundle.docx';
+              const a = document.createElement('a');
+              a.href = dlUrl;
+              a.download = 'writing_guidance_patch_bundle_' + projectId + '.docx';
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              fallbackSetResult(cfg.resultId, '改写补丁包 DOCX 下载已触发。', false);
+              fallbackSetOutput('[' + actionId + '] download ' + dlUrl);
+              return true;
+            }
             if (actionId === 'btnScoreShigong') {
               const readiness = await fallbackFetchScoringReadiness(projectId);
               if (readiness && readiness.ready === false) {
@@ -26284,8 +35739,20 @@ def index(
             }
             if (actionId === 'btnCompareReport') {
               fallbackSetOutput('[' + actionId + '] HTTP ' + String(res.status) + '\\n已渲染满分优化清单（详情已显示在页面，不再输出完整JSON）');
+            } else if ((actionId === 'btnWeightsSave' || actionId === 'btnWeightsApply') && res.ok) {
+              try {
+                const parsed = JSON.parse(text || '{}');
+                const summary = actionId === 'btnWeightsSave'
+                  ? buildExpertProfileSaveOutputSummary(parsed)
+                  : buildWeightsApplyOutputSummary(parsed);
+                fallbackSetOutput(buildCompactOutputLines(summary).join('\\n'));
+              } catch (_) {
+                fallbackSetOutput('[' + actionId + '] 请求成功 (HTTP ' + String(res.status) + ')');
+              }
             } else {
-              fallbackSetOutput('[' + actionId + '] HTTP ' + String(res.status) + '\\n' + String(text || ''));
+              let compactText = detail || String(text || '');
+              compactText = summarizeOutputScalar(compactText, 240);
+              fallbackSetOutput('[' + actionId + '] HTTP ' + String(res.status) + (compactText ? ('\\n' + compactText) : ''));
             }
             return !!res.ok;
           }
@@ -26368,6 +35835,13 @@ def index(
           const out = document.getElementById('output');
           if (out) out.textContent = msg;
         }
+        function surfaceActionStatus(actionId, msg, isError=false) {
+          const action = String(actionId || '').trim();
+          if (!action) return;
+          if (action === 'btnWeightsSave' || action === 'btnWeightsApply') {
+            setExpertProfileStatus(msg, !!isError);
+          }
+        }
         window.addEventListener('error', function (e) {
           reportClientError('前端脚本错误', e && (e.error || e.message || e));
         });
@@ -26375,13 +35849,18 @@ def index(
           reportClientError('前端异步错误', e && (e.reason || e));
         });
         const SAFE_CLICK_HANDLERS = {};
+        function secureDesktopEnabled() {
+          return window.__ZHIFEI_SECURE_DESKTOP === true;
+        }
         const AUTH_PROTECTED_ACTION_IDS = new Set([
           'btnWeightsSave', 'btnWeightsApply', 'btnCleanupE2EProjects',
           'btnMaterialDepthReport', 'btnMaterialDepthReportDownload',
           'btnMaterialKnowledgeProfile', 'btnMaterialKnowledgeProfileDownload',
+          'btnTrialPreflightDownload', 'btnTrialPreflightDownloadDocx',
+          'btnWritingGuidanceDownload', 'btnWritingGuidancePatchBundleDownload', 'btnWritingGuidancePatchBundleDownloadDocx',
           'btnScoringDiagnostic', 'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions',
           'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
-          'btnEvolve', 'btnEvolutionHealth', 'btnFeedbackGovernance',
+          'btnEvolve', 'btnEvolutionHealth', 'btnTrialPreflight', 'btnFeedbackGovernance',
           'btnWritingGuidance', 'btnCompilationInstructions',
           'btnRebuildDelta', 'btnRebuildSamples', 'btnTrainCalibratorV2',
           'btnApplyCalibPredict', 'btnAutoRunReflection', 'btnEvalMetricsV2',
@@ -26393,12 +35872,15 @@ def index(
           if (!el) return;
           const wrapped = async (ev) => {
             if (ev) ev.preventDefault();
+            if (buttonBusy(el)) return;
+            setButtonBusyState(el, true);
             try {
               if (
                 AUTH_PROTECTED_ACTION_IDS.has(id)
                 && !(await ensureVerifiedApiKeyForAction(id, (msg) => {
                   const cfg = (window.__ZHIFEI_FALLBACK_ACTIONS && window.__ZHIFEI_FALLBACK_ACTIONS[id]) || {};
                   if (cfg.resultId && typeof setResultError === 'function') setResultError(cfg.resultId, msg);
+                  surfaceActionStatus(id, msg, true);
                 }))
               ) {
                 return;
@@ -26410,7 +35892,10 @@ def index(
               if (cfg.resultId && typeof setResultError === 'function') {
                 setResultError(cfg.resultId, msg);
               }
+              surfaceActionStatus(id, msg, true);
               reportClientError('按钮[' + id + ']执行失败', err);
+            } finally {
+              setButtonBusyState(el, false);
             }
           };
           if (SAFE_CLICK_HANDLERS[id]) {
@@ -26424,6 +35909,64 @@ def index(
           if (!el.style.position) el.style.position = 'relative';
           if (!el.style.zIndex || Number(el.style.zIndex) < 2) el.style.zIndex = '2';
         }
+        function safeClick0(id, fn) {
+          return safeClick(id, () => fn());
+        }
+        function buttonBusy(target) {
+          const el = typeof target === 'string' ? document.getElementById(target) : target;
+          if (!el || !el.dataset) return false;
+          return Number(el.dataset.busyCount || 0) > 0;
+        }
+        function setButtonBusyState(target, busy, options=null) {
+          const el = typeof target === 'string' ? document.getElementById(target) : target;
+          if (!el || !el.dataset) return;
+          const opts = (options && typeof options === 'object') ? options : {};
+          const currentCount = Math.max(0, Number(el.dataset.busyCount || 0));
+          const defaultLabel = String(
+            opts.defaultLabel
+            || el.dataset.originalLabel
+            || el.textContent
+            || el.dataset.defaultLabel
+            || ''
+          ).trim();
+          const loadingLabel = String(
+            opts.loadingLabel
+            || el.dataset.loadingLabel
+            || (defaultLabel ? (defaultLabel + '…') : '处理中...')
+          ).trim();
+          if (busy) {
+            if (currentCount <= 0) {
+              if (defaultLabel) {
+                el.dataset.defaultLabel = defaultLabel;
+                el.dataset.originalLabel = defaultLabel;
+              }
+              el.dataset.busyPrevDisabled = el.disabled ? '1' : '0';
+              el.disabled = true;
+              el.setAttribute('aria-busy', 'true');
+              el.classList.add('button-busy');
+              if (loadingLabel) el.textContent = loadingLabel;
+            }
+            el.dataset.busyCount = String(currentCount + 1);
+            return;
+          }
+          if (currentCount <= 1) {
+            delete el.dataset.busyCount;
+            el.disabled = el.dataset.busyPrevDisabled === '1';
+            delete el.dataset.busyPrevDisabled;
+            el.removeAttribute('aria-busy');
+            el.classList.remove('button-busy');
+            const restoreLabel = String(
+              opts.restoreLabel
+              || el.dataset.defaultLabel
+              || el.dataset.originalLabel
+              || defaultLabel
+              || ''
+            ).trim();
+            if (restoreLabel) el.textContent = restoreLabel;
+            return;
+          }
+          el.dataset.busyCount = String(currentCount - 1);
+        }
         // 兼容旧版内联 onclick：若已绑定 safeClick，则不再走旧兜底逻辑，避免覆盖详细渲染结果。
         const LEGACY_FALLBACK_CLICK = window.__zhifeiFallbackClick;
         window.__zhifeiFallbackClick = function (ev, actionId) {
@@ -26435,6 +35978,7 @@ def index(
           return true;
         };
         function safeChange(id, fn) { const el = document.getElementById(id); if (el) el.onchange = fn; }
+        function safeChange0(id, fn) { return safeChange(id, () => fn()); }
         function storageGet(key) {
           try { return localStorage.getItem(key) || ''; } catch (_) { return ''; }
         }
@@ -26661,6 +36205,16 @@ def index(
           } catch (_) {}
           return '';
         }
+        function syncProjectSelectionUrl(projectId='') {
+          try {
+            const url = new URL(window.location.href);
+            const normalized = String(projectId || '').trim();
+            if (normalized) url.searchParams.set('project_id', normalized);
+            else url.searchParams.delete('project_id');
+            const nextUrl = url.pathname + url.search + url.hash;
+            window.history.replaceState(null, '', nextUrl);
+          } catch (_) {}
+        }
         function selectedScoreScaleMax() {
           const el = document.getElementById('scoreScaleSelect');
           const raw = (el && el.value) ? String(el.value).trim() : '100';
@@ -26689,6 +36243,18 @@ def index(
         let groundTruthDraftCommitState = { project_id: '', signature: '' };
         function resetGroundTruthDraftCommitState() {
           groundTruthDraftCommitState = { project_id: '', signature: '' };
+        }
+        function clearGroundTruthDraftForm() {
+          const submissionSelect = document.getElementById('groundTruthSubmissionSelect');
+          if (submissionSelect) submissionSelect.value = '';
+          for (let i = 1; i <= 7; i += 1) {
+            const input = document.getElementById('gtJ' + String(i));
+            if (input) input.value = '';
+          }
+          const finalInput = document.getElementById('gtFinal');
+          if (finalInput) finalInput.value = '';
+          resetGroundTruthDraftCommitState();
+          applyGroundTruthFinalScoreAutoFill();
         }
         function groundTruthDraftSignature(submissionId, judgeScores, finalScore) {
           const scoresKey = (Array.isArray(judgeScores) ? judgeScores : [])
@@ -26916,26 +36482,31 @@ def index(
         };
         const DIM_IDS = Array.from({ length: 16 }, (_, i) => String(i + 1).padStart(2, '0'));
         let expertProfileLocked = false;
+        let expertProfileRescoreInFlight = false;
         let projectMetaById = {};
         let scoringReadinessState = { project_id: '', ready: false, gate_passed: false, issues: [] };
+        let scoringReadinessPanelState = null;
+        let systemClosureSummaryState = null;
+        let materialParseSummaryState = { summary: null, materials: [] };
         const PROJECT_REQUIRED_BUTTON_IDS = [
           'deleteCurrentProject', 'btnWeightsReset', 'btnWeightsSave', 'btnWeightsApply',
           'btnMaterialDepthReport', 'btnMaterialDepthReportDownload', 'btnMaterialKnowledgeProfile', 'btnMaterialKnowledgeProfileDownload',
-          'btnScoringDiagnostic', 'btnOptimizationReport',
+          'btnTrialPreflightDownload', 'btnTrialPreflightDownloadDocx', 'btnScoringDiagnostic', 'btnOptimizationReport',
           'btnRenameProject',
           'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
-          'btnEvolve', 'btnEvolutionHealth', 'btnFeedbackGovernance', 'btnWritingGuidance', 'btnCompilationInstructions',
+          'btnEvolve', 'btnEvolutionHealth', 'btnTrialPreflight', 'btnFeedbackGovernance', 'btnWritingGuidance', 'btnWritingGuidanceDownload', 'btnWritingGuidancePatchBundleDownload', 'btnWritingGuidancePatchBundleDownloadDocx', 'btnCompilationInstructions',
           'btnRebuildDelta', 'btnRebuildSamples', 'btnTrainCalibratorV2', 'btnApplyCalibPredict',
           'btnAutoRunReflection', 'btnEvalMetricsV2', 'btnEvalSummaryV2',
           'btnMinePatchV2', 'btnShadowPatchV2', 'btnDeployPatchV2', 'btnRollbackPatchV2',
         ];
         const NON_BLOCKING_ACTION_BUTTON_IDS = [
           'btnUploadMaterials', 'btnUploadBoq', 'btnUploadDrawing', 'btnUploadSitePhotos', 'btnRefreshMaterials', 'btnMaterialDepthReport', 'btnMaterialDepthReportDownload', 'btnMaterialKnowledgeProfile', 'btnMaterialKnowledgeProfileDownload', 'btnUploadShigong', 'btnScoreShigong', 'btnScoringDiagnostic', 'btnRefreshSubmissions',
+          'btnTrialPreflightDownload', 'btnTrialPreflightDownloadDocx', 'btnWritingGuidanceDownload', 'btnWritingGuidancePatchBundleDownload', 'btnWritingGuidancePatchBundleDownloadDocx',
           'btnOptimizationReport', 'btnCompare', 'btnCompareReport', 'btnInsights', 'btnLearning',
           'btnEvidenceTrace', 'btnScoringBasis',
           'btnAdaptive', 'btnAdaptivePatch', 'btnAdaptiveValidate', 'btnAdaptiveApply',
           'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
-          'btnEvolve', 'btnEvolutionHealth', 'btnFeedbackGovernance', 'btnWritingGuidance', 'btnCompilationInstructions',
+          'btnEvolve', 'btnEvolutionHealth', 'btnSelfCheck', 'btnSystemImprovementOverview', 'btnDataHygiene', 'btnEvalSummaryV2', 'btnTrialPreflight', 'btnFeedbackGovernance', 'btnWritingGuidance', 'btnWritingGuidanceDownload', 'btnWritingGuidancePatchBundleDownload', 'btnWritingGuidancePatchBundleDownloadDocx', 'btnCompilationInstructions',
           'btnRebuildDelta', 'btnRebuildSamples', 'btnTrainCalibratorV2', 'btnApplyCalibPredict',
           'btnAutoRunReflection', 'btnEvalMetricsV2', 'btnEvalSummaryV2',
           'btnMinePatchV2', 'btnShadowPatchV2', 'btnDeployPatchV2', 'btnRollbackPatchV2',
@@ -26951,6 +36522,8 @@ def index(
           if (!el) return;
           el.textContent = msg || '';
           el.style.color = isError ? '#b91c1c' : '#475569';
+          clearSystemClosureActionHint(id);
+          clearActionScopedClosureZoneHint(id);
         }
         function syncProjectHiddenInputs(projectId) {
           const value = projectId || '';
@@ -27032,6 +36605,26 @@ def index(
           if (select.value === 'all') storageRemove('project_month_filter');
           else storageSet('project_month_filter', select.value);
           return String(select.value || 'all');
+        }
+        function syncProjectMonthFilterToPreferredProject(projects, preferredProjectId='') {
+          const preferredId = String(preferredProjectId || '').trim();
+          if (!preferredId) return;
+          const rows = Array.isArray(projects) ? projects : [];
+          const target = rows.find(
+            (project) => String((project && project.id) || '').trim() === preferredId
+          );
+          if (!target || projectIsSystemGenerated(target)) return;
+          const monthKey = projectMonthKey(target);
+          if (!monthKey) return;
+          const select = document.getElementById('projectMonthFilter');
+          if (!select) {
+            storageSet('project_month_filter', monthKey);
+            return;
+          }
+          const currentValue = String(select.value || '').trim();
+          if (currentValue === 'all' || currentValue === monthKey) return;
+          select.value = monthKey;
+          storageSet('project_month_filter', monthKey);
         }
         function buildProjectPickerView(projects) {
           const rows = Array.isArray(projects) ? projects : [];
@@ -27168,6 +36761,7 @@ def index(
           }
           await onProjectChanged();
           setSelectMsg('已定位到项目：' + projectDisplayName(matched), false);
+          renderProjectSelectionClosureHint(systemClosureSummaryState, String(matched.id || ''));
         }
 
         function updateProjectBoundControlsState() {
@@ -27211,8 +36805,13 @@ def index(
         let projectSwitchSeq = 0;
         let materialParsePollTimer = null;
         let projectAutoRefreshTimer = null;
+        let projectAutoRefreshDueAtMs = 0;
+        let projectVisibilityHiddenAtMs = 0;
         let cachedProjectSubmissions = {};
+        let projectRefreshInflight = new Map();
         const PROJECT_AUTO_REFRESH_INTERVAL_MS = 5000;
+        const PROJECT_AUTO_REFRESH_WARM_INTERVAL_MS = 10000;
+        const PROJECT_AUTO_REFRESH_STABLE_HOT_INTERVAL_MS = 15000;
         function selectedProjectIdStrict() {
           const sel = document.getElementById('projectSelect');
           return (sel && sel.value) ? String(sel.value) : '';
@@ -27228,16 +36827,127 @@ def index(
             materialParsePollTimer = null;
           }
         }
-        function clearProjectAutoRefresh() {
+        function clearProjectAutoRefresh(resetDueAt=true) {
           if (projectAutoRefreshTimer) {
             clearTimeout(projectAutoRefreshTimer);
             projectAutoRefreshTimer = null;
           }
+          if (resetDueAt !== false) {
+            projectAutoRefreshDueAtMs = 0;
+          }
         }
-        function scheduleProjectAutoRefresh(projectId, switchSeq) {
-          clearProjectAutoRefresh();
+        function currentProjectAutoRefreshInterval(projectId='') {
+          const normalizedProjectId = String(projectId || '').trim();
+          if (!normalizedProjectId) return 0;
+          if (document.visibilityState === 'hidden') return 0;
+          const summary = (
+            materialParseSummaryState
+            && typeof materialParseSummaryState === 'object'
+            && materialParseSummaryState.summary
+            && typeof materialParseSummaryState.summary === 'object'
+          ) ? materialParseSummaryState.summary : {};
+          const summaryProjectId = String(summary.project_id || '').trim();
+          const summaryMatchesProject = !summaryProjectId || summaryProjectId === normalizedProjectId;
+          const processing = summaryMatchesProject ? Number(summary.processing_materials || 0) : 0;
+          const queued = summaryMatchesProject ? Number(summary.queued_materials || 0) : 0;
+          const backlog = summaryMatchesProject
+            ? Number(summary.backlog || (processing + queued) || 0)
+            : 0;
+          const failed = summaryMatchesProject ? Number(summary.failed_materials || 0) : 0;
+          if ((backlog + processing + queued + failed) > 0) {
+            return PROJECT_AUTO_REFRESH_INTERVAL_MS;
+          }
+          const readiness = (
+            scoringReadinessPanelState
+            && typeof scoringReadinessPanelState === 'object'
+          ) ? scoringReadinessPanelState : {};
+          const readinessProjectId = String(readiness.project_id || '').trim();
+          if (readinessProjectId && readinessProjectId === normalizedProjectId) {
+            if (readiness.ready === false || readiness.gate_passed === false) {
+              return PROJECT_AUTO_REFRESH_INTERVAL_MS;
+            }
+          } else {
+            return PROJECT_AUTO_REFRESH_INTERVAL_MS;
+          }
+          const schedulerProjectRecentWindowState = summaryMatchesProject
+            ? String(summary.scheduler_project_recent_window_state || '').trim()
+            : '';
+          const schedulerProjectRecentStableHot = summaryMatchesProject
+            ? Boolean(summary.scheduler_project_recent_stable_hot)
+            : false;
+          const schedulerProjectCacheState = summaryMatchesProject
+            ? String(summary.scheduler_project_cache_state || '').trim()
+            : '';
+          if (schedulerProjectRecentStableHot || schedulerProjectRecentWindowState === 'stable_hot') {
+            return PROJECT_AUTO_REFRESH_STABLE_HOT_INTERVAL_MS;
+          }
+          if (
+            schedulerProjectRecentWindowState === 'steady'
+            || schedulerProjectRecentWindowState === 'warming'
+            || schedulerProjectCacheState === 'warm'
+          ) {
+            return PROJECT_AUTO_REFRESH_WARM_INTERVAL_MS;
+          }
+          return PROJECT_AUTO_REFRESH_INTERVAL_MS;
+        }
+        function projectRefreshInflightKey(kind, projectId) {
+          return String(kind || '') + '::' + String(projectId || '');
+        }
+        function clearProjectRefreshInflight(projectId='') {
+          const targetProjectId = String(projectId || '').trim();
+          if (!targetProjectId) {
+            projectRefreshInflight = new Map();
+            return;
+          }
+          Array.from(projectRefreshInflight.keys()).forEach((key) => {
+            if (String(key || '').endsWith('::' + targetProjectId)) {
+              projectRefreshInflight.delete(key);
+            }
+          });
+        }
+        function runProjectRefreshTask(kind, projectId, runner) {
+          const projectKey = String(projectId || '').trim();
+          if (!projectKey || typeof runner !== 'function') {
+            return Promise.resolve().then(() => {
+              if (typeof runner === 'function') return runner();
+              return null;
+            });
+          }
+          const taskKey = projectRefreshInflightKey(kind, projectKey);
+          const existing = projectRefreshInflight.get(taskKey);
+          if (existing && existing.tail) {
+            existing.pending = true;
+            existing.runner = runner;
+            return existing.tail;
+          }
+          const state = {
+            pending: false,
+            runner: runner,
+            tail: null,
+          };
+          const executeLoop = async () => {
+            let result = null;
+            do {
+              state.pending = false;
+              result = await Promise.resolve().then(() => state.runner());
+            } while (state.pending);
+            return result;
+          };
+          state.tail = executeLoop().finally(() => {
+            const current = projectRefreshInflight.get(taskKey);
+            if (current === state) projectRefreshInflight.delete(taskKey);
+          });
+          projectRefreshInflight.set(taskKey, state);
+          return state.tail;
+        }
+        function scheduleProjectAutoRefresh(projectId, switchSeq, options=null) {
+          clearProjectAutoRefresh(false);
           if (!projectId || isStaleProjectResponse(projectId, switchSeq)) return;
-          if (document.visibilityState === 'hidden') return;
+          const opts = (options && typeof options === 'object') ? options : {};
+          const overrideDelayMs = Number(opts.delayMs || 0);
+          const delayMs = overrideDelayMs > 0 ? overrideDelayMs : currentProjectAutoRefreshInterval(projectId);
+          if (delayMs <= 0) return;
+          projectAutoRefreshDueAtMs = Date.now() + delayMs;
           projectAutoRefreshTimer = setTimeout(async () => {
             if (document.visibilityState === 'hidden') {
               scheduleProjectAutoRefresh(projectId, switchSeq);
@@ -27245,15 +36955,16 @@ def index(
             }
             if (isStaleProjectResponse(projectId, switchSeq)) return;
             try {
-              if (typeof refreshMaterials === 'function') await refreshMaterials(projectId, switchSeq);
-              if (typeof refreshSubmissions === 'function') await refreshSubmissions(projectId, switchSeq);
+              if (typeof refreshMaterials === 'function') await refreshMaterials(projectId, switchSeq, { skipReadinessRefresh: true });
+              if (typeof refreshSubmissions === 'function') await refreshSubmissions(projectId, switchSeq, { skipReadinessRefresh: true });
               if (typeof refreshScoringDiagnostic === 'function') await refreshScoringDiagnostic(projectId, switchSeq);
+              if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(projectId, switchSeq);
             } finally {
               if (!isStaleProjectResponse(projectId, switchSeq)) {
                 scheduleProjectAutoRefresh(projectId, switchSeq);
               }
             }
-          }, PROJECT_AUTO_REFRESH_INTERVAL_MS);
+          }, delayMs);
         }
         function materialParseBackendLabel(backend) {
           const raw = String(backend || '').trim();
@@ -27278,26 +36989,131 @@ def index(
         function renderMaterialParseSummary(summary, materials) {
           const meta = (summary && typeof summary === 'object') ? summary : {};
           const rows = Array.isArray(materials) ? materials : [];
+          materialParseSummaryState = { summary: meta, materials: rows };
           const total = Number(meta.materials_total || rows.length || 0);
           const parsed = Number(meta.parsed_materials || 0);
+          const previewed = Number(meta.previewed_materials || 0);
           const processing = Number(meta.processing_materials || 0);
           const queued = Number(meta.queued_materials || 0);
           const failed = Number(meta.failed_materials || 0);
           const backlog = Number(meta.backlog || (processing + queued) || 0);
           const workerCount = Number(meta.worker_count || 0);
           const aliveWorkerCount = Number(meta.alive_worker_count || 0);
+          const boqGuidedFull = Number(meta.boq_guided_full_materials || 0);
+          const boqGuidedFullStrong = Number(meta.boq_guided_full_strong_materials || 0);
+          const boqResumedFull = Number(meta.boq_resumed_full_materials || 0);
+          const boqResumedSheets = Number(meta.boq_resumed_sheet_count || 0);
+          const boqSavedRows = Number(meta.boq_saved_row_count || 0);
+          const boqSkippedTailSheets = Number(meta.boq_skipped_tail_sheets || 0);
+          const boqResumeHitRate = Number(meta.boq_resume_hit_rate || 0);
+          const schedulerProjectHits = Number(meta.scheduler_project_continuity_bonus_hits || 0);
+          const schedulerFollowupHits = Number(meta.scheduler_followup_full_bonus_hits || 0);
+          const schedulerSameMaterialHits = Number(meta.scheduler_same_material_followup_bonus_hits || 0);
+          const schedulerActiveProjectHits = Number(meta.scheduler_active_project_bonus_hits || 0);
+          const schedulerActiveProjectTypeHits = Number(meta.scheduler_active_project_type_bonus_hits || 0);
+          const schedulerClaimSnapshotCacheHits = Number(meta.scheduler_claim_snapshot_cache_hits || 0);
+          const schedulerClaimSnapshotCacheRebuilds = Number(meta.scheduler_claim_snapshot_cache_rebuilds || 0);
+          const schedulerClaimContextCacheHits = Number(meta.scheduler_claim_context_cache_hits || 0);
+          const schedulerClaimContextCacheRebuilds = Number(meta.scheduler_claim_context_cache_rebuilds || 0);
+          const schedulerProjectStageCacheHits = Number(meta.scheduler_project_stage_cache_hits || 0);
+          const schedulerProjectStageCacheRebuilds = Number(meta.scheduler_project_stage_cache_rebuilds || 0);
+          const schedulerPriorityContextCacheHits = Number(meta.scheduler_priority_context_cache_hits || 0);
+          const schedulerPriorityContextCacheRebuilds = Number(meta.scheduler_priority_context_cache_rebuilds || 0);
+          const schedulerJobsSummaryCacheHits = Number(meta.scheduler_jobs_summary_cache_hits || 0);
+          const schedulerJobsSummaryCacheRebuilds = Number(meta.scheduler_jobs_summary_cache_rebuilds || 0);
+          const schedulerStatusMaterialsCacheHits = Number(meta.scheduler_status_materials_cache_hits || 0);
+          const schedulerStatusMaterialsCacheRebuilds = Number(meta.scheduler_status_materials_cache_rebuilds || 0);
+          const schedulerStatusCoreCacheHits = Number(meta.scheduler_status_core_cache_hits || 0);
+          const schedulerStatusCoreCacheRebuilds = Number(meta.scheduler_status_core_cache_rebuilds || 0);
+          const schedulerCacheHitTotal = Number(meta.scheduler_cache_hit_total || 0);
+          const schedulerCacheRebuildTotal = Number(meta.scheduler_cache_rebuild_total || 0);
+          const schedulerCacheHitRatio = Number(meta.scheduler_cache_hit_ratio || 0);
+          const schedulerProjectJobsSummaryCacheHits = Number(meta.scheduler_project_jobs_summary_cache_hits || 0);
+          const schedulerProjectJobsSummaryCacheRebuilds = Number(meta.scheduler_project_jobs_summary_cache_rebuilds || 0);
+          const schedulerProjectJobsSummaryCacheState = String(meta.scheduler_project_jobs_summary_cache_state || '').trim();
+          const schedulerProjectStatusMaterialsCacheHits = Number(meta.scheduler_project_status_materials_cache_hits || 0);
+          const schedulerProjectStatusMaterialsCacheRebuilds = Number(meta.scheduler_project_status_materials_cache_rebuilds || 0);
+          const schedulerProjectStatusMaterialsCacheState = String(meta.scheduler_project_status_materials_cache_state || '').trim();
+          const schedulerProjectStatusCoreCacheHits = Number(meta.scheduler_project_status_core_cache_hits || 0);
+          const schedulerProjectStatusCoreCacheRebuilds = Number(meta.scheduler_project_status_core_cache_rebuilds || 0);
+          const schedulerProjectStatusCoreCacheState = String(meta.scheduler_project_status_core_cache_state || '').trim();
+          const schedulerProjectCacheHitTotal = Number(meta.scheduler_project_cache_hit_total || 0);
+          const schedulerProjectCacheRebuildTotal = Number(meta.scheduler_project_cache_rebuild_total || 0);
+          const schedulerProjectCacheHitRatio = Number(meta.scheduler_project_cache_hit_ratio || 0);
+          const schedulerProjectCacheNetSavings = Number(meta.scheduler_project_cache_net_savings || 0);
+          const schedulerProjectCacheState = String(meta.scheduler_project_cache_state || '').trim();
+          const schedulerProjectCacheHotLayerCount = Number(meta.scheduler_project_cache_hot_layer_count || 0);
+          const schedulerProjectCacheWarmingLayerCount = Number(meta.scheduler_project_cache_warming_layer_count || 0);
+          const schedulerProjectCacheColdLayerCount = Number(meta.scheduler_project_cache_cold_layer_count || 0);
+          const schedulerProjectRecentAvoidedRebuildLayers = Array.isArray(meta.scheduler_project_recent_avoided_rebuild_layers)
+            ? meta.scheduler_project_recent_avoided_rebuild_layers.map((value) => String(value || '').trim()).filter(Boolean)
+            : [];
+          const schedulerProjectRecentRebuiltLayers = Array.isArray(meta.scheduler_project_recent_rebuilt_layers)
+            ? meta.scheduler_project_recent_rebuilt_layers.map((value) => String(value || '').trim()).filter(Boolean)
+            : [];
+          const schedulerProjectRecentRequestWindowSize = Number(meta.scheduler_project_recent_request_window_size || 0);
+          const schedulerProjectRecentColdStartRoundCount = Number(meta.scheduler_project_recent_cold_start_round_count || 0);
+          const schedulerProjectRecentWarmingRoundCount = Number(meta.scheduler_project_recent_warming_round_count || 0);
+          const schedulerProjectRecentSteadyRoundCount = Number(meta.scheduler_project_recent_steady_round_count || 0);
+          const schedulerProjectRecentConsecutiveSteadyRoundCount = Number(meta.scheduler_project_recent_consecutive_steady_round_count || 0);
+          const schedulerProjectRecentStableHotThreshold = Number(meta.scheduler_project_recent_stable_hot_threshold || 0);
+          const schedulerProjectRecentStableHot = Boolean(meta.scheduler_project_recent_stable_hot);
+          const schedulerProjectRecentStableHotRemainingRounds = Number(meta.scheduler_project_recent_stable_hot_remaining_rounds || 0);
+          const schedulerProjectRecentStableHotProgressCompletedRounds = Number(meta.scheduler_project_recent_stable_hot_progress_completed_rounds || 0);
+          const schedulerProjectRecentStableHotProgressLabel = String(meta.scheduler_project_recent_stable_hot_progress_label || '').trim();
+          const schedulerProjectRecentStableHotProgressRatio = Number(meta.scheduler_project_recent_stable_hot_progress_ratio || 0);
+          const schedulerProjectRecentStableHotProgressPercent = Number(meta.scheduler_project_recent_stable_hot_progress_percent || 0);
+          const schedulerProjectRecentStableHotProgressPercentLabel = String(meta.scheduler_project_recent_stable_hot_progress_percent_label || '').trim();
+          const schedulerProjectRecentStableHotEtaHint = String(meta.scheduler_project_recent_stable_hot_eta_hint || '').trim();
+          const schedulerProjectRecentStableHotEtaShortLabel = String(meta.scheduler_project_recent_stable_hot_eta_short_label || '').trim();
+          const schedulerProjectRecentStableHotProgressSummaryLabel = String(meta.scheduler_project_recent_stable_hot_progress_summary_label || '').trim();
+          const schedulerProjectRecentStableHotBadgeLabel = String(meta.scheduler_project_recent_stable_hot_badge_label || '').trim();
+          const schedulerProjectRecentStableHotRuleLabel = String(meta.scheduler_project_recent_stable_hot_rule_label || '').trim();
+          const schedulerProjectRecentWindowState = String(meta.scheduler_project_recent_window_state || '').trim();
+          const schedulerProjectRecentAvoidedRebuildWorkUnits = Number(meta.scheduler_project_recent_avoided_rebuild_work_units || 0);
+          const schedulerProjectRecentRebuiltWorkUnits = Number(meta.scheduler_project_recent_rebuilt_work_units || 0);
+          const schedulerProjectRecentAvoidedRebuildWorkUnitsAvg = Number(meta.scheduler_project_recent_avoided_rebuild_work_units_avg || 0);
+          const schedulerProjectRecentRebuiltWorkUnitsAvg = Number(meta.scheduler_project_recent_rebuilt_work_units_avg || 0);
+          const schedulerProjectRecentNetSavedWorkUnitsAvg = Number(meta.scheduler_project_recent_net_saved_work_units_avg || 0);
+          const schedulerActiveProjectQuotaExhausted = Number(meta.scheduler_active_project_quota_exhausted_count || 0);
+          const schedulerActiveProjectTypeQuotaExhausted = Number(meta.scheduler_active_project_type_quota_exhausted_count || 0);
           const latestFinishedAt = formatMaterialParseTimestamp(meta.latest_finished_at);
           const latestFinishedFilename = String(meta.latest_finished_filename || '').trim();
+          function projectCacheLayerLabel(layerKey) {
+            if (layerKey === 'jobs_summary') return '作业汇总';
+            if (layerKey === 'status_materials') return '资料状态';
+            if (layerKey === 'status_core') return '状态核心';
+            return String(layerKey || '').trim();
+          }
+          function formatProjectCacheWorkUnits(value) {
+            const numeric = Number(value || 0);
+            return String(Math.round(numeric * 10) / 10);
+          }
           const activeRoutes = [];
           rows.forEach((row) => {
             if (!row || typeof row !== 'object') return;
             const status = String(row.parse_effective_status || row.parse_status || 'queued').trim().toLowerCase();
-            if (status !== 'queued' && status !== 'processing') return;
+            if (status !== 'queued' && status !== 'processing' && status !== 'previewed') return;
             const routeLabel = String(row.parse_route_label || '').trim();
             if (routeLabel && !activeRoutes.includes(routeLabel)) activeRoutes.push(routeLabel);
           });
+          const closureStageText = buildProjectClosureStageInlineText(
+            systemClosureSummaryState,
+            pid()
+          );
           if (!total) {
-            setMaterialParseSummary('当前解析概览：暂无资料。');
+            let emptyText = '当前解析概览：暂无资料。';
+            if (closureStageText) {
+              emptyText += ' 系统封关阶段：' + closureStageText + '。';
+            }
+            setMaterialParseSummary(emptyText);
+            renderProjectClosureZoneHint(
+              'materials',
+              'materialsParseSummary',
+              'materialsClosureHint',
+              systemClosureSummaryState,
+              pid()
+            );
             return;
           }
           let tone = '#166534';
@@ -27311,6 +37127,9 @@ def index(
             '排队 ' + String(queued) + ' 份',
             '失败 ' + String(failed) + ' 份',
           ];
+          if (previewed > 0) {
+            parts.splice(2, 0, '预解析完成 ' + String(previewed) + ' 份');
+          }
           if (workerCount > 0) {
             parts.push('worker ' + String(aliveWorkerCount) + '/' + String(workerCount));
           }
@@ -27326,7 +37145,325 @@ def index(
           if (activeRoutes.length) {
             summaryText += ' 当前路径：' + activeRoutes.slice(0, 2).join('、') + '。';
           }
+          if (boqGuidedFull > 0 || boqSavedRows > 0 || boqSkippedTailSheets > 0) {
+            const boqParts = [];
+            if (boqGuidedFull > 0) {
+              boqParts.push('预解析引导补全 ' + String(boqGuidedFull) + ' 份');
+            }
+            if (boqGuidedFullStrong > 0) {
+              boqParts.push('强引导 ' + String(boqGuidedFullStrong) + ' 份');
+            }
+            if (boqResumedFull > 0) {
+              boqParts.push('差量续跑 ' + String(boqResumedFull) + ' 份');
+            }
+            if (boqResumedSheets > 0) {
+              boqParts.push('续跑 sheet ' + String(boqResumedSheets) + ' 张');
+            }
+            if (boqSavedRows > 0) {
+              boqParts.push('少扫 ' + String(boqSavedRows) + ' 行');
+            }
+            if (boqSkippedTailSheets > 0) {
+              boqParts.push('尾部略过 ' + String(boqSkippedTailSheets) + ' 张 sheet');
+            }
+            if (boqGuidedFull > 0 && boqResumedFull > 0) {
+              boqParts.push('差量命中率 ' + String(Math.round(boqResumeHitRate * 100)) + '%');
+            }
+            if (boqParts.length) {
+              summaryText += ' BOQ 提速：' + boqParts.join('，') + '。';
+            }
+          }
+          if (
+            schedulerProjectHits > 0
+            || schedulerFollowupHits > 0
+            || schedulerSameMaterialHits > 0
+            || schedulerActiveProjectHits > 0
+            || schedulerActiveProjectTypeHits > 0
+            || schedulerActiveProjectQuotaExhausted > 0
+            || schedulerActiveProjectTypeQuotaExhausted > 0
+          ) {
+            const schedulerParts = [];
+            if (schedulerActiveProjectHits > 0) {
+              schedulerParts.push('活跃项目命中 ' + String(schedulerActiveProjectHits) + ' 次');
+            }
+            if (schedulerActiveProjectTypeHits > 0) {
+              schedulerParts.push('活跃类型命中 ' + String(schedulerActiveProjectTypeHits) + ' 次');
+            }
+            if (schedulerProjectHits > 0) {
+              schedulerParts.push('同项目接力 ' + String(schedulerProjectHits) + ' 次');
+            }
+            if (schedulerFollowupHits > 0) {
+              schedulerParts.push('follow-up full 接力 ' + String(schedulerFollowupHits) + ' 次');
+            }
+            if (schedulerSameMaterialHits > 0) {
+              schedulerParts.push('同材料接力 ' + String(schedulerSameMaterialHits) + ' 次');
+            }
+            if (schedulerActiveProjectQuotaExhausted > 0 || schedulerActiveProjectTypeQuotaExhausted > 0) {
+              schedulerParts.push(
+                '配额耗尽 项目 '
+                  + String(schedulerActiveProjectQuotaExhausted)
+                  + ' / 类型 '
+                  + String(schedulerActiveProjectTypeQuotaExhausted)
+              );
+            }
+            if (schedulerParts.length) {
+              summaryText += ' 调度命中：' + schedulerParts.join('，') + '。';
+            }
+          }
+          if (
+            schedulerClaimSnapshotCacheHits > 0
+            || schedulerClaimContextCacheHits > 0
+            || schedulerProjectStageCacheHits > 0
+            || schedulerPriorityContextCacheHits > 0
+            || schedulerJobsSummaryCacheHits > 0
+            || schedulerStatusMaterialsCacheHits > 0
+            || schedulerStatusCoreCacheHits > 0
+            || schedulerClaimSnapshotCacheRebuilds > 0
+            || schedulerClaimContextCacheRebuilds > 0
+            || schedulerProjectStageCacheRebuilds > 0
+            || schedulerPriorityContextCacheRebuilds > 0
+            || schedulerJobsSummaryCacheRebuilds > 0
+            || schedulerStatusMaterialsCacheRebuilds > 0
+            || schedulerStatusCoreCacheRebuilds > 0
+          ) {
+            const cacheHitParts = [];
+            const cacheRebuildParts = [];
+            if (schedulerClaimContextCacheHits > 0) {
+              cacheHitParts.push('claim 上下文 ' + String(schedulerClaimContextCacheHits) + ' 次');
+            }
+            if (schedulerClaimSnapshotCacheHits > 0) {
+              cacheHitParts.push('状态快照 ' + String(schedulerClaimSnapshotCacheHits) + ' 次');
+            }
+            if (schedulerProjectStageCacheHits > 0) {
+              cacheHitParts.push('项目阶段 ' + String(schedulerProjectStageCacheHits) + ' 次');
+            }
+            if (schedulerPriorityContextCacheHits > 0) {
+              cacheHitParts.push('优先级上下文 ' + String(schedulerPriorityContextCacheHits) + ' 次');
+            }
+            if (schedulerJobsSummaryCacheHits > 0) {
+              cacheHitParts.push('作业汇总 ' + String(schedulerJobsSummaryCacheHits) + ' 次');
+            }
+            if (schedulerStatusMaterialsCacheHits > 0) {
+              cacheHitParts.push('资料状态 ' + String(schedulerStatusMaterialsCacheHits) + ' 次');
+            }
+            if (schedulerStatusCoreCacheHits > 0) {
+              cacheHitParts.push('状态核心 ' + String(schedulerStatusCoreCacheHits) + ' 次');
+            }
+            if (schedulerClaimContextCacheRebuilds > 0) {
+              cacheRebuildParts.push('claim 上下文 ' + String(schedulerClaimContextCacheRebuilds) + ' 次');
+            }
+            if (schedulerClaimSnapshotCacheRebuilds > 0) {
+              cacheRebuildParts.push('状态快照 ' + String(schedulerClaimSnapshotCacheRebuilds) + ' 次');
+            }
+            if (schedulerProjectStageCacheRebuilds > 0) {
+              cacheRebuildParts.push('项目阶段 ' + String(schedulerProjectStageCacheRebuilds) + ' 次');
+            }
+            if (schedulerPriorityContextCacheRebuilds > 0) {
+              cacheRebuildParts.push('优先级上下文 ' + String(schedulerPriorityContextCacheRebuilds) + ' 次');
+            }
+            if (schedulerJobsSummaryCacheRebuilds > 0) {
+              cacheRebuildParts.push('作业汇总 ' + String(schedulerJobsSummaryCacheRebuilds) + ' 次');
+            }
+            if (schedulerStatusMaterialsCacheRebuilds > 0) {
+              cacheRebuildParts.push('资料状态 ' + String(schedulerStatusMaterialsCacheRebuilds) + ' 次');
+            }
+            if (schedulerStatusCoreCacheRebuilds > 0) {
+              cacheRebuildParts.push('状态核心 ' + String(schedulerStatusCoreCacheRebuilds) + ' 次');
+            }
+            if (cacheHitParts.length) {
+              summaryText += ' 缓存命中：' + cacheHitParts.join('，') + '。';
+            }
+            if (cacheRebuildParts.length) {
+              summaryText += ' 缓存重建：' + cacheRebuildParts.join('，') + '。';
+            }
+          }
+          if (schedulerCacheHitTotal > 0 || schedulerCacheRebuildTotal > 0) {
+            summaryText += ' 缓存总览：命中 '
+              + String(schedulerCacheHitTotal)
+              + ' 次，重建 '
+              + String(schedulerCacheRebuildTotal)
+              + ' 次，缓存命中率 '
+              + String(Math.round(schedulerCacheHitRatio * 100))
+              + '%。';
+          }
+          if (schedulerProjectCacheHitTotal > 0 || schedulerProjectCacheRebuildTotal > 0) {
+            const projectCacheParts = [];
+            if (schedulerProjectJobsSummaryCacheHits > 0 || schedulerProjectJobsSummaryCacheRebuilds > 0) {
+              projectCacheParts.push(
+                '作业汇总 '
+                  + String(schedulerProjectJobsSummaryCacheHits)
+                  + '/'
+                  + String(schedulerProjectJobsSummaryCacheRebuilds)
+              );
+            }
+            if (schedulerProjectStatusMaterialsCacheHits > 0 || schedulerProjectStatusMaterialsCacheRebuilds > 0) {
+              projectCacheParts.push(
+                '资料状态 '
+                  + String(schedulerProjectStatusMaterialsCacheHits)
+                  + '/'
+                  + String(schedulerProjectStatusMaterialsCacheRebuilds)
+              );
+            }
+            if (schedulerProjectStatusCoreCacheHits > 0 || schedulerProjectStatusCoreCacheRebuilds > 0) {
+              projectCacheParts.push(
+                '状态核心 '
+                  + String(schedulerProjectStatusCoreCacheHits)
+                  + '/'
+                  + String(schedulerProjectStatusCoreCacheRebuilds)
+              );
+            }
+            summaryText += ' 当前项目缓存：命中 '
+              + String(schedulerProjectCacheHitTotal)
+              + ' 次，重建 '
+              + String(schedulerProjectCacheRebuildTotal)
+              + ' 次，命中率 '
+              + String(Math.round(schedulerProjectCacheHitRatio * 100))
+              + '%';
+            if (schedulerProjectCacheNetSavings !== 0) {
+              summaryText += '，净节省冷路径 '
+                + String(Math.abs(schedulerProjectCacheNetSavings))
+                + ' 次';
+            }
+            if (schedulerProjectCacheState === 'warm') {
+              summaryText += '，状态 已转热';
+            } else if (schedulerProjectCacheState === 'warming') {
+              summaryText += '，状态 预热中';
+            } else if (schedulerProjectCacheState === 'cold') {
+              summaryText += '，状态 冷启动';
+            }
+            if (projectCacheParts.length) {
+              summaryText += '（' + projectCacheParts.join('，') + '）';
+            }
+            summaryText += '。';
+            summaryText += ' 缓存分层：已转热 '
+              + String(schedulerProjectCacheHotLayerCount)
+              + ' 层，预热中 '
+              + String(schedulerProjectCacheWarmingLayerCount)
+              + ' 层，冷启动 '
+              + String(schedulerProjectCacheColdLayerCount)
+              + ' 层';
+            const projectCacheStateParts = [];
+            if (schedulerProjectJobsSummaryCacheState) {
+              projectCacheStateParts.push('作业汇总 ' + schedulerProjectJobsSummaryCacheState);
+            }
+            if (schedulerProjectStatusMaterialsCacheState) {
+              projectCacheStateParts.push('资料状态 ' + schedulerProjectStatusMaterialsCacheState);
+            }
+            if (schedulerProjectStatusCoreCacheState) {
+              projectCacheStateParts.push('状态核心 ' + schedulerProjectStatusCoreCacheState);
+            }
+            if (projectCacheStateParts.length) {
+              summaryText += '（' + projectCacheStateParts.join('，') + '）';
+            }
+            summaryText += '。';
+            if (schedulerProjectRecentAvoidedRebuildLayers.length) {
+              summaryText += ' 最近一轮避开重建：'
+                + schedulerProjectRecentAvoidedRebuildLayers.map(projectCacheLayerLabel).filter(Boolean).join('、')
+                + '。';
+            }
+            if (schedulerProjectRecentRebuiltLayers.length) {
+              summaryText += ' 最近一轮实际重建：'
+                + schedulerProjectRecentRebuiltLayers.map(projectCacheLayerLabel).filter(Boolean).join('、')
+                + '。';
+            }
+            if (schedulerProjectRecentAvoidedRebuildWorkUnits > 0 || schedulerProjectRecentRebuiltWorkUnits > 0) {
+              summaryText += ' 最近一轮估算链路成本：避开 '
+                + String(schedulerProjectRecentAvoidedRebuildWorkUnits)
+                + ' 单位，重建 '
+                + String(schedulerProjectRecentRebuiltWorkUnits)
+                + ' 单位。';
+            }
+            if (schedulerProjectRecentRequestWindowSize > 0) {
+              summaryText += ' 最近 '
+                + String(schedulerProjectRecentRequestWindowSize)
+                + ' 轮阶段：冷启动首轮 '
+                + String(schedulerProjectRecentColdStartRoundCount)
+                + ' 轮，预热中 '
+                + String(schedulerProjectRecentWarmingRoundCount)
+                + ' 轮，稳定轮询 '
+                + String(schedulerProjectRecentSteadyRoundCount)
+                + ' 轮';
+              if (schedulerProjectRecentWindowState === 'stable_hot') {
+                summaryText += '，窗口状态 已稳定转热';
+              } else if (schedulerProjectRecentWindowState === 'steady') {
+                summaryText += '，窗口状态 已转热';
+              } else if (schedulerProjectRecentWindowState === 'warming') {
+                summaryText += '，窗口状态 仍在预热';
+              } else if (schedulerProjectRecentWindowState === 'cold_start') {
+                summaryText += '，窗口状态 冷启动首轮';
+              } else if (schedulerProjectRecentWindowState === 'cold') {
+                summaryText += '，窗口状态 冷启动';
+              }
+              if (schedulerProjectRecentStableHotBadgeLabel) {
+                summaryText += '，热态标签 ' + schedulerProjectRecentStableHotBadgeLabel;
+              }
+              if (schedulerProjectRecentStableHotThreshold > 0) {
+                summaryText += '，连续稳定轮询 '
+                  + String(schedulerProjectRecentConsecutiveSteadyRoundCount)
+                  + '/'
+                  + String(schedulerProjectRecentStableHotThreshold)
+                  + ' 轮';
+                if (schedulerProjectRecentStableHotProgressSummaryLabel) {
+                  summaryText += '，稳定转热进度 '
+                    + schedulerProjectRecentStableHotProgressSummaryLabel;
+                } else if (schedulerProjectRecentStableHotProgressLabel) {
+                  summaryText += '，稳定转热进度 '
+                    + schedulerProjectRecentStableHotProgressLabel
+                    + '（'
+                    + (
+                      schedulerProjectRecentStableHotProgressPercentLabel
+                      || (String(schedulerProjectRecentStableHotProgressPercent) + '%')
+                    )
+                    + '）';
+                }
+                if (schedulerProjectRecentStableHotProgressSummaryLabel) {
+                  // summary label already includes progress + eta semantics
+                } else if (schedulerProjectRecentStableHotEtaHint) {
+                  summaryText += '，'
+                    + (
+                      schedulerProjectRecentStableHotEtaShortLabel
+                      || schedulerProjectRecentStableHotEtaHint
+                    );
+                } else if (schedulerProjectRecentStableHot) {
+                  summaryText += '，已达到稳定转热阈值';
+                } else {
+                  summaryText += '，未达到稳定转热阈值';
+                  if (schedulerProjectRecentStableHotRemainingRounds > 0) {
+                    summaryText += '，还差 '
+                      + String(schedulerProjectRecentStableHotRemainingRounds)
+                      + ' 轮 steady';
+                  }
+                }
+              }
+              if (schedulerProjectRecentStableHotRuleLabel) {
+                summaryText += '，规则：' + schedulerProjectRecentStableHotRuleLabel;
+              }
+              summaryText += '。';
+              summaryText += ' 最近 '
+                + String(schedulerProjectRecentRequestWindowSize)
+                + ' 轮平均链路成本：避开 '
+                + formatProjectCacheWorkUnits(schedulerProjectRecentAvoidedRebuildWorkUnitsAvg)
+                + ' 单位，重建 '
+                + formatProjectCacheWorkUnits(schedulerProjectRecentRebuiltWorkUnitsAvg)
+                + ' 单位';
+              if (schedulerProjectRecentNetSavedWorkUnitsAvg !== 0) {
+                summaryText += '，净节省 '
+                  + formatProjectCacheWorkUnits(Math.abs(schedulerProjectRecentNetSavedWorkUnitsAvg))
+                  + ' 单位';
+              }
+              summaryText += '。';
+            }
+          }
+          if (closureStageText) {
+            summaryText += ' 系统封关阶段：' + closureStageText + '。';
+          }
           setMaterialParseSummary(summaryText, tone);
+          renderProjectClosureZoneHint(
+            'materials',
+            'materialsParseSummary',
+            'materialsClosureHint',
+            systemClosureSummaryState,
+            pid()
+          );
         }
         function materialParseStatusMeta(material) {
           const row = (material && typeof material === 'object') ? material : {};
@@ -27337,6 +37474,14 @@ def index(
           const note = String(row.parse_note || '').trim();
           const queuePosition = Number(row.queue_position || 0);
           const errorText = String(row.parse_error_message || row.parse_error_class || '').trim();
+          if (status === 'previewed') {
+            return {
+              status: 'previewed',
+              label: stageLabel || '预解析完成',
+              detail: note || routeLabel || (queuePosition > 0 ? ('全文补全队列第 ' + String(queuePosition) + ' 位') : ''),
+              tone: '#0f766e',
+            };
+          }
           if (status === 'parsed') {
             return {
               status: 'parsed',
@@ -27386,11 +37531,28 @@ def index(
             ? ('<div style="margin-top:4px;font-size:12px;color:#64748b;line-height:1.5">' + escapeHtmlText(parseMeta.detail) + '</div>')
             : '';
           return ''
+            + '<tr>'
             + '<td>' + escapeHtmlText(materialTypeText) + '</td>'
             + '<td>' + escapeHtmlText(row.filename || '') + '</td>'
             + '<td><span style="color:' + escapeHtmlText(parseMeta.tone || '#475569') + '">' + escapeHtmlText(parseMeta.label || '-') + '</span>' + parseDetailHtml + '</td>'
             + '<td>' + escapeHtmlText(String(row.created_at || '').slice(0, 19)) + '</td>'
-            + '<td><button type="button" class="btn-danger js-delete-material" data-material-id="' + escapeHtmlText(String(row.id || '')) + '" data-project-id="' + escapeHtmlText(String(projectId || '')) + '" data-filename="' + escapeHtmlText(String(row.filename || '')) + '">删除</button></td>';
+            + '<td><button type="button" class="btn-danger js-delete-material" data-material-id="' + escapeHtmlText(String(row.id || '')) + '" data-project-id="' + escapeHtmlText(String(projectId || '')) + '" data-filename="' + escapeHtmlText(String(row.filename || '')) + '">删除</button></td>'
+            + '</tr>';
+        }
+        function createMaterialTableRowElement(material, projectId) {
+          const template = document.createElement('template');
+          template.innerHTML = String(buildMaterialTableRowHtml(material, projectId) || '').trim();
+          const row = template.content ? template.content.firstElementChild : null;
+          return row && String(row.tagName || '').toUpperCase() === 'TR' ? row : null;
+        }
+        function buildFeedMaterialTableRowHtml(material, projectId) {
+          const row = (material && typeof material === 'object') ? material : {};
+          return ''
+            + '<tr>'
+            + '<td>' + escapeHtmlText(row.filename || '') + '</td>'
+            + '<td>' + escapeHtmlText(String(row.created_at || '').slice(0, 19)) + '</td>'
+            + '<td><button type="button" class="btn-danger js-delete-material" data-material-id="' + escapeHtmlText(String(row.id || '')) + '" data-project-id="' + escapeHtmlText(String(projectId || '')) + '" data-filename="' + escapeHtmlText(String(row.filename || '')) + '">删除</button></td>'
+            + '</tr>';
         }
         function applyMaterialParseZoneState(materials, summary) {
           const cardsByType = {};
@@ -27401,6 +37563,7 @@ def index(
             if (!cardsByType[typeKey]) cardsByType[typeKey] = {
               total: 0,
               parsed: 0,
+              previewed: 0,
               queued: 0,
               processing: 0,
               failed: 0,
@@ -27413,6 +37576,7 @@ def index(
             const routeLabel = String(row.parse_route_label || '').trim();
             const queuePosition = Number(row.queue_position || 0);
             if (status === 'parsed') bucket.parsed += 1;
+            else if (status === 'previewed') bucket.previewed += 1;
             else if (status === 'processing') bucket.processing += 1;
             else if (status === 'failed') bucket.failed += 1;
             else bucket.queued += 1;
@@ -27437,6 +37601,14 @@ def index(
               stateEl.style.color = '#92400e';
               stateEl.textContent = '当前状态：解析中 ' + bucket.processing + ' 份；已解析 ' + bucket.parsed + ' 份。'
                 + (bucket.routeLabels.length ? ' 解析路径：' + String(bucket.routeLabels[0] || '') + '。' : '');
+              return;
+            }
+            if (bucket.previewed > 0) {
+              zoneEl.dataset.health = 'ready';
+              stateEl.style.color = '#0f766e';
+              stateEl.textContent = '当前状态：预解析完成 ' + bucket.previewed + ' 份；已解析 ' + bucket.parsed + ' 份。'
+                + (bucket.routeLabels.length ? ' 当前路径：' + String(bucket.routeLabels[0] || '') + '。' : '')
+                + ' 后台仍在补全全文。';
               return;
             }
             if (bucket.queued > 0) {
@@ -27473,7 +37645,7 @@ def index(
           if (!projectId || isStaleProjectResponse(projectId, switchSeq) || (backlog + processing + queued) <= 0) return;
           materialParsePollTimer = setTimeout(async () => {
             if (isStaleProjectResponse(projectId, switchSeq)) return;
-            await refreshMaterials(projectId, switchSeq);
+            await refreshMaterials(projectId, switchSeq, { skipReadinessRefresh: true });
             if (typeof refreshScoringDiagnostic === 'function') await refreshScoringDiagnostic(projectId, switchSeq);
             if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(projectId, switchSeq);
           }, 1200);
@@ -27482,6 +37654,7 @@ def index(
           const table = document.getElementById(tableId);
           const tbody = table ? table.querySelector('tbody') : null;
           if (tbody) tbody.innerHTML = '';
+          clearTableRenderSignature(tableId);
           const emptyEl = document.getElementById(emptyId);
           if (emptyEl) {
             emptyEl.textContent = message || '';
@@ -27493,11 +37666,14 @@ def index(
           if (!el) return;
           el.style.display = 'none';
           el.innerHTML = '';
+          clearSystemClosureActionHint(resultId);
         }
         function resetProjectPanelsToStandby(projectId) {
           const hasProject = !!projectId;
           clearMaterialParsePolling();
           clearProjectAutoRefresh();
+          clearProjectRefreshInflight();
+          clearProjectScopedSystemClosureActionHints();
           setTableStandby(
             'materialsTable',
             'materialsEmpty',
@@ -27594,9 +37770,19 @@ def index(
           );
           setActionStatus(
             'shigongActionStatus',
-            hasProject ? '待机：可上传施组或点击“评分施组”。' : '请先在「2) 选择项目」中选择项目。',
+            hasProject ? ('待机：可上传施组或点击“' + currentScoreShigongActionLabel() + '”。') : '请先在「2) 选择项目」中选择项目。',
             !hasProject
           );
+          setMaterialTrialPreflightButtonHint('');
+          setMaterialTrialPreflightActionBadge('', '');
+          setMaterialTrialPreflightFollowUp('', '');
+          setMaterialTrialPreflightHint('', '');
+          setMaterialTrialPreflightFollowUpHint('', '');
+          setMaterialTrialPreflightFollowUpAction('', '');
+          setShigongTrialPreflightButtonHints('', '');
+          setShigongTrialPreflightActionBadge('', '');
+          setShigongTrialPreflightHint('', '');
+          setShigongTrialPreflightState('', '', '');
           setActionStatus(
             'feedActionStatus',
             hasProject ? '待机：可上传投喂包或录入真实评标。' : '请先在「2) 选择项目」中选择项目。',
@@ -27605,10 +37791,12 @@ def index(
           if (hasProject) {
             setExpertProfileStatus('待机：正在加载当前项目的16维关注度配置...');
             applyWeightsRaw({});
+            setShigongScoreLockNotice(false);
           } else {
             setExpertProfileStatus('请先选择项目。');
             applyWeightsRaw({});
             expertProfileLocked = false;
+            setShigongScoreLockNotice(false);
           }
           const out = document.getElementById('output');
           if (out) {
@@ -27690,12 +37878,273 @@ def index(
           el.textContent = text || '';
           el.style.color = isError ? '#b91c1c' : '#334155';
         }
+        function currentScoreShigongActionLabel() {
+          const scoreBtn = document.getElementById('btnScoreShigong');
+          if (!scoreBtn) return '评分施组';
+          const currentLabel = String(scoreBtn.textContent || '').trim();
+          if (currentLabel) return currentLabel;
+          return String(scoreBtn.dataset.defaultLabel || '评分施组').trim() || '评分施组';
+        }
+        function shigongTrialPreflightPriorityLabel(entrypointKey, entrypointLabel='') {
+          const key = String(entrypointKey || '').trim();
+          const label = String(entrypointLabel || '').trim();
+          if (key === 'score_shigong') return '优先：评分施组';
+          if (label.indexOf('上传新版施组') >= 0) return '优先：上传新版施组';
+          if (key === 'upload_shigong') return '优先：上传施组';
+          return label ? ('优先：' + label.replace(/^前往「4\\) 项目施组」/, '').trim()) : '';
+        }
+        function setShigongTrialPreflightActionBadge(entrypointKey='', entrypointLabel='') {
+          const badgeEl = document.getElementById('shigongTrialPreflightBadge');
+          if (!badgeEl) return;
+          const text = shigongTrialPreflightPriorityLabel(entrypointKey, entrypointLabel);
+          badgeEl.textContent = text;
+          badgeEl.style.display = text ? 'inline-flex' : 'none';
+        }
+        function setShigongTrialPreflightButtonHints(entrypointKey='', entrypointLabel='') {
+          const uploadHintEl = document.getElementById('btnUploadShigongHint');
+          const scoreHintEl = document.getElementById('btnScoreShigongHint');
+          if (uploadHintEl) {
+            uploadHintEl.textContent = '';
+            uploadHintEl.style.display = 'none';
+          }
+          if (scoreHintEl) {
+            scoreHintEl.textContent = '';
+            scoreHintEl.style.display = 'none';
+          }
+          const key = String(entrypointKey || '').trim();
+          const label = String(entrypointLabel || '').trim();
+          if (key === 'score_shigong') {
+            if (scoreHintEl) {
+              scoreHintEl.textContent = '建议直接评分';
+              scoreHintEl.style.display = 'inline';
+            }
+            return;
+          }
+          const uploadText = label.indexOf('上传新版施组') >= 0 ? '建议先上传新版' : '建议先上传施组';
+          if (uploadHintEl && uploadText) {
+            uploadHintEl.textContent = uploadText;
+            uploadHintEl.style.display = 'inline';
+          }
+        }
+        function setShigongTrialPreflightHint(entrypointLabel='', entrypointReasonLabel='') {
+          const hintEl = document.getElementById('shigongTrialPreflightHint');
+          if (!hintEl) return;
+          const label = String(entrypointLabel || '').trim();
+          const reason = String(entrypointReasonLabel || '').trim();
+          if (!label && !reason) {
+            hintEl.textContent = '';
+            hintEl.style.display = 'none';
+            return;
+          }
+          let text = '';
+          if (label) text += '当前建议：' + label;
+          if (reason) text += (text ? '；原因：' : '原因：') + reason;
+          hintEl.textContent = text;
+          hintEl.style.display = 'block';
+        }
+        let shigongTrialPreflightState = null;
+        function setShigongTrialPreflightState(entrypointKey='', entrypointLabel='', entrypointReasonLabel='') {
+          const key = String(entrypointKey || '').trim();
+          const label = String(entrypointLabel || '').trim();
+          const reason = String(entrypointReasonLabel || '').trim();
+          shigongTrialPreflightState = (key || label || reason)
+            ? { entrypointKey: key, entrypointLabel: label, entrypointReasonLabel: reason }
+            : null;
+        }
+        function promoteShigongTrialPreflightAfterUpload() {
+          const state = (shigongTrialPreflightState && typeof shigongTrialPreflightState === 'object')
+            ? shigongTrialPreflightState
+            : {};
+          const hasState = String(state.entrypointKey || state.entrypointLabel || state.entrypointReasonLabel || '').trim();
+          if (!hasState) return false;
+          return focusShigongWorkspaceEntrypoint(
+            'score_shigong',
+            '前往「4) 项目施组」评分施组',
+            '新版施组已显示到列表，可直接继续评分。'
+          );
+        }
+        function setShigongScoreLockNotice(locked=false) {
+          const visible = !!locked;
+          const scoreBtn = document.getElementById('btnScoreShigong');
+          let activeLabel = '评分施组';
+          if (scoreBtn && scoreBtn.classList) {
+            scoreBtn.classList.toggle('button-lock-emphasis', visible);
+            const defaultLabel = String(scoreBtn.dataset.defaultLabel || '评分施组').trim() || '评分施组';
+            const lockedLabel = String(scoreBtn.dataset.lockedLabel || '').trim() || defaultLabel;
+            activeLabel = visible ? lockedLabel : defaultLabel;
+            scoreBtn.textContent = activeLabel;
+          }
+          const badgeEl = document.getElementById('shigongScoreLockBadge');
+          if (badgeEl) badgeEl.style.display = visible ? 'inline-flex' : 'none';
+          const hintEl = document.getElementById('shigongScoreLockHint');
+          if (hintEl) hintEl.style.display = visible ? 'block' : 'none';
+          const statusEl = document.getElementById('shigongActionStatus');
+          if (statusEl) {
+            const currentStatus = String(statusEl.textContent || '').trim();
+            if (!currentStatus || currentStatus.indexOf('待机：可上传施组或点击“') === 0) {
+              statusEl.textContent = '待机：可上传施组或点击“' + activeLabel + '”。';
+            }
+          }
+        }
+        function buildExpertProfileSaveOutputSummary(data) {
+          const payload = (data && typeof data === 'object') ? data : {};
+          const profile = (payload.expert_profile && typeof payload.expert_profile === 'object')
+            ? payload.expert_profile
+            : {};
+          const project = (payload.project && typeof payload.project === 'object')
+            ? payload.project
+            : {};
+          const weightsRaw = (profile.weights_raw && typeof profile.weights_raw === 'object')
+            ? profile.weights_raw
+            : {};
+          return {
+            message: '专家配置已保存并绑定到当前项目',
+            project_id: project.id || payload.project_id || pid() || '-',
+            profile_name: profile.name || '-',
+            profile_id: profile.id || '-',
+            weight_dimensions: Object.keys(weightsRaw).length,
+            project_status: project.status || '-',
+          };
+        }
+        function buildWeightsApplyOutputSummary(data, message='') {
+          const payload = (data && typeof data === 'object') ? data : {};
+          const gate = (payload.material_utilization_gate && typeof payload.material_utilization_gate === 'object')
+            ? payload.material_utilization_gate
+            : {};
+          const summary = {
+            message: message || String(payload.message || '').trim() || '已按当前16维关注度完成本项目重算',
+            project_id: payload.project_id || pid() || '-',
+            score_scale_label: payload.score_scale_label || selectedScoreScaleLabel(),
+            submission_count: payload.submission_count || 0,
+            reports_generated: payload.reports_generated || 0,
+            blocked_submissions: Number(gate.blocked_submissions || payload.blocked_submissions || 0),
+            warn_submissions: Number(gate.warn_submissions || payload.warn_submissions || 0),
+            calibrator_version: payload.calibrator_version || '-',
+            recalculated: true,
+          };
+          if (Object.prototype.hasOwnProperty.call(payload, 'reflection_ok')) {
+            summary.reflection_ok = !!payload.reflection_ok;
+          }
+          return summary;
+        }
+        function buildCalibratorActionOutputSummary(data, message='') {
+          const payload = (data && typeof data === 'object') ? data : {};
+          const summary = (payload.calibrator_summary && typeof payload.calibrator_summary === 'object')
+            ? payload.calibrator_summary
+            : {};
+          const autoReview = (summary.auto_review && typeof summary.auto_review === 'object')
+            ? summary.auto_review
+            : ((payload.calibrator_auto_review && typeof payload.calibrator_auto_review === 'object')
+              ? payload.calibrator_auto_review
+              : {});
+          const gate = (summary.gate && typeof summary.gate === 'object')
+            ? summary.gate
+            : ((payload.calibrator_gate && typeof payload.calibrator_gate === 'object')
+              ? payload.calibrator_gate
+              : {});
+          const updatedReports = payload.updated_reports ?? payload.prediction_updated_reports;
+          const updatedSubmissions = payload.updated_submissions ?? payload.prediction_updated_submissions;
+          const runtimeGovernance = (payload.calibrator_runtime_governance && typeof payload.calibrator_runtime_governance === 'object')
+            ? payload.calibrator_runtime_governance
+            : {};
+          const postRunHealth = (payload.post_run_health_summary && typeof payload.post_run_health_summary === 'object')
+            ? payload.post_run_health_summary
+            : {};
+          const output = {
+            message: message || String(payload.message || '').trim() || '校准动作已完成',
+            project_id: payload.project_id || pid() || '-',
+            calibrator_version: summary.calibrator_version || payload.calibrator_version || payload.model_version || '-',
+            model_type: summary.model_type || payload.calibrator_model_type || payload.model_type || '-',
+            gate_passed: summary.gate_passed ?? payload.calibrator_gate_passed ?? gate.passed ?? null,
+            sample_count: summary.sample_count ?? null,
+            deployment_mode: summary.deployment_mode || '-',
+          };
+          if (updatedReports != null) output.updated_reports = Number(updatedReports || 0);
+          if (updatedSubmissions != null) output.updated_submissions = Number(updatedSubmissions || 0);
+          if (Object.prototype.hasOwnProperty.call(payload, 'calibrator_deployed')) {
+            output.calibrator_deployed = !!payload.calibrator_deployed;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, 'patch_deployed')) {
+            output.patch_deployed = !!payload.patch_deployed;
+          }
+          if (autoReview && Object.keys(autoReview).length) {
+            output.auto_review_action = autoReview.action || '-';
+            output.auto_review_reason = autoReview.reason || '-';
+          }
+          if (runtimeGovernance && Object.keys(runtimeGovernance).length) {
+            output.runtime_governance_action = runtimeGovernance.action || '-';
+            output.runtime_governance_reason = runtimeGovernance.reason || '-';
+            if (runtimeGovernance.rollback_candidate_version) {
+              output.runtime_governance_candidate = runtimeGovernance.rollback_candidate_version;
+            }
+            if (runtimeGovernance.active_calibrator_version_after) {
+              output.runtime_governance_active_version_after = runtimeGovernance.active_calibrator_version_after;
+            }
+            if (Object.prototype.hasOwnProperty.call(runtimeGovernance, 'updated_reports')) {
+              output.runtime_governance_updated_reports = Number(runtimeGovernance.updated_reports || 0);
+            }
+            if (Object.prototype.hasOwnProperty.call(runtimeGovernance, 'updated_submissions')) {
+              output.runtime_governance_updated_submissions = Number(runtimeGovernance.updated_submissions || 0);
+            }
+            if (typeof runtimeGovernance.degraded_after === 'boolean') {
+              output.runtime_governance_degraded_after = runtimeGovernance.degraded_after;
+            }
+            if (typeof runtimeGovernance.recovered_after === 'boolean') {
+              output.runtime_governance_recovered_after = runtimeGovernance.recovered_after;
+            }
+          }
+          if (postRunHealth && Object.keys(postRunHealth).length) {
+            output.post_run_calibrator_state = postRunHealth.current_calibrator_version
+              ? (postRunHealth.current_calibrator_degraded ? 'degraded' : 'stable')
+              : 'missing';
+            if (postRunHealth.current_calibrator_version) {
+              output.post_run_calibrator_version = postRunHealth.current_calibrator_version;
+            }
+            if (postRunHealth.current_calibrator_deployment_mode) {
+              output.post_run_calibrator_mode = postRunHealth.current_calibrator_deployment_mode;
+            }
+            if (postRunHealth.current_calibrator_recent_mae != null) {
+              output.post_run_calibrator_recent_mae = Number(postRunHealth.current_calibrator_recent_mae);
+            }
+            if (postRunHealth.current_calibrator_recent_rule_mae != null) {
+              output.post_run_calibrator_recent_rule_mae = Number(postRunHealth.current_calibrator_recent_rule_mae);
+            }
+            if (postRunHealth.current_calibrator_rollback_candidate_version) {
+              output.post_run_rollback_candidate = postRunHealth.current_calibrator_rollback_candidate_version;
+            }
+          }
+          if (summary.skipped_reason) {
+            output.skipped_reason = summary.skipped_reason;
+          }
+          return output;
+        }
+        function buildWeightsApplyRequestBody(forceUnlock=false) {
+          return {
+            scoring_engine_version: 'v2',
+            scope: 'project',
+            score_scale_max: selectedScoreScaleMax(),
+            rebuild_anchors: false,
+            rebuild_requirements: false,
+            retrain_calibrator: false,
+            force_unlock: !!forceUnlock
+          };
+        }
+        async function postProjectRescore(projectId, forceUnlock=false) {
+          const res = await fetch('/api/v1/projects/' + projectId + '/rescore', {
+            method: 'POST',
+            headers: apiHeaders(),
+            body: JSON.stringify(buildWeightsApplyRequestBody(forceUnlock)),
+          });
+          const data = await res.json().catch(() => ({}));
+          return { res, data };
+        }
         async function loadExpertProfile(expectedProjectId=null, switchSeq=null) {
           const projectId = expectedProjectId || pid();
           if (!projectId) {
             setExpertProfileStatus('请先选择项目。');
             applyWeightsRaw({});
             expertProfileLocked = false;
+            setShigongScoreLockNotice(false);
             return;
           }
           setExpertProfileStatus('正在加载当前生效配置...');
@@ -27717,6 +38166,7 @@ def index(
           applyWeightsRaw(profile.weights_raw || {});
           const project = (data && data.project) || {};
           expertProfileLocked = String(project.status || '') === 'submitted_to_qingtian';
+          setShigongScoreLockNotice(expertProfileLocked);
           let statusText =
             '当前生效配置：' + (profile.name || '-') +
             '（ID: ' + (profile.id || '-') + '，更新时间: ' + ((project.updated_at || profile.updated_at || '').slice(0, 19) || '-') + '）';
@@ -27727,12 +38177,11 @@ def index(
         }
         async function saveExpertProfile(askName=true, forceUnlock=false) {
           const projectId = pid();
-          if (!projectId) { setExpertProfileStatus('请先选择项目。', true); return false; }
-          if (expertProfileLocked && !forceUnlock) {
-            const unlockOk = confirm('当前项目已进入青天评标阶段。是否解锁并继续保存专家配置？');
-            if (!unlockOk) return false;
-            forceUnlock = true;
+          if (!projectId) {
+            setExpertProfileStatus('请先选择项目。', true);
+            return { ok: false, status: 0, lockedConflict: false, data: {} };
           }
+          if (expertProfileLocked && !forceUnlock) forceUnlock = true;
           const customName = askName ? (prompt('请输入专家配置名称（可留空自动命名）：') || '') : '';
           const payload = { name: customName, weights_raw: collectWeightsRaw(), force_unlock: !!forceUnlock };
           setExpertProfileStatus('正在保存配置...');
@@ -27746,85 +38195,94 @@ def index(
             data = await res.json().catch(() => ({}));
           } catch (err) {
             setExpertProfileStatus('保存失败：' + String((err && err.message) || err), true);
-            return false;
+            return { ok: false, status: 0, lockedConflict: false, data: {} };
           }
           if (!res.ok) {
             if (res.status === 409 && !forceUnlock) {
               setExpertProfileStatus('保存被锁定：项目处于青天评标阶段，请解锁后重试。', true);
-              return false;
+              return { ok: false, status: res.status, lockedConflict: true, data: data || {} };
             }
             setExpertProfileStatus('保存失败：' + (data.detail || ('HTTP ' + res.status)), true);
-            return false;
+            return { ok: false, status: res.status, lockedConflict: false, data: data || {} };
           }
           const profile = (data && data.expert_profile) || {};
           setExpertProfileStatus('已保存并绑定配置：' + (profile.name || '-') + '（' + (profile.id || '-') + '）');
           applyWeightsRaw(profile.weights_raw || {});
-          const out = document.getElementById('output');
-          if (out) out.textContent = JSON.stringify(data, null, 2);
-          return true;
+          showJson('output', buildExpertProfileSaveOutputSummary(data));
+          return { ok: true, status: res.status, lockedConflict: false, data: data || {}, profile };
         }
         async function applyExpertProfileAndRescore() {
+          if (expertProfileRescoreInFlight) {
+            setExpertProfileStatus('正在按当前关注度重算全部施组，请稍候…');
+            return;
+          }
           const projectId = pid();
           if (!projectId) { setExpertProfileStatus('请先选择项目。', true); return; }
           let forceUnlock = false;
-          if (expertProfileLocked) {
-            const unlockOk = confirm('当前项目已进入青天评标阶段。是否解锁并执行“保存+全项目重算”？');
-            if (!unlockOk) return;
-            forceUnlock = true;
-          }
-          const ok = confirm('将保存当前16维关注度，并重算本项目全部施组。是否继续？');
-          if (!ok) return;
-          const saved = await saveExpertProfile(false, forceUnlock);
-          if (!saved) return;
-          setExpertProfileStatus('正在按当前配置重算全部施组...');
-          let res, data;
+          if (expertProfileLocked) forceUnlock = true;
           try {
-            res = await fetch('/api/v1/projects/' + projectId + '/rescore', {
-              method: 'POST',
-              headers: apiHeaders(),
-              body: JSON.stringify({
-                scoring_engine_version: 'v2',
-                scope: 'project',
-                score_scale_max: selectedScoreScaleMax(),
-                rebuild_anchors: false,
-                rebuild_requirements: false,
-                retrain_calibrator: false,
-                force_unlock: !!forceUnlock
-              }),
-            });
-            data = await res.json().catch(() => ({}));
+            expertProfileRescoreInFlight = true;
+            setExpertProfileStatus('已接收请求：正在保存当前16维关注度并发起全项目重算...');
+            const out = document.getElementById('output');
+            if (out) {
+              out.textContent = buildCompactOutputLines({
+                message: '已接收请求，正在按当前16维关注度重算全部施组…',
+                project_id: projectId,
+                action: 'apply_weights_and_rescore',
+              }).join('\\n');
+            }
+            let saved = await saveExpertProfile(false, forceUnlock);
+            if (!saved.ok && saved.lockedConflict && !forceUnlock) {
+              forceUnlock = true;
+              setExpertProfileStatus('检测到项目已锁定，正在自动解锁并继续保存配置...');
+              saved = await saveExpertProfile(false, true);
+            }
+            if (!saved.ok) return;
+            setExpertProfileStatus('正在按当前配置重算全部施组...');
+            let { res, data } = await postProjectRescore(projectId, forceUnlock);
+            if (!res.ok && res.status === 409 && !forceUnlock) {
+              forceUnlock = true;
+              setExpertProfileStatus('检测到项目已锁定，正在自动解锁并继续重算...');
+              const retried = await postProjectRescore(projectId, true);
+              res = retried.res;
+              data = retried.data;
+            }
+            if (!res.ok) {
+              if (res.status === 409) {
+                setExpertProfileStatus('重算被锁定：项目处于青天评标阶段，请解锁后重试。', true);
+                return;
+              }
+              setExpertProfileStatus('重算失败：' + (data.detail || ('HTTP ' + res.status)), true);
+              return;
+            }
+            const gate = (data && typeof data.material_utilization_gate === 'object') ? data.material_utilization_gate : {};
+            const blockedCount = Number((gate && gate.blocked_submissions) || 0);
+            const warnCount = Number((gate && gate.warn_submissions) || 0);
+            let rescoreMsg =
+              '重算完成（' + ((data && data.score_scale_label) ? data.score_scale_label : selectedScoreScaleLabel()) + '）：共处理 ' + (data.submission_count || 0) + ' 份，生成 ' + (data.reports_generated || 0) + ' 份报告。';
+            if (blockedCount > 0) {
+              rescoreMsg += ' 资料门禁阻断 ' + blockedCount + ' 份。';
+            } else if (warnCount > 0) {
+              rescoreMsg += ' 资料门禁预警 ' + warnCount + ' 份。';
+            } else if (gate && gate.enabled) {
+              rescoreMsg += ' 资料门禁通过。';
+            }
+            setExpertProfileStatus(rescoreMsg, blockedCount > 0);
+            showJson('output', buildWeightsApplyOutputSummary(data, rescoreMsg));
+            if (typeof renderMaterialUtilizationPanel === 'function') {
+              renderMaterialUtilizationPanel(data || {});
+            }
+            if (typeof refreshSubmissions === 'function') await refreshSubmissions();
+            if (typeof refreshMaterials === 'function') await refreshMaterials();
+            if (typeof refreshSystemClosureSummary === 'function') {
+              await refreshSystemClosureSummary({ reason: 'weights_apply_rescore', silent: true });
+            }
           } catch (err) {
             setExpertProfileStatus('重算失败：' + String((err && err.message) || err), true);
             return;
+          } finally {
+            expertProfileRescoreInFlight = false;
           }
-          if (!res.ok) {
-            if (res.status === 409) {
-              setExpertProfileStatus('重算被锁定：项目处于青天评标阶段，请解锁后重试。', true);
-              return;
-            }
-            setExpertProfileStatus('重算失败：' + (data.detail || ('HTTP ' + res.status)), true);
-            return;
-          }
-          const gate = (data && typeof data.material_utilization_gate === 'object') ? data.material_utilization_gate : {};
-          const blockedCount = Number((gate && gate.blocked_submissions) || 0);
-          const warnCount = Number((gate && gate.warn_submissions) || 0);
-          let rescoreMsg =
-            '重算完成（' + ((data && data.score_scale_label) ? data.score_scale_label : selectedScoreScaleLabel()) + '）：共处理 ' + (data.submission_count || 0) + ' 份，生成 ' + (data.reports_generated || 0) + ' 份报告。';
-          if (blockedCount > 0) {
-            rescoreMsg += ' 资料门禁阻断 ' + blockedCount + ' 份。';
-          } else if (warnCount > 0) {
-            rescoreMsg += ' 资料门禁预警 ' + warnCount + ' 份。';
-          } else if (gate && gate.enabled) {
-            rescoreMsg += ' 资料门禁通过。';
-          }
-          setExpertProfileStatus(rescoreMsg, blockedCount > 0);
-          const out = document.getElementById('output');
-          if (out) out.textContent = JSON.stringify(data, null, 2);
-          if (typeof renderMaterialUtilizationPanel === 'function') {
-            renderMaterialUtilizationPanel(data || {});
-          }
-          if (typeof refreshSubmissions === 'function') await refreshSubmissions();
-          if (typeof refreshMaterials === 'function') await refreshMaterials();
         }
         function initWeightsSection() {
           try {
@@ -27834,14 +38292,187 @@ def index(
           }
         }
         safeClick('btnWeightsReset', () => applyWeightsRaw({}));
-        safeClick('btnWeightsSave', saveExpertProfile);
-        safeClick('btnWeightsApply', applyExpertProfileAndRescore);
+        safeClick('btnWeightsSave', async () => {
+          await saveExpertProfile();
+        });
+        safeClick0('btnWeightsApply', applyExpertProfileAndRescore);
 
         function setCreateMsg(msg, isError) {
           const el = document.getElementById('createProjectMessage');
           if (!el) { alert(msg); return; }
           el.textContent = msg || '';
           el.style.color = isError ? '#b91c1c' : '#15803d';
+          clearSystemClosureActionHint('createProjectMessage');
+        }
+        function buildSystemClosureNextStepText(closure, projectId, options=null) {
+          const data = (closure && typeof closure === 'object') ? closure : {};
+          const opts = (options && typeof options === 'object') ? options : {};
+          const blockerKind = String(data.blocker_kind || '').trim();
+          const nextStepTitle = String(data.next_step_title || '').trim();
+          const nextStepEntrypointLabel = String(data.next_step_entrypoint_label || '').trim();
+          const nextStepDetail = String(data.next_step_entrypoint_detail || '').trim();
+          const nextCandidateProjectId = String(data.next_candidate_project_id || '').trim();
+          const normalizedProjectId = String(projectId || '').trim();
+          const candidateMessage = String(
+            opts.candidateMessage || '当前项目已成为系统总封关候选项目'
+          ).trim();
+          const prefixLabel = String(opts.prefixLabel || '系统当前建议').trim();
+          const stepLabel = String(opts.stepLabel || '下一步建议').trim();
+          if (!nextStepTitle) return '';
+          if (
+            blockerKind === 'advance_candidate_project'
+            && normalizedProjectId
+            && nextCandidateProjectId
+            && normalizedProjectId === nextCandidateProjectId
+          ) {
+            return candidateMessage
+              + '。'
+              + stepLabel
+              + '：'
+              + nextStepTitle
+              + (nextStepEntrypointLabel ? '；' + nextStepEntrypointLabel : '')
+              + (nextStepDetail ? '。' + nextStepDetail : '。');
+          }
+          return prefixLabel
+            + '：'
+            + nextStepTitle
+            + (nextStepEntrypointLabel ? '；' + nextStepEntrypointLabel : '')
+            + (nextStepDetail ? '。' + nextStepDetail : '。');
+        }
+        function buildSystemClosureActionFollowUpMessage(baseMessage, closure, projectId, options=null) {
+          const base = String(baseMessage || '').trim();
+          const nextStepText = buildSystemClosureNextStepText(closure, projectId, options);
+          if (!nextStepText) return base;
+          if (!base) return nextStepText;
+          const normalizedBase = /[。！？.!?]$/.test(base) ? base : (base + '。');
+          return normalizedBase + nextStepText;
+        }
+        function ensureSystemClosureActionHintContainer(anchorId) {
+          const anchor = document.getElementById(anchorId);
+          if (!anchor || !anchor.parentNode) return null;
+          const hintId = anchorId + 'SystemClosureHint';
+          let el = document.getElementById(hintId);
+          if (!el) {
+            el = document.createElement('div');
+            el.id = hintId;
+            el.style.display = 'none';
+            el.style.margin = '6px 0 0 0';
+            el.style.padding = '8px 10px';
+            el.style.border = '1px solid #fde68a';
+            el.style.borderRadius = '8px';
+            el.style.background = '#fffbeb';
+            el.style.color = '#92400e';
+            el.style.fontSize = '12px';
+            anchor.parentNode.insertBefore(el, anchor.nextSibling);
+          }
+          return el;
+        }
+        function clearSystemClosureActionHint(anchorId) {
+          const el = document.getElementById(String(anchorId || '') + 'SystemClosureHint');
+          if (!el) return;
+          el.style.display = 'none';
+          el.innerHTML = '';
+        }
+        function clearProjectScopedSystemClosureActionHints() {
+          [
+            'createProjectMessage',
+            'materialsActionStatus',
+            'materialsActionStatusBoq',
+            'materialsActionStatusDrawing',
+            'materialsActionStatusPhoto',
+            'shigongActionStatus',
+            'evolveResult',
+            'calibTrainResult',
+          ].forEach(clearSystemClosureActionHint);
+        }
+        function buildClosureHintCtaHtml(entrypointKey, buttonText='查看下一步') {
+          const normalizedKey = String(entrypointKey || '').trim();
+          if (!normalizedKey) return '';
+          const label = String(buttonText || '查看下一步').trim() || '查看下一步';
+          return '<p style="margin:8px 0 0 0"><button type="button" class="secondary" onclick="return focusSystemClosureEntrypoint('
+            + escapeHtmlText(JSON.stringify(normalizedKey))
+            + ')">'
+            + escapeHtmlText(label)
+            + '</button></p>';
+        }
+        function renderClosureHintBlock(el, options=null) {
+          if (!el) return;
+          const opts = (options && typeof options === 'object') ? options : {};
+          const headingText = String(opts.headingText || '').trim();
+          const leadText = String(opts.leadText || '').trim();
+          const paragraphs = Array.isArray(opts.paragraphs) ? opts.paragraphs : [];
+          const actionEntrypointKey = String(opts.actionEntrypointKey || '').trim();
+          const actionLabel = String(opts.actionLabel || '').trim() || '查看下一步';
+          let html = '';
+          if (headingText || leadText) {
+            html += '<div>';
+            if (headingText) {
+              html += '<strong>' + escapeHtmlText(headingText) + (leadText ? '：</strong>' : '</strong>');
+            }
+            if (leadText) {
+              html += escapeHtmlText(leadText);
+            }
+            html += '</div>';
+          }
+          paragraphs.forEach((item, idx) => {
+            const row = (item && typeof item === 'object') ? item : {};
+            const text = String(row.text || '').trim();
+            if (!text) return;
+            const label = String(row.label || '').trim();
+            const style = String(
+              row.style || (idx === 0 ? 'margin:6px 0 0 0;color:#475569' : 'margin:4px 0 0 0;color:#475569')
+            ).trim();
+            html += '<p style="' + escapeHtmlText(style) + '">';
+            if (label) {
+              html += '<strong>' + escapeHtmlText(label) + '：</strong>';
+            }
+            html += escapeHtmlText(text) + '</p>';
+          });
+          html += buildClosureHintCtaHtml(actionEntrypointKey, actionLabel);
+          el.innerHTML = html;
+          el.style.display = 'block';
+        }
+        function renderSystemClosureActionHint(anchorId, closure, projectId, options=null) {
+          const el = ensureSystemClosureActionHintContainer(anchorId);
+          if (!el) return;
+          const data = (closure && typeof closure === 'object') ? closure : {};
+          const opts = (options && typeof options === 'object') ? options : {};
+          const nextStepTitle = String(data.next_step_title || '').trim();
+          const nextStepDetail = String(data.next_step_detail || '').trim();
+          const nextStepEntrypointKey = String(data.next_step_entrypoint_key || '').trim();
+          const nextStepEntrypointLabel = String(data.next_step_entrypoint_label || '').trim();
+          if (!nextStepTitle || !nextStepEntrypointKey) {
+            clearSystemClosureActionHint(anchorId);
+            return;
+          }
+          const leadText = buildSystemClosureNextStepText(closure, projectId, options);
+          const titleText = String(opts.titleText || '系统下一步').trim();
+          const buttonText = String(
+            opts.buttonText || data.next_step_action_label || '直达下一步'
+          ).trim();
+          renderClosureHintBlock(el, {
+            headingText: titleText,
+            leadText: leadText || nextStepTitle,
+            paragraphs: [
+              nextStepDetail ? { text: nextStepDetail, style: 'margin-top:4px;color:#78350f' } : null,
+              { label: '推荐入口', text: nextStepEntrypointLabel || '-', style: 'margin-top:6px;color:#a16207' },
+              { label: '入口动作', text: buttonText || '-', style: 'margin-top:4px;color:#a16207' },
+            ],
+            actionEntrypointKey: nextStepEntrypointKey,
+            actionLabel: buttonText || '直达下一步',
+          });
+        }
+        function buildCreateProjectFollowUpMessage(projectName, closure, projectId) {
+          const normalizedProjectName = String(projectName || '').trim() || '未命名项目';
+          return buildSystemClosureActionFollowUpMessage(
+            '创建成功，当前项目已自动切换：' + normalizedProjectName,
+            closure,
+            projectId,
+            {
+              candidateMessage: '该项目已成为系统总封关候选项目',
+              prefixLabel: '系统当前建议',
+            }
+          );
         }
         function setRecognizedProjectName(name) {
           const box = document.getElementById('createProjectRecognizedName');
@@ -27861,6 +38492,290 @@ def index(
           if (!el) { alert(msg); return; }
           el.textContent = msg || '';
           el.style.color = isError ? '#b91c1c' : '#15803d';
+          clearSystemClosureActionHint('selectProjectMessage');
+          clearProjectSelectionClosureHint();
+        }
+        function buildProjectClosureStageSummary(closure, projectId) {
+          const normalizedProjectId = String(projectId || '').trim();
+          if (!normalizedProjectId) return null;
+          const data = (closure && typeof closure === 'object') ? closure : {};
+          const blockerKind = String(data.blocker_kind || '').trim();
+          const nextCandidateProjectId = String(data.next_candidate_project_id || '').trim();
+          const nextPriorityProjectId = String(data.next_priority_project_id || '').trim();
+          const nextCandidateProjectName = String(data.next_candidate_project_name || '').trim();
+          const nextCandidateStage = String(data.next_candidate_stage || '').trim();
+          const nextCandidateActionHint = String(data.next_candidate_action_hint || '').trim();
+          const nextPriorityProjectName = String(data.next_priority_project_name || '').trim();
+          const nextPriorityFailedGates = Array.isArray(data.next_priority_failed_gates)
+            ? data.next_priority_failed_gates.map((x) => String(x || '').trim()).filter(Boolean)
+            : [];
+          const nextPriorityRecommendation = String(data.next_priority_recommendation || '').trim();
+          const nextStepTitle = String(data.next_step_title || '').trim();
+          const nextStepEntrypointKey = String(data.next_step_entrypoint_key || '').trim();
+          const nextStepEntrypointLabel = String(data.next_step_entrypoint_label || '').trim();
+          const nextStepActionLabel = String(data.next_step_action_label || '').trim();
+          const recommendation = String(data.recommendation || '').trim();
+          if (data.status === 'ready') {
+            return {
+              title: '当前项目已处于系统总封关可核查范围',
+              body: '当前系统已满足系统总封关前置条件，可直接执行跨项目总封关核查。',
+              tone: '#166534',
+              actionEntrypointKey: nextStepEntrypointKey,
+              actionEntrypointLabel: nextStepEntrypointLabel,
+              actionLabel: nextStepActionLabel || '执行跨项目汇总评估',
+            };
+          }
+          if (normalizedProjectId === nextCandidateProjectId) {
+            return {
+              title: '当前项目是系统总封关候选项目',
+              body: '当前阶段：' + (nextCandidateStage || '-')
+                + '；建议：' + (nextCandidateActionHint || recommendation || '-'),
+              tone: '#92400e',
+              actionEntrypointKey: nextStepEntrypointKey,
+              actionEntrypointLabel: nextStepEntrypointLabel,
+              actionLabel: nextStepActionLabel || '继续推进',
+            };
+          }
+          if (normalizedProjectId === nextPriorityProjectId) {
+            return {
+              title: '当前项目是当前优先收口项目',
+              body: '未通过门：' + (nextPriorityFailedGates.length ? nextPriorityFailedGates.join('、') : '-')
+                + '；建议：' + (nextPriorityRecommendation || recommendation || '-'),
+              tone: '#9f1239',
+              actionEntrypointKey: nextStepEntrypointKey,
+              actionEntrypointLabel: nextStepEntrypointLabel,
+              actionLabel: nextStepActionLabel || '继续推进',
+            };
+          }
+          if (blockerKind === 'need_new_project') {
+            return {
+              title: '当前项目已不是系统总封关的阻塞点',
+              body: recommendation || '系统当前仍缺第二个真实样本项目。',
+              tone: '#475569',
+              actionEntrypointKey: nextStepEntrypointKey,
+              actionEntrypointLabel: nextStepEntrypointLabel,
+              actionLabel: nextStepActionLabel || '查看下一步',
+            };
+          }
+          if (blockerKind === 'advance_candidate_project') {
+            return {
+              title: '当前项目不是系统当前首选候选',
+              body: '优先候选项目：' + (nextCandidateProjectName || '-')
+                + '；当前阶段：' + (nextCandidateStage || '-')
+                + '；建议：' + (nextCandidateActionHint || recommendation || '-'),
+              tone: '#475569',
+              actionEntrypointKey: nextStepEntrypointKey,
+              actionEntrypointLabel: nextStepEntrypointLabel,
+              actionLabel: nextStepActionLabel || '查看下一步',
+            };
+          }
+          if (blockerKind === 'close_not_ready_project') {
+            return {
+              title: '当前项目不是系统当前首选收口项目',
+              body: '优先收口项目：' + (nextPriorityProjectName || '-')
+                + '；建议：' + (nextPriorityRecommendation || recommendation || '-'),
+              tone: '#475569',
+              actionEntrypointKey: nextStepEntrypointKey,
+              actionEntrypointLabel: nextStepEntrypointLabel,
+              actionLabel: nextStepActionLabel || '查看下一步',
+            };
+          }
+          if (nextStepTitle) {
+            return {
+              title: '当前项目已切换完成',
+              body: recommendation || nextStepTitle,
+              tone: '#475569',
+              actionEntrypointKey: nextStepEntrypointKey,
+              actionEntrypointLabel: nextStepEntrypointLabel,
+              actionLabel: nextStepActionLabel || '查看下一步',
+            };
+          }
+          return null;
+        }
+        function buildProjectClosureStageInlineText(closure, projectId) {
+          const summary = buildProjectClosureStageSummary(closure, projectId);
+          if (!summary) return '';
+          const title = String(summary.title || '').trim();
+          const body = String(summary.body || '').trim();
+          if (!title && !body) return '';
+          if (!body) return title;
+          if (!title) return body;
+          return title + '；' + body;
+        }
+        function buildProjectClosureZoneHint(closure, projectId, zone) {
+          const summary = buildProjectClosureStageSummary(closure, projectId);
+          if (!summary) return null;
+          const normalizedZone = String(zone || '').trim().toLowerCase();
+          const actionKey = String(summary.actionEntrypointKey || '').trim();
+          const actionLabel = String(summary.actionLabel || '查看下一步').trim();
+          const zoneLabel = normalizedZone === 'materials' ? '资料区' : '施组区';
+          const zoneRelevantKeys = normalizedZone === 'materials'
+            ? ['upload_materials']
+            : ['upload_shigong', 'score_shigong', 'ground_truth', 'auto_run_reflection', 'project_evaluation', 'evaluation_summary'];
+          const isRelevant = !!(actionKey && zoneRelevantKeys.includes(actionKey));
+          if (isRelevant) {
+            return {
+              title: zoneLabel + '是当前推荐入口',
+              body: String(summary.body || '').trim() || ('下一步请执行：' + actionLabel),
+              actionEntrypointKey: actionKey,
+              actionLabel: actionLabel,
+              tone: summary.tone || '#166534',
+            };
+          }
+          if (!actionKey) {
+            return {
+              title: zoneLabel + '当前暂无新的推进动作',
+              body: String(summary.body || '').trim() || '当前系统暂无可执行的下一步。',
+              actionEntrypointKey: '',
+              actionLabel: '',
+              tone: summary.tone || '#475569',
+            };
+          }
+          return {
+            title: zoneLabel + '已完成当前阶段',
+            body: '当前项目阶段：' + String(summary.title || '-')
+              + '。下一步建议执行：' + actionLabel + '。',
+            actionEntrypointKey: actionKey,
+            actionLabel: actionLabel,
+            tone: '#475569',
+          };
+        }
+        function ensureProjectClosureZoneHintContainer(anchorId, containerId) {
+          const anchor = document.getElementById(anchorId);
+          if (!anchor || !anchor.parentNode) return null;
+          let el = document.getElementById(containerId);
+          if (!el) {
+            el = document.createElement('div');
+            el.id = containerId;
+            el.className = 'result-block';
+            el.style.display = 'none';
+            el.style.marginTop = '8px';
+            anchor.parentNode.insertBefore(el, anchor.nextSibling);
+          }
+          return el;
+        }
+        function clearProjectClosureZoneHint(containerId) {
+          const el = document.getElementById(containerId);
+          if (!el) return;
+          el.style.display = 'none';
+          el.innerHTML = '';
+        }
+        function clearActionScopedClosureZoneHint(actionStatusId) {
+          const raw = String(actionStatusId || '').trim();
+          if (!raw) return;
+          if (raw === 'shigongActionStatus') {
+            clearProjectClosureZoneHint('shigongClosureHint');
+            return;
+          }
+          if (
+            raw === 'materialsActionStatus'
+            || raw === 'materialsActionStatusBoq'
+            || raw === 'materialsActionStatusDrawing'
+            || raw === 'materialsActionStatusPhoto'
+          ) {
+            clearProjectClosureZoneHint('materialsClosureHint');
+          }
+        }
+        function renderProjectClosureZoneHint(zone, anchorId, containerId, closure, projectId) {
+          const normalizedProjectId = String(projectId || '').trim();
+          if (!normalizedProjectId) {
+            clearProjectClosureZoneHint(containerId);
+            return;
+          }
+          const hint = buildProjectClosureZoneHint(closure, normalizedProjectId, zone);
+          if (!hint) {
+            clearProjectClosureZoneHint(containerId);
+            return;
+          }
+          const el = ensureProjectClosureZoneHintContainer(anchorId, containerId);
+          if (!el) return;
+          renderClosureHintBlock(el, {
+            headingText: String(hint.title || '').trim(),
+            paragraphs: [
+              { text: String(hint.body || '').trim(), style: 'margin:4px 0 0 0;color:#475569' },
+            ],
+            actionEntrypointKey: hint.actionEntrypointKey,
+            actionLabel: hint.actionLabel || '查看下一步',
+          });
+        }
+        function ensureProjectSelectionClosureHintContainer() {
+          const anchor = document.getElementById('selectProjectMessage');
+          if (!anchor || !anchor.parentNode) return null;
+          let el = document.getElementById('projectSelectionClosureHint');
+          if (!el) {
+            el = document.createElement('div');
+            el.id = 'projectSelectionClosureHint';
+            el.className = 'result-block';
+            el.style.display = 'none';
+            el.style.marginTop = '8px';
+            anchor.parentNode.insertBefore(el, anchor.nextSibling);
+          }
+          return el;
+        }
+        function clearProjectSelectionClosureHint() {
+          const el = document.getElementById('projectSelectionClosureHint');
+          if (!el) return;
+          el.style.display = 'none';
+          el.innerHTML = '';
+        }
+        function renderProjectSelectionClosureHint(closure, projectId) {
+          const normalizedProjectId = String(projectId || '').trim();
+          if (!normalizedProjectId) {
+            clearProjectSelectionClosureHint();
+            return;
+          }
+          const el = ensureProjectSelectionClosureHintContainer();
+          if (!el) return;
+          const selectedProjectName = currentSelectedProjectDisplayName() || normalizedProjectId;
+          const summary = buildProjectClosureStageSummary(closure, normalizedProjectId);
+          if (!summary) {
+            clearProjectSelectionClosureHint();
+            return;
+          }
+          renderClosureHintBlock(el, {
+            headingText: summary.title || '',
+            paragraphs: [
+              { label: '项目', text: selectedProjectName, style: 'margin:6px 0 0 0;color:#475569' },
+              { text: summary.body || '', style: 'margin:4px 0 0 0;color:#475569' },
+              summary.actionEntrypointKey
+                ? { label: '推荐入口', text: summary.actionEntrypointLabel || '-', style: 'margin:4px 0 0 0;color:#64748b' }
+                : null,
+              summary.actionEntrypointKey
+                ? { label: '推荐动作', text: summary.actionLabel || '查看下一步', style: 'margin:8px 0 0 0;color:#64748b' }
+                : null,
+            ],
+            actionEntrypointKey: summary.actionEntrypointKey,
+            actionLabel: summary.actionLabel || '查看下一步',
+          });
+        }
+        function refreshProjectScopedClosureInlineHints() {
+          const currentProjectId = String(pid() || '').trim();
+          if (!currentProjectId) {
+            clearProjectSelectionClosureHint();
+            clearProjectClosureZoneHint('materialsClosureHint');
+            clearProjectClosureZoneHint('shigongClosureHint');
+            return;
+          }
+          if (materialParseSummaryState && typeof renderMaterialParseSummary === 'function') {
+            renderMaterialParseSummary(
+              materialParseSummaryState.summary || {},
+              materialParseSummaryState.materials || []
+            );
+          }
+          if (
+            scoringReadinessPanelState
+            && typeof renderScoringReadinessPanel === 'function'
+            && String(scoringReadinessPanelState.project_id || '') === currentProjectId
+          ) {
+            renderScoringReadinessPanel(scoringReadinessPanelState);
+          } else if (
+            scoringReadinessState
+            && typeof updateShigongGateSummary === 'function'
+            && String(scoringReadinessState.project_id || '') === currentProjectId
+          ) {
+            updateShigongGateSummary(scoringReadinessState);
+          }
+          renderProjectSelectionClosureHint(systemClosureSummaryState, currentProjectId);
         }
         function normalizeTenderCreateErrorMessage(detail, projectNameOverride='') {
           const raw = String(detail || '').trim();
@@ -27991,17 +38906,382 @@ def index(
           html += '</table>';
           el.innerHTML = html;
         }
-        function setScoringFactorsResult(summary, details, isError) {
-          const el = document.getElementById('scoringFactorsResult');
+        function setDataHygieneResult(summary, details, isError) {
+          const el = document.getElementById('dataHygieneResult');
           if (!el) return;
           el.style.display = 'block';
-          el.style.borderLeftColor = isError ? '#b91c1c' : '#2563eb';
+          el.style.borderLeftColor = isError ? '#b91c1c' : '#15803d';
           el.innerHTML = '<strong></strong><pre style="margin-top:6px"></pre>';
           const strong = el.querySelector('strong');
           const pre = el.querySelector('pre');
           if (strong) strong.textContent = summary || '';
           if (pre) pre.textContent = details || '';
         }
+        function renderDataHygienePanel(payload) {
+          const el = document.getElementById('dataHygieneResult');
+          if (!el) return;
+          const data = (payload && typeof payload === 'object') ? payload : {};
+          const datasets = Array.isArray(data.datasets) ? data.datasets : [];
+          const recommendations = Array.isArray(data.recommendations) ? data.recommendations : [];
+          const orphanRecordsTotal = Number(data.orphan_records_total || 0);
+          const cleanedRecordsTotal = Number(data.cleaned_records_total || 0);
+          const validProjectCount = Number(data.valid_project_count || 0);
+          const applyMode = !!data.apply_mode;
+          let summary = '数据卫生良好：未发现孤儿记录';
+          let accent = '#15803d';
+          if (orphanRecordsTotal > 0) {
+            summary = applyMode
+              ? ('数据卫生修复已完成：清理 ' + cleanedRecordsTotal + ' 条孤儿记录')
+              : ('数据卫生巡检发现 ' + orphanRecordsTotal + ' 条孤儿记录');
+            accent = '#b45309';
+          }
+          el.style.display = 'block';
+          el.style.borderLeftColor = accent;
+          let html = '<strong>' + escapeHtmlText(summary) + '</strong>';
+          html += '<p style="margin:6px 0 0 0;font-size:12px;color:#475569">'
+            + '有效项目数：' + escapeHtmlText(String(validProjectCount))
+            + '；巡检模式：' + escapeHtmlText(applyMode ? '修复' : '只读审计')
+            + '；生成时间：' + escapeHtmlText(String(data.generated_at || '-'))
+            + '</p>';
+          html += '<table style="margin-top:8px"><tr><th>数据集</th><th>总记录</th><th>孤儿记录</th><th>已清理</th><th>关联模式</th></tr>'
+            + (datasets.length
+              ? datasets.map((row) => {
+                const item = (row && typeof row === 'object') ? row : {};
+                return '<tr>'
+                  + '<td>' + escapeHtmlText(String(item.name || '-')) + '</td>'
+                  + '<td>' + escapeHtmlText(String(item.total || 0)) + '</td>'
+                  + '<td>' + escapeHtmlText(String(item.orphan_count || 0)) + '</td>'
+                  + '<td>' + escapeHtmlText(String(item.cleaned_count || 0)) + '</td>'
+                  + '<td>' + escapeHtmlText(String(item.mode || '-')) + '</td>'
+                  + '</tr>';
+              }).join('')
+              : '<tr><td colspan="5">暂无巡检数据</td></tr>')
+            + '</table>';
+          if (recommendations.length) {
+            html += '<strong>建议动作</strong><ul style="margin:6px 0 0 18px;color:#334155">'
+              + recommendations.map((x) => '<li>' + escapeHtmlText(String(x || '')) + '</li>').join('')
+              + '</ul>';
+          }
+          el.innerHTML = html;
+        }
+        window.renderDataHygienePanel = renderDataHygienePanel;
+        function setScoringFactorsResult(summary, details, isError) {
+          const el = document.getElementById('scoringFactorsResult');
+          if (!el) return;
+          el.style.display = 'block';
+          el.style.borderLeftColor = isError ? '#b91c1c' : '#2563eb';
+          el.innerHTML = '<strong></strong><pre style="margin-top:6px"></pre>';
+          if (el.dataset) delete el.dataset.renderSignature;
+          const strong = el.querySelector('strong');
+          const pre = el.querySelector('pre');
+          if (strong) strong.textContent = summary || '';
+          if (pre) pre.textContent = details || '';
+        }
+        function renderPendingFeedbackPatchBundleSection(bundle, titleText='待确认反馈改写补丁包') {
+          const data = (bundle && typeof bundle === 'object') ? bundle : {};
+          const patchSections = Array.isArray(data.sections) ? data.sections : [];
+          const patchMarkdown = String(data.copy_markdown || '').trim();
+          if (!patchSections.length && !patchMarkdown) return '';
+          const renderParagraphList = (items) => {
+            const rows = Array.isArray(items)
+              ? items.map((item) => String(item || '').trim()).filter((item) => !!item)
+              : [];
+            if (!rows.length) {
+              return '<p class="muted" style="margin:6px 0 0 0">暂无可复制正文</p>';
+            }
+            return '<ul class="scoring-factors-list">'
+              + rows.map((item) => '<li>' + escapeHtmlText(item) + '</li>').join('')
+              + '</ul>';
+          };
+          let html = '<div class="scoring-factors-section"><h4>'
+            + escapeHtmlText(String(titleText || '待确认反馈改写补丁包'))
+            + '</h4>'
+            + '<p class="scoring-factors-meta">补丁小节：'
+            + escapeHtmlText(String(data.section_count || patchSections.length || 0))
+            + '；章节锚点插入：' + escapeHtmlText(String(data.insert_after_anchor_count || 0))
+            + '；关键词锚点插入：' + escapeHtmlText(String(data.keyword_anchor_count || 0))
+            + '；新增小节：' + escapeHtmlText(String(data.append_new_section_count || 0))
+            + '</p>';
+          if (patchSections.length) {
+            html += '<div class="scoring-factors-card-grid">'
+              + patchSections.slice(0, 6).map((row) => {
+                const section = (row && typeof row === 'object') ? row : {};
+                const paragraphs = Array.isArray(section.section_paragraphs)
+                  ? section.section_paragraphs.slice(0, 3)
+                  : [];
+                const copyBlock = String(section.copy_block || '').trim();
+                let card = '<div class="scoring-factors-card pending">';
+                card += '<p class="scoring-factors-meta">'
+                  + escapeHtmlText(String(section.dimension_id || ''))
+                  + (section.dimension_name
+                    ? (' ' + escapeHtmlText(String(section.dimension_name || '')))
+                    : '')
+                  + '</p>';
+                card += '<h4>' + escapeHtmlText(String(section.section_title || '改写补丁')) + '</h4>';
+                card += '<p class="scoring-factors-meta">写入方式：'
+                  + escapeHtmlText(String(section.operation_label || '-')) + '</p>';
+                card += '<p class="scoring-factors-meta">写入位置：'
+                  + escapeHtmlText(String(section.target || '-')) + '</p>';
+                if (paragraphs.length) {
+                  card += '<strong>改写正文</strong>' + renderParagraphList(paragraphs);
+                }
+                if (copyBlock) {
+                  card += '<details><summary>查看可复制补丁</summary>'
+                    + '<div class="scoring-factors-template">' + escapeHtmlText(copyBlock) + '</div>'
+                    + '</details>';
+                }
+                card += '</div>';
+                return card;
+              }).join('')
+              + '</div>';
+          }
+          if (patchMarkdown) {
+            html += '<details><summary>查看项目级补丁包</summary>'
+              + '<div class="scoring-factors-template">' + escapeHtmlText(patchMarkdown) + '</div>'
+              + '</details>';
+          }
+          html += '</div>';
+          return html;
+        }
+        function renderScoringFactorsPanel(payload) {
+          const el = document.getElementById('scoringFactorsResult');
+          if (!el) return;
+          const data = (payload && typeof payload === 'object') ? payload : {};
+          const chapter = (data.chapter_requirements && typeof data.chapter_requirements === 'object')
+            ? data.chapter_requirements
+            : {};
+          const adaptiveSummary = (data.adaptive_summary && typeof data.adaptive_summary === 'object')
+            ? data.adaptive_summary
+            : {};
+          const adaptivePoints = Array.isArray(data.adaptive_scoring_points)
+            ? data.adaptive_scoring_points
+            : [];
+          const pendingFeedbackSummary = (data.pending_feedback_summary && typeof data.pending_feedback_summary === 'object')
+            ? data.pending_feedback_summary
+            : {};
+          const pendingFeedbackPoints = Array.isArray(data.pending_feedback_scoring_points)
+            ? data.pending_feedback_scoring_points
+            : [];
+          const pendingFeedbackPatchBundle = (data.pending_feedback_patch_bundle && typeof data.pending_feedback_patch_bundle === 'object')
+            ? data.pending_feedback_patch_bundle
+            : {};
+          const flags = (data.capability_flags && typeof data.capability_flags === 'object')
+            ? data.capability_flags
+            : {};
+          const source = (data.source && typeof data.source === 'object') ? data.source : {};
+          const renderList = (items, emptyText='暂无') => {
+            const rows = Array.isArray(items)
+              ? items.map((item) => String(item || '').trim()).filter((item) => !!item)
+              : [];
+            if (!rows.length) {
+              return '<p class="muted" style="margin:6px 0 0 0">' + escapeHtmlText(emptyText) + '</p>';
+            }
+            return '<ul class="scoring-factors-list">'
+              + rows.map((item) => '<li>' + escapeHtmlText(item) + '</li>').join('')
+              + '</ul>';
+          };
+          const renderPills = (items) => {
+            const rows = Array.isArray(items)
+              ? items.map((item) => String(item || '').trim()).filter((item) => !!item)
+              : [];
+            if (!rows.length) return '';
+            return '<div class="scoring-factors-pills">'
+              + rows.map((item) => '<span class="scoring-factors-pill">' + escapeHtmlText(item) + '</span>').join('')
+              + '</div>';
+          };
+          const renderPointCard = (item, mode) => {
+            const row = (item && typeof item === 'object') ? item : {};
+            const hints = Array.isArray(row.hint_preview) ? row.hint_preview.slice(0, 4) : [];
+            const sourceFilename = String(row.source_submission_filename || '').trim();
+            const sourceLabel = String(row.source_label || '').trim();
+            const dimensionLabel = String(row.dimension_id || '').trim()
+              + (row.dimension_name ? (' ' + String(row.dimension_name || '').trim()) : '');
+            let cardHtml = '<div class="scoring-factors-card ' + escapeHtmlText(mode) + '">';
+            cardHtml += '<p class="scoring-factors-meta">'
+              + escapeHtmlText(sourceLabel || (mode === 'pending' ? '待确认真实评标反馈' : '动态评分点'))
+              + (dimensionLabel.trim() ? ('；维度：' + escapeHtmlText(dimensionLabel.trim())) : '')
+              + '</p>';
+            cardHtml += '<h4>' + escapeHtmlText(String(row.title || '未命名评分点')) + '</h4>';
+            if (mode === 'adaptive') {
+              const weightText = Number(row.weight || 0);
+              cardHtml += '<p class="scoring-factors-meta">'
+                + '权重：' + escapeHtmlText(weightText ? String(weightText) : '-')
+                + (sourceFilename ? ('；来源施组：' + escapeHtmlText(sourceFilename)) : '')
+                + '</p>';
+            } else {
+              const recommendedSection = String(row.recommended_section || '').trim() || '待补充';
+              const recommendedSubsection = String(row.recommended_subsection || '').trim() || '待补充';
+              const currentAnchor = String(row.current_submission_anchor || '').trim();
+              const gapSummary = String(row.gap_summary || '').trim();
+              const insertionHint = String(row.insertion_hint || '').trim();
+              const currentExcerpt = String(row.current_submission_excerpt || '').trim();
+              const guardrailReason = String(row.guardrail_reason || '').trim() || '待人工确认';
+              cardHtml += '<p class="scoring-factors-meta">'
+                + '推荐章节：' + escapeHtmlText(recommendedSection)
+                + (sourceFilename ? ('；样本：' + escapeHtmlText(sourceFilename)) : '')
+                + '</p>';
+              cardHtml += '<p class="scoring-factors-meta">建议小节：' + escapeHtmlText(recommendedSubsection) + '</p>';
+              if (currentAnchor) {
+                cardHtml += '<p class="scoring-factors-meta">当前施组锚点：' + escapeHtmlText(currentAnchor) + '</p>';
+              }
+              cardHtml += '<p class="scoring-factors-meta">阻断原因：' + escapeHtmlText(guardrailReason) + '</p>';
+              if (gapSummary) {
+                cardHtml += '<strong>当前缺口</strong><p class="scoring-factors-meta">' + escapeHtmlText(gapSummary) + '</p>';
+              }
+              if (insertionHint) {
+                cardHtml += '<strong>插入建议</strong><p class="scoring-factors-meta">' + escapeHtmlText(insertionHint) + '</p>';
+              }
+              const actionSteps = Array.isArray(row.action_steps) ? row.action_steps.slice(0, 4) : [];
+              const evidenceToAdd = Array.isArray(row.evidence_to_add) ? row.evidence_to_add.slice(0, 6) : [];
+              const rewriteSentences = Array.isArray(row.rewrite_sentences) ? row.rewrite_sentences.slice(0, 3) : [];
+              const insertableParagraphs = Array.isArray(row.insertable_paragraphs) ? row.insertable_paragraphs.slice(0, 3) : [];
+              const draftSectionTitle = String(row.draft_section_title || '').trim();
+              const draftSectionParagraphs = Array.isArray(row.draft_section_paragraphs) ? row.draft_section_paragraphs.slice(0, 3) : [];
+              const autoRewriteOperationLabel = String(row.auto_rewrite_operation_label || '').trim();
+              const autoRewriteTarget = String(row.auto_rewrite_target || '').trim();
+              const autoRewriteBeforeExcerpt = String(row.auto_rewrite_before_excerpt || '').trim();
+              const autoRewriteSectionTitle = String(row.auto_rewrite_section_title || '').trim();
+              const autoRewriteParagraphs = Array.isArray(row.auto_rewrite_section_paragraphs) ? row.auto_rewrite_section_paragraphs.slice(0, 3) : [];
+              if (actionSteps.length) {
+                cardHtml += '<strong>建议动作</strong>' + renderList(actionSteps);
+              }
+              if (evidenceToAdd.length) {
+                cardHtml += '<strong>建议补证</strong>' + renderPills(evidenceToAdd);
+              }
+              if (rewriteSentences.length) {
+                cardHtml += '<strong>句式模板</strong>' + renderList(rewriteSentences);
+              }
+              if (insertableParagraphs.length) {
+                cardHtml += '<strong>可直接贴入正文</strong>' + renderList(insertableParagraphs);
+              }
+              const rewriteTemplate = String(row.rewrite_template || '').trim();
+              if (rewriteTemplate) {
+                cardHtml += '<details><summary>查看改写模板</summary>'
+                  + '<div class="scoring-factors-template">' + escapeHtmlText(rewriteTemplate) + '</div>'
+                  + '</details>';
+              }
+              if (currentExcerpt) {
+                cardHtml += '<details><summary>查看当前施组锚点摘录</summary>'
+                  + '<div class="scoring-factors-template">' + escapeHtmlText(currentExcerpt) + '</div>'
+                  + '</details>';
+              }
+              if (draftSectionTitle || draftSectionParagraphs.length) {
+                cardHtml += '<details><summary>查看小节草稿</summary><div class="scoring-factors-template">';
+                if (draftSectionTitle) {
+                  cardHtml += '<p style="margin:0 0 8px 0"><strong>标题：</strong>' + escapeHtmlText(draftSectionTitle) + '</p>';
+                }
+                if (draftSectionParagraphs.length) {
+                  cardHtml += draftSectionParagraphs.map((item) => '<p style="margin:0 0 8px 0">' + escapeHtmlText(String(item || '')) + '</p>').join('');
+                }
+                cardHtml += '</div></details>';
+              }
+              if (autoRewriteOperationLabel || autoRewriteSectionTitle || autoRewriteParagraphs.length) {
+                cardHtml += '<details><summary>查看自动改写草案</summary><div class="scoring-factors-template">';
+                if (autoRewriteOperationLabel) {
+                  cardHtml += '<p style="margin:0 0 8px 0"><strong>写入方式：</strong>' + escapeHtmlText(autoRewriteOperationLabel) + '</p>';
+                }
+                if (autoRewriteTarget) {
+                  cardHtml += '<p style="margin:0 0 8px 0"><strong>写入位置：</strong>' + escapeHtmlText(autoRewriteTarget) + '</p>';
+                }
+                if (autoRewriteBeforeExcerpt) {
+                  cardHtml += '<p style="margin:0 0 8px 0"><strong>原文摘录：</strong>' + escapeHtmlText(autoRewriteBeforeExcerpt) + '</p>';
+                }
+                if (autoRewriteSectionTitle) {
+                  cardHtml += '<p style="margin:0 0 8px 0"><strong>改写标题：</strong>' + escapeHtmlText(autoRewriteSectionTitle) + '</p>';
+                }
+                if (autoRewriteParagraphs.length) {
+                  cardHtml += autoRewriteParagraphs.map((item) => '<p style="margin:0 0 8px 0">' + escapeHtmlText(String(item || '')) + '</p>').join('');
+                }
+                cardHtml += '</div></details>';
+              }
+            }
+            if (hints.length) {
+              cardHtml += '<strong>命中提示</strong>' + renderList(hints);
+            }
+            cardHtml += '</div>';
+            return cardHtml;
+          };
+          const statCards = [
+            { value: data.dimension_count || 0, label: '评分维度' },
+            { value: Array.isArray(data.penalty_rules) ? data.penalty_rules.length : 0, label: '扣分规则' },
+            { value: Array.isArray(chapter.required_sections) ? chapter.required_sections.length : 0, label: '必备章节' },
+            { value: adaptiveSummary.total_points || 0, label: '动态评分点' },
+            { value: pendingFeedbackSummary.pending_sample_count || 0, label: '待确认样本' },
+            { value: pendingFeedbackSummary.pending_point_count || 0, label: '待确认反馈点' },
+          ];
+          const capabilityItems = [
+            '组织机构要求：' + (flags.organization_structure_required ? '是' : '否'),
+            '章节完整性：' + (flags.chapter_content_completeness_required ? '是' : '否'),
+            '重难点要求：' + (flags.key_difficult_points_required ? '是' : '否'),
+            '图文要求：' + (flags.graphic_content_required ? '是' : '否'),
+            '一致性校验：' + (flags.consistency_checks_enabled ? '启用' : '关闭'),
+            'Lint校验：' + (flags.lint_checks_enabled ? '启用' : '关闭'),
+          ];
+          const updatedAtText = escapeHtmlText(String(data.updated_at || '').slice(0, 19) || '-');
+          let html = '<strong>评分体系总览已加载</strong>';
+          html += '<p class="scoring-factors-meta">'
+            + '项目：' + escapeHtmlText(String(data.project_id || '-'))
+            + '；引擎版本：' + escapeHtmlText(String(data.engine_version || 'v2'))
+            + '；规则版本：' + escapeHtmlText(String(source.rubric_version || '-'))
+            + '；章节来源：' + escapeHtmlText(String(source.chapter_requirements || '-'))
+            + '；更新时间：' + updatedAtText
+            + '</p>';
+          html += '<div class="scoring-factors-grid">'
+            + statCards.map((row) => '<div class="scoring-factors-stat"><strong>'
+              + escapeHtmlText(String(row.value || 0))
+              + '</strong><span>' + escapeHtmlText(String(row.label || '')) + '</span></div>').join('')
+            + '</div>';
+          html += '<div class="scoring-factors-section"><h4>章节与编制要求</h4><div class="scoring-factors-columns">'
+            + '<div><strong>必备章节</strong>' + renderList(chapter.required_sections, '当前无项目级章节要求') + '</div>'
+            + '<div><strong>必备图表/图片</strong>' + renderList(chapter.required_charts_images, '当前无额外图文要求') + '</div>'
+            + '<div><strong>必备要素</strong>' + renderList(chapter.mandatory_elements, '当前无必备要素') + '</div>'
+            + '<div><strong>禁止表述</strong>' + renderList(chapter.forbidden_patterns, '当前无禁止表述') + '</div>'
+            + '</div></div>';
+          html += '<div class="scoring-factors-section"><h4>能力覆盖与数据来源</h4><div class="scoring-factors-columns">'
+            + '<div><strong>能力覆盖</strong>' + renderPills(capabilityItems) + '</div>'
+            + '<div><strong>数据来源</strong>' + renderPills([
+              '评分规则：' + String(source.rubric_version || '-'),
+              '章节要求：' + String(source.chapter_requirements || '-'),
+              '动态评分点：' + String(source.adaptive_scoring_points || '-'),
+            ]) + '</div>'
+            + '</div></div>';
+          html += '<div class="scoring-factors-section"><h4>动态评分点（结合上传资料与真实评标）</h4>'
+            + '<p class="scoring-factors-meta">资料驱动：'
+            + escapeHtmlText(String(adaptiveSummary.material_points || 0))
+            + '；已生效真实评标反馈：' + escapeHtmlText(String(adaptiveSummary.feedback_points || 0))
+            + '；高置信学习骨架：' + escapeHtmlText(String(adaptiveSummary.feature_points || 0))
+            + '</p>';
+          if (adaptivePoints.length) {
+            html += '<div class="scoring-factors-card-grid">'
+              + adaptivePoints.slice(0, 12).map((item) => renderPointCard(item, 'adaptive')).join('')
+              + '</div>';
+          } else {
+            html += '<p class="muted" style="margin:6px 0 0 0">当前项目暂未形成动态评分点。</p>';
+          }
+          html += '</div>';
+          html += '<div class="scoring-factors-section"><h4>待确认真实评标反馈点（未正式生效）</h4>'
+            + '<p class="scoring-factors-meta">待人工确认样本：'
+            + escapeHtmlText(String(pendingFeedbackSummary.pending_sample_count || 0))
+            + '；待确认反馈点：'
+            + escapeHtmlText(String(pendingFeedbackSummary.pending_point_count || 0))
+            + '。这些点来自已录入真实评标，但当前仍处于人工确认门内，尚未自动纳入正式评分主链。</p>';
+          if (pendingFeedbackPoints.length) {
+            html += '<div class="scoring-factors-card-grid">'
+              + pendingFeedbackPoints.slice(0, 12).map((item) => renderPointCard(item, 'pending')).join('')
+              + '</div>';
+          } else {
+            html += '<p class="muted" style="margin:6px 0 0 0">当前没有待确认真实评标反馈点。</p>';
+          }
+          html += '</div>';
+          html += renderPendingFeedbackPatchBundleSection(pendingFeedbackPatchBundle);
+          const stableHtml = html.replace(/；更新时间：[^<]*/g, '；更新时间：__volatile__');
+          replaceElementHtmlIfChanged(
+            'scoringFactorsResult',
+            html,
+            'scoring_factors|' + buildTableRenderSignature([stableHtml])
+          );
+        }
+        window.renderScoringFactorsPanel = renderScoringFactorsPanel;
         async function probeEndpoint(url, options) {
           try {
             const res = await fetch(url, options);
@@ -28035,8 +39315,43 @@ def index(
           }
           const data = r.data || {};
           renderSelfCheckPanel(data);
-          const out = document.getElementById('output');
-          if (out) out.textContent = JSON.stringify(data, null, 2);
+          const summary = (data && typeof data.summary === 'object') ? data.summary : {};
+          showOutputSummary({
+            message: '系统自检已完成',
+            project_id: summary.project_id || pid() || '-',
+            total_items: summary.total_items || 0,
+            failed_required_count: data.failed_required_count || 0,
+            failed_optional_count: data.failed_optional_count || 0,
+            degraded: !!data.degraded,
+            parser_capability_count: summary.parser_capability_count || 0,
+          });
+        }
+        async function runSystemDataHygiene() {
+          setDataHygieneResult('正在执行数据卫生巡检…', '', false);
+          const r = await probeEndpoint('/api/v1/system/data_hygiene');
+          if (r.error) {
+            setDataHygieneResult('数据卫生巡检失败', r.error, true);
+            const out = document.getElementById('output');
+            if (out) out.textContent = r.error;
+            return;
+          }
+          if (!r.ok) {
+            const detail = (r.data && r.data.detail) ? String(r.data.detail) : String(r.text || '').slice(0, 200);
+            setDataHygieneResult('数据卫生巡检失败', 'HTTP ' + r.status + ' ' + detail, true);
+            const out = document.getElementById('output');
+            if (out) out.textContent = detail;
+            return;
+          }
+          const data = r.data || {};
+          const datasets = Array.isArray(data.datasets) ? data.datasets : [];
+          renderDataHygienePanel(data);
+          showOutputSummary({
+            message: '数据卫生巡检已完成',
+            valid_project_count: data.valid_project_count || 0,
+            orphan_records_total: data.orphan_records_total || 0,
+            cleaned_records_total: data.cleaned_records_total || 0,
+            affected_dataset_count: datasets.filter((item) => Number((item && item.orphan_count) || 0) > 0).length,
+          });
         }
         async function loadScoringFactorsOverview() {
           const currentId = pid();
@@ -28066,13 +39381,24 @@ def index(
             '，章节完整性=' + (flags.chapter_content_completeness_required ? '是' : '否') +
             '，重难点要求=' + (flags.key_difficult_points_required ? '是' : '否') +
             '，图文要求=' + (flags.graphic_content_required ? '是' : '否');
-          const details = JSON.stringify(d, null, 2);
-          setScoringFactorsResult(summary, details, false);
-          const out = document.getElementById('output');
-          if (out) out.textContent = details;
+          renderScoringFactorsPanel(d);
+          showOutputSummary({
+            message: '评分体系总览已加载',
+            project_id: currentId || '-',
+            dimension_count: d.dimension_count || 0,
+            penalty_rule_count: Array.isArray(d.penalty_rules) ? d.penalty_rules.length : 0,
+            adaptive_point_count: Number((d.adaptive_summary && d.adaptive_summary.total_points) || 0),
+            pending_feedback_sample_count: Number((d.pending_feedback_summary && d.pending_feedback_summary.pending_sample_count) || 0),
+            pending_feedback_point_count: Number((d.pending_feedback_summary && d.pending_feedback_summary.pending_point_count) || 0),
+            pending_feedback_patch_section_count: Number((d.pending_feedback_patch_bundle && d.pending_feedback_patch_bundle.section_count) || 0),
+            organization_structure_required: !!flags.organization_structure_required,
+            chapter_content_completeness_required: !!flags.chapter_content_completeness_required,
+            key_difficult_points_required: !!flags.key_difficult_points_required,
+            graphic_content_required: !!flags.graphic_content_required,
+          });
         }
         async function loadScoringFactorsMarkdown() {
-          if (SECURE_DESKTOP_MODE) {
+          if (secureDesktopEnabled()) {
             secureDesktopBlockResult('scoringFactorsResult');
             return;
           }
@@ -28097,11 +39423,15 @@ def index(
           }
           const markdown = String((r.data && r.data.markdown) || '');
           setScoringFactorsResult('评分体系 Markdown 已生成（可直接复制到 ChatGPT）', markdown.slice(0, 600) + (markdown.length > 600 ? '\\n...（已截断预览）' : ''), false);
-          const out = document.getElementById('output');
-          if (out) out.textContent = markdown;
+          showOutputSummary({
+            message: '评分体系 Markdown 已生成',
+            project_id: currentId || '-',
+            markdown_chars: markdown.length,
+            preview: summarizeOutputScalar(markdown, 120),
+          });
         }
         async function loadProjectAnalysisBundle() {
-          if (SECURE_DESKTOP_MODE) {
+          if (secureDesktopEnabled()) {
             secureDesktopBlockResult('scoringFactorsResult');
             return;
           }
@@ -28128,11 +39458,15 @@ def index(
           }
           const markdown = String((r.data && r.data.markdown) || '');
           setScoringFactorsResult('项目分析包已生成（可直接复制给 ChatGPT）', markdown.slice(0, 600) + (markdown.length > 600 ? '\\n...（已截断预览）' : ''), false);
-          const out = document.getElementById('output');
-          if (out) out.textContent = markdown;
+          showOutputSummary({
+            message: '项目分析包已生成',
+            project_id: currentId,
+            markdown_chars: markdown.length,
+            preview: summarizeOutputScalar(markdown, 120),
+          });
         }
         async function downloadProjectAnalysisBundle() {
-          if (SECURE_DESKTOP_MODE) {
+          if (secureDesktopEnabled()) {
             secureDesktopBlockResult('scoringFactorsResult');
             return;
           }
@@ -28166,11 +39500,24 @@ def index(
         }
         async function refreshProjects(preferredProjectId='', options=null) {
           const opts = (options && typeof options === 'object') ? options : {};
+          if (!opts.skipCoalesce) {
+            const projectKey = String(
+              preferredProjectId || storageGet('selected_project_id') || pid() || '__project_picker__'
+            ).trim() || '__project_picker__';
+            return runProjectRefreshTask(
+              'project_picker',
+              projectKey,
+              () => refreshProjects(preferredProjectId, Object.assign({}, opts, { skipCoalesce: true }))
+            );
+          }
           const allowEmptySelection = !!opts.allowEmptySelection;
           const intakeMode = allowEmptySelection || projectIntakeModeEnabled();
           const emptySelectionMessage = String(
             opts.emptySelectionMessage || '已切换到新项目录入界面，历史项目已保留并隐藏。'
           );
+          const closureSummaryOptions = (
+            opts.closureSummaryOptions && typeof opts.closureSummaryOptions === 'object'
+          ) ? opts.closureSummaryOptions : { reason: 'refresh_projects', silent: true };
           setSelectMsg('正在加载…', false);
           const current = preferredProjectId || (
             intakeMode
@@ -28209,6 +39556,7 @@ def index(
             return at.localeCompare(bt);
           });
           projectListCache = list.slice();
+          if (preferredProjectId) syncProjectMonthFilterToPreferredProject(projectListCache, preferredProjectId);
           if (!res.ok) {
             const errMsg = (typeof list === 'object' && list && list.detail) ? String(list.detail) : (text || '').slice(0, 200);
             setSelectMsg('刷新失败: ' + res.status + ' ' + errMsg, true);
@@ -28276,12 +39624,22 @@ def index(
           }
           applyProjectScoreScale(sel.value || '');
           await onProjectChanged({
+            skipClosureSummaryRefresh: true,
             emptySelectionIsInfo: intakeMode || (pickerView.totalCount > 0 && list.length === 0),
             emptySelectionMessage:
               pickerView.totalCount > 0 && list.length === 0
                 ? '当前月份筛选下暂无可见项目，可切换月份查看；OPS/E2E 系统项目已默认隐藏。'
                 : emptySelectionMessage,
           });
+          let closureSummary = null;
+          if (typeof refreshSystemClosureSummary === 'function') {
+            closureSummary = await refreshSystemClosureSummary(closureSummaryOptions);
+          }
+          renderProjectSelectionClosureHint(closureSummary, String(sel.value || ''));
+          return {
+            selectedProjectId: String(sel.value || ''),
+            closureSummary: closureSummary && typeof closureSummary === 'object' ? closureSummary : null,
+          };
         }
         async function onProjectChanged(options=null) {
           const opts = (options && typeof options === 'object') ? options : {};
@@ -28295,6 +39653,7 @@ def index(
             storageRemove('selected_project_id');
             if (opts.emptySelectionIsInfo) setProjectIntakeMode(true);
           }
+          syncProjectSelectionUrl(selectedId);
           applyProjectScoreScale(selectedId);
           updateProjectBoundControlsState();
           resetProjectPanelsToStandby(selectedId);
@@ -28303,12 +39662,13 @@ def index(
               String(opts.emptySelectionMessage || '请先在上方选择项目。'),
               !opts.emptySelectionIsInfo
             );
+            clearProjectSelectionClosureHint();
             return;
           }
           await Promise.all([
             (typeof loadExpertProfile === 'function') ? loadExpertProfile(selectedId, switchSeq) : Promise.resolve(),
-            (typeof refreshSubmissions === 'function') ? refreshSubmissions(selectedId, switchSeq) : Promise.resolve(),
-            (typeof refreshMaterials === 'function') ? refreshMaterials(selectedId, switchSeq) : Promise.resolve(),
+            (typeof refreshSubmissions === 'function') ? refreshSubmissions(selectedId, switchSeq, { skipReadinessRefresh: true }) : Promise.resolve(),
+            (typeof refreshMaterials === 'function') ? refreshMaterials(selectedId, switchSeq, { skipReadinessRefresh: true }) : Promise.resolve(),
             (typeof refreshScoringReadiness === 'function') ? refreshScoringReadiness(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshScoringDiagnostic === 'function') ? refreshScoringDiagnostic(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshFeedMaterials === 'function') ? refreshFeedMaterials(selectedId, switchSeq) : Promise.resolve(),
@@ -28317,6 +39677,13 @@ def index(
           ]);
           if (isStaleProjectResponse(selectedId, switchSeq)) return;
           setSelectMsg('已切换项目并自动刷新下方所有区域。', false);
+          if (!opts.skipClosureSummaryRefresh && typeof refreshSystemClosureSummary === 'function') {
+            const closureSummary = await refreshSystemClosureSummary({
+              reason: 'project_changed',
+              silent: true,
+            });
+            renderProjectSelectionClosureHint(closureSummary, selectedId);
+          }
           scheduleProjectAutoRefresh(selectedId, switchSeq);
         }
         const INITIAL_CREATE_ERROR = __INITIAL_CREATE_ERROR__;
@@ -28423,14 +39790,12 @@ def index(
           setSelectMsg('已修正当前项目名称：' + updatedName, false);
           await refreshProjects(projectId);
         }
-        const elRefresh = document.getElementById('refreshProjects');
-        if (elRefresh) elRefresh.onclick = refreshProjects;
-        const btnStartNewProject = document.getElementById('btnStartNewProject');
-        if (btnStartNewProject) btnStartNewProject.onclick = startNewProjectIntake;
-        safeClick('btnRenameProject', renameCurrentProject);
-        safeChange('projectMonthFilter', () => refreshProjects(selectedProjectIdStrict() || ''));
-        safeChange('projectSelect', onProjectChanged);
-        safeClick('btnSelectProjectBySearch', locateProjectBySearch);
+        safeClick0('refreshProjects', refreshProjects);
+        safeClick0('btnStartNewProject', startNewProjectIntake);
+        safeClick0('btnRenameProject', renameCurrentProject);
+        safeChange0('projectMonthFilter', () => refreshProjects(selectedProjectIdStrict() || ''));
+        safeChange0('projectSelect', onProjectChanged);
+        safeClick0('btnSelectProjectBySearch', locateProjectBySearch);
         const projectSearchInput = document.getElementById('projectSearchInput');
         if (projectSearchInput) {
           projectSearchInput.addEventListener('keydown', async (event) => {
@@ -28439,112 +39804,121 @@ def index(
             await locateProjectBySearch();
           });
         }
-        const btnSelfCheck = document.getElementById('btnSelfCheck');
-        if (btnSelfCheck) btnSelfCheck.onclick = runSystemSelfCheck;
-        const btnScoringFactors = document.getElementById('btnScoringFactors');
-        if (btnScoringFactors) btnScoringFactors.onclick = loadScoringFactorsOverview;
-        const btnScoringFactorsMd = document.getElementById('btnScoringFactorsMd');
-        if (btnScoringFactorsMd) btnScoringFactorsMd.onclick = loadScoringFactorsMarkdown;
-        const btnAnalysisBundle = document.getElementById('btnAnalysisBundle');
-        if (btnAnalysisBundle) btnAnalysisBundle.onclick = loadProjectAnalysisBundle;
-        const btnAnalysisBundleDownload = document.getElementById('btnAnalysisBundleDownload');
-        if (btnAnalysisBundleDownload) btnAnalysisBundleDownload.onclick = downloadProjectAnalysisBundle;
+        safeClick0('btnScoringFactors', loadScoringFactorsOverview);
+        safeClick0('btnScoringFactorsMd', loadScoringFactorsMarkdown);
+        safeClick0('btnAnalysisBundle', loadProjectAnalysisBundle);
+        safeClick0('btnAnalysisBundleDownload', downloadProjectAnalysisBundle);
         const deleteProjectForm = document.getElementById('deleteProjectForm');
+        let deleteCurrentProjectInFlight = false;
         if (deleteProjectForm) {
           deleteProjectForm.onsubmit = async (e) => {
             e.preventDefault();
-            if (!(await ensureVerifiedApiKeyForAction('deleteCurrentProject', (msg) => setSelectMsg(msg, true)))) return;
-            const id = pid();
-            if (!id) { setSelectMsg('请先选择要删除的项目', true); return; }
-            const sel = document.getElementById('projectSelect');
-            const opt = sel && sel.options && sel.selectedIndex >= 0 ? sel.options[sel.selectedIndex] : null;
-            const label = (opt && opt.textContent) ? opt.textContent : id;
-            const ok = confirm('确认删除项目「' + label + '」？\\n此操作不可恢复，并会删除该项目全部资料和评分记录。');
-            if (!ok) return;
-            setSelectMsg('正在删除项目…', false);
-            let res, text;
+            if (deleteCurrentProjectInFlight) {
+              setSelectMsg('项目删除进行中，请稍候…', false);
+              return;
+            }
+            deleteCurrentProjectInFlight = true;
+            setButtonBusyState('deleteCurrentProject', true, { loadingLabel: '删除中...' });
             try {
-              res = await fetch('/api/v1/projects/' + id, { method: 'DELETE', headers: apiHeaders(false) });
-              text = await res.text();
-            } catch (err) {
-              setSelectMsg('删除失败: ' + (err.message || err), true);
-              return;
-            }
-            if (res.status === 204) {
-              setSelectMsg('项目已删除', false);
-              const out = document.getElementById('output');
-              if (out) out.textContent = '已删除项目：' + label;
-              await refreshProjects();
-              if (typeof refreshSubmissions === 'function') refreshSubmissions();
-              if (typeof refreshMaterials === 'function') refreshMaterials();
-              if (typeof refreshFeedMaterials === 'function') refreshFeedMaterials();
-              if (typeof refreshGroundTruth === 'function') refreshGroundTruth();
-            } else {
-              let detail = text || '';
-              try { const j = JSON.parse(text || '{}'); detail = (j && j.detail) || detail; } catch (_) {}
-              setSelectMsg('删除失败: ' + res.status + ' ' + String(detail || '').slice(0, 120), true);
-            }
-          };
-        }
-        const deleteSelectedProjectsBtn = document.getElementById('deleteSelectedProjects');
-        if (deleteSelectedProjectsBtn) {
-          deleteSelectedProjectsBtn.onclick = async () => {
-            if (!(await ensureVerifiedApiKeyForAction('deleteSelectedProjects', (msg) => setSelectMsg(msg, true)))) return;
-            const delSel = document.getElementById('projectDeleteSelect');
-            const selectedOptions = delSel ? Array.from(delSel.selectedOptions || []) : [];
-            const ids = selectedOptions.map((o) => String(o.value || '')).filter(Boolean);
-            if (!ids.length) {
-              setSelectMsg('请先在“批量删除”列表中选择项目（可按 Command/Ctrl 多选）。', true);
-              return;
-            }
-            const labels = selectedOptions.map((o) => String(o.textContent || o.value || ''));
-            const ok = confirm(
-              '确认删除所选 ' + ids.length + ' 个项目？\\n\\n'
-              + labels.join('\\n')
-              + '\\n\\n此操作不可恢复，并会删除对应项目全部资料与记录。'
-            );
-            if (!ok) return;
-            setSelectMsg('正在批量删除项目…', false);
-            const failed = [];
-            let removedCount = 0;
-            for (const id of ids) {
+              if (!(await ensureVerifiedApiKeyForAction('deleteCurrentProject', (msg) => setSelectMsg(msg, true)))) return;
+              const id = pid();
+              if (!id) { setSelectMsg('请先选择要删除的项目', true); return; }
+              const sel = document.getElementById('projectSelect');
+              const opt = sel && sel.options && sel.selectedIndex >= 0 ? sel.options[sel.selectedIndex] : null;
+              const label = (opt && opt.textContent) ? opt.textContent : id;
+              const ok = confirm('确认删除项目「' + label + '」？\\n此操作不可恢复，并会删除该项目全部资料和评分记录。');
+              if (!ok) return;
+              setSelectMsg('正在删除项目…', false);
+              let res, text;
               try {
-                const res = await fetch(
-                  '/api/v1/projects/' + encodeURIComponent(id),
-                  { method: 'DELETE', headers: apiHeaders(false) }
-                );
-                const text = await res.text();
-                if (res.status === 204) {
-                  removedCount += 1;
-                } else {
-                  let detail = text || '';
-                  try { const j = JSON.parse(text || '{}'); detail = (j && j.detail) || detail; } catch (_) {}
-                  failed.push({ project_id: id, detail: String(detail || ('HTTP ' + res.status)).slice(0, 160) });
-                }
+                res = await fetch('/api/v1/projects/' + id, { method: 'DELETE', headers: apiHeaders(false) });
+                text = await res.text();
               } catch (err) {
-                failed.push({ project_id: id, detail: String((err && err.message) || err || '网络异常') });
+                setSelectMsg('删除失败: ' + (err.message || err), true);
+                return;
               }
+              if (res.status === 204) {
+                setSelectMsg('项目已删除', false);
+                const out = document.getElementById('output');
+                if (out) out.textContent = '已删除项目：' + label;
+                clearProjectAutoRefresh();
+                clearMaterialParsePolling();
+                clearProjectRefreshInflight(id);
+                projectSwitchSeq += 1;
+                storageRemove('selected_project_id');
+                const selectEl = document.getElementById('projectSelect');
+                if (selectEl) selectEl.value = '';
+                syncProjectSelectionUrl('');
+                updateProjectBoundControlsState();
+                resetProjectPanelsToStandby('');
+                await refreshProjects();
+              } else {
+                let detail = text || '';
+                try { const j = JSON.parse(text || '{}'); detail = (j && j.detail) || detail; } catch (_) {}
+                setSelectMsg('删除失败: ' + res.status + ' ' + String(detail || '').slice(0, 120), true);
+              }
+            } finally {
+              deleteCurrentProjectInFlight = false;
+              setButtonBusyState('deleteCurrentProject', false);
             }
-            const out = document.getElementById('output');
-            if (out) {
-              out.textContent = JSON.stringify(
-                { action: 'batch_delete_projects', requested: ids.length, removed_count: removedCount, failed_count: failed.length, failed },
-                null,
-                2
-              );
-            }
-            if (failed.length) {
-              setSelectMsg('批量删除完成：成功 ' + removedCount + '，失败 ' + failed.length + '。', true);
-            } else {
-              setSelectMsg('批量删除完成：已删除 ' + removedCount + ' 个项目。', false);
-            }
-            await refreshProjects();
-            if (typeof refreshSubmissions === 'function') refreshSubmissions();
-            if (typeof refreshMaterials === 'function') refreshMaterials();
-            if (typeof refreshFeedMaterials === 'function') refreshFeedMaterials();
-            if (typeof refreshGroundTruth === 'function') refreshGroundTruth();
           };
         }
+        safeClick('deleteSelectedProjects', async () => {
+          if (!(await ensureVerifiedApiKeyForAction('deleteSelectedProjects', (msg) => setSelectMsg(msg, true)))) return;
+          const delSel = document.getElementById('projectDeleteSelect');
+          const selectedOptions = delSel ? Array.from(delSel.selectedOptions || []) : [];
+          const ids = selectedOptions.map((o) => String(o.value || '')).filter(Boolean);
+          if (!ids.length) {
+            setSelectMsg('请先在“批量删除”列表中选择项目（可按 Command/Ctrl 多选）。', true);
+            return;
+          }
+          const labels = selectedOptions.map((o) => String(o.textContent || o.value || ''));
+          const ok = confirm(
+            '确认删除所选 ' + ids.length + ' 个项目？\\n\\n'
+            + labels.join('\\n')
+            + '\\n\\n此操作不可恢复，并会删除对应项目全部资料与记录。'
+          );
+          if (!ok) return;
+          setSelectMsg('正在批量删除项目…', false);
+          const failed = [];
+          let removedCount = 0;
+          for (const id of ids) {
+            try {
+              const res = await fetch(
+                '/api/v1/projects/' + encodeURIComponent(id),
+                { method: 'DELETE', headers: apiHeaders(false) }
+              );
+              const text = await res.text();
+              if (res.status === 204) {
+                removedCount += 1;
+              } else {
+                let detail = text || '';
+                try { const j = JSON.parse(text || '{}'); detail = (j && j.detail) || detail; } catch (_) {}
+                failed.push({ project_id: id, detail: String(detail || ('HTTP ' + res.status)).slice(0, 160) });
+              }
+            } catch (err) {
+              failed.push({ project_id: id, detail: String((err && err.message) || err || '网络异常') });
+            }
+          }
+          showOutputSummary({
+            message: '批量删除项目已完成',
+            action: 'batch_delete_projects',
+            requested: ids.length,
+            removed_count: removedCount,
+            failed_count: failed.length,
+            failed_preview: failed.slice(0, 3).map((item) => item && item.detail).filter(Boolean),
+          });
+          if (failed.length) {
+            setSelectMsg('批量删除完成：成功 ' + removedCount + '，失败 ' + failed.length + '。', true);
+          } else {
+            setSelectMsg('批量删除完成：已删除 ' + removedCount + ' 个项目。', false);
+          }
+          await refreshProjects();
+          if (typeof refreshSubmissions === 'function') refreshSubmissions();
+          if (typeof refreshMaterials === 'function') refreshMaterials();
+          if (typeof refreshFeedMaterials === 'function') refreshFeedMaterials();
+          if (typeof refreshGroundTruth === 'function') refreshGroundTruth();
+        });
         safeClick('btnCleanupE2EProjects', async () => {
           const ok = confirm('将批量删除名称以 E2E_ 开头的测试项目及其资料/施组记录。是否继续？');
           if (!ok) return;
@@ -28552,8 +39926,16 @@ def index(
           const text = await res.text();
           let data = {};
           try { data = JSON.parse(text || '{}'); } catch (_) {}
-          const out = document.getElementById('output');
-          if (out) out.textContent = res.ok ? JSON.stringify(data, null, 2) : text;
+          if (res.ok) {
+            showOutputSummary({
+              message: 'E2E 测试项目已清理',
+              action: 'cleanup_e2e_projects',
+              removed_count: data.removed_count || 0,
+              failed_count: Array.isArray(data.failed) ? data.failed.length : 0,
+            });
+          } else {
+            showOutputTextSummary(text, 'E2E 清理失败');
+          }
           if (res.ok) {
             setSelectMsg('E2E 清理完成：删除 ' + (data.removed_count || 0) + ' 个项目。', false);
             await refreshProjects();
@@ -28563,49 +39945,84 @@ def index(
         });
 
         const formCreate = document.getElementById('createProject');
+        let createProjectInFlight = false;
         if (formCreate) {
           formCreate.onsubmit = async (e) => {
             e.preventDefault();
-            if (!(await ensureVerifiedApiKeyForAction('btnCreateProject', (msg) => setCreateMsg(msg, true)))) return;
-            const name = (formCreate.elements.name && formCreate.elements.name.value || '').trim();
-            if (!name) { setCreateMsg('请填写项目名称', true); return; }
-            setCreateMsg('正在创建…', false);
-            let res, text;
-            try {
-              res = await fetch('/api/v1/projects', { method: 'POST', headers: apiHeaders(), body: JSON.stringify({ name }) });
-              text = await res.text();
-            } catch (err) {
-              setCreateMsg('网络错误: ' + (err.message || err), true);
-              const out = document.getElementById('output');
-              if (out) { out.textContent = '请求失败: ' + (err.message || err); out.scrollIntoView({ behavior: 'smooth' }); }
+            if (createProjectInFlight) {
+              setCreateMsg('项目创建进行中，请稍候…', false);
               return;
             }
-            const outEl = document.getElementById('output');
-            if (outEl) outEl.textContent = text;
-            if (res && res.ok) {
-              let created = {};
+            createProjectInFlight = true;
+            setButtonBusyState('btnCreateProject', true);
+            try {
+              if (!(await ensureVerifiedApiKeyForAction('btnCreateProject', (msg) => setCreateMsg(msg, true)))) return;
+              const name = (formCreate.elements.name && formCreate.elements.name.value || '').trim();
+              if (!name) { setCreateMsg('请填写项目名称', true); return; }
+              setCreateMsg('正在创建…', false);
+              let res, text;
               try {
-                created = JSON.parse(text || '{}');
-                if (created && created.id) storageSet('selected_project_id', created.id);
-              } catch (_) {}
-              if (formCreate.elements.name) formCreate.elements.name.value = '';
-              const searchInput = document.getElementById('projectSearchInput');
-              if (searchInput) searchInput.value = '';
-              const createdName = String((created && (created.name || name)) || name || '').trim();
-              setCreateMsg('创建成功，当前项目已自动切换：' + createdName, false);
-              await refreshProjects(String((created && created.id) || ''));
-            } else {
-              let detail = text;
-              try { const j = JSON.parse(text); detail = (j && j.detail) || text; } catch (_) {}
-              setCreateMsg('创建失败: ' + res.status + ' ' + (detail || '').slice(0, 100), true);
-              const outSc = document.getElementById('output');
-              if (outSc) outSc.scrollIntoView({ behavior: 'smooth' });
+                res = await fetch('/api/v1/projects', { method: 'POST', headers: apiHeaders(), body: JSON.stringify({ name }) });
+                text = await res.text();
+              } catch (err) {
+                setCreateMsg('网络错误: ' + (err.message || err), true);
+                const out = document.getElementById('output');
+                if (out) { out.textContent = '请求失败: ' + (err.message || err); out.scrollIntoView({ behavior: 'smooth' }); }
+                return;
+              }
+              const outEl = document.getElementById('output');
+              if (outEl) outEl.textContent = text;
+              if (res && res.ok) {
+                let created = {};
+                try {
+                  created = JSON.parse(text || '{}');
+                  if (created && created.id) storageSet('selected_project_id', created.id);
+                } catch (_) {}
+                if (formCreate.elements.name) formCreate.elements.name.value = '';
+                const searchInput = document.getElementById('projectSearchInput');
+                if (searchInput) searchInput.value = '';
+                const createdName = String((created && (created.name || name)) || name || '').trim();
+                const refreshed = await refreshProjects(String((created && created.id) || ''), {
+                  closureSummaryOptions: {
+                    reason: 'create_project_success',
+                    silent: true,
+                  },
+                });
+                setCreateMsg(
+                  buildCreateProjectFollowUpMessage(
+                    createdName,
+                    refreshed && refreshed.closureSummary,
+                    String((created && created.id) || ''),
+                  ),
+                  false,
+                );
+                renderSystemClosureActionHint(
+                  'createProjectMessage',
+                  refreshed && refreshed.closureSummary,
+                  String((created && created.id) || ''),
+                  {
+                    titleText: '创建成功后的下一步',
+                    candidateMessage: '该项目已成为系统总封关候选项目',
+                    prefixLabel: '系统当前建议',
+                  }
+                );
+              } else {
+                let detail = text;
+                try { const j = JSON.parse(text); detail = (j && j.detail) || text; } catch (_) {}
+                setCreateMsg('创建失败: ' + res.status + ' ' + (detail || '').slice(0, 100), true);
+                const outSc = document.getElementById('output');
+                if (outSc) outSc.scrollIntoView({ behavior: 'smooth' });
+              }
+            } finally {
+              createProjectInFlight = false;
+              setButtonBusyState('btnCreateProject', false);
             }
           };
         } else {
           console.error('createProject form not found');
         }
         const formCreateFromTender = document.getElementById('createProjectFromTender');
+        let createProjectFromTenderInFlight = false;
         let inferTenderNameSeq = 0;
         function syncCreateProjectNameOverride() {
           const nameInput = document.getElementById('createProjectNameInput');
@@ -28681,68 +40098,101 @@ def index(
         if (formCreateFromTender) {
           formCreateFromTender.onsubmit = async (e) => {
             e.preventDefault();
-            if (!(await ensureVerifiedApiKeyForAction('btnCreateProjectFromTender', (msg) => setCreateMsg(msg, true)))) return;
-            const fileInput = document.getElementById('createProjectFromTenderFile');
-            const files = fileInput && fileInput.files ? Array.from(fileInput.files) : [];
-            if (!files.length) { setCreateMsg('请先选择招标文件', true); return; }
-            setCreateMsg('正在解析招标文件并自动创建项目…', false);
-            let res, text;
-            try {
-              const formData = new FormData(formCreateFromTender);
-              const manualProjectName = syncCreateProjectNameOverride();
-              if (manualProjectName) formData.set('project_name_override', manualProjectName);
-              res = await fetch('/api/v1/projects/create_from_tender', {
-                method: 'POST',
-                headers: apiHeaders(false),
-                body: formData,
-              });
-              text = await res.text();
-            } catch (err) {
-              setCreateMsg('网络错误: ' + (err.message || err), true);
-              const out = document.getElementById('output');
-              if (out) { out.textContent = '请求失败: ' + (err.message || err); out.scrollIntoView({ behavior: 'smooth' }); }
+            if (createProjectFromTenderInFlight) {
+              setCreateMsg('招标文件自动建项进行中，请稍候…', false);
               return;
             }
-            const outEl = document.getElementById('output');
-            if (outEl) outEl.textContent = text;
-            if (res && res.ok) {
-              let result = {};
+            createProjectFromTenderInFlight = true;
+            setButtonBusyState('btnCreateProjectFromTender', true);
+            try {
+              if (!(await ensureVerifiedApiKeyForAction('btnCreateProjectFromTender', (msg) => setCreateMsg(msg, true)))) return;
+              const fileInput = document.getElementById('createProjectFromTenderFile');
+              const files = fileInput && fileInput.files ? Array.from(fileInput.files) : [];
+              if (!files.length) { setCreateMsg('请先选择招标文件', true); return; }
+              setCreateMsg('正在解析招标文件并自动创建项目…', false);
+              let res, text;
               try {
-                result = JSON.parse(text || '{}');
-              } catch (_) {}
-              const project = result && result.project ? result.project : {};
-              const projectId = String((project && project.id) || '').trim();
-              const projectName = String((project && project.name) || '').trim();
-              if (projectId) storageSet('selected_project_id', projectId);
-              const nameInput = document.getElementById('createProjectNameInput');
-              if (nameInput) {
-                nameInput.value = projectName;
-                nameInput.title = projectName;
+                const formData = new FormData(formCreateFromTender);
+                const manualProjectName = syncCreateProjectNameOverride();
+                if (manualProjectName) formData.set('project_name_override', manualProjectName);
+                res = await fetch('/api/v1/projects/create_from_tender', {
+                  method: 'POST',
+                  headers: apiHeaders(false),
+                  body: formData,
+                });
+                text = await res.text();
+              } catch (err) {
+                setCreateMsg('网络错误: ' + (err.message || err), true);
+                const out = document.getElementById('output');
+                if (out) { out.textContent = '请求失败: ' + (err.message || err); out.scrollIntoView({ behavior: 'smooth' }); }
+                return;
               }
-              setRecognizedProjectName(projectName);
-              syncCreateProjectNameOverride();
-              if (fileInput) fileInput.value = '';
-              updateFilePickerText('createProjectFromTenderFile', 'createProjectFromTenderFileName');
-              const searchInput = document.getElementById('projectSearchInput');
-              if (searchInput) searchInput.value = '';
-              const successMsg = result && result.created
-                ? ('已自动创建项目：' + projectName)
-                : ('已定位现有项目并补充招标文件：' + projectName);
-              setCreateMsg(successMsg, false);
-              await refreshProjects(projectId);
-            } else {
-              let detail = text;
-              try { const j = JSON.parse(text); detail = (j && j.detail) || text; } catch (_) {}
-              const normalizedError = normalizeTenderCreateErrorMessage(
-                detail,
-                syncCreateProjectNameOverride()
-              );
-              await enterProjectIntakeMode(normalizedError, {
-                isError: true,
-                emptySelectionMessage: '自动创建未完成，当前保留在新项目录入界面；请先补齐项目名称或更换招标文件。',
-              });
-              const outSc = document.getElementById('output');
-              if (outSc) outSc.scrollIntoView({ behavior: 'smooth' });
+              const outEl = document.getElementById('output');
+              if (outEl) outEl.textContent = text;
+              if (res && res.ok) {
+                let result = {};
+                try {
+                  result = JSON.parse(text || '{}');
+                } catch (_) {}
+                const project = result && result.project ? result.project : {};
+                const projectId = String((project && project.id) || '').trim();
+                const projectName = String((project && project.name) || '').trim();
+                if (projectId) storageSet('selected_project_id', projectId);
+                const nameInput = document.getElementById('createProjectNameInput');
+                if (nameInput) {
+                  nameInput.value = projectName;
+                  nameInput.title = projectName;
+                }
+                setRecognizedProjectName(projectName);
+                syncCreateProjectNameOverride();
+                if (fileInput) fileInput.value = '';
+                updateFilePickerText('createProjectFromTenderFile', 'createProjectFromTenderFileName');
+                const searchInput = document.getElementById('projectSearchInput');
+                if (searchInput) searchInput.value = '';
+                const successMsg = result && result.created
+                  ? ('已自动创建项目：' + projectName)
+                  : ('已定位现有项目并补充招标文件：' + projectName);
+                const refreshed = await refreshProjects(projectId, {
+                  closureSummaryOptions: {
+                    reason: 'create_from_tender_success',
+                    silent: true,
+                  },
+                });
+                setCreateMsg(
+                  buildCreateProjectFollowUpMessage(
+                    successMsg.replace(/^已自动创建项目：|^已定位现有项目并补充招标文件：/, '').trim() || projectName,
+                    refreshed && refreshed.closureSummary,
+                    projectId,
+                  ),
+                  false,
+                );
+                renderSystemClosureActionHint(
+                  'createProjectMessage',
+                  refreshed && refreshed.closureSummary,
+                  projectId,
+                  {
+                    titleText: '创建成功后的下一步',
+                    candidateMessage: '该项目已成为系统总封关候选项目',
+                    prefixLabel: '系统当前建议',
+                  }
+                );
+              } else {
+                let detail = text;
+                try { const j = JSON.parse(text); detail = (j && j.detail) || text; } catch (_) {}
+                const normalizedError = normalizeTenderCreateErrorMessage(
+                  detail,
+                  syncCreateProjectNameOverride()
+                );
+                await enterProjectIntakeMode(normalizedError, {
+                  isError: true,
+                  emptySelectionMessage: '自动创建未完成，当前保留在新项目录入界面；请先补齐项目名称或更换招标文件。',
+                });
+                const outSc = document.getElementById('output');
+                if (outSc) outSc.scrollIntoView({ behavior: 'smooth' });
+              }
+            } finally {
+              createProjectFromTenderInFlight = false;
+              setButtonBusyState('btnCreateProjectFromTender', false);
             }
           };
         } else {
@@ -28820,10 +40270,10 @@ def index(
         }
 
         const MATERIAL_UPLOAD_CONFIGS = {
-          tender_qa: { formId: 'uploadMaterial', statusId: 'materialsActionStatus', typeLabel: '招标文件和答疑' },
-          boq: { formId: 'uploadMaterialBoq', statusId: 'materialsActionStatusBoq', typeLabel: '清单' },
-          drawing: { formId: 'uploadMaterialDrawing', statusId: 'materialsActionStatusDrawing', typeLabel: '图纸' },
-          site_photo: { formId: 'uploadMaterialPhoto', statusId: 'materialsActionStatusPhoto', typeLabel: '现场照片' },
+          tender_qa: { formId: 'uploadMaterial', buttonId: 'btnUploadMaterials', statusId: 'materialsActionStatus', typeLabel: '招标文件和答疑' },
+          boq: { formId: 'uploadMaterialBoq', buttonId: 'btnUploadBoq', statusId: 'materialsActionStatusBoq', typeLabel: '清单' },
+          drawing: { formId: 'uploadMaterialDrawing', buttonId: 'btnUploadDrawing', statusId: 'materialsActionStatusDrawing', typeLabel: '图纸' },
+          site_photo: { formId: 'uploadMaterialPhoto', buttonId: 'btnUploadSitePhotos', statusId: 'materialsActionStatusPhoto', typeLabel: '现场照片' },
         };
         const uploadMaterialsInFlightByType = {};
         function bindMaterialUploadForm(materialType) {
@@ -28848,6 +40298,12 @@ def index(
             setActionStatus(cfg.statusId, cfg.typeLabel + '上传进行中，请稍候…', false);
             return;
           }
+          setButtonBusyState(cfg.buttonId, true);
+          setMaterialTrialPreflightButtonHint('');
+          setMaterialTrialPreflightActionBadge('', '');
+          setMaterialTrialPreflightHint('', '');
+          setMaterialTrialPreflightFollowUpHint('', '');
+          setMaterialTrialPreflightFollowUpAction('', '');
           if (!(await ensureVerifiedApiKeyForAction(cfg.formId, (msg) => setActionStatus(cfg.statusId, msg, true)))) {
             return;
           }
@@ -28879,6 +40335,7 @@ def index(
             let okCount = 0;
             let failCount = 0;
             const details = [];
+            let closureSummary = null;
             for (const f of files) {
               const fd = new FormData();
               fd.append('file', f);
@@ -28914,11 +40371,47 @@ def index(
               await refreshMaterials(projectId, projectSwitchSeq);
               if (typeof refreshFeedMaterials === 'function') await refreshFeedMaterials(projectId, projectSwitchSeq);
               if (typeof refreshScoringDiagnostic === 'function') await refreshScoringDiagnostic(projectId, projectSwitchSeq);
+              if (typeof refreshSystemClosureSummary === 'function') {
+                closureSummary = await refreshSystemClosureSummary({
+                  reason: 'upload_materials',
+                  silent: true,
+                });
+              }
             }
             if (fileInput && failCount === 0) fileInput.value = '';
             if (fileInput && fileInput.id) updateFilePickerText(fileInput.id, fileInput.id + 'Name');
+            const finalStatus = buildSystemClosureActionFollowUpMessage(
+              '上传完成：成功 ' + okCount + '，失败 ' + failCount + '；成功文件已进入后台深读队列。',
+              closureSummary,
+              projectId,
+              { prefixLabel: '系统下一步建议' }
+            );
+            const trialPreflightFollowUp = okCount > 0 ? materialTrialPreflightFollowUpSummary() : '';
+            setActionStatus(
+              cfg.statusId,
+              trialPreflightFollowUp ? (finalStatus + ' ' + trialPreflightFollowUp) : finalStatus,
+              failCount > 0
+            );
+            if (trialPreflightFollowUp) {
+              const state = materialTrialPreflightFollowUpState || {};
+              setMaterialTrialPreflightFollowUpHint(
+                String(state.entrypointLabel || ''),
+                String(state.entrypointReasonLabel || '')
+              );
+              setMaterialTrialPreflightFollowUpAction(
+                String(state.entrypointLabel || ''),
+                String(state.entrypointReasonLabel || ''),
+                true
+              );
+              focusMaterialTrialPreflightFollowUpAction();
+            }
+            renderSystemClosureActionHint(cfg.statusId, closureSummary, projectId, {
+              titleText: '资料上传后的下一步',
+              prefixLabel: '系统下一步建议',
+            });
           } finally {
             uploadMaterialsInFlightByType[materialType] = false;
+            setButtonBusyState(cfg.buttonId, false);
           }
         }
 
@@ -28955,6 +40448,16 @@ def index(
             setActionStatus('shigongActionStatus', '施组上传进行中，请稍候…', false);
             return;
           }
+          setButtonBusyState('btnUploadShigong', true);
+          setMaterialTrialPreflightButtonHint('');
+          setMaterialTrialPreflightActionBadge('', '');
+          setMaterialTrialPreflightFollowUp('', '');
+          setMaterialTrialPreflightHint('', '');
+          setMaterialTrialPreflightFollowUpHint('', '');
+          setMaterialTrialPreflightFollowUpAction('', '');
+          setShigongTrialPreflightButtonHints('', '');
+          setShigongTrialPreflightActionBadge('', '');
+          setShigongTrialPreflightHint('', '');
           if (!(await ensureVerifiedApiKeyForAction('btnUploadShigong', (msg) => setActionStatus('shigongActionStatus', msg, true)))) {
             return;
           }
@@ -28986,6 +40489,7 @@ def index(
             let failCount = 0;
             const details = [];
             const uploadedSubmissions = [];
+            let closureSummary = null;
             for (const f of files) {
               const fd = new FormData();
               fd.append('file', f);
@@ -29041,23 +40545,40 @@ def index(
                   ? refreshScoringDiagnostic(projectId, projectSwitchSeq)
                   : Promise.resolve(),
               ]);
+              if (typeof refreshSystemClosureSummary === 'function') {
+                closureSummary = await refreshSystemClosureSummary({
+                  reason: 'upload_shigong',
+                  silent: true,
+                });
+              }
             } else {
               if (fileInput && fileInput.id) updateFilePickerText(fileInput.id, fileInput.id + 'Name');
             }
-            const finalStatus = uploadSummary
+            const finalStatus = buildSystemClosureActionFollowUpMessage(
+              uploadSummary
               + (okCount > 0
                 ? (
                   visibleConfirmed
                     ? '已显示到施组列表，可直接继续评分。'
                     : '已入库，列表同步稍有延迟，系统会继续自动刷新。'
                 )
-                : '未有成功上传文件。');
+                : '未有成功上传文件。'),
+              closureSummary,
+              projectId,
+              { prefixLabel: '系统下一步建议' }
+            );
             if (o) {
               o.textContent = finalStatus + (details.length ? (NL + details.join(NL)) : '');
             }
             setActionStatus('shigongActionStatus', finalStatus, failCount > 0);
+            if (okCount > 0 && visibleConfirmed) promoteShigongTrialPreflightAfterUpload();
+            renderSystemClosureActionHint('shigongActionStatus', closureSummary, projectId, {
+              titleText: '施组上传后的下一步',
+              prefixLabel: '系统下一步建议',
+            });
           } finally {
             uploadShigongInFlight = false;
+            setButtonBusyState('btnUploadShigong', false);
           }
         }
         async function scoreShigongAction() {
@@ -29065,6 +40586,20 @@ def index(
             setActionStatus('shigongActionStatus', '施组评分进行中，请稍候…', false);
             return;
           }
+          setButtonBusyState('btnScoreShigong', true, {
+            defaultLabel: currentScoreShigongActionLabel(),
+            restoreLabel: currentScoreShigongActionLabel(),
+          });
+          setMaterialTrialPreflightButtonHint('');
+          setMaterialTrialPreflightActionBadge('', '');
+          setMaterialTrialPreflightFollowUp('', '');
+          setMaterialTrialPreflightHint('', '');
+          setMaterialTrialPreflightFollowUpHint('', '');
+          setMaterialTrialPreflightFollowUpAction('', '');
+          setShigongTrialPreflightButtonHints('', '');
+          setShigongTrialPreflightActionBadge('', '');
+          setShigongTrialPreflightHint('', '');
+          setShigongTrialPreflightState('', '', '');
           if (!(await ensureVerifiedApiKeyForAction('btnScoreShigong', (msg) => setActionStatus('shigongActionStatus', msg, true)))) {
             return;
           }
@@ -29100,22 +40635,35 @@ def index(
             setActionStatus('shigongActionStatus', '施组评分中（' + scaleLabel + '）...', false);
             let res;
             let data = {};
+            const requestRescore = async (forceUnlock=false) => {
+              const result = await postProjectRescore(projectId, forceUnlock);
+              return result;
+            };
             try {
-              res = await fetch('/api/v1/projects/' + projectId + '/rescore', {
-                method: 'POST',
-                headers: apiHeaders(true),
-                body: JSON.stringify({
-                  scope: 'project',
-                  scoring_engine_version: 'v2',
-                  score_scale_max: selectedScoreScaleMax(),
-                }),
-              });
-              data = await res.json().catch(() => ({}));
+              ({ res, data } = await requestRescore(false));
             } catch (err) {
               const msg = '评分失败：' + String((err && err.message) || err || '网络异常');
               if (o) o.textContent = msg;
               setActionStatus('shigongActionStatus', msg, true);
               return;
+            }
+            if (!res.ok && res.status === 409) {
+              const detail = (data && data.detail) ? String(data.detail) : '';
+              if (detail.indexOf('force_unlock=true') >= 0) {
+                const ok = window.confirm(detail + '\\n\\n是否确认解锁当前项目并继续重算？');
+                if (ok) {
+                  setActionStatus('shigongActionStatus', '检测到项目已锁定，正在解锁并继续重算...', false);
+                  if (o) o.textContent = '检测到项目已锁定，正在解锁并继续重算...';
+                  try {
+                    ({ res, data } = await requestRescore(true));
+                  } catch (err) {
+                    const msg = '评分失败：' + String((err && err.message) || err || '网络异常');
+                    if (o) o.textContent = msg;
+                    setActionStatus('shigongActionStatus', msg, true);
+                    return;
+                  }
+                }
+              }
             }
             if (!res.ok) {
               const detail = (data && data.detail) ? String(data.detail) : ('HTTP ' + String(res.status || 0));
@@ -29140,7 +40688,7 @@ def index(
               doneMsg += ' 资料门禁通过。';
             }
             if (Object.keys(closedLoop).length) {
-              if (closedLoop.ok === false) doneMsg += ' 反馈闭环执行异常，请查看“原始输出”。';
+              if (closedLoop.ok === false) doneMsg += ' 反馈闭环执行异常，请查看“执行结果摘要”。';
               else doneMsg += ' 反馈闭环已执行。';
             }
             doneMsg += ' 满分优化清单已同步刷新。';
@@ -29156,9 +40704,31 @@ def index(
             if (typeof refreshScoringDiagnostic === 'function') {
               await refreshScoringDiagnostic(projectId, projectSwitchSeq);
             }
+            let closureSummary = null;
+            if (typeof refreshSystemClosureSummary === 'function') {
+              closureSummary = await refreshSystemClosureSummary({
+                reason: 'score_shigong',
+                silent: true,
+              });
+            }
+            const finalDoneMsg = buildSystemClosureActionFollowUpMessage(
+              doneMsg,
+              closureSummary,
+              projectId,
+              { prefixLabel: '系统下一步建议' }
+            );
+            if (o) o.textContent = finalDoneMsg;
+            setActionStatus('shigongActionStatus', finalDoneMsg, blockedCount > 0);
+            renderSystemClosureActionHint('shigongActionStatus', closureSummary, projectId, {
+              titleText: '评分完成后的下一步',
+              prefixLabel: '系统下一步建议',
+            });
             triggerOptimizationReportAction(projectId);
           } finally {
             scoreShigongInFlight = false;
+            setButtonBusyState('btnScoreShigong', false, {
+              restoreLabel: currentScoreShigongActionLabel(),
+            });
           }
         }
         function updateTableEmptyState(tableId, emptyId) {
@@ -29167,6 +40737,64 @@ def index(
           const emptyEl = document.getElementById(emptyId);
           if (!emptyEl) return;
           emptyEl.style.display = (tbody && tbody.querySelector('tr')) ? 'none' : 'block';
+        }
+        function clearTableRenderSignature(tableId) {
+          const table = document.getElementById(tableId);
+          const tbody = table ? table.querySelector('tbody') : null;
+          if (!tbody || !tbody.dataset) return;
+          delete tbody.dataset.renderSignature;
+        }
+        function buildTableRenderSignature(rows, partsBuilder=null) {
+          const items = Array.isArray(rows) ? rows : [];
+          const builder = typeof partsBuilder === 'function'
+            ? partsBuilder
+            : ((row) => {
+              if (row == null) return '';
+              if (typeof row === 'string') return row;
+              try {
+                return JSON.stringify(row);
+              } catch (_) {
+                return String(row);
+              }
+            });
+          return items.map((row, idx) => String(builder(row, idx) || '')).join('||');
+        }
+        function replaceTableRowsIfChanged(tableId, rowsHtml, signature='') {
+          const table = document.getElementById(tableId);
+          const tbody = table ? table.querySelector('tbody') : null;
+          if (!tbody) return false;
+          const nextHtml = Array.isArray(rowsHtml) ? rowsHtml.join('') : String(rowsHtml || '');
+          const nextSignature = String(signature || '');
+          const currentSignature = String((tbody.dataset && tbody.dataset.renderSignature) || '');
+          const hasRows = tbody.childElementCount > 0;
+          const nextHasRows = !!nextHtml;
+          if (currentSignature === nextSignature && hasRows === nextHasRows) {
+            return false;
+          }
+          tbody.innerHTML = nextHtml;
+          if (tbody.dataset) tbody.dataset.renderSignature = nextSignature;
+          return true;
+        }
+        function clearElementRenderSignature(elementId) {
+          const el = document.getElementById(elementId);
+          if (!el || !el.dataset) return;
+          delete el.dataset.renderSignature;
+        }
+        function replaceElementHtmlIfChanged(elementId, html, signature='') {
+          const el = document.getElementById(elementId);
+          if (!el) return false;
+          const nextHtml = String(html || '');
+          const nextSignature = String(signature || nextHtml);
+          const currentSignature = String((el.dataset && el.dataset.renderSignature) || '');
+          const isVisible = el.style.display !== 'none';
+          const nextVisible = !!nextHtml;
+          if (currentSignature === nextSignature && isVisible === nextVisible) {
+            return false;
+          }
+          el.style.display = nextVisible ? 'block' : 'none';
+          el.innerHTML = nextHtml;
+          if (el.dataset) el.dataset.renderSignature = nextSignature;
+          return true;
         }
         function waitForNextPaint() {
           return new Promise((resolve) => {
@@ -29231,6 +40859,7 @@ def index(
           const tbody = table ? table.querySelector('tbody') : null;
           const emptyEl = document.getElementById('submissionsEmpty');
           if (!tbody) return;
+          clearTableRenderSignature('submissionsTable');
           if (emptyEl) emptyEl.style.display = 'none';
           rows
             .slice()
@@ -29247,8 +40876,8 @@ def index(
               ).find((btn) => String(btn.getAttribute('data-submission-id') || '') === submissionId);
               const existingRow = existingButton && existingButton.closest ? existingButton.closest('tr') : null;
               if (existingRow) existingRow.remove();
-              const tr = document.createElement('tr');
-              tr.innerHTML = buildSubmissionTableRowHtml(submission, projectId, escapeHtmlText);
+              const tr = createSubmissionTableRowElement(submission, projectId, escapeHtmlText);
+              if (!tr) return;
               if (tbody.firstChild) tbody.insertBefore(tr, tbody.firstChild);
               else tbody.appendChild(tr);
             });
@@ -29283,6 +40912,7 @@ def index(
             return;
           }
           if (rowEl) rowEl.remove();
+          clearTableRenderSignature('submissionsTable');
           updateTableEmptyState('submissionsTable', 'submissionsEmpty');
           if (typeof refreshSubmissions === 'function') await refreshSubmissions(id);
           if (typeof refreshScoringReadiness === 'function') refreshScoringReadiness();
@@ -29319,6 +40949,8 @@ def index(
             return;
           }
           if (rowEl) rowEl.remove();
+          clearTableRenderSignature('materialsTable');
+          clearTableRenderSignature('feedMaterialsTable');
           updateTableEmptyState('materialsTable', 'materialsEmpty');
           if (typeof refreshFeedMaterials === 'function') refreshFeedMaterials();
           if (typeof refreshScoringReadiness === 'function') refreshScoringReadiness();
@@ -29337,6 +40969,20 @@ def index(
             );
           }
         }
+        let pendingOptimizationReportScroll = false;
+        function scrollOptimizationReportPanelIntoView() {
+          const panel = document.getElementById('compareReportResult');
+          if (!panel || typeof panel.scrollIntoView !== 'function') return;
+          panel.scrollIntoView({ behavior: 'auto', block: 'start' });
+        }
+        function flushOptimizationReportPanelScroll() {
+          if (!pendingOptimizationReportScroll) return;
+          pendingOptimizationReportScroll = false;
+          scrollOptimizationReportPanelIntoView();
+          window.setTimeout(() => {
+            scrollOptimizationReportPanelIntoView();
+          }, 180);
+        }
         function triggerOptimizationReportAction(projectId='', options=null) {
           const opts = (options && typeof options === 'object') ? options : {};
           const effectiveProjectId = String(projectId || resolveProjectId() || '').trim();
@@ -29349,13 +40995,9 @@ def index(
             setResultError('compareReportResult', '满分优化清单入口不可用。');
             return false;
           }
+          pendingOptimizationReportScroll = !!opts.scrollIntoView;
           triggerBtn.click();
-          if (opts.scrollIntoView) {
-            const panel = document.getElementById('compareReportResult');
-            if (panel && typeof panel.scrollIntoView === 'function') {
-              panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
-            }
-          }
+          if (pendingOptimizationReportScroll) scrollOptimizationReportPanelIntoView();
           return true;
         }
         function bindDeleteRowHandlers() {
@@ -29430,13 +41072,25 @@ def index(
             });
           }
         }
-        async function refreshSubmissions(expectedProjectId=null, switchSeq=null) {
+        async function refreshSubmissions(expectedProjectId=null, switchSeq=null, options=null) {
           const id = expectedProjectId || pid();
+          const opts = (options && typeof options === 'object') ? options : {};
+          const skipReadinessRefresh = !!opts.skipReadinessRefresh;
+          if (id && !opts.skipCoalesce) {
+            return runProjectRefreshTask(
+              'submissions',
+              id,
+              () => refreshSubmissions(id, switchSeq, {
+                skipCoalesce: true,
+                skipReadinessRefresh: skipReadinessRefresh,
+              })
+            );
+          }
           const tbl = document.getElementById('submissionsTable');
           const tbody = tbl ? tbl.querySelector('tbody') : null;
           const emptyEl = document.getElementById('submissionsEmpty');
           if (!id) {
-            if (tbody) tbody.innerHTML = '';
+            replaceTableRowsIfChanged('submissionsTable', [], '__submissions__projectless__');
             if (emptyEl) {
               emptyEl.textContent = '暂无施组，请先选择项目。';
               emptyEl.style.display = 'block';
@@ -29471,12 +41125,12 @@ def index(
             delete cachedProjectSubmissions[String(id || '')];
             if (typeof clearMaterialUtilizationPanel === 'function') clearMaterialUtilizationPanel();
             clearSubmissionDualTrackOverview();
-            if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
+            if (!skipReadinessRefresh && typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             await refreshGroundTruthSubmissionOptions(id, switchSeq, []);
             return [];
           }
           if (!Array.isArray(subs) || subs.length === 0) {
-            if (tbody) tbody.innerHTML = '';
+            replaceTableRowsIfChanged('submissionsTable', [], '__submissions__empty__|' + String(id || ''));
             if (emptyEl) {
               emptyEl.textContent = '暂无施组，请下方添加。';
               emptyEl.style.display = 'block';
@@ -29484,19 +41138,18 @@ def index(
             cachedProjectSubmissions[String(id || '')] = [];
             if (typeof clearMaterialUtilizationPanel === 'function') clearMaterialUtilizationPanel();
             clearSubmissionDualTrackOverview();
-            if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
+            if (!skipReadinessRefresh && typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             await refreshGroundTruthSubmissionOptions(id, switchSeq, []);
             return [];
           }
           cachedProjectSubmissions[String(id || '')] = subs;
           if (emptyEl) emptyEl.style.display = 'none';
-          if (tbody) tbody.innerHTML = '';
-          clearSubmissionDualTrackOverview();
-          subs.forEach(s => {
-            const tr = document.createElement('tr');
-            tr.innerHTML = buildSubmissionTableRowHtml(s, id, escapeHtmlText);
-            if (tbody) tbody.appendChild(tr);
-          });
+          const rowHtml = subs.map((s) => buildSubmissionTableRowHtml(s, id, escapeHtmlText));
+          replaceTableRowsIfChanged(
+            'submissionsTable',
+            rowHtml,
+            'submissions|' + id + '|' + buildTableRenderSignature(rowHtml)
+          );
           renderSubmissionDualTrackOverview(subs, id, escapeHtmlText);
           let utilPayload = null;
           for (const s of subs) {
@@ -29520,7 +41173,7 @@ def index(
             else clearMaterialUtilizationPanel();
           }
           updateTableEmptyState('submissionsTable', 'submissionsEmpty');
-          if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
+          if (!skipReadinessRefresh && typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
           await refreshGroundTruthSubmissionOptions(id, switchSeq, subs);
           return subs;
         }
@@ -29645,14 +41298,26 @@ def index(
           }
           renderGroundTruthSubmissionOptions(sel, id, subs, prev);
         }
-        async function refreshMaterials(expectedProjectId=null, switchSeq=null) {
+        async function refreshMaterials(expectedProjectId=null, switchSeq=null, options=null) {
           const id = expectedProjectId || pid();
+          const opts = (options && typeof options === 'object') ? options : {};
+          const skipReadinessRefresh = !!opts.skipReadinessRefresh;
+          if (id && !opts.skipCoalesce) {
+            return runProjectRefreshTask(
+              'materials_parse_status',
+              id,
+              () => refreshMaterials(id, switchSeq, {
+                skipCoalesce: true,
+                skipReadinessRefresh: skipReadinessRefresh,
+              })
+            );
+          }
           const tbl = document.getElementById('materialsTable');
           const tbody = tbl ? tbl.querySelector('tbody') : null;
           const emptyEl = document.getElementById('materialsEmpty');
           if (!id) {
             clearMaterialParsePolling();
-            if (tbody) tbody.innerHTML = '';
+            replaceTableRowsIfChanged('materialsTable', [], '__materials__projectless__');
             if (emptyEl) {
               emptyEl.textContent = '暂无资料，请先选择项目。';
               emptyEl.style.display = 'block';
@@ -29687,11 +41352,11 @@ def index(
             }
             setMaterialParseSummary('资料解析概览加载失败（HTTP ' + String(res.status || 0) + '）。', '#991b1b');
             if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState([], {});
-            if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
+            if (!skipReadinessRefresh && typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             return;
           }
           if (!Array.isArray(mats) || mats.length === 0) {
-            if (tbody) tbody.innerHTML = '';
+            replaceTableRowsIfChanged('materialsTable', [], '__materials__empty__|' + String(id || ''));
             if (emptyEl) {
               emptyEl.textContent = '暂无资料，请下方添加。';
               emptyEl.style.display = 'block';
@@ -29699,33 +41364,31 @@ def index(
             renderMaterialParseSummary(summary, []);
             if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState([], summary);
             scheduleMaterialParsePolling(id, summary, switchSeq);
-            if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
+            if (!skipReadinessRefresh && typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             return;
           }
           if (emptyEl) emptyEl.style.display = 'none';
           renderMaterialParseSummary(summary, mats);
           if (typeof applyMaterialParseZoneState === 'function') applyMaterialParseZoneState(mats, summary);
-          if (tbody) tbody.innerHTML = '';
-          mats.forEach(m => {
-            const tr = document.createElement('tr');
-            tr.innerHTML = buildMaterialTableRowHtml(m, id);
-            if (tbody) tbody.appendChild(tr);
-          });
+          const rowHtml = mats.map((m) => buildMaterialTableRowHtml(m, id));
+          replaceTableRowsIfChanged(
+            'materialsTable',
+            rowHtml,
+            'materials|' + id + '|' + buildTableRenderSignature(rowHtml)
+          );
           updateTableEmptyState('materialsTable', 'materialsEmpty');
           scheduleMaterialParsePolling(id, summary, switchSeq);
-          if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
+          if (!skipReadinessRefresh && typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
         }
         bindDeleteRowHandlers();
-        const btnRefSub = document.getElementById('btnRefreshSubmissions');
-        if (btnRefSub) btnRefSub.onclick = async () => {
+        safeClick('btnRefreshSubmissions', async () => {
           await refreshSubmissions();
           if (typeof refreshScoringDiagnostic === 'function') await refreshScoringDiagnostic();
-        };
-        const btnRefMat = document.getElementById('btnRefreshMaterials');
-        if (btnRefMat) btnRefMat.onclick = async () => {
+        });
+        safeClick('btnRefreshMaterials', async () => {
           await refreshMaterials();
           if (typeof refreshScoringDiagnostic === 'function') await refreshScoringDiagnostic();
-        };
+        });
         safeClick('btnMaterialDepthReport', async () => {
           if (!ensureProjectForAction('materialDepthReportResult')) return;
           const id = pid();
@@ -29748,11 +41411,17 @@ def index(
             return;
           }
           renderMaterialDepthReportPanel(data);
-          const out = document.getElementById('output');
-          if (out) out.textContent = JSON.stringify(data, null, 2);
+          showOutputSummary({
+            message: '资料深读体检已生成',
+            project_id: id,
+            by_type_count: Array.isArray(data.by_type) ? data.by_type.length : 0,
+            material_count: data.material_count || 0,
+            parsed_material_count: data.parsed_material_count || 0,
+            overall_depth_level: data.overall_depth_level || '-',
+          });
         });
         safeClick('btnMaterialDepthReportDownload', async () => {
-          if (SECURE_DESKTOP_MODE) {
+          if (secureDesktopEnabled()) {
             secureDesktopBlockResult('materialDepthReportResult');
             return;
           }
@@ -29789,11 +41458,17 @@ def index(
             return;
           }
           renderMaterialKnowledgeProfilePanel(data);
-          const out = document.getElementById('output');
-          if (out) out.textContent = JSON.stringify(data, null, 2);
+          showOutputSummary({
+            message: '资料知识画像已生成',
+            project_id: id,
+            material_count: data.material_count || 0,
+            parsed_material_count: data.parsed_material_count || 0,
+            focus_dimension_count: Array.isArray(data.focus_dimensions) ? data.focus_dimensions.length : 0,
+            knowledge_density: data.knowledge_density || '-',
+          });
         });
         safeClick('btnMaterialKnowledgeProfileDownload', async () => {
-          if (SECURE_DESKTOP_MODE) {
+          if (secureDesktopEnabled()) {
             secureDesktopBlockResult('materialKnowledgeProfileResult');
             return;
           }
@@ -29809,13 +41484,21 @@ def index(
           setResultSuccess('materialKnowledgeProfileResult', '资料知识画像报告下载已触发。');
         });
 
-        async function refreshFeedMaterials(expectedProjectId=null, switchSeq=null) {
+        async function refreshFeedMaterials(expectedProjectId=null, switchSeq=null, options=null) {
+          const opts = (options && typeof options === 'object') ? options : {};
           const id = expectedProjectId || pid();
+          if (id && !opts.skipCoalesce) {
+            return runProjectRefreshTask(
+              'feed_materials',
+              id,
+              () => refreshFeedMaterials(id, switchSeq, Object.assign({}, opts, { skipCoalesce: true }))
+            );
+          }
           const tbl = document.getElementById('feedMaterialsTable');
           const tbody = tbl ? tbl.querySelector('tbody') : null;
           const emptyEl = document.getElementById('feedMaterialsEmpty');
-          if (tbody) tbody.innerHTML = '';
           if (!id) {
+            replaceTableRowsIfChanged('feedMaterialsTable', [], '__feed_materials__projectless__');
             if (emptyEl) {
               emptyEl.textContent = '暂无投喂包，请先选择项目。';
               emptyEl.style.display = 'block';
@@ -29843,6 +41526,7 @@ def index(
             return;
           }
           if (!Array.isArray(mats) || mats.length === 0) {
+            replaceTableRowsIfChanged('feedMaterialsTable', [], '__feed_materials__empty__|' + String(id || ''));
             if (emptyEl) {
               emptyEl.textContent = '暂无投喂包，请在上方或「3) 项目资料」上传。';
               emptyEl.style.display = 'block';
@@ -29850,20 +41534,31 @@ def index(
             return;
           }
           if (emptyEl) emptyEl.style.display = 'none';
-          mats.forEach(m => {
-            const tr = document.createElement('tr');
-            tr.innerHTML = '<td>' + m.filename + '</td><td>' + (m.created_at || '').slice(0,19) + '</td><td><button type="button" class="btn-danger js-delete-material" data-material-id="' + String(m.id || '') + '" data-project-id="' + String(id || '') + '" data-filename="' + String(m.filename || '').replace(/"/g, '&quot;') + '">删除</button></td>';
-            const btn = tr.querySelector('button');
-            if (btn) btn.onclick = async () => {
-              const r = await fetch('/api/v1/projects/' + id + '/materials/' + m.id, { method: 'DELETE', headers: apiHeaders() });
-              if (r.ok) { refreshMaterials(); refreshFeedMaterials(); }
-              else { const o = document.getElementById('output'); if (o) o.textContent = await r.text(); }
-            };
-            if (tbody) tbody.appendChild(tr);
-          });
+          const rowHtml = mats.map((m) => buildFeedMaterialTableRowHtml(m, id));
+          const changed = replaceTableRowsIfChanged(
+            'feedMaterialsTable',
+            rowHtml,
+            'feed_materials|' + id + '|' + buildTableRenderSignature(rowHtml)
+          );
+          if (changed && tbody) {
+            Array.from(tbody.querySelectorAll('.js-delete-material')).forEach((btn, idx) => {
+              const row = mats[idx];
+              if (!btn || !row) return;
+              btn.onclick = async () => {
+                const r = await fetch('/api/v1/projects/' + id + '/materials/' + row.id, { method: 'DELETE', headers: apiHeaders() });
+                if (r.ok) {
+                  clearTableRenderSignature('feedMaterialsTable');
+                  refreshMaterials();
+                  refreshFeedMaterials();
+                } else {
+                  const o = document.getElementById('output');
+                  if (o) o.textContent = await r.text();
+                }
+              };
+            });
+          }
         }
-        const btnRefFeed = document.getElementById('btnRefreshFeedMaterials');
-        if (btnRefFeed) btnRefFeed.onclick = refreshFeedMaterials;
+        safeClick0('btnRefreshFeedMaterials', refreshFeedMaterials);
 
         function groundTruthListProjectId() {
           const scope = document.getElementById('groundTruthScope').value;
@@ -29871,13 +41566,39 @@ def index(
           if (scope === 'other') return document.getElementById('groundTruthOtherProject').value || '';
           return '';
         }
+        function buildGroundTruthTableRowHtml(record, index, isCurrent) {
+          const row = (record && typeof record === 'object') ? record : {};
+          const sourceSubmissionFilename = String(row.source_submission_filename || '').trim();
+          const shigongText = String(row.shigong_text || '');
+          const summary = sourceSubmissionFilename || shigongText.slice(0, 50);
+          const scores = Array.isArray(row.judge_scores) ? row.judge_scores : [];
+          const scoresStr = scores.length
+            ? (scores.map((score) => Number(score).toFixed(1)).join(', ') + '（' + scores.length + '人）')
+            : '-';
+          const titleText = sourceSubmissionFilename || shigongText.slice(0, 200);
+          const displayLabel = sourceSubmissionFilename
+            ? sourceSubmissionFilename
+            : (summary ? summary + (shigongText.length > 50 ? '…' : '') : '-');
+          const actionCell = isCurrent
+            ? '<td><button type="button" class="btn-danger js-delete-ground-truth" data-gt-id="' + escapeHtmlText(String(row.id || '')) + '">删除</button></td>'
+            : '<td></td>';
+          return ''
+            + '<tr>'
+            + '<td>' + String(index + 1) + '</td>'
+            + '<td title="' + escapeHtmlText(titleText) + '">' + escapeHtmlText(displayLabel) + '</td>'
+            + '<td>' + escapeHtmlText(scoresStr) + '</td>'
+            + '<td>' + escapeHtmlText(row.final_score != null ? row.final_score : '-') + '</td>'
+            + '<td>' + escapeHtmlText(row.source || '-') + '</td>'
+            + actionCell
+            + '</tr>';
+        }
         async function refreshGroundTruth(expectedProjectId=null, switchSeq=null) {
           const listId = expectedProjectId || groundTruthListProjectId();
           const tbl = document.getElementById('groundTruthTable');
           const tbody = tbl ? tbl.querySelector('tbody') : null;
           const emptyEl = document.getElementById('groundTruthEmpty');
-          if (tbody) tbody.innerHTML = '';
           if (!listId) {
+            replaceTableRowsIfChanged('groundTruthTable', [], '__ground_truth__projectless__');
             if (emptyEl) {
               emptyEl.textContent = '暂无真实评标，请先选择项目。';
               emptyEl.style.display = 'block';
@@ -29911,6 +41632,7 @@ def index(
           const scope = document.getElementById('groundTruthScope').value;
           const isCurrent = scope === 'current' && listId === selectedProjectIdStrict();
           if (list.length === 0) {
+            replaceTableRowsIfChanged('groundTruthTable', [], '__ground_truth__empty__|' + String(listId || '') + '|' + scope);
             if (emptyEl) {
               emptyEl.textContent = '暂无真实评标，请下方录入。';
               emptyEl.style.display = 'block';
@@ -29919,33 +41641,28 @@ def index(
             return;
           }
           if (emptyEl) emptyEl.style.display = 'none';
-          list.forEach((r, idx) => {
-            const sourceSubmissionFilename = String(r.source_submission_filename || '').trim();
-            const shigongText = String(r.shigong_text || '');
-            const summary = sourceSubmissionFilename || shigongText.slice(0, 50);
-            const scores = Array.isArray(r.judge_scores) ? r.judge_scores : [];
-            const scoresStr = scores.length
-              ? (scores.map(s => Number(s).toFixed(1)).join(', ') + '（' + scores.length + '人）')
-              : '-';
-            const tr = document.createElement('tr');
-            const titleText = sourceSubmissionFilename || shigongText.slice(0, 200);
-            const displayLabel = sourceSubmissionFilename
-              ? sourceSubmissionFilename
-              : (summary ? summary + (shigongText.length > 50 ? '…' : '') : '-');
-            const actionCell = isCurrent
-              ? '<td><button type="button" class="btn-danger js-delete-ground-truth" data-gt-id="' + escapeHtmlText(String(r.id || '')) + '">删除</button></td>'
-              : '<td></td>';
-            tr.innerHTML = '<td>' + (idx + 1) + '</td><td title="' + escapeHtmlText(titleText) + '">' + escapeHtmlText(displayLabel) + '</td><td>' + scoresStr + '</td><td>' + (r.final_score != null ? r.final_score : '-') + '</td><td>' + (r.source || '-') + '</td>' + actionCell;
-            if (isCurrent) {
-              const delBtn = tr.querySelector('button');
-              if (delBtn) delBtn.onclick = async () => {
-                const delRes = await fetch('/api/v1/projects/' + listId + '/ground_truth/' + r.id, { method: 'DELETE', headers: apiHeaders() });
-                if (delRes.status === 204) refreshGroundTruth();
-                else { const o = document.getElementById('output'); if (o) o.textContent = await delRes.text(); }
+          const rowHtml = list.map((row, idx) => buildGroundTruthTableRowHtml(row, idx, isCurrent));
+          const changed = replaceTableRowsIfChanged(
+            'groundTruthTable',
+            rowHtml,
+            'ground_truth|' + listId + '|' + scope + '|' + buildTableRenderSignature(rowHtml)
+          );
+          if (changed && isCurrent && tbody) {
+            Array.from(tbody.querySelectorAll('.js-delete-ground-truth')).forEach((btn, idx) => {
+              const row = list[idx];
+              if (!btn || !row) return;
+              btn.onclick = async () => {
+                const delRes = await fetch('/api/v1/projects/' + listId + '/ground_truth/' + row.id, { method: 'DELETE', headers: apiHeaders() });
+                if (delRes.status === 204) {
+                  clearTableRenderSignature('groundTruthTable');
+                  refreshGroundTruth();
+                } else {
+                  const o = document.getElementById('output');
+                  if (o) o.textContent = await delRes.text();
+                }
               };
-            }
-            if (tbody) tbody.appendChild(tr);
-          });
+            });
+          }
           setResultSuccess('evolveResult', '刷新完成：共 ' + list.length + ' 条真实评标记录');
         }
         safeChange('groundTruthScope', function() {
@@ -29995,8 +41712,8 @@ def index(
             resetGroundTruthDraftCommitState();
           });
         }
-        safeChange('groundTruthOtherProject', refreshGroundTruth);
-        safeClick('btnRefreshGroundTruth', refreshGroundTruth);
+        safeChange0('groundTruthOtherProject', refreshGroundTruth);
+        safeClick0('btnRefreshGroundTruth', refreshGroundTruth);
         safeClick('btnRefreshGroundTruthSubmissionOptions', async () => {
           if (!ensureProjectForAction('evolveResult')) return;
           setResultLoading('evolveResult', '施组选项刷新中...');
@@ -30004,9 +41721,68 @@ def index(
           setResultSuccess('evolveResult', '施组选项已刷新：请在下拉框中选择步骤4已上传施组。');
         });
 
+        function summarizeOutputScalar(value, maxLength=120) {
+          if (value == null) return '-';
+          const text = String(value);
+          if (text.length <= maxLength) return text;
+          return text.slice(0, maxLength) + '…（已截断）';
+        }
+        function summarizeOutputValue(value) {
+          if (Array.isArray(value)) {
+            return '数组(' + value.length + ')';
+          }
+          if (value && typeof value === 'object') {
+            return '对象(' + Object.keys(value).length + '键)';
+          }
+          return summarizeOutputScalar(value);
+        }
+        function buildCompactOutputLines(data) {
+          if (typeof data === 'string') {
+            return [summarizeOutputScalar(data, 240)];
+          }
+          if (data == null) {
+            return ['（空响应）'];
+          }
+          if (typeof data !== 'object') {
+            return [String(data)];
+          }
+          const obj = data;
+          const lines = [];
+          const consumed = new Set();
+          const priorityKeys = [
+            'detail', 'message', 'ok', 'project_id', 'submission_id',
+            'score_scale_label', 'submission_count', 'reports_generated',
+            'updated_reports', 'updated_submissions', 'blocked_submissions', 'warn_submissions',
+            'model_version', 'calibrator_version', 'patch_id', 'deployed'
+          ];
+          priorityKeys.forEach((key) => {
+            if (!Object.prototype.hasOwnProperty.call(obj, key)) return;
+            consumed.add(key);
+            lines.push(key + ': ' + summarizeOutputValue(obj[key]));
+          });
+          const remainingKeys = Object.keys(obj).filter((key) => !consumed.has(key));
+          remainingKeys.slice(0, 8).forEach((key) => {
+            lines.push(key + ': ' + summarizeOutputValue(obj[key]));
+          });
+          if (remainingKeys.length > 8) {
+            lines.push('…已省略 ' + (remainingKeys.length - 8) + ' 个字段');
+          }
+          return lines.length ? lines : ['（空对象）'];
+        }
         function showJson(id, data) {
-          const out = document.getElementById('output');
-          if (out) out.textContent = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+          const out = document.getElementById(id || 'output');
+          if (!out) return;
+          out.textContent = buildCompactOutputLines(data).join('\\n');
+        }
+        function showOutputSummary(data) {
+          showJson('output', data);
+        }
+        function showOutputTextSummary(text, message='') {
+          const payload = {
+            message: message || '操作已完成',
+            detail: summarizeOutputScalar(text, 240),
+          };
+          showOutputSummary(payload);
         }
         function escapeHtmlText(v) {
           return String(v == null ? '' : v)
@@ -30017,6 +41793,8 @@ def index(
             .replace(/'/g, '&#39;');
         }
         function toFiniteNumber(v) {
+          if (v == null) return null;
+          if (typeof v === 'string' && !v.trim()) return null;
           const n = Number(v);
           return Number.isFinite(n) ? n : null;
         }
@@ -30053,11 +41831,12 @@ def index(
         }
         function submissionAlignmentStatusLabel(status) {
           const raw = String(status || '').trim();
-          if (raw === 'approximation_better') return '逼近层更接近青天';
+          if (raw === 'approximation_better') return '当前分层更接近青天';
           if (raw === 'independent_better') return '独立层更接近青天';
           if (raw === 'tracks_tied') return '双轨与青天偏差相当';
-          if (raw === 'await_approximation') return '已录入青天，等待逼近层收敛';
+          if (raw === 'await_approximation') return '已录入青天，等待当前分收敛';
           if (raw === 'await_ground_truth') return '等待青天结果验证';
+          if (raw === 'ground_truth_exact') return '已命中真实评标';
           if (raw === 'independent_only') return '当前仅有独立评分';
           return raw || '待生成';
         }
@@ -30071,22 +41850,18 @@ def index(
           const approximationScore = toFiniteNumber(summary.approximation_score);
           const qingtianScore = toFiniteNumber(summary.qingtian_score);
           if (independentScore != null) detailTokens.push('独立: ' + independentScore);
-          if (approximationScore != null) detailTokens.push('逼近: ' + approximationScore);
+          if (approximationScore != null) detailTokens.push('当前分: ' + approximationScore);
           if (qingtianScore != null) detailTokens.push('青天: ' + qingtianScore);
           const scaleLabel = String(summary.scale_label || '').trim();
           if (scaleLabel) detailTokens.push(scaleLabel);
-          const displayTotal100 = toFiniteNumber(summary.display_total_score_100);
           const scaleMax = Number(summary.scale_max || 100) === 5 ? 5 : 100;
-          if (scaleMax !== 100 && displayTotal100 != null) {
-            detailTokens.push('折算100分口径: ' + displayTotal100);
-          }
-          const displayLabel = String(summary.display_score_label || (approximationScore != null ? '逼近分' : '独立分'));
+          const displayLabel = String(summary.display_score_label || (approximationScore != null ? '当前分' : '独立分'));
           const displayTotal = summary.display_total_score != null
             ? summary.display_total_score
             : ((submission && submission.total_score != null) ? submission.total_score : null);
           let html = '-';
           if (flags.isBlocked) {
-            html = '<div class="error">已生成分数，但本施组触发资料利用预警。</div>';
+            html = '<div class="warn">已生成分数，但本施组触发资料利用预警。</div>';
           }
           if (displayTotal != null) {
             const primaryText = displayLabel + ': ' + displayTotal + (scaleMax === 5 ? ' / 5' : '');
@@ -30109,21 +41884,24 @@ def index(
             ? summary.material_gate_reasons
             : (Array.isArray(utilGate.reasons) ? utilGate.reasons : []);
           const deltaTokens = [];
-          const independentDelta = toFiniteNumber(summary.independent_delta_100);
-          const approximationDelta = toFiniteNumber(summary.approximation_delta_100);
-          const improvement = toFiniteNumber(summary.abs_delta_improvement_100);
+          const independentDelta = toFiniteNumber(summary.independent_delta);
+          const approximationDelta = toFiniteNumber(summary.approximation_delta);
+          const improvement = toFiniteNumber(summary.abs_delta_improvement);
           if (independentDelta != null) deltaTokens.push('独立偏差 ' + independentDelta);
-          if (approximationDelta != null) deltaTokens.push('逼近偏差 ' + approximationDelta);
+          if (approximationDelta != null) deltaTokens.push('当前分偏差 ' + approximationDelta);
           if (improvement != null) deltaTokens.push('改善 ' + improvement);
           let html = '';
           if (flags.isBlocked) {
-            html += '<div class="error"><strong>已评分，但本施组对部分项目资料未形成足够证据关联。</strong></div>';
+            html += '<div class="warn"><strong>已评分，但本施组对部分项目资料未形成足够证据关联。</strong></div>';
             if (gateReasons.length) {
-              html += '<div class="error">' + esc(gateReasons.slice(0, 2).join('；')) + '</div>';
+              html += '<div class="warn">' + esc(gateReasons.slice(0, 2).join('；')) + '</div>';
             }
             html += '<div class="note">这是施组级资料利用预警，不是项目资料未上传。建议先看“满分优化清单”，再决定是否补资料复评。</div>';
           } else if (deltaTokens.length) {
-            html += '<div><strong>' + esc(deltaTokens.join(' / ')) + '</strong><span class="note">（100分口径）</span></div>';
+            const scaleLabel = String(summary.scale_label || '').trim();
+            html += '<div><strong>' + esc(deltaTokens.join(' / ')) + '</strong>'
+              + (scaleLabel ? ('<span class="note">（' + esc(scaleLabel) + '）</span>') : '')
+              + '</div>';
           } else {
             html += '<div class="note">暂无青天对照偏差。</div>';
           }
@@ -30205,26 +41983,34 @@ def index(
               ? '高'
               : (awarenessLevel === 'medium' ? '中' : '低');
             const awarenessText = Number.isFinite(awarenessScore)
-              ? '（' + awarenessScore.toFixed(1) + '）'
+              ? '（内部指数 ' + awarenessScore.toFixed(1) + '/100）'
               : '';
             const reasonPreview = awarenessReasons
               .map((item) => String(item || '').trim())
               .filter((item) => !!item)
               .slice(0, 1)
               .join('；');
-            scoreHtml += '<div class="note">评分置信度: ' + esc(awarenessLabel + awarenessText + (reasonPreview ? ' / ' + reasonPreview : '')) + '</div>';
+            scoreHtml += '<div class="note">评分置信等级（内部指数）: ' + esc(awarenessLabel + awarenessText + (reasonPreview ? ' / ' + reasonPreview : '')) + '</div>';
           }
           if (utilBlocked) {
-            scoreHtml += '<div class="error">资料利用门禁未达标（建议补齐资料后重评分）</div>';
+            scoreHtml += '<div class="warn">资料利用门禁未达标（建议补齐资料后重评分）</div>';
           } else if (flags.isWarned) {
             scoreHtml += '<div class="note">资料利用存在补强提示（不阻断当前评分）。</div>';
           }
           return ''
-            + '<td>' + esc(row.filename || '') + '</td>'
-            + '<td>' + scoreHtml + '</td>'
-            + '<td>' + diagnosticHtml + '</td>'
-            + '<td>' + esc(String(row.created_at || '').slice(0, 19)) + '</td>'
-            + '<td><button type="button" class="btn-danger js-delete-submission" data-submission-id="' + esc(String(row.id || '')) + '" data-project-id="' + esc(String(projectId || '')) + '" data-filename="' + esc(String(row.filename || '')) + '">删除</button></td>';
+            + '<tr class="submission-row">'
+            + '<td class="submission-file-cell"><div class="submission-filename">' + esc(row.filename || '') + '</div></td>'
+            + '<td class="submission-score-cell"><div class="submission-stack">' + scoreHtml + '</div></td>'
+            + '<td class="submission-diagnostic-cell"><div class="submission-stack">' + diagnosticHtml + '</div></td>'
+            + '<td class="submission-created-cell">' + esc(String(row.created_at || '').slice(0, 19)) + '</td>'
+            + '<td class="submission-actions-cell"><button type="button" class="btn-danger js-delete-submission" data-submission-id="' + esc(String(row.id || '')) + '" data-project-id="' + esc(String(projectId || '')) + '" data-filename="' + esc(String(row.filename || '')) + '">删除</button></td>'
+            + '</tr>';
+        }
+        function createSubmissionTableRowElement(submission, projectId, escapeFn) {
+          const template = document.createElement('template');
+          template.innerHTML = String(buildSubmissionTableRowHtml(submission, projectId, escapeFn) || '').trim();
+          const row = template.content ? template.content.firstElementChild : null;
+          return row && String(row.tagName || '').toUpperCase() === 'TR' ? row : null;
         }
         function buildSubmissionDualTrackOverviewHtml(submissions, projectId, escapeFn) {
           const esc = typeof escapeFn === 'function' ? escapeFn : ((v) => String(v == null ? '' : v));
@@ -30248,20 +42034,24 @@ def index(
           };
           const independentRows = scoredSummaries.filter((row) => toFiniteNumber(row.independent_score) != null);
           const approximationRows = scoredSummaries.filter((row) => !!row.has_approximation_score);
+          const exactGroundTruthRows = scoredSummaries.filter((row) => !!row.has_exact_ground_truth_score);
           const qingtianRows = scoredSummaries.filter((row) => !!row.has_ground_truth);
-          const improvementAvg = avg(scoredSummaries.map((row) => row.abs_delta_improvement_100));
+          const scaleLabel = String((scoredSummaries[0] && scoredSummaries[0].scale_label) || '').trim();
+          const improvementAvg = avg(scoredSummaries.map((row) => row.abs_delta_improvement));
           let headline = '当前暂无已评分施组。';
           if (scoredSummaries.length) {
             headline = approximationRows.length
-              ? '当前默认展示逼近分，并保留独立分作审计基线。'
-              : '当前默认展示独立分。';
+              ? '当前默认展示当前分，并保留独立分作审计基线。'
+              : (exactGroundTruthRows.length
+                ? '当前默认展示真实分，并保留独立分作审计基线。'
+                : '当前默认展示独立分。');
           }
           if (blockedRows.length) {
             headline = '已生成评分 ' + scoredSummaries.length + ' 份，其中 ' + blockedRows.length + ' 份触发资料利用预警；分数已保留，建议按满分优化清单补强后复评。';
           }
           if (improvementAvg != null) {
             if (improvementAvg > 0 && !blockedRows.length) {
-              headline = '逼近层整体上更接近青天，建议继续用评分治理稳态收敛。';
+              headline = '当前分层整体上更接近青天，建议继续用评分治理稳态收敛。';
             } else if (improvementAvg < 0 && !blockedRows.length) {
               headline = '独立层整体上更接近青天，建议先检查闭环样本和校准版本。';
             }
@@ -30269,6 +42059,7 @@ def index(
           const metricTokens = [
             '已生成评分 ' + scoredSummaries.length + ' 份',
             '双轨样本 ' + approximationRows.length + ' 份',
+            '真实命中 ' + exactGroundTruthRows.length + ' 份',
             '青天对照 ' + qingtianRows.length + ' 份',
           ];
           if (blockedRows.length) {
@@ -30276,16 +42067,16 @@ def index(
           }
           const metricSpecs = [
             ['independent_avg', '独立均分', avg(independentRows.map((row) => row.independent_score)), false],
-            ['approximation_avg', '逼近均分', avg(approximationRows.map((row) => row.approximation_score)), false],
+            ['approximation_avg', '当前分均分', avg(approximationRows.map((row) => row.approximation_score)), false],
             ['qingtian_avg', '青天均分', avg(qingtianRows.map((row) => row.qingtian_score)), false],
-            ['independent_abs_delta_avg_100', '独立平均绝对偏差', avg(qingtianRows.map((row) => row.independent_abs_delta_100)), true],
-            ['approximation_abs_delta_avg_100', '逼近平均绝对偏差', avg(qingtianRows.map((row) => row.approximation_abs_delta_100)), true],
-            ['abs_delta_improvement_avg_100', '平均改善', improvementAvg, true],
+            ['independent_abs_delta_avg', '独立平均绝对偏差', avg(qingtianRows.map((row) => row.independent_abs_delta)), true],
+            ['approximation_abs_delta_avg', '当前分平均绝对偏差', avg(qingtianRows.map((row) => row.approximation_abs_delta)), true],
+            ['abs_delta_improvement_avg', '平均改善', improvementAvg, true],
           ];
           metricSpecs.forEach((spec) => {
             const value = spec[2];
             if (value == null) return;
-            metricTokens.push(spec[1] + ' ' + value + (spec[3] ? '（100分口径）' : ''));
+            metricTokens.push(spec[1] + ' ' + value + ((spec[3] && scaleLabel) ? ('（' + scaleLabel + '）') : ''));
           });
           let html = '<strong>双轨总览</strong>';
           html += '<p style="margin:6px 0 0 0;color:#1f2937">' + esc(headline) + '</p>';
@@ -30299,6 +42090,7 @@ def index(
         function clearSubmissionDualTrackOverview() {
           const el = document.getElementById('submissionDualTrackOverview');
           if (!el) return;
+          clearElementRenderSignature('submissionDualTrackOverview');
           el.style.display = 'none';
           el.innerHTML = '';
         }
@@ -30310,8 +42102,11 @@ def index(
             clearSubmissionDualTrackOverview();
             return;
           }
-          el.style.display = 'block';
-          el.innerHTML = html;
+          replaceElementHtmlIfChanged(
+            'submissionDualTrackOverview',
+            html,
+            'submission_dual_track_overview|' + String(projectId || '') + '|' + buildTableRenderSignature([html])
+          );
         }
         function materialTypeDisplayName(materialType) {
           const t = String(materialType || '').trim();
@@ -30443,6 +42238,33 @@ def index(
           const evoAge = (summary.evolution_weight_age_days != null) ? summary.evolution_weight_age_days : '-';
           const evoSamples = (summary.evolution_weight_sample_count != null) ? summary.evolution_weight_sample_count : 0;
           const evoMinSamples = (summary.evolution_weight_min_samples != null) ? summary.evolution_weight_min_samples : '-';
+          const calibratorVersion = String(summary.current_calibrator_version || '').trim();
+          const calibratorMode = String(summary.current_calibrator_deployment_mode || '').trim();
+          const calibratorDegraded = !!summary.current_calibrator_degraded;
+          const calibratorRecentMae = (summary.current_calibrator_recent_mae != null)
+            ? Number(summary.current_calibrator_recent_mae)
+            : null;
+          const calibratorRecentRuleMae = (summary.current_calibrator_recent_rule_mae != null)
+            ? Number(summary.current_calibrator_recent_rule_mae)
+            : null;
+          const rollbackCandidateVersion = String(summary.current_calibrator_rollback_candidate_version || '').trim();
+          const rollbackCandidateMode = String(summary.current_calibrator_rollback_candidate_deployment_mode || '').trim();
+          const rollbackCandidateCvMae = (summary.current_calibrator_rollback_candidate_cv_mae != null)
+            ? Number(summary.current_calibrator_rollback_candidate_cv_mae)
+            : null;
+          const lastRuntimeGovernanceAction = String(summary.last_calibrator_runtime_governance_action || '').trim();
+          const lastRuntimeGovernanceReason = String(summary.last_calibrator_runtime_governance_reason || '').trim();
+          const lastRuntimeGovernanceAt = String(summary.last_calibrator_runtime_governance_recorded_at || '').trim();
+          const lastRuntimeGovernanceCandidate = String(summary.last_calibrator_runtime_governance_candidate || '').trim();
+          const lastRuntimeGovernanceActiveVersion = String(summary.last_calibrator_runtime_governance_active_version_after || '').trim();
+          const lastRuntimeGovernanceDegradedAfter = (typeof summary.last_calibrator_runtime_governance_degraded_after === 'boolean')
+            ? summary.last_calibrator_runtime_governance_degraded_after
+            : null;
+          const lastRuntimeGovernanceRecoveredAfter = (typeof summary.last_calibrator_runtime_governance_recovered_after === 'boolean')
+            ? summary.last_calibrator_runtime_governance_recovered_after
+            : null;
+          const lastRuntimeGovernanceUpdatedReports = Number(summary.last_calibrator_runtime_governance_updated_reports || 0);
+          const lastRuntimeGovernanceUpdatedSubmissions = Number(summary.last_calibrator_runtime_governance_updated_submissions || 0);
           const enhancementReviewStatus = String(summary.enhancement_review_status || 'not_run');
           const enhancementReviewProvider = String(summary.enhancement_review_provider || '').trim();
           const enhancementReviewSimilarity = (summary.enhancement_review_similarity != null)
@@ -30461,17 +42283,50 @@ def index(
                 : (enhancementReviewStatus === 'unavailable'
                   ? '<span class="warn">复核不可用</span>'
                   : '<span class="note">未执行双模型复核</span>')));
+          const calibratorStatus = calibratorVersion
+            ? ((calibratorDegraded ? '<span class="warn">已退化</span>' : '<span class="success">稳定</span>')
+              + '；版本=' + escapeHtmlText(calibratorVersion)
+              + (calibratorMode ? ('；模式=' + escapeHtmlText(calibratorMode)) : ''))
+            : '<span class="note">未部署项目级校准器</span>';
+          const rollbackStatus = rollbackCandidateVersion
+            ? ('版本=' + escapeHtmlText(rollbackCandidateVersion)
+              + (rollbackCandidateMode ? ('；模式=' + escapeHtmlText(rollbackCandidateMode)) : '')
+              + (rollbackCandidateCvMae != null ? ('；CV MAE=' + escapeHtmlText(rollbackCandidateCvMae.toFixed(4))) : ''))
+            : '无';
+          const runtimeGovernanceStatus = lastRuntimeGovernanceAction
+            ? (
+              escapeHtmlText(lastRuntimeGovernanceAction)
+              + (lastRuntimeGovernanceReason ? ('；原因=' + escapeHtmlText(lastRuntimeGovernanceReason)) : '')
+              + (lastRuntimeGovernanceCandidate ? ('；候选=' + escapeHtmlText(lastRuntimeGovernanceCandidate)) : '')
+              + (lastRuntimeGovernanceActiveVersion ? ('；当前版本=' + escapeHtmlText(lastRuntimeGovernanceActiveVersion)) : '')
+              + (lastRuntimeGovernanceRecoveredAfter === true
+                ? '；恢复=已恢复稳定'
+                : (lastRuntimeGovernanceDegradedAfter === true ? '；恢复=仍退化' : ''))
+              + ((lastRuntimeGovernanceUpdatedReports > 0 || lastRuntimeGovernanceUpdatedSubmissions > 0)
+                ? ('；回填=' + escapeHtmlText(lastRuntimeGovernanceUpdatedReports) + '/' + escapeHtmlText(lastRuntimeGovernanceUpdatedSubmissions))
+                : '')
+              + (lastRuntimeGovernanceAt ? ('；时间=' + escapeHtmlText(lastRuntimeGovernanceAt)) : '')
+            )
+            : '未记录';
           let html = '<strong>进化健康度（误差趋势 / 漂移）</strong>';
           html += '<p style="margin:6px 0">漂移等级：'
             + escapeHtmlText(drift.level || 'insufficient_data')
-            + '；近30天 MAE=' + escapeHtmlText((w30.mae != null) ? w30.mae : '-')
-            + '；近90天 MAE=' + escapeHtmlText((w90.mae != null) ? w90.mae : '-')
-            + '；全量 MAE=' + escapeHtmlText((wAll.mae != null) ? wAll.mae : '-')
+            + '；近30天内部校准 MAE=' + escapeHtmlText((w30.mae != null) ? w30.mae : '-')
+            + '；近90天内部校准 MAE=' + escapeHtmlText((w90.mae != null) ? w90.mae : '-')
+            + '；全量内部校准 MAE=' + escapeHtmlText((wAll.mae != null) ? wAll.mae : '-')
             + '</p>';
           html += '<table><tr><th>指标</th><th>值</th></tr>';
           html += '<tr><td>真实评分样本</td><td>' + escapeHtmlText(summary.ground_truth_count || 0) + '</td></tr>';
-          html += '<tr><td>已匹配预测</td><td>' + escapeHtmlText(summary.matched_prediction_count || 0) + '</td></tr>';
+          html += '<tr><td>已关联评分记录</td><td>' + escapeHtmlText((summary.matched_score_record_count ?? summary.matched_prediction_count) || 0) + '</td></tr>';
           html += '<tr><td>未匹配样本</td><td>' + escapeHtmlText(summary.unmatched_ground_truth_count || 0) + '</td></tr>';
+          html += '<tr><td>当前项目级校准器</td><td>' + calibratorStatus + '</td></tr>';
+          html += '<tr><td>近30天校准器/规则 MAE（内部校准指标）</td><td>'
+            + escapeHtmlText((calibratorRecentMae != null) ? calibratorRecentMae.toFixed(4) : '-')
+            + ' / '
+            + escapeHtmlText((calibratorRecentRuleMae != null) ? calibratorRecentRuleMae.toFixed(4) : '-')
+            + '</td></tr>';
+          html += '<tr><td>历史回退候选</td><td>' + rollbackStatus + '</td></tr>';
+          html += '<tr><td>最近运行时校准治理</td><td>' + runtimeGovernanceStatus + '</td></tr>';
           html += '<tr><td>当前权重来源</td><td>' + escapeHtmlText(summary.current_weights_source || '-') + '</td></tr>';
           html += '<tr><td>进化权重状态</td><td>' + evoStatus + '</td></tr>';
           html += '<tr><td>进化权重样本/阈值</td><td>' + escapeHtmlText(evoSamples) + ' / ' + escapeHtmlText(evoMinSamples) + '</td></tr>';
@@ -30488,6 +42343,1095 @@ def index(
           }
           el.style.display = 'block';
           el.innerHTML = html;
+        }
+        let systemImprovementOverviewLastPayload = null;
+        let systemImprovementActionGroupFilter = 'all';
+        let systemImprovementWorkstreamFilter = 'all';
+        const normalizeSystemImprovementActionGroupFilter = (filter) => {
+          const raw = String(filter || 'all').trim().toLowerCase();
+          if (raw === 'auto' || raw === 'readonly' || raw === 'manual') return raw;
+          return 'all';
+        };
+        const formatSystemImprovementActionGroupFilterLabel = (label, count) => {
+          const normalizedLabel = String(label || '-').trim() || '-';
+          const numericCount = Math.max(0, Number(count || 0));
+          return normalizedLabel + '（' + String(numericCount) + '）';
+        };
+        const setSystemImprovementActionGroupFilter = (filter, rerender = true) => {
+          systemImprovementActionGroupFilter = normalizeSystemImprovementActionGroupFilter(filter);
+          if (rerender && systemImprovementOverviewLastPayload) {
+            renderSystemImprovementOverviewPanel(systemImprovementOverviewLastPayload);
+          }
+        };
+        const normalizeSystemImprovementWorkstreamFilter = (filter) => {
+          const raw = String(filter || 'all').trim().toLowerCase();
+          if (raw === 'ok' || raw === 'warn' || raw === 'blocked') return raw;
+          return 'all';
+        };
+        const formatSystemImprovementWorkstreamFilterLabel = (label, count) => {
+          const normalizedLabel = String(label || '-').trim() || '-';
+          const numericCount = Math.max(0, Number(count || 0));
+          return normalizedLabel + '（' + String(numericCount) + '）';
+        };
+        const setSystemImprovementWorkstreamFilter = (filter, rerender = true) => {
+          systemImprovementWorkstreamFilter = normalizeSystemImprovementWorkstreamFilter(filter);
+          if (rerender && systemImprovementOverviewLastPayload) {
+            renderSystemImprovementOverviewPanel(systemImprovementOverviewLastPayload);
+          }
+        };
+        async function refreshSystemImprovementOverview(options=null) {
+          const opts = (options && typeof options === 'object') ? options : {};
+          const el = document.getElementById('systemImprovementResult');
+          const panelVisible = !!(el && el.style.display !== 'none');
+          if (opts.resetFilters) {
+            setSystemImprovementActionGroupFilter('all', false);
+            setSystemImprovementWorkstreamFilter('all', false);
+          }
+          if (!opts.silent && el) {
+            setResultLoading('systemImprovementResult', '系统继续完善总览生成中...');
+          }
+          let res;
+          let data = {};
+          try {
+            res = await fetch('/api/v1/system/improvement_overview', {
+              method: 'GET',
+              headers: apiHeaders(false),
+            });
+            data = await res.json().catch(() => ({}));
+          } catch (err) {
+            if (el) {
+              setResultError('systemImprovementResult', '分析失败：' + String((err && err.message) || err || '网络异常'));
+            }
+            return null;
+          }
+          if (!opts.silentOutput) {
+            showJson('output', formatApiOutput(res, data));
+          }
+          if (!res.ok) {
+            const detail = (data && data.detail) ? String(data.detail) : ('HTTP ' + String(res.status || 0));
+            if (el) {
+              setResultError('systemImprovementResult', '分析失败：' + detail);
+            }
+            return null;
+          }
+          if (panelVisible || opts.forceRender) {
+            renderSystemImprovementOverviewPanel(data);
+          } else {
+            systemImprovementOverviewLastPayload = data;
+          }
+          return data;
+        }
+        function renderSystemImprovementOverviewPanel(payload) {
+          const el = document.getElementById('systemImprovementResult');
+          if (!el) return;
+          const data = (payload && typeof payload === 'object') ? payload : {};
+          systemImprovementOverviewLastPayload = data;
+          const metrics = (data.metrics && typeof data.metrics === 'object') ? data.metrics : {};
+          const focusWorkstreams = Array.isArray(data.focus_workstreams) ? data.focus_workstreams : [];
+          const focusWorkstreamStatusSummaries = Array.isArray(data.focus_workstream_status_summaries)
+            ? data.focus_workstream_status_summaries
+            : [];
+          const opsAgentQualitySummary = (data.ops_agent_quality_summary && typeof data.ops_agent_quality_summary === 'object')
+            ? data.ops_agent_quality_summary
+            : {};
+          const closureGateDetails = Array.isArray(data.closure_gate_details) ? data.closure_gate_details : [];
+          const projectGapDetails = Array.isArray(data.project_gap_details) ? data.project_gap_details : [];
+          const projectGateGapDetails = Array.isArray(data.project_gate_gap_details) ? data.project_gate_gap_details : [];
+          const projectActionGapDetails = Array.isArray(data.project_action_gap_details) ? data.project_action_gap_details : [];
+          const globalActionGapDetails = Array.isArray(data.global_action_gap_details) ? data.global_action_gap_details : [];
+          const globalActionGroupSummaries = Array.isArray(data.global_action_group_summaries) ? data.global_action_group_summaries : [];
+          const globalAutoActionGapDetails = Array.isArray(data.global_auto_action_gap_details) ? data.global_auto_action_gap_details : [];
+          const globalReadonlyActionGapDetails = Array.isArray(data.global_readonly_action_gap_details) ? data.global_readonly_action_gap_details : [];
+          const globalManualActionGapDetails = Array.isArray(data.global_manual_action_gap_details) ? data.global_manual_action_gap_details : [];
+          const blockers = Array.isArray(data.blockers) ? data.blockers : [];
+          const warnings = Array.isArray(data.warnings) ? data.warnings : [];
+          const strengths = Array.isArray(data.strengths) ? data.strengths : [];
+          const recommendations = Array.isArray(data.recommendations) ? data.recommendations : [];
+          const status = String(data.status || 'unknown').trim();
+          const statusLabel = String(data.status_label || '-').trim() || '-';
+          const summaryLabel = String(data.summary_label || '').trim();
+          const activeSystemImprovementActionGroupFilter = normalizeSystemImprovementActionGroupFilter(systemImprovementActionGroupFilter);
+          const activeSystemImprovementWorkstreamFilter = normalizeSystemImprovementWorkstreamFilter(systemImprovementWorkstreamFilter);
+          const closureFailedGates = Array.isArray(metrics.system_closure_failed_gates)
+            ? metrics.system_closure_failed_gates
+            : [];
+          const statusBadge = status === 'ready'
+            ? '<span class="success">系统级体检通过</span>'
+            : (status === 'watch'
+              ? '<span class="warn">仍需继续完善</span>'
+              : '<span class="error">存在阻断项</span>');
+          const renderListBlock = (title, items, color) => {
+            if (!items.length) return '';
+            return '<strong>' + escapeHtmlText(title) + '</strong>'
+              + '<ul style="margin:6px 0 10px 18px;color:' + color + '">'
+              + items.map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('')
+              + '</ul>';
+          };
+          const renderOpsAgentQualitySummary = (summary) => {
+            const row = (summary && typeof summary === 'object') ? summary : {};
+            if (!Object.keys(row).length) return '';
+            const qualityStatus = String(row.quality_status || 'watch').trim();
+            const qualityStatusLabel = String(row.quality_status_label || '-').trim() || '-';
+            const overallStatusLabel = String(row.overall_status_label || '-').trim() || '-';
+            const summaryLabel = String(row.summary_label || '').trim();
+            const generatedAt = String(row.generated_at || '').trim();
+            const snapshotPath = String(row.snapshot_path || '').trim();
+            const loadError = String(row.load_error || '').trim();
+            const qualityBadge = qualityStatus === 'ready'
+              ? '<span class="success">质量正常</span>'
+              : (qualityStatus === 'blocked'
+                ? '<span class="error">存在失败或复验未收口项</span>'
+                : '<span class="warn">仍需关注</span>');
+            const strengths = Array.isArray(row.strengths) ? row.strengths : [];
+            const blockers = Array.isArray(row.blockers) ? row.blockers : [];
+            const warnings = Array.isArray(row.warnings) ? row.warnings : [];
+            const recommendations = Array.isArray(row.recommendations) ? row.recommendations : [];
+            const agentRows = Array.isArray(row.agent_rows) ? row.agent_rows : [];
+            const recentAuditRows = Array.isArray(row.recent_audit_rows) ? row.recent_audit_rows : [];
+            const manualConfirmationRows = Array.isArray(row.manual_confirmation_rows) ? row.manual_confirmation_rows : [];
+            const recentQualityReasonSummaryRows = Array.isArray(row.recent_quality_reason_summary_rows)
+              ? row.recent_quality_reason_summary_rows
+              : [];
+            let sectionHtml = '<strong>自动巡检智能体质量</strong>';
+            sectionHtml += '<p style="margin:6px 0">结论：' + qualityBadge
+              + '；巡检状态：' + escapeHtmlText(overallStatusLabel)
+              + (summaryLabel ? ('；摘要：' + escapeHtmlText(summaryLabel)) : '')
+              + (generatedAt ? ('；快照时间：' + escapeHtmlText(generatedAt)) : '')
+              + '</p>';
+            sectionHtml += '<table><tr><th>指标</th><th>值</th></tr>';
+            sectionHtml += '<tr><td>智能体通过/待收口/失败</td><td>'
+              + escapeHtmlText(row.pass_count || 0) + ' / '
+              + escapeHtmlText(row.warn_count || 0) + ' / '
+              + escapeHtmlText(row.fail_count || 0) + '</td></tr>';
+            sectionHtml += '<tr><td>最近巡检轮次（通过/待收口/失败）</td><td>'
+              + escapeHtmlText(row.recent_cycle_count || 0) + '（'
+              + escapeHtmlText(row.recent_pass_cycle_count || 0) + ' / '
+              + escapeHtmlText(row.recent_warn_cycle_count || 0) + ' / '
+              + escapeHtmlText(row.recent_fail_cycle_count || 0) + '）</td></tr>';
+            sectionHtml += '<tr><td>最近连续未通过轮次/人工确认轮次</td><td>'
+              + escapeHtmlText(row.recent_non_pass_streak_count || 0) + ' / '
+              + escapeHtmlText(row.recent_manual_gate_cycle_count || 0) + '</td></tr>';
+            sectionHtml += '<tr><td>当前主因标签/连续同主因轮次</td><td>'
+              + escapeHtmlText(row.latest_quality_reason_label || '-') + ' / '
+              + escapeHtmlText(row.recent_same_reason_streak_count || 0) + '</td></tr>';
+            if (row.latest_quality_reason_project_name || row.latest_quality_reason_project_detail) {
+              sectionHtml += '<tr><td>当前主因项目</td><td>'
+                + escapeHtmlText(row.latest_quality_reason_project_name || row.latest_quality_reason_project_id || '-')
+                + (row.latest_quality_reason_project_detail
+                  ? ('<br><span style="color:#475569">' + escapeHtmlText(row.latest_quality_reason_project_detail) + '</span>')
+                  : '')
+                + '</td></tr>';
+            }
+            sectionHtml += '<tr><td>自动修复开关/自动学习开关</td><td>'
+              + (row.auto_repair_enabled ? '开启' : '关闭')
+              + ' / '
+              + (row.auto_evolve_enabled ? '开启' : '关闭')
+              + '</td></tr>';
+            sectionHtml += '<tr><td>自动修复尝试/成功/实际修复</td><td>'
+              + escapeHtmlText(row.auto_repair_attempted_count || 0) + ' / '
+              + escapeHtmlText(row.auto_repair_success_count || 0) + ' / '
+              + escapeHtmlText(row.auto_fixed_count || 0) + '</td></tr>';
+            sectionHtml += '<tr><td>自动学习尝试/成功</td><td>'
+              + escapeHtmlText(row.auto_evolve_attempted_count || 0) + ' / '
+              + escapeHtmlText(row.auto_evolve_success_count || 0) + '</td></tr>';
+            sectionHtml += '<tr><td>历史自动修复成功率/自动学习成功率</td><td>'
+              + (
+                  row.repair_success_rate != null
+                    ? escapeHtmlText((Number(row.repair_success_rate) * 100).toFixed(0) + '%')
+                    : '-'
+                )
+              + ' / '
+              + (
+                  row.evolve_success_rate != null
+                    ? escapeHtmlText((Number(row.evolve_success_rate) * 100).toFixed(0) + '%')
+                    : '-'
+                )
+              + '</td></tr>';
+            sectionHtml += '<tr><td>人工确认需求/复验失败</td><td>'
+              + escapeHtmlText(row.manual_confirmation_required_count || 0) + ' / '
+              + escapeHtmlText(row.post_verify_failed_count || 0) + '</td></tr>';
+            sectionHtml += '<tr><td>Bootstrap 监控/低质量账号池</td><td>'
+              + escapeHtmlText(row.bootstrap_monitoring_count || 0) + ' / '
+              + escapeHtmlText(row.llm_account_low_quality_pool_count || 0) + '</td></tr>';
+            if (snapshotPath) {
+              sectionHtml += '<tr><td>快照路径</td><td>' + escapeHtmlText(snapshotPath) + '</td></tr>';
+            }
+            if (loadError) {
+              sectionHtml += '<tr><td>快照读取错误</td><td>' + escapeHtmlText(loadError) + '</td></tr>';
+            }
+            sectionHtml += '</table>';
+            if (manualConfirmationRows.length) {
+              sectionHtml += '<table><tr><th>当前人工确认项目</th><th>关键事实</th><th>建议入口</th></tr>';
+              manualConfirmationRows.forEach((item) => {
+                const detailRow = (item && typeof item === 'object') ? item : {};
+                const projectName = String(detailRow.project_name || detailRow.project_id || '-').trim() || '-';
+                const detail = String(detailRow.detail || '').trim();
+                const recommendation = String(detailRow.recommendation || '').trim();
+                const actionLabel = String(detailRow.action_label || '').trim();
+                const overrideHint = String(detailRow.manual_override_hint || '').trim();
+                const pendingExtremeCount = Number(detailRow.pending_extreme_ground_truth_count || 0);
+                const matchedSubmissionCount = Number(detailRow.matched_submission_count || 0);
+                const deploymentMode = String(detailRow.current_calibrator_deployment_mode || '').trim();
+                const entrypointHtml = renderSystemImprovementEntrypoint(detailRow);
+                sectionHtml += '<tr><td>' + escapeHtmlText(projectName) + '</td><td>'
+                  + (pendingExtremeCount > 0 ? ('待确认极端样本：' + escapeHtmlText(pendingExtremeCount) + '<br>') : '')
+                  + '关联预测样本：' + escapeHtmlText(matchedSubmissionCount)
+                  + (deploymentMode ? ('<br>部署模式：' + escapeHtmlText(deploymentMode)) : '')
+                  + (detail ? ('<br><span style="color:#475569">' + escapeHtmlText(detail) + '</span>') : '')
+                  + '</td><td>'
+                  + (String(entrypointHtml || '').trim()
+                    ? ('<span style="color:#475569">' + entrypointHtml + '</span>')
+                    : '-')
+                  + (actionLabel ? ('<br><span style="color:#475569">建议动作：' + escapeHtmlText(actionLabel) + '</span>') : '')
+                  + (recommendation ? ('<br><span style="color:#475569">' + escapeHtmlText(recommendation) + '</span>') : '')
+                  + (overrideHint ? ('<br><code>' + escapeHtmlText(overrideHint) + '</code>') : '')
+                  + '</td></tr>';
+              });
+              sectionHtml += '</table>';
+            }
+            if (recentAuditRows.length) {
+              if (recentQualityReasonSummaryRows.length) {
+                sectionHtml += '<table><tr><th>最近主因分布</th><th>出现轮次</th></tr>';
+                recentQualityReasonSummaryRows.forEach((item) => {
+                  const reasonRow = (item && typeof item === 'object') ? item : {};
+                  sectionHtml += '<tr><td>' + escapeHtmlText(reasonRow.quality_reason_label || reasonRow.quality_reason_code || '-') + '</td><td>'
+                    + escapeHtmlText(reasonRow.count || 0) + '</td></tr>';
+                });
+                sectionHtml += '</table>';
+              }
+              sectionHtml += '<table><tr><th>最近巡检质量审计</th><th>状态</th><th>关键事实</th></tr>';
+              recentAuditRows.slice().reverse().forEach((item) => {
+                const auditRow = (item && typeof item === 'object') ? item : {};
+                const overallStatus = String(auditRow.overall_status || 'warn').trim();
+                const statusHtml = overallStatus === 'pass'
+                  ? '<span class="success">通过</span>'
+                  : (overallStatus === 'fail'
+                    ? '<span class="error">失败</span>'
+                    : '<span class="warn">待收口</span>');
+                const qualityAuditLabel = String(auditRow.quality_audit_label || '').trim();
+                const qualityReasonDetail = String(auditRow.quality_reason_detail || '').trim();
+                const topRecommendation = String(auditRow.top_recommendation || '').trim();
+                const generatedAtText = String(auditRow.generated_at || '').trim();
+                sectionHtml += '<tr><td>'
+                  + escapeHtmlText(generatedAtText || '-')
+                  + (qualityAuditLabel ? ('<br><span style="color:#475569">' + escapeHtmlText(qualityAuditLabel) + '</span>') : '')
+                  + (qualityReasonDetail ? ('<br><span style="color:#475569">' + escapeHtmlText(qualityReasonDetail) + '</span>') : '')
+                  + '</td><td>' + statusHtml + '</td><td>'
+                  + '自动修复尝试/成功：' + escapeHtmlText(auditRow.auto_repair_attempted_count || 0) + ' / ' + escapeHtmlText(auditRow.auto_repair_success_count || 0)
+                  + '<br>自动学习尝试/成功：' + escapeHtmlText(auditRow.auto_evolve_attempted_count || 0) + ' / ' + escapeHtmlText(auditRow.auto_evolve_success_count || 0)
+                  + '<br>人工确认/复验失败：' + escapeHtmlText(auditRow.manual_confirmation_required_count || 0) + ' / ' + escapeHtmlText(auditRow.post_verify_failed_count || 0)
+                  + (topRecommendation ? ('<br><span style="color:#475569">' + escapeHtmlText(topRecommendation) + '</span>') : '')
+                  + '</td></tr>';
+              });
+              sectionHtml += '</table>';
+            }
+            if (agentRows.length) {
+              sectionHtml += '<table><tr><th>智能体</th><th>状态</th><th>首要结论</th></tr>';
+              agentRows.forEach((item) => {
+                const agentRow = (item && typeof item === 'object') ? item : {};
+                const agentStatus = String(agentRow.status || 'unknown').trim();
+                const agentStatusHtml = agentStatus === 'pass'
+                  ? '<span class="success">通过</span>'
+                  : (agentStatus === 'fail'
+                    ? '<span class="error">失败</span>'
+                    : '<span class="warn">待收口</span>');
+                sectionHtml += '<tr><td>' + escapeHtmlText(agentRow.label || agentRow.name || '-') + '</td><td>'
+                  + agentStatusHtml + '</td><td>'
+                  + escapeHtmlText(agentRow.recommendation || '-') + '</td></tr>';
+              });
+              sectionHtml += '</table>';
+            }
+            sectionHtml += renderListBlock('优势项', strengths, '#166534');
+            sectionHtml += renderListBlock('阻断项', blockers, '#b91c1c');
+            sectionHtml += renderListBlock('警告项', warnings, '#92400e');
+            sectionHtml += renderListBlock('建议动作', recommendations, '#334155');
+            return sectionHtml;
+          };
+          const systemImprovementEntrypointMeta = (key) => {
+            const raw = String(key || '').trim();
+            if (raw === 'system_self_check') {
+              return { sectionId: 'section-learning-evolution', focusId: 'btnSelfCheck' };
+            }
+            return systemClosureEntrypointMeta(raw);
+          };
+          const systemImprovementEntrypointHref = (key) => {
+            const meta = systemImprovementEntrypointMeta(key);
+            return meta && meta.sectionId ? ('#' + meta.sectionId) : '#';
+          };
+          const systemImprovementEntrypointSupported = (key) => {
+            const meta = systemImprovementEntrypointMeta(key);
+            return !!(meta && meta.sectionId);
+          };
+          const renderSystemImprovementEntrypoint = (row) => {
+            const projectId = String(row.project_id || '').trim();
+            const projectName = String(row.project_name || '').trim();
+            const entrypointKey = String(row.entrypoint_key || '').trim();
+            const entrypointLabel = String(row.entrypoint_label || '').trim();
+            const actionLabel = String(row.action_label || '').trim();
+            const entrypointSupported = systemImprovementEntrypointSupported(entrypointKey);
+            if (entrypointSupported && entrypointLabel) {
+              return '<a href="' + escapeHtmlText(systemImprovementEntrypointHref(entrypointKey)) + '"'
+                + ' data-system-improvement-workstream="1"'
+                + ' data-project-id="' + escapeHtmlText(projectId) + '"'
+                + ' data-project-name="' + escapeHtmlText(projectName) + '"'
+                + ' data-entrypoint-key="' + escapeHtmlText(entrypointKey) + '"'
+                + ' data-entrypoint-label="' + escapeHtmlText(entrypointLabel) + '"'
+                + ' data-action-label="' + escapeHtmlText(actionLabel) + '">'
+                + escapeHtmlText(entrypointLabel) + '</a>';
+            }
+            return escapeHtmlText(entrypointLabel || '-');
+          };
+          const findFocusWorkstreamStatusSummary = (rows, statusValue) => rows.find((item) => {
+            const row = (item && typeof item === 'object') ? item : {};
+            return String(row.workstream_status || '').trim() === String(statusValue || '').trim();
+          }) || null;
+          const renderFocusWorkstreamFilters = (rows, summaries, activeFilter) => {
+            if (!rows.length) return '';
+            const statusCounts = rows.reduce((acc, item) => {
+              const row = (item && typeof item === 'object') ? item : {};
+              const rowStatus = String(row.status || 'warn').trim();
+              if (rowStatus === 'ok' || rowStatus === 'warn' || rowStatus === 'blocked') {
+                acc[rowStatus] += 1;
+              }
+              return acc;
+            }, { ok: 0, warn: 0, blocked: 0 });
+            const totalCount = rows.length;
+            const renderStatusCell = (statusValue, fallbackLabel) => {
+              const summaryRow = findFocusWorkstreamStatusSummary(summaries, statusValue) || {};
+              const label = String(summaryRow.workstream_status_label || fallbackLabel || '-').trim() || '-';
+              const count = Number.isFinite(Number(summaryRow.count))
+                ? Number(summaryRow.count)
+                : Number(statusCounts[statusValue] || 0);
+              const rowStatus = String(summaryRow.status || (count > 0 ? 'active' : 'empty')).trim();
+              const summary = String(summaryRow.summary || summaryRow.empty_reason_label || '').trim();
+              const priorityWorkstreamTitle = String(summaryRow.priority_workstream_title || '').trim();
+              const priorityActionLabel = String(summaryRow.priority_action_label || '').trim();
+              const priorityEntrypointHtml = renderSystemImprovementEntrypoint({
+                project_id: summaryRow.priority_project_id,
+                project_name: summaryRow.priority_project_name,
+                entrypoint_key: summaryRow.priority_entrypoint_key,
+                entrypoint_label: summaryRow.priority_entrypoint_label,
+              });
+              const statusHtml = rowStatus === 'active'
+                ? (
+                    statusValue === 'ok'
+                      ? '<span class="success">已命中 ' + escapeHtmlText(count) + ' 条</span>'
+                      : (statusValue === 'blocked'
+                        ? '<span class="error">已命中 ' + escapeHtmlText(count) + ' 条</span>'
+                        : '<span class="warn">已命中 ' + escapeHtmlText(count) + ' 条</span>')
+                  )
+                : '<span class="warn">当前为空</span>';
+              return '<tr><td><button type="button" class="' + (activeFilter === statusValue ? 'primary' : 'secondary') + '"'
+                + ' data-system-improvement-workstream-filter="' + escapeHtmlText(statusValue) + '">'
+                + escapeHtmlText(formatSystemImprovementWorkstreamFilterLabel(label, count))
+                + '</button></td><td>'
+                + statusHtml
+                + (summary ? ('<br><span style="color:#475569">' + escapeHtmlText(summary) + '</span>') : '')
+                + (
+                  priorityWorkstreamTitle
+                    ? (
+                        '<br><span style="color:#0f766e">建议优先工作流：'
+                        + escapeHtmlText(priorityWorkstreamTitle)
+                        + '</span>'
+                        + (
+                            String(priorityEntrypointHtml || '').trim()
+                              ? ('<br><span style="color:#475569">建议入口：' + priorityEntrypointHtml + '</span>')
+                              : ''
+                          )
+                        + (
+                            priorityActionLabel
+                              ? ('<br><span style="color:#475569">建议动作：' + escapeHtmlText(priorityActionLabel) + '</span>')
+                              : ''
+                          )
+                      )
+                    : ''
+                )
+                + '</td></tr>';
+            };
+            let sectionHtml = '<div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 10px 0">'
+              + '<button type="button" class="' + (activeFilter === 'all' ? 'primary' : 'secondary') + '"'
+              + ' data-system-improvement-workstream-filter="all">'
+              + escapeHtmlText(formatSystemImprovementWorkstreamFilterLabel('查看全部工作流', totalCount))
+              + '</button>'
+              + '</button>'
+              + '</div>';
+            sectionHtml += '<table><tr><th>工作流状态</th><th>当前状态</th></tr>';
+            sectionHtml += renderStatusCell('ok', '正常');
+            sectionHtml += renderStatusCell('warn', '待收口');
+            sectionHtml += renderStatusCell('blocked', '阻断');
+            sectionHtml += '</table>';
+            if (activeFilter !== 'all') {
+              const activeSummary = findFocusWorkstreamStatusSummary(summaries, activeFilter);
+              if (activeSummary) {
+                sectionHtml += '<p style="margin:8px 0 10px 0;color:#475569">当前仅显示：'
+                  + escapeHtmlText(String(activeSummary.workstream_status_label || activeFilter))
+                  + '</p>';
+              }
+            }
+            return sectionHtml;
+          };
+          const renderGlobalActionGapTable = (title, rows) => {
+            if (!rows.length) return '';
+            let sectionHtml = '<strong>' + escapeHtmlText(title) + '</strong>';
+            sectionHtml += '<table><tr><th>优先动作</th><th>影响项目</th><th>系统级缺口</th><th>建议入口</th></tr>';
+            rows.forEach((item) => {
+              const row = (item && typeof item === 'object') ? item : {};
+              const projectId = String(row.project_id || '').trim();
+              const projectName = String(row.project_name || '').trim();
+              const actionLabel = String(row.action_label || '').trim();
+              const executionModeLabel = String(row.execution_mode_label || '').trim();
+              const priorityReasonLabel = String(row.priority_reason_label || '').trim();
+              const prioritySortLabel = String(row.priority_sort_label || '').trim();
+              const groupReasonLabel = String(row.group_reason_label || '').trim();
+              const detail = String(row.detail || '').trim();
+              const entrypointHtml = renderSystemImprovementEntrypoint(row);
+              sectionHtml += '<tr><td>' + escapeHtmlText(actionLabel || row.kind_label || '-') + '</td>'
+                + '<td>' + escapeHtmlText(String(row.project_count || 0)) + ' 个项目'
+                + '<br><span style="color:#475569">优先项目：' + escapeHtmlText(projectName || projectId || '-') + '</span>'
+                + (executionModeLabel ? ('<br><span style="color:#0f766e">执行方式：' + escapeHtmlText(executionModeLabel) + '</span>') : '')
+                + (groupReasonLabel ? ('<br><span style="color:#475569">分组依据：' + escapeHtmlText(groupReasonLabel) + '</span>') : '')
+                + '</td><td>'
+                + escapeHtmlText(row.summary || '-')
+                + (priorityReasonLabel ? ('<br><span style="color:#475569">优先依据：' + escapeHtmlText(priorityReasonLabel) + '</span>') : '')
+                + (prioritySortLabel ? ('<br><span style="color:#475569">排序优先依据：' + escapeHtmlText(prioritySortLabel) + '</span>') : '')
+                + (detail ? ('<br><span style="color:#475569">' + escapeHtmlText(detail) + '</span>') : '')
+                + '</td><td>' + entrypointHtml + '</td></tr>';
+            });
+            sectionHtml += '</table>';
+            return sectionHtml;
+          };
+          const findGlobalActionGroupSummary = (rows, actionGroup) => rows.find((item) => {
+            const row = (item && typeof item === 'object') ? item : {};
+            return String(row.action_group || '').trim() === String(actionGroup || '').trim();
+          }) || null;
+          const renderGlobalActionGroupEmptyState = (title, rows, actionGroup, activeFilter) => {
+            if (activeFilter !== actionGroup || rows.length) return '';
+            const groupSummary = findGlobalActionGroupSummary(globalActionGroupSummaries, actionGroup);
+            if (!groupSummary) return '';
+            const summary = String(groupSummary.summary || groupSummary.empty_reason_label || '').trim();
+            return '<p style="margin:8px 0 12px 0;padding:8px 10px;border-radius:8px;background:#fffbeb;border:1px solid #fcd34d">'
+              + '<strong>' + escapeHtmlText(title) + '</strong>'
+              + '<br><span class="warn">当前为空</span>'
+              + (summary ? ('<br><span style="color:#475569">' + escapeHtmlText(summary) + '</span>') : '')
+              + '</p>';
+          };
+          const renderGlobalActionGroupSummaries = (rows, activeFilter) => {
+            if (!rows.length) return '';
+            const totalCount = rows.reduce((sum, item) => {
+              const row = (item && typeof item === 'object') ? item : {};
+              return sum + Math.max(0, Number(row.count || 0));
+            }, 0);
+            let sectionHtml = '<div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 10px 0">';
+            sectionHtml += '<button type="button" class="' + (activeFilter === 'all' ? 'primary' : 'secondary') + '"'
+              + ' data-system-improvement-action-group-filter="all">'
+              + escapeHtmlText(formatSystemImprovementActionGroupFilterLabel('查看全部动作', totalCount))
+              + '</button>';
+            sectionHtml += '</div>';
+            sectionHtml += '<table><tr><th>动作分组</th><th>当前状态</th></tr>'
+              + rows.map((item) => {
+                const row = (item && typeof item === 'object') ? item : {};
+                const actionGroup = String(row.action_group || '').trim();
+                const label = String(row.action_group_label || row.action_group || '-').trim();
+                const count = Number(row.count || 0);
+                const status = String(row.status || '').trim();
+                const summary = String(row.summary || '').trim();
+                const statusHtml = status === 'active'
+                  ? '<span class="success">已命中 ' + escapeHtmlText(count) + ' 条</span>'
+                  : '<span class="warn">当前为空</span>';
+                return '<tr><td><button type="button" class="' + (activeFilter === actionGroup ? 'primary' : 'secondary') + '"'
+                  + ' data-system-improvement-action-group-filter="' + escapeHtmlText(actionGroup) + '">'
+                  + escapeHtmlText(formatSystemImprovementActionGroupFilterLabel(label, count))
+                  + '</button></td><td>'
+                  + statusHtml
+                  + (summary ? ('<br><span style="color:#475569">' + escapeHtmlText(summary) + '</span>') : '')
+                  + '</td></tr>';
+              }).join('')
+              + '</table>';
+            if (activeFilter !== 'all') {
+              const activeSummary = findGlobalActionGroupSummary(rows, activeFilter);
+              if (activeSummary) {
+                sectionHtml += '<p style="margin:8px 0 10px 0;color:#475569">当前仅显示：'
+                  + escapeHtmlText(String(activeSummary.action_group_label || activeFilter))
+                  + '</p>';
+              }
+            }
+            return sectionHtml;
+          };
+          let html = '<strong>系统继续完善总览</strong>';
+          html += '<p style="margin:6px 0">结论：' + statusBadge
+            + '；状态说明：' + escapeHtmlText(statusLabel)
+            + (summaryLabel ? ('；摘要：' + escapeHtmlText(summaryLabel)) : '')
+            + '</p>';
+          html += '<table><tr><th>指标</th><th>值</th></tr>';
+          html += '<tr><td>系统自检</td><td>' + (metrics.self_check_ok ? '<span class="success">通过</span>' : '<span class="error">未通过</span>') + '</td></tr>';
+          html += '<tr><td>核心失败/降级告警</td><td>' + escapeHtmlText(metrics.failed_required_count || 0) + ' / ' + escapeHtmlText(metrics.failed_optional_count || 0) + '</td></tr>';
+          html += '<tr><td>孤儿记录/影响数据集</td><td>' + escapeHtmlText(metrics.orphan_records_total || 0) + ' / ' + escapeHtmlText(metrics.affected_dataset_count || 0) + '</td></tr>';
+          html += '<tr><td>系统纳管项目</td><td>' + escapeHtmlText(metrics.project_count || 0) + '</td></tr>';
+          html += '<tr><td>已评估/Ready/未Ready</td><td>' + escapeHtmlText(metrics.evaluated_project_count || 0) + ' / ' + escapeHtmlText(metrics.ready_project_count || 0) + ' / ' + escapeHtmlText(metrics.not_ready_project_count || 0) + '</td></tr>';
+          html += '<tr><td>候选项目/最小 Ready 数</td><td>' + escapeHtmlText(metrics.candidate_project_count || 0) + ' / ' + escapeHtmlText(metrics.minimum_ready_projects || 0) + '</td></tr>';
+          html += '<tr><td>当前分对齐青天</td><td>' + escapeHtmlText(metrics.current_display_matches_qt_pass_count || 0) + ' / ' + escapeHtmlText(metrics.evaluated_project_count || 0) + '</td></tr>';
+          html += '<tr><td>误差不劣于 V2</td><td>' + escapeHtmlText(metrics.current_mae_rmse_not_worse_pass_count || 0) + ' / ' + escapeHtmlText(metrics.evaluated_project_count || 0) + '</td></tr>';
+          html += '<tr><td>排序不劣于 V2</td><td>' + escapeHtmlText(metrics.current_rank_corr_not_worse_pass_count || 0) + ' / ' + escapeHtmlText(metrics.evaluated_project_count || 0) + '</td></tr>';
+          html += '<tr><td>系统总封关</td><td>' + (metrics.system_closure_ready ? '<span class="success">已满足</span>' : '<span class="warn">未完成</span>') + '</td></tr>';
+          html += '</table>';
+          html += renderOpsAgentQualitySummary(opsAgentQualitySummary);
+          if (focusWorkstreams.length) {
+            const filteredFocusWorkstreams = activeSystemImprovementWorkstreamFilter === 'all'
+              ? focusWorkstreams
+              : focusWorkstreams.filter((item) => {
+                const row = (item && typeof item === 'object') ? item : {};
+                return String(row.status || 'warn').trim() === activeSystemImprovementWorkstreamFilter;
+              });
+            html += '<strong>继续完善工作流</strong>';
+            html += renderFocusWorkstreamFilters(
+              focusWorkstreams,
+              focusWorkstreamStatusSummaries,
+              activeSystemImprovementWorkstreamFilter,
+            );
+            if (activeSystemImprovementWorkstreamFilter !== 'all' && !filteredFocusWorkstreams.length) {
+              html += '<p style="margin:8px 0 12px 0;padding:8px 10px;border-radius:8px;background:#fffbeb;border:1px solid #fcd34d">'
+                + '<span class="warn">当前没有命中该状态的工作流。</span>'
+                + '</p>';
+            }
+            html += '<table><tr><th>工作流</th><th>状态</th><th>当前结论</th><th>建议入口</th></tr>';
+            filteredFocusWorkstreams.forEach((item) => {
+              const row = (item && typeof item === 'object') ? item : {};
+              const rowStatus = String(row.status || 'warn').trim();
+              const statusHtml = rowStatus === 'ok'
+                ? '<span class="success">正常</span>'
+                : (rowStatus === 'blocked'
+                  ? '<span class="error">阻断</span>'
+                  : '<span class="warn">待收口</span>');
+              const projectId = String(row.project_id || '').trim();
+              const projectName = String(row.project_name || '').trim();
+              const entrypointKey = String(row.entrypoint_key || '').trim();
+              const entrypointLabel = String(row.entrypoint_label || '').trim();
+              const actionLabel = String(row.action_label || '').trim();
+              const detail = String(row.detail || '').trim();
+              const entrypointHtml = renderSystemImprovementEntrypoint(row);
+              html += '<tr><td>' + escapeHtmlText(row.title || '-') + '</td><td>' + statusHtml + '</td><td>'
+                + escapeHtmlText(row.summary || '-') + (detail ? ('<br><span style="color:#475569">' + escapeHtmlText(detail) + '</span>') : '')
+                + '</td><td>' + entrypointHtml + (actionLabel ? ('<br><span style="color:#0f766e">建议动作：' + escapeHtmlText(actionLabel) + '</span>') : '') + '</td></tr>';
+            });
+            html += '</table>';
+          }
+          if (closureFailedGates.length) {
+            html += '<p style="margin:8px 0 0 0;color:#92400e"><strong>系统总封关未通过门：</strong>'
+              + escapeHtmlText(closureFailedGates.join('、'))
+              + '</p>';
+          }
+          if (closureGateDetails.length) {
+            html += '<strong>系统总封关未通过门清单</strong>';
+            html += '<table><tr><th>未通过门</th><th>当前缺口</th><th>建议入口</th></tr>';
+            closureGateDetails.forEach((item) => {
+              const row = (item && typeof item === 'object') ? item : {};
+              const projectId = String(row.project_id || '').trim();
+              const projectName = String(row.project_name || '').trim();
+              const entrypointKey = String(row.entrypoint_key || '').trim();
+              const entrypointLabel = String(row.entrypoint_label || '').trim();
+              const actionLabel = String(row.action_label || '').trim();
+              const detail = String(row.detail || '').trim();
+              const entrypointHtml = renderSystemImprovementEntrypoint(row);
+              html += '<tr><td>' + escapeHtmlText(row.label || row.id || '-') + '</td><td>'
+                + escapeHtmlText(row.summary || '-') + (detail ? ('<br><span style="color:#475569">' + escapeHtmlText(detail) + '</span>') : '')
+                + '</td><td>' + entrypointHtml + (actionLabel ? ('<br><span style="color:#0f766e">建议动作：' + escapeHtmlText(actionLabel) + '</span>') : '') + '</td></tr>';
+            });
+            html += '</table>';
+          }
+          if (projectGapDetails.length) {
+            html += '<strong>逐项目收口清单</strong>';
+            html += '<table><tr><th>收口项</th><th>项目</th><th>当前缺口</th><th>建议入口</th></tr>';
+            projectGapDetails.forEach((item) => {
+              const row = (item && typeof item === 'object') ? item : {};
+              const projectId = String(row.project_id || '').trim();
+              const projectName = String(row.project_name || '').trim();
+              const entrypointKey = String(row.entrypoint_key || '').trim();
+              const entrypointLabel = String(row.entrypoint_label || '').trim();
+              const actionLabel = String(row.action_label || '').trim();
+              const detail = String(row.detail || '').trim();
+              const entrypointHtml = renderSystemImprovementEntrypoint(row);
+              html += '<tr><td>' + escapeHtmlText(row.kind_label || row.kind || '-') + '</td>'
+                + '<td>' + escapeHtmlText(projectName || projectId || '-') + '</td><td>'
+                + escapeHtmlText(row.summary || '-') + (detail ? ('<br><span style="color:#475569">' + escapeHtmlText(detail) + '</span>') : '')
+                + '</td><td>' + entrypointHtml + (actionLabel ? ('<br><span style="color:#0f766e">建议动作：' + escapeHtmlText(actionLabel) + '</span>') : '') + '</td></tr>';
+            });
+            html += '</table>';
+          }
+          if (projectGateGapDetails.length) {
+            html += '<strong>项目内未通过门清单</strong>';
+            html += '<table><tr><th>未通过门</th><th>项目</th><th>门内缺口</th><th>建议入口</th></tr>';
+            projectGateGapDetails.forEach((item) => {
+              const row = (item && typeof item === 'object') ? item : {};
+              const projectId = String(row.project_id || '').trim();
+              const projectName = String(row.project_name || '').trim();
+              const entrypointKey = String(row.entrypoint_key || '').trim();
+              const entrypointLabel = String(row.entrypoint_label || '').trim();
+              const actionLabel = String(row.action_label || '').trim();
+              const detail = String(row.detail || '').trim();
+              const entrypointHtml = renderSystemImprovementEntrypoint(row);
+              html += '<tr><td>' + escapeHtmlText(row.gate_label || row.gate_id || '-') + '</td>'
+                + '<td>' + escapeHtmlText(projectName || projectId || '-') + '</td><td>'
+                + escapeHtmlText(row.summary || '-') + (detail ? ('<br><span style="color:#475569">' + escapeHtmlText(detail) + '</span>') : '')
+                + '</td><td>' + entrypointHtml + (actionLabel ? ('<br><span style="color:#0f766e">建议动作：' + escapeHtmlText(actionLabel) + '</span>') : '') + '</td></tr>';
+            });
+            html += '</table>';
+          }
+          if (projectActionGapDetails.length) {
+            html += '<strong>按动作归并的项目收口清单</strong>';
+            html += '<table><tr><th>建议动作</th><th>项目</th><th>关联缺口</th><th>执行入口</th></tr>';
+            projectActionGapDetails.forEach((item) => {
+              const row = (item && typeof item === 'object') ? item : {};
+              const projectId = String(row.project_id || '').trim();
+              const projectName = String(row.project_name || '').trim();
+              const entrypointKey = String(row.entrypoint_key || '').trim();
+              const entrypointLabel = String(row.entrypoint_label || '').trim();
+              const actionLabel = String(row.action_label || '').trim();
+              const detail = String(row.detail || '').trim();
+              const entrypointHtml = renderSystemImprovementEntrypoint(row);
+              html += '<tr><td>' + escapeHtmlText(actionLabel || row.kind_label || '-') + '</td>'
+                + '<td>' + escapeHtmlText(projectName || projectId || '-') + '</td><td>'
+                + escapeHtmlText(row.summary || '-') + (detail ? ('<br><span style="color:#475569">' + escapeHtmlText(detail) + '</span>') : '')
+                + '</td><td>' + entrypointHtml + '</td></tr>';
+            });
+            html += '</table>';
+          }
+          if (globalActionGapDetails.length || globalActionGroupSummaries.length) {
+            html += '<strong>系统级优先动作清单</strong>';
+            html += renderGlobalActionGroupSummaries(globalActionGroupSummaries, activeSystemImprovementActionGroupFilter);
+            if (activeSystemImprovementActionGroupFilter === 'all' || activeSystemImprovementActionGroupFilter === 'auto') {
+              html += renderGlobalActionGapTable('可自动收口动作', globalAutoActionGapDetails);
+              html += renderGlobalActionGroupEmptyState('可自动收口动作', globalAutoActionGapDetails, 'auto', activeSystemImprovementActionGroupFilter);
+            }
+            if (activeSystemImprovementActionGroupFilter === 'all' || activeSystemImprovementActionGroupFilter === 'readonly') {
+              html += renderGlobalActionGapTable('只读诊断动作', globalReadonlyActionGapDetails);
+              html += renderGlobalActionGroupEmptyState('只读诊断动作', globalReadonlyActionGapDetails, 'readonly', activeSystemImprovementActionGroupFilter);
+            }
+            if (activeSystemImprovementActionGroupFilter === 'all' || activeSystemImprovementActionGroupFilter === 'manual') {
+              html += renderGlobalActionGapTable('必须人工处理动作', globalManualActionGapDetails);
+              html += renderGlobalActionGroupEmptyState('必须人工处理动作', globalManualActionGapDetails, 'manual', activeSystemImprovementActionGroupFilter);
+            }
+            if (
+              activeSystemImprovementActionGroupFilter === 'all'
+              && !globalAutoActionGapDetails.length
+              && !globalReadonlyActionGapDetails.length
+              && !globalManualActionGapDetails.length
+            ) {
+              html += renderGlobalActionGapTable('系统级动作', globalActionGapDetails);
+            }
+          }
+          html += renderListBlock('优势项', strengths, '#166534');
+          html += renderListBlock('阻断项', blockers, '#b91c1c');
+          html += renderListBlock('警告项', warnings, '#92400e');
+          html += renderListBlock('建议动作', recommendations, '#334155');
+          el.style.display = 'block';
+          el.innerHTML = html;
+        }
+        window.renderSystemImprovementOverviewPanel = renderSystemImprovementOverviewPanel;
+        async function ensureSystemImprovementProjectSelection(projectId, projectName='') {
+          const targetProjectId = String(projectId || '').trim();
+          if (!targetProjectId) return true;
+          const sel = document.getElementById('projectSelect');
+          if (!sel) return false;
+          if (String(sel.value || '') === targetProjectId) return true;
+          let optionExists = Array.from(sel.options || []).some(
+            (opt) => String(opt.value || '').trim() === targetProjectId
+          );
+          let switchedMonthFilter = false;
+          if (!optionExists) {
+            const monthSelect = document.getElementById('projectMonthFilter');
+            if (monthSelect && String(monthSelect.value || 'all').trim() !== 'all') {
+              monthSelect.value = 'all';
+              storageRemove('project_month_filter');
+              switchedMonthFilter = true;
+            }
+            await refreshProjects(targetProjectId, {
+              closureSummaryOptions: { reason: 'system_improvement_overview_nav', silent: true },
+            });
+            optionExists = Array.from(sel.options || []).some(
+              (opt) => String(opt.value || '').trim() === targetProjectId
+            );
+          }
+          if (!optionExists) {
+            setSelectMsg('未能定位优先项目：' + String(projectName || targetProjectId), true);
+            return false;
+          }
+          sel.value = targetProjectId;
+          if (String(sel.value || '') !== targetProjectId) {
+            setSelectMsg('未能切换到优先项目：' + String(projectName || targetProjectId), true);
+            return false;
+          }
+          await onProjectChanged({ skipClosureSummaryRefresh: true });
+          setSelectMsg(
+            (switchedMonthFilter ? '已自动切换到全部月份并定位项目：' : '已定位到项目：')
+              + String(projectName || targetProjectId),
+            false
+          );
+          renderProjectSelectionClosureHint(systemClosureSummaryState, targetProjectId);
+          return true;
+        }
+        function renderSystemImprovementEntrypointActionHint(entrypointKey, projectName='', entrypointLabel='', actionLabel='') {
+          const key = String(entrypointKey || '').trim();
+          if (key !== 'ground_truth') return;
+          const el = document.getElementById('evolveResult');
+          if (!el) return;
+          const projectLabel = String(projectName || currentSelectedProjectDisplayName() || pid() || '-').trim() || '-';
+          const entryLabel = String(entrypointLabel || '前往「5) 自我学习与进化」录入真实评标').trim()
+            || '前往「5) 自我学习与进化」录入真实评标';
+          const actionText = String(actionLabel || '录入真实评标').trim() || '录入真实评标';
+          el.innerHTML = '<strong>系统当前建议：' + escapeHtmlText(actionText) + '</strong>'
+            + '<p style="margin:6px 0 0 0;color:#475569">已定位到项目：' + escapeHtmlText(projectLabel) + '</p>'
+            + '<p style="margin:4px 0 0 0;color:#475569">建议入口：' + escapeHtmlText(entryLabel) + '</p>'
+            + '<p style="margin:4px 0 0 0;color:#475569">请先在“施组文件”下拉中选择步骤4已上传施组，再录入真实评标。</p>';
+          el.style.display = 'block';
+        }
+        async function navigateSystemImprovementWorkstream(projectId, projectName, entrypointKey, entrypointLabel='', actionLabel='') {
+          const key = String(entrypointKey || '').trim();
+          if (!key) return false;
+          if (!(await ensureSystemImprovementProjectSelection(projectId, projectName))) return false;
+          renderSystemImprovementEntrypointActionHint(key, projectName, entrypointLabel, actionLabel);
+          return focusSystemClosureEntrypoint(key);
+        }
+        const systemImprovementResultEl = document.getElementById('systemImprovementResult');
+        if (systemImprovementResultEl && !systemImprovementResultEl.dataset.workstreamBindingReady) {
+          systemImprovementResultEl.dataset.workstreamBindingReady = '1';
+          systemImprovementResultEl.addEventListener('click', async (event) => {
+            const workstreamFilterTarget = event.target && typeof event.target.closest === 'function'
+              ? event.target.closest('button[data-system-improvement-workstream-filter]')
+              : null;
+            if (workstreamFilterTarget && systemImprovementResultEl.contains(workstreamFilterTarget)) {
+              event.preventDefault();
+              setSystemImprovementWorkstreamFilter(workstreamFilterTarget.dataset.systemImprovementWorkstreamFilter || 'all');
+              return;
+            }
+            const filterTarget = event.target && typeof event.target.closest === 'function'
+              ? event.target.closest('button[data-system-improvement-action-group-filter]')
+              : null;
+            if (filterTarget && systemImprovementResultEl.contains(filterTarget)) {
+              event.preventDefault();
+              setSystemImprovementActionGroupFilter(filterTarget.dataset.systemImprovementActionGroupFilter || 'all');
+              return;
+            }
+            const target = event.target && typeof event.target.closest === 'function'
+              ? event.target.closest('a[data-system-improvement-workstream]')
+              : null;
+            if (!target || !systemImprovementResultEl.contains(target)) return;
+            event.preventDefault();
+            await navigateSystemImprovementWorkstream(
+              target.dataset.projectId || '',
+              target.dataset.projectName || '',
+              target.dataset.entrypointKey || '',
+              target.dataset.entrypointLabel || '',
+              target.dataset.actionLabel || '',
+            );
+          });
+        }
+        function renderTrialPreflightPanel(payload) {
+          const el = document.getElementById('trialPreflightResult');
+          if (!el) return;
+          const data = (payload && typeof payload === 'object') ? payload : {};
+          const metrics = (data.metrics && typeof data.metrics === 'object') ? data.metrics : {};
+          const signoff = (data.signoff && typeof data.signoff === 'object') ? data.signoff : {};
+          const warningDetails = (data.warning_details && typeof data.warning_details === 'object') ? data.warning_details : {};
+          const recordDraft = (data.record_draft && typeof data.record_draft === 'object') ? data.record_draft : {};
+          const blockers = Array.isArray(data.blockers) ? data.blockers : [];
+          const warnings = Array.isArray(data.warnings) ? data.warnings : [];
+          const strengths = Array.isArray(data.strengths) ? data.strengths : [];
+          const recommendations = Array.isArray(data.recommendations) ? data.recommendations : [];
+          const verificationChecklist = Array.isArray(signoff.verification_checklist)
+            ? signoff.verification_checklist
+            : [];
+          const topHighSeverityConflicts = Array.isArray(warningDetails.high_severity_material_conflicts)
+            ? warningDetails.high_severity_material_conflicts
+            : [];
+          const conflictRecommendations = Array.isArray(warningDetails.material_conflict_recommendations)
+            ? warningDetails.material_conflict_recommendations
+            : [];
+          const warningAckItems = Array.isArray(recordDraft.warning_ack_items)
+            ? recordDraft.warning_ack_items
+            : [];
+          const closureFailedGates = Array.isArray(metrics.system_closure_failed_gates)
+            ? metrics.system_closure_failed_gates
+            : [];
+          const status = String(data.status || 'unknown').trim();
+          const statusLabel = String(data.status_label || '-').trim() || '-';
+          const signoffDecisionLabel = String(signoff.decision_label || statusLabel || '-').trim() || '-';
+          const signoffRiskLabel = String(signoff.risk_label || '-').trim() || '-';
+          const signoffSummaryLabel = String(signoff.summary_label || '').trim();
+          const recordDraftStatusLabel = String(recordDraft.status_label || '-').trim() || '-';
+          const recordDraftSummaryLabel = String(recordDraft.summary_label || '-').trim() || '-';
+          const recordDraftRecommendedConclusion = String(recordDraft.recommended_conclusion || '-').trim() || '-';
+          const recordDraftRecommendedRisk = String(recordDraft.recommended_risk_label || '-').trim() || '-';
+          const recordDraftSuggestedAt = String(recordDraft.suggested_executed_at || '-').trim() || '-';
+          const recordDraftExecutor = String(recordDraft.executor_name || '-').trim() || '-';
+          const recordDraftHint = String(recordDraft.confirmation_hint || '-').trim() || '-';
+          const recordDraftNextAction = String(recordDraft.next_recommended_action || '').trim();
+          const statusBadge = status === 'ready'
+            ? '<span class="success">可直接试车</span>'
+            : (status === 'watch'
+              ? '<span class="warn">可试车但需关注</span>'
+              : '<span class="error">暂不建议试车</span>');
+          const renderListBlock = (title, items, color) => {
+            if (!items.length) return '';
+            return '<strong>' + escapeHtmlText(title) + '</strong>'
+              + '<ul style="margin:6px 0 10px 18px;color:' + color + '">'
+              + items.map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('')
+              + '</ul>';
+          };
+          let html = '<strong>试车前综合体检</strong>';
+          html += '<p style="margin:6px 0">结论：' + statusBadge
+            + '；状态说明：' + escapeHtmlText(statusLabel)
+            + '；项目：' + escapeHtmlText(String(data.project_name || data.project_id || '-'))
+            + '</p>';
+          html += '<p style="margin:6px 0 10px 0;padding:8px 10px;border-radius:8px;background:#fff7ed;border:1px solid #fdba74">'
+            + '签发决策：<strong>' + escapeHtmlText(signoffDecisionLabel) + '</strong>'
+            + '；风险级别：<strong>' + escapeHtmlText(signoffRiskLabel) + '</strong>'
+            + (signoffSummaryLabel ? ('；签发摘要：' + escapeHtmlText(signoffSummaryLabel)) : '')
+            + '</p>';
+          if (verificationChecklist.length) {
+            html += '<strong>核验清单</strong>';
+            html += '<table><tr><th>项目</th><th>状态</th><th>说明</th></tr>';
+            verificationChecklist.forEach((item) => {
+              const row = (item && typeof item === 'object') ? item : {};
+              const passed = !!row.passed;
+              html += '<tr><td>' + escapeHtmlText(row.name || '-') + '</td><td>'
+                + (passed ? '<span class="success">通过</span>' : '<span class="error">未通过</span>')
+                + '</td><td>' + escapeHtmlText(row.detail || '-') + '</td></tr>';
+            });
+            html += '</table>';
+          }
+          html += '<strong>试车记录草案（待确认）</strong>';
+          html += '<table><tr><th>项目</th><th>值</th></tr>';
+          html += '<tr><td>记录状态</td><td>' + escapeHtmlText(recordDraftStatusLabel) + '</td></tr>';
+          html += '<tr><td>草案摘要</td><td>' + escapeHtmlText(recordDraftSummaryLabel) + '</td></tr>';
+          html += '<tr><td>建议结论</td><td>' + escapeHtmlText(recordDraftRecommendedConclusion) + '</td></tr>';
+          html += '<tr><td>风险级别</td><td>' + escapeHtmlText(recordDraftRecommendedRisk) + '</td></tr>';
+          html += '<tr><td>建议试车时间</td><td>' + escapeHtmlText(recordDraftSuggestedAt) + '</td></tr>';
+          html += '<tr><td>执行人</td><td>' + escapeHtmlText(recordDraftExecutor) + '</td></tr>';
+          html += '<tr><td>确认提示</td><td>' + escapeHtmlText(recordDraftHint) + '</td></tr>';
+          html += '</table>';
+          if (warningAckItems.length) {
+            html += '<strong>需确认警告项</strong>'
+              + '<ul style="margin:6px 0 10px 18px;color:#92400e">'
+              + warningAckItems.map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('')
+              + '</ul>';
+          }
+          if (recordDraftNextAction) {
+            html += '<p style="margin:6px 0 10px 0"><strong>建议优先动作：</strong>'
+              + escapeHtmlText(recordDraftNextAction)
+              + '</p>';
+          }
+          if (topHighSeverityConflicts.length || conflictRecommendations.length) {
+            html += '<strong>重点警告明细</strong>';
+            if (topHighSeverityConflicts.length) {
+              html += '<table><tr><th>高严重度资料冲突清单</th><th>说明</th><th>建议处理</th></tr>';
+              topHighSeverityConflicts.forEach((item) => {
+                const row = (item && typeof item === 'object') ? item : {};
+                const entrypointKey = String(row.entrypoint_key || 'upload_shigong').trim() || 'upload_shigong';
+                const entrypointLabel = String(row.entrypoint_label || '').trim();
+                const entrypointAnchor = String(row.entrypoint_anchor || '').trim() || '#section-shigong';
+                const entrypointReasonLabel = String(row.entrypoint_reason_label || '').trim();
+                const materialType = String(row.material_type || '').trim();
+                const materialReviewEntryLabel = String(row.material_review_entrypoint_label || '').trim();
+                const materialReviewReasonLabel = String(row.material_review_reason_label || '').trim();
+                const materialReviewEntryAnchor = String(row.material_review_entrypoint_anchor || '').trim()
+                  || '#section-materials';
+                const actionLabel = String(row.action_label || '').trim();
+                const secondaryHint = String(row.secondary_hint || '').trim();
+                let actionHtml = '-';
+                if (
+                  entrypointLabel
+                  || materialReviewEntryLabel
+                  || actionLabel
+                  || secondaryHint
+                ) {
+                  actionHtml = '';
+                  if (entrypointLabel) {
+                    actionHtml += '<a href="' + escapeHtmlText(entrypointAnchor) + '"'
+                      + ' data-trial-preflight-entry="shigong_update"'
+                      + ' data-entrypoint-key="' + escapeHtmlText(entrypointKey) + '"'
+                      + ' data-entrypoint-label="' + escapeHtmlText(entrypointLabel) + '"'
+                      + ' data-entrypoint-reason-label="' + escapeHtmlText(entrypointReasonLabel) + '">'
+                      + escapeHtmlText(entrypointLabel) + '</a>';
+                  }
+                  if (materialReviewEntryLabel) {
+                    actionHtml += (actionHtml ? '<br>' : '')
+                      + '<a href="' + escapeHtmlText(materialReviewEntryAnchor) + '"'
+                      + ' data-trial-preflight-entry="material_review"'
+                      + ' data-material-type="' + escapeHtmlText(materialType) + '"'
+                      + ' data-entrypoint-key="' + escapeHtmlText(entrypointKey) + '"'
+                      + ' data-entrypoint-label="' + escapeHtmlText(entrypointLabel) + '"'
+                      + ' data-entrypoint-reason-label="' + escapeHtmlText(entrypointReasonLabel) + '"'
+                      + ' data-material-entry-label="' + escapeHtmlText(materialReviewEntryLabel) + '"'
+                      + ' data-material-entry-reason-label="' + escapeHtmlText(materialReviewReasonLabel) + '">'
+                      + escapeHtmlText(materialReviewEntryLabel) + '</a>';
+                  }
+                  if (materialReviewReasonLabel) {
+                    actionHtml += (actionHtml ? '<br>' : '') + '<span style="color:#0f766e">'
+                      + '资料核对依据：' + escapeHtmlText(materialReviewReasonLabel) + '</span>';
+                  }
+                  if (entrypointReasonLabel) {
+                    actionHtml += (actionHtml ? '<br>' : '') + '<span style="color:#475569">'
+                      + '推荐入口依据：' + escapeHtmlText(entrypointReasonLabel) + '</span>';
+                  }
+                  if (actionLabel) {
+                    actionHtml += (actionHtml ? '<br>' : '') + escapeHtmlText(actionLabel);
+                  }
+                  if (secondaryHint) {
+                    actionHtml += (actionHtml ? '<br>' : '') + escapeHtmlText(secondaryHint);
+                  }
+                }
+                html += '<tr><td>' + escapeHtmlText(row.summary_label || '-') + '</td><td>'
+                  + escapeHtmlText(row.detail_label || '-') + '</td><td>'
+                  + actionHtml + '</td></tr>';
+              });
+              html += '</table>';
+            }
+            if (conflictRecommendations.length) {
+              html += '<strong>冲突处理建议</strong>'
+                + '<ul style="margin:6px 0 10px 18px;color:#92400e">'
+                + conflictRecommendations.map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('')
+                + '</ul>';
+            }
+          }
+          html += '<table><tr><th>指标</th><th>值</th></tr>';
+          html += '<tr><td>运行自检</td><td>' + (metrics.self_check_ok ? '<span class="success">通过</span>' : '<span class="error">未通过</span>') + '</td></tr>';
+          html += '<tr><td>项目评分前置</td><td>' + (metrics.project_ready_to_score ? '<span class="success">已满足</span>' : '<span class="error">未满足</span>') + '</td></tr>';
+          html += '<tr><td>资料门禁</td><td>' + (metrics.project_gate_passed ? '<span class="success">通过</span>' : '<span class="error">未通过</span>') + '</td></tr>';
+          html += '<tr><td>MECE 健康度</td><td>' + escapeHtmlText(metrics.project_mece_level || '-') + ' / ' + escapeHtmlText(metrics.project_mece_health_score ?? '-') + '</td></tr>';
+          html += '<tr><td>真实评标样本</td><td>' + escapeHtmlText(metrics.ground_truth_count || 0) + '</td></tr>';
+          html += '<tr><td>有效预测匹配</td><td>' + escapeHtmlText(metrics.matched_prediction_count || 0) + '</td></tr>';
+          html += '<tr><td>有效评分记录匹配</td><td>' + escapeHtmlText(metrics.matched_score_record_count || 0) + '</td></tr>';
+          html += '<tr><td>项目级校准器</td><td>' + escapeHtmlText(metrics.current_calibrator_version || '-') + (metrics.current_calibrator_degraded ? '（已退化）' : '') + '</td></tr>';
+          html += '<tr><td>演化权重可用</td><td>' + (metrics.evolution_weights_usable ? '<span class="success">是</span>' : '<span class="warn">否</span>') + '</td></tr>';
+          html += '<tr><td>漂移等级</td><td>' + escapeHtmlText(metrics.drift_level || '-') + '</td></tr>';
+          html += '<tr><td>最新评分置信等级</td><td>' + escapeHtmlText(metrics.latest_score_confidence_level || '-') + '</td></tr>';
+          html += '<tr><td>高严重度资料冲突</td><td>' + escapeHtmlText(metrics.material_conflict_high_severity_count || 0) + '</td></tr>';
+          html += '<tr><td>系统总封关</td><td>' + (metrics.system_closure_ready ? '<span class="success">已满足</span>' : '<span class="warn">未完成</span>') + '</td></tr>';
+          html += '<tr><td>数据卫生孤儿记录</td><td>' + escapeHtmlText(metrics.orphan_records_total || 0) + '</td></tr>';
+          html += '</table>';
+          if (closureFailedGates.length) {
+            html += '<p style="margin:8px 0 0 0;color:#92400e"><strong>总封关未通过门：</strong>'
+              + escapeHtmlText(closureFailedGates.join('、'))
+              + '</p>';
+          }
+          html += renderListBlock('优势项', strengths, '#166534');
+          html += renderListBlock('阻断项', blockers, '#b91c1c');
+          html += renderListBlock('警告项', warnings, '#92400e');
+          html += renderListBlock('建议动作', recommendations, '#334155');
+          el.style.display = 'block';
+          el.innerHTML = html;
+        }
+        window.renderTrialPreflightPanel = renderTrialPreflightPanel;
+        const trialPreflightResultEl = document.getElementById('trialPreflightResult');
+        if (trialPreflightResultEl && !trialPreflightResultEl.dataset.entrypointBindingReady) {
+          trialPreflightResultEl.dataset.entrypointBindingReady = '1';
+          trialPreflightResultEl.addEventListener('click', (event) => {
+            const target = event.target && typeof event.target.closest === 'function'
+              ? event.target.closest('a[data-trial-preflight-entry]')
+              : null;
+            if (!target || !trialPreflightResultEl.contains(target)) return;
+            event.preventDefault();
+            navigateTrialPreflightEntrypoint(
+              target.dataset.trialPreflightEntry || '',
+              target.getAttribute('href') || '',
+              target.dataset.materialType || '',
+              target.dataset.entrypointKey || '',
+              target.dataset.entrypointLabel || '',
+              target.dataset.entrypointReasonLabel || '',
+              target.dataset.materialEntryLabel || '',
+              target.dataset.materialEntryReasonLabel || '',
+            );
+          });
+        }
+        function renderManualConfirmationAuditBlock(audit) {
+          const item = (audit && typeof audit === 'object') ? audit : {};
+          if (!Object.keys(item).length) return '';
+          const actionLabel = String(item.action_label || '继续执行').trim() || '继续执行';
+          const status = String(item.status || '').trim();
+          const statusLabel = String(item.status_label || '').trim();
+          const detail = String(item.detail || '').trim();
+          const recommendation = String(item.recommendation || '').trim();
+          const overrideUsed = item.override_used === true;
+          const pendingCount = Number(item.pending_extreme_ground_truth_count || 0);
+          const blockedCount = Number(item.blocked_ground_truth_count || 0);
+          const approvedCount = Number(item.approved_extreme_ground_truth_count || 0);
+          const beforePendingCount = Number(item.before_pending_extreme_ground_truth_count || 0);
+          const beforeBlockedCount = Number(item.before_blocked_ground_truth_count || 0);
+          const beforeApprovedCount = Number(item.before_approved_extreme_ground_truth_count || 0);
+          const deltaPendingCount = Number(item.delta_pending_extreme_ground_truth_count || 0);
+          const deltaBlockedCount = Number(item.delta_blocked_ground_truth_count || 0);
+          const deltaApprovedCount = Number(item.delta_approved_extreme_ground_truth_count || 0);
+          const gateClearedAfterReverify = item.gate_cleared_after_reverify === true;
+          const reverifySummary = String(item.reverify_summary || '').trim();
+          const manualOverrideHint = String(item.manual_override_hint || '').trim();
+          const deploymentMode = String(item.current_calibrator_deployment_mode || '').trim();
+          const statusColor = status === 'cleared'
+            ? '#166534'
+            : (status === 'blocked' ? '#92400e' : '#475569');
+          const fmtDelta = (value) => {
+            const num = Number(value || 0);
+            if (!Number.isFinite(num)) return '0';
+            if (num > 0) return '+' + String(num);
+            return String(num);
+          };
+          let html = '<div style="margin:10px 0 8px 0;padding:10px 12px;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc">';
+          html += '<strong>人工确认复验审计</strong>';
+          html += '<p style="margin:6px 0 0 0;color:' + statusColor + '"><strong>动作：</strong>'
+            + escapeHtmlText(actionLabel)
+            + '；<strong>状态：</strong>'
+            + escapeHtmlText(statusLabel || '-')
+            + '</p>';
+          if (overrideUsed) {
+            html += '<p style="margin:6px 0 0 0;color:#475569">本次已按 <code>confirm_extreme_sample=1</code> 继续执行，并已重新检查治理状态。</p>';
+          }
+          if (reverifySummary) {
+            html += '<p style="margin:6px 0 0 0;color:#475569"><strong>复验摘要：</strong>'
+              + escapeHtmlText(reverifySummary)
+              + '</p>';
+          }
+          html += '<p style="margin:6px 0 0 0;color:#475569"><strong>复验前：</strong>待人工审核='
+            + escapeHtmlText(beforePendingCount)
+            + '；当前被拦截=' + escapeHtmlText(beforeBlockedCount)
+            + '；已人工放行=' + escapeHtmlText(beforeApprovedCount)
+            + '</p>';
+          html += '<p style="margin:6px 0 0 0;color:#475569">待人工审核='
+            + escapeHtmlText(pendingCount)
+            + '；当前被拦截=' + escapeHtmlText(blockedCount)
+            + '；已人工放行=' + escapeHtmlText(approvedCount)
+            + (deploymentMode ? ('；部署模式=' + escapeHtmlText(deploymentMode)) : '')
+            + '</p>';
+          html += '<p style="margin:6px 0 0 0;color:#475569"><strong>变化：</strong>待人工审核='
+            + escapeHtmlText(fmtDelta(deltaPendingCount))
+            + '；当前被拦截=' + escapeHtmlText(fmtDelta(deltaBlockedCount))
+            + '；已人工放行=' + escapeHtmlText(fmtDelta(deltaApprovedCount))
+            + (gateClearedAfterReverify ? '；人工确认门已在本次复验后清除' : '')
+            + '</p>';
+          if (detail) {
+            html += '<p style="margin:6px 0 0 0;color:#475569">' + escapeHtmlText(detail) + '</p>';
+          }
+          if (recommendation) {
+            html += '<p style="margin:6px 0 0 0;color:#475569"><strong>建议：</strong>' + escapeHtmlText(recommendation) + '</p>';
+          }
+          if (manualOverrideHint) {
+            html += '<p style="margin:6px 0 0 0;color:#475569"><strong>提示参数：</strong><code>'
+              + escapeHtmlText(manualOverrideHint)
+              + '</code></p>';
+          }
+          html += '</div>';
+          return html;
+        }
+        function renderGroundTruthPostAddFollowUpActionHint(projectName='', entrypointLabel='', actionLabel='') {
+          const projectLabel = String(projectName || currentSelectedProjectDisplayName() || pid() || '-').trim() || '-';
+          const entryLabel = String(entrypointLabel || '前往「5) 自我学习与进化」执行“一键闭环”').trim()
+            || '前往「5) 自我学习与进化」执行“一键闭环”';
+          const actionText = String(actionLabel || '执行一键闭环复验人工确认结果').trim()
+            || '执行一键闭环复验人工确认结果';
+          return '<div style="margin:10px 0 8px 0;padding:10px 12px;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc">'
+            + '<strong>系统当前建议：' + escapeHtmlText(actionText) + '</strong>'
+            + '<p style="margin:6px 0 0 0;color:#475569">已定位到项目：' + escapeHtmlText(projectLabel) + '</p>'
+            + '<p style="margin:4px 0 0 0;color:#475569">建议入口：' + escapeHtmlText(entryLabel) + '</p>'
+            + '<p style="margin:4px 0 0 0;color:#475569">已自动高亮“一键闭环执行”按钮，可直接复验人工确认后的学习/校准状态。</p>'
+            + '</div>';
         }
         function renderEvolutionEnhancementAudit(data) {
           const item = (data && typeof data === 'object') ? data : {};
@@ -30562,6 +43506,18 @@ def index(
           const latestProjectCalibratorAutoReview = (summary.latest_project_calibrator_auto_review && typeof summary.latest_project_calibrator_auto_review === 'object')
             ? summary.latest_project_calibrator_auto_review
             : {};
+          const currentCalibratorDegraded = !!summary.current_calibrator_degraded;
+          const currentCalibratorRecentMae = (summary.current_calibrator_recent_mae != null)
+            ? Number(summary.current_calibrator_recent_mae)
+            : null;
+          const currentCalibratorRecentRuleMae = (summary.current_calibrator_recent_rule_mae != null)
+            ? Number(summary.current_calibrator_recent_rule_mae)
+            : null;
+          const rollbackCandidateVersion = String(summary.current_calibrator_rollback_candidate_version || '').trim();
+          const rollbackCandidateMode = String(summary.current_calibrator_rollback_candidate_deployment_mode || '').trim();
+          const rollbackCandidateCvMae = (summary.current_calibrator_rollback_candidate_cv_mae != null)
+            ? Number(summary.current_calibrator_rollback_candidate_cv_mae)
+            : null;
           const formatCalibratorMode = (value) => ({
             prior_fallback: 'prior 兜底',
             cv_validated: '完整 CV 校准',
@@ -30642,20 +43598,35 @@ def index(
           html += '<tr><td>few-shot 版本数</td><td>' + escapeHtmlText(summary.few_shot_feature_version_count || 0) + '</td></tr>';
           html += '<tr><td>最新 few-shot 版本</td><td>' + escapeHtmlText(summary.latest_few_shot_version_id || '-') + '</td></tr>';
           html += '<tr><td>当前校准器</td><td>' + escapeHtmlText(summary.current_calibrator_version || '-') + '</td></tr>';
+          html += '<tr><td>当前校准器状态</td><td>' + escapeHtmlText(summary.current_calibrator_version ? (currentCalibratorDegraded ? '已退化' : '稳定') : '未部署项目级校准器') + '</td></tr>';
           html += '<tr><td>当前校准形态</td><td>' + escapeHtmlText(formatCalibratorMode(summary.current_calibrator_deployment_mode)) + '</td></tr>';
+          html += '<tr><td>近30天校准器/规则 MAE（内部校准指标）</td><td>'
+            + escapeHtmlText((currentCalibratorRecentMae != null) ? currentCalibratorRecentMae.toFixed(4) : '-')
+            + ' / '
+            + escapeHtmlText((currentCalibratorRecentRuleMae != null) ? currentCalibratorRecentRuleMae.toFixed(4) : '-')
+            + '</td></tr>';
+          html += '<tr><td>历史回退候选</td><td>'
+            + (rollbackCandidateVersion
+              ? (
+                escapeHtmlText(rollbackCandidateVersion)
+                + (rollbackCandidateMode ? ('；' + escapeHtmlText(formatCalibratorMode(rollbackCandidateMode))) : '')
+                + (rollbackCandidateCvMae != null ? ('；CV MAE=' + escapeHtmlText(rollbackCandidateCvMae.toFixed(4))) : '')
+              )
+              : '无')
+            + '</td></tr>';
           html += '<tr><td>当前自动复核</td><td>' + escapeHtmlText(formatAutoReview(currentCalibratorAutoReview)) + '</td></tr>';
           html += '<tr><td>最新项目级校准器</td><td>' + escapeHtmlText(summary.latest_project_calibrator_version || '-') + '</td></tr>';
           html += '<tr><td>最新项目级形态</td><td>' + escapeHtmlText(formatCalibratorMode(summary.latest_project_calibrator_deployment_mode)) + '</td></tr>';
           html += '<tr><td>最新项目级自动复核</td><td>' + escapeHtmlText(formatAutoReview(latestProjectCalibratorAutoReview)) + '</td></tr>';
           html += '</table>';
           if (blockedSamples.length) {
-            html += '<strong>被拦截样本</strong><table><tr><th>记录ID</th><th>来源</th><th>真实分</th><th>预测分</th><th>偏差(100分)</th><th>审核状态</th><th>说明</th><th>操作</th></tr>';
+            html += '<strong>被拦截样本</strong><table><tr><th>记录ID</th><th>来源</th><th>真实分</th><th>当前分</th><th>偏差</th><th>审核状态</th><th>说明</th><th>操作</th></tr>';
             html += blockedSamples.slice(0, 10).map((row) => '<tr>'
               + '<td>' + escapeHtmlText(row.record_id || '-') + '</td>'
               + '<td>' + escapeHtmlText(row.source_submission_filename || row.source || '-') + '</td>'
-              + '<td>' + escapeHtmlText(row.actual_score_100 != null ? row.actual_score_100 : '-') + '</td>'
-              + '<td>' + escapeHtmlText(row.predicted_score_100 != null ? row.predicted_score_100 : '-') + '</td>'
-              + '<td>' + escapeHtmlText(row.abs_delta_100 != null ? row.abs_delta_100 : '-') + '</td>'
+              + '<td>' + escapeHtmlText(row.actual_score != null ? row.actual_score : (row.actual_score_100 != null ? row.actual_score_100 : '-')) + '</td>'
+              + '<td>' + escapeHtmlText(row.current_score != null ? row.current_score : (row.predicted_score != null ? row.predicted_score : (row.current_score_100 != null ? row.current_score_100 : (row.predicted_score_100 != null ? row.predicted_score_100 : '-')))) + '</td>'
+              + '<td>' + escapeHtmlText(row.abs_delta != null ? row.abs_delta : (row.abs_delta_100 != null ? row.abs_delta_100 : '-')) + '</td>'
               + '<td>' + escapeHtmlText(row.manual_review_status || 'pending') + '</td>'
               + '<td>' + escapeHtmlText(row.warning_message || '-') + '</td>'
               + '<td>'
@@ -30697,7 +43668,7 @@ def index(
               const effect = (row && typeof row.closed_loop_effect === 'object') ? row.closed_loop_effect : {};
               return '<tr>'
                 + '<td>' + escapeHtmlText(row.record_id || '-') + '</td>'
-                + '<td>' + escapeHtmlText(row.abs_delta_100 != null ? row.abs_delta_100 : '-') + '</td>'
+                + '<td>' + escapeHtmlText(row.abs_delta != null ? row.abs_delta : (row.abs_delta_100 != null ? row.abs_delta_100 : '-')) + '</td>'
                 + '<td>' + escapeHtmlText(row.reviewed_at || '-') + '</td>'
                 + '<td>' + escapeHtmlText(effect.weight_updated ? '已更新' : '未更新') + '</td>'
                 + '<td>' + escapeHtmlText(effect.delta_case_count || 0) + '</td>'
@@ -30912,7 +43883,9 @@ def index(
             setResultError('feedbackGovernanceResult', '分析失败：' + String((err && err.message) || err || '网络异常'));
             return null;
           }
-          showJson('output', formatApiOutput(res, data));
+          if (!opts.silentOutput) {
+            showJson('output', formatApiOutput(res, data));
+          }
           if (!res.ok) {
             const detail = (data && data.detail) ? String(data.detail) : ('HTTP ' + String(res.status || 0));
             setResultError('feedbackGovernanceResult', '分析失败：' + detail);
@@ -31220,8 +44193,11 @@ def index(
         function clearScoringReadinessPanel() {
           const el = document.getElementById('scoringReadinessResult');
           if (!el) return;
+          clearElementRenderSignature('scoringReadinessResult');
           el.style.display = 'none';
           el.innerHTML = '';
+          scoringReadinessPanelState = null;
+          clearProjectClosureZoneHint('shigongClosureHint');
           updateShigongGateSummary({ project_id: pid(), ready: false, gate_passed: false, issues: ['评分前置检查未完成'] });
           applyScoringReadiness({ project_id: pid(), ready: false, gate_passed: false, issues: ['评分前置检查未完成'] });
         }
@@ -31248,6 +44224,361 @@ def index(
           if (mt === 'drawing') return 'uploadZoneStateDrawing';
           if (mt === 'site_photo') return 'uploadZoneStateSitePhoto';
           return '';
+        }
+        function materialTypeUploadButtonId(materialType) {
+          const mt = String(materialType || '').trim();
+          if (mt === 'tender_qa') return 'btnUploadMaterials';
+          if (mt === 'boq') return 'btnUploadBoq';
+          if (mt === 'drawing') return 'btnUploadDrawing';
+          if (mt === 'site_photo') return 'btnUploadSitePhotos';
+          return 'btnUploadMaterials';
+        }
+        function materialTrialPreflightHintButtonId(materialType) {
+          const mt = String(materialType || '').trim();
+          if (mt === 'tender_qa') return 'btnUploadMaterialsHint';
+          if (mt === 'boq') return 'btnUploadBoqHint';
+          if (mt === 'drawing') return 'btnUploadDrawingHint';
+          if (mt === 'site_photo') return 'btnUploadSitePhotosHint';
+          return '';
+        }
+        function materialTrialPreflightBadgeId(materialType) {
+          const mt = String(materialType || '').trim();
+          if (mt === 'tender_qa') return 'btnUploadMaterialsBadge';
+          if (mt === 'boq') return 'btnUploadBoqBadge';
+          if (mt === 'drawing') return 'btnUploadDrawingBadge';
+          if (mt === 'site_photo') return 'btnUploadSitePhotosBadge';
+          return '';
+        }
+        function materialTrialPreflightPriorityLabel(materialType, entrypointLabel='') {
+          const mt = String(materialType || '').trim();
+          if (mt === 'boq') return '优先：核对清单';
+          if (mt === 'drawing') return '优先：核对图纸';
+          if (mt === 'site_photo') return '优先：核对现场照片';
+          if (mt === 'tender_qa') return '优先：核对招标文件和答疑';
+          const label = String(entrypointLabel || '').trim();
+          return label ? ('优先：' + label.replace(/^前往「3\\) 项目资料」/, '').trim()) : '';
+        }
+        function materialTrialPreflightHintLabel(materialType) {
+          const mt = String(materialType || '').trim();
+          if (mt === 'boq') return '建议先核对清单';
+          if (mt === 'drawing') return '建议先核对图纸';
+          if (mt === 'site_photo') return '建议先核对现场照片';
+          if (mt === 'tender_qa') return '建议先核对招标文件和答疑';
+          return '';
+        }
+        function setMaterialTrialPreflightButtonHint(materialType='') {
+          ['tender_qa', 'boq', 'drawing', 'site_photo'].forEach((kind) => {
+            const hintEl = document.getElementById(materialTrialPreflightHintButtonId(kind));
+            if (!hintEl) return;
+            hintEl.style.display = 'none';
+            hintEl.textContent = '';
+          });
+          const hintId = materialTrialPreflightHintButtonId(materialType);
+          const label = materialTrialPreflightHintLabel(materialType);
+          if (!hintId || !label) return;
+          const activeHintEl = document.getElementById(hintId);
+          if (!activeHintEl) return;
+          activeHintEl.textContent = label;
+          activeHintEl.style.display = 'inline';
+        }
+        function setMaterialTrialPreflightActionBadge(materialType='', entrypointLabel='') {
+          ['tender_qa', 'boq', 'drawing', 'site_photo'].forEach((kind) => {
+            const badgeEl = document.getElementById(materialTrialPreflightBadgeId(kind));
+            if (!badgeEl) return;
+            badgeEl.style.display = 'none';
+            badgeEl.textContent = '';
+          });
+          const badgeId = materialTrialPreflightBadgeId(materialType);
+          const text = materialTrialPreflightPriorityLabel(materialType, entrypointLabel);
+          if (!badgeId || !text) return;
+          const activeBadgeEl = document.getElementById(badgeId);
+          if (!activeBadgeEl) return;
+          activeBadgeEl.textContent = text;
+          activeBadgeEl.style.display = 'inline-flex';
+        }
+        let materialTrialPreflightFollowUpState = null;
+        function setMaterialTrialPreflightFollowUp(entrypointLabel='', entrypointReasonLabel='') {
+          const label = String(entrypointLabel || '').trim();
+          const reason = String(entrypointReasonLabel || '').trim();
+          materialTrialPreflightFollowUpState = (label || reason)
+            ? { entrypointLabel: label, entrypointReasonLabel: reason }
+            : null;
+        }
+        function materialTrialPreflightFollowUpSummary() {
+          const state = (materialTrialPreflightFollowUpState && typeof materialTrialPreflightFollowUpState === 'object')
+            ? materialTrialPreflightFollowUpState
+            : {};
+          const label = String(state.entrypointLabel || '').trim();
+          const reason = String(state.entrypointReasonLabel || '').trim();
+          if (!label && !reason) return '';
+          let text = '试车下一步：';
+          if (label) text += label;
+          if (reason) text += (label ? '；原因：' : '原因：') + reason;
+          return text;
+        }
+        function materialTrialPreflightFollowUpEntryKey(entrypointLabel='') {
+          const label = String(entrypointLabel || '').trim();
+          return label.indexOf('评分施组') >= 0 ? 'score_shigong' : 'upload_shigong';
+        }
+        function materialTrialPreflightFollowUpActionLabel(entrypointLabel='', entrypointReasonLabel='', promoted=false) {
+          const label = String(entrypointLabel || '').trim();
+          const reason = String(entrypointReasonLabel || '').trim();
+          if (label) return (promoted ? '继续处理施组：' : '完成本步后：') + label;
+          if (reason) return promoted ? '继续处理施组' : '完成本步后返回施组区';
+          return '';
+        }
+        function setMaterialTrialPreflightHint(entrypointLabel='', entrypointReasonLabel='') {
+          const hintEl = document.getElementById('materialsTrialPreflightHint');
+          if (!hintEl) return;
+          const label = String(entrypointLabel || '').trim();
+          const reason = String(entrypointReasonLabel || '').trim();
+          if (!label && !reason) {
+            hintEl.textContent = '';
+            hintEl.style.display = 'none';
+            return;
+          }
+          let text = '';
+          if (label) text += '当前建议：' + label;
+          if (reason) text += (text ? '；原因：' : '原因：') + reason;
+          hintEl.textContent = text;
+          hintEl.style.display = 'block';
+        }
+        function setMaterialTrialPreflightFollowUpHint(entrypointLabel='', entrypointReasonLabel='') {
+          const hintEl = document.getElementById('materialsTrialPreflightHint');
+          if (!hintEl) return;
+          const label = String(entrypointLabel || '').trim();
+          const reason = String(entrypointReasonLabel || '').trim();
+          if (!label && !reason) {
+            hintEl.textContent = '';
+            hintEl.style.display = 'none';
+            return;
+          }
+          let text = '试车下一步：';
+          if (label) text += label;
+          if (reason) text += (label ? '；原因：' : '原因：') + reason;
+          hintEl.textContent = text;
+          hintEl.style.display = 'block';
+        }
+        function setMaterialTrialPreflightFollowUpAction(entrypointLabel='', entrypointReasonLabel='', promoted=false) {
+          const actionEl = document.getElementById('materialsTrialPreflightFollowUpAction');
+          if (!actionEl) return;
+          const label = String(entrypointLabel || '').trim();
+          const reason = String(entrypointReasonLabel || '').trim();
+          const text = materialTrialPreflightFollowUpActionLabel(label, reason, promoted);
+          if (!text) {
+            actionEl.textContent = '';
+            actionEl.style.display = 'none';
+            actionEl.dataset.entrypointKey = '';
+            actionEl.dataset.entrypointLabel = '';
+            actionEl.dataset.entrypointReasonLabel = '';
+            actionEl.dataset.promoted = '';
+            actionEl.classList.add('secondary');
+            actionEl.classList.remove('trial-follow-up-promoted');
+            return;
+          }
+          actionEl.textContent = text;
+          actionEl.dataset.entrypointKey = materialTrialPreflightFollowUpEntryKey(label);
+          actionEl.dataset.entrypointLabel = label;
+          actionEl.dataset.entrypointReasonLabel = reason;
+          actionEl.dataset.promoted = promoted ? '1' : '';
+          actionEl.classList.toggle('secondary', !promoted);
+          actionEl.classList.toggle('trial-follow-up-promoted', promoted);
+          actionEl.style.display = 'inline-flex';
+        }
+        function focusMaterialTrialPreflightFollowUpAction() {
+          const actionEl = document.getElementById('materialsTrialPreflightFollowUpAction');
+          if (!actionEl || actionEl.style.display === 'none') return false;
+          const text = String(actionEl.textContent || '').trim();
+          if (!text) return false;
+          const hintEl = document.getElementById('materialsTrialPreflightHint');
+          clearTrialPreflightEntrypointFocus();
+          markTrialPreflightEntrypointFocus(actionEl, {
+            outline: '2px solid #0f766e',
+            outlineOffset: '2px',
+            boxShadow: '0 0 0 4px rgba(15, 118, 110, 0.18)',
+            backgroundImage: 'linear-gradient(90deg, rgba(15,118,110,0.12), rgba(15,118,110,0.02))',
+            backgroundColor: '#ecfdf5',
+          });
+          if (hintEl && hintEl.style.display !== 'none' && String(hintEl.textContent || '').trim()) {
+            markTrialPreflightEntrypointFocus(hintEl, {
+              outline: '2px solid #34d399',
+              outlineOffset: '2px',
+              boxShadow: '0 0 0 3px rgba(52, 211, 153, 0.18)',
+              backgroundImage: 'linear-gradient(90deg, rgba(52,211,153,0.10), rgba(52,211,153,0.02))',
+              backgroundColor: '#f0fdf4',
+            });
+          }
+          window.clearTimeout(window.__trialPreflightEntrypointFocusTimer || 0);
+          window.__trialPreflightEntrypointFocusTimer = window.setTimeout(() => {
+            clearTrialPreflightEntrypointFocus();
+          }, 2400);
+          actionEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          window.setTimeout(() => {
+            if (typeof actionEl.focus === 'function') actionEl.focus({ preventScroll: true });
+          }, 240);
+          return true;
+        }
+        function clearTrialPreflightEntrypointFocus() {
+          const prevIds = Array.isArray(window.__trialPreflightEntrypointFocusIds)
+            ? window.__trialPreflightEntrypointFocusIds
+            : [];
+          prevIds.forEach((id) => {
+            const el = document.getElementById(String(id || '').trim());
+            if (!el) return;
+            el.style.outline = el.dataset.trialPreflightPrevOutline || '';
+            el.style.outlineOffset = el.dataset.trialPreflightPrevOutlineOffset || '';
+            el.style.boxShadow = el.dataset.trialPreflightPrevBoxShadow || '';
+            el.style.backgroundImage = el.dataset.trialPreflightPrevBackgroundImage || '';
+            el.style.backgroundColor = el.dataset.trialPreflightPrevBackgroundColor || '';
+            el.style.transition = el.dataset.trialPreflightPrevTransition || '';
+          });
+          window.__trialPreflightEntrypointFocusIds = [];
+        }
+        function markTrialPreflightEntrypointFocus(el, styleConfig) {
+          if (!el || !el.id) return;
+          const cfg = (styleConfig && typeof styleConfig === 'object') ? styleConfig : {};
+          el.dataset.trialPreflightPrevOutline = el.style.outline || '';
+          el.dataset.trialPreflightPrevOutlineOffset = el.style.outlineOffset || '';
+          el.dataset.trialPreflightPrevBoxShadow = el.style.boxShadow || '';
+          el.dataset.trialPreflightPrevBackgroundImage = el.style.backgroundImage || '';
+          el.dataset.trialPreflightPrevBackgroundColor = el.style.backgroundColor || '';
+          el.dataset.trialPreflightPrevTransition = el.style.transition || '';
+          el.style.transition = 'outline-color 0.2s ease';
+          el.style.outline = String(cfg.outline || '3px solid #0ea5e9');
+          el.style.outlineOffset = String(cfg.outlineOffset || '4px');
+          el.style.boxShadow = String(cfg.boxShadow || '0 0 0 4px rgba(14, 165, 233, 0.18)');
+          el.style.backgroundImage = String(
+            cfg.backgroundImage || 'linear-gradient(90deg, rgba(14,165,233,0.12), rgba(14,165,233,0.02))'
+          );
+          el.style.backgroundColor = String(cfg.backgroundColor || '#f0f9ff');
+          const focused = Array.isArray(window.__trialPreflightEntrypointFocusIds)
+            ? window.__trialPreflightEntrypointFocusIds.slice()
+            : [];
+          if (!focused.includes(el.id)) focused.push(el.id);
+          window.__trialPreflightEntrypointFocusIds = focused;
+        }
+        function focusMaterialUploadEntrypoint(materialType, entrypointLabel='', entrypointReasonLabel='') {
+          const section = document.getElementById('section-materials');
+          if (!section) return false;
+          const zoneId = materialTypeUploadZoneId(materialType);
+          const targetEl = zoneId ? document.getElementById(zoneId) : null;
+          const focusEl = targetEl || section;
+          clearTrialPreflightEntrypointFocus();
+          setMaterialTrialPreflightButtonHint(materialType);
+          setMaterialTrialPreflightActionBadge(materialType, entrypointLabel);
+          setMaterialTrialPreflightHint(entrypointLabel, entrypointReasonLabel);
+          markTrialPreflightEntrypointFocus(focusEl, {
+            outline: '3px solid #0ea5e9',
+            boxShadow: '0 0 0 4px rgba(14, 165, 233, 0.18)',
+            backgroundImage: 'linear-gradient(90deg, rgba(14,165,233,0.12), rgba(14,165,233,0.02))',
+            backgroundColor: '#f0f9ff',
+          });
+          window.clearTimeout(window.__trialPreflightEntrypointFocusTimer || 0);
+          window.__trialPreflightEntrypointFocusTimer = window.setTimeout(() => {
+            clearTrialPreflightEntrypointFocus();
+          }, 2200);
+          section.scrollIntoView({ behavior: 'auto', block: 'start' });
+          const focusId = materialTypeUploadButtonId(materialType);
+          window.setTimeout(() => {
+            const btn = focusId ? document.getElementById(focusId) : null;
+            if (btn && typeof btn.focus === 'function') btn.focus({ preventScroll: true });
+          }, 240);
+          return false;
+        }
+        function focusShigongWorkspaceEntrypoint(entrypointKey, entrypointLabel, entrypointReasonLabel) {
+          const section = document.getElementById('section-shigong');
+          if (!section) return false;
+          const key = String(entrypointKey || '').trim() || 'upload_shigong';
+          const primaryButtonId = key === 'score_shigong' ? 'btnScoreShigong' : 'btnUploadShigong';
+          const primaryButton = document.getElementById(primaryButtonId);
+          const gateSummary = document.getElementById('shigongGateSummary');
+          const actionStatus = document.getElementById('shigongActionStatus');
+          clearTrialPreflightEntrypointFocus();
+          markTrialPreflightEntrypointFocus(section, {
+            outline: '3px solid #f59e0b',
+            boxShadow: '0 0 0 4px rgba(245, 158, 11, 0.18)',
+            backgroundImage: 'linear-gradient(90deg, rgba(245,158,11,0.12), rgba(245,158,11,0.02))',
+            backgroundColor: '#fff7ed',
+          });
+          markTrialPreflightEntrypointFocus(primaryButton, {
+            outline: '2px solid #f59e0b',
+            outlineOffset: '2px',
+            boxShadow: '0 0 0 4px rgba(245, 158, 11, 0.18)',
+            backgroundImage: 'linear-gradient(90deg, rgba(245,158,11,0.18), rgba(245,158,11,0.02))',
+            backgroundColor: '#fff7ed',
+          });
+          markTrialPreflightEntrypointFocus(gateSummary, {
+            outline: '2px solid #fdba74',
+            outlineOffset: '2px',
+            boxShadow: '0 0 0 3px rgba(253, 186, 116, 0.18)',
+            backgroundImage: 'linear-gradient(90deg, rgba(253,186,116,0.14), rgba(253,186,116,0.02))',
+            backgroundColor: '#fff7ed',
+          });
+          markTrialPreflightEntrypointFocus(actionStatus, {
+            outline: '2px solid #fdba74',
+            outlineOffset: '2px',
+            boxShadow: '0 0 0 3px rgba(253, 186, 116, 0.18)',
+            backgroundImage: 'linear-gradient(90deg, rgba(253,186,116,0.14), rgba(253,186,116,0.02))',
+            backgroundColor: '#fff7ed',
+          });
+          window.clearTimeout(window.__trialPreflightEntrypointFocusTimer || 0);
+          window.__trialPreflightEntrypointFocusTimer = window.setTimeout(() => {
+            clearTrialPreflightEntrypointFocus();
+          }, 2400);
+          section.scrollIntoView({ behavior: 'auto', block: 'start' });
+          setMaterialTrialPreflightButtonHint('');
+          setMaterialTrialPreflightActionBadge('', '');
+          setMaterialTrialPreflightFollowUp('', '');
+          setMaterialTrialPreflightHint('', '');
+          setMaterialTrialPreflightFollowUpHint('', '');
+          setMaterialTrialPreflightFollowUpAction('', '');
+          setShigongTrialPreflightButtonHints(key, entrypointLabel);
+          setShigongTrialPreflightActionBadge(key, entrypointLabel);
+          setShigongTrialPreflightHint(entrypointLabel, entrypointReasonLabel);
+          setShigongTrialPreflightState(key, entrypointLabel, entrypointReasonLabel);
+          window.setTimeout(() => {
+            if (primaryButton && typeof primaryButton.focus === 'function') {
+              primaryButton.focus({ preventScroll: true });
+            }
+          }, 240);
+          return false;
+        }
+        function navigateTrialPreflightEntrypoint(kind, anchor, materialType, entrypointKey, entrypointLabel, entrypointReasonLabel, materialReviewEntryLabel, materialReviewReasonLabel) {
+          const actionKind = String(kind || '').trim();
+          if (actionKind === 'material_review') {
+            setShigongTrialPreflightButtonHints('', '');
+            setShigongTrialPreflightActionBadge('', '');
+            setShigongTrialPreflightHint('', '');
+            setShigongTrialPreflightState('', '', '');
+            setMaterialTrialPreflightFollowUp(entrypointLabel, entrypointReasonLabel);
+            setMaterialTrialPreflightFollowUpAction(entrypointLabel, entrypointReasonLabel, false);
+            return focusMaterialUploadEntrypoint(materialType, materialReviewEntryLabel, materialReviewReasonLabel);
+          }
+          if (actionKind === 'shigong_update') {
+            return focusShigongWorkspaceEntrypoint(entrypointKey, entrypointLabel, entrypointReasonLabel);
+          }
+          setMaterialTrialPreflightButtonHint('');
+          setMaterialTrialPreflightActionBadge('', '');
+          setMaterialTrialPreflightFollowUp('', '');
+          setMaterialTrialPreflightHint('', '');
+          setMaterialTrialPreflightFollowUpHint('', '');
+          setMaterialTrialPreflightFollowUpAction('', '');
+          const href = String(anchor || '').trim();
+          if (href && href.charAt(0) === '#') {
+            window.location.hash = href;
+          }
+          return false;
+        }
+        const materialsTrialPreflightFollowUpActionEl = document.getElementById('materialsTrialPreflightFollowUpAction');
+        if (materialsTrialPreflightFollowUpActionEl && !materialsTrialPreflightFollowUpActionEl.dataset.bindingReady) {
+          materialsTrialPreflightFollowUpActionEl.dataset.bindingReady = '1';
+          materialsTrialPreflightFollowUpActionEl.addEventListener('click', (event) => {
+            event.preventDefault();
+            const entrypointKey = String(materialsTrialPreflightFollowUpActionEl.dataset.entrypointKey || '').trim() || 'upload_shigong';
+            const entrypointLabel = String(materialsTrialPreflightFollowUpActionEl.dataset.entrypointLabel || '').trim();
+            const entrypointReasonLabel = String(materialsTrialPreflightFollowUpActionEl.dataset.entrypointReasonLabel || '').trim();
+            focusShigongWorkspaceEntrypoint(entrypointKey, entrypointLabel, entrypointReasonLabel);
+          });
         }
         function clearMaterialUploadZoneHighlights() {
           ['tender_qa', 'boq', 'drawing', 'site_photo'].forEach((materialType) => {
@@ -31349,9 +44680,14 @@ def index(
           const el = document.getElementById('shigongGateSummary');
           if (!el) return;
           const source = (payload && typeof payload === 'object') ? payload : {};
+          const closureStageText = buildProjectClosureStageInlineText(
+            systemClosureSummaryState,
+            String(source.project_id || pid() || '')
+          );
           if (!pid()) {
             el.style.color = '#475569';
             el.textContent = '当前未选择项目。';
+            clearProjectClosureZoneHint('shigongClosureHint');
             return;
           }
           const issues = Array.isArray(source.issues) ? source.issues.filter((item) => String(item || '').trim()) : [];
@@ -31363,7 +44699,18 @@ def index(
             : [];
           if (source.ready) {
             el.style.color = '#166534';
-            el.innerHTML = '评分前置已满足，可直接点击“评分施组”。';
+            let readyHtml = '评分前置已满足，可直接点击“' + escapeHtmlText(currentScoreShigongActionLabel()) + '”。';
+            if (closureStageText) {
+              readyHtml += ' 系统封关阶段：' + escapeHtmlText(closureStageText) + '。';
+            }
+            el.innerHTML = readyHtml;
+            renderProjectClosureZoneHint(
+              'shigong',
+              'shigongGateSummary',
+              'shigongClosureHint',
+              systemClosureSummaryState,
+              String(source.project_id || pid() || '')
+            );
             return;
           }
           const parts = [];
@@ -31403,15 +44750,26 @@ def index(
           if (!parts.length && warnings.length) {
             warnings.slice(0, 2).forEach((item) => parts.push(escapeHtmlText(String(item))));
           }
+          if (closureStageText) {
+            parts.push('系统封关阶段：' + escapeHtmlText(closureStageText));
+          }
           el.style.color = '#9f1239';
           el.innerHTML = parts.length
             ? ('当前不可评分：' + parts.join('；'))
             : '当前不可评分，请先补齐资料并完成评分前置检查。';
+          renderProjectClosureZoneHint(
+            'shigong',
+            'shigongGateSummary',
+            'shigongClosureHint',
+            systemClosureSummaryState,
+            String(source.project_id || pid() || '')
+          );
         }
         function renderScoringReadinessPanel(payload) {
           const el = document.getElementById('scoringReadinessResult');
           if (!el) return;
           const source = (payload && typeof payload === 'object') ? payload : {};
+          scoringReadinessPanelState = source;
           const issues = Array.isArray(source.issues) ? source.issues : [];
           const warnings = Array.isArray(source.warnings) ? source.warnings : [];
           const materialQuality = (source.material_quality && typeof source.material_quality === 'object')
@@ -31430,13 +44788,17 @@ def index(
           const depthNumeric = Number(materialQuality.total_numeric_terms || 0);
           const depthPassed = depthGate && depthGate.passed !== false;
           const depthEnforced = !!(depthGate && depthGate.enforce);
+          const closureStageText = buildProjectClosureStageInlineText(
+            systemClosureSummaryState,
+            String(source.project_id || pid() || '')
+          );
           const toPct = (v) => {
             const n = Number(v);
             return Number.isFinite(n) ? (n * 100).toFixed(1) + '%' : '-';
           };
           let html = '<strong>评分前置检查</strong>';
           if (source.ready) {
-            html += '<p class="success" style="margin:6px 0">已满足评分条件，可点击“评分施组”。</p>';
+            html += '<p class="success" style="margin:6px 0">已满足评分条件，可点击“' + escapeHtmlText(currentScoreShigongActionLabel()) + '”。</p>';
           } else {
             html += '<p class="error" style="margin:6px 0">暂不满足评分条件，请先补齐以下问题。</p>';
           }
@@ -31463,13 +44825,25 @@ def index(
               + escapeHtmlText(gate.required_types.map(materialTypeDisplayName).join('、'))
               + '</p>';
           }
-          el.style.display = 'block';
-          el.innerHTML = html;
+          if (closureStageText) {
+            html += '<p style="margin-top:8px;font-size:12px;color:#475569"><b>系统封关阶段</b>：'
+              + escapeHtmlText(closureStageText)
+              + '</p>';
+          }
+          replaceElementHtmlIfChanged(
+            'scoringReadinessResult',
+            html,
+            'scoring_readiness|' + String(source.project_id || '') + '|' + buildTableRenderSignature([html])
+          );
           updateShigongGateSummary(source);
           applyScoringReadiness(source);
         }
-        async function refreshScoringReadiness(expectedProjectId=null, switchSeq=null) {
+        async function refreshScoringReadiness(expectedProjectId=null, switchSeq=null, options=null) {
           const id = expectedProjectId || pid();
+          const opts = (options && typeof options === 'object') ? options : {};
+          if (id && !opts.skipCoalesce) {
+            return runProjectRefreshTask('scoring_readiness', id, () => refreshScoringReadiness(id, switchSeq, { skipCoalesce: true }));
+          }
           if (!id) {
             clearScoringReadinessPanel();
             return;
@@ -31511,6 +44885,7 @@ def index(
         function clearMaterialUtilizationPanel() {
           const el = document.getElementById('materialUtilizationResult');
           if (!el) return;
+          clearElementRenderSignature('materialUtilizationResult');
           el.style.display = 'none';
           el.innerHTML = '';
         }
@@ -31938,13 +45313,17 @@ def index(
             }).join('');
             html += '</table></details>';
           }
-          el.style.display = 'block';
-          el.innerHTML = html;
+          replaceElementHtmlIfChanged(
+            'materialUtilizationResult',
+            html,
+            'material_utilization|' + buildTableRenderSignature([html])
+          );
         }
         window.renderMaterialUtilizationPanel = renderMaterialUtilizationPanel;
         function clearScoringDiagnosticPanel() {
           const el = document.getElementById('scoringDiagnosticResult');
           if (!el) return;
+          clearElementRenderSignature('scoringDiagnosticResult');
           el.style.display = 'none';
           el.innerHTML = '';
           clearMaterialUploadZoneHighlights();
@@ -32033,11 +45412,12 @@ def index(
             if (clean && !orderedTypes.includes(clean)) orderedTypes.push(clean);
           });
 
+          const generatedAtText = escapeHtmlText(String(data.generated_at || '').slice(0, 19) || '-');
           let html = '<strong>评分证据链诊断（项目级）</strong>';
           html += '<p style="margin:6px 0">最新施组：'
             + (latest.exists ? escapeHtmlText(latest.filename || '-') : '<span style="color:#64748b">暂无施组</span>')
             + '；状态：' + statusLabel
-            + '；生成时间：' + escapeHtmlText(String(data.generated_at || '').slice(0, 19) || '-')
+            + '；生成时间：' + generatedAtText
             + '</p>';
           html += '<p style="margin:4px 0;color:#334155">资料异步深读：总任务 '
             + escapeHtmlText(summary.parse_total_jobs || 0)
@@ -32274,7 +45654,7 @@ def index(
             + '；字数 ' + escapeHtmlText(summary.material_parsed_chars || 0)
             + '；分块 ' + escapeHtmlText(summary.material_parsed_chunks || 0)
             + '</td><td>' + (summary.material_parsed_chunks > 0 ? '<span class="success">已解析</span>' : '<span class="error">未解析</span>') + '</td></tr>';
-          html += '<tr><td>评分置信度</td><td>'
+          html += '<tr><td>评分置信等级（内部指数）</td><td>'
             + (latestSelfAwareness.level
               ? (escapeHtmlText(String(latestSelfAwareness.level === 'high' ? '高' : (latestSelfAwareness.level === 'medium' ? '中' : '低')))
                   + ' / '
@@ -32359,8 +45739,16 @@ def index(
             }
             html += '</details>';
           }
-          el.style.display = 'block';
-          el.innerHTML = html;
+          const diagnosticSignatureHtml = html.replace(
+            '；生成时间：' + generatedAtText,
+            '；生成时间：__volatile__'
+          );
+          replaceElementHtmlIfChanged(
+            'scoringDiagnosticResult',
+            html,
+            'scoring_diagnostic|' + String(data.project_id || pid() || '') + '|'
+              + buildTableRenderSignature([diagnosticSignatureHtml])
+          );
           applyMaterialUploadZoneHighlights(typeCards);
           updateShigongGateSummary({
             project_id: data.project_id || pid(),
@@ -32372,8 +45760,12 @@ def index(
           });
         }
         window.renderScoringDiagnosticPanel = renderScoringDiagnosticPanel;
-        async function refreshScoringDiagnostic(expectedProjectId=null, switchSeq=null) {
+        async function refreshScoringDiagnostic(expectedProjectId=null, switchSeq=null, options=null) {
           const id = expectedProjectId || pid();
+          const opts = (options && typeof options === 'object') ? options : {};
+          if (id && !opts.skipCoalesce) {
+            return runProjectRefreshTask('scoring_diagnostic_latest', id, () => refreshScoringDiagnostic(id, switchSeq, { skipCoalesce: true }));
+          }
           if (!id) {
             clearScoringDiagnosticPanel();
             return;
@@ -32403,8 +45795,10 @@ def index(
         function setResultLoading(resultId, label) {
           const el = document.getElementById(resultId);
           if (!el) return;
+          clearElementRenderSignature(resultId);
           el.style.display = 'block';
           el.innerHTML = '<span style="color:#334155">' + escapeHtmlText(label || '处理中，请稍候...') + '</span>';
+          clearSystemClosureActionHint(resultId);
         }
         function setResultError(resultId, msg) {
           const text = msg || '请求失败';
@@ -32413,6 +45807,7 @@ def index(
             el.style.display = 'block';
             el.innerHTML = '<span class="error">' + escapeHtmlText(text) + '</span>';
           }
+          clearSystemClosureActionHint(resultId);
           const out = document.getElementById('output');
           if (out) out.textContent = text;
         }
@@ -32431,6 +45826,7 @@ def index(
             el.style.display = 'block';
             el.innerHTML = '<span class="success">' + escapeHtmlText(text) + '</span>';
           }
+          clearSystemClosureActionHint(resultId);
         }
         function formatApiOutput(res, data, fallback='请求失败') {
           if (res && res.ok) return data;
@@ -32454,14 +45850,14 @@ def index(
           const el = document.getElementById('compareResult');
           el.style.display = 'block';
           if (res.ok && data.rankings) {
-            const scoreSource = (s) => (s === 'pred' ? '预测' : '规则');
+            const scoreSource = (s) => (s === 'pred' ? '校准' : (s === 'ground_truth' ? '真实' : '规则'));
             const awarenessText = (row) => {
               const awareness = (row && typeof row.score_self_awareness === 'object') ? row.score_self_awareness : {};
               const level = row && row.score_confidence_level ? row.score_confidence_level : (awareness.level || '-');
-              const score = awareness && awareness.score_0_100 != null ? '（' + awareness.score_0_100 + '）' : '';
+              const score = awareness && awareness.score_0_100 != null ? '（内部指数 ' + awareness.score_0_100 + '/100）' : '';
               return String(level || '-') + score;
             };
-            el.innerHTML = '<strong>排名</strong><table><tr><th>文件名</th><th>总分(优先预测)</th><th>规则分(追溯)</th><th>来源</th><th>评分置信度</th><th>时间</th></tr>' +
+            el.innerHTML = '<strong>排名</strong><table><tr><th>文件名</th><th>当前总分(优先当前分)</th><th>规则分(追溯)</th><th>来源</th><th>评分置信等级（内部指数）</th><th>时间</th></tr>' +
               data.rankings.map(r => '<tr><td>' + r.filename + '</td><td>' + r.total_score + '</td><td>' + (r.rule_total_score ?? '-') + '</td><td>' + scoreSource(r.score_source) + '</td><td>' + awarenessText(r) + '</td><td>' + r.created_at + '</td></tr>').join('') + '</table>';
           } else {
             el.innerHTML = '<span class="error">' + (data.detail || '请求失败') + '</span>';
@@ -32494,17 +45890,17 @@ def index(
             const escMultiline = (v) => esc(v).replace(/\\n/g, '<br/>');
             const scoreText = (row) => {
               if (!row) return '-';
-              const source = row.score_source === 'pred' ? '预测' : '规则';
+              const source = row.score_source === 'pred' ? '校准' : (row.score_source === 'ground_truth' ? '真实' : '规则');
               const rule = row.rule_total_score == null ? '-' : row.rule_total_score;
               return esc(row.total_score) + ' 分（规则 ' + esc(rule) + '，来源 ' + source + '）';
             };
             const confidenceText = (row) => {
-              if (!row || typeof row !== 'object') return '置信度 -';
+              if (!row || typeof row !== 'object') return '置信等级 -';
               const awareness = row.score_self_awareness && typeof row.score_self_awareness === 'object' ? row.score_self_awareness : {};
               const level = row.score_confidence_level || awareness.level || '-';
-              const score = awareness.score_0_100 == null ? '' : (' / ' + awareness.score_0_100 + '分');
+              const score = awareness.score_0_100 == null ? '' : ('（内部指数 ' + awareness.score_0_100 + '/100）');
               const reason = Array.isArray(awareness.reasons) && awareness.reasons.length ? ('；' + awareness.reasons[0]) : '';
-              return '置信度 ' + esc(level) + score + reason;
+              return '置信等级 ' + esc(level) + score + reason;
             };
             let html = '<p class="note">用途：定位低分页码、证据片段、建议改写和验收标准，直接支撑“如何把施组做到更高分”。</p>';
             html += '<p><strong>摘要</strong>: ' + (data.summary || '') + '</p>';
@@ -32522,7 +45918,7 @@ def index(
                   const title = esc(card.filename || '') +
                     '（排名 ' + esc(card.rank_desc || '-') +
                     '，总分 ' + esc(card.total_score) +
-                    '，置信度 ' + esc(card.score_confidence_level || '-') + '/' + esc(card.score_confidence_score ?? '-') +
+                    '，置信等级 ' + esc(card.score_confidence_level || '-') + ' / 内部指数 ' + esc(card.score_confidence_score ?? '-') + '/100' +
                     '，距满分 ' + esc(card.gap_to_full_total) +
                     '，累计扣分 ' + esc(card.total_deduction_points) + '）';
 
@@ -32573,6 +45969,8 @@ def index(
             if (data.submission_optimization_cards && data.submission_optimization_cards.length) {
               html += '<strong>逐文件优化清单（你要的直接执行版）</strong>' +
                 data.submission_optimization_cards.map(card => {
+                  const gateSummary = String(card.material_gate_summary || '').trim();
+                  const gateClass = card.material_gate_blocked ? 'error' : 'note';
                   const rows = Array.isArray(card.recommendations) ? card.recommendations : [];
                   const table = '<table><tr><th>优先级</th><th>类别</th><th>建议章节</th><th>定位页码</th><th>预计提分</th><th>优先理由</th><th>问题</th><th>证据片段</th><th>证据窗口（前后文）</th><th>改写前后示例</th><th>建议改写（直接执行）</th><th>验收标准</th><th>执行检查表</th></tr>' +
                     rows.map(r => '<tr>' +
@@ -32592,7 +45990,10 @@ def index(
                     '</tr>').join('') + '</table>';
                   const refTop = card.reference_top_score == null ? '' : ('，项目最高 ' + esc(card.reference_top_score) + ' 分');
                   const title = esc(card.filename || '') + '（当前 ' + esc(card.total_score) + ' 分，目标 ' + esc(card.target_score) + ' 分，差距 ' + esc(card.target_gap) + refTop + '）';
-                  return '<details style="margin-top:8px" open><summary>' + title + '</summary><div style="margin-top:8px">' + table + '</div></details>';
+                  const gateHtml = gateSummary
+                    ? '<div class="' + gateClass + '" style="margin-bottom:8px"><strong>' + escMultiline(gateSummary) + '</strong></div>'
+                    : '';
+                  return '<details style="margin-top:8px" open><summary>' + title + '</summary><div style="margin-top:8px">' + gateHtml + table + '</div></details>';
                 }).join('');
             }
             if (data.score_overview && Object.keys(data.score_overview).length) {
@@ -32680,8 +46081,10 @@ def index(
                 }).join('') + '</table></details>';
             }
             el.innerHTML = html;
+            flushOptimizationReportPanelScroll();
           } else {
             el.innerHTML = '<span class="error">' + (data.detail || '请求失败') + '</span>';
+            flushOptimizationReportPanelScroll();
           }
         });
 
@@ -32771,7 +46174,7 @@ def index(
           if (recommendations.length) {
             html += '<strong>建议动作</strong><ul>' + recommendations.slice(0, 8).map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('') + '</ul>';
           }
-          if (!SECURE_DESKTOP_MODE) {
+          if (!secureDesktopEnabled()) {
             html += '<div style="margin-top:8px"><button type="button" class="secondary" id="btnEvidenceTraceDownload">下载 Markdown</button></div>';
           } else {
             html += '<p style="font-size:12px;margin-top:8px;color:#9a3412">保密模式下已禁用 Markdown 下载。</p>';
@@ -32780,7 +46183,7 @@ def index(
           const dlBtn = document.getElementById('btnEvidenceTraceDownload');
           if (dlBtn) {
             dlBtn.onclick = () => {
-              if (SECURE_DESKTOP_MODE) {
+              if (secureDesktopEnabled()) {
                 secureDesktopBlockResult('evidenceTraceResult');
                 return;
               }
@@ -33063,10 +46466,22 @@ def index(
         const buildFeedbackGuardrailWarning = (guardrail) => {
           const info = (guardrail && typeof guardrail === 'object') ? guardrail : {};
           if (info.warning_message) return String(info.warning_message);
-          const absDelta = Number(info.abs_delta_100 || 0);
+          const scaleMax = Number(info.score_scale_max || 100) === 5 ? 5 : 100;
+          const scaleLabel = scaleMax === 5 ? '5分制' : '100分制';
+          const rawDelta = Number.isFinite(Number(info.abs_delta_raw))
+            ? Number(info.abs_delta_raw)
+            : (scaleMax === 5
+              ? (Number(info.abs_delta_100 || 0) * 5 / 100)
+              : Number(info.abs_delta_100 || 0));
           const ratio = Number(info.relative_delta_ratio || 0) * 100;
-          if (absDelta > 0) {
-            return '预测与真实总分偏差 ' + absDelta.toFixed(2) + ' 分（100分口径，' + ratio.toFixed(1) + '%），已暂停自动调权/自动校准，请人工确认后再执行。';
+          if (rawDelta > 0) {
+            return '当前分与真实总分偏差 '
+              + rawDelta.toFixed(scaleMax === 5 ? 4 : 2)
+              + ' 分（'
+              + scaleLabel
+              + '，'
+              + ratio.toFixed(1)
+              + '%），已暂停自动调权/自动校准，请人工确认后再执行。';
           }
           return '检测到极端偏差样本，已暂停自动调权/自动校准，请人工确认后再执行。';
         };
@@ -33235,10 +46650,55 @@ def index(
                 ? '<p style="margin:8px 0 0 0;color:#9a3412"><strong>风控提示：</strong>' + escapeHtmlText(buildFeedbackGuardrailWarning(activeGuardrail)) + '</p>'
                 : '<p style="margin:8px 0 0 0;color:#166534">反馈闭环已接收该样本，未触发极端偏差拦截。</p>'
             );
+          if (!guardrailBlocked) {
+            evolveEl.innerHTML += renderGroundTruthPostAddFollowUpActionHint(
+              currentSelectedProjectDisplayName(),
+              '前往「5) 自我学习与进化」执行“一键闭环”',
+              '执行一键闭环复验人工确认结果',
+            );
+            focusSystemClosureEntrypoint('auto_run_reflection');
+          }
           evolveEl.style.display = 'block';
-          const submissionSelect = document.getElementById('groundTruthSubmissionSelect');
-          if (submissionSelect) submissionSelect.value = '';
-          resetGroundTruthDraftCommitState();
+          if (typeof loadFeedbackGovernancePanel === 'function') {
+            await loadFeedbackGovernancePanel(projectId, {
+              suppressLoading: true,
+              silentOutput: true,
+              actionMessage: guardrailBlocked
+                ? '真实评标录入后已自动刷新评分治理视图，可直接处理当前人工确认阻塞。'
+                : '真实评标录入后已自动刷新评分治理视图，可直接复验人工确认/校准状态。',
+            });
+          }
+          if (typeof refreshSystemImprovementOverview === 'function') {
+            await refreshSystemImprovementOverview({
+              silent: true,
+              silentOutput: true,
+            });
+          }
+          clearGroundTruthDraftForm();
+          let closureSummary = null;
+          if (typeof refreshSystemClosureSummary === 'function') {
+            closureSummary = await refreshSystemClosureSummary({
+              reason: 'ground_truth_add',
+              silent: true,
+            });
+          }
+          const closureFollowUp = buildSystemClosureNextStepText(closureSummary, projectId, {
+            prefixLabel: '下一步建议',
+          });
+          if (closureFollowUp) {
+            evolveEl.innerHTML += '<p style="margin:8px 0 0 0;color:#0f172a"><strong>系统下一步：</strong>'
+              + escapeHtmlText(closureFollowUp)
+              + '</p>';
+          }
+          renderSystemClosureActionHint('evolveResult', closureSummary, projectId, {
+            titleText: '真实评标录入后的下一步',
+            prefixLabel: '下一步建议',
+          });
+          if (closureSummary && closureSummary.next_step_entrypoint_key) {
+            focusSystemClosureEntrypoint(closureSummary.next_step_entrypoint_key);
+          } else {
+            clearSystemClosureActionHint('evolveResult');
+          }
         });
         safeClick('btnEvolve', async () => {
           if (!ensureProjectForAction('evolveResult')) return;
@@ -33280,6 +46740,7 @@ def index(
             if (autoRecordedBeforeEvolve) {
               html += '<p style="margin:6px 0 0 0;color:#166534">本次已先自动录入当前表单中的真实评标，再执行学习进化。</p>';
             }
+            html += renderManualConfirmationAuditBlock(data.manual_confirmation_audit);
             html += renderEvolutionEnhancementAudit(data);
             if (data.high_score_logic && data.high_score_logic.length) html += '<strong>高分逻辑</strong><ul>' + data.high_score_logic.map(l => '<li>' + l + '</li>').join('') + '</ul>';
             if (data.writing_guidance && data.writing_guidance.length) html += '<strong>编制指导</strong><ul>' + data.writing_guidance.map(l => '<li>' + l + '</li>').join('') + '</ul>';
@@ -33290,6 +46751,85 @@ def index(
             html += '<p style="font-size:12px;margin-top:8px">点击「编制系统指令」可查看/导出编制约束（必备章节、图表、禁止表述等）。</p>';
             el.innerHTML = html;
           } else { el.innerHTML = '<span class="error">' + (data.detail || '请求失败，若需认证请设置 API Key') + '</span>'; }
+        });
+        safeClick('btnSystemImprovementOverview', async () => {
+          await refreshSystemImprovementOverview({
+            resetFilters: true,
+            forceRender: true,
+          });
+        });
+        safeClick('btnSelfCheck', async () => {
+          setResultLoading('selfCheckResult', '系统自检执行中...');
+          let res;
+          let data = {};
+          const projectId = actionProjectId();
+          const requestPath = projectId
+            ? ('/api/v1/system/self_check?project_id=' + encodeURIComponent(projectId))
+            : '/api/v1/system/self_check';
+          try {
+            res = await fetch(requestPath, {
+              method: 'GET',
+              headers: apiHeaders(false),
+            });
+            data = await res.json().catch(() => ({}));
+          } catch (err) {
+            setResultError('selfCheckResult', '系统自检失败：' + String((err && err.message) || err || '网络异常'));
+            return;
+          }
+          showJson('output', formatApiOutput(res, data));
+          if (!res.ok) {
+            const detail = (data && data.detail) ? String(data.detail) : ('HTTP ' + String(res.status || 0));
+            setResultError('selfCheckResult', '系统自检失败：' + detail);
+            return;
+          }
+          renderSelfCheckPanel(data);
+        });
+        safeClick('btnDataHygiene', async () => {
+          setResultLoading('dataHygieneResult', '数据卫生巡检中...');
+          let res;
+          let data = {};
+          try {
+            res = await fetch('/api/v1/system/data_hygiene', {
+              method: 'GET',
+              headers: apiHeaders(false),
+            });
+            data = await res.json().catch(() => ({}));
+          } catch (err) {
+            setResultError('dataHygieneResult', '巡检失败：' + String((err && err.message) || err || '网络异常'));
+            return;
+          }
+          showJson('output', formatApiOutput(res, data));
+          if (!res.ok) {
+            const detail = (data && data.detail) ? String(data.detail) : ('HTTP ' + String(res.status || 0));
+            setResultError('dataHygieneResult', '巡检失败：' + detail);
+            return;
+          }
+          renderDataHygienePanel(data);
+        });
+        safeClick('btnEvalSummaryV2', async () => {
+          setResultLoading('evalResult', '跨项目汇总评估中...');
+          const res = await fetch('/api/v1/evaluation/summary');
+          const data = await res.json().catch(() => ({}));
+          showJson('output', formatApiOutput(res, data));
+          if (!res.ok) {
+            renderEvaluationAggregateSummaryBlock('evalResult', false, '跨项目汇总评估失败', data);
+            renderSystemClosureSummaryPanel(
+              {
+                total_closure_readiness: {
+                  status_label: '系统总封关摘要加载失败',
+                  next_step_title: '-',
+                  next_step_detail: (data && data.detail)
+                    ? String(data.detail)
+                    : ('HTTP ' + String(res.status || 0)),
+                  system_closure_path: [],
+                },
+              },
+              { refreshReason: 'manual_eval_summary_failed' }
+            );
+            return;
+          }
+          renderEvaluationAggregateSummaryBlock('evalResult', true, '跨项目汇总评估完成', data);
+          renderSystemClosureSummaryPanel(data, { refreshReason: 'manual_eval_summary' });
         });
         safeClick('btnEvolutionHealth', async () => {
           if (!ensureProjectForAction('evolutionHealthResult')) return;
@@ -33315,6 +46855,30 @@ def index(
           }
           renderEvolutionHealthPanel(data);
         });
+        safeClick('btnTrialPreflight', async () => {
+          if (!ensureProjectForAction('trialPreflightResult')) return;
+          const projectId = actionProjectId();
+          setResultLoading('trialPreflightResult', '试车前综合体检生成中...');
+          let res;
+          let data = {};
+          try {
+            res = await fetch('/api/v1/projects/' + encodeURIComponent(projectId) + '/trial_preflight', {
+              method: 'GET',
+              headers: apiHeaders(false),
+            });
+            data = await res.json().catch(() => ({}));
+          } catch (err) {
+            setResultError('trialPreflightResult', '分析失败：' + String((err && err.message) || err || '网络异常'));
+            return;
+          }
+          showJson('output', formatApiOutput(res, data));
+          if (!res.ok) {
+            const detail = (data && data.detail) ? String(data.detail) : ('HTTP ' + String(res.status || 0));
+            setResultError('trialPreflightResult', '分析失败：' + detail);
+            return;
+          }
+          renderTrialPreflightPanel(data);
+        });
         safeClick('btnFeedbackGovernance', async () => {
           if (!ensureProjectForAction('feedbackGovernanceResult')) return;
           const projectId = actionProjectId();
@@ -33334,8 +46898,110 @@ def index(
             html += renderEvolutionEnhancementAudit(data);
             if (data.high_score_logic && data.high_score_logic.length) html += '<strong>高分逻辑</strong><ul>' + data.high_score_logic.map(l => '<li>' + l + '</li>').join('') + '</ul>';
             if (data.guidance && data.guidance.length) html += '<strong>编制指导</strong><ul>' + data.guidance.map(l => '<li>' + l + '</li>').join('') + '</ul>';
+            const pendingFeedbackSummary = (data.pending_feedback_summary && typeof data.pending_feedback_summary === 'object')
+              ? data.pending_feedback_summary
+              : {};
+            const pendingFeedbackPatchBundle = (data.pending_feedback_patch_bundle && typeof data.pending_feedback_patch_bundle === 'object')
+              ? data.pending_feedback_patch_bundle
+              : {};
+            if (Number(pendingFeedbackSummary.pending_sample_count || 0) > 0 || Number(pendingFeedbackSummary.pending_point_count || 0) > 0) {
+              html += '<p class="scoring-factors-meta">待人工确认样本：'
+                + escapeHtmlText(String(pendingFeedbackSummary.pending_sample_count || 0))
+                + '；待确认反馈点：'
+                + escapeHtmlText(String(pendingFeedbackSummary.pending_point_count || 0))
+                + '。这些反馈尚未正式进入评分主链，但已整理成项目级改写补丁供编制时参考。</p>';
+            }
+            html += renderPendingFeedbackPatchBundleSection(
+              pendingFeedbackPatchBundle,
+              '待确认反馈改写补丁包（来自待人工确认样本）'
+            );
+            if (Number(pendingFeedbackPatchBundle.section_count || 0) > 0) {
+              if (!secureDesktopEnabled()) {
+                html += '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="secondary" id="btnGuidancePatchBundleInlineDownload">下载改写补丁包(.md)</button><button type="button" class="secondary" id="btnGuidancePatchBundleInlineDownloadDocx">下载改写补丁包(.docx)</button></div>';
+              } else {
+                html += '<p style="font-size:12px;margin-top:8px;color:#9a3412">保密模式下已禁用改写补丁包下载。</p>';
+              }
+            }
             el.innerHTML = html || '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
+            const inlinePatchBtn = document.getElementById('btnGuidancePatchBundleInlineDownload');
+            const inlinePatchDocxBtn = document.getElementById('btnGuidancePatchBundleInlineDownloadDocx');
+            if (inlinePatchBtn) {
+              inlinePatchBtn.onclick = () => {
+                if (secureDesktopEnabled()) {
+                  secureDesktopBlockResult('guidanceResult');
+                  return;
+                }
+                downloadWritingGuidancePatchBundle(projectId, 'guidanceResult');
+              };
+            }
+            if (inlinePatchDocxBtn) {
+              inlinePatchDocxBtn.onclick = () => {
+                if (secureDesktopEnabled()) {
+                  secureDesktopBlockResult('guidanceResult');
+                  return;
+                }
+                downloadWritingGuidancePatchBundleDocx(projectId, 'guidanceResult');
+              };
+            }
           } else { el.innerHTML = '<span class="error">' + (data.detail || '') + '</span>'; }
+        });
+        safeClick('btnWritingGuidanceDownload', async () => {
+          if (secureDesktopEnabled()) {
+            secureDesktopBlockResult('guidanceResult');
+            return;
+          }
+          if (!ensureProjectForAction('guidanceResult')) return;
+          const id = pid();
+          const url = '/api/v1/projects/' + encodeURIComponent(id) + '/writing_guidance.md';
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'writing_guidance_' + id + '.md';
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          setResultSuccess('guidanceResult', '编制指导 Markdown 下载已触发。');
+        });
+        function downloadWritingGuidancePatchBundle(projectId, resultId='guidanceResult') {
+          const id = String(projectId || '').trim();
+          if (!id) return false;
+          const url = '/api/v1/projects/' + encodeURIComponent(id) + '/writing_guidance_patch_bundle.md';
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'writing_guidance_patch_bundle_' + id + '.md';
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          if (resultId) setResultSuccess(resultId, '改写补丁包 Markdown 下载已触发。');
+          return true;
+        }
+        function downloadWritingGuidancePatchBundleDocx(projectId, resultId='guidanceResult') {
+          const id = String(projectId || '').trim();
+          if (!id) return false;
+          const url = '/api/v1/projects/' + encodeURIComponent(id) + '/writing_guidance_patch_bundle.docx';
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'writing_guidance_patch_bundle_' + id + '.docx';
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          if (resultId) setResultSuccess(resultId, '改写补丁包 DOCX 下载已触发。');
+          return true;
+        }
+        safeClick('btnWritingGuidancePatchBundleDownload', async () => {
+          if (secureDesktopEnabled()) {
+            secureDesktopBlockResult('guidanceResult');
+            return;
+          }
+          if (!ensureProjectForAction('guidanceResult')) return;
+          downloadWritingGuidancePatchBundle(pid(), 'guidanceResult');
+        });
+        safeClick('btnWritingGuidancePatchBundleDownloadDocx', async () => {
+          if (secureDesktopEnabled()) {
+            secureDesktopBlockResult('guidanceResult');
+            return;
+          }
+          if (!ensureProjectForAction('guidanceResult')) return;
+          downloadWritingGuidancePatchBundleDocx(pid(), 'guidanceResult');
         });
         safeClick('btnCompilationInstructions', async () => {
           if (!ensureProjectForAction('compilationInstructionsResult')) return;
@@ -33353,14 +47019,14 @@ def index(
             if ((data.mandatory_elements || []).length) html += '<p><b>必备要素：</b>' + data.mandatory_elements.join('；') + '</p>';
             if ((data.forbidden_patterns || []).length) html += '<p><b>禁止表述：</b>' + data.forbidden_patterns.join('；') + '</p>';
             if ((data.guidance_items || []).length) html += '<p><b>编制指导：</b><ul>' + data.guidance_items.map(l => '<li>' + l + '</li>').join('') + '</ul></p>';
-            if (!SECURE_DESKTOP_MODE) {
+            if (!secureDesktopEnabled()) {
               html += '<button type="button" class="secondary" id="btnExportInstructions" style="margin-top:8px">导出为文本（复制到剪贴板）</button>';
             } else {
               html += '<p style="font-size:12px;margin-top:8px;color:#9a3412">保密模式下已禁用复制导出。</p>';
             }
             el.innerHTML = html;
             (document.getElementById('btnExportInstructions')||{}).onclick = () => {
-              if (SECURE_DESKTOP_MODE) {
+              if (secureDesktopEnabled()) {
                 secureDesktopBlockResult('compilationInstructionsResult');
                 return;
               }
@@ -33381,17 +47047,509 @@ def index(
           const el = document.getElementById(id);
           if (!el) return;
           el.style.display = 'block';
+          clearSystemClosureActionHint(id);
           const klass = ok ? 'success' : 'error';
           el.innerHTML = '<p class="' + klass + '">' + title + '</p><pre style="margin:0">' + JSON.stringify(payload, null, 2) + '</pre>';
+        }
+        function renderEvaluationSummaryBlock(id, ok, title, payload) {
+          const el = document.getElementById(id);
+          if (!el) return;
+          el.style.display = 'block';
+          const klass = ok ? 'success' : 'error';
+          if (!ok) {
+            el.innerHTML = '<p class="' + klass + '">' + title + '</p><pre style="margin:0">' + JSON.stringify(payload, null, 2) + '</pre>';
+            return;
+          }
+          const data = (payload && typeof payload === 'object') ? payload : {};
+          const variants = data.variants || {};
+          const acceptance = data.acceptance || {};
+          const closure = (data.phase1_closure_readiness && typeof data.phase1_closure_readiness === 'object')
+            ? data.phase1_closure_readiness
+            : {};
+          const variantOrder = [
+            ['v1', 'V1 规则基线'],
+            ['v2', 'V2 原始规则分'],
+            ['current', '当前展示分'],
+            ['v2_calib', 'V2+Calib 校准分'],
+          ];
+          let html = '<p class="' + klass + '">' + title + '</p>';
+          html += '<p style="margin:4px 0"><b>青天样本数</b>：' + escapeHtmlText(String(data.sample_count_qt || 0)) + '</p>';
+          html += '<table style="border-collapse:collapse;font-size:12px;margin-top:6px"><thead><tr>'
+            + '<th style="padding:2px 8px;border:1px solid #dbe3ef">版本</th>'
+            + '<th style="padding:2px 8px;border:1px solid #dbe3ef">样本数</th>'
+            + '<th style="padding:2px 8px;border:1px solid #dbe3ef">MAE</th>'
+            + '<th style="padding:2px 8px;border:1px solid #dbe3ef">RMSE</th>'
+            + '<th style="padding:2px 8px;border:1px solid #dbe3ef">Spearman</th>'
+            + '</tr></thead><tbody>';
+          html += variantOrder.map(([key, label]) => {
+            const row = variants[key] || {};
+            return '<tr>'
+              + '<td style="padding:2px 8px;border:1px solid #dbe3ef">' + escapeHtmlText(label) + '</td>'
+              + '<td style="padding:2px 8px;border:1px solid #dbe3ef">' + escapeHtmlText(String(row.sample_count || 0)) + '</td>'
+              + '<td style="padding:2px 8px;border:1px solid #dbe3ef">' + escapeHtmlText(String(row.mae != null ? row.mae : '-')) + '</td>'
+              + '<td style="padding:2px 8px;border:1px solid #dbe3ef">' + escapeHtmlText(String(row.rmse != null ? row.rmse : '-')) + '</td>'
+              + '<td style="padding:2px 8px;border:1px solid #dbe3ef">' + escapeHtmlText(String(row.spearman != null ? row.spearman : '-')) + '</td>'
+              + '</tr>';
+          }).join('');
+          html += '</tbody></table>';
+          html += '<div style="margin-top:8px">'
+            + '<p style="margin:4px 0"><b>验收结论</b></p>'
+            + '<ul style="margin:4px 0 0 18px;padding:0">'
+            + '<li>当前分已与青天结果对齐：' + escapeHtmlText(String(!!acceptance.current_display_matches_qt)) + '</li>'
+            + '<li>当前分 MAE/RMSE 不劣于 V2：' + escapeHtmlText(String(!!acceptance.current_mae_rmse_not_worse_than_v2)) + '</li>'
+            + '<li>当前分排序相关性不劣于 V2：' + escapeHtmlText(String(!!acceptance.current_rank_corr_not_worse_vs_v2)) + '</li>'
+            + '</ul></div>';
+          if (closure && Object.keys(closure).length) {
+            const statusLabel = String(closure.status_label || '暂不可封第一阶段');
+            const passedGateCount = Number(closure.passed_gate_count || 0);
+            const failedGateCount = Number(closure.failed_gate_count || 0);
+            const failedGates = Array.isArray(closure.failed_gates) ? closure.failed_gates : [];
+            const recommendation = String(closure.recommendation || '-');
+            html += '<div style="margin-top:8px">'
+              + '<p style="margin:4px 0"><b>第一阶段封关 readiness</b></p>'
+              + '<ul style="margin:4px 0 0 18px;padding:0">'
+              + '<li>状态：' + escapeHtmlText(statusLabel) + '</li>'
+              + '<li>通过门数：' + escapeHtmlText(String(passedGateCount)) + ' / 10</li>'
+              + '<li>未通过门数：' + escapeHtmlText(String(failedGateCount)) + '</li>'
+              + '<li>未通过门：' + escapeHtmlText(failedGates.length ? failedGates.join(', ') : '-')
+              + '</li>'
+              + '<li>建议：' + escapeHtmlText(recommendation) + '</li>'
+              + '</ul></div>';
+          }
+          el.innerHTML = html;
+        }
+        function renderEvaluationAggregateSummaryBlock(id, ok, title, payload) {
+          const el = document.getElementById(id);
+          if (!el) return;
+          el.style.display = 'block';
+          const klass = ok ? 'success' : 'error';
+          if (!ok) {
+            el.innerHTML = '<p class="' + klass + '">' + title + '</p><pre style="margin:0">' + JSON.stringify(payload, null, 2) + '</pre>';
+            return;
+          }
+          const data = (payload && typeof payload === 'object') ? payload : {};
+          const aggregate = data.aggregate || {};
+          const passCount = data.acceptance_pass_count || {};
+          const closure = (data.total_closure_readiness && typeof data.total_closure_readiness === 'object')
+            ? data.total_closure_readiness
+            : {};
+          const variantOrder = [
+            ['v1', 'V1'],
+            ['v2', 'V2'],
+            ['current', '当前分'],
+            ['v2_calib', 'V2+Calib'],
+          ];
+          let html = '<p class="' + klass + '">' + title + '</p>';
+          html += '<p style="margin:4px 0"><b>项目数</b>：' + escapeHtmlText(String(data.project_count || 0)) + '</p>';
+          html += '<table style="border-collapse:collapse;font-size:12px;margin-top:6px"><thead><tr>'
+            + '<th style="padding:2px 8px;border:1px solid #dbe3ef">版本</th>'
+            + '<th style="padding:2px 8px;border:1px solid #dbe3ef">项目数</th>'
+            + '<th style="padding:2px 8px;border:1px solid #dbe3ef">样本总数</th>'
+            + '<th style="padding:2px 8px;border:1px solid #dbe3ef">MAE均值</th>'
+            + '<th style="padding:2px 8px;border:1px solid #dbe3ef">RMSE均值</th>'
+            + '</tr></thead><tbody>';
+          html += variantOrder.map(([key, label]) => {
+            const row = aggregate[key] || {};
+            return '<tr>'
+              + '<td style="padding:2px 8px;border:1px solid #dbe3ef">' + escapeHtmlText(label) + '</td>'
+              + '<td style="padding:2px 8px;border:1px solid #dbe3ef">' + escapeHtmlText(String(row.project_count || 0)) + '</td>'
+              + '<td style="padding:2px 8px;border:1px solid #dbe3ef">' + escapeHtmlText(String(row.sample_count_total || 0)) + '</td>'
+              + '<td style="padding:2px 8px;border:1px solid #dbe3ef">' + escapeHtmlText(String(row.mae_avg != null ? row.mae_avg : '-')) + '</td>'
+              + '<td style="padding:2px 8px;border:1px solid #dbe3ef">' + escapeHtmlText(String(row.rmse_avg != null ? row.rmse_avg : '-')) + '</td>'
+              + '</tr>';
+          }).join('');
+          html += '</tbody></table>';
+          html += '<p style="margin:8px 0 0 0"><b>通过统计</b>：当前分已对齐=' + escapeHtmlText(String(passCount.current_display_matches_qt || 0))
+            + '；当前分 MAE/RMSE 不劣于 V2=' + escapeHtmlText(String(passCount.current_mae_rmse_not_worse_than_v2 || 0))
+            + '；当前分排序相关性不劣于 V2=' + escapeHtmlText(String(passCount.current_rank_corr_not_worse_vs_v2 || 0))
+            + '</p>';
+          if (closure && Object.keys(closure).length) {
+            const statusLabel = String(closure.status_label || '暂不可封系统总关');
+            const evaluatedProjectCount = Number(closure.evaluated_project_count || 0);
+            const readyProjectCount = Number(closure.ready_project_count || 0);
+            const notReadyProjectCount = Number(closure.not_ready_project_count || 0);
+            const failedGates = Array.isArray(closure.failed_gates) ? closure.failed_gates : [];
+            const nextPriorityProjectName = String(closure.next_priority_project_name || '-');
+            const nextPriorityFailedGates = Array.isArray(closure.next_priority_failed_gates)
+              ? closure.next_priority_failed_gates
+              : [];
+            const nextPriorityRecommendation = String(closure.next_priority_recommendation || '-');
+          const candidateProjectCount = Number(closure.candidate_project_count || 0);
+          const blockerKind = String(closure.blocker_kind || '-');
+          const nextStepTitle = String(closure.next_step_title || '-');
+          const nextStepDetail = String(closure.next_step_detail || '-');
+          const nextStepEntrypointLabel = String(closure.next_step_entrypoint_label || '-');
+          const nextStepEntrypointDetail = String(closure.next_step_entrypoint_detail || '-');
+          const nextCandidateProjectName = String(closure.next_candidate_project_name || '-');
+          const nextCandidateStage = String(closure.next_candidate_stage || '-');
+          const nextCandidateActionHint = String(closure.next_candidate_action_hint || '-');
+            const systemClosurePath = Array.isArray(closure.system_closure_path)
+              ? closure.system_closure_path
+              : [];
+            const recommendation = String(closure.recommendation || '-');
+            html += '<div style="margin-top:8px">'
+              + '<p style="margin:4px 0"><b>系统总封关 readiness</b></p>'
+              + '<ul style="margin:4px 0 0 18px;padding:0">'
+              + '<li>状态：' + escapeHtmlText(statusLabel) + '</li>'
+              + '<li>具备真实样本项目数：' + escapeHtmlText(String(evaluatedProjectCount)) + '</li>'
+              + '<li>已达第一阶段 ready 项目数：' + escapeHtmlText(String(readyProjectCount)) + '</li>'
+              + '<li>未 ready 项目数：' + escapeHtmlText(String(notReadyProjectCount)) + '</li>'
+              + '<li>候选项目数：' + escapeHtmlText(String(candidateProjectCount)) + '</li>'
+              + '<li>候选首选项目：' + escapeHtmlText(nextCandidateProjectName) + '</li>'
+              + '<li>候选推进阶段：' + escapeHtmlText(nextCandidateStage) + '</li>'
+              + '<li>候选推进建议：' + escapeHtmlText(nextCandidateActionHint) + '</li>'
+              + '<li>阻塞类型：' + escapeHtmlText(closureBlockerKindLabel(blockerKind)) + '</li>'
+              + '<li>当前最该做的下一步：' + escapeHtmlText(nextStepTitle) + '</li>'
+              + '<li>下一步详情：' + escapeHtmlText(nextStepDetail) + '</li>'
+              + '<li>推荐入口：' + escapeHtmlText(nextStepEntrypointLabel) + '</li>'
+              + '<li>入口动作：' + escapeHtmlText(nextStepEntrypointDetail) + '</li>'
+              + '<li>下一优先项目：' + escapeHtmlText(nextPriorityProjectName) + '</li>'
+              + '<li>下一优先未通过门：' + escapeHtmlText(nextPriorityFailedGates.length ? nextPriorityFailedGates.join(', ') : '-') + '</li>'
+              + '<li>项目级建议：' + escapeHtmlText(nextPriorityRecommendation) + '</li>'
+              + '<li>未通过门：' + escapeHtmlText(failedGates.length ? failedGates.join(', ') : '-') + '</li>'
+              + '<li>建议：' + escapeHtmlText(recommendation) + '</li>'
+              + '</ul>'
+              + '<p style="margin:6px 0 0 0"><b>最短闭环路径</b></p>'
+              + '<ol style="margin:4px 0 0 18px;padding:0">'
+              + (systemClosurePath.length
+                  ? systemClosurePath.map((x) => '<li>' + escapeHtmlText(String(x)) + '</li>').join('')
+                  : '<li>-</li>')
+              + '</ol></div>';
+          }
+          el.innerHTML = html;
+        }
+        function closureBlockerKindLabel(kind) {
+          const raw = String(kind || '').trim();
+          if (raw === 'ready') return '已满足系统总封关前置条件';
+          if (raw === 'advance_candidate_project') return '缺第二个可评估项目，需推进候选项目';
+          if (raw === 'need_new_project') return '缺第二个真实样本项目';
+          if (raw === 'close_not_ready_project') return '存在未 ready 项目待收口';
+          if (raw === 'general_not_ready') return '系统总封关前置条件未齐';
+          return raw || '-';
+        }
+        function systemClosureEntrypointMeta(key) {
+          const raw = String(key || '').trim();
+          if (raw === 'system_self_check') return { sectionId: 'section-learning-evolution', focusId: 'btnSelfCheck' };
+          if (raw === 'system_data_hygiene') return { sectionId: 'section-learning-evolution', focusId: 'btnDataHygiene' };
+          if (raw === 'create_project') return { sectionId: 'section-create-project', focusId: 'btnStartNewProject' };
+          if (raw === 'upload_materials') return { sectionId: 'section-materials', focusId: 'btnUploadMaterials' };
+          if (raw === 'upload_shigong') return { sectionId: 'section-shigong', focusId: 'btnUploadShigong' };
+          if (raw === 'score_shigong') return { sectionId: 'section-shigong', focusId: 'btnScoreShigong' };
+          if (raw === 'ground_truth') return { sectionId: 'section-learning-evolution', focusId: 'btnAddGroundTruth' };
+          if (raw === 'feedback_governance') return { sectionId: 'section-learning-evolution', focusId: 'btnFeedbackGovernance' };
+          if (raw === 'auto_run_reflection') return { sectionId: 'section-learning-evolution', focusId: 'btnAutoRunReflection' };
+          if (raw === 'project_evaluation') return { sectionId: 'section-learning-evolution', focusId: 'btnEvalMetricsV2' };
+          if (raw === 'evaluation_summary') return { sectionId: 'section-learning-evolution', focusId: 'btnEvalSummaryV2' };
+          return null;
+        }
+        function clearSystemClosureEntrypointHighlight() {
+          const prevId = String(window.__systemClosureEntrypointFocusId || '').trim();
+          if (!prevId) {
+            window.__systemClosureEntrypointSuggestedKey = '';
+            window.__systemClosureEntrypointSuggestedTitle = '';
+            return;
+          }
+          const btn = document.getElementById(prevId);
+          if (btn) {
+            btn.style.outline = btn.dataset.systemClosurePrevOutline || '';
+            btn.style.outlineOffset = btn.dataset.systemClosurePrevOutlineOffset || '';
+            btn.style.boxShadow = btn.dataset.systemClosurePrevBoxShadow || '';
+            btn.style.backgroundImage = btn.dataset.systemClosurePrevBackgroundImage || '';
+            btn.style.backgroundColor = btn.dataset.systemClosurePrevBackgroundColor || '';
+            const oldTitle = btn.dataset.systemClosurePrevTitle;
+            if (oldTitle !== undefined) btn.title = oldTitle;
+          }
+          window.__systemClosureEntrypointFocusId = '';
+          window.__systemClosureEntrypointSuggestedKey = '';
+          window.__systemClosureEntrypointSuggestedTitle = '';
+        }
+        function highlightSystemClosureEntrypoint(key, title) {
+          clearSystemClosureEntrypointHighlight();
+          const meta = systemClosureEntrypointMeta(key);
+          if (!meta || !meta.focusId) return;
+          const btn = document.getElementById(meta.focusId);
+          if (!btn) return;
+          btn.dataset.systemClosurePrevOutline = btn.style.outline || '';
+          btn.dataset.systemClosurePrevOutlineOffset = btn.style.outlineOffset || '';
+          btn.dataset.systemClosurePrevBoxShadow = btn.style.boxShadow || '';
+          btn.dataset.systemClosurePrevBackgroundImage = btn.style.backgroundImage || '';
+          btn.dataset.systemClosurePrevBackgroundColor = btn.style.backgroundColor || '';
+          btn.dataset.systemClosurePrevTitle = btn.title || '';
+          btn.style.outline = '2px solid #f59e0b';
+          btn.style.outlineOffset = '2px';
+          btn.style.boxShadow = '0 0 0 4px rgba(245, 158, 11, 0.18)';
+          btn.style.backgroundImage = 'linear-gradient(90deg, rgba(245,158,11,0.18), rgba(245,158,11,0.02))';
+          btn.style.backgroundColor = '#fff7ed';
+          btn.title = '系统当前建议：' + String(title || '').trim();
+          window.__systemClosureEntrypointFocusId = meta.focusId;
+          window.__systemClosureEntrypointSuggestedKey = String(key || '').trim();
+          window.__systemClosureEntrypointSuggestedTitle = String(title || '').trim();
+        }
+        function syncSystemClosureEntrypointHighlight(key, title) {
+          const normalizedKey = String(key || '').trim();
+          const normalizedTitle = String(title || '').trim();
+          const prevKey = String(window.__systemClosureEntrypointSuggestedKey || '').trim();
+          const prevTitle = String(window.__systemClosureEntrypointSuggestedTitle || '').trim();
+          if (!normalizedKey) {
+            clearSystemClosureEntrypointHighlight();
+            clearSystemClosureEntrypointActionFocus();
+            return;
+          }
+          if (normalizedKey === prevKey && normalizedTitle === prevTitle) return;
+          highlightSystemClosureEntrypoint(normalizedKey, normalizedTitle);
+        }
+        function focusSystemClosureEntrypoint(key) {
+          const meta = systemClosureEntrypointMeta(key);
+          if (!meta || !meta.sectionId) return false;
+          const section = document.getElementById(meta.sectionId);
+          if (!section) return false;
+          section.scrollIntoView({ behavior: 'auto', block: 'start' });
+          const prevOutline = section.style.outline;
+          const prevOutlineOffset = section.style.outlineOffset;
+          const prevTransition = section.style.transition;
+          section.style.transition = 'outline-color 0.2s ease';
+          section.style.outline = '3px solid #f59e0b';
+          section.style.outlineOffset = '4px';
+          window.clearTimeout(window.__systemClosureEntrypointFocusTimer || 0);
+          window.__systemClosureEntrypointFocusTimer = window.setTimeout(() => {
+            section.style.outline = prevOutline;
+            section.style.outlineOffset = prevOutlineOffset;
+            section.style.transition = prevTransition;
+          }, 2200);
+          window.clearTimeout(window.__systemClosureEntrypointActionQueueTimer || 0);
+          window.__systemClosureEntrypointActionQueueTimer = window.setTimeout(() => {
+            focusSystemClosureEntrypointAction(key);
+          }, 220);
+          return false;
+        }
+        function clearSystemClosureEntrypointActionFocus() {
+          const prevId = String(window.__systemClosureEntrypointActionFocusId || '').trim();
+          if (!prevId) return;
+          const target = document.getElementById(prevId);
+          if (target) {
+            target.style.outline = target.dataset.systemClosureActionPrevOutline || '';
+            target.style.outlineOffset = target.dataset.systemClosureActionPrevOutlineOffset || '';
+            target.style.boxShadow = target.dataset.systemClosureActionPrevBoxShadow || '';
+            target.style.backgroundImage = target.dataset.systemClosureActionPrevBackgroundImage || '';
+            target.style.backgroundColor = target.dataset.systemClosureActionPrevBackgroundColor || '';
+            target.style.transition = target.dataset.systemClosureActionPrevTransition || '';
+          }
+          window.__systemClosureEntrypointActionFocusId = '';
+        }
+        function focusSystemClosureEntrypointAction(key) {
+          const meta = systemClosureEntrypointMeta(key);
+          if (!meta || !meta.focusId) return false;
+          const target = document.getElementById(meta.focusId);
+          if (!target) return false;
+          clearSystemClosureEntrypointActionFocus();
+          target.dataset.systemClosureActionPrevOutline = target.style.outline || '';
+          target.dataset.systemClosureActionPrevOutlineOffset = target.style.outlineOffset || '';
+          target.dataset.systemClosureActionPrevBoxShadow = target.style.boxShadow || '';
+          target.dataset.systemClosureActionPrevBackgroundImage = target.style.backgroundImage || '';
+          target.dataset.systemClosureActionPrevBackgroundColor = target.style.backgroundColor || '';
+          target.dataset.systemClosureActionPrevTransition = target.style.transition || '';
+          target.style.transition = 'box-shadow 0.2s ease, outline-color 0.2s ease';
+          target.style.outline = '2px solid #f59e0b';
+          target.style.outlineOffset = '2px';
+          target.style.boxShadow = '0 0 0 4px rgba(245, 158, 11, 0.22)';
+          target.style.backgroundImage = 'linear-gradient(90deg, rgba(245,158,11,0.22), rgba(245,158,11,0.04))';
+          target.style.backgroundColor = '#fff7ed';
+          window.__systemClosureEntrypointActionFocusId = meta.focusId;
+          window.clearTimeout(window.__systemClosureEntrypointActionFocusTimer || 0);
+          window.__systemClosureEntrypointActionFocusTimer = window.setTimeout(() => {
+            clearSystemClosureEntrypointActionFocus();
+          }, 2400);
+          if (typeof target.scrollIntoView === 'function') {
+            target.scrollIntoView({ behavior: 'auto', block: 'center' });
+          }
+          window.setTimeout(() => {
+            if (typeof target.focus === 'function') target.focus({ preventScroll: true });
+          }, 240);
+          return true;
+        }
+        function renderSystemClosureSummaryPanel(payload, options) {
+          const el = document.getElementById('systemClosureSummaryResult');
+          if (!el) return;
+          const data = (payload && typeof payload === 'object') ? payload : {};
+          const closure = (data.total_closure_readiness && typeof data.total_closure_readiness === 'object')
+            ? data.total_closure_readiness
+            : ((data && typeof data === 'object') ? data : {});
+          const statusLabel = String(closure.status_label || '暂不可封系统总关');
+          const blockerKind = String(closure.blocker_kind || '-');
+          const nextStepTitle = String(closure.next_step_title || '-');
+          const nextStepDetail = String(closure.next_step_detail || '-');
+          const nextStepEntrypointKey = String(closure.next_step_entrypoint_key || '').trim();
+          const nextStepEntrypointLabel = String(closure.next_step_entrypoint_label || '-');
+          const nextStepEntrypointDetail = String(closure.next_step_entrypoint_detail || '-');
+          const candidateProjectCount = Number(closure.candidate_project_count || 0);
+          const nextCandidateProjectName = String(closure.next_candidate_project_name || '-');
+          const nextCandidateStage = String(closure.next_candidate_stage || '-');
+          const nextCandidateActionHint = String(closure.next_candidate_action_hint || '-');
+          const evaluatedProjectCount = Number(closure.evaluated_project_count || 0);
+          const readyProjectCount = Number(closure.ready_project_count || 0);
+          const systemClosurePath = Array.isArray(closure.system_closure_path)
+            ? closure.system_closure_path
+            : [];
+          const opts = (options && typeof options === 'object') ? options : {};
+          const refreshReason = String(opts.refreshReason || '').trim();
+          const refreshReasonText = refreshReason ? ('；刷新来源=' + refreshReason) : '';
+          syncSystemClosureEntrypointHighlight(nextStepEntrypointKey, nextStepTitle);
+          let html = '<strong>系统封关推进摘要</strong>';
+          html += '<p style="margin:6px 0;color:#334155"><b>状态</b>：'
+            + escapeHtmlText(statusLabel)
+            + '；<b>当前最该做的下一步</b>：'
+            + escapeHtmlText(nextStepTitle)
+            + refreshReasonText
+            + '</p>';
+          html += '<p style="margin:4px 0;color:#475569"><b>下一步详情</b>：'
+            + escapeHtmlText(nextStepDetail)
+            + '</p>';
+          html += '<p style="margin:4px 0;color:#475569"><b>推荐入口</b>：'
+            + escapeHtmlText(nextStepEntrypointLabel)
+            + '；<b>入口动作</b>：'
+            + escapeHtmlText(nextStepEntrypointDetail)
+            + '</p>';
+          html += '<table><tr><th>指标</th><th>值</th></tr>'
+            + '<tr><td>阻塞类型</td><td>' + escapeHtmlText(closureBlockerKindLabel(blockerKind)) + '</td></tr>'
+            + '<tr><td>具备真实样本项目数</td><td>' + escapeHtmlText(evaluatedProjectCount) + '</td></tr>'
+            + '<tr><td>已达第一阶段 ready 项目数</td><td>' + escapeHtmlText(readyProjectCount) + '</td></tr>'
+            + '<tr><td>候选项目数</td><td>' + escapeHtmlText(candidateProjectCount) + '</td></tr>'
+            + '<tr><td>候选首选项目</td><td>' + escapeHtmlText(nextCandidateProjectName) + '</td></tr>'
+            + '<tr><td>候选推进阶段</td><td>' + escapeHtmlText(nextCandidateStage) + '</td></tr>'
+            + '<tr><td>候选推进建议</td><td>' + escapeHtmlText(nextCandidateActionHint) + '</td></tr>'
+            + '</table>';
+          html += '<details style="margin-top:8px"><summary>最短闭环路径</summary><ol style="margin:6px 0 0 18px;padding:0">'
+            + (systemClosurePath.length
+              ? systemClosurePath.map((x) => '<li>' + escapeHtmlText(String(x)) + '</li>').join('')
+              : '<li>-</li>')
+            + '</ol></details>';
+          replaceElementHtmlIfChanged(
+            'systemClosureSummaryResult',
+            html,
+            'system_closure_summary|' + buildTableRenderSignature([html])
+          );
+        }
+        let systemClosureSummaryRefreshSeq = 0;
+        async function refreshSystemClosureSummary(options=null) {
+          const opts = (options && typeof options === 'object') ? options : {};
+          const reason = String(opts.reason || '').trim();
+          const silent = opts.silent !== false;
+          const autoFocusEntrypoint = !!opts.autoFocusEntrypoint;
+          const el = document.getElementById('systemClosureSummaryResult');
+          if (!el) return null;
+          const seq = ++systemClosureSummaryRefreshSeq;
+          if (!silent) {
+            el.style.display = 'block';
+            el.innerHTML = '<strong>系统封关推进摘要</strong><p style="margin:6px 0 0 0;color:#475569">正在汇总系统总封关状态…</p>';
+          }
+          let res;
+          let data = {};
+          try {
+            res = await fetch('/api/v1/evaluation/summary?t=' + Date.now(), { cache: 'no-store' });
+            data = await res.json().catch(() => ({}));
+          } catch (err) {
+            if (seq !== systemClosureSummaryRefreshSeq) return null;
+            systemClosureSummaryState = null;
+            syncSystemClosureEntrypointHighlight('', '');
+            refreshProjectScopedClosureInlineHints();
+            setResultError(
+              'systemClosureSummaryResult',
+              '系统总封关摘要加载失败：' + String((err && err.message) || err || '网络异常')
+            );
+            return null;
+          }
+          if (seq !== systemClosureSummaryRefreshSeq) return null;
+          if (!res.ok) {
+            systemClosureSummaryState = null;
+            syncSystemClosureEntrypointHighlight('', '');
+            refreshProjectScopedClosureInlineHints();
+            const detail = (data && data.detail) ? String(data.detail) : ('HTTP ' + String(res.status || 0));
+            setResultError('systemClosureSummaryResult', '系统总封关摘要加载失败：' + detail);
+            return null;
+          }
+          renderSystemClosureSummaryPanel(data, { refreshReason: reason });
+          const closure = (data.total_closure_readiness && typeof data.total_closure_readiness === 'object')
+            ? data.total_closure_readiness
+            : null;
+          systemClosureSummaryState = closure;
+          if (!closure || !closure.next_step_entrypoint_key) {
+            syncSystemClosureEntrypointHighlight('', '');
+          }
+          refreshProjectScopedClosureInlineHints();
+          if (autoFocusEntrypoint && closure && closure.next_step_entrypoint_key) {
+            focusSystemClosureEntrypoint(closure.next_step_entrypoint_key);
+          }
+          return closure;
         }
         function fmtMetric(v) {
           if (typeof v !== 'number' || Number.isNaN(v)) return '-';
           return Number(v).toFixed(4);
         }
+        function buildPostAutoRunRefreshSummary(data, closureSummary=null, systemImprovementOverview=null, projectId='') {
+          const payload = (data && typeof data === 'object') ? data : {};
+          const audit = (payload.manual_confirmation_audit && typeof payload.manual_confirmation_audit === 'object')
+            ? payload.manual_confirmation_audit
+            : {};
+          const closure = (closureSummary && typeof closureSummary === 'object') ? closureSummary : {};
+          const overview = (systemImprovementOverview && typeof systemImprovementOverview === 'object')
+            ? systemImprovementOverview
+            : {};
+          const manualStatusLabel = String(audit.status_label || '').trim();
+          const manualDetail = String(audit.detail || '').trim();
+          const closureStatusLabel = String(closure.status_label || '').trim();
+          const overviewStatusLabel = String(overview.status_label || '').trim();
+          const nextStepText = buildSystemClosureNextStepText(closure, projectId, {
+            prefixLabel: '下一步建议',
+          });
+          let summaryLabel = '闭环已执行，已同步刷新评分治理视图、系统总封关与系统总览。';
+          if (audit.gate_cleared_after_reverify === true) {
+            summaryLabel = '本轮人工确认主因已解除，已同步刷新评分治理视图、系统总封关与系统总览。';
+          } else if (audit.manual_confirmation_required === true) {
+            summaryLabel = '本轮人工确认主因仍未解除，已同步刷新评分治理视图、系统总封关与系统总览。';
+          }
+          return {
+            summary_label: summaryLabel,
+            manual_status_label: manualStatusLabel || null,
+            manual_detail: manualDetail || null,
+            closure_status_label: closureStatusLabel || null,
+            overview_status_label: overviewStatusLabel || null,
+            next_step_text: nextStepText || null,
+          };
+        }
+        function renderPostAutoRunRefreshSummaryBlock(summary) {
+          const row = (summary && typeof summary === 'object') ? summary : {};
+          if (!Object.keys(row).length) return '';
+          const summaryLabel = String(row.summary_label || '').trim();
+          const manualStatusLabel = String(row.manual_status_label || '').trim();
+          const manualDetail = String(row.manual_detail || '').trim();
+          const closureStatusLabel = String(row.closure_status_label || '').trim();
+          const overviewStatusLabel = String(row.overview_status_label || '').trim();
+          const nextStepText = String(row.next_step_text || '').trim();
+          let html = '<div style="margin:8px 0 0 0;padding:8px 10px;border:1px solid #bfdbfe;border-radius:8px;background:#eff6ff;color:#1d4ed8">';
+          html += '<strong>闭环后主因状态：</strong>' + escapeHtmlText(summaryLabel || '-');
+          if (manualStatusLabel) {
+            html += '<p style="margin:6px 0 0 0"><b>人工确认门</b>：' + escapeHtmlText(manualStatusLabel)
+              + (manualDetail ? '；' + escapeHtmlText(manualDetail) : '')
+              + '</p>';
+          }
+          if (closureStatusLabel || overviewStatusLabel) {
+            html += '<p style="margin:4px 0 0 0"><b>收口状态</b>：系统总封关='
+              + escapeHtmlText(closureStatusLabel || '-')
+              + '；系统总览='
+              + escapeHtmlText(overviewStatusLabel || '-')
+              + '</p>';
+          }
+          if (nextStepText) {
+            html += '<p style="margin:4px 0 0 0"><b>下一步建议</b>：' + escapeHtmlText(nextStepText) + '</p>';
+          }
+          html += '</div>';
+          return html;
+        }
         function showCalibratorSummaryBlock(id, ok, title, payload) {
           const el = document.getElementById(id);
           if (!el) return;
           el.style.display = 'block';
+          clearSystemClosureActionHint(id);
           const klass = ok ? 'success' : 'error';
           let html = '<p class="' + klass + '">' + title + '</p>';
           const data = payload && typeof payload === 'object' ? payload : {};
@@ -33418,12 +47576,43 @@ def index(
             const cvPredCount = cv.pred_count ?? metrics.cv_pred_count;
             const bootstrapSmallSample = !!summary.bootstrap_small_sample;
             const deploymentMode = summary.deployment_mode || metrics.deployment_mode || '-';
+            const updatedReports = data.updated_reports ?? data.prediction_updated_reports;
+            const updatedSubmissions = data.updated_submissions ?? data.prediction_updated_submissions;
             const autoReview = (summary.auto_review && typeof summary.auto_review === 'object')
               ? summary.auto_review
               : ((data.calibrator_auto_review && typeof data.calibrator_auto_review === 'object') ? data.calibrator_auto_review : {});
+            const postRunHealth = (data.post_run_health_summary && typeof data.post_run_health_summary === 'object')
+              ? data.post_run_health_summary
+              : {};
             const gateText = typeof gatePassed === 'boolean' ? (gatePassed ? '通过' : '未通过') : '-';
             html += '<p style="margin:4px 0"><b>校准摘要</b>：模型=' + modelType + '；版本=' + version + '；闸门=' + gateText + (sampleCount != null ? ('；样本=' + sampleCount) : '') + '</p>';
             html += '<p style="margin:4px 0"><b>部署形态</b>：' + String(deploymentMode || '-') + (bootstrapSmallSample ? '；当前属于小样本 bootstrap 校准' : '') + '</p>';
+            if (postRunHealth && Object.keys(postRunHealth).length) {
+              const postRunVersion = String(postRunHealth.current_calibrator_version || '-');
+              const postRunMode = String(postRunHealth.current_calibrator_deployment_mode || '-');
+              const postRunDegraded = !!postRunHealth.current_calibrator_degraded;
+              const postRunMae = postRunHealth.current_calibrator_recent_mae;
+              const postRunRuleMae = postRunHealth.current_calibrator_recent_rule_mae;
+              const postRunRollbackCandidate = String(postRunHealth.current_calibrator_rollback_candidate_version || '-');
+              html += '<p style="margin:4px 0"><b>闭环后状态</b>：'
+                + (postRunVersion && postRunVersion !== '-' ? ('版本=' + postRunVersion + '；模式=' + postRunMode) : '未部署项目级校准器')
+                + (postRunVersion && postRunVersion !== '-'
+                  ? (postRunDegraded ? '；状态=仍退化' : '；状态=稳定')
+                  : '')
+                + ((typeof postRunMae === 'number' || typeof postRunRuleMae === 'number')
+                  ? ('；近30天内部校准 MAE=' + fmtMetric(postRunMae) + '/' + fmtMetric(postRunRuleMae))
+                  : '')
+                + (postRunRollbackCandidate && postRunRollbackCandidate !== '-' ? ('；回退候选=' + postRunRollbackCandidate) : '')
+                + '</p>';
+            }
+            html += renderManualConfirmationAuditBlock(data.manual_confirmation_audit);
+            if (updatedReports != null || updatedSubmissions != null) {
+              html += '<p style="margin:4px 0"><b>回填结果</b>：评分报告='
+                + escapeHtmlText(String(updatedReports != null ? updatedReports : '-'))
+                + '；施组记录='
+                + escapeHtmlText(String(updatedSubmissions != null ? updatedSubmissions : '-'))
+                + '</p>';
+            }
             if (skippedReason) {
               html += '<p style="margin:4px 0;color:#9a3412"><b>提示</b>：本次未训练校准器（' + skippedReason + '）。</p>';
             }
@@ -33438,6 +47627,49 @@ def index(
               const reviewAction = String(autoReview.action || 'skip');
               const reviewReason = String(autoReview.reason || '-');
               html += '<p style="margin:4px 0"><b>自动复核</b>：' + reviewPassed + '；动作=' + reviewAction + '；原因=' + reviewReason + (reviewChecked ? '' : '；当前仅进入监控') + '</p>';
+            }
+            const runtimeGovernance = (data.calibrator_runtime_governance && typeof data.calibrator_runtime_governance === 'object')
+              ? data.calibrator_runtime_governance
+              : {};
+            if (runtimeGovernance && Object.keys(runtimeGovernance).length) {
+              const checked = !!runtimeGovernance.checked;
+              const action = String(runtimeGovernance.action || 'skip');
+              const reason = String(runtimeGovernance.reason || '-');
+              const candidateVersion = String(runtimeGovernance.rollback_candidate_version || '-');
+              const activeVersionAfter = String(runtimeGovernance.active_calibrator_version_after || '-');
+              const recoveredAfter = (typeof runtimeGovernance.recovered_after === 'boolean')
+                ? runtimeGovernance.recovered_after
+                : null;
+              const degradedAfter = (typeof runtimeGovernance.degraded_after === 'boolean')
+                ? runtimeGovernance.degraded_after
+                : null;
+              const matchedCount = Number(runtimeGovernance.matched_submission_count || 0);
+              const runtimeUpdatedReports = Number(runtimeGovernance.updated_reports || 0);
+              const runtimeUpdatedSubmissions = Number(runtimeGovernance.updated_submissions || 0);
+              html += '<details style="margin:6px 0"><summary>运行时校准治理</summary>';
+              html += '<p style="margin:4px 0"><b>状态</b>：'
+                + (checked ? '已检查' : '未检查')
+                + '；动作=' + action
+                + '；原因=' + reason
+                + '；候选版本=' + candidateVersion
+                + '；回退后版本=' + activeVersionAfter
+                + '</p>';
+              html += '<p style="margin:4px 0"><b>预演</b>：匹配样本=' + matchedCount
+                + '；当前偏差=' + fmtMetric(runtimeGovernance.avg_abs_delta_stored)
+                + '；候选偏差=' + fmtMetric(runtimeGovernance.avg_abs_delta_preview)
+                + '；改善=' + fmtMetric(runtimeGovernance.avg_abs_delta_improvement)
+                + '</p>';
+              if (action === 'rollback') {
+                html += '<p style="margin:4px 0;color:#166534"><b>结果</b>：已自动回退并回填评分，评分报告='
+                  + runtimeUpdatedReports
+                  + '；施组记录='
+                  + runtimeUpdatedSubmissions
+                  + (recoveredAfter === true
+                    ? '；回退后已恢复稳定'
+                    : (degradedAfter === true ? '；回退后仍显示退化' : '；回退后恢复状态待确认'))
+                  + '。</p>';
+              }
+              html += '</details>';
             }
             const candidates = Array.isArray(summary.auto_candidates) ? summary.auto_candidates : (Array.isArray(data.calibrator_auto_candidates) ? data.calibrator_auto_candidates : []);
             if (candidates.length) {
@@ -33462,8 +47694,11 @@ def index(
                 + '；回滚目标=' + String(govern.rollback_to_patch_id || '-') + '</p>';
               html += '</details>';
             }
+            html += renderPostAutoRunRefreshSummaryBlock(data.post_auto_run_refresh_summary);
           }
-          html += '<pre style="margin:0">' + JSON.stringify(payload, null, 2) + '</pre>';
+          html += '<details style="margin:6px 0 0 0"><summary>运行明细（已折叠）</summary><pre style="margin:6px 0 0 0">'
+            + escapeHtmlText(JSON.stringify(payload, null, 2))
+            + '</pre></details>';
           el.innerHTML = html;
         }
         safeClick('btnRebuildDelta', async () => {
@@ -33488,16 +47723,20 @@ def index(
           const body = { project_id: projectId, model_type: 'auto', alpha: 1.0, auto_deploy: true };
           const res = await fetch('/api/v1/calibration/train', { method: 'POST', headers: apiHeaders(true), body: JSON.stringify(body) });
           const data = await res.json().catch(() => ({}));
-          showJson('output', formatApiOutput(res, data));
+          showJson('output', res.ok
+            ? buildCalibratorActionOutputSummary(data, '校准器训练已完成')
+            : formatApiOutput(res, data));
           showCalibratorSummaryBlock('calibTrainResult', res.ok, res.ok ? '校准器训练完成' : '校准器训练失败', data);
         });
         safeClick('btnApplyCalibPredict', async () => {
           const projectId = actionProjectId();
-          setResultLoading('calibTrainResult', '正在回填预测分...');
+          setResultLoading('calibTrainResult', '正在回填校准分...');
           const res = await fetch('/api/v1/projects/' + projectId + '/calibration/predict', { method: 'POST', headers: apiHeaders(false) });
           const data = await res.json().catch(() => ({}));
-          showJson('output', formatApiOutput(res, data));
-          showBlock('calibTrainResult', res.ok, res.ok ? '预测分回填完成' : '预测分回填失败', data);
+          showJson('output', res.ok
+            ? buildCalibratorActionOutputSummary(data, '校准分回填已完成')
+            : formatApiOutput(res, data));
+          showCalibratorSummaryBlock('calibTrainResult', res.ok, res.ok ? '校准分回填完成' : '校准分回填失败', data);
         });
         safeClick('btnAutoRunReflection', async () => {
           const projectId = actionProjectId();
@@ -33514,8 +47753,49 @@ def index(
           let res = await requestAutoRun(preConfirmed === true);
           let data = await res.json().catch(() => ({}));
           ({ res, data } = await maybeRetryWithExtremeSampleConfirm(projectId, '一键闭环执行', res, data, requestAutoRun));
-          showJson('output', formatApiOutput(res, data));
+          showJson('output', res.ok
+            ? buildCalibratorActionOutputSummary(data, '一键闭环执行已完成')
+            : formatApiOutput(res, data));
+          let closureSummary = null;
+          let systemImprovementOverview = null;
+          if (res.ok && typeof loadFeedbackGovernancePanel === 'function') {
+            await loadFeedbackGovernancePanel(projectId, {
+              suppressLoading: true,
+              silentOutput: true,
+              actionMessage: '一键闭环执行后已自动刷新评分治理视图，可直接查看最新学习/校准状态。',
+            });
+          }
+          if (res.ok && typeof refreshSystemClosureSummary === 'function') {
+            closureSummary = await refreshSystemClosureSummary({ reason: 'auto_run_reflection', silent: true });
+          }
+          if (res.ok && typeof refreshSystemImprovementOverview === 'function') {
+            systemImprovementOverview = await refreshSystemImprovementOverview({
+              silent: true,
+              silentOutput: true,
+            });
+          }
+          if (res.ok) {
+            data = Object.assign({}, data, {
+              post_auto_run_refresh_summary: buildPostAutoRunRefreshSummary(
+                data,
+                closureSummary,
+                systemImprovementOverview,
+                projectId,
+              ),
+            });
+          }
           showCalibratorSummaryBlock('calibTrainResult', res.ok, res.ok ? '一键闭环执行完成' : '一键闭环执行失败', data);
+          if (res.ok && closureSummary) {
+            renderSystemClosureActionHint('calibTrainResult', closureSummary, projectId, {
+              titleText: '闭环后的下一步',
+              prefixLabel: '下一步建议',
+            });
+            if (closureSummary.next_step_entrypoint_key) {
+              focusSystemClosureEntrypoint(closureSummary.next_step_entrypoint_key);
+            }
+          } else {
+            clearSystemClosureActionHint('calibTrainResult');
+          }
         });
         safeClick('btnEvalMetricsV2', async () => {
           const projectId = actionProjectId();
@@ -33530,14 +47810,7 @@ def index(
             acceptance: a,
             variants: data.variants || {},
           };
-          showBlock('evalResult', true, '项目指标评估完成', summary);
-        });
-        safeClick('btnEvalSummaryV2', async () => {
-          const res = await fetch('/api/v1/evaluation/summary');
-          const data = await res.json().catch(() => ({}));
-          showJson('output', formatApiOutput(res, data));
-          if (!res.ok) { showBlock('evalResult', false, '跨项目汇总评估失败', data); return; }
-          showBlock('evalResult', true, '跨项目汇总评估完成', data);
+          renderEvaluationSummaryBlock('evalResult', true, '项目指标评估完成', summary);
         });
         safeClick('btnMinePatchV2', async () => {
           const projectId = actionProjectId();
@@ -33585,10 +47858,8 @@ def index(
         });
 
         // 关闭“硬接管”兜底，避免覆盖 safeClick 的详细渲染结果。
-        const btnSaveApiKey = document.getElementById('btnSaveApiKey');
-        if (btnSaveApiKey) btnSaveApiKey.onclick = saveApiKeyFromInput;
-        const btnClearApiKey = document.getElementById('btnClearApiKey');
-        if (btnClearApiKey) btnClearApiKey.onclick = clearStoredApiKey;
+        safeClick0('btnSaveApiKey', saveApiKeyFromInput);
+        safeClick0('btnClearApiKey', clearStoredApiKey);
         initWeightsSection();
         syncGroundTruthJudgeInputs();
         syncApiKeyHiddenInputs();
@@ -33598,12 +47869,23 @@ def index(
         }
         document.addEventListener('visibilitychange', () => {
           if (document.visibilityState === 'hidden') {
+            projectVisibilityHiddenAtMs = Date.now();
             clearMaterialParsePolling();
-            clearProjectAutoRefresh();
+            clearProjectAutoRefresh(false);
             return;
           }
           const currentId = selectedProjectIdStrict();
           if (!currentId) return;
+          const hiddenAt = Number(projectVisibilityHiddenAtMs || 0);
+          projectVisibilityHiddenAtMs = 0;
+          const refreshIntervalMs = currentProjectAutoRefreshInterval(currentId);
+          const nowMs = Date.now();
+          const remainingMs = projectAutoRefreshDueAtMs > nowMs ? (projectAutoRefreshDueAtMs - nowMs) : 0;
+          const hiddenDurationMs = hiddenAt > 0 ? Math.max(0, nowMs - hiddenAt) : Number.POSITIVE_INFINITY;
+          if (remainingMs > 0 && hiddenDurationMs < refreshIntervalMs) {
+            scheduleProjectAutoRefresh(currentId, projectSwitchSeq, { delayMs: remainingMs });
+            return;
+          }
           scheduleProjectAutoRefresh(currentId, projectSwitchSeq);
           if (typeof refreshMaterials === 'function') refreshMaterials(currentId, projectSwitchSeq);
           if (typeof refreshScoringDiagnostic === 'function') refreshScoringDiagnostic(currentId, projectSwitchSeq);

@@ -5,12 +5,15 @@ from __future__ import annotations
 import copy
 import os
 import re
+import subprocess
+import sys
 import tempfile
-from collections import Counter
+from collections import Counter, deque
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -162,6 +165,58 @@ class TestVersionedJsonHistoryRoutes:
 
 
 class TestMaterialParseWorkerLifecycle:
+    def test_material_should_use_preview_stage_for_large_pdf_inputs(self):
+        from app.main import _material_should_use_preview_stage
+
+        assert (
+            _material_should_use_preview_stage(
+                b"x" * 400_000,
+                "招标文件.pdf",
+                material_type="tender_qa",
+            )
+            is True
+        )
+        assert (
+            _material_should_use_preview_stage(
+                b"x" * 120_000,
+                "招标文件.pdf",
+                material_type="tender_qa",
+            )
+            is False
+        )
+        assert (
+            _material_should_use_preview_stage(
+                b"x" * 400_000,
+                "工程量清单.xlsx",
+                material_type="boq",
+            )
+            is True
+        )
+        assert (
+            _material_should_use_preview_stage(
+                b"x" * 400_000,
+                "工程量清单.pdf",
+                material_type="boq",
+            )
+            is True
+        )
+        assert (
+            _material_should_use_preview_stage(
+                b"x" * 80_000,
+                "工程量清单.xlsx",
+                material_type="boq",
+            )
+            is False
+        )
+        assert (
+            _material_should_use_preview_stage(
+                b"x" * 80_000,
+                "工程量清单.pdf",
+                material_type="boq",
+            )
+            is False
+        )
+
     @patch("app.main._bootstrap_material_parse_state")
     @patch("app.main.threading.Thread")
     def test_start_material_parse_worker_starts_worker_pool(
@@ -174,9 +229,10 @@ class TestMaterialParseWorkerLifecycle:
         original_worker = main_module._MATERIAL_PARSE_WORKER
         original_workers = list(main_module._MATERIAL_PARSE_WORKERS)
         original_event_state = main_module._MATERIAL_PARSE_STOP_EVENT.is_set()
+        original_wake_state = main_module._MATERIAL_PARSE_WAKE_EVENT.is_set()
         worker_pool = [
             MagicMock(name=f"worker-{idx}")
-            for idx in range(main_module.DEFAULT_MATERIAL_PARSE_WORKER_COUNT)
+            for idx in range(main_module._material_parse_total_worker_count())
         ]
         mock_thread_cls.side_effect = worker_pool
         main_module._MATERIAL_PARSE_WORKER = None
@@ -184,12 +240,23 @@ class TestMaterialParseWorkerLifecycle:
         try:
             main_module._start_material_parse_worker()
 
-            assert mock_thread_cls.call_count == main_module.DEFAULT_MATERIAL_PARSE_WORKER_COUNT
+            assert mock_thread_cls.call_count == main_module._material_parse_total_worker_count()
             for worker in worker_pool:
                 worker.start.assert_called_once()
             mock_bootstrap_state.assert_called_once()
             assert main_module._MATERIAL_PARSE_WORKER is worker_pool[0]
             assert main_module._MATERIAL_PARSE_WORKERS == worker_pool
+            first_kwargs = mock_thread_cls.call_args_list[0].kwargs
+            assert first_kwargs["kwargs"]["preferred_parse_mode"] == "preview"
+            assert first_kwargs["kwargs"]["allow_fallback"] is True
+            assert (
+                first_kwargs["kwargs"]["max_preview_speed_rank"]
+                == main_module.DEFAULT_MATERIAL_PARSE_PREVIEW_EXPRESS_MAX_SPEED_RANK
+            )
+            second_kwargs = mock_thread_cls.call_args_list[1].kwargs
+            assert second_kwargs["kwargs"]["preferred_parse_mode"] == "preview"
+            assert second_kwargs["kwargs"]["allow_fallback"] is False
+            assert second_kwargs["kwargs"]["max_preview_speed_rank"] is None
         finally:
             main_module._MATERIAL_PARSE_WORKER = original_worker
             main_module._MATERIAL_PARSE_WORKERS = original_workers
@@ -197,6 +264,2866 @@ class TestMaterialParseWorkerLifecycle:
                 main_module._MATERIAL_PARSE_STOP_EVENT.set()
             else:
                 main_module._MATERIAL_PARSE_STOP_EVENT.clear()
+            if original_wake_state:
+                main_module._MATERIAL_PARSE_WAKE_EVENT.set()
+            else:
+                main_module._MATERIAL_PARSE_WAKE_EVENT.clear()
+
+    @patch("app.main._invalidate_material_index_cache")
+    @patch("app.main.save_materials")
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_material_parse_jobs")
+    @patch("app.main.get_openai_api_key", return_value="")
+    def test_claim_next_material_parse_job_prioritizes_scoring_blocker_required_materials(
+        self,
+        _mock_openai_key,
+        mock_load_jobs,
+        mock_load_materials,
+        mock_load_submissions,
+        mock_save_jobs,
+        mock_save_materials,
+        _mock_invalidate,
+    ):
+        from app.main import _claim_next_material_parse_job
+
+        mock_load_materials.return_value = [
+            {
+                "id": "m-photo",
+                "project_id": "p-materials",
+                "material_type": "site_photo",
+                "filename": "现场.jpg",
+                "path": "/tmp/现场.jpg",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+            {
+                "id": "m-drawing",
+                "project_id": "p-score",
+                "material_type": "drawing",
+                "filename": "总图.pdf",
+                "path": "/tmp/总图.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+            {
+                "id": "m-boq",
+                "project_id": "p-score",
+                "material_type": "boq",
+                "filename": "清单.xlsx",
+                "path": "/tmp/清单.xlsx",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-photo",
+                "material_id": "m-photo",
+                "project_id": "p-materials",
+                "material_type": "site_photo",
+                "filename": "现场.jpg",
+                "status": "queued",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            },
+            {
+                "id": "j-drawing",
+                "material_id": "m-drawing",
+                "project_id": "p-score",
+                "material_type": "drawing",
+                "filename": "总图.pdf",
+                "status": "queued",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            },
+            {
+                "id": "j-boq",
+                "material_id": "m-boq",
+                "project_id": "p-score",
+                "material_type": "boq",
+                "filename": "清单.xlsx",
+                "status": "queued",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            },
+        ]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p-score",
+                "filename": "施组1.docx",
+                "text": "施工组织设计正文",
+                "score": None,
+                "report": None,
+            }
+        ]
+
+        claimed = _claim_next_material_parse_job()
+
+        assert claimed is not None
+        assert claimed["id"] == "j-boq"
+        saved_jobs = mock_save_jobs.call_args[0][0]
+        prioritized = next(job for job in saved_jobs if job["id"] == "j-boq")
+        assert prioritized["status"] == "processing"
+        saved_rows = mock_save_materials.call_args[0][0]
+        prioritized_row = next(row for row in saved_rows if row["id"] == "m-boq")
+        assert prioritized_row["parse_status"] == "processing"
+        assert prioritized_row["parse_backend"] == "local"
+
+    @patch("app.main.load_materials")
+    @patch("app.main.load_material_parse_jobs")
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.save_materials")
+    @patch("app.main._invalidate_material_index_cache")
+    @patch("app.main._get_material_parse_active_project_types")
+    @patch("app.main._get_material_parse_active_projects")
+    @patch("app.main._load_material_parse_job_priority_contexts")
+    @patch("app.main._build_material_parse_project_stage_rank")
+    def test_claim_next_material_parse_job_preview_reserved_worker_waits_for_preview_jobs(
+        self,
+        mock_build_stage_ranks,
+        mock_load_priority_contexts,
+        mock_get_active_projects,
+        mock_get_active_project_types,
+        _mock_invalidate,
+        _mock_save_materials,
+        _mock_save_jobs,
+        mock_load_jobs,
+        mock_load_materials,
+    ):
+        from app.main import _claim_next_material_parse_job
+
+        mock_load_materials.return_value = [
+            {
+                "id": "m-boq",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "清单.xlsx",
+                "path": "/tmp/清单.xlsx",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            }
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-boq-full",
+                "material_id": "m-boq",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "清单.xlsx",
+                "status": "queued",
+                "parse_mode": "full",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            }
+        ]
+
+        claimed = _claim_next_material_parse_job(
+            preferred_parse_mode="preview",
+            allow_fallback=False,
+            prefer_active_projects=True,
+        )
+
+        assert claimed is None
+        mock_build_stage_ranks.assert_not_called()
+        mock_load_priority_contexts.assert_not_called()
+        mock_get_active_projects.assert_not_called()
+        mock_get_active_project_types.assert_not_called()
+
+    @patch("app.main._invalidate_material_index_cache")
+    @patch("app.main._invalidate_material_parse_claim_snapshot")
+    @patch("app.main.save_materials")
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main._get_material_parse_active_project_types")
+    @patch("app.main._get_material_parse_active_projects")
+    @patch("app.main._load_material_parse_job_priority_contexts")
+    @patch("app.main._build_material_parse_project_stage_rank")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_material_parse_jobs")
+    def test_claim_next_material_parse_job_single_candidate_skips_priority_context(
+        self,
+        mock_load_jobs,
+        mock_load_materials,
+        mock_build_stage_ranks,
+        mock_load_priority_contexts,
+        mock_get_active_projects,
+        mock_get_active_project_types,
+        mock_save_jobs,
+        mock_save_materials,
+        mock_invalidate_claim_snapshot,
+        _mock_invalidate,
+    ):
+        from app.main import _claim_next_material_parse_job
+
+        mock_load_materials.return_value = [
+            {
+                "id": "m-boq",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "清单.xlsx",
+                "path": "/tmp/清单.xlsx",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            }
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-boq-preview",
+                "material_id": "m-boq",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "清单.xlsx",
+                "status": "queued",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            }
+        ]
+
+        claimed = _claim_next_material_parse_job(prefer_active_projects=True)
+
+        assert claimed is not None
+        assert claimed["id"] == "j-boq-preview"
+        mock_build_stage_ranks.assert_not_called()
+        mock_load_priority_contexts.assert_not_called()
+        mock_get_active_projects.assert_not_called()
+        mock_get_active_project_types.assert_not_called()
+        saved_jobs = mock_save_jobs.call_args[0][0]
+        prioritized = next(job for job in saved_jobs if job["id"] == "j-boq-preview")
+        assert prioritized["status"] == "processing"
+        saved_rows = mock_save_materials.call_args[0][0]
+        prioritized_row = next(row for row in saved_rows if row["id"] == "m-boq")
+        assert prioritized_row["parse_status"] == "processing"
+        mock_invalidate_claim_snapshot.assert_called_once()
+
+    @patch("app.main._invalidate_material_index_cache")
+    @patch("app.main.save_materials")
+    @patch("app.main.save_material_parse_jobs")
+    @patch(
+        "app.main._material_parse_preview_speed_rank",
+        side_effect=lambda *_args, **_kwargs: (2, 20_000, 2),
+    )
+    @patch("app.main.load_materials")
+    @patch("app.main.load_material_parse_jobs")
+    def test_claim_next_material_parse_job_preview_express_high_cost_miss_skips_speed_rerank(
+        self,
+        mock_load_jobs,
+        mock_load_materials,
+        mock_speed_rank,
+        _mock_save_jobs,
+        _mock_save_materials,
+        _mock_invalidate,
+    ):
+        from app.main import _claim_next_material_parse_job
+
+        mock_load_materials.return_value = [
+            {
+                "id": "m-tender",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件.pdf",
+                "path": "/tmp/招标文件.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            }
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-tender-preview",
+                "material_id": "m-tender",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件.pdf",
+                "status": "queued",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            }
+        ]
+
+        claimed = _claim_next_material_parse_job(
+            preferred_parse_mode="preview",
+            allow_fallback=False,
+            max_preview_speed_rank=1,
+        )
+
+        assert claimed is None
+        assert mock_speed_rank.call_count == 1
+
+    @patch("app.main._invalidate_material_index_cache")
+    @patch("app.main.save_materials")
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main._parse_iso_datetime_utc")
+    @patch(
+        "app.main._material_parse_preview_speed_rank",
+        side_effect=[(0, 1_000, 0), (2, 20_000, 2)],
+    )
+    @patch("app.main.load_materials")
+    @patch("app.main.load_material_parse_jobs")
+    def test_claim_next_material_parse_job_preview_fallback_reuses_dynamic_eligibility_scan(
+        self,
+        mock_load_jobs,
+        mock_load_materials,
+        _mock_speed_rank,
+        mock_parse_iso,
+        mock_save_jobs,
+        mock_save_materials,
+        _mock_invalidate,
+    ):
+        from app.main import _claim_next_material_parse_job
+
+        mock_parse_iso.side_effect = lambda value: datetime.fromisoformat(value) if value else None
+        mock_load_materials.return_value = [
+            {
+                "id": "m-fast",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "快速预解析.pdf",
+                "path": "/tmp/快速预解析.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+            {
+                "id": "m-slow",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "回退预解析.pdf",
+                "path": "/tmp/回退预解析.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-fast-preview",
+                "material_id": "m-fast",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "快速预解析.pdf",
+                "status": "failed",
+                "attempt": 1,
+                "next_retry_at": "2099-03-10T00:00:00+00:00",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            },
+            {
+                "id": "j-slow-preview",
+                "material_id": "m-slow",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "回退预解析.pdf",
+                "status": "queued",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            },
+        ]
+
+        claimed = _claim_next_material_parse_job(
+            preferred_parse_mode="preview",
+            allow_fallback=True,
+            max_preview_speed_rank=1,
+        )
+
+        assert claimed is not None
+        assert claimed["id"] == "j-slow-preview"
+        assert mock_parse_iso.call_count == 1
+        saved_jobs = mock_save_jobs.call_args[0][0]
+        prioritized = next(job for job in saved_jobs if job["id"] == "j-slow-preview")
+        assert prioritized["status"] == "processing"
+        saved_rows = mock_save_materials.call_args[0][0]
+        prioritized_row = next(row for row in saved_rows if row["id"] == "m-slow")
+        assert prioritized_row["parse_status"] == "processing"
+
+    @patch("app.main._invalidate_material_index_cache")
+    @patch("app.main.save_materials")
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_material_parse_jobs")
+    @patch("app.main.get_openai_api_key", return_value="")
+    def test_claim_next_material_parse_job_preview_express_worker_falls_back_to_general_preview(
+        self,
+        _mock_openai_key,
+        mock_load_jobs,
+        mock_load_materials,
+        mock_save_jobs,
+        mock_save_materials,
+        _mock_invalidate,
+    ):
+        from app.main import _claim_next_material_parse_job
+
+        mock_load_materials.return_value = [
+            {
+                "id": "m-tender",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件.pdf",
+                "path": "/tmp/招标文件.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            }
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-tender-preview",
+                "material_id": "m-tender",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件.pdf",
+                "status": "queued",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            }
+        ]
+
+        claimed = _claim_next_material_parse_job(
+            preferred_parse_mode="preview",
+            allow_fallback=True,
+            max_preview_speed_rank=1,
+        )
+
+        assert claimed is not None
+        assert claimed["id"] == "j-tender-preview"
+        saved_jobs = mock_save_jobs.call_args[0][0]
+        prioritized = next(job for job in saved_jobs if job["id"] == "j-tender-preview")
+        assert prioritized["status"] == "processing"
+        saved_rows = mock_save_materials.call_args[0][0]
+        prioritized_row = next(row for row in saved_rows if row["id"] == "m-tender")
+        assert prioritized_row["parse_status"] == "processing"
+
+    @patch("app.main._invalidate_material_index_cache")
+    @patch("app.main.save_materials")
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_material_parse_jobs")
+    def test_claim_next_material_parse_job_preview_express_worker_claims_boq_pdf_preview(
+        self,
+        mock_load_jobs,
+        mock_load_materials,
+        mock_load_submissions,
+        mock_save_jobs,
+        mock_save_materials,
+        _mock_invalidate,
+    ):
+        from app.main import _claim_next_material_parse_job
+
+        mock_load_submissions.return_value = []
+        mock_load_materials.return_value = [
+            {
+                "id": "m-boq-pdf",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "path": "/tmp/工程量清单.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+            {
+                "id": "m-tender",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件.pdf",
+                "path": "/tmp/招标文件.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-tender-preview",
+                "material_id": "m-tender",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件.pdf",
+                "status": "queued",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            },
+            {
+                "id": "j-boq-pdf-preview",
+                "material_id": "m-boq-pdf",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "status": "queued",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            },
+        ]
+
+        claimed = _claim_next_material_parse_job(
+            preferred_parse_mode="preview",
+            allow_fallback=False,
+            max_preview_speed_rank=1,
+        )
+
+        assert claimed is not None
+        assert claimed["id"] == "j-boq-pdf-preview"
+        saved_jobs = mock_save_jobs.call_args[0][0]
+        prioritized = next(job for job in saved_jobs if job["id"] == "j-boq-pdf-preview")
+        assert prioritized["status"] == "processing"
+        saved_rows = mock_save_materials.call_args[0][0]
+        prioritized_row = next(row for row in saved_rows if row["id"] == "m-boq-pdf")
+        assert prioritized_row["parse_status"] == "processing"
+        assert prioritized_row["parse_backend"] == "local_preview"
+
+    @patch("app.main._invalidate_material_index_cache")
+    @patch("app.main.save_materials")
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_material_parse_jobs")
+    def test_claim_next_material_parse_job_preview_express_prefers_tabular_boq_before_boq_pdf(
+        self,
+        mock_load_jobs,
+        mock_load_materials,
+        mock_load_submissions,
+        mock_save_jobs,
+        mock_save_materials,
+        _mock_invalidate,
+    ):
+        from app.main import _claim_next_material_parse_job
+
+        mock_load_submissions.return_value = []
+        mock_load_materials.return_value = [
+            {
+                "id": "m-boq-xlsx",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.xlsx",
+                "path": "",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+            {
+                "id": "m-boq-pdf",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "path": "",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-boq-pdf-preview",
+                "material_id": "m-boq-pdf",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "status": "queued",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            },
+            {
+                "id": "j-boq-xlsx-preview",
+                "material_id": "m-boq-xlsx",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.xlsx",
+                "status": "queued",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:01+00:00",
+                "updated_at": "2026-03-09T00:00:01+00:00",
+            },
+        ]
+
+        claimed = _claim_next_material_parse_job(
+            preferred_parse_mode="preview",
+            allow_fallback=False,
+            max_preview_speed_rank=1,
+        )
+
+        assert claimed is not None
+        assert claimed["id"] == "j-boq-xlsx-preview"
+        saved_jobs = mock_save_jobs.call_args[0][0]
+        prioritized = next(job for job in saved_jobs if job["id"] == "j-boq-xlsx-preview")
+        assert prioritized["status"] == "processing"
+        saved_rows = mock_save_materials.call_args[0][0]
+        prioritized_row = next(row for row in saved_rows if row["id"] == "m-boq-xlsx")
+        assert prioritized_row["parse_status"] == "processing"
+        assert prioritized_row["parse_backend"] == "local_preview"
+
+    @patch("app.main._invalidate_material_index_cache")
+    @patch("app.main.save_materials")
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_material_parse_jobs")
+    @patch("app.main._build_material_parse_project_stage_rank")
+    def test_claim_next_material_parse_job_same_project_multi_candidate_skips_stage_rank(
+        self,
+        mock_build_stage_rank,
+        mock_load_jobs,
+        mock_load_materials,
+        mock_load_submissions,
+        mock_save_jobs,
+        mock_save_materials,
+        _mock_invalidate,
+    ):
+        from app.main import _claim_next_material_parse_job
+
+        mock_load_submissions.return_value = []
+        mock_load_materials.return_value = [
+            {
+                "id": "m-boq",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.xlsx",
+                "path": "/tmp/工程量清单.xlsx",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+            {
+                "id": "m-drawing",
+                "project_id": "p1",
+                "material_type": "drawing",
+                "filename": "总图.pdf",
+                "path": "/tmp/总图.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-drawing-preview",
+                "material_id": "m-drawing",
+                "project_id": "p1",
+                "material_type": "drawing",
+                "filename": "总图.pdf",
+                "status": "queued",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            },
+            {
+                "id": "j-boq-preview",
+                "material_id": "m-boq",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.xlsx",
+                "status": "queued",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:01+00:00",
+                "updated_at": "2026-03-09T00:00:01+00:00",
+            },
+        ]
+
+        claimed = _claim_next_material_parse_job(preferred_parse_mode="preview")
+
+        assert claimed is not None
+        assert claimed["id"] == "j-boq-preview"
+        mock_build_stage_rank.assert_not_called()
+        saved_jobs = mock_save_jobs.call_args[0][0]
+        prioritized = next(job for job in saved_jobs if job["id"] == "j-boq-preview")
+        assert prioritized["status"] == "processing"
+        saved_rows = mock_save_materials.call_args[0][0]
+        prioritized_row = next(row for row in saved_rows if row["id"] == "m-boq")
+        assert prioritized_row["parse_status"] == "processing"
+
+    @patch("app.main._invalidate_material_index_cache")
+    @patch("app.main.save_materials")
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_material_parse_jobs")
+    def test_claim_next_material_parse_job_prefers_same_project_within_same_preview_tier(
+        self,
+        mock_load_jobs,
+        mock_load_materials,
+        mock_load_submissions,
+        mock_save_jobs,
+        mock_save_materials,
+        _mock_invalidate,
+    ):
+        from app.main import _claim_next_material_parse_job
+
+        mock_load_submissions.return_value = []
+        mock_load_materials.return_value = [
+            {
+                "id": "m-p1",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "path": "/tmp/p1.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+            {
+                "id": "m-p2",
+                "project_id": "p2",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "path": "/tmp/p2.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-p2-preview",
+                "material_id": "m-p2",
+                "project_id": "p2",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "status": "queued",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            },
+            {
+                "id": "j-p1-preview",
+                "material_id": "m-p1",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "status": "queued",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:01+00:00",
+                "updated_at": "2026-03-09T00:00:01+00:00",
+            },
+        ]
+
+        claimed = _claim_next_material_parse_job(
+            preferred_parse_mode="preview",
+            allow_fallback=False,
+            max_preview_speed_rank=1,
+            preferred_project_id="p1",
+        )
+
+        assert claimed is not None
+        assert claimed["id"] == "j-p1-preview"
+        saved_jobs = mock_save_jobs.call_args[0][0]
+        prioritized = next(job for job in saved_jobs if job["id"] == "j-p1-preview")
+        assert prioritized["status"] == "processing"
+        saved_rows = mock_save_materials.call_args[0][0]
+        prioritized_row = next(row for row in saved_rows if row["id"] == "m-p1")
+        assert prioritized_row["parse_status"] == "processing"
+        assert prioritized_row["parse_backend"] == "local_preview"
+
+    @patch("app.main._invalidate_material_index_cache")
+    @patch("app.main.save_materials")
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_material_parse_jobs")
+    def test_claim_next_material_parse_job_prefers_active_project_window_when_enabled(
+        self,
+        mock_load_jobs,
+        mock_load_materials,
+        mock_load_submissions,
+        mock_save_jobs,
+        mock_save_materials,
+        _mock_invalidate,
+    ):
+        from app import main as main_module
+        from app.main import _claim_next_material_parse_job
+
+        original_active_projects = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECTS)
+        original_active_project_claims = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS)
+        mock_load_submissions.return_value = []
+        mock_load_materials.return_value = [
+            {
+                "id": "m-p1",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "path": "/tmp/p1.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+            {
+                "id": "m-p2",
+                "project_id": "p2",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "path": "/tmp/p2.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-p2-preview",
+                "material_id": "m-p2",
+                "project_id": "p2",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "status": "queued",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            },
+            {
+                "id": "j-p1-preview",
+                "material_id": "m-p1",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "status": "queued",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:01+00:00",
+                "updated_at": "2026-03-09T00:00:01+00:00",
+            },
+        ]
+        try:
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS["p1"] = 108.0
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS["p1"] = 1
+            with patch("app.main.time.monotonic", return_value=100.0):
+                claimed = _claim_next_material_parse_job(
+                    preferred_parse_mode="preview",
+                    allow_fallback=False,
+                    max_preview_speed_rank=1,
+                    prefer_active_projects=True,
+                )
+        finally:
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.update(original_active_projects)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.update(original_active_project_claims)
+
+        assert claimed is not None
+        assert claimed["id"] == "j-p1-preview"
+        saved_jobs = mock_save_jobs.call_args[0][0]
+        prioritized = next(job for job in saved_jobs if job["id"] == "j-p1-preview")
+        assert prioritized["status"] == "processing"
+        saved_rows = mock_save_materials.call_args[0][0]
+        prioritized_row = next(row for row in saved_rows if row["id"] == "m-p1")
+        assert prioritized_row["parse_status"] == "processing"
+        assert prioritized_row["parse_backend"] == "local_preview"
+
+    @patch("app.main._invalidate_material_index_cache")
+    @patch("app.main.save_materials")
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_material_parse_jobs")
+    def test_claim_next_material_parse_job_prefers_active_project_material_type_when_enabled(
+        self,
+        mock_load_jobs,
+        mock_load_materials,
+        mock_load_submissions,
+        mock_save_jobs,
+        mock_save_materials,
+        _mock_invalidate,
+    ):
+        from app import main as main_module
+        from app.main import _claim_next_material_parse_job
+
+        original_active_projects = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECTS)
+        original_active_project_types = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES)
+        original_active_project_claims = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS)
+        original_active_project_type_claims = dict(
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS
+        )
+        mock_load_submissions.return_value = []
+        mock_load_materials.return_value = [
+            {
+                "id": "m-p1-boq",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.xlsx",
+                "path": "/tmp/p1-boq.xlsx",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+            {
+                "id": "m-p1-tender",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件.pdf",
+                "path": "/tmp/p1-tender.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-p1-tender-full",
+                "material_id": "m-p1-tender",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件.pdf",
+                "status": "queued",
+                "parse_mode": "full",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            },
+            {
+                "id": "j-p1-boq-full",
+                "material_id": "m-p1-boq",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.xlsx",
+                "status": "queued",
+                "parse_mode": "full",
+                "created_at": "2026-03-09T00:00:01+00:00",
+                "updated_at": "2026-03-09T00:00:01+00:00",
+            },
+        ]
+        try:
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS["p1"] = 108.0
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS["p1"] = 1
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES[("p1", "boq")] = 108.0
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS[("p1", "boq")] = 1
+            with patch("app.main.time.monotonic", return_value=100.0):
+                claimed = _claim_next_material_parse_job(prefer_active_projects=True)
+        finally:
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.update(original_active_projects)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.update(original_active_project_types)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.update(original_active_project_claims)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.update(
+                original_active_project_type_claims
+            )
+
+        assert claimed is not None
+        assert claimed["id"] == "j-p1-boq-full"
+        saved_jobs = mock_save_jobs.call_args[0][0]
+        prioritized = next(job for job in saved_jobs if job["id"] == "j-p1-boq-full")
+        assert prioritized["status"] == "processing"
+        saved_rows = mock_save_materials.call_args[0][0]
+        prioritized_row = next(row for row in saved_rows if row["id"] == "m-p1-boq")
+        assert prioritized_row["parse_status"] == "processing"
+
+    @patch("app.main._invalidate_material_index_cache")
+    @patch("app.main.save_materials")
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_material_parse_jobs")
+    def test_claim_next_material_parse_job_active_project_bonus_respects_quota(
+        self,
+        mock_load_jobs,
+        mock_load_materials,
+        mock_load_submissions,
+        mock_save_jobs,
+        mock_save_materials,
+        _mock_invalidate,
+    ):
+        from app import main as main_module
+        from app.main import _claim_next_material_parse_job
+
+        original_active_projects = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECTS)
+        original_active_project_claims = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS)
+        original_active_project_types = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES)
+        original_active_project_type_claims = dict(
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS
+        )
+        mock_load_submissions.return_value = []
+        mock_load_materials.return_value = [
+            {
+                "id": "m-p1",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "path": "/tmp/p1.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+            {
+                "id": "m-p2",
+                "project_id": "p2",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "path": "/tmp/p2.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-p2-preview",
+                "material_id": "m-p2",
+                "project_id": "p2",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "status": "queued",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            },
+            {
+                "id": "j-p1-preview",
+                "material_id": "m-p1",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "status": "queued",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:01+00:00",
+                "updated_at": "2026-03-09T00:00:01+00:00",
+            },
+        ]
+        try:
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS["p1"] = 108.0
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS["p1"] = (
+                main_module.DEFAULT_MATERIAL_PARSE_ACTIVE_PROJECT_WINDOW_MAX_CLAIMS + 1
+            )
+            with patch("app.main.time.monotonic", return_value=100.0):
+                claimed = _claim_next_material_parse_job(
+                    preferred_parse_mode="preview",
+                    allow_fallback=False,
+                    max_preview_speed_rank=1,
+                    prefer_active_projects=True,
+                )
+        finally:
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.update(original_active_projects)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.update(original_active_project_claims)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.update(original_active_project_types)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.update(
+                original_active_project_type_claims
+            )
+
+        assert claimed is not None
+        assert claimed["id"] == "j-p2-preview"
+        saved_jobs = mock_save_jobs.call_args[0][0]
+        prioritized = next(job for job in saved_jobs if job["id"] == "j-p2-preview")
+        assert prioritized["status"] == "processing"
+        saved_rows = mock_save_materials.call_args[0][0]
+        prioritized_row = next(row for row in saved_rows if row["id"] == "m-p2")
+        assert prioritized_row["parse_status"] == "processing"
+
+    @patch("app.main.load_materials")
+    @patch("app.main.load_material_parse_jobs")
+    def test_load_material_parse_state_snapshot_reuses_cache_until_signature_changes(
+        self,
+        mock_load_jobs,
+        mock_load_materials,
+    ):
+        from app import main as main_module
+        from app.main import (
+            _invalidate_material_parse_claim_snapshot,
+            _load_material_parse_state_snapshot,
+        )
+
+        original_signature = main_module._MATERIAL_PARSE_CLAIM_SNAPSHOT_SIGNATURE
+        original_materials = list(main_module._MATERIAL_PARSE_CLAIM_SNAPSHOT_MATERIALS)
+        original_jobs = list(main_module._MATERIAL_PARSE_CLAIM_SNAPSHOT_JOBS)
+        mock_load_materials.side_effect = [
+            [{"id": "m1", "project_id": "p1"}],
+            [{"id": "m2", "project_id": "p2"}],
+        ]
+        mock_load_jobs.side_effect = [
+            [{"id": "j1", "material_id": "m1"}],
+            [{"id": "j2", "material_id": "m2"}],
+        ]
+        try:
+            _invalidate_material_parse_claim_snapshot()
+            with patch("app.main._material_parse_claim_cache_enabled", return_value=True), patch(
+                "app.main._material_parse_state_files_signature",
+                side_effect=[
+                    ((1, 1), (1, 1)),
+                    ((1, 1), (1, 1)),
+                    ((2, 2), (2, 2)),
+                ],
+            ):
+                materials1, jobs1 = _load_material_parse_state_snapshot()
+                materials2, jobs2 = _load_material_parse_state_snapshot()
+                materials3, jobs3 = _load_material_parse_state_snapshot()
+        finally:
+            main_module._MATERIAL_PARSE_CLAIM_SNAPSHOT_SIGNATURE = original_signature
+            main_module._MATERIAL_PARSE_CLAIM_SNAPSHOT_MATERIALS[:] = original_materials
+            main_module._MATERIAL_PARSE_CLAIM_SNAPSHOT_JOBS[:] = original_jobs
+
+        assert mock_load_materials.call_count == 2
+        assert mock_load_jobs.call_count == 2
+        assert materials1[0]["id"] == "m1"
+        assert jobs1[0]["id"] == "j1"
+        assert materials2[0]["id"] == "m1"
+        assert jobs2[0]["id"] == "j1"
+        assert materials3[0]["id"] == "m2"
+        assert jobs3[0]["id"] == "j2"
+        materials2[0]["id"] = "mutated"
+        jobs2[0]["id"] = "mutated"
+        assert materials1[0]["id"] == "m1"
+        assert jobs1[0]["id"] == "j1"
+
+    def test_load_material_parse_claim_context_reuses_cache_until_signature_changes(self):
+        from app import main as main_module
+        from app.main import _load_material_parse_claim_context
+
+        original_signature = main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE
+        original_materials = list(main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIALS)
+        original_jobs = list(main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_JOBS)
+        original_material_by_id = {
+            key: dict(value)
+            for key, value in main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_BY_ID.items()
+        }
+        original_material_index_by_id = dict(
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_INDEX_BY_ID
+        )
+        original_size_hint_by_material_id = dict(
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIZE_HINT_BY_MATERIAL_ID
+        )
+        original_retry_due_at_by_job_id = dict(
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_RETRY_DUE_AT_BY_JOB_ID
+        )
+        original_sort_key_by_job_id = {
+            key: tuple(value)
+            for key, value in main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SORT_KEY_BY_JOB_ID.items()
+        }
+        original_preview_priority_by_job_id = {
+            key: tuple(value)
+            for key, value in main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_PRIORITY_BY_JOB_ID.items()
+        }
+        original_candidate_indices = list(
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES
+        )
+        original_candidate_indices_by_mode = {
+            key: list(value)
+            for key, value in main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE.items()
+        }
+        original_preview_candidate_indices_by_speed = {
+            int(key): list(value)
+            for key, value in (
+                main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_BY_SPEED.items()
+            )
+        }
+        original_preview_candidate_indices_up_to_speed = {
+            int(key): list(value)
+            for key, value in (
+                main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_UP_TO_SPEED.items()
+            )
+        }
+        materials_v1 = [
+            {"id": "m1", "project_id": "p1", "material_type": "boq", "filename": "清单1.xlsx"}
+        ]
+        materials_v2 = [
+            {"id": "m2", "project_id": "p2", "material_type": "boq", "filename": "清单2.xlsx"}
+        ]
+        jobs_v1 = [{"id": "j1", "material_id": "m1", "project_id": "p1", "parse_mode": "preview"}]
+        jobs_v2 = [{"id": "j2", "material_id": "m2", "project_id": "p2", "parse_mode": "preview"}]
+        try:
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE = None
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIALS.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_JOBS.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_BY_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_INDEX_BY_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIZE_HINT_BY_MATERIAL_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_RETRY_DUE_AT_BY_JOB_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SORT_KEY_BY_JOB_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_PRIORITY_BY_JOB_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE.clear()
+            (
+                main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_BY_SPEED.clear()
+            )
+            (
+                main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_UP_TO_SPEED.clear()
+            )
+            with patch(
+                "app.main._material_parse_claim_context_cache_enabled",
+                return_value=True,
+            ), patch(
+                "app.main._material_parse_state_files_signature",
+                side_effect=[
+                    ((1, 1), (1, 1)),
+                    ((1, 1), (1, 1)),
+                    ((1, 1), (1, 1)),
+                    ((2, 2), (2, 2)),
+                    ((2, 2), (2, 2)),
+                ],
+            ), patch(
+                "app.main._load_material_parse_state_snapshot",
+                side_effect=[
+                    ([dict(row) for row in materials_v1], [dict(job) for job in jobs_v1]),
+                    ([dict(row) for row in materials_v2], [dict(job) for job in jobs_v2]),
+                ],
+            ) as mock_load_snapshot:
+                (
+                    materials1,
+                    jobs1,
+                    material_by_id1,
+                    material_index_by_id1,
+                    size_hint_by_material_id1,
+                    retry_due_at_by_job_id1,
+                    sort_key_by_job_id1,
+                    preview_priority_by_job_id1,
+                    candidate_indices1,
+                    candidate_indices_by_mode1,
+                    preview_candidate_indices_by_speed1,
+                    preview_candidate_indices_up_to_speed1,
+                    materials_changed1,
+                    jobs_changed1,
+                ) = _load_material_parse_claim_context()
+                materials1[0]["id"] = "mutated"
+                jobs1[0]["id"] = "mutated"
+                material_by_id1["m1"]["id"] = "mutated"
+                material_index_by_id1["m1"] = 99
+                size_hint_by_material_id1["m1"] = 1
+                retry_due_at_by_job_id1["j1"] = None
+                sort_key_by_job_id1["j1"] = ("x", "y", "z")
+                preview_priority_by_job_id1["j1"] = (9, 9, 9)
+                (
+                    materials2,
+                    jobs2,
+                    material_by_id2,
+                    material_index_by_id2,
+                    size_hint_by_material_id2,
+                    retry_due_at_by_job_id2,
+                    sort_key_by_job_id2,
+                    preview_priority_by_job_id2,
+                    candidate_indices2,
+                    candidate_indices_by_mode2,
+                    preview_candidate_indices_by_speed2,
+                    preview_candidate_indices_up_to_speed2,
+                    materials_changed2,
+                    jobs_changed2,
+                ) = _load_material_parse_claim_context()
+                (
+                    materials3,
+                    jobs3,
+                    material_by_id3,
+                    material_index_by_id3,
+                    size_hint_by_material_id3,
+                    retry_due_at_by_job_id3,
+                    sort_key_by_job_id3,
+                    preview_priority_by_job_id3,
+                    candidate_indices3,
+                    candidate_indices_by_mode3,
+                    preview_candidate_indices_by_speed3,
+                    preview_candidate_indices_up_to_speed3,
+                    materials_changed3,
+                    jobs_changed3,
+                ) = _load_material_parse_claim_context()
+        finally:
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE = original_signature
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIALS[:] = original_materials
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_JOBS[:] = original_jobs
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_BY_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_BY_ID.update(
+                original_material_by_id
+            )
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_INDEX_BY_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_INDEX_BY_ID.update(
+                original_material_index_by_id
+            )
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIZE_HINT_BY_MATERIAL_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIZE_HINT_BY_MATERIAL_ID.update(
+                original_size_hint_by_material_id
+            )
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_RETRY_DUE_AT_BY_JOB_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_RETRY_DUE_AT_BY_JOB_ID.update(
+                original_retry_due_at_by_job_id
+            )
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SORT_KEY_BY_JOB_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SORT_KEY_BY_JOB_ID.update(
+                original_sort_key_by_job_id
+            )
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_PRIORITY_BY_JOB_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_PRIORITY_BY_JOB_ID.update(
+                original_preview_priority_by_job_id
+            )
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES[
+                :
+            ] = original_candidate_indices
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE.update(
+                original_candidate_indices_by_mode
+            )
+            (
+                main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_BY_SPEED.clear()
+            )
+            (
+                main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_BY_SPEED.update(
+                    original_preview_candidate_indices_by_speed
+                )
+            )
+            (
+                main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_UP_TO_SPEED.clear()
+            )
+            (
+                main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_UP_TO_SPEED.update(
+                    original_preview_candidate_indices_up_to_speed
+                )
+            )
+
+        assert mock_load_snapshot.call_count == 2
+        assert materials_changed1 is True
+        assert jobs_changed1 is True
+        assert materials_changed2 is False
+        assert jobs_changed2 is False
+        assert candidate_indices1 == [0]
+        assert candidate_indices2 == [0]
+        assert candidate_indices3 == [0]
+        assert candidate_indices_by_mode1 == {"preview": [0]}
+        assert candidate_indices_by_mode2 == {"preview": [0]}
+        assert candidate_indices_by_mode3 == {"preview": [0]}
+        assert preview_candidate_indices_by_speed1 == {0: [0]}
+        assert preview_candidate_indices_by_speed2 == {0: [0]}
+        assert preview_candidate_indices_by_speed3 == {0: [0]}
+        assert preview_candidate_indices_up_to_speed1 == {0: [0], 1: [0]}
+        assert preview_candidate_indices_up_to_speed2 == {0: [0], 1: [0]}
+        assert preview_candidate_indices_up_to_speed3 == {0: [0], 1: [0]}
+        assert size_hint_by_material_id2 == {"m1": 10**12}
+        assert size_hint_by_material_id3 == {"m2": 10**12}
+        assert retry_due_at_by_job_id2 == {}
+        assert retry_due_at_by_job_id3 == {}
+        assert sort_key_by_job_id2["j1"][2] == "j1"
+        assert sort_key_by_job_id2["j1"][0] == sort_key_by_job_id2["j1"][1]
+        assert sort_key_by_job_id3["j2"][2] == "j2"
+        assert sort_key_by_job_id3["j2"][0] == sort_key_by_job_id3["j2"][1]
+        assert preview_priority_by_job_id2 == {"j1": (0, 360, 2)}
+        assert preview_priority_by_job_id3 == {"j2": (0, 360, 2)}
+        assert material_index_by_id2 == {"m1": 0}
+        assert material_index_by_id3 == {"m2": 0}
+        assert materials3[0]["id"] == "m2"
+        assert jobs3[0]["id"] == "j2"
+        assert material_by_id2["m1"]["id"] == "m1"
+        assert material_by_id3["m2"]["id"] == "m2"
+
+    def test_load_material_parse_claim_context_view_reuses_cache_without_copy(self):
+        from app import main as main_module
+        from app.main import _load_material_parse_claim_context_view
+
+        original_signature = main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE
+        original_materials = list(main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIALS)
+        original_jobs = list(main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_JOBS)
+        original_material_by_id = {
+            key: dict(value)
+            for key, value in main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_BY_ID.items()
+        }
+        original_material_index_by_id = dict(
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_INDEX_BY_ID
+        )
+        original_size_hint_by_material_id = dict(
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIZE_HINT_BY_MATERIAL_ID
+        )
+        original_retry_due_at_by_job_id = dict(
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_RETRY_DUE_AT_BY_JOB_ID
+        )
+        original_sort_key_by_job_id = {
+            key: tuple(value)
+            for key, value in main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SORT_KEY_BY_JOB_ID.items()
+        }
+        original_preview_priority_by_job_id = {
+            key: tuple(value)
+            for key, value in main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_PRIORITY_BY_JOB_ID.items()
+        }
+        original_candidate_indices = list(
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES
+        )
+        original_candidate_indices_by_mode = {
+            key: list(value)
+            for key, value in main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE.items()
+        }
+        original_preview_candidate_indices_by_speed = {
+            int(key): list(value)
+            for key, value in (
+                main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_BY_SPEED.items()
+            )
+        }
+        original_preview_candidate_indices_up_to_speed = {
+            int(key): list(value)
+            for key, value in (
+                main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_UP_TO_SPEED.items()
+            )
+        }
+        try:
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE = None
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIALS.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_JOBS.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_BY_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_INDEX_BY_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIZE_HINT_BY_MATERIAL_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_RETRY_DUE_AT_BY_JOB_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SORT_KEY_BY_JOB_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_PRIORITY_BY_JOB_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE.clear()
+            (
+                main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_BY_SPEED.clear()
+            )
+            (
+                main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_UP_TO_SPEED.clear()
+            )
+            with patch(
+                "app.main._material_parse_claim_context_cache_enabled",
+                return_value=True,
+            ), patch(
+                "app.main._material_parse_state_files_signature",
+                return_value=((1, 1), (1, 1)),
+            ), patch(
+                "app.main._load_material_parse_state_snapshot",
+                return_value=(
+                    [
+                        {
+                            "id": "m1",
+                            "project_id": "p1",
+                            "material_type": "boq",
+                            "filename": "清单1.xlsx",
+                        }
+                    ],
+                    [
+                        {
+                            "id": "j1",
+                            "material_id": "m1",
+                            "project_id": "p1",
+                            "parse_mode": "preview",
+                        }
+                    ],
+                ),
+            ) as mock_load_snapshot:
+                (
+                    materials1,
+                    jobs1,
+                    material_by_id1,
+                    material_index_by_id1,
+                    size_hint_by_material_id1,
+                    retry_due_at_by_job_id1,
+                    sort_key_by_job_id1,
+                    preview_priority_by_job_id1,
+                    _candidate_indices1,
+                    _candidate_indices_by_mode1,
+                    _preview_candidate_indices_by_speed1,
+                    preview_candidate_indices_up_to_speed1,
+                    *_,
+                ) = _load_material_parse_claim_context_view()
+                (
+                    materials2,
+                    jobs2,
+                    material_by_id2,
+                    material_index_by_id2,
+                    size_hint_by_material_id2,
+                    retry_due_at_by_job_id2,
+                    sort_key_by_job_id2,
+                    preview_priority_by_job_id2,
+                    _candidate_indices2,
+                    _candidate_indices_by_mode2,
+                    _preview_candidate_indices_by_speed2,
+                    preview_candidate_indices_up_to_speed2,
+                    *_,
+                ) = _load_material_parse_claim_context_view()
+        finally:
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE = original_signature
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIALS[:] = original_materials
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_JOBS[:] = original_jobs
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_BY_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_BY_ID.update(
+                original_material_by_id
+            )
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_INDEX_BY_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_INDEX_BY_ID.update(
+                original_material_index_by_id
+            )
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIZE_HINT_BY_MATERIAL_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIZE_HINT_BY_MATERIAL_ID.update(
+                original_size_hint_by_material_id
+            )
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_RETRY_DUE_AT_BY_JOB_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_RETRY_DUE_AT_BY_JOB_ID.update(
+                original_retry_due_at_by_job_id
+            )
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SORT_KEY_BY_JOB_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SORT_KEY_BY_JOB_ID.update(
+                original_sort_key_by_job_id
+            )
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_PRIORITY_BY_JOB_ID.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_PRIORITY_BY_JOB_ID.update(
+                original_preview_priority_by_job_id
+            )
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES[
+                :
+            ] = original_candidate_indices
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE.clear()
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE.update(
+                original_candidate_indices_by_mode
+            )
+            (
+                main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_BY_SPEED.clear()
+            )
+            (
+                main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_BY_SPEED.update(
+                    original_preview_candidate_indices_by_speed
+                )
+            )
+            (
+                main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_UP_TO_SPEED.clear()
+            )
+            (
+                main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_CANDIDATE_INDICES_UP_TO_SPEED.update(
+                    original_preview_candidate_indices_up_to_speed
+                )
+            )
+
+        assert mock_load_snapshot.call_count == 1
+        assert materials1 is materials2
+        assert jobs1 is jobs2
+        assert material_by_id1 is material_by_id2
+        assert material_index_by_id1 is material_index_by_id2
+        assert size_hint_by_material_id1 is size_hint_by_material_id2
+        assert retry_due_at_by_job_id1 is retry_due_at_by_job_id2
+        assert sort_key_by_job_id1 is sort_key_by_job_id2
+        assert preview_priority_by_job_id1 is preview_priority_by_job_id2
+        assert preview_candidate_indices_up_to_speed1 is preview_candidate_indices_up_to_speed2
+
+    @patch("app.main.load_submissions")
+    def test_load_material_parse_project_stage_ranks_reuses_cache_until_signature_changes(
+        self,
+        mock_load_submissions,
+    ):
+        from app import main as main_module
+        from app.main import _load_material_parse_project_stage_ranks
+
+        original_signature = main_module._MATERIAL_PARSE_PROJECT_STAGE_CACHE_SIGNATURE
+        original_ranks = dict(main_module._MATERIAL_PARSE_PROJECT_STAGE_CACHE_RANKS)
+        mock_load_submissions.side_effect = [
+            [
+                {
+                    "id": "s1",
+                    "project_id": "p1",
+                    "text": "示例文本",
+                    "report": {"scoring_status": "pending"},
+                }
+            ],
+            [
+                {
+                    "id": "s2",
+                    "project_id": "p1",
+                    "text": "示例文本",
+                    "report": {"scoring_status": "scored", "total_score": 88},
+                }
+            ],
+        ]
+        try:
+            main_module._MATERIAL_PARSE_PROJECT_STAGE_CACHE_SIGNATURE = None
+            main_module._MATERIAL_PARSE_PROJECT_STAGE_CACHE_RANKS.clear()
+            with patch(
+                "app.main._material_parse_project_stage_cache_enabled", return_value=True
+            ), patch(
+                "app.main._material_parse_state_file_signature",
+                side_effect=[(1, 1), (1, 1), (1, 1), (2, 2), (2, 2)],
+            ):
+                ranks1 = _load_material_parse_project_stage_ranks({"p1"})
+                ranks2 = _load_material_parse_project_stage_ranks({"p1"})
+                ranks3 = _load_material_parse_project_stage_ranks({"p1"})
+        finally:
+            main_module._MATERIAL_PARSE_PROJECT_STAGE_CACHE_SIGNATURE = original_signature
+            main_module._MATERIAL_PARSE_PROJECT_STAGE_CACHE_RANKS.clear()
+            main_module._MATERIAL_PARSE_PROJECT_STAGE_CACHE_RANKS.update(original_ranks)
+
+        assert mock_load_submissions.call_count == 2
+        assert ranks1 == {"p1": 0}
+        assert ranks2 == {"p1": 0}
+        assert ranks3 == {"p1": 1}
+
+    def test_load_material_parse_job_priority_contexts_reuses_cache_until_signature_changes(self):
+        from app import main as main_module
+        from app.main import _load_material_parse_job_priority_contexts
+
+        original_signature = main_module._MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_SIGNATURE
+        original_cache = dict(main_module._MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE)
+        jobs = [
+            {
+                "id": "j1",
+                "material_id": "m1",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.xlsx",
+                "status": "queued",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            }
+        ]
+        material_by_id = {
+            "m1": {
+                "id": "m1",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.xlsx",
+                "path": "/tmp/工程量清单.xlsx",
+            }
+        }
+        try:
+            main_module._MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_SIGNATURE = None
+            main_module._MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE.clear()
+            with patch("app.main._material_parse_priority_cache_enabled", return_value=True), patch(
+                "app.main._material_parse_priority_snapshot_signature",
+                side_effect=["sig-1", "sig-1", "sig-2"],
+            ):
+                contexts1 = _load_material_parse_job_priority_contexts(
+                    jobs,
+                    material_by_id,
+                    {"p1": 0},
+                )
+                jobs[0]["parse_mode"] = "full"
+                contexts2 = _load_material_parse_job_priority_contexts(
+                    jobs,
+                    material_by_id,
+                    {"p1": 0},
+                )
+                contexts3 = _load_material_parse_job_priority_contexts(
+                    jobs,
+                    material_by_id,
+                    {"p1": 0},
+                )
+        finally:
+            main_module._MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_SIGNATURE = original_signature
+            main_module._MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE.clear()
+            main_module._MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE.update(original_cache)
+
+        assert contexts1["j1"] == contexts2["j1"]
+        assert contexts1["j1"] != contexts3["j1"]
+
+    @patch("app.main._build_material_parse_job_priority_context")
+    def test_load_material_parse_job_priority_contexts_scopes_to_requested_jobs(
+        self,
+        mock_build_context,
+    ):
+        from app.main import _load_material_parse_job_priority_contexts
+
+        mock_build_context.side_effect = [
+            ("p1", "m1", "boq", 0, 0, 0, 1, 0, 360, 0, 1, 1, "", "", ""),
+        ]
+        jobs = [
+            {"id": "j1", "material_id": "m1", "project_id": "p1", "parse_mode": "preview"},
+            {"id": "j2", "material_id": "m2", "project_id": "p1", "parse_mode": "full"},
+        ]
+
+        contexts = _load_material_parse_job_priority_contexts(
+            [jobs[0]],
+            {
+                "m1": {
+                    "id": "m1",
+                    "project_id": "p1",
+                    "material_type": "boq",
+                    "filename": "a.xlsx",
+                },
+                "m2": {
+                    "id": "m2",
+                    "project_id": "p1",
+                    "material_type": "tender_qa",
+                    "filename": "b.pdf",
+                },
+            },
+            {"p1": 0},
+        )
+
+        assert list(contexts) == ["j1"]
+        mock_build_context.assert_called_once()
+
+    def test_load_material_parse_job_priority_contexts_view_reuses_cache_without_copy(self):
+        from app import main as main_module
+        from app.main import _load_material_parse_job_priority_contexts_view
+
+        original_signature = main_module._MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_SIGNATURE
+        original_cache = dict(main_module._MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE)
+        try:
+            main_module._MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_SIGNATURE = None
+            main_module._MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE.clear()
+            jobs = [{"id": "j1", "material_id": "m1", "project_id": "p1", "parse_mode": "preview"}]
+            with patch(
+                "app.main._material_parse_priority_cache_enabled",
+                return_value=True,
+            ), patch(
+                "app.main._material_parse_priority_snapshot_signature",
+                return_value=(((1, 1), (1, 1)), (1, 1)),
+            ), patch(
+                "app.main._build_material_parse_job_priority_context",
+                return_value=("p1", "m1", "boq", 0, 0, 0, 1, 0, 360, 0, 1, 1, "", "", ""),
+            ) as mock_build_context:
+                contexts1 = _load_material_parse_job_priority_contexts_view(
+                    jobs,
+                    {"m1": {"id": "m1", "project_id": "p1", "material_type": "boq"}},
+                    {"p1": 0},
+                )
+                contexts2 = _load_material_parse_job_priority_contexts_view(
+                    jobs,
+                    {"m1": {"id": "m1", "project_id": "p1", "material_type": "boq"}},
+                    {"p1": 0},
+                )
+        finally:
+            main_module._MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_SIGNATURE = original_signature
+            main_module._MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE.clear()
+            main_module._MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE.update(original_cache)
+
+        assert mock_build_context.call_count == 1
+        assert contexts1 is contexts2
+        assert list(contexts2) == ["j1"]
+
+    @patch("app.main._material_parse_priority_cache_enabled", return_value=False)
+    @patch("app.main._material_parse_job_sort_key")
+    @patch("app.main._material_parse_preview_speed_rank")
+    @patch("app.main._material_parse_row_size_hint")
+    def test_load_material_parse_job_priority_contexts_view_reuses_precomputed_preview_priority(
+        self,
+        mock_row_size_hint,
+        mock_preview_speed_rank,
+        mock_sort_key,
+        _mock_priority_cache_enabled,
+    ):
+        from app.main import _load_material_parse_job_priority_contexts_view
+
+        contexts = _load_material_parse_job_priority_contexts_view(
+            [
+                {
+                    "id": "j1",
+                    "material_id": "m1",
+                    "project_id": "p1",
+                    "parse_mode": "preview",
+                    "status": "queued",
+                    "created_at": "2026-03-09T00:00:00+00:00",
+                    "updated_at": "2026-03-09T00:00:00+00:00",
+                }
+            ],
+            {
+                "m1": {
+                    "id": "m1",
+                    "project_id": "p1",
+                    "material_type": "boq",
+                    "filename": "清单.xlsx",
+                    "path": "",
+                }
+            },
+            {"p1": 0},
+            {"j1": (0, 360, 0)},
+            {"m1": 2048},
+            {"j1": ("u", "c", "j1")},
+        )
+
+        assert contexts["j1"][7:10] == (0, 360, 0)
+        assert contexts["j1"][11] == 2048
+        assert contexts["j1"][12:15] == ("u", "c", "j1")
+        mock_preview_speed_rank.assert_not_called()
+        mock_row_size_hint.assert_not_called()
+        mock_sort_key.assert_not_called()
+
+    @patch("app.main._load_material_parse_project_stage_ranks")
+    def test_build_material_parse_project_stage_rank_scopes_to_candidate_jobs(
+        self,
+        mock_load_stage_ranks,
+    ):
+        from app.main import _build_material_parse_project_stage_rank
+
+        mock_load_stage_ranks.return_value = {"p1": 0}
+        ranks = _build_material_parse_project_stage_rank(
+            {
+                "m1": {"id": "m1", "project_id": "p1"},
+                "m2": {"id": "m2", "project_id": "p2"},
+            },
+            [
+                {"id": "j1", "material_id": "m1", "project_id": "p1"},
+            ],
+        )
+
+        assert ranks == {"p1": 0}
+        mock_load_stage_ranks.assert_called_once_with({"p1"})
+
+    def test_collect_material_parse_active_window_state_cleans_expired_and_reports_quotas(self):
+        from app import main as main_module
+        from app.main import _collect_material_parse_active_window_state
+
+        original_active_projects = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECTS)
+        original_active_project_types = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES)
+        original_active_project_claims = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS)
+        original_active_project_type_claims = dict(
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS
+        )
+        try:
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.update(
+                {"p1": 108.0, "p2": 108.0, "expired": 99.0}
+            )
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.update(
+                {
+                    ("p1", "boq"): 108.0,
+                    ("p2", "tender_qa"): 108.0,
+                    ("expired", "drawing"): 99.0,
+                }
+            )
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.update(
+                {
+                    "p1": 1,
+                    "p2": main_module.DEFAULT_MATERIAL_PARSE_ACTIVE_PROJECT_WINDOW_MAX_CLAIMS + 1,
+                    "expired": 1,
+                }
+            )
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.update(
+                {
+                    ("p1", "boq"): 1,
+                    (
+                        "p2",
+                        "tender_qa",
+                    ): main_module.DEFAULT_MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_WINDOW_MAX_CLAIMS + 1,
+                    ("expired", "drawing"): 1,
+                }
+            )
+            with patch("app.main.time.monotonic", return_value=100.0):
+                (
+                    active_project_ids,
+                    active_project_type_keys,
+                    active_project_quota_exhausted,
+                    active_project_type_quota_exhausted,
+                ) = _collect_material_parse_active_window_state()
+        finally:
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.update(original_active_projects)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.update(original_active_project_types)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.update(original_active_project_claims)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.update(
+                original_active_project_type_claims
+            )
+
+        assert active_project_ids == {"p1"}
+        assert active_project_type_keys == {("p1", "boq")}
+        assert active_project_quota_exhausted == 1
+        assert active_project_type_quota_exhausted == 1
+
+    def test_touch_material_parse_active_window_updates_project_and_type_in_one_pass(self):
+        from app import main as main_module
+        from app.main import _touch_material_parse_active_window
+
+        original_active_projects = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECTS)
+        original_active_project_types = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES)
+        original_active_project_claims = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS)
+        original_active_project_type_claims = dict(
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS
+        )
+        try:
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.clear()
+            with patch("app.main.time.monotonic", return_value=100.0) as mock_monotonic:
+                _touch_material_parse_active_window("p1", "boq")
+            expected_expires_at = (
+                100.0 + main_module.DEFAULT_MATERIAL_PARSE_ACTIVE_PROJECT_WINDOW_SECONDS
+            )
+            active_projects = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECTS)
+            active_project_types = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES)
+            active_project_claims = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS)
+            active_project_type_claims = dict(
+                main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS
+            )
+        finally:
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.update(original_active_projects)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.update(original_active_project_types)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.update(original_active_project_claims)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.update(
+                original_active_project_type_claims
+            )
+
+        assert active_projects == {"p1": expected_expires_at}
+        assert active_project_types == {("p1", "boq"): expected_expires_at}
+        assert active_project_claims == {"p1": 1}
+        assert active_project_type_claims == {("p1", "boq"): 1}
+        assert mock_monotonic.call_count == 1
+        assert "expired" not in main_module._MATERIAL_PARSE_ACTIVE_PROJECTS
+        assert ("expired", "drawing") not in main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES
+
+    def test_touch_material_parse_active_window_uses_precomputed_normalized_material_type(self):
+        from app import main as main_module
+        from app.main import _touch_material_parse_active_window
+
+        original_active_projects = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECTS)
+        original_active_project_types = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES)
+        original_active_project_claims = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS)
+        original_active_project_type_claims = dict(
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS
+        )
+        try:
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.clear()
+            with patch("app.main._normalize_material_type") as mock_normalize:
+                with patch("app.main.time.monotonic", return_value=100.0):
+                    _touch_material_parse_active_window(
+                        "p1",
+                        "工程量清单.xlsx",
+                        normalized_material_type="boq",
+                    )
+            active_projects = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECTS)
+            active_project_types = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES)
+        finally:
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.update(original_active_projects)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.update(original_active_project_types)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.update(original_active_project_claims)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.update(
+                original_active_project_type_claims
+            )
+
+        assert active_projects == {
+            "p1": 100.0 + main_module.DEFAULT_MATERIAL_PARSE_ACTIVE_PROJECT_WINDOW_SECONDS
+        }
+        assert active_project_types == {
+            ("p1", "boq"): 100.0 + main_module.DEFAULT_MATERIAL_PARSE_ACTIVE_PROJECT_WINDOW_SECONDS
+        }
+        mock_normalize.assert_not_called()
+
+    def test_load_material_parse_jobs_summary_reuses_cache_until_signature_changes(self):
+        from app import main as main_module
+        from app.main import _load_material_parse_jobs_summary_cached
+
+        original_signature = main_module._MATERIAL_PARSE_JOBS_SUMMARY_CACHE_SIGNATURE
+        original_filtered = {
+            key: [dict(job) for job in value]
+            for key, value in main_module._MATERIAL_PARSE_JOBS_SUMMARY_CACHE_FILTERED.items()
+        }
+        original_summary = {
+            key: dict(value)
+            for key, value in main_module._MATERIAL_PARSE_JOBS_SUMMARY_CACHE_SUMMARY.items()
+        }
+        jobs_v1 = [
+            {
+                "id": "j1",
+                "project_id": "p1",
+                "material_id": "m1",
+                "material_type": "boq",
+                "filename": "工程量清单.xlsx",
+                "status": "queued",
+                "parse_backend": "local",
+            },
+            {
+                "id": "j2",
+                "project_id": "p1",
+                "material_id": "m2",
+                "material_type": "boq",
+                "filename": "工程量清单.xlsx",
+                "status": "parsed",
+                "parse_backend": "gpt-5.4",
+                "finished_at": "2026-03-09T00:02:03+00:00",
+            },
+        ]
+        jobs_v2 = [
+            {
+                "id": "j3",
+                "project_id": "p1",
+                "material_id": "m3",
+                "material_type": "boq",
+                "filename": "工程量清单2.xlsx",
+                "status": "failed",
+                "parse_backend": "local",
+            }
+        ]
+        try:
+            main_module._MATERIAL_PARSE_JOBS_SUMMARY_CACHE_SIGNATURE = None
+            main_module._MATERIAL_PARSE_JOBS_SUMMARY_CACHE_FILTERED.clear()
+            main_module._MATERIAL_PARSE_JOBS_SUMMARY_CACHE_SUMMARY.clear()
+            with patch(
+                "app.main._material_parse_jobs_summary_cache_enabled",
+                return_value=True,
+            ), patch(
+                "app.main._material_parse_state_file_signature",
+                side_effect=[(1, 1), (1, 1), (1, 1), (2, 2), (2, 2)],
+            ), patch(
+                "app.main._load_material_parse_state_snapshot",
+                side_effect=[
+                    ([], [dict(job) for job in jobs_v1]),
+                    ([], [dict(job) for job in jobs_v2]),
+                ],
+            ) as mock_load_snapshot:
+                filtered1, summary1 = _load_material_parse_jobs_summary_cached("p1")
+                filtered1[0]["status"] = "mutated"
+                summary1["backlog"] = 99
+                filtered2, summary2 = _load_material_parse_jobs_summary_cached("p1")
+                filtered3, summary3 = _load_material_parse_jobs_summary_cached("p1")
+        finally:
+            main_module._MATERIAL_PARSE_JOBS_SUMMARY_CACHE_SIGNATURE = original_signature
+            main_module._MATERIAL_PARSE_JOBS_SUMMARY_CACHE_FILTERED.clear()
+            main_module._MATERIAL_PARSE_JOBS_SUMMARY_CACHE_FILTERED.update(original_filtered)
+            main_module._MATERIAL_PARSE_JOBS_SUMMARY_CACHE_SUMMARY.clear()
+            main_module._MATERIAL_PARSE_JOBS_SUMMARY_CACHE_SUMMARY.update(original_summary)
+
+        assert mock_load_snapshot.call_count == 2
+        assert [job["id"] for job in filtered1] == ["j1", "j2"]
+        assert [job["id"] for job in filtered2] == ["j1", "j2"]
+        assert [job["id"] for job in filtered3] == ["j3"]
+        assert summary2["backlog"] == 1
+        assert summary2["latest_finished_filename"] == "工程量清单.xlsx"
+        assert summary3["failed_jobs"] == 1
+        assert filtered2[0]["status"] == "queued"
+
+    def test_load_material_parse_status_materials_payload_reuses_cache_until_signature_changes(
+        self,
+    ):
+        from app import main as main_module
+        from app.main import _load_material_parse_status_materials_payload
+
+        original_signature = main_module._MATERIAL_PARSE_STATUS_MATERIALS_CACHE_SIGNATURE
+        original_cache = {
+            key: copy.deepcopy(value)
+            for key, value in main_module._MATERIAL_PARSE_STATUS_MATERIALS_CACHE.items()
+        }
+        materials_v1 = [
+            {
+                "id": "m1",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.xlsx",
+                "path": "/tmp/工程量清单.xlsx",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+                "parse_phase": None,
+                "created_at": "2026-03-09T00:00:00+00:00",
+            }
+        ]
+        materials_v2 = [
+            {
+                "id": "m2",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单2.xlsx",
+                "path": "/tmp/工程量清单2.xlsx",
+                "parse_status": "parsed",
+                "parse_backend": "local",
+                "parse_phase": "full",
+                "parse_ready_for_gate": True,
+                "created_at": "2026-03-09T00:00:00+00:00",
+            }
+        ]
+        jobs_v1 = [
+            {
+                "id": "j1",
+                "material_id": "m1",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.xlsx",
+                "status": "queued",
+                "parse_mode": "preview",
+                "parse_backend": "local_preview",
+            }
+        ]
+        jobs_v2 = [
+            {
+                "id": "j2",
+                "material_id": "m2",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单2.xlsx",
+                "status": "parsed",
+                "parse_mode": "full",
+                "parse_backend": "local",
+            }
+        ]
+        jobs_summary_v1 = (
+            [dict(job) for job in jobs_v1],
+            {"backlog": 1},
+        )
+        jobs_summary_v2 = (
+            [dict(job) for job in jobs_v2],
+            {"backlog": 0},
+        )
+        try:
+            main_module._MATERIAL_PARSE_STATUS_MATERIALS_CACHE_SIGNATURE = None
+            main_module._MATERIAL_PARSE_STATUS_MATERIALS_CACHE.clear()
+            with patch(
+                "app.main._material_parse_status_materials_cache_enabled",
+                return_value=True,
+            ), patch(
+                "app.main._material_parse_state_files_signature",
+                side_effect=[
+                    ((1, 1), (1, 1)),
+                    ((1, 1), (1, 1)),
+                    ((1, 1), (1, 1)),
+                    ((2, 2), (2, 2)),
+                    ((2, 2), (2, 2)),
+                ],
+            ), patch(
+                "app.main._load_material_parse_state_snapshot",
+                side_effect=[
+                    ([dict(row) for row in materials_v1], []),
+                    ([dict(row) for row in materials_v2], []),
+                ],
+            ) as mock_load_snapshot, patch(
+                "app.main._build_material_parse_jobs_summary",
+                side_effect=[jobs_summary_v1, jobs_summary_v2],
+            ) as mock_build_jobs_summary:
+                payload1 = _load_material_parse_status_materials_payload("p1")
+                payload1["enriched_materials"][0]["parse_stage_label"] = "mutated"
+                payload2 = _load_material_parse_status_materials_payload("p1")
+                payload3 = _load_material_parse_status_materials_payload("p1")
+        finally:
+            main_module._MATERIAL_PARSE_STATUS_MATERIALS_CACHE_SIGNATURE = original_signature
+            main_module._MATERIAL_PARSE_STATUS_MATERIALS_CACHE.clear()
+            main_module._MATERIAL_PARSE_STATUS_MATERIALS_CACHE.update(original_cache)
+
+        assert mock_load_snapshot.call_count == 2
+        assert mock_build_jobs_summary.call_count == 2
+        assert payload1["materials_total"] == 1
+        assert payload2["materials_total"] == 1
+        assert payload3["materials_total"] == 1
+        assert payload2["enriched_materials"][0]["parse_stage_label"] != "mutated"
+        assert payload2["enriched_materials"][0]["queue_position"] == 1
+        assert payload3["enriched_materials"][0]["filename"] == "工程量清单2.xlsx"
+        assert payload3["parsed_materials"] == 1
+
+    def test_load_material_parse_status_core_payload_reuses_cache_until_signature_changes(self):
+        from app import main as main_module
+        from app.main import _load_material_parse_status_core_payload
+
+        original_signature = main_module._MATERIAL_PARSE_STATUS_CORE_CACHE_SIGNATURE
+        original_cache = {
+            key: copy.deepcopy(value)
+            for key, value in main_module._MATERIAL_PARSE_STATUS_CORE_CACHE.items()
+        }
+        jobs_summary_v1 = (
+            [
+                {
+                    "id": "j1",
+                    "project_id": "p1",
+                    "material_id": "m1",
+                    "status": "queued",
+                }
+            ],
+            {
+                "total_jobs": 1,
+                "status_counts": {"queued": 1},
+                "backlog": 1,
+                "failed_jobs": 0,
+                "gpt_jobs": 0,
+                "gpt_failed_jobs": 0,
+                "gpt_ratio": 0.0,
+                "latest_finished_at": None,
+                "latest_finished_filename": None,
+            },
+        )
+        jobs_summary_v2 = (
+            [
+                {
+                    "id": "j2",
+                    "project_id": "p1",
+                    "material_id": "m2",
+                    "status": "parsed",
+                }
+            ],
+            {
+                "total_jobs": 1,
+                "status_counts": {"parsed": 1},
+                "backlog": 0,
+                "failed_jobs": 0,
+                "gpt_jobs": 0,
+                "gpt_failed_jobs": 0,
+                "gpt_ratio": 0.0,
+                "latest_finished_at": "2026-03-09T00:02:03+00:00",
+                "latest_finished_filename": "工程量清单2.xlsx",
+            },
+        )
+        materials_payload_v1 = {
+            "materials": [{"id": "m1", "project_id": "p1", "material_type": "boq"}],
+            "enriched_materials": [
+                {
+                    "id": "m1",
+                    "project_id": "p1",
+                    "material_type": "boq",
+                    "parse_stage_label": "排队中",
+                }
+            ],
+            "materials_total": 1,
+            "parsed_materials": 0,
+            "failed_materials": 0,
+            "processing_materials": 0,
+            "queued_materials": 1,
+            "previewed_materials": 0,
+        }
+        materials_payload_v2 = {
+            "materials": [{"id": "m2", "project_id": "p1", "material_type": "boq"}],
+            "enriched_materials": [
+                {
+                    "id": "m2",
+                    "project_id": "p1",
+                    "material_type": "boq",
+                    "parse_stage_label": "已解析（local）",
+                }
+            ],
+            "materials_total": 1,
+            "parsed_materials": 1,
+            "failed_materials": 0,
+            "processing_materials": 0,
+            "queued_materials": 0,
+            "previewed_materials": 0,
+        }
+        boq_summary_v1 = {"boq_saved_row_count": 0}
+        boq_summary_v2 = {"boq_saved_row_count": 12}
+        try:
+            main_module._MATERIAL_PARSE_STATUS_CORE_CACHE_SIGNATURE = None
+            main_module._MATERIAL_PARSE_STATUS_CORE_CACHE.clear()
+            with patch(
+                "app.main._material_parse_status_core_cache_enabled",
+                return_value=True,
+            ), patch(
+                "app.main._material_parse_state_files_signature",
+                side_effect=[
+                    ((1, 1), (1, 1)),
+                    ((1, 1), (1, 1)),
+                    ((1, 1), (1, 1)),
+                    ((2, 2), (2, 2)),
+                    ((2, 2), (2, 2)),
+                ],
+            ), patch(
+                "app.main._build_material_parse_jobs_summary",
+                side_effect=[jobs_summary_v1, jobs_summary_v2],
+            ) as mock_jobs_summary, patch(
+                "app.main._load_material_parse_status_materials_payload",
+                side_effect=[materials_payload_v1, materials_payload_v2],
+            ) as mock_materials_payload, patch(
+                "app.main._build_boq_parse_status_summary",
+                side_effect=[boq_summary_v1, boq_summary_v2],
+            ) as mock_boq_summary:
+                payload1 = _load_material_parse_status_core_payload("p1")
+                payload1["summary"]["backlog"] = 99
+                payload1["materials"][0]["parse_stage_label"] = "mutated"
+                payload2 = _load_material_parse_status_core_payload("p1")
+                payload3 = _load_material_parse_status_core_payload("p1")
+        finally:
+            main_module._MATERIAL_PARSE_STATUS_CORE_CACHE_SIGNATURE = original_signature
+            main_module._MATERIAL_PARSE_STATUS_CORE_CACHE.clear()
+            main_module._MATERIAL_PARSE_STATUS_CORE_CACHE.update(original_cache)
+
+        assert mock_jobs_summary.call_count == 2
+        assert mock_materials_payload.call_count == 2
+        assert mock_boq_summary.call_count == 2
+        assert payload2["summary"]["backlog"] == 1
+        assert payload2["materials"][0]["parse_stage_label"] == "排队中"
+        assert payload3["summary"]["boq_saved_row_count"] == 12
+        assert payload3["summary"]["parsed_materials"] == 1
+        assert payload3["jobs"][0]["id"] == "j2"
+
+    @patch("app.main._invalidate_material_index_cache")
+    @patch("app.main.save_materials")
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_material_parse_jobs")
+    def test_claim_next_material_parse_job_preview_express_worker_claims_low_ocr_drawing_preview(
+        self,
+        mock_load_jobs,
+        mock_load_materials,
+        mock_load_submissions,
+        mock_save_jobs,
+        mock_save_materials,
+        _mock_invalidate,
+    ):
+        from app.main import _claim_next_material_parse_job
+
+        mock_load_submissions.return_value = []
+        mock_load_materials.return_value = [
+            {
+                "id": "m-drawing",
+                "project_id": "p1",
+                "material_type": "drawing",
+                "filename": "总图.pdf",
+                "path": "/tmp/总图.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+            {
+                "id": "m-tender",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件.pdf",
+                "path": "/tmp/招标文件.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-tender-preview",
+                "material_id": "m-tender",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件.pdf",
+                "status": "queued",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            },
+            {
+                "id": "j-drawing-preview",
+                "material_id": "m-drawing",
+                "project_id": "p1",
+                "material_type": "drawing",
+                "filename": "总图.pdf",
+                "status": "queued",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            },
+        ]
+
+        claimed = _claim_next_material_parse_job(
+            preferred_parse_mode="preview",
+            allow_fallback=False,
+            max_preview_speed_rank=1,
+        )
+
+        assert claimed is not None
+        assert claimed["id"] == "j-drawing-preview"
+        saved_jobs = mock_save_jobs.call_args[0][0]
+        prioritized = next(job for job in saved_jobs if job["id"] == "j-drawing-preview")
+        assert prioritized["status"] == "processing"
+        saved_rows = mock_save_materials.call_args[0][0]
+        prioritized_row = next(row for row in saved_rows if row["id"] == "m-drawing")
+        assert prioritized_row["parse_status"] == "processing"
+        assert prioritized_row["parse_backend"] == "local_preview"
+
+    @patch("app.main._invalidate_material_index_cache")
+    @patch("app.main.save_materials")
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_material_parse_jobs")
+    def test_claim_next_material_parse_job_preview_prefers_lighter_tabular_preview_tasks(
+        self,
+        mock_load_jobs,
+        mock_load_materials,
+        mock_load_submissions,
+        mock_save_jobs,
+        mock_save_materials,
+        _mock_invalidate,
+    ):
+        from app.main import _claim_next_material_parse_job
+
+        mock_load_submissions.return_value = []
+        mock_load_materials.return_value = [
+            {
+                "id": "m-tender",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件.pdf",
+                "path": "/tmp/招标文件.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+            {
+                "id": "m-boq",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.xlsx",
+                "path": "/tmp/工程量清单.xlsx",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-tender-preview",
+                "material_id": "m-tender",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件.pdf",
+                "status": "queued",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            },
+            {
+                "id": "j-boq-preview",
+                "material_id": "m-boq",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.xlsx",
+                "status": "queued",
+                "parse_mode": "preview",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            },
+        ]
+
+        claimed = _claim_next_material_parse_job(preferred_parse_mode="preview")
+
+        assert claimed is not None
+        assert claimed["id"] == "j-boq-preview"
+        saved_jobs = mock_save_jobs.call_args[0][0]
+        prioritized = next(job for job in saved_jobs if job["id"] == "j-boq-preview")
+        assert prioritized["status"] == "processing"
+        saved_rows = mock_save_materials.call_args[0][0]
+        prioritized_row = next(row for row in saved_rows if row["id"] == "m-boq")
+        assert prioritized_row["parse_status"] == "processing"
+        assert prioritized_row["parse_backend"] == "local_preview"
+
+    @patch("app.main._schedule_project_material_rebuild")
+    @patch("app.main._notify_material_parse_workers")
+    @patch("app.main._invalidate_material_index_cache")
+    @patch("app.main.save_materials")
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_material_parse_jobs")
+    def test_complete_material_parse_job_enqueues_full_parse_after_preview(
+        self,
+        mock_load_jobs,
+        mock_load_materials,
+        mock_save_jobs,
+        mock_save_materials,
+        mock_invalidate,
+        mock_notify_workers,
+        mock_schedule_rebuild,
+    ):
+        from app.main import _complete_material_parse_job
+
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-preview",
+                "material_id": "m1",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件.pdf",
+                "status": "processing",
+                "attempt": 0,
+                "parse_mode": "preview",
+                "created_at": "2026-03-30T00:00:00+00:00",
+                "updated_at": "2026-03-30T00:00:00+00:00",
+                "started_at": "2026-03-30T00:00:01+00:00",
+            }
+        ]
+        mock_load_materials.return_value = [
+            {
+                "id": "m1",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件.pdf",
+                "path": "/tmp/招标文件.pdf",
+                "created_at": "2026-03-30T00:00:00+00:00",
+                "updated_at": "2026-03-30T00:00:00+00:00",
+                "parse_status": "processing",
+                "parse_backend": "local_preview",
+                "parse_phase": None,
+                "parse_ready_for_gate": False,
+                "job_id": "j-preview",
+            }
+        ]
+
+        _complete_material_parse_job(
+            "j-preview",
+            {
+                "project_id": "p1",
+                "parse_backend": "local_preview",
+                "parse_phase": "preview",
+                "parse_ready_for_gate": False,
+                "parse_confidence": 0.61,
+                "parse_finished_at": "2026-03-30T00:00:02+00:00",
+                "parse_version": "v3-gpt-async",
+                "structured_summary": {"structured_quality_score": 0.61},
+                "parsed_text": "预解析文本",
+                "parsed_chars": 1200,
+                "parsed_chunks": ["预解析文本"],
+                "numeric_terms_norm": ["120"],
+                "lexical_terms": ["工期"],
+            },
+            failed=False,
+            followup_parse_mode="full",
+        )
+
+        saved_jobs = mock_save_jobs.call_args[0][0]
+        preview_job = next(job for job in saved_jobs if job["id"] == "j-preview")
+        followup_job = next(job for job in saved_jobs if job["id"] != "j-preview")
+        assert preview_job["status"] == "parsed"
+        assert preview_job["parse_mode"] == "preview"
+        assert followup_job["status"] == "queued"
+        assert followup_job["parse_mode"] == "full"
+        assert followup_job["followup_from_preview"] is True
+
+        saved_rows = mock_save_materials.call_args[0][0]
+        saved_row = saved_rows[0]
+        assert saved_row["parse_status"] == "parsed"
+        assert saved_row["parse_phase"] == "preview"
+        assert saved_row["parse_ready_for_gate"] is False
+        assert saved_row["job_id"] == followup_job["id"]
+        mock_invalidate.assert_called_once_with("p1")
+        mock_notify_workers.assert_called_once()
+        mock_schedule_rebuild.assert_not_called()
+
+    @patch("app.main._invalidate_material_index_cache")
+    @patch("app.main.save_materials")
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_material_parse_jobs")
+    def test_claim_next_material_parse_job_prefers_followup_full_after_preview(
+        self,
+        mock_load_jobs,
+        mock_load_materials,
+        mock_load_submissions,
+        mock_save_jobs,
+        mock_save_materials,
+        _mock_invalidate,
+    ):
+        from app.main import _claim_next_material_parse_job
+
+        mock_load_submissions.return_value = []
+        mock_load_materials.return_value = [
+            {
+                "id": "m-followup",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "path": "/tmp/followup.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+                "parse_phase": "preview",
+                "parse_ready_for_gate": False,
+            },
+            {
+                "id": "m-regular",
+                "project_id": "p2",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "path": "/tmp/regular.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            },
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-regular-full",
+                "material_id": "m-regular",
+                "project_id": "p2",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "status": "queued",
+                "parse_mode": "full",
+                "followup_from_preview": False,
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            },
+            {
+                "id": "j-followup-full",
+                "material_id": "m-followup",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "status": "queued",
+                "parse_mode": "full",
+                "followup_from_preview": True,
+                "created_at": "2026-03-09T00:00:01+00:00",
+                "updated_at": "2026-03-09T00:00:01+00:00",
+            },
+        ]
+
+        claimed = _claim_next_material_parse_job()
+
+        assert claimed is not None
+        assert claimed["id"] == "j-followup-full"
+        saved_jobs = mock_save_jobs.call_args[0][0]
+        prioritized = next(job for job in saved_jobs if job["id"] == "j-followup-full")
+        assert prioritized["status"] == "processing"
+        saved_rows = mock_save_materials.call_args[0][0]
+        prioritized_row = next(row for row in saved_rows if row["id"] == "m-followup")
+        assert prioritized_row["job_id"] == "j-followup-full"
+
+    @patch("app.main._invalidate_material_index_cache")
+    @patch("app.main.save_materials")
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_material_parse_jobs")
+    def test_claim_next_material_parse_job_prefers_followup_full_for_same_material(
+        self,
+        mock_load_jobs,
+        mock_load_materials,
+        mock_load_submissions,
+        mock_save_jobs,
+        mock_save_materials,
+        _mock_invalidate,
+    ):
+        from app.main import _claim_next_material_parse_job
+
+        mock_load_submissions.return_value = []
+        mock_load_materials.return_value = [
+            {
+                "id": "m-same",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单A.pdf",
+                "path": "/tmp/same.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+                "parse_phase": "preview",
+                "parse_ready_for_gate": False,
+            },
+            {
+                "id": "m-other",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单B.pdf",
+                "path": "/tmp/other.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+                "parse_phase": "preview",
+                "parse_ready_for_gate": False,
+            },
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-other-followup-full",
+                "material_id": "m-other",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单B.pdf",
+                "status": "queued",
+                "parse_mode": "full",
+                "followup_from_preview": True,
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:00:00+00:00",
+            },
+            {
+                "id": "j-same-followup-full",
+                "material_id": "m-same",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单A.pdf",
+                "status": "queued",
+                "parse_mode": "full",
+                "followup_from_preview": True,
+                "created_at": "2026-03-09T00:00:01+00:00",
+                "updated_at": "2026-03-09T00:00:01+00:00",
+            },
+        ]
+
+        claimed = _claim_next_material_parse_job(
+            preferred_project_id="p1",
+            preferred_material_id="m-same",
+        )
+
+        assert claimed is not None
+        assert claimed["id"] == "j-same-followup-full"
+        saved_jobs = mock_save_jobs.call_args[0][0]
+        prioritized = next(job for job in saved_jobs if job["id"] == "j-same-followup-full")
+        assert prioritized["status"] == "processing"
+        saved_rows = mock_save_materials.call_args[0][0]
+        prioritized_row = next(row for row in saved_rows if row["id"] == "m-same")
+        assert prioritized_row["job_id"] == "j-same-followup-full"
+
+    @patch("app.main._complete_material_parse_job")
+    @patch("app.main._parse_material_record_payload")
+    @patch("app.main.load_materials")
+    def test_process_material_parse_job_reuses_cached_material_parse_result(
+        self,
+        mock_load_materials,
+        mock_parse_payload,
+        mock_complete_job,
+    ):
+        from app.main import _compute_material_content_hash, _process_material_parse_job
+
+        content_hash = _compute_material_content_hash(b"same material content")
+        mock_load_materials.return_value = [
+            {
+                "id": "m-target",
+                "project_id": "p1",
+                "material_type": "drawing",
+                "filename": "总图-新.pdf",
+                "path": "/tmp/总图-新.pdf",
+                "content_hash": content_hash,
+                "parse_status": "processing",
+                "parse_backend": "queued",
+                "job_id": "j-target",
+            },
+            {
+                "id": "m-cache",
+                "project_id": "p2",
+                "material_type": "drawing",
+                "filename": "总图-历史.pdf",
+                "path": "/tmp/总图-历史.pdf",
+                "content_hash": content_hash,
+                "parse_status": "parsed",
+                "parse_backend": "local",
+                "parse_phase": "full",
+                "parse_ready_for_gate": True,
+                "parse_confidence": 0.88,
+                "parse_version": "v3-gpt-async",
+                "parsed_text": "历史全文解析结果",
+                "parsed_chars": 9,
+                "parsed_chunks": ["历史全文解析结果"],
+                "numeric_terms_norm": ["120"],
+                "lexical_terms": ["工期"],
+                "structured_summary": {"structured_quality_score": 0.88},
+                "drawing_structured_summary": {"structured_quality_score": 0.88},
+                "updated_at": "2026-03-30T01:00:00+00:00",
+            },
+        ]
+
+        _process_material_parse_job(
+            {
+                "id": "j-target",
+                "material_id": "m-target",
+                "project_id": "p1",
+                "material_type": "drawing",
+                "filename": "总图-新.pdf",
+                "status": "processing",
+                "parse_mode": "full",
+            }
+        )
+
+        mock_parse_payload.assert_not_called()
+        mock_complete_job.assert_called_once()
+        args, kwargs = mock_complete_job.call_args
+        assert args[0] == "j-target"
+        assert args[1]["parsed_text"] == "历史全文解析结果"
+        assert args[1]["parse_ready_for_gate"] is True
+        assert args[1]["project_id"] == "p1"
+        assert kwargs["failed"] is False
+        assert kwargs["followup_parse_mode"] is None
+
+    def test_build_material_parse_runtime_details_marks_previewed_backfill_state(self):
+        from app.main import _build_material_parse_runtime_details
+
+        details = _build_material_parse_runtime_details(
+            {
+                "id": "m1",
+                "material_type": "tender_qa",
+                "filename": "招标文件.pdf",
+                "parse_status": "parsed",
+                "parse_backend": "local_preview",
+                "parse_phase": "preview",
+                "parse_ready_for_gate": False,
+            },
+            active_job={
+                "id": "j-full",
+                "status": "queued",
+                "parse_mode": "full",
+            },
+            queue_position=2,
+        )
+
+        assert details["parse_effective_status"] == "previewed"
+        assert "预解析完成" in str(details["parse_stage_label"])
+        assert "后台会继续补全全文" in str(details["parse_note"])
+        assert details["parse_route_label"] == "本地极速预解析，后台补全全文"
+
+    @patch("app.main.load_materials")
+    def test_build_material_quality_snapshot_keeps_preview_parse_out_of_gate_ready_counts(
+        self,
+        mock_load_materials,
+    ):
+        from app.main import _build_material_quality_snapshot, _invalidate_material_index_cache
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as handle:
+            handle.write(b"%PDF-1.4 preview data")
+            temp_path = handle.name
+        try:
+            mock_load_materials.return_value = [
+                {
+                    "id": "m-preview",
+                    "project_id": "p-preview",
+                    "material_type": "tender_qa",
+                    "filename": "招标文件.pdf",
+                    "path": temp_path,
+                    "created_at": "2026-03-30T00:00:00+00:00",
+                    "updated_at": "2026-03-30T00:00:00+00:00",
+                    "parse_status": "parsed",
+                    "parse_backend": "local_preview",
+                    "parse_phase": "preview",
+                    "parse_ready_for_gate": False,
+                    "parsed_text": "项目名称 工期 质量 安全文明 " * 60,
+                    "parsed_chars": 1800,
+                    "parsed_chunks": ["chunk-a", "chunk-b"],
+                    "structured_summary": {"structured_quality_score": 0.55},
+                }
+            ]
+            _invalidate_material_index_cache("p-preview")
+            snapshot = _build_material_quality_snapshot("p-preview")
+            assert snapshot["previewed_files"] == 1
+            assert snapshot["parsed_ok_files"] == 0
+            assert snapshot["total_parsed_chars"] == 0
+            assert snapshot["parse_status_by_type"]["tender_qa"]["previewed"] == 1
+        finally:
+            os.unlink(temp_path)
+            _invalidate_material_index_cache("p-preview")
 
     @patch("app.main.logger.warning")
     @patch("app.main.threading.Thread")
@@ -234,6 +3161,472 @@ class TestMaterialParseWorkerLifecycle:
 
 
 class TestMaterialParsePerformanceGuards:
+    @patch("app.main._call_gpt_material_parser")
+    @patch("app.main._render_pdf_page_pngs_for_gpt")
+    def test_augment_tender_summary_skips_pdf_page_vision_when_local_summary_is_mid_strong(
+        self,
+        mock_render_pages,
+        mock_call_gpt,
+    ):
+        local_summary = {
+            "structured_quality_score": 0.62,
+            "section_titles": [
+                "第一章 招标公告",
+                "第二章 投标人须知",
+                "第三章 评标办法",
+            ],
+            "scoring_point_terms": ["工期", "质量", "安全文明"],
+            "mandatory_clause_terms": ["不得缺少专项方案", "必须响应关键节点"],
+            "top_numeric_terms": ["90", "100", "120"],
+        }
+        parsed_text = "项目名称 工期 质量 安全文明 BIM 深化 关键节点 " * 120
+        mock_call_gpt.return_value = (
+            True,
+            {
+                "section_titles": ["第四章 合同"],
+                "scoring_point_terms": ["加分项"],
+                "mandatory_clause_terms": ["必须响应关键节点"],
+                "numeric_constraints": ["120"],
+                "focused_dimensions": ["09"],
+                "parse_confidence": 0.71,
+            },
+            "",
+        )
+
+        with patch("app.main.get_openai_api_key", return_value="sk-test"):
+            merged, backend, confidence, error = app_main._augment_tender_summary_with_gpt(
+                b"%PDF-1.4",
+                "招标文件正文.pdf",
+                parsed_text,
+                local_summary,
+            )
+
+        assert backend == "hybrid"
+        assert error == ""
+        assert confidence == 0.71
+        assert merged["gpt_page_vision_skip_reason"] == "local_summary_text_only"
+        mock_render_pages.assert_not_called()
+        mock_call_gpt.assert_called_once()
+
+    @patch("app.main._call_gpt_material_parser")
+    @patch("app.main._render_pdf_page_pngs_for_gpt")
+    def test_augment_tender_summary_uses_signal_excerpt_for_text_only_gpt(
+        self,
+        mock_render_pages,
+        mock_call_gpt,
+    ):
+        local_summary = {
+            "structured_quality_score": 0.62,
+            "section_titles": [
+                "第一章 招标公告",
+                "第二章 投标人须知",
+                "第三章 评标办法",
+            ],
+            "scoring_point_terms": ["工期", "质量", "安全文明"],
+            "mandatory_clause_terms": ["不得缺少专项方案", "必须响应关键节点"],
+            "top_numeric_terms": ["90", "100", "120"],
+        }
+        noisy_text = "\n".join(
+            [
+                "项目管理例会纪要 与评标无关",
+                "第三章 评标办法",
+                "评分细则 工期120天 质量90分 安全文明100分",
+                "投标文件必须响应关键节点 不得缺少专项方案",
+                "普通叙述 行政沟通 材料报审",
+            ]
+            * 24
+        )
+        mock_call_gpt.return_value = (
+            True,
+            {
+                "section_titles": ["第四章 合同"],
+                "scoring_point_terms": ["加分项"],
+                "mandatory_clause_terms": ["必须响应关键节点"],
+                "numeric_constraints": ["120"],
+                "focused_dimensions": ["09"],
+                "parse_confidence": 0.71,
+            },
+            "",
+        )
+
+        merged, backend, confidence, error = app_main._augment_tender_summary_with_gpt(
+            b"%PDF-1.4",
+            "招标文件正文.pdf",
+            noisy_text,
+            local_summary,
+        )
+
+        assert backend == "hybrid"
+        assert error == ""
+        assert confidence == 0.71
+        assert merged["gpt_page_vision_skip_reason"] == "local_summary_text_only"
+        mock_render_pages.assert_not_called()
+        prompt = mock_call_gpt.call_args.args[0]
+        assert "章节线索：第一章 招标公告、第二章 投标人须知、第三章 评标办法" in prompt
+        assert "评分线索：工期、质量、安全文明" in prompt
+        assert "强制条款：不得缺少专项方案、必须响应关键节点" in prompt
+        assert "评分细则工期120天质量90分安全文明100分" in prompt
+        assert "投标文件必须响应关键节点不得缺少专项方案" in prompt
+        assert "项目管理例会纪要 与评标无关" not in prompt
+        assert "普通叙述 行政沟通 材料报审" not in prompt
+
+    @patch("app.main._call_gpt_material_parser")
+    @patch("app.main._render_pdf_page_pngs_for_gpt")
+    def test_augment_tender_summary_uses_adaptive_pdf_page_budget(
+        self,
+        mock_render_pages,
+        mock_call_gpt,
+    ):
+        local_summary = {
+            "structured_quality_score": 0.55,
+            "section_titles": [
+                "第一章 招标公告",
+                "第二章 投标人须知",
+                "第三章 评标办法",
+            ],
+            "scoring_point_terms": ["工期", "质量"],
+            "mandatory_clause_terms": ["不得缺少专项方案", "必须响应关键节点"],
+            "top_numeric_terms": ["90", "100", "120"],
+        }
+        parsed_text = "项目名称 工期 质量 安全文明 BIM 深化 关键节点 " * 220
+        mock_render_pages.return_value = []
+        mock_call_gpt.return_value = (False, {}, "gpt_parse_failed")
+
+        with patch("app.main.get_openai_api_key", return_value="sk-test"):
+            _merged, backend, confidence, error = app_main._augment_tender_summary_with_gpt(
+                b"%PDF-1.4",
+                "招标文件正文.pdf",
+                parsed_text,
+                local_summary,
+            )
+
+        assert backend == "local"
+        assert confidence == 0.55
+        assert error == "gpt_parse_failed"
+        mock_render_pages.assert_called_once()
+        assert mock_render_pages.call_args.kwargs["max_pages"] == 4
+        assert mock_render_pages.call_args.kwargs["always_include_first_pages"] == 1
+        assert "工期" in mock_render_pages.call_args.kwargs["preferred_tokens"]
+        assert "必须响应关键节点" in mock_render_pages.call_args.kwargs["preferred_tokens"]
+
+    @patch("app.main._call_gpt_material_parser")
+    @patch("app.main._render_pdf_page_pngs_for_gpt")
+    def test_augment_drawing_summary_skips_pdf_page_vision_when_local_summary_is_mid_strong(
+        self,
+        mock_render_pages,
+        mock_call_gpt,
+    ):
+        local_summary = {
+            "detected_format": "pdf",
+            "structured_quality_score": 0.64,
+            "structured_terms": [
+                "总平面",
+                "节点详图",
+                "综合排布",
+                "消防",
+                "净高复核",
+                "机电",
+            ],
+            "discipline_keywords": ["建筑", "机电"],
+            "sheet_type_tags": ["节点详图/大样"],
+            "risk_keywords": ["洞口", "高支模"],
+            "top_numeric_terms": ["600", "1200", "3.5", "45"],
+        }
+        mock_call_gpt.return_value = (
+            True,
+            {
+                "discipline": "建筑",
+                "sheet_type": "节点详图/大样",
+                "layout_tags": ["总平面"],
+                "space_tags": ["机房"],
+                "component_tags": ["梁"],
+                "dimension_markers": ["1200"],
+                "risk_tags": ["洞口"],
+                "constraint_terms": ["净高复核"],
+                "numeric_constraints": ["3.5"],
+                "focused_dimensions": ["05"],
+                "parse_confidence": 0.72,
+            },
+            "",
+        )
+
+        merged, backend, confidence, error = app_main._augment_drawing_summary_with_gpt(
+            b"%PDF-1.4",
+            "总图.pdf",
+            "总平面 节点详图 机电 综合排布 标高 轴线 机房 梁 板 柱 " * 80,
+            local_summary,
+        )
+
+        assert backend == "hybrid"
+        assert error == ""
+        assert confidence == 0.72
+        assert merged["gpt_page_vision_skip_reason"] == "local_summary_text_only"
+        mock_render_pages.assert_not_called()
+        kwargs = mock_call_gpt.call_args.kwargs
+        assert kwargs.get("image_bytes") is None
+
+    @patch("app.main._call_gpt_material_parser")
+    @patch("app.main._render_pdf_page_pngs_for_gpt")
+    def test_augment_drawing_summary_skips_pdf_page_vision_when_local_summary_is_relaxed_mid_strong(
+        self,
+        mock_render_pages,
+        mock_call_gpt,
+    ):
+        local_summary = {
+            "detected_format": "pdf",
+            "structured_quality_score": 0.54,
+            "structured_terms": ["总平面", "节点详图", "综合排布", "消防", "净高复核"],
+            "discipline_keywords": ["建筑"],
+            "sheet_type_tags": ["节点详图/大样"],
+            "risk_keywords": ["洞口"],
+            "top_numeric_terms": ["600", "1200", "3.5"],
+            "layout_tags": ["轴网"],
+            "component_tags": ["梁", "板"],
+        }
+        mock_call_gpt.return_value = (
+            True,
+            {
+                "discipline": "建筑",
+                "sheet_type": "节点详图/大样",
+                "layout_tags": ["总平面"],
+                "space_tags": ["机房"],
+                "component_tags": ["梁"],
+                "dimension_markers": ["1200"],
+                "risk_tags": ["洞口"],
+                "constraint_terms": ["净高复核"],
+                "numeric_constraints": ["3.5"],
+                "focused_dimensions": ["05"],
+                "parse_confidence": 0.69,
+            },
+            "",
+        )
+
+        merged, backend, confidence, error = app_main._augment_drawing_summary_with_gpt(
+            b"%PDF-1.4",
+            "总图.pdf",
+            "总平面 节点详图 综合排布 消防 净高复核 轴网 梁 板 洞口 标高 1200 600 " * 24,
+            local_summary,
+        )
+
+        assert backend == "hybrid"
+        assert error == ""
+        assert confidence == 0.69
+        assert merged["gpt_page_vision_skip_reason"] == "local_summary_text_only"
+        mock_render_pages.assert_not_called()
+        kwargs = mock_call_gpt.call_args.kwargs
+        assert kwargs.get("image_bytes") is None
+
+    @patch("app.main._call_gpt_material_parser")
+    @patch("app.main._render_pdf_page_pngs_for_gpt")
+    def test_augment_drawing_summary_uses_signal_excerpt_for_text_only_gpt(
+        self,
+        mock_render_pages,
+        mock_call_gpt,
+    ):
+        local_summary = {
+            "detected_format": "pdf",
+            "structured_quality_score": 0.64,
+            "structured_terms": [
+                "总平面",
+                "节点详图",
+                "综合排布",
+                "消防",
+                "净高复核",
+                "机电",
+            ],
+            "discipline_keywords": ["建筑", "机电"],
+            "sheet_type_tags": ["节点详图/大样"],
+            "risk_keywords": ["洞口", "高支模"],
+            "top_numeric_terms": ["600", "1200", "3.5", "45"],
+        }
+        noisy_text = "\n".join(
+            [
+                "会议纪要 与 图纸解析无关的说明文字",
+                "节点详图 机电综合排布 轴网A-B 标高3.5 洞口预留 1200 600",
+                "普通叙述 行政沟通 材料报审",
+                "总平面 消防分区 净高复核 梁板关系 45 600 1200",
+                "随手记录 与当前图纸无关",
+            ]
+            * 10
+        )
+        mock_call_gpt.return_value = (
+            True,
+            {
+                "discipline": "建筑",
+                "sheet_type": "节点详图/大样",
+                "layout_tags": ["总平面"],
+                "space_tags": ["机房"],
+                "component_tags": ["梁"],
+                "dimension_markers": ["1200"],
+                "risk_tags": ["洞口"],
+                "constraint_terms": ["净高复核"],
+                "numeric_constraints": ["3.5"],
+                "focused_dimensions": ["05"],
+                "parse_confidence": 0.72,
+            },
+            "",
+        )
+
+        merged, backend, confidence, error = app_main._augment_drawing_summary_with_gpt(
+            b"%PDF-1.4",
+            "总图.pdf",
+            noisy_text,
+            local_summary,
+        )
+
+        assert backend == "hybrid"
+        assert error == ""
+        assert confidence == 0.72
+        assert merged["gpt_page_vision_skip_reason"] == "local_summary_text_only"
+        mock_render_pages.assert_not_called()
+        prompt = mock_call_gpt.call_args.args[0]
+        assert "识别专业：建筑、机电" in prompt
+        assert "图纸类型：节点详图/大样" in prompt
+        assert "节点详图机电综合排布轴网A-B 标高3.5 洞口预留 1200 600" in prompt
+        assert "总平面消防分区净高复核梁板关系 45 600 1200" in prompt
+        assert "会议纪要 与 图纸解析无关的说明文字" not in prompt
+        assert "普通叙述 行政沟通 材料报审" not in prompt
+
+    @patch("app.main._call_gpt_material_parser")
+    @patch("app.main._collect_pdf_page_candidates_for_gpt")
+    @patch("app.main._render_pdf_page_pngs_for_gpt")
+    def test_augment_drawing_summary_prefers_high_signal_pdf_page_when_page_vision_is_needed(
+        self,
+        mock_render_pages,
+        mock_collect_candidates,
+        mock_call_gpt,
+    ):
+        local_summary = {
+            "detected_format": "pdf",
+            "structured_quality_score": 0.51,
+            "structured_terms": ["总平面", "节点详图", "综合排布", "消防", "净高复核"],
+            "discipline_keywords": ["建筑", "机电"],
+            "sheet_type_tags": ["节点详图/大样"],
+            "risk_keywords": ["洞口", "高支模"],
+            "top_numeric_terms": ["600", "1200", "3.5", "45"],
+            "layout_tags": ["轴网"],
+            "component_tags": ["梁", "板"],
+        }
+        mock_collect_candidates.return_value = [
+            {"page_no": 1, "text": "封面 图纸目录", "score": 3.0},
+            {"page_no": 3, "text": "节点详图 机电综合排布", "score": 5.2},
+        ]
+        mock_render_pages.return_value = []
+        mock_call_gpt.return_value = (False, {}, "gpt_parse_failed")
+
+        _merged, backend, confidence, error = app_main._augment_drawing_summary_with_gpt(
+            b"%PDF-1.4",
+            "总图.pdf",
+            "总平面 节点详图 机电 综合排布 标高 轴线 机房 梁 板 柱 " * 12,
+            local_summary,
+        )
+
+        assert backend == "local"
+        assert confidence == 0.51
+        assert error == "gpt_parse_failed"
+        mock_collect_candidates.assert_called_once()
+        mock_render_pages.assert_called_once()
+        kwargs = mock_render_pages.call_args.kwargs
+        assert kwargs["max_pages"] == 1
+        assert kwargs["always_include_first_pages"] == 0
+        assert "总平面" in kwargs["preferred_tokens"]
+        assert "节点详图/大样" in kwargs["preferred_tokens"]
+        assert "机电" in kwargs["preferred_tokens"]
+        assert "洞口" in kwargs["preferred_tokens"]
+        assert "600" in kwargs["preferred_tokens"]
+        assert kwargs["page_candidates"] == mock_collect_candidates.return_value
+
+    def test_render_pdf_page_pngs_for_gpt_prefers_scoring_pages_when_focus_tokens_present(self):
+        class _FakePixmap:
+            def tobytes(self, fmt: str):
+                return b"png"
+
+        class _FakePage:
+            def __init__(self, text: str):
+                self._text = text
+
+            def get_text(self):
+                return self._text
+
+            def get_pixmap(self, matrix=None, alpha=False):
+                return _FakePixmap()
+
+        class _FakeDoc:
+            def __init__(self, pages):
+                self._pages = pages
+
+            def __iter__(self):
+                return iter(self._pages)
+
+            def __getitem__(self, index):
+                return self._pages[index]
+
+            def close(self):
+                return None
+
+        pages = [
+            _FakePage("封面 项目名称 招标公告"),
+            _FakePage("一般说明 施工部署 组织架构 资源配置 质量安全管理"),
+            _FakePage("评标办法 评分细则 工期120天 质量90分 加分 扣分 关键节点"),
+            _FakePage("附录 其他说明"),
+        ]
+
+        with patch("app.main.pymupdf") as mock_pymupdf:
+            mock_pymupdf.open.return_value = _FakeDoc(pages)
+            previews = app_main._render_pdf_page_pngs_for_gpt(
+                b"%PDF-1.4",
+                max_pages=2,
+                preferred_tokens=["评分细则", "工期", "质量"],
+                always_include_first_pages=1,
+            )
+
+        assert [item["page_no"] for item in previews] == [1, 3]
+
+    def test_render_pdf_page_pngs_for_gpt_can_drop_first_page_bias_when_disabled(self):
+        class _FakePixmap:
+            def tobytes(self, fmt: str):
+                return b"png"
+
+        class _FakePage:
+            def __init__(self, text: str):
+                self._text = text
+
+            def get_text(self):
+                return self._text
+
+            def get_pixmap(self, matrix=None, alpha=False):
+                return _FakePixmap()
+
+        class _FakeDoc:
+            def __init__(self, pages):
+                self._pages = pages
+
+            def __iter__(self):
+                return iter(self._pages)
+
+            def __getitem__(self, index):
+                return self._pages[index]
+
+            def close(self):
+                return None
+
+        pages = [
+            _FakePage("封面 项目名称 图纸目录"),
+            _FakePage("一般说明 施工部署 资源配置"),
+            _FakePage("节点详图 机电综合排布 轴网 标高600 1200 洞口 净高复核"),
+        ]
+
+        with patch("app.main.pymupdf") as mock_pymupdf:
+            mock_pymupdf.open.return_value = _FakeDoc(pages)
+            previews = app_main._render_pdf_page_pngs_for_gpt(
+                b"%PDF-1.4",
+                max_pages=1,
+                preferred_tokens=["节点详图", "机电综合排布", "洞口"],
+                always_include_first_pages=0,
+            )
+
+        assert [item["page_no"] for item in previews] == [3]
+
     @patch("app.main._call_gpt_material_parser")
     @patch("app.main._render_pdf_page_pngs_for_gpt")
     def test_augment_tender_summary_skips_gpt_when_local_summary_is_strong(
@@ -312,6 +3705,64 @@ class TestMaterialParsePerformanceGuards:
         mock_call_gpt.assert_not_called()
 
     @patch("app.main._call_gpt_material_parser")
+    @patch("app.main._collect_pdf_page_candidates_for_gpt")
+    @patch("app.main._render_pdf_page_pngs_for_gpt")
+    def test_augment_drawing_summary_skips_page_vision_when_focus_page_is_not_distinct(
+        self,
+        mock_render_pages,
+        mock_collect_candidates,
+        mock_call_gpt,
+    ):
+        local_summary = {
+            "detected_format": "pdf",
+            "structured_quality_score": 0.51,
+            "structured_terms": ["总平面", "节点详图", "综合排布", "消防", "净高复核"],
+            "discipline_keywords": ["建筑", "机电"],
+            "sheet_type_tags": ["节点详图/大样"],
+            "risk_keywords": ["洞口", "高支模"],
+            "top_numeric_terms": ["600", "1200", "3.5", "45"],
+            "layout_tags": ["轴网"],
+            "component_tags": ["梁", "板"],
+        }
+        mock_collect_candidates.return_value = [
+            {"page_no": 1, "text": "封面 图纸目录", "score": 4.2},
+            {"page_no": 3, "text": "节点详图 机电综合排布", "score": 4.8},
+        ]
+        mock_call_gpt.return_value = (
+            True,
+            {
+                "discipline": "建筑",
+                "sheet_type": "节点详图/大样",
+                "layout_tags": ["总平面"],
+                "space_tags": ["机房"],
+                "component_tags": ["梁"],
+                "dimension_markers": ["1200"],
+                "risk_tags": ["洞口"],
+                "constraint_terms": ["净高复核"],
+                "numeric_constraints": ["3.5"],
+                "focused_dimensions": ["05"],
+                "parse_confidence": 0.66,
+            },
+            "",
+        )
+
+        merged, backend, confidence, error = app_main._augment_drawing_summary_with_gpt(
+            b"%PDF-1.4",
+            "总图.pdf",
+            "总平面 节点详图 机电 综合排布 标高 轴线 机房 梁 板 柱 " * 12,
+            local_summary,
+        )
+
+        assert backend == "hybrid"
+        assert error == ""
+        assert confidence == 0.66
+        assert merged["gpt_page_vision_skip_reason"] == "focus_page_not_distinct_enough"
+        mock_collect_candidates.assert_called_once()
+        mock_render_pages.assert_not_called()
+        kwargs = mock_call_gpt.call_args.kwargs
+        assert kwargs.get("image_bytes") is None
+
+    @patch("app.main._call_gpt_material_parser")
     def test_augment_site_photo_summary_skips_gpt_when_local_summary_is_strong(
         self,
         mock_call_gpt,
@@ -351,8 +3802,13 @@ class TestMaterialParsePerformanceGuards:
         assert merged["evidence_confidence"] == 0.78
         mock_call_gpt.assert_not_called()
 
+    @patch("app.main._notify_material_parse_workers")
     @patch("app.main._rebuild_project_anchors_and_requirements")
-    def test_material_parse_rebuilds_are_debounced_per_project(self, mock_rebuild):
+    def test_material_parse_rebuilds_are_debounced_per_project(
+        self,
+        mock_rebuild,
+        mock_notify_workers,
+    ):
         from app import main as main_module
 
         original_pending = dict(main_module._MATERIAL_PARSE_PENDING_REBUILDS)
@@ -367,6 +3823,7 @@ class TestMaterialParsePerformanceGuards:
 
             assert rebuilt == 2
             assert mock_rebuild.call_count == 2
+            assert mock_notify_workers.call_count == 3
             mock_rebuild.assert_any_call("p1")
             mock_rebuild.assert_any_call("p2")
             assert "p1" not in main_module._MATERIAL_PARSE_PENDING_REBUILDS
@@ -374,6 +3831,100 @@ class TestMaterialParsePerformanceGuards:
         finally:
             main_module._MATERIAL_PARSE_PENDING_REBUILDS.clear()
             main_module._MATERIAL_PARSE_PENDING_REBUILDS.update(original_pending)
+
+    @patch("app.main.load_material_parse_jobs")
+    @patch("app.main._rebuild_project_anchors_and_requirements")
+    def test_material_parse_rebuilds_wait_for_parse_backlog_when_requested(
+        self,
+        mock_rebuild,
+        mock_load_jobs,
+    ):
+        from app import main as main_module
+
+        original_pending = dict(main_module._MATERIAL_PARSE_PENDING_REBUILDS)
+        try:
+            main_module._MATERIAL_PARSE_PENDING_REBUILDS.clear()
+            mock_load_jobs.return_value = [
+                {
+                    "id": "j1",
+                    "material_id": "m1",
+                    "project_id": "p1",
+                    "status": "queued",
+                    "parse_mode": "full",
+                    "created_at": "2026-03-30T00:00:00+00:00",
+                    "updated_at": "2026-03-30T00:00:00+00:00",
+                }
+            ]
+            with patch("app.main.time.monotonic", return_value=100.0):
+                main_module._schedule_project_material_rebuild("p1")
+            with patch("app.main.time.monotonic", return_value=103.0):
+                rebuilt = main_module._drain_due_project_material_rebuilds(
+                    limit=10,
+                    skip_if_parse_backlog=True,
+                )
+
+            assert rebuilt == 0
+            mock_rebuild.assert_not_called()
+            assert "p1" in main_module._MATERIAL_PARSE_PENDING_REBUILDS
+        finally:
+            main_module._MATERIAL_PARSE_PENDING_REBUILDS.clear()
+            main_module._MATERIAL_PARSE_PENDING_REBUILDS.update(original_pending)
+
+    @patch("app.main._load_material_parse_claim_context")
+    def test_has_pending_material_parse_jobs_uses_claim_context_cache_when_available(
+        self,
+        mock_load_claim_context,
+    ):
+        from app import main as main_module
+
+        original_signature = main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE
+        original_jobs = [dict(job) for job in main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_JOBS]
+        original_candidate_indices = list(
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES
+        )
+        original_has_queued = main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_QUEUED_CANDIDATES
+        original_has_failed_without_due = (
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_RETRYABLE_FAILED_WITHOUT_DUE
+        )
+        original_earliest_failed_at = (
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_EARLIEST_RETRYABLE_FAILED_AT
+        )
+        try:
+            signature = ((1, 1), (2, 2))
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE = signature
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_JOBS[:] = [
+                {
+                    "id": "j1",
+                    "material_id": "m1",
+                    "project_id": "p1",
+                    "status": "queued",
+                    "parse_mode": "full",
+                }
+            ]
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES[:] = [0]
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_QUEUED_CANDIDATES = True
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_RETRYABLE_FAILED_WITHOUT_DUE = False
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_EARLIEST_RETRYABLE_FAILED_AT = None
+
+            with patch("app.main._material_parse_state_files_signature", return_value=signature):
+                assert main_module._has_pending_material_parse_jobs() is True
+        finally:
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE = original_signature
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_JOBS[:] = original_jobs
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES[
+                :
+            ] = original_candidate_indices
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_QUEUED_CANDIDATES = (
+                original_has_queued
+            )
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_RETRYABLE_FAILED_WITHOUT_DUE = (
+                original_has_failed_without_due
+            )
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_EARLIEST_RETRYABLE_FAILED_AT = (
+                original_earliest_failed_at
+            )
+
+        mock_load_claim_context.assert_not_called()
 
 
 class TestSecureDesktopExportBlock:
@@ -394,6 +3945,41 @@ class TestSecureDesktopExportBlock:
     def test_material_depth_report_markdown_returns_403_in_secure_mode(self, client):
         with patch("app.runtime_security.is_secure_desktop_mode_enabled", return_value=True):
             response = client.get("/api/v1/projects/p1/materials/depth_report/markdown")
+
+        assert response.status_code == 403
+        assert "保密模式已启用" in response.json()["detail"]
+
+    def test_project_trial_preflight_markdown_download_returns_403_in_secure_mode(self, client):
+        with patch("app.runtime_security.is_secure_desktop_mode_enabled", return_value=True):
+            response = client.get("/api/v1/projects/p1/trial_preflight.md")
+
+        assert response.status_code == 403
+        assert "保密模式已启用" in response.json()["detail"]
+
+    def test_project_trial_preflight_docx_download_returns_403_in_secure_mode(self, client):
+        with patch("app.runtime_security.is_secure_desktop_mode_enabled", return_value=True):
+            response = client.get("/api/v1/projects/p1/trial_preflight.docx")
+
+        assert response.status_code == 403
+        assert "保密模式已启用" in response.json()["detail"]
+
+    def test_writing_guidance_markdown_download_returns_403_in_secure_mode(self, client):
+        with patch("app.runtime_security.is_secure_desktop_mode_enabled", return_value=True):
+            response = client.get("/api/v1/projects/p1/writing_guidance.md")
+
+        assert response.status_code == 403
+        assert "保密模式已启用" in response.json()["detail"]
+
+    def test_writing_guidance_patch_bundle_download_returns_403_in_secure_mode(self, client):
+        with patch("app.runtime_security.is_secure_desktop_mode_enabled", return_value=True):
+            response = client.get("/api/v1/projects/p1/writing_guidance_patch_bundle.md")
+
+        assert response.status_code == 403
+        assert "保密模式已启用" in response.json()["detail"]
+
+    def test_writing_guidance_patch_bundle_docx_download_returns_403_in_secure_mode(self, client):
+        with patch("app.runtime_security.is_secure_desktop_mode_enabled", return_value=True):
+            response = client.get("/api/v1/projects/p1/writing_guidance_patch_bundle.docx")
 
         assert response.status_code == 403
         assert "保密模式已启用" in response.json()["detail"]
@@ -642,6 +4228,16 @@ class TestIndexEndpoint:
         assert 'id="btnMaterialKnowledgeProfile"' in response.text
         assert 'id="btnMaterialKnowledgeProfileDownload"' in response.text
         assert 'id="btnEvolutionHealth"' in response.text
+        assert 'id="btnSelfCheck"' in response.text
+        assert 'id="btnSystemImprovementOverview"' in response.text
+        assert 'id="btnDataHygiene"' in response.text
+        assert 'id="btnEvalSummaryV2"' in response.text
+        assert 'id="btnTrialPreflight"' in response.text
+        assert 'id="btnTrialPreflightDownload"' in response.text
+        assert 'id="btnTrialPreflightDownloadDocx"' in response.text
+        assert 'id="btnWritingGuidanceDownload"' in response.text
+        assert 'id="btnWritingGuidancePatchBundleDownload"' in response.text
+        assert 'id="btnWritingGuidancePatchBundleDownloadDocx"' in response.text
         assert 'id="btnEvidenceTrace"' in response.text
         assert 'id="btnScoringBasis"' in response.text
         assert 'id="btnScoringDiagnostic"' in response.text
@@ -649,6 +4245,9 @@ class TestIndexEndpoint:
         assert 'id="shigongGateSummary"' in response.text
         assert 'id="scoringBasisResult"' in response.text
         assert 'id="scoringDiagnosticResult"' in response.text
+        assert 'id="systemImprovementResult"' in response.text
+        assert 'id="dataHygieneResult"' in response.text
+        assert 'id="trialPreflightResult"' in response.text
         assert "解析状态" in response.text
         assert "双轨分数" in response.text
         assert "偏差诊断" in response.text
@@ -714,9 +4313,9 @@ class TestIndexEndpoint:
         assert "双轨总览" in page
         assert "双轨分数" in page
         assert "偏差诊断" in page
-        assert "逼近层整体上更接近青天" in page
-        assert "独立: 78.0 / 逼近: 82.0 / 青天: 84.0 / 100分制" in page
-        assert "独立偏差 -6.0 / 逼近偏差 -2.0 / 改善 4.0" in page
+        assert "当前分层整体上更接近青天" in page
+        assert "当前分: " in page
+        assert "当前分偏差 " in page
         assert "查看满分优化清单（逐页）" in page
         assert "查看评分治理（异常样本/校准/回退）" in page
 
@@ -759,9 +4358,19 @@ class TestIndexEndpoint:
         page = response.text
         assert "已生成分数，但本施组触发资料利用预警。" in page
         assert "这是施组级资料利用预警，不是项目资料未上传。" in page
-        assert "折算100分口径: 74.65" in page
+        assert "5分制" in page
+        assert "折算100分口径" not in page
+        assert "（100分口径）" not in page
         assert "查看满分优化清单（逐页）" in page
         assert "查看评分治理（异常样本/校准/回退）" in page
+        assert '<div class="warn">已生成分数，但本施组触发资料利用预警。</div>' in page
+        assert (
+            '<div class="warn"><strong>已评分，但本施组对部分项目资料未形成足够证据关联。</strong></div>'
+            in page
+        )
+        assert '<div class="warn">资料利用门禁未达标（建议补齐资料后重评分）</div>' in page
+        assert '<div class="error">已生成分数，但本施组触发资料利用预警。</div>' not in page
+        assert '<div class="error">资料利用门禁未达标（建议补齐资料后重评分）</div>' not in page
 
     def test_index_downgrades_optional_uploaded_material_issue_to_note(self, client):
         submission = {
@@ -828,10 +4437,32 @@ class TestIndexEndpoint:
             )
 
         rows_html = rendered["rows_html"]
+        assert '<tr class="submission-row">' in rows_html
+        assert 'class="submission-file-cell"' in rows_html
+        assert 'class="submission-score-cell"' in rows_html
+        assert 'class="submission-diagnostic-cell"' in rows_html
         assert "资料利用存在补强提示（不阻断当前评分）。" in rows_html
         assert "已生成分数，但本施组触发资料利用预警。" not in rows_html
         assert "已评分，但本施组对部分项目资料未形成足够证据关联。" not in rows_html
         assert "资料利用门禁未达标（建议补齐资料后重评分）" not in rows_html
+
+    def test_index_material_gate_warning_uses_warn_class_in_client_render_baseline(self, client):
+        response = client.get("/")
+
+        assert response.status_code == 200
+        page = response.text
+        assert ".warn { color: #9a3412; }" in page
+        assert "html = '<div class=\"warn\">已生成分数，但本施组触发资料利用预警。</div>';" in page
+        assert (
+            "html += '<div class=\"warn\"><strong>已评分，但本施组对部分项目资料未形成足够证据关联。</strong></div>';"
+            in page
+        )
+        assert (
+            "scoreHtml += '<div class=\"warn\">资料利用门禁未达标（建议补齐资料后重评分）</div>';"
+            in page
+        )
+        assert "折算100分口径" not in page
+        assert "（100分口径）" not in page
 
     def test_index_renders_selected_project_material_rows(self, client):
         materials = [
@@ -908,7 +4539,17 @@ class TestIndexEndpoint:
             "btnAddGroundTruth",
             "btnEvolve",
             "btnEvolutionHealth",
+            "btnSelfCheck",
+            "btnSystemImprovementOverview",
+            "btnDataHygiene",
+            "btnEvalSummaryV2",
+            "btnTrialPreflight",
+            "btnTrialPreflightDownload",
+            "btnTrialPreflightDownloadDocx",
             "btnWritingGuidance",
+            "btnWritingGuidanceDownload",
+            "btnWritingGuidancePatchBundleDownload",
+            "btnWritingGuidancePatchBundleDownloadDocx",
         ):
             assert f'id="{button_id}"' in page
             assert f'id="{button_id}" class="secondary compact-hidden"' not in page
@@ -919,6 +4560,25 @@ class TestIndexEndpoint:
         assert response.status_code == 200
         page = response.text
         assert "function renderEvolutionEnhancementAudit(data)" in page
+        assert "function renderManualConfirmationAuditBlock(audit)" in page
+        assert "const scaleMax = Number(info.score_scale_max || 100) === 5 ? 5 : 100;" in page
+        assert "const rawDelta = Number.isFinite(Number(info.abs_delta_raw))" in page
+        assert (
+            "function renderGroundTruthPostAddFollowUpActionHint(projectName='', entrypointLabel='', actionLabel='')"
+            in page
+        )
+        assert (
+            "function buildPostAutoRunRefreshSummary(data, closureSummary=null, systemImprovementOverview=null, projectId='')"
+            in page
+        )
+        assert "function renderPostAutoRunRefreshSummaryBlock(summary)" in page
+        assert "if (!opts.silentOutput) {" in page
+        assert "silentOutput: true" in page
+        assert "真实评标录入后已自动刷新评分治理视图，可直接复验人工确认/校准状态。" in page
+        assert "真实评标录入后已自动刷新评分治理视图，可直接处理当前人工确认阻塞。" in page
+        assert "一键闭环执行后已自动刷新评分治理视图，可直接查看最新学习/校准状态。" in page
+        assert "闭环后主因状态：" in page
+        assert "闭环后的下一步" in page
         assert "双模型分歧，已自动回退到规则版建议" in page
         assert "已通过双模型复核" in page
 
@@ -927,7 +4587,12 @@ class TestIndexEndpoint:
         assert response.status_code == 200
         page = response.text
         assert ".compact-hidden { display:none !important; }" in page
-        assert '<details class="compact-hidden"' in page
+        assert "页面默认精简高级维护按钮，仅保留评分体系与分析包等关键入口，聚焦试车操作。" in page
+        assert '<details style="margin-top:8px">' in page
+        assert 'id="btnScoringFactors" class="secondary"' in page
+        assert 'id="btnScoringFactorsMd" class="secondary"' in page
+        assert 'id="btnAnalysisBundle" class="secondary"' in page
+        assert 'id="btnAnalysisBundleDownload" class="secondary"' in page
         assert "2.5) 青天评标关注度（16维）" in page
         assert (
             '<div class="section card compact-hidden">\n        <h2>2.5) 青天评标关注度（16维）</h2>'
@@ -997,6 +4662,29 @@ class TestIndexEndpoint:
         page = response.text
         assert 'id="btnStartNewProject"' in page
         assert page.index('id="btnStartNewProject"') < page.index("<h2>2) 选择项目</h2>")
+
+    def test_index_frontend_wraps_refresh_click_handlers_without_pointerevent_leakage(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert "safeClick0('refreshProjects', refreshProjects);" in page
+        assert "safeClick0('btnRefreshFeedMaterials', refreshFeedMaterials);" in page
+        assert "if (elRefresh) elRefresh.onclick = () => refreshProjects();" not in page
+        assert "if (btnRefFeed) btnRefFeed.onclick = () => refreshFeedMaterials();" not in page
+        assert "if (elRefresh) elRefresh.onclick = refreshProjects;" not in page
+        assert "if (btnRefFeed) btnRefFeed.onclick = refreshFeedMaterials;" not in page
+
+    def test_index_frontend_clears_stale_project_refresh_after_delete(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert "clearProjectAutoRefresh();" in page
+        assert "clearMaterialParsePolling();" in page
+        assert "clearProjectRefreshInflight(id);" in page
+        assert "projectSwitchSeq += 1;" in page
+        assert "storageRemove('selected_project_id');" in page
+        assert "syncProjectSelectionUrl('');" in page
+        assert "resetProjectPanelsToStandby('');" in page
         assert 'id="projectMonthFilter"' in page
         assert "async function startNewProjectIntake()" in page
         assert "async function enterProjectIntakeMode(message, options=null)" in page
@@ -1004,12 +4692,21 @@ class TestIndexEndpoint:
         assert "function projectIsSystemGenerated(project)" in page
         assert "function buildProjectPickerView(projects)" in page
         assert (
-            "safeChange('projectMonthFilter', () => refreshProjects(selectedProjectIdStrict() || ''));"
+            "function syncProjectMonthFilterToPreferredProject(projects, preferredProjectId='')"
+            in page
+        )
+        assert (
+            "safeChange0('projectMonthFilter', () => refreshProjects(selectedProjectIdStrict() || ''));"
             in page
         )
         assert "const INITIAL_CREATE_ERROR = __INITIAL_CREATE_ERROR__;" not in page
         assert "storageGet('project_intake_mode') === '1'" in page
         assert "await refreshProjects('', {" in page
+        assert (
+            "if (preferredProjectId) syncProjectMonthFilterToPreferredProject(projectListCache, preferredProjectId);"
+            in page
+        )
+        assert "select.value = monthKey;" in page
         assert "allowEmptySelection: true," in page
         assert (
             "emptySelectionIsInfo: intakeMode || (pickerView.totalCount > 0 && list.length === 0),"
@@ -1029,8 +4726,345 @@ class TestIndexEndpoint:
             "const current = preferredProjectId || storageGet('selected_project_id') || pid() || '';"
             not in page
         )
-        assert "await refreshProjects(String((created && created.id) || ''));" in page
+        assert "await refreshProjects(String((created && created.id) || ''), {" in page
+        assert "reason: 'create_project_success'" in page
+        assert "autoFocusEntrypoint: true" not in page
         assert "nameInput.value = projectName;" in page
+
+    def test_index_frontend_coalesces_project_refresh_requests(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert "let projectRefreshInflight = new Map();" in page
+        assert "function projectRefreshInflightKey(kind, projectId) {" in page
+        assert "function clearProjectRefreshInflight(projectId='') {" in page
+        assert "function runProjectRefreshTask(kind, projectId, runner) {" in page
+        assert "clearProjectRefreshInflight();" in page
+        assert "return runProjectRefreshTask(" in page
+        assert "'project_picker'," in page
+        assert "'feed_materials'," in page
+        assert "'submissions'," in page
+        assert "'materials_parse_status'," in page
+        assert "skipCoalesce: true," in page
+        assert "skipReadinessRefresh: skipReadinessRefresh," in page
+
+    def test_index_frontend_adapts_project_auto_refresh_interval_for_stable_hot_projects(
+        self, client
+    ):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert "const PROJECT_AUTO_REFRESH_INTERVAL_MS = 5000;" in page
+        assert "const PROJECT_AUTO_REFRESH_WARM_INTERVAL_MS = 10000;" in page
+        assert "const PROJECT_AUTO_REFRESH_STABLE_HOT_INTERVAL_MS = 15000;" in page
+        assert "function currentProjectAutoRefreshInterval(projectId='') {" in page
+        assert "if (document.visibilityState === 'hidden') return 0;" in page
+        assert "return PROJECT_AUTO_REFRESH_STABLE_HOT_INTERVAL_MS;" in page
+        assert "return PROJECT_AUTO_REFRESH_WARM_INTERVAL_MS;" in page
+        assert "const overrideDelayMs = Number(opts.delayMs || 0);" in page
+        assert (
+            "const delayMs = overrideDelayMs > 0 ? overrideDelayMs : currentProjectAutoRefreshInterval(projectId);"
+            in page
+        )
+        assert "}, delayMs);" in page
+        assert (
+            "return runProjectRefreshTask('scoring_readiness', id, () => refreshScoringReadiness(id, switchSeq, { skipCoalesce: true }));"
+            in page
+        )
+        assert (
+            "return runProjectRefreshTask('scoring_diagnostic_latest', id, () => refreshScoringDiagnostic(id, switchSeq, { skipCoalesce: true }));"
+            in page
+        )
+        assert "const skipReadinessRefresh = !!opts.skipReadinessRefresh;" in page
+        assert (
+            "(typeof refreshSubmissions === 'function') ? refreshSubmissions(selectedId, switchSeq, { skipReadinessRefresh: true }) : Promise.resolve(),"
+            in page
+        )
+        assert (
+            "(typeof refreshMaterials === 'function') ? refreshMaterials(selectedId, switchSeq, { skipReadinessRefresh: true }) : Promise.resolve(),"
+            in page
+        )
+        assert (
+            "if (typeof refreshMaterials === 'function') await refreshMaterials(projectId, switchSeq, { skipReadinessRefresh: true });"
+            in page
+        )
+        assert (
+            "if (typeof refreshSubmissions === 'function') await refreshSubmissions(projectId, switchSeq, { skipReadinessRefresh: true });"
+            in page
+        )
+        assert (
+            "await refreshMaterials(projectId, switchSeq, { skipReadinessRefresh: true });" in page
+        )
+
+    def test_index_frontend_preserves_remaining_project_refresh_delay_across_brief_visibility_changes(
+        self, client
+    ):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert "let projectAutoRefreshDueAtMs = 0;" in page
+        assert "let projectVisibilityHiddenAtMs = 0;" in page
+        assert "function clearProjectAutoRefresh(resetDueAt=true) {" in page
+        assert "projectVisibilityHiddenAtMs = Date.now();" in page
+        assert "clearProjectAutoRefresh(false);" in page
+        assert (
+            "const remainingMs = projectAutoRefreshDueAtMs > nowMs ? (projectAutoRefreshDueAtMs - nowMs) : 0;"
+            in page
+        )
+        assert (
+            "const hiddenDurationMs = hiddenAt > 0 ? Math.max(0, nowMs - hiddenAt) : Number.POSITIVE_INFINITY;"
+            in page
+        )
+        assert "if (remainingMs > 0 && hiddenDurationMs < refreshIntervalMs) {" in page
+        assert (
+            "scheduleProjectAutoRefresh(currentId, projectSwitchSeq, { delayMs: remainingMs });"
+            in page
+        )
+
+    def test_index_frontend_stabilizes_compare_report_opening_and_system_closure_binding(
+        self, client
+    ):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert "let pendingOptimizationReportScroll = false;" in page
+        assert "function scrollOptimizationReportPanelIntoView() {" in page
+        assert "function flushOptimizationReportPanelScroll() {" in page
+        assert "pendingOptimizationReportScroll = !!opts.scrollIntoView;" in page
+        assert (
+            "if (pendingOptimizationReportScroll) scrollOptimizationReportPanelIntoView();" in page
+        )
+        assert "flushOptimizationReportPanelScroll();" in page
+        assert "replaceElementHtmlIfChanged(\n            'systemClosureSummaryResult'," in page
+        assert "'system_closure_summary|' + buildTableRenderSignature([html])" in page
+        assert "'scoring_diagnostic|' + String((latest && latest.filename) || '')" not in page
+
+    def test_index_frontend_uses_structured_submission_table_layout(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert '<div class="table-scroll submission-table-wrap">' in page
+        assert '<table id="submissionsTable" class="submission-table">' in page
+        assert '<col class="submission-col-file" />' in page
+        assert '<col class="submission-col-score" />' in page
+        assert '<col class="submission-col-diagnostic" />' in page
+        assert '<col class="submission-col-created" />' in page
+        assert '<col class="submission-col-actions" />' in page
+        assert ".submission-table { table-layout:fixed; min-width:1120px; }" in page
+        assert (
+            ".submission-table .submission-stack { display:flex; flex-direction:column; gap:6px; min-width:0; }"
+            in page
+        )
+        assert "function createSubmissionTableRowElement(submission, projectId, escapeFn) {" in page
+        assert """+ '<tr class="submission-row">'""" in page
+        assert """+ '<td class="submission-file-cell"><div class="submission-filename">'""" in page
+        assert """+ '<td class="submission-score-cell"><div class="submission-stack">'""" in page
+        assert (
+            """+ '<td class="submission-diagnostic-cell"><div class="submission-stack">'""" in page
+        )
+        assert "function createMaterialTableRowElement(material, projectId) {" in page
+        assert "function buildFeedMaterialTableRowHtml(material, projectId) {" in page
+        assert "function buildGroundTruthTableRowHtml(record, index, isCurrent) {" in page
+        assert """+ '<tr>'""" in page
+
+    def test_index_frontend_skips_noop_table_rerenders_for_project_data(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert "function clearTableRenderSignature(tableId) {" in page
+        assert "function buildTableRenderSignature(rows, partsBuilder=null) {" in page
+        assert "function replaceTableRowsIfChanged(tableId, rowsHtml, signature='') {" in page
+        assert "clearTableRenderSignature(tableId);" in page
+        assert (
+            "replaceTableRowsIfChanged('submissionsTable', [], '__submissions__projectless__');"
+            in page
+        )
+        assert (
+            "replaceTableRowsIfChanged(\n            'submissionsTable',\n            rowHtml,"
+            in page
+        )
+        assert (
+            "replaceTableRowsIfChanged(\n            'materialsTable',\n            rowHtml,"
+            in page
+        )
+        assert (
+            "replaceTableRowsIfChanged(\n            'feedMaterialsTable',\n            rowHtml,"
+            in page
+        )
+        assert (
+            "replaceTableRowsIfChanged(\n            'groundTruthTable',\n            rowHtml,"
+            in page
+        )
+        assert "function buildFeedMaterialTableRowHtml(material, projectId) {" in page
+        assert "function buildGroundTruthTableRowHtml(record, index, isCurrent) {" in page
+        assert "clearTableRenderSignature('submissionsTable');" in page
+        assert "clearTableRenderSignature('materialsTable');" in page
+        assert "clearTableRenderSignature('feedMaterialsTable');" in page
+        assert "clearTableRenderSignature('groundTruthTable');" in page
+
+    def test_index_frontend_skips_noop_panel_rerenders_for_project_diagnostics(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert "function clearElementRenderSignature(elementId) {" in page
+        assert "function replaceElementHtmlIfChanged(elementId, html, signature='') {" in page
+        assert "clearElementRenderSignature('submissionDualTrackOverview');" in page
+        assert "clearElementRenderSignature('scoringReadinessResult');" in page
+        assert "clearElementRenderSignature('materialUtilizationResult');" in page
+        assert "clearElementRenderSignature('scoringDiagnosticResult');" in page
+        assert "replaceElementHtmlIfChanged(\n            'submissionDualTrackOverview'," in page
+        assert "replaceElementHtmlIfChanged(\n            'scoringReadinessResult'," in page
+        assert "replaceElementHtmlIfChanged(\n            'materialUtilizationResult'," in page
+        assert "replaceElementHtmlIfChanged(\n            'scoringDiagnosticResult'," in page
+        assert (
+            "const generatedAtText = escapeHtmlText(String(data.generated_at || '').slice(0, 19) || '-');"
+            in page
+        )
+        assert "const diagnosticSignatureHtml = html.replace(" in page
+        assert "'；生成时间：__volatile__'" in page
+        assert "function setResultLoading(resultId, label) {" in page
+        assert "clearElementRenderSignature(resultId);" in page
+
+    def test_index_frontend_renders_scoring_factors_panel_with_pending_feedback_templates(
+        self, client
+    ):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert ".scoring-factors-grid { display:grid;" in page
+        assert ".scoring-factors-card-grid { display:grid;" in page
+        assert "function renderScoringFactorsPanel(payload) {" in page
+        assert (
+            "const pendingFeedbackPoints = Array.isArray(data.pending_feedback_scoring_points)"
+            in page
+        )
+        assert "if (el.dataset) delete el.dataset.renderSignature;" in page
+        assert "window.renderScoringFactorsPanel = renderScoringFactorsPanel;" in page
+        assert "动态评分点（结合上传资料与真实评标）" in page
+        assert "待确认真实评标反馈点（未正式生效）" in page
+        assert "查看改写模板" in page
+        assert "推荐章节：" in page
+        assert "建议小节：" in page
+        assert "当前施组锚点：" in page
+        assert "插入建议" in page
+        assert "查看当前施组锚点摘录" in page
+        assert "查看小节草稿" in page
+        assert "查看自动改写草案" in page
+        assert "待确认反馈改写补丁包" in page
+        assert "查看项目级补丁包" in page
+        assert "查看可复制补丁" in page
+        assert "阻断原因：" in page
+        assert "句式模板" in page
+        assert "可直接贴入正文" in page
+        assert "写入方式：" in page
+        assert "改写标题：" in page
+        assert (
+            "const pendingFeedbackPatchBundle = (data.pending_feedback_patch_bundle && typeof data.pending_feedback_patch_bundle === 'object')"
+            in page
+        )
+        assert "const draftSectionParagraphs = Array.isArray(row.draft_section_paragraphs)" in page
+        assert (
+            "const autoRewriteParagraphs = Array.isArray(row.auto_rewrite_section_paragraphs)"
+            in page
+        )
+        assert "const insertableParagraphs = Array.isArray(row.insertable_paragraphs)" in page
+        assert "const rewriteSentences = Array.isArray(row.rewrite_sentences)" in page
+        assert "；更新时间：__volatile__" in page
+        assert "replaceElementHtmlIfChanged(\n            'scoringFactorsResult'," in page
+        assert "renderScoringFactorsPanel(d);" in page
+        assert "adaptive_point_count:" in page
+        assert "pending_feedback_point_count:" in page
+        assert "pending_feedback_patch_section_count:" in page
+
+    def test_index_frontend_renders_writing_guidance_patch_bundle(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert (
+            "function renderPendingFeedbackPatchBundleSection(bundle, titleText='待确认反馈改写补丁包') {"
+            in page
+        )
+        assert "下载改写补丁包(.md)" in page
+        assert "下载改写补丁包(.docx)" in page
+        assert "待确认反馈改写补丁包（来自待人工确认样本）" in page
+        assert "这些反馈尚未正式进入评分主链，但已整理成项目级改写补丁供编制时参考。" in page
+        assert (
+            "const pendingFeedbackPatchBundle = (data.pending_feedback_patch_bundle && typeof data.pending_feedback_patch_bundle === 'object')"
+            in page
+        )
+        assert (
+            "const pendingFeedbackSummary = (data.pending_feedback_summary && typeof data.pending_feedback_summary === 'object')"
+            in page
+        )
+        assert "html += renderPendingFeedbackPatchBundleSection(" in page
+        assert "btnGuidancePatchBundleInlineDownload" in page
+        assert "btnGuidancePatchBundleInlineDownloadDocx" in page
+        assert "downloadWritingGuidancePatchBundle(projectId, 'guidanceResult');" in page
+        assert "downloadWritingGuidancePatchBundleDocx(projectId, 'guidanceResult');" in page
+
+    def test_index_frontend_web_button_contract_is_consistent(self, client):
+        from scripts.check_web_button_contract import build_report_from_html
+
+        response = client.get("/")
+        assert response.status_code == 200
+        report = build_report_from_html(response.text)
+
+        assert report["ok"] is True
+        assert report["missing_bindings"] == []
+        assert report["button_count"] >= 60
+        assert report["bound_button_count"] == report["button_count"]
+        assert all(item["ok"] for item in report["export_contracts"])
+        assert all(item["ok"] for item in report["inline_contracts"])
+        assert all(item["ok"] for item in report["dynamic_button_contracts"])
+        assert all(item["ok"] for item in report["critical_visible_button_contracts"])
+        assert all(item["ok"] for item in report["action_result_contracts"])
+        assert all(item["ok"] for item in report["guard_set_contracts"])
+        assert all(item["ok"] for item in report["smoke_coverage_contracts"])
+        assert report["smoke_gap_contracts"] == []
+        assert report["smoke_allowlist_contract"]["ok"] is True
+        assert report["smoke_allowlist_contract"]["stale_ids"] == []
+        covered_ids = {item["button_id"] for item in report["smoke_coverage_contracts"]}
+        assert "btnSaveApiKey" in covered_ids
+        assert "btnClearApiKey" in covered_ids
+        assert "btnStartNewProject" in covered_ids
+        assert "btnCreateProjectFromTender" in covered_ids
+        assert "deleteSelectedProjects" in covered_ids
+        assert "refreshProjects" in covered_ids
+        assert "btnSelectProjectBySearch" in covered_ids
+        assert "btnUploadMaterials" in covered_ids
+        assert "btnUploadBoq" in covered_ids
+        assert "btnUploadDrawing" in covered_ids
+        assert "btnUploadSitePhotos" in covered_ids
+        assert "btnRefreshMaterials" in covered_ids
+        assert "btnUploadShigong" in covered_ids
+        assert "btnRefreshSubmissions" in covered_ids
+        assert "btnRefreshFeedMaterials" in covered_ids
+        assert "btnRefreshGroundTruth" in covered_ids
+        assert "materialsTrialPreflightFollowUpAction" in covered_ids
+        assert "btnCreateProject" in report["submit_bound_button_ids"]
+        assert "btnCreateProjectFromTender" in report["submit_bound_button_ids"]
+        assert "deleteCurrentProject" in report["submit_bound_button_ids"]
+
+    def test_index_frontend_disallows_direct_safe_click_or_change_business_bindings(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        direct_click_bindings = re.findall(
+            r"safeClick\(\s*'[^']+'\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+            page,
+        )
+        direct_change_bindings = re.findall(
+            r"safeChange\(\s*'[^']+'\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+            page,
+        )
+        assert direct_click_bindings == [], (
+            "safeClick 业务绑定应通过 safeClick0 或显式 lambda 包装，避免把 click 事件对象误传进业务函数："
+            f" {direct_click_bindings}"
+        )
+        assert direct_change_bindings == [], (
+            "safeChange 业务绑定应通过 safeChange0 或显式 lambda 包装，避免把 change 事件对象误传进业务函数："
+            f" {direct_change_bindings}"
+        )
 
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
@@ -1145,8 +5179,11 @@ class TestIndexEndpoint:
         assert "function refreshGroundTruthScoringRule" in page
         assert "function applyGroundTruthFinalScoreAutoFill" in page
         assert "function submitGroundTruthDraft" in page
+        assert "function clearGroundTruthDraftForm()" in page
+        assert "clearGroundTruthDraftForm();" in page
+        assert "function buildGroundTruthTableRowHtml(record, index, isCurrent) {" in page
         assert (
-            "const sourceSubmissionFilename = String(r.source_submission_filename || '').trim();"
+            "const sourceSubmissionFilename = String(row.source_submission_filename || '').trim();"
             in page
         )
         assert "/ground_truth/scoring_rule" in page
@@ -1209,6 +5246,190 @@ class TestIndexEndpoint:
         assert "showJson('output', res.ok ? data : (data.detail || await res.text()))" not in page
         assert "function formatApiOutput" in page
 
+    def test_index_frontend_compacts_output_and_applies_weights_without_confirm(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert "执行结果摘要（最近一次操作）" in page
+        assert "（这里只保留关键结果摘要，不展示冗长原始响应）" in page
+        assert "function summarizeOutputScalar(value, maxLength=120)" in page
+        assert "return [summarizeOutputScalar(data, 240)];" in page
+        assert "function showOutputSummary(data)" in page
+        assert "function showOutputTextSummary(text, message='')" in page
+        assert "remainingKeys.slice(0, 8)" in page
+        assert "…已省略 ' + (remainingKeys.length - 8) + ' 个字段" in page
+        assert "当前项目已进入青天评标阶段。是否解锁并执行“保存+全项目重算”？" not in page
+        assert "已接收请求：正在保存当前16维关注度并发起全项目重算..." in page
+        assert "action: 'apply_weights_and_rescore'" in page
+        assert "function buildExpertProfileSaveOutputSummary(data)" in page
+        assert "function buildWeightsApplyOutputSummary(data, message='')" in page
+        assert "function buildCalibratorActionOutputSummary(data, message='')" in page
+        assert "function buildWeightsApplyRequestBody(forceUnlock=false)" in page
+        assert "检测到项目已锁定，正在自动解锁并继续保存配置..." in page
+        assert "检测到项目已锁定，正在自动解锁并继续重算..." in page
+        assert "反馈闭环执行异常，请查看“执行结果摘要”。" in page
+        assert "反馈闭环执行异常，请查看下方执行结果摘要。" in page
+        assert "message: '系统自检已完成'" in page
+        assert "message: '评分体系总览已加载'" in page
+        assert "message: '评分体系 Markdown 已生成'" in page
+        assert "message: '项目分析包已生成'" in page
+        assert "message: '资料深读体检已生成'" in page
+        assert "message: '资料知识画像已生成'" in page
+        assert "message: '批量删除项目已完成'" in page
+        assert "message: 'E2E 清理失败'" in page or "message: 'E2E 测试项目已清理'" in page
+        assert "function renderEvaluationSummaryBlock(id, ok, title, payload)" in page
+        assert "function renderEvaluationAggregateSummaryBlock(id, ok, title, payload)" in page
+        assert "运行明细（已折叠）" in page
+        assert "运行时校准治理" in page
+        assert "已自动回退并回填评分" in page
+        assert "当前项目级校准器" in page
+        assert "近30天校准器/规则 MAE（内部校准指标）" in page
+        assert "近30天校准器/规则 MAE</td>" not in page
+        assert "历史回退候选" in page
+        assert "最近运行时校准治理" in page
+        assert "回退后已恢复稳定" in page
+        assert "当前校准器状态" in page
+        assert "校准器训练已完成" in page
+        assert "校准分回填已完成" in page
+        assert "一键闭环执行已完成" in page
+        assert "闭环后状态" in page
+        assert "当前分已与青天结果对齐" in page
+        assert "当前分 MAE/RMSE 不劣于 V2" in page
+        assert "当前分排序相关性不劣于 V2" in page
+        assert "第一阶段封关 readiness" in page
+        assert "通过门数：" in page
+        assert "未通过门数：" in page
+        assert "系统总封关 readiness" in page
+        assert "系统封关推进摘要" in page
+        assert "候选项目数：" in page
+        assert "候选首选项目：" in page
+        assert "候选推进阶段：" in page
+        assert "候选推进建议：" in page
+        assert "阻塞类型" in page
+        assert "当前最该做的下一步" in page
+        assert "下一步详情" in page
+        assert "推荐入口" in page
+        assert "入口动作" in page
+        assert "前往：" not in page
+        assert "最短闭环路径" in page
+        assert "function ensureProjectSelectionClosureHintContainer()" in page
+        assert "function clearProjectSelectionClosureHint()" in page
+        assert "function renderProjectSelectionClosureHint(closure, projectId)" in page
+        assert (
+            """<button type="button" class="secondary" onclick="return focusSystemClosureEntrypoint("""
+            in page
+        )
+        assert "actionEntrypointLabel: nextStepEntrypointLabel," in page
+        assert "推荐入口：" in page
+        assert "function clearActionScopedClosureZoneHint(actionStatusId)" in page
+        assert "function buildProjectClosureStageSummary(closure, projectId)" in page
+        assert "function buildProjectClosureStageInlineText(closure, projectId)" in page
+        assert "function buildProjectClosureZoneHint(closure, projectId, zone)" in page
+        assert "function ensureProjectClosureZoneHintContainer(anchorId, containerId)" in page
+        assert "function clearProjectClosureZoneHint(containerId)" in page
+        assert (
+            "function renderProjectClosureZoneHint(zone, anchorId, containerId, closure, projectId)"
+            in page
+        )
+        assert "function refreshProjectScopedClosureInlineHints()" in page
+        assert (
+            "renderProjectSelectionClosureHint(systemClosureSummaryState, String(matched.id || ''));"
+            in page
+        )
+        assert "当前项目是系统总封关候选项目" in page
+        assert "当前项目是当前优先收口项目" in page
+        assert "当前项目已不是系统总封关的阻塞点" in page
+        assert "zoneLabel + '是当前推荐入口'" in page
+        assert "zoneLabel + '已完成当前阶段'" in page
+        assert "系统封关阶段" in page
+        assert "function buildSystemClosureNextStepText(closure, projectId, options=null)" in page
+        assert (
+            "function buildSystemClosureActionFollowUpMessage(baseMessage, closure, projectId, options=null)"
+            in page
+        )
+        assert "function ensureSystemClosureActionHintContainer(anchorId)" in page
+        assert "function clearSystemClosureActionHint(anchorId)" in page
+        assert "function clearProjectScopedSystemClosureActionHints()" in page
+        assert "function buildClosureHintCtaHtml(entrypointKey, buttonText='查看下一步')" in page
+        assert "function renderClosureHintBlock(el, options=null)" in page
+        assert "escapeHtmlText(JSON.stringify(normalizedKey))" in page
+        assert "html += buildClosureHintCtaHtml(actionEntrypointKey, actionLabel);" in page
+        assert "renderClosureHintBlock(el, {" in page
+        assert "const gateSummary = String(card.material_gate_summary || '').trim();" in page
+        assert (
+            "function renderSystemClosureActionHint(anchorId, closure, projectId, options=null)"
+            in page
+        )
+        assert (
+            """<button type="button" class="secondary" onclick="return focusSystemClosureEntrypoint("""
+            in page
+        )
+        assert "function buildCreateProjectFollowUpMessage(projectName, closure, projectId)" in page
+        assert "该项目已成为系统总封关候选项目" in page
+        assert "创建成功后的下一步" in page
+        assert "资料上传后的下一步" in page
+        assert "施组上传后的下一步" in page
+        assert "评分完成后的下一步" in page
+        assert "真实评标录入后的下一步" in page
+        assert "next_step_action_label" in page
+        assert "前往：" not in page
+        assert "create_project_success" in page
+        assert "create_from_tender_success" in page
+        assert "reason: 'upload_materials'" in page
+        assert "reason: 'upload_shigong'" in page
+        assert "reason: 'score_shigong'" in page
+        assert "reason: 'ground_truth_add'" in page
+        assert "autoFocusEntrypoint: true" not in page
+        assert "skipClosureSummaryRefresh: true" in page
+        assert "reason: 'project_changed'" in page
+        assert "function syncSystemClosureEntrypointHighlight(key, title)" in page
+        assert "clearProjectScopedSystemClosureActionHints();" in page
+        assert "clearSystemClosureActionHint(resultId);" in page
+        assert "clearSystemClosureActionHint(id);" in page
+        assert "clearSystemClosureActionHint('createProjectMessage');" in page
+        assert "clearSystemClosureActionHint('selectProjectMessage');" in page
+        assert "clearProjectSelectionClosureHint();" in page
+        assert "clearActionScopedClosureZoneHint(id);" in page
+        assert "clearProjectClosureZoneHint('materialsClosureHint');" in page
+        assert "clearProjectClosureZoneHint('shigongClosureHint');" in page
+        assert "已达第一阶段 ready 项目数：" in page
+        assert "未 ready 项目数：" in page
+        assert "下一优先项目：" in page
+        assert "下一优先未通过门：" in page
+        assert "项目级建议：" in page
+        assert "async function refreshSystemClosureSummary(options=null)" in page
+        assert "function systemClosureEntrypointMeta(key)" in page
+        assert "function clearSystemClosureEntrypointHighlight()" in page
+        assert "function highlightSystemClosureEntrypoint(key, title)" in page
+        assert "function focusSystemClosureEntrypoint(key)" in page
+        assert "clearSystemClosureEntrypointActionFocus();" in page
+        assert "评估 规则/当前分/校准" in page
+        assert "previewed_materials" in page
+        assert "预解析完成" in page
+        assert "后台仍在补全全文" in page
+
+    def test_index_frontend_inline_scripts_are_valid_javascript(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        scripts = re.findall(r"<script>(.*?)</script>", page, flags=re.S)
+        assert scripts
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".js", delete=False, encoding="utf-8"
+        ) as handle:
+            handle.write("\n\n".join(scripts))
+            script_path = handle.name
+        try:
+            result = subprocess.run(
+                ["node", "--check", script_path],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        finally:
+            os.unlink(script_path)
+        assert result.returncode == 0, result.stderr
+
     def test_index_frontend_has_non_blocking_handlers_for_compare_and_adaptive(self, client):
         """Section 5/6 buttons should stay clickable and show explicit project-selection feedback."""
         response = client.get("/")
@@ -1219,6 +5440,390 @@ class TestIndexEndpoint:
         assert "setResultLoading('compareResult'" in page
         assert "setResultLoading('adaptiveResult'" in page
         assert "setResultLoading('scoringDiagnosticResult'" in page
+        assert "setResultLoading('systemImprovementResult'" in page
+        assert "setResultLoading('selfCheckResult'" in page
+        assert "setResultLoading('dataHygieneResult'" in page
+        assert "setResultLoading('trialPreflightResult'" in page
+        assert "function renderSystemImprovementOverviewPanel(payload)" in page
+        assert (
+            "const closureGateDetails = Array.isArray(data.closure_gate_details) ? data.closure_gate_details : [];"
+            in page
+        )
+        assert (
+            "const projectGapDetails = Array.isArray(data.project_gap_details) ? data.project_gap_details : [];"
+            in page
+        )
+        assert (
+            "const projectGateGapDetails = Array.isArray(data.project_gate_gap_details) ? data.project_gate_gap_details : [];"
+            in page
+        )
+        assert (
+            "const projectActionGapDetails = Array.isArray(data.project_action_gap_details) ? data.project_action_gap_details : [];"
+            in page
+        )
+        assert (
+            "const globalActionGapDetails = Array.isArray(data.global_action_gap_details) ? data.global_action_gap_details : [];"
+            in page
+        )
+        assert (
+            "const focusWorkstreamStatusSummaries = Array.isArray(data.focus_workstream_status_summaries)"
+            in page
+        )
+        assert (
+            "const opsAgentQualitySummary = (data.ops_agent_quality_summary && typeof data.ops_agent_quality_summary === 'object')"
+            in page
+        )
+        assert (
+            "const globalActionGroupSummaries = Array.isArray(data.global_action_group_summaries) ? data.global_action_group_summaries : [];"
+            in page
+        )
+        assert (
+            "const globalAutoActionGapDetails = Array.isArray(data.global_auto_action_gap_details) ? data.global_auto_action_gap_details : [];"
+            in page
+        )
+        assert (
+            "const globalReadonlyActionGapDetails = Array.isArray(data.global_readonly_action_gap_details) ? data.global_readonly_action_gap_details : [];"
+            in page
+        )
+        assert (
+            "const globalManualActionGapDetails = Array.isArray(data.global_manual_action_gap_details) ? data.global_manual_action_gap_details : [];"
+            in page
+        )
+        assert "let systemImprovementOverviewLastPayload = null;" in page
+        assert "let systemImprovementActionGroupFilter = 'all';" in page
+        assert "let systemImprovementWorkstreamFilter = 'all';" in page
+        assert "async function refreshSystemImprovementOverview(options=null)" in page
+        assert "const normalizeSystemImprovementActionGroupFilter = (filter) => {" in page
+        assert "const formatSystemImprovementActionGroupFilterLabel = (label, count) => {" in page
+        assert (
+            "const setSystemImprovementActionGroupFilter = (filter, rerender = true) => {" in page
+        )
+        assert "const normalizeSystemImprovementWorkstreamFilter = (filter) => {" in page
+        assert "const formatSystemImprovementWorkstreamFilterLabel = (label, count) => {" in page
+        assert "const setSystemImprovementWorkstreamFilter = (filter, rerender = true) => {" in page
+        assert "const executionModeLabel = String(row.execution_mode_label || '').trim();" in page
+        assert "const priorityReasonLabel = String(row.priority_reason_label || '').trim();" in page
+        assert "const prioritySortLabel = String(row.priority_sort_label || '').trim();" in page
+        assert "const groupReasonLabel = String(row.group_reason_label || '').trim();" in page
+        assert "项目内未通过门清单" in page
+        assert "按动作归并的项目收口清单" in page
+        assert "系统级优先动作清单" in page
+        assert "可自动收口动作" in page
+        assert "只读诊断动作" in page
+        assert "必须人工处理动作" in page
+        assert "查看全部工作流" in page
+        assert "待收口" in page
+        assert "阻断" in page
+        assert "const renderGlobalActionGroupSummaries = (rows, activeFilter) => {" in page
+        assert (
+            "const renderGlobalActionGroupEmptyState = (title, rows, actionGroup, activeFilter) => {"
+            in page
+        )
+        assert (
+            "const findFocusWorkstreamStatusSummary = (rows, statusValue) => rows.find((item) => {"
+            in page
+        )
+        assert "const renderFocusWorkstreamFilters = (rows, summaries, activeFilter) => {" in page
+        assert "当前没有命中该状态的工作流。" in page
+        assert 'data-system-improvement-action-group-filter="all"' in page
+        assert 'data-system-improvement-workstream-filter="all"' in page
+        assert "formatSystemImprovementActionGroupFilterLabel('查看全部动作', totalCount)" in page
+        assert "formatSystemImprovementActionGroupFilterLabel(label, count)" in page
+        assert "formatSystemImprovementWorkstreamFilterLabel('查看全部工作流', totalCount)" in page
+        assert "工作流状态" in page
+        assert (
+            "const priorityWorkstreamTitle = String(summaryRow.priority_workstream_title || '').trim();"
+            in page
+        )
+        assert (
+            "const priorityActionLabel = String(summaryRow.priority_action_label || '').trim();"
+            in page
+        )
+        assert "建议优先工作流：" in page
+        assert "当前仅显示：" in page
+        assert "当前为空" in page
+        assert "执行方式：" in page
+        assert "分组依据：" in page
+        assert "优先依据：" in page
+        assert "排序优先依据：" in page
+        assert "const renderGlobalActionGapTable = (title, rows) => {" in page
+        assert "const renderOpsAgentQualitySummary = (summary) => {" in page
+        assert "自动巡检智能体质量" in page
+        assert (
+            "const manualConfirmationRows = Array.isArray(row.manual_confirmation_rows) ? row.manual_confirmation_rows : [];"
+            in page
+        )
+        assert "最近巡检轮次（通过/待收口/失败）" in page
+        assert "最近连续未通过轮次/人工确认轮次" in page
+        assert "当前主因标签/连续同主因轮次" in page
+        assert "当前主因项目" in page
+        assert "当前人工确认项目" in page
+        assert "人工确认复验审计" in page
+        assert "复验前：" in page
+        assert "复验摘要：" in page
+        assert "变化：" in page
+        assert "执行一键闭环复验人工确认结果" in page
+        assert "已自动高亮“一键闭环执行”按钮，可直接复验人工确认后的学习/校准状态。" in page
+        assert "const entrypointHtml = renderSystemImprovementEntrypoint(detailRow);" in page
+        assert "建议入口" in page
+        assert "系统当前建议：" in page
+        assert "confirm_extreme_sample=1" in page
+        assert "请先在“施组文件”下拉中选择步骤4已上传施组，再录入真实评标。" in page
+        assert "最近主因分布" in page
+        assert "历史自动修复成功率/自动学习成功率" in page
+        assert "最近巡检质量审计" in page
+        assert "人工确认需求/复验失败" in page
+        assert "Bootstrap 监控/低质量账号池" in page
+        assert "function setDataHygieneResult(summary, details, isError)" in page
+        assert "function renderDataHygienePanel(payload)" in page
+        assert "window.renderDataHygienePanel = renderDataHygienePanel;" in page
+        assert "async function runSystemDataHygiene()" in page
+        assert "safeClick('btnSelfCheck'" in page
+        assert "/system/self_check" in page
+        assert "/system/improvement_overview" in page
+        assert "/system/data_hygiene" in page
+        assert "/evaluation/summary" in page
+        assert "function syncProjectSelectionUrl(projectId='')" in page
+        assert 'id="section-expert-profile"' in page
+        assert 'id="section-learning-evolution"' in page
+        assert (
+            "const focusWorkstreams = Array.isArray(data.focus_workstreams) ? data.focus_workstreams : [];"
+            in page
+        )
+        assert "const systemImprovementEntrypointMeta = (key) => {" in page
+        assert "if (raw === 'system_self_check') {" in page
+        assert (
+            "return { sectionId: 'section-learning-evolution', focusId: 'btnSelfCheck' };" in page
+        )
+        assert (
+            "if (raw === 'system_data_hygiene') return { sectionId: 'section-learning-evolution', focusId: 'btnDataHygiene' };"
+            in page
+        )
+        assert "function ensureSystemImprovementProjectSelection(projectId, projectName='')" in page
+        assert (
+            "function renderSystemImprovementEntrypointActionHint(entrypointKey, projectName='', entrypointLabel='', actionLabel='')"
+            in page
+        )
+        assert (
+            "async function navigateSystemImprovementWorkstream(projectId, projectName, entrypointKey, entrypointLabel='', actionLabel='')"
+            in page
+        )
+        assert "function clearSystemClosureEntrypointActionFocus()" in page
+        assert "function focusSystemClosureEntrypointAction(key)" in page
+        assert "window.__systemClosureEntrypointActionQueueTimer" in page
+        assert "target.closest('button[data-system-improvement-workstream-filter]')" in page
+        assert "target.closest('button[data-system-improvement-action-group-filter]')" in page
+        assert "target.closest('a[data-system-improvement-workstream]')" in page
+        assert 'data-system-improvement-workstream="1"' in page
+        assert 'data-action-label="' in page
+        assert 'data-project-id="' in page
+        assert 'data-project-name="' in page
+        assert "await refreshProjects(targetProjectId, {" in page
+        assert "await onProjectChanged({ skipClosureSummaryRefresh: true });" in page
+        assert (
+            "renderProjectSelectionClosureHint(systemClosureSummaryState, targetProjectId);" in page
+        )
+        assert "focusSystemClosureEntrypoint(key);" in page
+        assert "focusSystemClosureEntrypointAction(key);" in page
+        assert "target.scrollIntoView({ behavior: 'auto', block: 'center' });" in page
+        assert "focusSystemClosureEntrypoint('auto_run_reflection');" in page
+        assert "await loadFeedbackGovernancePanel(projectId, {" in page
+        assert "await refreshSystemImprovementOverview({" in page
+        assert "silent: true," in page
+        assert "renderSystemClosureActionHint('evolveResult', closureSummary, projectId, {" in page
+        assert (
+            "renderSystemClosureActionHint('calibTrainResult', closureSummary, projectId, {" in page
+        )
+        assert "focusSystemClosureEntrypoint(closureSummary.next_step_entrypoint_key);" in page
+        assert "clearSystemClosureActionHint('evolveResult');" in page
+        assert "clearSystemClosureActionHint('calibTrainResult');" in page
+        assert "function safeClick0(id, fn) {" in page
+        assert "function buttonBusy(target) {" in page
+        assert "function setButtonBusyState(target, busy, options=null) {" in page
+        assert "el.setAttribute('aria-busy', 'true');" in page
+        assert "el.classList.add('button-busy');" in page
+        assert "el.classList.remove('button-busy');" in page
+        assert "function safeChange0(id, fn) {" in page
+        assert "safeChange0('groundTruthOtherProject', refreshGroundTruth);" in page
+        assert "safeClick0('btnRefreshGroundTruth', refreshGroundTruth);" in page
+        assert "safeClick0('btnWeightsApply', applyExpertProfileAndRescore);" in page
+        assert "safeClick0('btnStartNewProject', startNewProjectIntake);" in page
+        assert "safeClick0('btnRenameProject', renameCurrentProject);" in page
+        assert "safeChange0('projectSelect', onProjectChanged);" in page
+        assert "safeClick0('btnSelectProjectBySearch', locateProjectBySearch);" in page
+        assert "safeClick0('btnScoringFactors', loadScoringFactorsOverview);" in page
+        assert "safeClick0('btnScoringFactorsMd', loadScoringFactorsMarkdown);" in page
+        assert "safeClick0('btnAnalysisBundle', loadProjectAnalysisBundle);" in page
+        assert "safeClick0('btnAnalysisBundleDownload', downloadProjectAnalysisBundle);" in page
+        assert "section.scrollIntoView({ behavior: 'auto', block: 'start' });" in page
+        assert "syncProjectSelectionUrl(selectedId);" in page
+        assert "setSystemImprovementActionGroupFilter('all', false);" in page
+        assert "setSystemImprovementWorkstreamFilter('all', false);" in page
+        assert "继续完善工作流" in page
+        assert "系统总封关未通过门清单" in page
+        assert "逐项目收口清单" in page
+        assert "系统继续完善总览" in page
+        assert "function renderTrialPreflightPanel(payload)" in page
+        assert "/trial_preflight" in page
+        assert "/trial_preflight.md" in page
+        assert "/trial_preflight.docx" in page
+        assert (
+            "const signoff = (data.signoff && typeof data.signoff === 'object') ? data.signoff : {};"
+            in page
+        )
+        assert (
+            "const warningDetails = (data.warning_details && typeof data.warning_details === 'object') ? data.warning_details : {};"
+            in page
+        )
+        assert (
+            "const recordDraft = (data.record_draft && typeof data.record_draft === 'object') ? data.record_draft : {};"
+            in page
+        )
+        assert "const verificationChecklist = Array.isArray(signoff.verification_checklist)" in page
+        assert (
+            "const topHighSeverityConflicts = Array.isArray(warningDetails.high_severity_material_conflicts)"
+            in page
+        )
+        assert "const warningAckItems = Array.isArray(recordDraft.warning_ack_items)" in page
+        assert "签发决策：" in page
+        assert "风险级别：" in page
+        assert "签发摘要：" in page
+        assert "核验清单" in page
+        assert "试车记录草案（待确认）" in page
+        assert "重点警告明细" in page
+        assert "高严重度资料冲突清单" in page
+        assert "冲突处理建议" in page
+        assert "建议处理" in page
+        assert "const entrypointLabel = String(row.entrypoint_label || '').trim();" in page
+        assert (
+            "const entrypointKey = String(row.entrypoint_key || 'upload_shigong').trim() || 'upload_shigong';"
+            in page
+        )
+        assert (
+            "const entrypointReasonLabel = String(row.entrypoint_reason_label || '').trim();"
+            in page
+        )
+        assert "const materialType = String(row.material_type || '').trim();" in page
+        assert (
+            "const materialReviewEntryLabel = String(row.material_review_entrypoint_label || '').trim();"
+            in page
+        )
+        assert (
+            "const materialReviewReasonLabel = String(row.material_review_reason_label || '').trim();"
+            in page
+        )
+        assert (
+            "const materialReviewEntryAnchor = String(row.material_review_entrypoint_anchor || '').trim()"
+            in page
+        )
+        assert "const actionLabel = String(row.action_label || '').trim();" in page
+        assert "推荐入口依据：" in page
+        assert "资料核对依据：" in page
+        assert 'data-trial-preflight-entry="shigong_update"' in page
+        assert 'data-trial-preflight-entry="material_review"' in page
+        assert 'data-material-entry-label="' in page
+        assert 'data-material-entry-reason-label="' in page
+        assert "function materialTypeUploadButtonId(materialType)" in page
+        assert "function materialTrialPreflightHintButtonId(materialType)" in page
+        assert "function materialTrialPreflightBadgeId(materialType)" in page
+        assert (
+            "function materialTrialPreflightPriorityLabel(materialType, entrypointLabel='')" in page
+        )
+        assert "function materialTrialPreflightHintLabel(materialType)" in page
+        assert "function setMaterialTrialPreflightButtonHint(materialType='')" in page
+        assert (
+            "function setMaterialTrialPreflightActionBadge(materialType='', entrypointLabel='')"
+            in page
+        )
+        assert "let materialTrialPreflightFollowUpState = null;" in page
+        assert (
+            "function setMaterialTrialPreflightFollowUp(entrypointLabel='', entrypointReasonLabel='')"
+            in page
+        )
+        assert "function materialTrialPreflightFollowUpSummary()" in page
+        assert "function materialTrialPreflightFollowUpEntryKey(entrypointLabel='')" in page
+        assert (
+            "function materialTrialPreflightFollowUpActionLabel(entrypointLabel='', entrypointReasonLabel='', promoted=false)"
+            in page
+        )
+        assert (
+            "function setMaterialTrialPreflightHint(entrypointLabel='', entrypointReasonLabel='')"
+            in page
+        )
+        assert (
+            "function setMaterialTrialPreflightFollowUpHint(entrypointLabel='', entrypointReasonLabel='')"
+            in page
+        )
+        assert (
+            "function setMaterialTrialPreflightFollowUpAction(entrypointLabel='', entrypointReasonLabel='', promoted=false)"
+            in page
+        )
+        assert "function focusMaterialTrialPreflightFollowUpAction()" in page
+        assert "function clearTrialPreflightEntrypointFocus()" in page
+        assert "function markTrialPreflightEntrypointFocus(el, styleConfig)" in page
+        assert (
+            "function focusMaterialUploadEntrypoint(materialType, entrypointLabel='', entrypointReasonLabel='')"
+            in page
+        )
+        assert (
+            "function focusShigongWorkspaceEntrypoint(entrypointKey, entrypointLabel, entrypointReasonLabel)"
+            in page
+        )
+        assert (
+            "function navigateTrialPreflightEntrypoint(kind, anchor, materialType, entrypointKey, entrypointLabel, entrypointReasonLabel, materialReviewEntryLabel, materialReviewReasonLabel)"
+            in page
+        )
+        assert "setMaterialTrialPreflightButtonHint(materialType);" in page
+        assert "setMaterialTrialPreflightButtonHint('');" in page
+        assert "setMaterialTrialPreflightActionBadge(materialType, entrypointLabel);" in page
+        assert "setMaterialTrialPreflightActionBadge('', '');" in page
+        assert "setMaterialTrialPreflightFollowUp(entrypointLabel, entrypointReasonLabel);" in page
+        assert "setMaterialTrialPreflightFollowUp('', '');" in page
+        assert "setMaterialTrialPreflightHint(entrypointLabel, entrypointReasonLabel);" in page
+        assert "setMaterialTrialPreflightHint('', '');" in page
+        assert "setMaterialTrialPreflightFollowUpHint('', '');" in page
+        assert (
+            "setMaterialTrialPreflightFollowUpAction(entrypointLabel, entrypointReasonLabel, false);"
+            in page
+        )
+        assert "setMaterialTrialPreflightFollowUpAction('', '');" in page
+        assert "actionEl.classList.toggle('secondary', !promoted);" in page
+        assert "actionEl.classList.toggle('trial-follow-up-promoted', promoted);" in page
+        assert "focusMaterialTrialPreflightFollowUpAction();" in page
+        assert "const gateSummary = document.getElementById('shigongGateSummary');" in page
+        assert "const actionStatus = document.getElementById('shigongActionStatus');" in page
+        assert "setShigongTrialPreflightButtonHints(key, entrypointLabel);" in page
+        assert "setShigongTrialPreflightButtonHints('', '');" in page
+        assert "setShigongTrialPreflightActionBadge(key, entrypointLabel);" in page
+        assert "setShigongTrialPreflightActionBadge('', '');" in page
+        assert "setShigongTrialPreflightHint(entrypointLabel, entrypointReasonLabel);" in page
+        assert "setShigongTrialPreflightHint('', '');" in page
+        assert "setShigongTrialPreflightState('', '', '');" in page
+        assert "setShigongTrialPreflightState(key, entrypointLabel, entrypointReasonLabel);" in page
+        assert (
+            "if (okCount > 0 && visibleConfirmed) promoteShigongTrialPreflightAfterUpload();"
+            in page
+        )
+        assert "markTrialPreflightEntrypointFocus(section, {" in page
+        assert "markTrialPreflightEntrypointFocus(primaryButton, {" in page
+        assert "markTrialPreflightEntrypointFocus(gateSummary, {" in page
+        assert "markTrialPreflightEntrypointFocus(actionStatus, {" in page
+        assert (
+            "return focusShigongWorkspaceEntrypoint(entrypointKey, entrypointLabel, entrypointReasonLabel);"
+            in page
+        )
+        assert 'data-entrypoint-label="' in page
+        assert 'data-entrypoint-reason-label="' in page
+        assert "target.closest('a[data-trial-preflight-entry]')" in page
+        assert "trialPreflightResultEl.addEventListener('click', (event) => {" in page
+        assert "记录状态" in page
+        assert "建议试车时间" in page
+        assert "需确认警告项" in page
+        assert "建议优先动作：" in page
+        assert "试车报告下载准备中..." in page
+        assert "试车报告 DOCX 下载准备中..." in page
+        assert "试车前综合体检报告下载已触发。" in page
+        assert "试车前综合体检 DOCX 报告下载已触发。" in page
         assert "function updateShigongGateSummary" in page
         assert "function materialTypeUploadAnchor" in page
         assert "function applyMaterialUploadZoneHighlights" in page
@@ -1234,6 +5839,78 @@ class TestIndexEndpoint:
         assert "parse_stage_label" in page
         assert "parse_route_label" in page
         assert "queue_position" in page
+        assert "boq_saved_row_count" in page
+        assert "boq_resume_hit_rate" in page
+        assert "scheduler_project_continuity_bonus_hits" in page
+        assert "scheduler_active_project_bonus_hits" in page
+        assert "scheduler_claim_context_cache_hits" in page
+        assert "scheduler_status_core_cache_rebuilds" in page
+        assert "scheduler_cache_hit_total" in page
+        assert "scheduler_cache_hit_ratio" in page
+        assert "scheduler_project_cache_hit_total" in page
+        assert "scheduler_project_status_core_cache_hits" in page
+        assert "scheduler_project_cache_net_savings" in page
+        assert "scheduler_project_cache_state" in page
+        assert "scheduler_project_jobs_summary_cache_state" in page
+        assert "scheduler_project_cache_hot_layer_count" in page
+        assert "scheduler_project_recent_avoided_rebuild_layers" in page
+        assert "scheduler_project_recent_rebuilt_layers" in page
+        assert "scheduler_project_recent_request_window_size" in page
+        assert "scheduler_project_recent_cold_start_round_count" in page
+        assert "scheduler_project_recent_warming_round_count" in page
+        assert "scheduler_project_recent_steady_round_count" in page
+        assert "scheduler_project_recent_consecutive_steady_round_count" in page
+        assert "scheduler_project_recent_stable_hot_threshold" in page
+        assert "scheduler_project_recent_stable_hot" in page
+        assert "scheduler_project_recent_stable_hot_remaining_rounds" in page
+        assert "scheduler_project_recent_stable_hot_progress_completed_rounds" in page
+        assert "scheduler_project_recent_stable_hot_progress_label" in page
+        assert "scheduler_project_recent_stable_hot_progress_ratio" in page
+        assert "scheduler_project_recent_stable_hot_progress_percent" in page
+        assert "scheduler_project_recent_stable_hot_progress_percent_label" in page
+        assert "scheduler_project_recent_stable_hot_eta_hint" in page
+        assert "scheduler_project_recent_stable_hot_eta_short_label" in page
+        assert "scheduler_project_recent_stable_hot_progress_summary_label" in page
+        assert "scheduler_project_recent_stable_hot_badge_label" in page
+        assert "scheduler_project_recent_stable_hot_rule_label" in page
+        assert "scheduler_project_recent_window_state" in page
+        assert "scheduler_project_recent_avoided_rebuild_work_units" in page
+        assert "scheduler_project_recent_rebuilt_work_units" in page
+        assert "scheduler_project_recent_avoided_rebuild_work_units_avg" in page
+        assert "scheduler_project_recent_rebuilt_work_units_avg" in page
+        assert "detail.indexOf('force_unlock=true') >= 0" in page
+        assert "if (v == null) return null;" in page
+        assert "if (typeof v === 'string' && !v.trim()) return null;" in page
+        assert "检测到项目已锁定，正在解锁并继续重算..." in page
+        assert "预解析完成" in page
+        assert "后台仍在补全全文" in page
+        assert "BOQ 提速：" in page
+        assert "差量命中率" in page
+        assert "调度命中：" in page
+        assert "缓存命中：" in page
+        assert "缓存重建：" in page
+        assert "缓存总览：" in page
+        assert "缓存命中率" in page
+        assert "当前项目缓存：" in page
+        assert "净节省冷路径" in page
+        assert "状态 已转热" in page
+        assert "轮阶段：冷启动首轮" in page
+        assert "窗口状态 已稳定转热" in page
+        assert "连续稳定轮询 " in page
+        assert "已达到稳定转热阈值" in page
+        assert "还差 " in page
+        assert "稳定转热进度 " in page
+        assert "热态标签 " in page
+        assert "规则：" in page
+        assert "最近一轮避开重建：" in page
+        assert "最近一轮估算链路成本：" in page
+        assert "轮平均链路成本：避开 " in page
+        assert "缓存分层：" in page
+        assert "schedulerProjectJobsSummaryCacheState" in page
+        assert "活跃项目命中" in page
+        assert "同项目接力" in page
+        assert "follow-up full 接力" in page
+        assert "配额耗尽 项目" in page
         assert "确认删除该资料文件？\\n\\n" in page
         assert "PROJECT_AUTO_REFRESH_INTERVAL_MS" in page
         assert "visibilitychange" in page
@@ -1249,11 +5926,13 @@ class TestIndexEndpoint:
         assert "支撑较强维度" in page
         assert "证据薄弱维度" in page
         assert "维度支撑明细（16维）" in page
-        assert "评分置信度" in page
+        assert "评分置信等级（内部指数）" in page
+        assert "评分置信度" not in page
         assert "评分进化约束总览" in page
         assert "进化反馈约束" in page
         assert "高置信逻辑骨架约束" in page
         assert "当前有效权重（Top）" in page
+        assert "已关联评分记录" in page
 
     def test_index_frontend_has_no_broken_multiline_regex_literal(self, client):
         """Rendered JS should not contain regex literals split by line breaks (would break entire script)."""
@@ -1283,6 +5962,8 @@ class TestIndexEndpoint:
             "window.confirm(detail + '\n\n是否确认将该极端样本纳入本次「' + actionLabel + '」？');"
             not in page
         )
+        assert "window.confirm(detail + '\\n\\n是否确认解锁当前项目并继续重算？');" in page
+        assert "window.confirm(detail + '\n\n是否确认解锁当前项目并继续重算？');" not in page
 
     def test_index_frontend_binds_core_buttons_for_sections_5_6_7(self, client):
         """Core buttons in sections 5/6/7 should have safeClick bindings in generated page."""
@@ -1303,6 +5984,11 @@ class TestIndexEndpoint:
             "btnAdaptiveValidate",
             "btnAdaptiveApply",
             "btnEvolve",
+            "btnSelfCheck",
+            "btnSystemImprovementOverview",
+            "btnDataHygiene",
+            "btnEvalSummaryV2",
+            "btnTrialPreflight",
             "btnWritingGuidance",
             "btnCompilationInstructions",
             "btnRefreshGroundTruthSubmissionOptions",
@@ -1320,6 +6006,7 @@ class TestIndexEndpoint:
             "insightsResult",
             "learningResult",
             "scoringDiagnosticResult",
+            "trialPreflightResult",
             "evidenceTraceResult",
             "scoringBasisResult",
             "adaptiveResult",
@@ -1337,10 +6024,145 @@ class TestIndexEndpoint:
         response = client.get("/")
         assert response.status_code == 200
         page = response.text
-        assert '<button type="submit" id="btnUploadMaterials">上传资料</button>' in page
-        assert 'id="btnUploadShigong" name="submit_action" value="upload">上传施组</button>' in page
         assert (
-            'id="btnScoreShigong" class="secondary" formaction="/web/score_shigong" name="submit_action" value="score">评分施组</button>'
+            '<button type="submit" id="btnUploadMaterials" data-loading-label="上传资料中...">上传资料</button>'
+            in page
+        )
+        assert (
+            'id="btnUploadMaterialsBadge" class="status-badge-warning" style="display:none"></span>'
+            in page
+        )
+        assert 'id="btnUploadMaterialsHint" class="note" style="display:none"></span>' in page
+        assert (
+            'id="btnUploadBoqBadge" class="status-badge-warning" style="display:none"></span>'
+            in page
+        )
+        assert 'id="btnUploadBoqHint" class="note" style="display:none"></span>' in page
+        assert (
+            'id="btnUploadDrawingBadge" class="status-badge-warning" style="display:none"></span>'
+            in page
+        )
+        assert 'id="btnUploadDrawingHint" class="note" style="display:none"></span>' in page
+        assert (
+            'id="btnUploadSitePhotosBadge" class="status-badge-warning" style="display:none"></span>'
+            in page
+        )
+        assert 'id="btnUploadSitePhotosHint" class="note" style="display:none"></span>' in page
+        assert 'id="materialsTrialPreflightHint" style="display:none' in page
+        assert (
+            'id="materialsTrialPreflightFollowUpAction" class="secondary" style="display:none'
+            in page
+        )
+        assert (
+            'id="btnUploadShigong" name="submit_action" value="upload" data-loading-label="上传施组中...">上传施组</button>'
+            in page
+        )
+        assert 'id="btnUploadShigongHint" class="note" style="display:none"></span>' in page
+        assert (
+            'id="btnScoreShigong" class="secondary" formaction="/web/score_shigong" name="submit_action" value="score" data-default-label="评分施组" data-locked-label="评分施组（确认后重算）" data-loading-label="评分施组中...">评分施组</button>'
+            in page
+        )
+        assert 'id="btnScoreShigongHint" class="note" style="display:none"></span>' in page
+        assert "button.secondary.button-lock-emphasis" in page
+        assert 'id="shigongTrialPreflightBadge"' in page
+        assert (
+            'id="shigongTrialPreflightBadge" class="status-badge-warning" style="display:none"></span>'
+            in page
+        )
+        assert 'id="shigongScoreLockBadge"' in page
+        assert 'class="status-badge-warning"' in page
+        assert (
+            'id="shigongScoreLockBadge" class="status-badge-warning" style="display:none"' in page
+        )
+        assert "锁定项目可确认后重算" in page
+        assert 'id="shigongScoreLockHint"' in page
+        assert 'class="status-callout"' in page
+        assert 'id="shigongScoreLockHint" class="status-callout" style="display:none"' in page
+        assert 'id="shigongTrialPreflightHint" style="display:none' in page
+        assert "锁定说明：" in page
+        assert (
+            "若项目已进入青天评标阶段，点击“评分施组”后会先提示确认；确认后系统会自动解锁并继续重算，无需删除项目。"
+            in page
+        )
+        assert (
+            "function shigongTrialPreflightPriorityLabel(entrypointKey, entrypointLabel='')" in page
+        )
+        assert (
+            "function setShigongTrialPreflightActionBadge(entrypointKey='', entrypointLabel='')"
+            in page
+        )
+        assert (
+            "function setShigongTrialPreflightButtonHints(entrypointKey='', entrypointLabel='')"
+            in page
+        )
+        assert "let shigongTrialPreflightState = null;" in page
+        assert (
+            "function setShigongTrialPreflightState(entrypointKey='', entrypointLabel='', entrypointReasonLabel='')"
+            in page
+        )
+        assert "function promoteShigongTrialPreflightAfterUpload()" in page
+        assert "const badgeEl = document.getElementById('shigongTrialPreflightBadge');" in page
+        assert "const uploadHintEl = document.getElementById('btnUploadShigongHint');" in page
+        assert "const scoreHintEl = document.getElementById('btnScoreShigongHint');" in page
+        assert "建议先核对招标文件和答疑" in page
+        assert "建议先核对清单" in page
+        assert "建议先核对图纸" in page
+        assert "建议先核对现场照片" in page
+        assert "优先：核对招标文件和答疑" in page
+        assert "优先：核对清单" in page
+        assert "优先：核对图纸" in page
+        assert "优先：核对现场照片" in page
+        assert "试车下一步：" in page
+        assert "完成本步后：" in page
+        assert "继续处理施组：" in page
+        assert "const hintEl = document.getElementById('materialsTrialPreflightHint');" in page
+        assert (
+            "const actionEl = document.getElementById('materialsTrialPreflightFollowUpAction');"
+            in page
+        )
+        assert "actionEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });" in page
+        assert "button.trial-follow-up-promoted" in page
+        assert (
+            "const materialsTrialPreflightFollowUpActionEl = document.getElementById('materialsTrialPreflightFollowUpAction');"
+            in page
+        )
+        assert (
+            "materialsTrialPreflightFollowUpActionEl.addEventListener('click', (event) => {" in page
+        )
+        assert "优先：上传新版施组" in page
+        assert "优先：评分施组" in page
+        assert "建议先上传新版" in page
+        assert "建议直接评分" in page
+        assert "新版施组已显示到列表，可直接继续评分。" in page
+        assert (
+            "function setShigongTrialPreflightHint(entrypointLabel='', entrypointReasonLabel='')"
+            in page
+        )
+        assert "const hintEl = document.getElementById('shigongTrialPreflightHint');" in page
+        assert "当前建议：" in page
+        assert "原因：" in page
+        assert "function setShigongScoreLockNotice(locked=false)" in page
+        assert "scoreBtn.classList.toggle('button-lock-emphasis', visible);" in page
+        assert (
+            "const defaultLabel = String(scoreBtn.dataset.defaultLabel || '评分施组').trim() || '评分施组';"
+            in page
+        )
+        assert "activeLabel = visible ? lockedLabel : defaultLabel;" in page
+        assert "scoreBtn.textContent = activeLabel;" in page
+        assert "function currentScoreShigongActionLabel()" in page
+        assert "const currentLabel = String(scoreBtn.textContent || '').trim();" in page
+        assert "const statusEl = document.getElementById('shigongActionStatus');" in page
+        assert "currentStatus.indexOf('待机：可上传施组或点击“') === 0" in page
+        assert "statusEl.textContent = '待机：可上传施组或点击“' + activeLabel + '”。';" in page
+        assert "setShigongScoreLockNotice(false);" in page
+        assert "setShigongScoreLockNotice(expertProfileLocked);" in page
+        assert "待机：可上传施组或点击“' + currentScoreShigongActionLabel() + '”。" in page
+        assert (
+            "评分前置已满足，可直接点击“' + escapeHtmlText(currentScoreShigongActionLabel()) + '”。"
+            in page
+        )
+        assert (
+            "已满足评分条件，可点击“' + escapeHtmlText(currentScoreShigongActionLabel()) + '”。"
             in page
         )
         assert "btnUploadMaterials: { resultId: 'materialsActionStatus'" in page
@@ -1349,6 +6171,118 @@ class TestIndexEndpoint:
         assert "btnUploadSitePhotos: { resultId: 'materialsActionStatusPhoto'" in page
         assert "btnUploadShigong: { resultId: 'shigongActionStatus'" in page
         assert "btnScoreShigong: { resultId: 'shigongActionStatus'" in page
+        assert (
+            'id="btnSelfCheck" class="secondary" '
+            'onclick="return window.__zhifeiFallbackClick(event, '
+            "'btnSelfCheck')\"" in page
+        )
+        assert (
+            'id="btnSystemImprovementOverview" class="secondary" '
+            'onclick="return window.__zhifeiFallbackClick(event, '
+            "'btnSystemImprovementOverview')\"" in page
+        )
+        assert (
+            'id="btnDataHygiene" class="secondary" '
+            'onclick="return window.__zhifeiFallbackClick(event, '
+            "'btnDataHygiene')\"" in page
+        )
+        assert (
+            'id="btnEvalSummaryV2" class="secondary" '
+            'onclick="return window.__zhifeiFallbackClick(event, '
+            "'btnEvalSummaryV2')\"" in page
+        )
+        assert (
+            'id="btnTrialPreflightDownload" class="secondary" '
+            'onclick="return window.__zhifeiFallbackClick(event, '
+            "'btnTrialPreflightDownload')\"" in page
+        )
+        assert (
+            'id="btnTrialPreflightDownloadDocx" class="secondary" '
+            'onclick="return window.__zhifeiFallbackClick(event, '
+            "'btnTrialPreflightDownloadDocx')\"" in page
+        )
+        assert (
+            'id="btnWritingGuidanceDownload" class="secondary" '
+            'onclick="return window.__zhifeiFallbackClick(event, '
+            "'btnWritingGuidanceDownload')\"" in page
+        )
+        assert (
+            'id="btnWritingGuidancePatchBundleDownload" class="secondary" '
+            'onclick="return window.__zhifeiFallbackClick(event, '
+            "'btnWritingGuidancePatchBundleDownload')\"" in page
+        )
+        assert (
+            'id="btnWritingGuidancePatchBundleDownloadDocx" class="secondary" '
+            'onclick="return window.__zhifeiFallbackClick(event, '
+            "'btnWritingGuidancePatchBundleDownloadDocx')\"" in page
+        )
+        assert "btnSelfCheck: { resultId: 'selfCheckResult'" in page
+        assert "btnSystemImprovementOverview: { resultId: 'systemImprovementResult'" in page
+        assert "btnDataHygiene: { resultId: 'dataHygieneResult'" in page
+        assert "btnEvalSummaryV2: { resultId: 'evalResult'" in page
+        assert "btnTrialPreflightDownload: { resultId: 'trialPreflightResult'" in page
+        assert "btnTrialPreflightDownloadDocx: { resultId: 'trialPreflightResult'" in page
+        assert "btnMaterialDepthReportDownload: { resultId: 'materialDepthReportResult'" in page
+        assert (
+            "btnMaterialKnowledgeProfileDownload: { resultId: 'materialKnowledgeProfileResult'"
+            in page
+        )
+        assert "btnWritingGuidanceDownload: { resultId: 'guidanceResult'" in page
+        assert "btnWritingGuidancePatchBundleDownload: { resultId: 'guidanceResult'" in page
+        assert "btnWritingGuidancePatchBundleDownloadDocx: { resultId: 'guidanceResult'" in page
+        assert "function secureDesktopEnabled() {" in page
+        assert "if (secureDesktopEnabled()) {" in page
+        assert "if (!secureDesktopEnabled()) {" in page
+        assert "safeClick('btnMaterialDepthReportDownload'" in page
+        assert "safeClick('btnMaterialKnowledgeProfileDownload'" in page
+        assert (
+            "safeClick('btnMaterialDepthReportDownload', async () => {\n"
+            "          if (secureDesktopEnabled()) {" in page
+        )
+        assert (
+            "safeClick('btnMaterialKnowledgeProfileDownload', async () => {\n"
+            "          if (secureDesktopEnabled()) {" in page
+        )
+        assert "loading: '系统自检执行中...'" in page
+        assert "loading: '系统继续完善总览生成中...'" in page
+        assert "loading: '数据卫生巡检中...'" in page
+        assert "loading: '跨项目汇总评估中...'" in page
+        assert "loading: '体检报告下载准备中...'" in page
+        assert "loading: '知识画像下载准备中...'" in page
+        assert "loading: '试车报告下载准备中...'" in page
+        assert "loading: '试车报告 DOCX 下载准备中...'" in page
+        assert "loading: '编制指导下载准备中...'" in page
+        assert "loading: '改写补丁包下载准备中...'" in page
+        assert "loading: '改写补丁包 DOCX 下载准备中...'" in page
+        assert "safeClick('btnSelfCheck'" in page
+        assert "safeClick('btnSystemImprovementOverview'" in page
+        assert "safeClick('btnDataHygiene'" in page
+        assert "safeClick('btnEvalSummaryV2'" in page
+        assert "const FALLBACK_PROJECTLESS_ACTION_IDS = new Set([" in page
+        assert "function fallbackActionRequiresProject(actionId) {" in page
+        assert "if (fallbackActionRequiresProject(actionId) && !projectId) {" in page
+        assert "if (actionId === 'btnSelfCheck')" in page
+        assert "if (actionId === 'btnDataHygiene')" in page
+        assert "if (actionId === 'btnEvalSummaryV2')" in page
+        assert "if (actionId === 'btnTrialPreflightDownload')" in page
+        assert "if (actionId === 'btnTrialPreflightDownloadDocx')" in page
+        assert "if (actionId === 'btnWritingGuidancePatchBundleDownload')" in page
+        assert "if (actionId === 'btnWritingGuidancePatchBundleDownloadDocx')" in page
+        assert "a.download = 'trial_preflight_' + projectId + '.md';" in page
+        assert "a.download = 'trial_preflight_' + projectId + '.docx';" in page
+        assert "a.download = 'writing_guidance_patch_bundle_' + projectId + '.md';" in page
+        assert "a.download = 'writing_guidance_patch_bundle_' + projectId + '.docx';" in page
+        assert "setResult(cfg.resultId, '试车前综合体检报告下载已触发。', false);" in page
+        assert "setResult(cfg.resultId, '试车前综合体检 DOCX 报告下载已触发。', false);" in page
+        assert "setResult(cfg.resultId, '改写补丁包 Markdown 下载已触发。', false);" in page
+        assert "setResult(cfg.resultId, '改写补丁包 DOCX 下载已触发。', false);" in page
+        assert "fallbackSetResult(cfg.resultId, '试车前综合体检报告下载已触发。', false);" in page
+        assert "fallbackSetResult(cfg.resultId, '改写补丁包 DOCX 下载已触发。', false);" in page
+        assert (
+            "fallbackSetResult(cfg.resultId, '试车前综合体检 DOCX 报告下载已触发。', false);"
+            in page
+        )
+        assert "fallbackSetResult(cfg.resultId, '改写补丁包 Markdown 下载已触发。', false);" in page
         assert 'id="btnOptimizationReport" class="secondary">满分优化清单（逐页）</button>' in page
         assert "safeClick('btnUploadMaterials', uploadMaterialsAction);" not in page
         assert "safeClick('btnUploadShigong', uploadShigongAction);" not in page
@@ -2051,6 +6985,51 @@ class TestProjectsEndpoints:
         assert response.status_code == 422
         assert response.json()["detail"] == "项目名称已存在，请更换名称"
 
+    @patch("app.main.save_expert_profiles")
+    @patch("app.main.load_expert_profiles")
+    @patch("app.main.save_projects")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_rename_project_syncs_default_profile_name(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_save_projects,
+        mock_load_profiles,
+        mock_save_profiles,
+        client,
+    ):
+        mock_load_projects.return_value = [
+            {
+                "id": "p1",
+                "name": "塘册中心老旧小区改造工程招标",
+                "meta": {},
+                "expert_profile_id": "ep1",
+                "created_at": "2026-04-02T00:00:00+00:00",
+                "updated_at": "2026-04-02T00:00:00+00:00",
+            }
+        ]
+        mock_load_profiles.return_value = [
+            {
+                "id": "ep1",
+                "name": "塘册中心老旧小区改造工程招标 默认配置",
+                "weights_raw": {f"{i:02d}": 5 for i in range(1, 17)},
+                "created_at": "2026-04-02T00:00:00+00:00",
+                "updated_at": "2026-04-02T00:00:00+00:00",
+            }
+        ]
+
+        response = client.put(
+            "/api/v1/projects/p1",
+            json={"name": "塘岗中心老旧小区改造工程招标"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["name"] == "塘岗中心老旧小区改造工程招标"
+        assert mock_load_profiles.return_value[0]["name"] == "塘岗中心老旧小区改造工程招标 默认配置"
+        mock_save_projects.assert_called_once()
+        mock_save_profiles.assert_called_once()
+
     @patch("app.main.upload_material")
     @patch("app.main.save_projects")
     @patch("app.main.load_projects")
@@ -2298,11 +7277,458 @@ class TestProjectsEndpoints:
         mock_preview.assert_called_once_with(
             b"%PDF-1.4\n",
             "招标文件.pdf",
+            material_type="tender_qa",
             max_pages=10,
             max_chars=32000,
             ocr_pages=3,
             stop_when_project_name_found=True,
         )
+
+    def test_extract_pdf_text_preview_stops_early_when_tender_signals_are_sufficient(self):
+        class _FakePage:
+            def __init__(self, text: str):
+                self._text = text
+
+            def get_text(self):
+                return self._text
+
+        class _FakeDoc:
+            def __init__(self, pages):
+                self._pages = pages
+
+            def __iter__(self):
+                return iter(self._pages)
+
+            def close(self):
+                return None
+
+        fake_doc = _FakeDoc(
+            [
+                _FakePage(
+                    "第一章 施工组织设计总体部署\n"
+                    "第二章 质量管理与验收标准\n"
+                    "第三章 进度计划与节点控制\n"
+                    + (
+                        "本章说明项目总体部署、施工顺序、资源投入、质量控制、安全文明与节点安排。\n"
+                        * 18
+                    )
+                ),
+                _FakePage(
+                    "第四章 评分办法\n"
+                    "工期120日历天，质量90分，安全文明80分。\n"
+                    "投标文件必须响应关键节点，不得缺少专项方案。\n"
+                    "评分、评审、加分、扣分均按条款执行。"
+                    + (
+                        "\n评分细则要求体现BIM深化、危大工程专项方案、质量验收、进度里程碑与安全文明措施。"
+                        * 14
+                    )
+                ),
+                _FakePage("不应再继续扫描到这一页"),
+            ]
+        )
+
+        with patch("app.main.pymupdf") as mock_pymupdf, patch(
+            "app.main._score_ocr_text_candidate", return_value=5.0
+        ):
+            mock_pymupdf.open.return_value = fake_doc
+            preview = app_main._extract_pdf_text_preview(
+                b"%PDF-1.4\n",
+                "招标文件.pdf",
+                material_type="tender_qa",
+                max_pages=6,
+                max_chars=32000,
+                ocr_pages=0,
+                stop_when_project_name_found=False,
+            )
+
+        assert "[PAGE:1]" in preview
+        assert "[PAGE:2]" in preview
+        assert "[PAGE:3]" not in preview
+        assert "不应再继续扫描到这一页" not in preview
+
+    def test_extract_pdf_text_preview_stops_early_when_boq_signals_are_sufficient(self):
+        class _FakePage:
+            def __init__(self, text: str):
+                self._text = text
+
+            def get_text(self):
+                return self._text
+
+        class _FakeDoc:
+            def __init__(self, pages):
+                self._pages = pages
+
+            def __iter__(self):
+                return iter(self._pages)
+
+            def close(self):
+                return None
+
+        fake_doc = _FakeDoc(
+            [
+                _FakePage(
+                    "项目编码 项目名称 单位 工程量 综合单价 合价\n"
+                    + "\n".join(
+                        f"0101{i:03d} 土方开挖{i} m3 {100+i} {30+i} {(100+i)*(30+i)}"
+                        for i in range(1, 18)
+                    )
+                ),
+                _FakePage(
+                    "项目编码 项目名称 单位 工程量 综合单价 合价\n"
+                    + "\n".join(
+                        f"0201{i:03d} 混凝土{i} m3 {80+i} {40+i} {(80+i)*(40+i)}"
+                        for i in range(1, 18)
+                    )
+                ),
+                _FakePage("不应再继续扫描到这一页"),
+            ]
+        )
+
+        with patch("app.main.pymupdf") as mock_pymupdf, patch(
+            "app.main._score_ocr_text_candidate", return_value=4.8
+        ):
+            mock_pymupdf.open.return_value = fake_doc
+            preview = app_main._extract_pdf_text_preview(
+                b"%PDF-1.4\n",
+                "工程量清单.pdf",
+                material_type="boq",
+                max_pages=6,
+                max_chars=32000,
+                ocr_pages=0,
+                stop_when_project_name_found=False,
+            )
+
+        assert "[PAGE:1]" in preview
+        assert "[PAGE:2]" in preview
+        assert "[PAGE:3]" not in preview
+        assert "不应再继续扫描到这一页" not in preview
+
+    def test_extract_pdf_text_stops_early_when_tender_full_parse_signals_are_sufficient(self):
+        class _FakePage:
+            def __init__(self, text: str):
+                self._text = text
+
+            def get_text(self):
+                return self._text
+
+        class _FakeDoc:
+            def __init__(self, pages):
+                self._pages = pages
+
+            def __iter__(self):
+                return iter(self._pages)
+
+            def close(self):
+                return None
+
+        repeated_intro = (
+            "施工组织设计总体部署 质量管理与验收标准 进度计划与节点控制 安全文明施工 "
+            "资源配置 危大工程专项方案 BIM 深化 "
+        ) * 14
+        scoring_page = (
+            "第四章 评分办法\n"
+            "评分细则：工期120日历天，质量90分，安全文明80分，专项方案加分。\n"
+            "投标文件必须响应关键节点，不得缺少危大工程专项方案。\n"
+        ) * 10
+        pages = [
+            _FakePage("第一章 招标公告\n" + repeated_intro),
+            _FakePage("第二章 投标人须知\n" + repeated_intro),
+            _FakePage("第三章 合同条款\n" + repeated_intro),
+            _FakePage(scoring_page),
+            _FakePage("不应继续扫描到这一页"),
+        ]
+
+        with patch("app.main.pymupdf") as mock_pymupdf, patch(
+            "app.main._score_ocr_text_candidate", return_value=4.8
+        ):
+            mock_pymupdf.open.return_value = _FakeDoc(pages)
+            text = app_main._extract_pdf_text(
+                b"%PDF-1.4\n",
+                "招标文件.pdf",
+                material_type="tender_qa",
+            )
+
+        assert "[PAGE:1]" in text
+        assert "[PAGE:4]" in text
+        assert "[PDF_EARLY_STOP_AFTER_PAGE:4] tender_qa_enough_signals" in text
+        assert "[PAGE:5]" not in text
+        assert "不应继续扫描到这一页" not in text
+
+    def test_extract_pdf_text_stops_early_when_boq_full_parse_signals_are_sufficient(self):
+        class _FakePage:
+            def __init__(self, text: str):
+                self._text = text
+
+            def get_text(self):
+                return self._text
+
+        class _FakeDoc:
+            def __init__(self, pages):
+                self._pages = pages
+
+            def __iter__(self):
+                return iter(self._pages)
+
+            def close(self):
+                return None
+
+        pages = [
+            _FakePage(
+                "项目编码 项目名称 单位 工程量 综合单价 合价\n"
+                + "\n".join(
+                    f"0101{i:03d} 土方开挖{i} m3 {100+i} {30+i} {(100+i)*(30+i)}"
+                    for i in range(1, 22)
+                )
+            ),
+            _FakePage(
+                "项目编码 项目名称 单位 工程量 综合单价 合价\n"
+                + "\n".join(
+                    f"0201{i:03d} 混凝土{i} m3 {80+i} {40+i} {(80+i)*(40+i)}" for i in range(1, 22)
+                )
+            ),
+            _FakePage(
+                "项目编码 项目名称 单位 工程量 综合单价 合价\n"
+                + "\n".join(
+                    f"0301{i:03d} 模板工程{i} ㎡ {60+i} {25+i} {(60+i)*(25+i)}"
+                    for i in range(1, 22)
+                )
+            ),
+            _FakePage("不应继续扫描到这一页"),
+        ]
+
+        with patch("app.main.pymupdf") as mock_pymupdf, patch(
+            "app.main._score_ocr_text_candidate", return_value=4.7
+        ):
+            mock_pymupdf.open.return_value = _FakeDoc(pages)
+            text = app_main._extract_pdf_text(
+                b"%PDF-1.4\n",
+                "工程量清单.pdf",
+                material_type="boq",
+            )
+
+        assert "[PAGE:1]" in text
+        assert "[PAGE:3]" in text
+        assert "[PDF_EARLY_STOP_AFTER_PAGE:3] boq_enough_signals" in text
+        assert "[PAGE:4]" not in text
+        assert "不应继续扫描到这一页" not in text
+
+    def test_build_boq_full_parse_text_resumes_pdf_from_preview_page(self):
+        from app.main import _build_boq_full_parse_text
+
+        class _FakePage:
+            def __init__(self, text: str):
+                self._text = text
+
+            def get_text(self):
+                return self._text
+
+        class _FakeDoc:
+            def __init__(self, pages):
+                self._pages = pages
+
+            def __iter__(self):
+                return iter(self._pages)
+
+            def close(self):
+                return None
+
+        pages = [
+            _FakePage(
+                "项目编码 项目名称 单位 工程量 综合单价 合价\n"
+                + "\n".join(
+                    f"0101{i:03d} 土方开挖{i} m3 {100+i} {30+i} {(100+i)*(30+i)}"
+                    for i in range(1, 22)
+                )
+            ),
+            _FakePage(
+                "项目编码 项目名称 单位 工程量 综合单价 合价\n"
+                + "\n".join(
+                    f"0201{i:03d} 混凝土{i} m3 {80+i} {40+i} {(80+i)*(40+i)}" for i in range(1, 22)
+                )
+            ),
+            _FakePage(
+                "项目编码 项目名称 单位 工程量 综合单价 合价\n"
+                + "\n".join(
+                    f"0301{i:03d} 模板工程{i} ㎡ {60+i} {25+i} {(60+i)*(25+i)}"
+                    for i in range(1, 22)
+                )
+            ),
+            _FakePage("不应继续扫描到这一页"),
+        ]
+        prior_text = "[PDF_BACKEND:pymupdf]\n" "[PAGE:1]\n第一页预解析\n\n" "[PAGE:2]\n第二页预解析"
+
+        with patch("app.main.pymupdf") as mock_pymupdf, patch(
+            "app.main._score_ocr_text_candidate", return_value=4.7
+        ):
+            mock_pymupdf.open.return_value = _FakeDoc(pages)
+            text = _build_boq_full_parse_text(
+                b"%PDF-1.4\n",
+                "工程量清单.pdf",
+                prior_text=prior_text,
+                prior_summary={"parse_stage": "preview", "preview_last_page": 2},
+            )
+
+        assert text.count("[PAGE:1]") == 1
+        assert text.count("[PAGE:2]") == 1
+        assert "[PAGE:3]" in text
+        assert "[PAGE:4]" not in text
+        assert "不应继续扫描到这一页" not in text
+
+    def test_extract_pdf_text_stops_early_when_drawing_full_parse_signals_are_sufficient(self):
+        class _FakePage:
+            def __init__(self, text: str):
+                self._text = text
+
+            def get_text(self):
+                return self._text
+
+        class _FakeDoc:
+            def __init__(self, pages):
+                self._pages = pages
+
+            def __iter__(self):
+                return iter(self._pages)
+
+            def close(self):
+                return None
+
+        pages = [
+            _FakePage(
+                "建筑总平面图 轴线1-8 标高3.500 净高2.900 机电综合 碰撞 净高复核 "
+                "节点详图 梁 板 柱 消防 风管 桥架"
+            ),
+            _FakePage(
+                "平面布置图 轴线A-F 标高4.200 管径DN65 综合管线 BIM 深化 节点 大样 "
+                "给排水 电气 暖通 设备机房"
+            ),
+            _FakePage(
+                "剖面图 立面图 标高6.000 节点详图 洞口 预留预埋 套管 " "消防喷淋 管径 DN100 梁板柱"
+            ),
+            _FakePage("不应继续扫描到这一页"),
+        ]
+
+        with patch("app.main.pymupdf") as mock_pymupdf, patch(
+            "app.main._score_ocr_text_candidate", return_value=4.8
+        ):
+            mock_pymupdf.open.return_value = _FakeDoc(pages)
+            text = app_main._extract_pdf_text(
+                b"%PDF-1.4\n",
+                "总图.pdf",
+                material_type="drawing",
+            )
+
+        assert "[PAGE:1]" in text
+        assert "[PAGE:3]" in text
+        assert "[PDF_EARLY_STOP_AFTER_PAGE:3] drawing_enough_signals" in text
+        assert "[PAGE:4]" not in text
+        assert "不应继续扫描到这一页" not in text
+
+    @patch("app.main._extract_pdf_text", return_value="[PDF_BACKEND:pymupdf]\nfull text")
+    def test_read_uploaded_file_content_passes_material_type_to_pdf_parser(self, mock_extract_pdf):
+        text = app_main._read_uploaded_file_content(
+            b"%PDF-1.4\n",
+            "招标文件.pdf",
+            material_type="tender_qa",
+        )
+
+        assert text == "[PDF_BACKEND:pymupdf]\nfull text"
+        mock_extract_pdf.assert_called_once_with(
+            b"%PDF-1.4\n",
+            "招标文件.pdf",
+            material_type="tender_qa",
+        )
+
+    def test_should_run_pdf_page_ocr_skips_non_empty_page_after_text_layer_confirmed(self):
+        analysis = {
+            "text": "附表A 进度计划 工期120天 质量90分 安全文明80分 " * 3,
+            "char_count": 72,
+            "score": 1.6,
+        }
+
+        should_ocr = app_main._should_run_pdf_page_ocr(
+            page_index=3,
+            page_analysis=analysis,
+            max_ocr_pages=3,
+            text_layer_confirmed=True,
+        )
+
+        assert should_ocr is False
+
+    def test_should_run_pdf_page_ocr_keeps_empty_page_eligible_after_text_layer_confirmed(self):
+        analysis = {
+            "text": "",
+            "char_count": 0,
+            "score": 0.0,
+        }
+
+        should_ocr = app_main._should_run_pdf_page_ocr(
+            page_index=3,
+            page_analysis=analysis,
+            max_ocr_pages=3,
+            text_layer_confirmed=True,
+        )
+
+        assert should_ocr is True
+
+    def test_extract_pdf_text_preview_skips_followup_ocr_after_text_layer_is_confirmed(self):
+        class _FakePixmap:
+            def tobytes(self, fmt: str):
+                return b"png"
+
+        class _FakePage:
+            def __init__(self, text: str):
+                self._text = text
+                self.get_pixmap = MagicMock(return_value=_FakePixmap())
+
+            def get_text(self):
+                return self._text
+
+        class _FakeDoc:
+            def __init__(self, pages):
+                self._pages = pages
+
+            def __iter__(self):
+                return iter(self._pages)
+
+            def close(self):
+                return None
+
+        strong_text = (
+            "施工组织设计总体部署 质量管理 进度计划 安全文明 资源配置 "
+            "危大工程 BIM 深化 关键节点 施工顺序 专项方案 "
+        ) * 24
+        weak_text = (
+            "附表A 进度计划 工期120天 质量90分 安全文明80分，"
+            "关键节点详见后附说明及分项安排，材料设备进场计划、劳动力投入计划、"
+            "质量验收节点与安全文明措施要求见附录。"
+        )
+        pages = [
+            _FakePage(strong_text),
+            _FakePage(strong_text),
+            _FakePage(weak_text),
+        ]
+        fake_doc = _FakeDoc(pages)
+
+        with patch("app.main.pymupdf") as mock_pymupdf, patch(
+            "app.main.pytesseract", MagicMock()
+        ), patch("app.main.Image", MagicMock()), patch(
+            "app.main._score_ocr_text_candidate",
+            side_effect=[4.8, 4.8, 1.4],
+        ):
+            mock_pymupdf.open.return_value = fake_doc
+            preview = app_main._extract_pdf_text_preview(
+                b"%PDF-1.4\n",
+                "综合说明.pdf",
+                material_type="site_photo",
+                max_pages=6,
+                max_chars=32000,
+                ocr_pages=3,
+                stop_when_project_name_found=False,
+            )
+
+        assert "[PAGE:3]" in preview
+        for page in pages:
+            page.get_pixmap.assert_not_called()
 
     def test_read_uploaded_file_preview_for_project_name_keeps_scanning_until_explicit_field(self):
         class _FakePage:
@@ -2387,6 +7813,84 @@ class TestProjectsEndpoints:
         assert (
             app_main._infer_project_name_from_tender_text(preview, "招标文件.pdf")
             == "蜀山区城区危房改造"
+        )
+
+    def test_infer_project_name_from_tender_applies_contextual_proper_noun_correction(self):
+        preview = """
+[PAGE:1]
+房建市政施工招标示范文本202501版
+塘册中心老旧小区改造工程招标
+[PAGE:2]
+第一章 招标公告
+塘岗中心老旧小区改造工程招标
+"""
+
+        assert (
+            app_main._infer_project_name_from_tender_text(preview, "招标文件.pdf")
+            == "塘岗中心老旧小区改造工程招标"
+        )
+
+    def test_infer_project_name_from_tender_prefers_more_specific_cover_title_when_semantic_base_matches(
+        self,
+    ):
+        preview = """
+[PAGE:1]
+塘岗中心老旧小区改造工程招标
+[PAGE:3]
+第一章 招标公告
+1.1 项目名称：塘岗中心老旧小区改造项目
+2.1 招标项目名称：塘岗中心老旧小区改造工程
+"""
+
+        assert (
+            app_main._infer_project_name_from_tender_text(preview, "招标文件.pdf")
+            == "塘岗中心老旧小区改造工程招标"
+        )
+
+    def test_read_uploaded_file_preview_for_project_name_does_not_early_stop_before_field_name(
+        self,
+    ):
+        class _FakePage:
+            def __init__(self, text: str):
+                self._text = text
+
+            def get_text(self):
+                return self._text
+
+            def get_pixmap(self, *args, **kwargs):
+                raise AssertionError("should not request OCR pixmap in this test")
+
+        class _FakeDoc:
+            def __init__(self, pages):
+                self._pages = pages
+
+            def __iter__(self):
+                return iter(self._pages)
+
+            def close(self):
+                return None
+
+        fake_doc = _FakeDoc(
+            [
+                _FakePage("房建市政施工招标示范文本202501版\n塘册中心老旧小区改造工程招标"),
+                _FakePage("目录\n第一章 招标公告\n第二章 投标人须知"),
+                _FakePage("第一章 招标公告\n1.1 项目名称：塘岗中心老旧小区改造项目"),
+            ]
+        )
+
+        with patch("app.main.pymupdf") as mock_pymupdf, patch(
+            "app.main._should_early_stop_pdf_preview", return_value=True
+        ), patch("app.main._score_ocr_text_candidate", return_value=5.0):
+            mock_pymupdf.open.return_value = fake_doc
+            preview = app_main._read_uploaded_file_preview_for_project_name(
+                b"%PDF-1.4\n",
+                "招标文件.pdf",
+            )
+
+        assert "1.1 项目名称：塘岗中心老旧小区改造项目" in preview
+        assert (
+            app_main._infer_project_name_from_tender_text(preview, "招标文件.pdf")
+            == "塘岗中心老旧小区改造项目"
         )
 
     @patch("app.main._read_uploaded_file_preview_for_project_name")
@@ -3062,13 +8566,24 @@ class TestMaterialsEndpoint:
         mock_invalidate_cache.assert_called_once_with("p1")
         mock_feedback_loop.assert_not_called()
 
+    @patch("app.main._notify_material_parse_workers")
+    @patch("app.main.save_material_parse_jobs")
     @patch("app.main.save_materials")
     @patch("app.main.load_materials")
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
     @patch("app.main.MATERIALS_DIR")
     def test_upload_material_success(
-        self, mock_dir, mock_ensure, mock_load_proj, mock_load_mat, mock_save, client, tmp_path
+        self,
+        mock_dir,
+        mock_ensure,
+        mock_load_proj,
+        mock_load_mat,
+        mock_save,
+        mock_save_jobs,
+        mock_notify_workers,
+        client,
+        tmp_path,
     ):
         """Upload material should save file and return record."""
         mock_dir.__truediv__ = lambda self, x: tmp_path / x
@@ -3087,6 +8602,60 @@ class TestMaterialsEndpoint:
         assert data["material"]["parse_status"] == "queued"
         assert data["parse_job"]["status"] == "queued"
         assert data["constraint_sync"]["mode"] == "async_parse_pending"
+        saved_materials = mock_save.call_args[0][0]
+        assert len(saved_materials) == 1
+        assert str(saved_materials[0].get("content_hash") or "").strip()
+        mock_save_jobs.assert_called_once()
+        mock_notify_workers.assert_called_once()
+
+    @patch("app.main._notify_material_parse_workers")
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.load_material_parse_jobs")
+    @patch("app.main.save_materials")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.MATERIALS_DIR")
+    def test_upload_material_enters_material_parse_state_lock(
+        self,
+        mock_dir,
+        mock_ensure,
+        mock_load_proj,
+        mock_load_mat,
+        mock_save,
+        mock_load_jobs,
+        mock_save_jobs,
+        mock_notify_workers,
+        client,
+        tmp_path,
+    ):
+        mock_dir.__truediv__ = lambda self, x: tmp_path / x
+        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_load_mat.return_value = []
+        mock_load_jobs.return_value = []
+
+        events = []
+
+        class _SpyLock:
+            def __enter__(self):
+                events.append("enter")
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                events.append("exit")
+                return False
+
+        with patch("app.main._MATERIAL_PARSE_STATE_LOCK", _SpyLock()):
+            response = client.post(
+                "/api/v1/projects/p1/materials",
+                files={"file": ("test.txt", BytesIO(b"test content"), "text/plain")},
+            )
+
+        assert response.status_code == 200
+        assert events == ["enter", "exit"]
+        mock_save.assert_called_once()
+        mock_save_jobs.assert_called_once()
+        mock_notify_workers.assert_called_once()
 
     @patch("app.main.save_materials")
     @patch("app.main.load_materials")
@@ -3208,6 +8777,23 @@ class TestMaterialsEndpoint:
         mock_load_jobs,
         client,
     ):
+        from app import main as main_module
+
+        original_active_projects = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECTS)
+        original_active_project_types = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES)
+        original_active_project_claims = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS)
+        original_active_project_type_claims = dict(
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS
+        )
+        original_scheduler_stats = dict(main_module._MATERIAL_PARSE_SCHEDULER_STATS)
+        original_project_cache_stats = {
+            key: dict(value)
+            for key, value in main_module._MATERIAL_PARSE_PROJECT_CACHE_STATS.items()
+        }
+        original_project_cache_request_history = {
+            key: [dict(item) for item in value]
+            for key, value in main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.items()
+        }
         mock_load_projects.return_value = [{"id": "p1", "name": "项目1"}]
         mock_load_materials.return_value = [
             {
@@ -3246,23 +8832,891 @@ class TestMaterialsEndpoint:
                 "finished_at": "2026-03-09T00:02:03+00:00",
             },
         ]
+        try:
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_SCHEDULER_STATS.clear()
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_STATS.clear()
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.clear()
+            response = client.get("/api/v1/projects/p1/materials/parse_status")
+        finally:
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.update(original_active_projects)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.update(original_active_project_types)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.update(original_active_project_claims)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.update(
+                original_active_project_type_claims
+            )
+            main_module._MATERIAL_PARSE_SCHEDULER_STATS.clear()
+            main_module._MATERIAL_PARSE_SCHEDULER_STATS.update(original_scheduler_stats)
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_STATS.clear()
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_STATS.update(
+                {key: dict(value) for key, value in original_project_cache_stats.items()}
+            )
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.clear()
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.update(
+                {
+                    key: deque(
+                        [dict(item) for item in value],
+                        maxlen=main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY_WINDOW_SIZE,
+                    )
+                    for key, value in original_project_cache_request_history.items()
+                }
+            )
 
-        response = client.get("/api/v1/projects/p1/materials/parse_status")
         assert response.status_code == 200
         data = response.json()
         assert data["project_id"] == "p1"
         assert data["summary"]["materials_total"] == 1
         assert data["summary"]["queued_materials"] == 1
-        assert data["summary"]["worker_count"] == 2
+        assert data["summary"]["worker_count"] == app_main._material_parse_total_worker_count()
+        assert (
+            data["summary"]["preview_express_reserved_worker_count"]
+            == app_main.DEFAULT_MATERIAL_PARSE_PREVIEW_EXPRESS_RESERVED_WORKER_COUNT
+        )
+        assert (
+            data["summary"]["preview_reserved_worker_count"]
+            == app_main.DEFAULT_MATERIAL_PARSE_PREVIEW_RESERVED_WORKER_COUNT
+        )
         assert data["summary"]["backlog"] == 1
         assert data["summary"]["latest_finished_at"] == "2026-03-09T00:02:03+00:00"
         assert data["summary"]["latest_finished_filename"] == "工程量清单.xlsx"
+        assert data["summary"]["scheduler_project_continuity_bonus_hits"] == 0
+        assert data["summary"]["scheduler_followup_full_bonus_hits"] == 0
+        assert data["summary"]["scheduler_same_material_followup_bonus_hits"] == 0
+        assert data["summary"]["scheduler_active_project_bonus_hits"] == 0
+        assert data["summary"]["scheduler_active_project_type_bonus_hits"] == 0
+        assert data["summary"]["scheduler_claim_snapshot_cache_hits"] == 0
+        assert data["summary"]["scheduler_claim_snapshot_cache_rebuilds"] == 0
+        assert data["summary"]["scheduler_claim_context_cache_hits"] == 0
+        assert data["summary"]["scheduler_claim_context_cache_rebuilds"] == 0
+        assert data["summary"]["scheduler_project_stage_cache_hits"] == 0
+        assert data["summary"]["scheduler_project_stage_cache_rebuilds"] == 0
+        assert data["summary"]["scheduler_priority_context_cache_hits"] == 0
+        assert data["summary"]["scheduler_priority_context_cache_rebuilds"] == 0
+        assert data["summary"]["scheduler_jobs_summary_cache_hits"] == 0
+        assert data["summary"]["scheduler_jobs_summary_cache_rebuilds"] == 0
+        assert data["summary"]["scheduler_status_materials_cache_hits"] == 0
+        assert data["summary"]["scheduler_status_materials_cache_rebuilds"] == 0
+        assert data["summary"]["scheduler_status_core_cache_hits"] == 0
+        assert data["summary"]["scheduler_status_core_cache_rebuilds"] == 0
+        assert data["summary"]["scheduler_cache_hit_total"] == 0
+        assert data["summary"]["scheduler_cache_rebuild_total"] == 0
+        assert data["summary"]["scheduler_cache_hit_ratio"] == 0.0
+        assert data["summary"]["scheduler_project_jobs_summary_cache_hits"] == 0
+        assert data["summary"]["scheduler_project_jobs_summary_cache_rebuilds"] == 0
+        assert data["summary"]["scheduler_project_jobs_summary_cache_state"] == "cold"
+        assert data["summary"]["scheduler_project_status_materials_cache_hits"] == 0
+        assert data["summary"]["scheduler_project_status_materials_cache_rebuilds"] == 0
+        assert data["summary"]["scheduler_project_status_materials_cache_state"] == "cold"
+        assert data["summary"]["scheduler_project_status_core_cache_hits"] == 0
+        assert data["summary"]["scheduler_project_status_core_cache_rebuilds"] == 0
+        assert data["summary"]["scheduler_project_status_core_cache_state"] == "cold"
+        assert data["summary"]["scheduler_project_cache_hit_total"] == 0
+        assert data["summary"]["scheduler_project_cache_rebuild_total"] == 0
+        assert data["summary"]["scheduler_project_cache_hit_ratio"] == 0.0
+        assert data["summary"]["scheduler_project_cache_net_savings"] == 0
+        assert data["summary"]["scheduler_project_cache_state"] == "cold"
+        assert data["summary"]["scheduler_project_cache_hot_layer_count"] == 0
+        assert data["summary"]["scheduler_project_cache_warming_layer_count"] == 0
+        assert data["summary"]["scheduler_project_cache_cold_layer_count"] == 3
+        assert data["summary"]["scheduler_project_recent_avoided_rebuild_layers"] == []
+        assert data["summary"]["scheduler_project_recent_rebuilt_layers"] == []
+        assert data["summary"]["scheduler_project_recent_avoided_rebuild_layer_count"] == 0
+        assert data["summary"]["scheduler_project_recent_rebuilt_layer_count"] == 0
+        assert data["summary"]["scheduler_project_recent_avoided_rebuild_work_units"] == 0
+        assert data["summary"]["scheduler_project_recent_rebuilt_work_units"] == 0
+        assert data["summary"]["scheduler_project_recent_request_window_size"] == 0
+        assert data["summary"]["scheduler_project_recent_cold_start_round_count"] == 0
+        assert data["summary"]["scheduler_project_recent_warming_round_count"] == 0
+        assert data["summary"]["scheduler_project_recent_steady_round_count"] == 0
+        assert data["summary"]["scheduler_project_recent_consecutive_steady_round_count"] == 0
+        assert (
+            data["summary"]["scheduler_project_recent_stable_hot_threshold"]
+            == main_module._MATERIAL_PARSE_PROJECT_CACHE_STEADY_THRESHOLD
+        )
+        assert data["summary"]["scheduler_project_recent_stable_hot"] is False
+        assert data["summary"]["scheduler_project_recent_stable_hot_remaining_rounds"] == 3
+        assert data["summary"]["scheduler_project_recent_stable_hot_progress_completed_rounds"] == 0
+        assert data["summary"]["scheduler_project_recent_stable_hot_progress_label"] == "0/3"
+        assert data["summary"]["scheduler_project_recent_stable_hot_progress_ratio"] == 0.0
+        assert data["summary"]["scheduler_project_recent_stable_hot_progress_percent"] == 0
+        assert data["summary"]["scheduler_project_recent_stable_hot_progress_percent_label"] == "0%"
+        assert (
+            data["summary"]["scheduler_project_recent_stable_hot_eta_hint"]
+            == "还需连续 3 轮 steady"
+        )
+        assert data["summary"]["scheduler_project_recent_stable_hot_eta_short_label"] == "还需3轮"
+        assert (
+            data["summary"]["scheduler_project_recent_stable_hot_progress_summary_label"]
+            == "0/3（0%），还需3轮"
+        )
+        assert data["summary"]["scheduler_project_recent_stable_hot_badge_label"] == "冷启动"
+        assert (
+            data["summary"]["scheduler_project_recent_stable_hot_rule_label"]
+            == main_module._material_parse_project_cache_stable_hot_rule_label()
+        )
+        assert data["summary"]["scheduler_project_recent_window_state"] == "cold"
+        assert data["summary"]["scheduler_project_recent_avoided_rebuild_work_units_avg"] == 0.0
+        assert data["summary"]["scheduler_project_recent_rebuilt_work_units_avg"] == 0.0
+        assert data["summary"]["scheduler_project_recent_net_saved_work_units_avg"] == 0.0
+        assert data["summary"]["scheduler_active_project_window_count"] == 0
+        assert data["summary"]["scheduler_active_project_type_window_count"] == 0
+        assert data["summary"]["scheduler_active_project_quota_exhausted_count"] == 0
+        assert data["summary"]["scheduler_active_project_type_quota_exhausted_count"] == 0
         assert data["jobs"][0]["status"] == "processing"
         assert data["materials"][0]["parse_backend"] == "queued"
         assert data["materials"][0]["parse_effective_status"] == "processing"
         assert "解析中" in str(data["materials"][0]["parse_stage_label"])
         assert data["materials"][0]["parse_route_label"] == "本地预解析，必要时 GPT 深解析"
 
+    @patch("app.main.load_material_parse_jobs")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_material_parse_status_includes_scheduler_metrics(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        mock_load_jobs,
+        client,
+    ):
+        from app import main as main_module
+
+        original_active_projects = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECTS)
+        original_active_project_types = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES)
+        original_active_project_claims = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS)
+        original_active_project_type_claims = dict(
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS
+        )
+        original_scheduler_stats = dict(main_module._MATERIAL_PARSE_SCHEDULER_STATS)
+        original_project_cache_stats = {
+            key: dict(value)
+            for key, value in main_module._MATERIAL_PARSE_PROJECT_CACHE_STATS.items()
+        }
+        original_project_cache_request_history = {
+            key: [dict(item) for item in value]
+            for key, value in main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.items()
+        }
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1"}]
+        mock_load_materials.return_value = [
+            {
+                "id": "m1",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.xlsx",
+                "path": "/tmp/工程量清单.xlsx",
+                "created_at": "2026-03-10T00:00:00+00:00",
+                "parse_status": "parsed",
+                "parse_backend": "local",
+                "parse_phase": "full",
+                "parse_ready_for_gate": True,
+            }
+        ]
+        mock_load_jobs.return_value = []
+        try:
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_SCHEDULER_STATS.clear()
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.update({"p1": 108.0, "p2": 108.0})
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.update(
+                {("p1", "boq"): 108.0, ("p2", "tender_qa"): 108.0}
+            )
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.update(
+                {
+                    "p1": 2,
+                    "p2": main_module.DEFAULT_MATERIAL_PARSE_ACTIVE_PROJECT_WINDOW_MAX_CLAIMS + 1,
+                }
+            )
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.update(
+                {
+                    ("p1", "boq"): 1,
+                    (
+                        "p2",
+                        "tender_qa",
+                    ): main_module.DEFAULT_MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_WINDOW_MAX_CLAIMS + 1,
+                }
+            )
+            main_module._MATERIAL_PARSE_SCHEDULER_STATS.update(
+                {
+                    "project_continuity_bonus_hits": 4,
+                    "followup_full_bonus_hits": 3,
+                    "same_material_followup_bonus_hits": 2,
+                    "active_project_bonus_hits": 5,
+                    "active_project_type_bonus_hits": 1,
+                    "claim_snapshot_cache_hits": 8,
+                    "claim_snapshot_cache_rebuilds": 2,
+                    "claim_context_cache_hits": 7,
+                    "claim_context_cache_rebuilds": 3,
+                    "project_stage_cache_hits": 6,
+                    "project_stage_cache_rebuilds": 2,
+                    "priority_context_cache_hits": 5,
+                    "priority_context_cache_rebuilds": 1,
+                    "jobs_summary_cache_hits": 4,
+                    "jobs_summary_cache_rebuilds": 2,
+                    "status_materials_cache_hits": 3,
+                    "status_materials_cache_rebuilds": 1,
+                    "status_core_cache_hits": 2,
+                    "status_core_cache_rebuilds": 1,
+                }
+            )
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_STATS.clear()
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_STATS.update(
+                {
+                    "p1": {
+                        "jobs_summary_cache_hits": 4,
+                        "jobs_summary_cache_rebuilds": 2,
+                        "status_materials_cache_hits": 3,
+                        "status_materials_cache_rebuilds": 1,
+                        "status_core_cache_hits": 2,
+                        "status_core_cache_rebuilds": 1,
+                    },
+                    "p2": {
+                        "jobs_summary_cache_hits": 9,
+                        "jobs_summary_cache_rebuilds": 4,
+                    },
+                }
+            )
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.clear()
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.update(
+                {
+                    "p1": deque(
+                        [
+                            {
+                                "avoided_rebuild_work_units": 6,
+                                "rebuilt_work_units": 0,
+                                "avoided_rebuild_layer_count": 3,
+                                "rebuilt_layer_count": 0,
+                            },
+                            {
+                                "avoided_rebuild_work_units": 2,
+                                "rebuilt_work_units": 4,
+                                "avoided_rebuild_layer_count": 1,
+                                "rebuilt_layer_count": 2,
+                            },
+                        ],
+                        maxlen=main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY_WINDOW_SIZE,
+                    )
+                }
+            )
+            with patch("app.main.time.monotonic", return_value=100.0):
+                response = client.get("/api/v1/projects/p1/materials/parse_status")
+        finally:
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.update(original_active_projects)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.update(original_active_project_types)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.update(original_active_project_claims)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.update(
+                original_active_project_type_claims
+            )
+            main_module._MATERIAL_PARSE_SCHEDULER_STATS.clear()
+            main_module._MATERIAL_PARSE_SCHEDULER_STATS.update(original_scheduler_stats)
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_STATS.clear()
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_STATS.update(
+                {key: dict(value) for key, value in original_project_cache_stats.items()}
+            )
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.clear()
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.update(
+                {
+                    key: deque(
+                        [dict(item) for item in value],
+                        maxlen=main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY_WINDOW_SIZE,
+                    )
+                    for key, value in original_project_cache_request_history.items()
+                }
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["summary"]["scheduler_project_continuity_bonus_hits"] == 4
+        assert data["summary"]["scheduler_followup_full_bonus_hits"] == 3
+        assert data["summary"]["scheduler_same_material_followup_bonus_hits"] == 2
+        assert data["summary"]["scheduler_active_project_bonus_hits"] == 5
+        assert data["summary"]["scheduler_active_project_type_bonus_hits"] == 1
+        assert data["summary"]["scheduler_claim_snapshot_cache_hits"] == 8
+        assert data["summary"]["scheduler_claim_snapshot_cache_rebuilds"] == 2
+        assert data["summary"]["scheduler_claim_context_cache_hits"] == 7
+        assert data["summary"]["scheduler_claim_context_cache_rebuilds"] == 3
+        assert data["summary"]["scheduler_project_stage_cache_hits"] == 6
+        assert data["summary"]["scheduler_project_stage_cache_rebuilds"] == 2
+        assert data["summary"]["scheduler_priority_context_cache_hits"] == 5
+        assert data["summary"]["scheduler_priority_context_cache_rebuilds"] == 1
+        assert data["summary"]["scheduler_jobs_summary_cache_hits"] == 4
+        assert data["summary"]["scheduler_jobs_summary_cache_rebuilds"] == 2
+        assert data["summary"]["scheduler_status_materials_cache_hits"] == 3
+        assert data["summary"]["scheduler_status_materials_cache_rebuilds"] == 1
+        assert data["summary"]["scheduler_status_core_cache_hits"] == 2
+        assert data["summary"]["scheduler_status_core_cache_rebuilds"] == 1
+        assert data["summary"]["scheduler_cache_hit_total"] == 35
+        assert data["summary"]["scheduler_cache_rebuild_total"] == 12
+        assert data["summary"]["scheduler_cache_hit_ratio"] == 0.7447
+        assert data["summary"]["scheduler_project_jobs_summary_cache_hits"] == 4
+        assert data["summary"]["scheduler_project_jobs_summary_cache_rebuilds"] == 2
+        assert data["summary"]["scheduler_project_jobs_summary_cache_state"] == "warm"
+        assert data["summary"]["scheduler_project_status_materials_cache_hits"] == 3
+        assert data["summary"]["scheduler_project_status_materials_cache_rebuilds"] == 1
+        assert data["summary"]["scheduler_project_status_materials_cache_state"] == "warm"
+        assert data["summary"]["scheduler_project_status_core_cache_hits"] == 2
+        assert data["summary"]["scheduler_project_status_core_cache_rebuilds"] == 1
+        assert data["summary"]["scheduler_project_status_core_cache_state"] == "warm"
+        assert data["summary"]["scheduler_project_cache_hit_total"] == 9
+        assert data["summary"]["scheduler_project_cache_rebuild_total"] == 4
+        assert data["summary"]["scheduler_project_cache_hit_ratio"] == 0.6923
+        assert data["summary"]["scheduler_project_cache_net_savings"] == 5
+        assert data["summary"]["scheduler_project_cache_state"] == "warm"
+        assert data["summary"]["scheduler_project_cache_hot_layer_count"] == 3
+        assert data["summary"]["scheduler_project_cache_warming_layer_count"] == 0
+        assert data["summary"]["scheduler_project_cache_cold_layer_count"] == 0
+        assert data["summary"]["scheduler_project_recent_avoided_rebuild_layers"] == []
+        assert data["summary"]["scheduler_project_recent_rebuilt_layers"] == []
+        assert data["summary"]["scheduler_project_recent_avoided_rebuild_layer_count"] == 0
+        assert data["summary"]["scheduler_project_recent_rebuilt_layer_count"] == 0
+        assert data["summary"]["scheduler_project_recent_avoided_rebuild_work_units"] == 0
+        assert data["summary"]["scheduler_project_recent_rebuilt_work_units"] == 0
+        assert data["summary"]["scheduler_project_recent_request_window_size"] == 2
+        assert data["summary"]["scheduler_project_recent_cold_start_round_count"] == 0
+        assert data["summary"]["scheduler_project_recent_warming_round_count"] == 1
+        assert data["summary"]["scheduler_project_recent_steady_round_count"] == 1
+        assert data["summary"]["scheduler_project_recent_consecutive_steady_round_count"] == 0
+        assert (
+            data["summary"]["scheduler_project_recent_stable_hot_threshold"]
+            == main_module._MATERIAL_PARSE_PROJECT_CACHE_STEADY_THRESHOLD
+        )
+        assert data["summary"]["scheduler_project_recent_stable_hot"] is False
+        assert data["summary"]["scheduler_project_recent_stable_hot_remaining_rounds"] == 3
+        assert data["summary"]["scheduler_project_recent_stable_hot_progress_completed_rounds"] == 0
+        assert data["summary"]["scheduler_project_recent_stable_hot_progress_label"] == "0/3"
+        assert data["summary"]["scheduler_project_recent_stable_hot_progress_ratio"] == 0.0
+        assert data["summary"]["scheduler_project_recent_stable_hot_progress_percent"] == 0
+        assert data["summary"]["scheduler_project_recent_stable_hot_progress_percent_label"] == "0%"
+        assert (
+            data["summary"]["scheduler_project_recent_stable_hot_eta_hint"]
+            == "还需连续 3 轮 steady"
+        )
+        assert data["summary"]["scheduler_project_recent_stable_hot_eta_short_label"] == "还需3轮"
+        assert (
+            data["summary"]["scheduler_project_recent_stable_hot_progress_summary_label"]
+            == "0/3（0%），还需3轮"
+        )
+        assert (
+            data["summary"]["scheduler_project_recent_stable_hot_badge_label"]
+            == "预热中 0/3（0%），还需3轮"
+        )
+        assert (
+            data["summary"]["scheduler_project_recent_stable_hot_rule_label"]
+            == main_module._material_parse_project_cache_stable_hot_rule_label()
+        )
+        assert data["summary"]["scheduler_project_recent_window_state"] == "warming"
+        assert data["summary"]["scheduler_project_recent_avoided_rebuild_work_units_avg"] == 4.0
+        assert data["summary"]["scheduler_project_recent_rebuilt_work_units_avg"] == 2.0
+        assert data["summary"]["scheduler_project_recent_net_saved_work_units_avg"] == 2.0
+        assert data["summary"]["scheduler_active_project_window_count"] == 1
+        assert data["summary"]["scheduler_active_project_type_window_count"] == 1
+        assert data["summary"]["scheduler_active_project_quota_exhausted_count"] == 1
+        assert data["summary"]["scheduler_active_project_type_quota_exhausted_count"] == 1
+
+    def test_build_material_parse_project_cache_request_delta_core_hit_implies_full_chain_saved(
+        self,
+    ):
+        from app import main as main_module
+
+        delta = main_module._build_material_parse_project_cache_request_delta(
+            {},
+            {
+                "status_core_cache_hits": 1,
+            },
+        )
+
+        assert delta["scheduler_project_recent_avoided_rebuild_layers"] == [
+            "status_core",
+            "status_materials",
+            "jobs_summary",
+        ]
+        assert delta["scheduler_project_recent_rebuilt_layers"] == []
+        assert delta["scheduler_project_recent_avoided_rebuild_layer_count"] == 3
+        assert delta["scheduler_project_recent_rebuilt_layer_count"] == 0
+        assert delta["scheduler_project_recent_avoided_rebuild_work_units"] == 6
+        assert delta["scheduler_project_recent_rebuilt_work_units"] == 0
+
+    def test_build_material_parse_project_cache_request_delta_tracks_mixed_hit_and_rebuild_layers(
+        self,
+    ):
+        from app import main as main_module
+
+        delta = main_module._build_material_parse_project_cache_request_delta(
+            {},
+            {
+                "jobs_summary_cache_rebuilds": 1,
+                "status_materials_cache_hits": 1,
+                "status_core_cache_rebuilds": 1,
+            },
+        )
+
+        assert delta["scheduler_project_recent_avoided_rebuild_layers"] == ["status_materials"]
+        assert delta["scheduler_project_recent_rebuilt_layers"] == ["status_core", "jobs_summary"]
+        assert delta["scheduler_project_recent_avoided_rebuild_layer_count"] == 1
+        assert delta["scheduler_project_recent_rebuilt_layer_count"] == 2
+        assert delta["scheduler_project_recent_avoided_rebuild_work_units"] == 2
+        assert delta["scheduler_project_recent_rebuilt_work_units"] == 4
+
+    def test_build_material_parse_project_cache_request_delta_excludes_same_request_rebuild_from_saved_layers(
+        self,
+    ):
+        from app import main as main_module
+
+        delta = main_module._build_material_parse_project_cache_request_delta(
+            {},
+            {
+                "jobs_summary_cache_hits": 1,
+                "jobs_summary_cache_rebuilds": 1,
+            },
+        )
+
+        assert delta["scheduler_project_recent_avoided_rebuild_layers"] == []
+        assert delta["scheduler_project_recent_rebuilt_layers"] == ["jobs_summary"]
+        assert delta["scheduler_project_recent_avoided_rebuild_layer_count"] == 0
+        assert delta["scheduler_project_recent_rebuilt_layer_count"] == 1
+        assert delta["scheduler_project_recent_avoided_rebuild_work_units"] == 0
+        assert delta["scheduler_project_recent_rebuilt_work_units"] == 1
+
+    def test_record_material_parse_project_cache_request_delta_ignores_zero_delta(self):
+        from app import main as main_module
+
+        original_history = {
+            key: [dict(item) for item in value]
+            for key, value in main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.items()
+        }
+        try:
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.clear()
+            main_module._record_material_parse_project_cache_request_delta(
+                "p1",
+                {
+                    "scheduler_project_recent_avoided_rebuild_work_units": 0,
+                    "scheduler_project_recent_rebuilt_work_units": 0,
+                    "scheduler_project_recent_avoided_rebuild_layer_count": 0,
+                    "scheduler_project_recent_rebuilt_layer_count": 0,
+                },
+            )
+            assert main_module._material_parse_project_cache_request_history_snapshot("p1") == []
+        finally:
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.clear()
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.update(
+                {
+                    key: deque(
+                        [dict(item) for item in value],
+                        maxlen=main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY_WINDOW_SIZE,
+                    )
+                    for key, value in original_history.items()
+                }
+            )
+
+    def test_record_material_parse_project_cache_request_delta_respects_window_size(self):
+        from app import main as main_module
+
+        original_history = {
+            key: [dict(item) for item in value]
+            for key, value in main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.items()
+        }
+        try:
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.clear()
+            for value in range(
+                main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY_WINDOW_SIZE + 2
+            ):
+                main_module._record_material_parse_project_cache_request_delta(
+                    "p1",
+                    {
+                        "scheduler_project_recent_avoided_rebuild_work_units": value + 1,
+                        "scheduler_project_recent_rebuilt_work_units": 0,
+                        "scheduler_project_recent_avoided_rebuild_layer_count": 1,
+                        "scheduler_project_recent_rebuilt_layer_count": 0,
+                    },
+                )
+            history = main_module._material_parse_project_cache_request_history_snapshot("p1")
+            assert (
+                len(history)
+                == main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY_WINDOW_SIZE
+            )
+            assert history[0]["avoided_rebuild_work_units"] == 3
+            assert history[-1]["avoided_rebuild_work_units"] == (
+                main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY_WINDOW_SIZE + 2
+            )
+        finally:
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.clear()
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.update(
+                {
+                    key: deque(
+                        [dict(item) for item in value],
+                        maxlen=main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY_WINDOW_SIZE,
+                    )
+                    for key, value in original_history.items()
+                }
+            )
+
+    def test_material_parse_project_cache_request_stage_classifies_rounds(self):
+        from app import main as main_module
+
+        assert (
+            main_module._material_parse_project_cache_request_stage(
+                {
+                    "avoided_rebuild_work_units": 0,
+                    "rebuilt_work_units": 6,
+                }
+            )
+            == "cold_start"
+        )
+        assert (
+            main_module._material_parse_project_cache_request_stage(
+                {
+                    "avoided_rebuild_work_units": 6,
+                    "rebuilt_work_units": 0,
+                }
+            )
+            == "steady"
+        )
+        assert (
+            main_module._material_parse_project_cache_request_stage(
+                {
+                    "avoided_rebuild_work_units": 2,
+                    "rebuilt_work_units": 4,
+                }
+            )
+            == "warming"
+        )
+
+    def test_material_parse_project_cache_recent_consecutive_stage_count_tracks_tail_only(self):
+        from app import main as main_module
+
+        history = [
+            {"avoided_rebuild_work_units": 6, "rebuilt_work_units": 0},
+            {"avoided_rebuild_work_units": 0, "rebuilt_work_units": 6},
+            {"avoided_rebuild_work_units": 6, "rebuilt_work_units": 0},
+            {"avoided_rebuild_work_units": 6, "rebuilt_work_units": 0},
+        ]
+
+        assert (
+            main_module._material_parse_project_cache_recent_consecutive_stage_count(
+                history,
+                "steady",
+            )
+            == 2
+        )
+
+    def test_build_material_parse_scheduler_summary_marks_stable_hot_after_threshold(self):
+        from app import main as main_module
+
+        original_history = {
+            key: [dict(item) for item in value]
+            for key, value in main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.items()
+        }
+        original_scheduler_stats = dict(main_module._MATERIAL_PARSE_SCHEDULER_STATS)
+        original_project_cache_stats = {
+            key: dict(value)
+            for key, value in main_module._MATERIAL_PARSE_PROJECT_CACHE_STATS.items()
+        }
+        original_active_projects = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECTS)
+        original_active_project_types = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES)
+        original_active_project_claims = dict(main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS)
+        original_active_project_type_claims = dict(
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS
+        )
+        try:
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.clear()
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.update(
+                {
+                    "p1": deque(
+                        [
+                            {"avoided_rebuild_work_units": 6, "rebuilt_work_units": 0},
+                            {"avoided_rebuild_work_units": 6, "rebuilt_work_units": 0},
+                            {"avoided_rebuild_work_units": 6, "rebuilt_work_units": 0},
+                        ],
+                        maxlen=main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY_WINDOW_SIZE,
+                    )
+                }
+            )
+            main_module._MATERIAL_PARSE_SCHEDULER_STATS.clear()
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_STATS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.clear()
+
+            summary = main_module._build_material_parse_scheduler_summary("p1")
+        finally:
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.clear()
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY.update(
+                {
+                    key: deque(
+                        [dict(item) for item in value],
+                        maxlen=main_module._MATERIAL_PARSE_PROJECT_CACHE_REQUEST_HISTORY_WINDOW_SIZE,
+                    )
+                    for key, value in original_history.items()
+                }
+            )
+            main_module._MATERIAL_PARSE_SCHEDULER_STATS.clear()
+            main_module._MATERIAL_PARSE_SCHEDULER_STATS.update(original_scheduler_stats)
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_STATS.clear()
+            main_module._MATERIAL_PARSE_PROJECT_CACHE_STATS.update(
+                {key: dict(value) for key, value in original_project_cache_stats.items()}
+            )
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECTS.update(original_active_projects)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPES.update(original_active_project_types)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_CLAIMS.update(original_active_project_claims)
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.clear()
+            main_module._MATERIAL_PARSE_ACTIVE_PROJECT_TYPE_CLAIMS.update(
+                original_active_project_type_claims
+            )
+
+        assert summary["scheduler_project_recent_steady_round_count"] == 3
+        assert summary["scheduler_project_recent_consecutive_steady_round_count"] == 3
+        assert (
+            summary["scheduler_project_recent_stable_hot_threshold"]
+            == main_module._MATERIAL_PARSE_PROJECT_CACHE_STEADY_THRESHOLD
+        )
+        assert summary["scheduler_project_recent_stable_hot"] is True
+        assert summary["scheduler_project_recent_stable_hot_remaining_rounds"] == 0
+        assert summary["scheduler_project_recent_stable_hot_progress_completed_rounds"] == 3
+        assert summary["scheduler_project_recent_stable_hot_progress_label"] == "3/3"
+        assert summary["scheduler_project_recent_stable_hot_progress_ratio"] == 1.0
+        assert summary["scheduler_project_recent_stable_hot_progress_percent"] == 100
+        assert summary["scheduler_project_recent_stable_hot_progress_percent_label"] == "100%"
+        assert summary["scheduler_project_recent_stable_hot_eta_hint"] == "已达到稳定转热阈值"
+        assert summary["scheduler_project_recent_stable_hot_eta_short_label"] == "已达阈值"
+        assert (
+            summary["scheduler_project_recent_stable_hot_progress_summary_label"]
+            == "3/3（100%），已达阈值"
+        )
+        assert summary["scheduler_project_recent_stable_hot_badge_label"] == "稳定热态"
+        assert (
+            summary["scheduler_project_recent_stable_hot_rule_label"]
+            == main_module._material_parse_project_cache_stable_hot_rule_label()
+        )
+        assert summary["scheduler_project_recent_window_state"] == "stable_hot"
+
+    @patch("app.main.load_material_parse_jobs")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_material_parse_status_includes_boq_resume_metrics(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        mock_load_jobs,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1"}]
+        mock_load_materials.return_value = [
+            {
+                "id": "m2",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.xlsx",
+                "path": "/tmp/工程量清单.xlsx",
+                "created_at": "2026-03-10T00:00:00+00:00",
+                "parse_status": "parsed",
+                "parse_backend": "local",
+                "parse_phase": "full",
+                "parse_ready_for_gate": True,
+                "boq_structured_summary": {
+                    "scan_strategy": "preview_guided_full",
+                    "scan_guidance_strength": "strong",
+                    "skipped_tail_sheets": 1,
+                    "sheets": [
+                        {
+                            "sheet": "分部分项工程量清单",
+                            "resumed_from_prior_summary": True,
+                            "resume_from_row": 181,
+                        },
+                        {
+                            "sheet": "措施项目清单",
+                            "resumed_from_prior_summary": True,
+                            "resume_from_row": 121,
+                        },
+                        {
+                            "sheet": "封面说明",
+                            "resumed_from_prior_summary": False,
+                            "resume_from_row": 1,
+                        },
+                    ],
+                },
+            }
+        ]
+        mock_load_jobs.return_value = []
+
+        response = client.get("/api/v1/projects/p1/materials/parse_status")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["summary"]["boq_guided_full_materials"] == 1
+        assert data["summary"]["boq_guided_full_strong_materials"] == 1
+        assert data["summary"]["boq_resumed_full_materials"] == 1
+        assert data["summary"]["boq_resumed_sheet_count"] == 2
+        assert data["summary"]["boq_saved_row_count"] == 300
+        assert data["summary"]["boq_skipped_tail_sheets"] == 1
+        assert data["summary"]["boq_resume_hit_rate"] == 1.0
+        assert "已复用预解析前段" in data["materials"][0]["parse_note"]
+        assert "续跑 2 张 sheet" in data["materials"][0]["parse_note"]
+        assert "少扫 300 行" in data["materials"][0]["parse_note"]
+        assert "尾部略过 1 张辅助 sheet" in data["materials"][0]["parse_note"]
+
+    @patch("app.main.load_material_parse_jobs")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_material_parse_status_includes_boq_preview_note(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        mock_load_jobs,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1"}]
+        mock_load_materials.return_value = [
+            {
+                "id": "m3",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.csv",
+                "path": "/tmp/工程量清单.csv",
+                "created_at": "2026-03-10T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+                "parse_phase": "preview",
+                "parse_ready_for_gate": False,
+                "boq_structured_summary": {
+                    "parse_stage": "preview",
+                    "sheets": [
+                        {"sheet": "csv", "scanned_rows": 180},
+                    ],
+                },
+                "job_id": "j3",
+            }
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j3",
+                "material_id": "m3",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.csv",
+                "status": "queued",
+                "parse_backend": "local_preview",
+                "parse_mode": "full",
+                "attempt": 1,
+            }
+        ]
+
+        response = client.get("/api/v1/projects/p1/materials/parse_status")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["materials"][0]["parse_effective_status"] == "previewed"
+        assert "BOQ 已完成轻量预解析" in data["materials"][0]["parse_note"]
+        assert "已先扫 1 张 sheet" in data["materials"][0]["parse_note"]
+        assert "约 180 行" in data["materials"][0]["parse_note"]
+        assert "后台会继续补全 full 解析" in data["materials"][0]["parse_note"]
+
+    @patch("app.main.load_material_parse_jobs")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_material_parse_status_includes_boq_pdf_note(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        mock_load_jobs,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1"}]
+        mock_load_materials.return_value = [
+            {
+                "id": "m4",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "path": "/tmp/工程量清单.pdf",
+                "created_at": "2026-03-10T00:00:00+00:00",
+                "parse_status": "parsed",
+                "parse_backend": "local",
+                "parse_phase": "full",
+                "parse_ready_for_gate": True,
+                "boq_structured_summary": {
+                    "detected_format": "pdf",
+                    "text_chars": 7134,
+                },
+            }
+        ]
+        mock_load_jobs.return_value = []
+
+        response = client.get("/api/v1/projects/p1/materials/parse_status")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["materials"][0]["parse_effective_status"] == "parsed"
+        assert "已完成本地解析。" in data["materials"][0]["parse_note"]
+        assert "当前为 PDF 清单" in data["materials"][0]["parse_note"]
+        assert "未进入表格型 BOQ 的 preview/full 差量补全路径" in data["materials"][0]["parse_note"]
+
+    @patch("app.main.load_material_parse_jobs")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_material_parse_status_includes_boq_pdf_resume_note(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        mock_load_jobs,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1"}]
+        mock_load_materials.return_value = [
+            {
+                "id": "m5",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "path": "/tmp/工程量清单.pdf",
+                "created_at": "2026-03-10T00:00:00+00:00",
+                "parse_status": "parsed",
+                "parse_backend": "local",
+                "parse_phase": "full",
+                "parse_ready_for_gate": True,
+                "boq_structured_summary": {
+                    "detected_format": "pdf",
+                    "scan_strategy": "preview_guided_full_pdf",
+                    "resume_from_page": 3,
+                    "saved_page_count": 2,
+                    "parsed_page_count": 3,
+                    "text_chars": 7134,
+                },
+            }
+        ]
+        mock_load_jobs.return_value = []
+
+        response = client.get("/api/v1/projects/p1/materials/parse_status")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["materials"][0]["parse_effective_status"] == "parsed"
+        assert "已复用预解析前页" in data["materials"][0]["parse_note"]
+        assert "从第 3 页继续" in data["materials"][0]["parse_note"]
+        assert "少扫前 2 页" in data["materials"][0]["parse_note"]
+
+    @patch("app.main._notify_material_parse_workers")
     @patch("app.main.save_material_parse_jobs")
     @patch("app.main.save_materials")
     @patch("app.main.load_material_parse_jobs")
@@ -3277,6 +9731,7 @@ class TestMaterialsEndpoint:
         mock_load_jobs,
         mock_save_materials,
         mock_save_jobs,
+        mock_notify_workers,
         client,
     ):
         mock_load_projects.return_value = [{"id": "p1", "name": "项目1"}]
@@ -3314,6 +9769,7 @@ class TestMaterialsEndpoint:
         assert data["summary"]["queued_materials"] == 1
         saved_rows = mock_save_materials.call_args[0][0]
         assert saved_rows[0]["parse_status"] == "queued"
+        mock_notify_workers.assert_called_once()
         assert saved_rows[0]["parse_error_message"] is None
         assert mock_save_jobs.called is True
 
@@ -3432,6 +9888,79 @@ class TestMaterialsEndpoint:
         saved_rows = mock_save_materials.call_args[0][0]
         assert saved_rows[0]["parse_status"] == "parsed"
         assert saved_rows[0]["job_id"] == "j-processing"
+
+    @patch("app.main.save_material_parse_jobs")
+    @patch("app.main.save_materials")
+    @patch("app.main.load_material_parse_jobs")
+    @patch("app.main.load_materials")
+    def test_bootstrap_material_parse_state_requeues_stale_terminal_job_without_material_payload(
+        self,
+        mock_load_materials,
+        mock_load_jobs,
+        mock_save_materials,
+        mock_save_jobs,
+    ):
+        from app.main import _bootstrap_material_parse_state
+
+        mock_load_materials.return_value = [
+            {
+                "id": "m1",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "path": "/tmp/工程量清单.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:05:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+                "parse_phase": None,
+                "parse_ready_for_gate": False,
+                "parse_confidence": 0.0,
+                "parse_error_class": "worker_recovered",
+                "parse_error_message": "worker_recovered",
+                "job_id": "j-parsed",
+                "parsed_text": "",
+                "structured_summary": None,
+                "parsed_chars": 0,
+                "parsed_chunks": [],
+                "numeric_terms_norm": [],
+                "lexical_terms": [],
+            }
+        ]
+        mock_load_jobs.return_value = [
+            {
+                "id": "j-parsed",
+                "material_id": "m1",
+                "project_id": "p1",
+                "material_type": "boq",
+                "filename": "工程量清单.pdf",
+                "status": "parsed",
+                "parse_mode": "full",
+                "attempt": 1,
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "updated_at": "2026-03-09T00:05:00+00:00",
+                "finished_at": "2026-03-09T00:05:00+00:00",
+                "parse_backend": "local",
+                "parse_confidence": 0.48,
+            }
+        ]
+
+        summary = _bootstrap_material_parse_state()
+
+        assert summary["requeued_terminal_jobs"] == 1
+        saved_jobs = mock_save_jobs.call_args[0][0]
+        assert len(saved_jobs) == 2
+        assert any(job["id"] == "j-parsed" and job["status"] == "parsed" for job in saved_jobs)
+        repaired_jobs = [job for job in saved_jobs if job["id"] != "j-parsed"]
+        assert len(repaired_jobs) == 1
+        assert repaired_jobs[0]["material_id"] == "m1"
+        assert repaired_jobs[0]["status"] == "queued"
+        assert repaired_jobs[0]["parse_mode"] == "full"
+        saved_rows = mock_save_materials.call_args[0][0]
+        assert saved_rows[0]["parse_status"] == "queued"
+        assert saved_rows[0]["parse_backend"] == "queued"
+        assert saved_rows[0]["job_id"] != "j-parsed"
+        assert saved_rows[0]["parse_error_message"] == "stale_terminal_job_without_material_payload"
 
     @patch("app.main.save_material_parse_jobs")
     @patch("app.main.save_materials")
@@ -3907,6 +10436,740 @@ class TestMaterialsEndpoint:
         assert data["summary"]["ground_truth_count"] == 4
         assert data["drift"]["level"] == "low"
 
+    @patch("app.main._build_project_trial_preflight")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_project_trial_preflight_success(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_build_preflight,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_build_preflight.return_value = {
+            "generated_at": "2026-03-31T10:00:00+08:00",
+            "base_url": "/api/v1",
+            "project_id": "p1",
+            "project_name": "项目1",
+            "trial_run_ready": True,
+            "status": "watch",
+            "status_label": "可试车，但建议先关注警告项",
+            "metrics": {
+                "self_check_ok": True,
+                "project_ready_to_score": True,
+                "project_gate_passed": True,
+                "project_mece_level": "good",
+                "project_mece_health_score": 100.0,
+                "ground_truth_count": 2,
+                "matched_prediction_count": 2,
+                "matched_score_record_count": 2,
+                "current_calibrator_version": "calib_auto_offset_20260331_075649",
+                "current_calibrator_degraded": False,
+                "evolution_weights_usable": True,
+                "drift_level": "insufficient_data",
+                "latest_score_confidence_level": "high",
+                "material_conflict_high_severity_count": 3,
+                "system_closure_ready": False,
+                "system_closure_failed_gates": ["minimum_ready_projects"],
+                "orphan_records_total": 0,
+            },
+            "signoff": {
+                "decision": "approve_with_watch",
+                "decision_label": "建议试车（带警告）",
+                "risk_level": "medium",
+                "risk_label": "中风险",
+                "summary_label": "建议试车（带警告） / 中风险 / 阻断 0 / 警告 1 / 状态 可试车，但建议先关注警告项",
+                "verification_checklist": [
+                    {"name": "系统自检", "passed": True, "detail": "运行时必需项全部正常"},
+                ],
+            },
+            "warning_details": {
+                "high_severity_material_conflict_count": 1,
+                "high_severity_material_conflicts": [
+                    {
+                        "dimension_id": "13",
+                        "material_type": "boq",
+                        "material_type_label": "清单",
+                        "conflict_kind_label": "数值不一致",
+                        "label": "跨资料一致性：施组需体现清单关键约束",
+                        "summary_label": "维度13 / 清单 / 数值不一致 / 跨资料一致性：施组需体现清单关键约束",
+                        "detail_label": "强制项；术语 0/2；数值 0/1；来源 retrieval_chunks",
+                        "entrypoint_key": "upload_shigong",
+                        "entrypoint_label": "前往「4) 项目施组」上传新版施组",
+                        "entrypoint_anchor": "#section-shigong",
+                        "entrypoint_reason_label": "当前项目已有已评分施组；若已按冲突项修改内容，应先上传新版施组，再重新评分。",
+                        "material_review_entrypoint_label": "前往「3) 项目资料」核对清单",
+                        "material_review_entrypoint_anchor": "#uploadMaterialBoq",
+                        "material_review_reason_label": "当前该高严重度冲突来自清单数值不一致，建议先核对对应资料来源文件和量化约束。",
+                        "action_label": "优先回到施组，补齐与清单一致的量化约束、工程量或参数。",
+                        "secondary_hint": "必要时再回看「3) 项目资料」中的清单来源文件是否齐全。",
+                    }
+                ],
+                "material_conflict_recommendations": [
+                    "清单一致性命中率偏低（0.0%），建议补充明确的量化约束与章节引用。"
+                ],
+            },
+            "record_draft": {
+                "status": "pending_manual_confirmation",
+                "status_label": "待人工确认",
+                "summary_label": "待人工确认 / 建议试车（带警告） / 中风险",
+                "suggested_executed_at": "2026-03-31T10:00:00+08:00",
+                "executor_name": "待填写",
+                "recommended_conclusion": "建议试车（带警告）",
+                "recommended_risk_label": "中风险",
+                "warning_ack_required": True,
+                "warning_ack_items": ["系统总封关前置条件尚未全部满足，但这不阻断当前项目试车。"],
+                "confirmation_hint": "当前存在警告项，试车后请人工补记确认意见并逐条复核警告项。",
+                "next_recommended_action": "继续累计真实评标样本，提升漂移判断与自学习稳定性。",
+            },
+            "strengths": ["系统自检通过，运行时必需项全部正常。"],
+            "blockers": [],
+            "warnings": ["系统总封关前置条件尚未全部满足，但这不阻断当前项目试车。"],
+            "recommendations": ["继续累计真实评标样本，提升漂移判断与自学习稳定性。"],
+        }
+
+        response = client.get("/api/v1/projects/p1/trial_preflight")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["trial_run_ready"] is True
+        assert data["status"] == "watch"
+        assert data["metrics"]["ground_truth_count"] == 2
+        assert data["metrics"]["system_closure_failed_gates"] == ["minimum_ready_projects"]
+        assert data["signoff"]["decision"] == "approve_with_watch"
+        assert data["signoff"]["risk_level"] == "medium"
+        assert data["warning_details"]["high_severity_material_conflict_count"] == 1
+        assert (
+            data["warning_details"]["high_severity_material_conflicts"][0]["dimension_id"] == "13"
+        )
+        assert (
+            data["warning_details"]["high_severity_material_conflicts"][0][
+                "material_review_entrypoint_label"
+            ]
+            == "前往「3) 项目资料」核对清单"
+        )
+        assert (
+            data["warning_details"]["high_severity_material_conflicts"][0][
+                "entrypoint_reason_label"
+            ]
+            == "当前项目已有已评分施组；若已按冲突项修改内容，应先上传新版施组，再重新评分。"
+        )
+        assert (
+            data["warning_details"]["high_severity_material_conflicts"][0][
+                "material_review_reason_label"
+            ]
+            == "当前该高严重度冲突来自清单数值不一致，建议先核对对应资料来源文件和量化约束。"
+        )
+        assert data["record_draft"]["status"] == "pending_manual_confirmation"
+        assert data["record_draft"]["recommended_conclusion"] == "建议试车（带警告）"
+
+    @patch("app.main._build_system_improvement_overview")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_system_improvement_overview_success(
+        self,
+        mock_ensure,
+        mock_build_overview,
+        client,
+    ):
+        mock_build_overview.return_value = {
+            "generated_at": "2026-03-31T10:00:00+08:00",
+            "base_url": "/api/v1",
+            "overall_ready": False,
+            "status": "watch",
+            "status_label": "系统可继续试车，但仍需按清单持续收口",
+            "summary_label": "系统可继续试车，但仍需按清单持续收口 / 阻断 0 / 警告 3 / 项目 3",
+            "metrics": {
+                "self_check_ok": True,
+                "failed_required_count": 0,
+                "failed_optional_count": 1,
+                "orphan_records_total": 0,
+                "affected_dataset_count": 0,
+                "project_count": 3,
+                "evaluated_project_count": 2,
+                "ready_project_count": 1,
+                "not_ready_project_count": 1,
+                "candidate_project_count": 1,
+                "minimum_ready_projects": 2,
+                "system_closure_ready": False,
+                "system_closure_failed_gates": ["minimum_ready_projects"],
+                "current_display_matches_qt_pass_count": 1,
+                "current_mae_rmse_not_worse_pass_count": 1,
+                "current_rank_corr_not_worse_pass_count": 2,
+                "next_priority_project_name": "项目A",
+                "next_candidate_project_name": "项目B",
+            },
+            "ops_agent_quality_summary": {
+                "snapshot_available": True,
+                "snapshot_path": "build/ops_agents_status.json",
+                "generated_at": "2026-03-31T10:00:00+08:00",
+                "overall_status": "warn",
+                "overall_status_label": "巡检待关注",
+                "quality_status": "watch",
+                "quality_status_label": "自动巡检可继续运行，但质量仍需关注",
+                "summary_label": "自动巡检可继续运行，但质量仍需关注 / 通过 8 / 待收口 1 / 失败 0",
+                "agent_count": 9,
+                "pass_count": 8,
+                "warn_count": 1,
+                "fail_count": 0,
+                "duration_ms": 6122,
+                "recent_cycle_count": 2,
+                "recent_pass_cycle_count": 1,
+                "recent_warn_cycle_count": 1,
+                "recent_fail_cycle_count": 0,
+                "recent_non_pass_streak_count": 1,
+                "recent_manual_gate_cycle_count": 1,
+                "recent_post_verify_failed_cycle_count": 0,
+                "latest_quality_reason_code": "manual_confirmation_required",
+                "latest_quality_reason_label": "自动学习需人工确认",
+                "latest_quality_reason_project_id": "p-manual",
+                "latest_quality_reason_project_name": "项目手工确认A",
+                "latest_quality_reason_project_detail": "待人工确认极端样本 4 条；当前暂无可关联预测样本",
+                "recent_same_reason_streak_count": 1,
+                "recent_quality_reason_summary_rows": [
+                    {
+                        "quality_reason_code": "auto_actions_executed",
+                        "quality_reason_label": "已执行自动动作",
+                        "count": 1,
+                    },
+                    {
+                        "quality_reason_code": "manual_confirmation_required",
+                        "quality_reason_label": "自动学习需人工确认",
+                        "count": 1,
+                    },
+                ],
+                "auto_repair_enabled": True,
+                "auto_evolve_enabled": True,
+                "auto_repair_attempted_count": 0,
+                "auto_repair_success_count": 0,
+                "auto_fixed_count": 0,
+                "total_auto_repair_attempted_count": 1,
+                "total_auto_repair_success_count": 1,
+                "repair_success_rate": 1.0,
+                "auto_evolve_attempted_count": 0,
+                "auto_evolve_success_count": 0,
+                "total_auto_evolve_attempted_count": 1,
+                "total_auto_evolve_success_count": 1,
+                "evolve_success_rate": 1.0,
+                "manual_confirmation_required_count": 1,
+                "manual_confirmation_rows": [
+                    {
+                        "project_id": "p-manual",
+                        "project_name": "项目手工确认A",
+                        "pending_extreme_ground_truth_count": 4,
+                        "matched_submission_count": 0,
+                        "entrypoint_key": "ground_truth",
+                        "entrypoint_label": "前往「5) 自我学习与进化」录入真实评标",
+                        "action_label": "录入真实评标并人工确认极端样本",
+                        "manual_override_hint": "confirm_extreme_sample=1",
+                        "current_calibrator_deployment_mode": "prior_fallback",
+                        "detail": "待人工确认极端样本 4 条；当前暂无可关联预测样本",
+                        "recommendation": "存在 4 条极端偏差样本，自动调权/自动校准已被暂停；人工确认后再执行学习进化或一键闭环。",
+                    }
+                ],
+                "post_verify_failed_count": 0,
+                "bootstrap_monitoring_count": 1,
+                "llm_account_low_quality_pool_count": 2,
+                "recent_audit_rows": [
+                    {
+                        "generated_at": "2026-03-30T10:00:00+08:00",
+                        "overall_status": "pass",
+                        "auto_repair_attempted_count": 1,
+                        "auto_repair_success_count": 1,
+                        "auto_evolve_attempted_count": 1,
+                        "auto_evolve_success_count": 1,
+                        "manual_confirmation_required_count": 0,
+                        "post_verify_failed_count": 0,
+                        "quality_reason_code": "auto_actions_executed",
+                        "quality_reason_label": "已执行自动动作",
+                        "quality_reason_detail": "自动修复 1/1；自动学习 1/1",
+                        "quality_audit_label": "已执行自动动作",
+                        "top_recommendation": "",
+                    },
+                    {
+                        "generated_at": "2026-03-31T10:00:00+08:00",
+                        "overall_status": "warn",
+                        "auto_repair_attempted_count": 0,
+                        "auto_repair_success_count": 0,
+                        "auto_evolve_attempted_count": 0,
+                        "auto_evolve_success_count": 0,
+                        "manual_confirmation_required_count": 1,
+                        "post_verify_failed_count": 0,
+                        "quality_reason_code": "manual_confirmation_required",
+                        "quality_reason_label": "自动学习需人工确认",
+                        "quality_reason_detail": "人工确认需求 1 项",
+                        "quality_reason_project_id": "p-manual",
+                        "quality_reason_project_name": "项目手工确认A",
+                        "quality_reason_project_detail": "待人工确认极端样本 4 条；当前暂无可关联预测样本",
+                        "quality_audit_label": "自动学习需人工确认",
+                        "top_recommendation": "有 1 个项目存在极端偏差样本，需人工确认后才能继续自动学习。",
+                    },
+                ],
+                "agent_rows": [
+                    {
+                        "name": "learning_calibration",
+                        "label": "学习校准智能体",
+                        "status": "warn",
+                        "recommendation": "有 1 个项目存在极端偏差样本，需人工确认后才能继续自动学习。",
+                    }
+                ],
+                "strengths": ["自动修复开关已开启。"],
+                "blockers": [],
+                "warnings": ["当前仍有 1 个项目需人工确认后，自动学习链路才能继续推进。"],
+                "recommendations": ["有 1 个项目存在极端偏差样本，需人工确认后才能继续自动学习。"],
+            },
+            "focus_workstreams": [
+                {
+                    "id": "runtime_stability",
+                    "title": "运行稳定性",
+                    "status": "warn",
+                    "summary": "系统自检已通过，但仍有 1 项降级告警。",
+                    "detail": "核心失败 0 项；降级告警 1 项。",
+                    "entrypoint_key": "system_self_check",
+                    "entrypoint_label": "前往「5) 自我学习与进化」执行“系统自检”",
+                    "action_label": "执行系统自检",
+                },
+                {
+                    "id": "system_closure",
+                    "title": "系统总封关",
+                    "status": "warn",
+                    "summary": "暂不可封系统总关",
+                    "detail": "先处理当前分与青天未完全对齐的问题。",
+                    "project_id": "p1",
+                    "project_name": "项目A",
+                    "entrypoint_key": "evaluation_summary",
+                    "entrypoint_label": "前往「5) 自我学习与进化」执行“跨项目汇总评估”",
+                    "action_label": "查看跨项目汇总",
+                },
+            ],
+            "focus_workstream_status_summaries": [
+                {
+                    "workstream_status": "ok",
+                    "workstream_status_label": "正常",
+                    "count": 0,
+                    "status": "empty",
+                    "summary": "当前没有处于正常状态的工作流，说明系统级主工作流仍在持续收口。",
+                    "empty_reason_label": "当前没有处于正常状态的工作流，说明系统级主工作流仍在持续收口。",
+                    "priority_workstream_id": "",
+                    "priority_workstream_title": "",
+                    "priority_project_id": "",
+                    "priority_project_name": "",
+                    "priority_entrypoint_key": "",
+                    "priority_entrypoint_label": "",
+                    "priority_action_label": "",
+                },
+                {
+                    "workstream_status": "warn",
+                    "workstream_status_label": "待收口",
+                    "count": 2,
+                    "status": "active",
+                    "summary": "当前已有 2 条工作流仍待收口，建议继续按建议入口推进。",
+                    "empty_reason_label": "",
+                    "priority_workstream_id": "system_closure",
+                    "priority_workstream_title": "系统总封关",
+                    "priority_project_id": "p1",
+                    "priority_project_name": "项目A",
+                    "priority_entrypoint_key": "evaluation_summary",
+                    "priority_entrypoint_label": "前往「5) 自我学习与进化」执行“跨项目汇总评估”",
+                    "priority_action_label": "查看跨项目汇总",
+                },
+                {
+                    "workstream_status": "blocked",
+                    "workstream_status_label": "阻断",
+                    "count": 0,
+                    "status": "empty",
+                    "summary": "当前没有阻断工作流，说明现有系统级缺口暂不阻断继续试车。",
+                    "empty_reason_label": "当前没有阻断工作流，说明现有系统级缺口暂不阻断继续试车。",
+                    "priority_workstream_id": "",
+                    "priority_workstream_title": "",
+                    "priority_project_id": "",
+                    "priority_project_name": "",
+                    "priority_entrypoint_key": "",
+                    "priority_entrypoint_label": "",
+                    "priority_action_label": "",
+                },
+            ],
+            "closure_gate_details": [
+                {
+                    "id": "minimum_ready_projects",
+                    "label": "达到第一阶段 ready 的项目数达到 2 个",
+                    "summary": "当前仅有 1 个项目达到第一阶段 ready，至少需要 2 个。",
+                    "detail": "先推进未 ready 项目进入第一阶段 ready。",
+                    "project_id": "p1",
+                    "project_name": "项目A",
+                    "entrypoint_key": "ground_truth",
+                    "entrypoint_label": "前往「5) 自我学习与进化」录入真实评标",
+                    "action_label": "录入真实评标",
+                }
+            ],
+            "project_gap_details": [
+                {
+                    "id": "phase1_ready_gap:p1",
+                    "kind": "phase1_ready_gap",
+                    "kind_label": "第一阶段 ready 缺口",
+                    "project_id": "p1",
+                    "project_name": "项目A",
+                    "summary": "当前项目仍未达到第一阶段 ready（未通过门 2 个）。",
+                    "detail": "未通过门：current_display_matches_qt、drift_low；当前项目尚未满足第一阶段封关条件，优先收口未通过门。",
+                    "entrypoint_key": "auto_run_reflection",
+                    "entrypoint_label": "前往「5) 自我学习与进化」执行“一键闭环执行”",
+                    "action_label": "执行一键闭环",
+                }
+            ],
+            "project_gate_gap_details": [
+                {
+                    "id": "p1:current_display_matches_qt",
+                    "kind": "project_failed_gate",
+                    "kind_label": "项目内未通过门",
+                    "project_id": "p1",
+                    "project_name": "项目A",
+                    "gate_id": "current_display_matches_qt",
+                    "gate_label": "当前分已与青天结果对齐",
+                    "summary": "当前项目仍未通过：当前分已与青天结果对齐。",
+                    "detail": "门内详情：false 当前项目尚未满足第一阶段封关条件，优先收口未通过门。 先重跑 V2 一键闭环，收口当前分、校准器和漂移状态。",
+                    "entrypoint_key": "auto_run_reflection",
+                    "entrypoint_label": "前往「5) 自我学习与进化」执行“一键闭环执行”",
+                    "action_label": "执行一键闭环",
+                }
+            ],
+            "project_action_gap_details": [
+                {
+                    "id": "p1:auto_run_reflection",
+                    "kind": "project_action_gap",
+                    "kind_label": "按动作归并的项目收口",
+                    "project_id": "p1",
+                    "project_name": "项目A",
+                    "entrypoint_key": "auto_run_reflection",
+                    "entrypoint_label": "前往「5) 自我学习与进化」执行“一键闭环执行”",
+                    "action_label": "执行一键闭环",
+                    "gate_count": 2,
+                    "summary": "当前项目有 2 个未通过门建议通过该动作收口。",
+                    "detail": "关联未通过门：当前分已与青天结果对齐、近30天漂移等级为 low 先重跑 V2 一键闭环，收口当前分、校准器和漂移状态。",
+                }
+            ],
+            "global_action_gap_details": [
+                {
+                    "id": "global_action:auto_run_reflection",
+                    "kind": "global_action_gap",
+                    "kind_label": "系统级优先动作",
+                    "project_id": "p1",
+                    "project_name": "项目A",
+                    "entrypoint_key": "auto_run_reflection",
+                    "entrypoint_label": "前往「5) 自我学习与进化」执行“一键闭环执行”",
+                    "action_label": "执行一键闭环",
+                    "priority_reason_label": "该项目是当前系统总封关优先收口项目。",
+                    "priority_sort_label": "系统总封关优先项目。",
+                    "execution_mode": "auto",
+                    "execution_mode_label": "自动闭环优先",
+                    "group_reason_label": "该动作支持直接执行自动闭环收口。",
+                    "project_count": 1,
+                    "gate_count_total": 2,
+                    "summary": "当前有 1 个项目、2 个未通过门建议通过该动作收口。",
+                    "detail": "涉及项目：项目A 建议优先从“项目A”开始。",
+                }
+            ],
+            "global_action_group_summaries": [
+                {
+                    "action_group": "auto",
+                    "action_group_label": "可自动收口动作",
+                    "count": 1,
+                    "status": "active",
+                    "summary": "当前已有 1 条可自动收口动作，可优先通过自动闭环压缩系统缺口。",
+                    "empty_reason_label": "",
+                },
+                {
+                    "action_group": "readonly",
+                    "action_group_label": "只读诊断动作",
+                    "count": 1,
+                    "status": "active",
+                    "summary": "当前已有 1 条只读诊断动作，适合先诊断再决定是否进入人工或自动收口。",
+                    "empty_reason_label": "",
+                },
+                {
+                    "action_group": "manual",
+                    "action_group_label": "必须人工处理动作",
+                    "count": 1,
+                    "status": "active",
+                    "summary": "当前已有 1 条必须人工处理动作，需人工录入、复核或治理后继续推进。",
+                    "empty_reason_label": "",
+                },
+            ],
+            "global_auto_action_gap_details": [
+                {
+                    "id": "global_action:auto_run_reflection",
+                    "kind": "global_action_gap",
+                    "kind_label": "系统级优先动作",
+                    "project_id": "p1",
+                    "project_name": "项目A",
+                    "entrypoint_key": "auto_run_reflection",
+                    "entrypoint_label": "前往「5) 自我学习与进化」执行“一键闭环执行”",
+                    "action_label": "执行一键闭环",
+                    "priority_reason_label": "该项目是当前系统总封关优先收口项目。",
+                    "priority_sort_label": "系统总封关优先项目。",
+                    "execution_mode": "auto",
+                    "execution_mode_label": "自动闭环优先",
+                    "action_group": "auto",
+                    "action_group_label": "可自动收口动作",
+                    "group_reason_label": "该动作支持直接执行自动闭环收口。",
+                    "project_count": 1,
+                    "gate_count_total": 2,
+                    "summary": "当前有 1 个项目、2 个未通过门建议通过该动作收口。",
+                    "detail": "涉及项目：项目A 建议优先从“项目A”开始。",
+                }
+            ],
+            "global_readonly_action_gap_details": [
+                {
+                    "id": "global_action:evaluation_summary",
+                    "kind": "global_action_gap",
+                    "kind_label": "系统级优先动作",
+                    "project_id": "p1",
+                    "project_name": "项目A",
+                    "entrypoint_key": "evaluation_summary",
+                    "entrypoint_label": "前往「5) 自我学习与进化」执行“跨项目汇总评估”",
+                    "action_label": "查看跨项目汇总",
+                    "priority_reason_label": "该项目是当前系统总封关优先收口项目。",
+                    "priority_sort_label": "系统总封关优先项目。",
+                    "execution_mode": "readonly",
+                    "execution_mode_label": "只读诊断",
+                    "action_group": "readonly",
+                    "action_group_label": "只读诊断动作",
+                    "group_reason_label": "该动作仅用于只读诊断，不直接改写项目状态。",
+                    "project_count": 1,
+                    "gate_count_total": 0,
+                    "summary": "当前有 1 条系统级诊断工作流建议先执行该动作。",
+                    "detail": "关联工作流：跨项目学习对齐 先查看跨项目汇总，再决定是否继续闭环或治理。 建议优先从“项目A”开始。",
+                }
+            ],
+            "global_manual_action_gap_details": [
+                {
+                    "id": "global_action:ground_truth",
+                    "kind": "global_action_gap",
+                    "kind_label": "系统级优先动作",
+                    "project_id": "p1",
+                    "project_name": "项目A",
+                    "entrypoint_key": "ground_truth",
+                    "entrypoint_label": "前往「5) 自我学习与进化」录入真实评标",
+                    "action_label": "录入真实评标",
+                    "priority_reason_label": "该项目是当前系统总封关优先收口项目。",
+                    "priority_sort_label": "系统总封关优先项目。",
+                    "execution_mode": "manual",
+                    "execution_mode_label": "人工处理优先",
+                    "action_group": "manual",
+                    "action_group_label": "必须人工处理动作",
+                    "group_reason_label": "该动作需要人工录入、判断或复核后才能继续收口。",
+                    "project_count": 1,
+                    "gate_count_total": 1,
+                    "summary": "当前有 1 个项目、1 个未通过门建议通过该动作收口。",
+                    "detail": "涉及项目：项目A 建议优先从“项目A”开始。",
+                }
+            ],
+            "strengths": ["系统自检通过，核心运行项正常。"],
+            "blockers": [],
+            "warnings": ["系统总封关前置条件尚未全部满足，仍需继续收口跨项目闭环。"],
+            "recommendations": ["优先收口项目“项目A”：先处理当前分与青天未完全对齐的问题。"],
+        }
+
+        response = client.get("/api/v1/system/improvement_overview")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["overall_ready"] is False
+        assert data["status"] == "watch"
+        assert data["metrics"]["project_count"] == 3
+        assert data["ops_agent_quality_summary"]["overall_status"] == "warn"
+        assert data["ops_agent_quality_summary"]["manual_confirmation_required_count"] == 1
+        assert data["metrics"]["system_closure_failed_gates"] == ["minimum_ready_projects"]
+        assert data["focus_workstreams"][0]["title"] == "运行稳定性"
+        assert data["focus_workstream_status_summaries"][1]["workstream_status"] == "warn"
+        assert data["focus_workstream_status_summaries"][1]["count"] == 2
+        assert (
+            data["focus_workstream_status_summaries"][1]["priority_workstream_title"]
+            == "系统总封关"
+        )
+        assert (
+            data["focus_workstream_status_summaries"][1]["priority_entrypoint_key"]
+            == "evaluation_summary"
+        )
+        assert data["focus_workstreams"][1]["project_id"] == "p1"
+        assert (
+            data["focus_workstreams"][1]["entrypoint_label"]
+            == "前往「5) 自我学习与进化」执行“跨项目汇总评估”"
+        )
+        assert data["closure_gate_details"][0]["id"] == "minimum_ready_projects"
+        assert data["project_gap_details"][0]["kind"] == "phase1_ready_gap"
+        assert data["project_gap_details"][0]["entrypoint_key"] == "auto_run_reflection"
+        assert data["project_gate_gap_details"][0]["gate_id"] == "current_display_matches_qt"
+        assert data["project_gate_gap_details"][0]["entrypoint_key"] == "auto_run_reflection"
+        assert data["project_action_gap_details"][0]["entrypoint_key"] == "auto_run_reflection"
+        assert data["project_action_gap_details"][0]["gate_count"] == 2
+        assert data["global_action_gap_details"][0]["entrypoint_key"] == "auto_run_reflection"
+        assert data["global_action_group_summaries"][0]["action_group"] == "auto"
+        assert data["global_action_group_summaries"][0]["status"] == "active"
+        assert data["global_action_gap_details"][0]["execution_mode"] == "auto"
+        assert (
+            data["global_action_gap_details"][0]["priority_reason_label"]
+            == "该项目是当前系统总封关优先收口项目。"
+        )
+        assert data["global_action_gap_details"][0]["priority_sort_label"] == "系统总封关优先项目。"
+        assert data["global_action_gap_details"][0]["gate_count_total"] == 2
+        assert data["global_auto_action_gap_details"][0]["action_group"] == "auto"
+        assert data["global_auto_action_gap_details"][0]["action_group_label"] == "可自动收口动作"
+        assert (
+            data["global_auto_action_gap_details"][0]["group_reason_label"]
+            == "该动作支持直接执行自动闭环收口。"
+        )
+        assert data["global_readonly_action_gap_details"][0]["action_group"] == "readonly"
+        assert data["global_readonly_action_gap_details"][0]["action_group_label"] == "只读诊断动作"
+        assert (
+            data["global_readonly_action_gap_details"][0]["group_reason_label"]
+            == "该动作仅用于只读诊断，不直接改写项目状态。"
+        )
+        assert data["global_manual_action_gap_details"][0]["action_group"] == "manual"
+        assert (
+            data["global_manual_action_gap_details"][0]["action_group_label"] == "必须人工处理动作"
+        )
+        assert (
+            data["global_manual_action_gap_details"][0]["group_reason_label"]
+            == "该动作需要人工录入、判断或复核后才能继续收口。"
+        )
+
+    @patch("app.main.render_trial_preflight_markdown")
+    @patch("app.main._build_project_trial_preflight")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_project_trial_preflight_markdown_and_download(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_build_preflight,
+        mock_render_markdown,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_build_preflight.return_value = {
+            "generated_at": "2026-03-31T10:00:00+08:00",
+            "base_url": "/api/v1",
+            "project_id": "p1",
+            "project_name": "项目1",
+            "trial_run_ready": True,
+            "status": "watch",
+            "status_label": "可试车，但建议先关注警告项",
+            "metrics": {"ground_truth_count": 2},
+            "signoff": {
+                "decision": "approve_with_watch",
+                "decision_label": "建议试车（带警告）",
+                "risk_level": "medium",
+                "risk_label": "中风险",
+                "summary_label": "建议试车（带警告） / 中风险 / 阻断 0 / 警告 0 / 状态 可试车，但建议先关注警告项",
+                "verification_checklist": [],
+            },
+            "warning_details": {
+                "high_severity_material_conflict_count": 0,
+                "high_severity_material_conflicts": [],
+                "material_conflict_recommendations": [],
+            },
+            "record_draft": {
+                "status": "pending_manual_confirmation",
+                "status_label": "待人工确认",
+                "summary_label": "待人工确认 / 建议试车（带警告） / 中风险",
+                "suggested_executed_at": "2026-03-31T10:00:00+08:00",
+                "executor_name": "待填写",
+                "recommended_conclusion": "建议试车（带警告）",
+                "recommended_risk_label": "中风险",
+                "warning_ack_required": False,
+                "warning_ack_items": [],
+                "confirmation_hint": "试车完成后请补记执行人与结论确认。",
+                "next_recommended_action": "",
+            },
+            "strengths": ["系统自检通过，运行时必需项全部正常。"],
+            "blockers": [],
+            "warnings": [],
+            "recommendations": [],
+        }
+        mock_render_markdown.return_value = "# 项目试车前综合体检报告\n\n- 项目ID：p1\n"
+
+        md_resp = client.get("/api/v1/projects/p1/trial_preflight/markdown")
+        assert md_resp.status_code == 200
+        md_data = md_resp.json()
+        assert md_data["project_id"] == "p1"
+        assert md_data["generated_at"] == "2026-03-31T10:00:00+08:00"
+        assert md_data["markdown"].startswith("# 项目试车前综合体检报告")
+
+        file_resp = client.get("/api/v1/projects/p1/trial_preflight.md")
+        assert file_resp.status_code == 200
+        assert file_resp.text.startswith("# 项目试车前综合体检报告")
+        assert "text/markdown" in file_resp.headers.get("content-type", "")
+        disposition = file_resp.headers.get("content-disposition", "")
+        assert "attachment; filename=" in disposition
+        assert "trial_preflight_p1.md" in disposition
+
+    @patch("app.main.render_trial_preflight_docx")
+    @patch("app.main._build_project_trial_preflight")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_download_project_trial_preflight_docx(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_build_preflight,
+        mock_render_docx,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_build_preflight.return_value = {
+            "generated_at": "2026-03-31T10:00:00+08:00",
+            "base_url": "/api/v1",
+            "project_id": "p1",
+            "project_name": "项目1",
+            "trial_run_ready": True,
+            "status": "watch",
+            "status_label": "可试车，但建议先关注警告项",
+            "metrics": {"ground_truth_count": 2},
+            "signoff": {
+                "decision": "approve_with_watch",
+                "decision_label": "建议试车（带警告）",
+                "risk_level": "medium",
+                "risk_label": "中风险",
+                "summary_label": "建议试车（带警告） / 中风险 / 阻断 0 / 警告 0 / 状态 可试车，但建议先关注警告项",
+                "verification_checklist": [],
+            },
+            "warning_details": {
+                "high_severity_material_conflict_count": 0,
+                "high_severity_material_conflicts": [],
+                "material_conflict_recommendations": [],
+            },
+            "record_draft": {
+                "status": "pending_manual_confirmation",
+                "status_label": "待人工确认",
+                "summary_label": "待人工确认 / 建议试车（带警告） / 中风险",
+                "suggested_executed_at": "2026-03-31T10:00:00+08:00",
+                "executor_name": "待填写",
+                "recommended_conclusion": "建议试车（带警告）",
+                "recommended_risk_label": "中风险",
+                "warning_ack_required": False,
+                "warning_ack_items": [],
+                "confirmation_hint": "试车完成后请补记执行人与结论确认。",
+                "next_recommended_action": "",
+            },
+            "strengths": ["系统自检通过，运行时必需项全部正常。"],
+            "blockers": [],
+            "warnings": [],
+            "recommendations": [],
+        }
+        mock_render_docx.return_value = b"PK\x03\x04trial-preflight-docx"
+
+        response = client.get("/api/v1/projects/p1/trial_preflight.docx")
+
+        assert response.status_code == 200
+        assert response.content.startswith(b"PK\x03\x04")
+        assert (
+            response.headers.get("content-type", "")
+            == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+        disposition = response.headers.get("content-disposition", "")
+        assert "attachment; filename=" in disposition
+        assert "trial_preflight_p1.docx" in disposition
+
+    @patch("app.main.load_calibration_models")
     @patch("app.main._resolve_project_scoring_context")
     @patch("app.main.load_evolution_reports")
     @patch("app.main.load_ground_truth")
@@ -3917,9 +11180,11 @@ class TestMaterialsEndpoint:
         mock_load_ground_truth,
         mock_load_evo_reports,
         mock_resolve_scoring_context,
+        mock_load_calibration_models,
     ):
         from app.main import _build_evolution_health_report
 
+        mock_load_calibration_models.return_value = []
         mock_load_submissions.return_value = [
             {
                 "id": "s1",
@@ -3957,10 +11222,152 @@ class TestMaterialsEndpoint:
         assert payload["project_id"] == "p1"
         assert payload["summary"]["ground_truth_count"] == 1
         assert payload["summary"]["matched_prediction_count"] == 1
+        assert payload["summary"]["matched_score_record_count"] == 1
         assert payload["windows"]["all"]["mae"] == pytest.approx(8.0, abs=1e-4)
         assert payload["windows"]["all"]["count"] == 1
         assert payload["drift"]["level"] in {"insufficient_data", "watch", "low", "medium", "high"}
 
+    @patch("app.main.load_calibration_models")
+    @patch("app.main._resolve_project_scoring_context")
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_submissions")
+    def test_build_evolution_health_report_treats_perfect_recent_matches_as_low_drift(
+        self,
+        mock_load_submissions,
+        mock_load_ground_truth,
+        mock_load_evo_reports,
+        mock_resolve_scoring_context,
+        mock_load_calibration_models,
+    ):
+        from app.main import _build_evolution_health_report
+
+        mock_load_calibration_models.return_value = []
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "report": {"pred_total_score": 82.2, "score_scale_max": 100},
+            },
+            {
+                "id": "s2",
+                "project_id": "p1",
+                "report": {"pred_total_score": 80.02, "score_scale_max": 100},
+            },
+            {
+                "id": "s3",
+                "project_id": "p1",
+                "report": {"pred_total_score": 80.74, "score_scale_max": 100},
+            },
+        ]
+        mock_load_ground_truth.return_value = [
+            {
+                "id": "gt1",
+                "project_id": "p1",
+                "source_submission_id": "s1",
+                "judge_scores": [82.16, 82.19, 82.16, 82.18, 82.22, 82.19, 82.28],
+                "final_score": 82.2,
+                "score_scale_max": 100,
+                "created_at": "2026-03-20T00:00:00+00:00",
+            },
+            {
+                "id": "gt2",
+                "project_id": "p1",
+                "source_submission_id": "s2",
+                "judge_scores": [79.99, 80.02, 79.97, 80.01, 80.02, 80.00, 80.10],
+                "final_score": 80.02,
+                "score_scale_max": 100,
+                "created_at": "2026-03-21T00:00:00+00:00",
+            },
+            {
+                "id": "gt3",
+                "project_id": "p1",
+                "source_submission_id": "s3",
+                "judge_scores": [80.73, 80.73, 80.72, 80.72, 80.76, 80.73, 80.81],
+                "final_score": 80.74,
+                "score_scale_max": 100,
+                "created_at": "2026-03-22T00:00:00+00:00",
+            },
+        ]
+        mock_load_evo_reports.return_value = {
+            "p1": {
+                "updated_at": "2026-03-22T08:00:00+00:00",
+                "scoring_evolution": {"dimension_multipliers": {"01": 1.1}},
+            }
+        }
+        mock_resolve_scoring_context.return_value = (
+            {"01": 1.1, "02": 0.9},
+            None,
+            {"id": "p1", "meta": {"score_scale_max": 100}},
+        )
+
+        payload = _build_evolution_health_report(
+            "p1",
+            {"id": "p1", "meta": {"score_scale_max": 100}},
+        )
+
+        assert payload["summary"]["matched_prediction_count"] == 3
+        assert payload["summary"]["matched_score_record_count"] == 3
+        assert payload["windows"]["recent_30d"]["mae"] == pytest.approx(0.0, abs=1e-6)
+        assert payload["windows"]["prev_30_90d"]["count"] == 0
+        assert payload["drift"]["level"] == "low"
+
+    @patch("app.main.load_calibration_models")
+    @patch("app.main._resolve_project_scoring_context")
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_submissions")
+    def test_build_evolution_health_report_matches_ground_truth_by_filename(
+        self,
+        mock_load_submissions,
+        mock_load_ground_truth,
+        mock_load_evo_reports,
+        mock_resolve_scoring_context,
+        mock_load_calibration_models,
+    ):
+        from app.main import _build_evolution_health_report
+
+        mock_load_calibration_models.return_value = []
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "安徽中江建投-道路工程(1).pdf",
+                "text": "重新上传后的施组文本",
+                "report": {"pred_total_score": 77.9, "score_scale_max": 100},
+            }
+        ]
+        mock_load_ground_truth.return_value = [
+            {
+                "id": "gt1",
+                "project_id": "p1",
+                "source_submission_filename": "/tmp/安徽中江建投-道路工程(1).pdf",
+                "shigong_text": "历史录入时保存的旧文本",
+                "judge_scores": [77.85, 77.97, 77.86, 77.86, 77.91, 77.89, 77.94],
+                "final_score": 77.9,
+                "score_scale_max": 100,
+                "created_at": "2026-03-22T00:00:00+00:00",
+            }
+        ]
+        mock_load_evo_reports.return_value = {"p1": {}}
+        mock_resolve_scoring_context.return_value = (
+            {"01": 1.0},
+            None,
+            {"id": "p1", "meta": {"score_scale_max": 100}},
+        )
+
+        payload = _build_evolution_health_report(
+            "p1",
+            {"id": "p1", "meta": {"score_scale_max": 100}},
+        )
+
+        assert payload["summary"]["ground_truth_count"] == 1
+        assert payload["summary"]["matched_prediction_count"] == 1
+        assert payload["summary"]["matched_score_record_count"] == 1
+        assert payload["summary"]["unmatched_ground_truth_count"] == 0
+        assert payload["windows"]["all"]["mae"] == pytest.approx(0.0, abs=1e-6)
+
+    @patch("app.main.load_calibration_models")
     @patch("app.main.load_projects")
     @patch("app.main._resolve_project_scoring_context")
     @patch("app.main.load_evolution_reports")
@@ -3973,9 +11380,11 @@ class TestMaterialsEndpoint:
         mock_load_evo_reports,
         mock_resolve_scoring_context,
         mock_load_projects,
+        mock_load_calibration_models,
     ):
         from app.main import _build_evolution_health_report
 
+        mock_load_calibration_models.return_value = []
         mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 100}}]
         mock_load_submissions.return_value = []
         mock_load_ground_truth.return_value = []
@@ -4006,6 +11415,7 @@ class TestMaterialsEndpoint:
         assert payload["summary"]["enhancement_review_similarity"] == pytest.approx(0.12, abs=1e-6)
         assert any("双模型复核分歧较大" in str(item) for item in payload["recommendations"])
 
+    @patch("app.main.load_calibration_models")
     @patch("app.main._resolve_project_scoring_context")
     @patch("app.main.load_evolution_reports")
     @patch("app.main.load_ground_truth")
@@ -4016,9 +11426,11 @@ class TestMaterialsEndpoint:
         mock_load_ground_truth,
         mock_load_evo_reports,
         mock_resolve_scoring_context,
+        mock_load_calibration_models,
     ):
         from app.main import _build_evolution_health_report
 
+        mock_load_calibration_models.return_value = []
         mock_load_submissions.return_value = [
             {
                 "id": "s1",
@@ -4076,6 +11488,7 @@ class TestMaterialsEndpoint:
         assert summary["ground_truth_count"] == 3
         assert summary["eligible_learning_ground_truth_count"] == 1
         assert summary["matched_prediction_count"] == 1
+        assert summary["matched_score_record_count"] == 1
         assert summary["guardrail_blocked_count"] == 1
         assert summary["learning_quality_blocked_count"] == 1
         assert summary["evolution_weight_min_samples"] == 1
@@ -4084,6 +11497,7 @@ class TestMaterialsEndpoint:
         )
         assert any("被排除在自动学习之外" in str(item) for item in payload["recommendations"])
 
+    @patch("app.main.load_calibration_models")
     @patch("app.main.load_projects")
     @patch("app.main._resolve_project_scoring_context")
     @patch("app.main.load_evolution_reports")
@@ -4096,9 +11510,11 @@ class TestMaterialsEndpoint:
         mock_load_evo_reports,
         mock_resolve_scoring_context,
         mock_load_projects,
+        mock_load_calibration_models,
     ):
         from app.main import _build_evolution_health_report
 
+        mock_load_calibration_models.return_value = []
         mock_load_projects.return_value = [
             {
                 "id": "p1",
@@ -4142,6 +11558,214 @@ class TestMaterialsEndpoint:
         assert summary["current_weights_source"] == "expert_profile"
         assert summary["evolution_weights_inactive_reason"] == "sample_count_below_min"
         assert any("样本量未达到生效阈值" in str(x) for x in payload["recommendations"])
+
+    @patch("app.main.load_calibration_models")
+    @patch("app.main._resolve_project_scoring_context")
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_submissions")
+    def test_build_evolution_health_report_flags_degraded_current_project_calibrator(
+        self,
+        mock_load_submissions,
+        mock_load_ground_truth,
+        mock_load_evo_reports,
+        mock_resolve_scoring_context,
+        mock_load_calibration_models,
+    ):
+        from app.main import _build_evolution_health_report
+
+        mock_load_calibration_models.return_value = [
+            {
+                "calibrator_version": "calib_auto_existing",
+                "train_filter": {"project_id": "p1"},
+                "deployed": True,
+                "calibrator_summary": {
+                    "deployment_mode": "cv_validated",
+                    "cv_metrics": {"mae": 1.8},
+                },
+                "metrics": {"cv_mae": 1.8},
+            },
+            {
+                "calibrator_version": "calib_auto_prev",
+                "train_filter": {"project_id": "p1"},
+                "deployed": False,
+                "calibrator_summary": {
+                    "deployment_mode": "cv_validated",
+                    "cv_metrics": {"mae": 1.1},
+                },
+                "metrics": {"cv_mae": 1.1},
+            },
+        ]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "report": {
+                    "total_score": 85.0,
+                    "pred_total_score": 85.0,
+                    "rule_total_score": 80.0,
+                    "score_scale_max": 100,
+                },
+            },
+            {
+                "id": "s2",
+                "project_id": "p1",
+                "report": {
+                    "total_score": 84.6,
+                    "pred_total_score": 84.6,
+                    "rule_total_score": 80.2,
+                    "score_scale_max": 100,
+                },
+            },
+            {
+                "id": "s3",
+                "project_id": "p1",
+                "report": {
+                    "total_score": 84.8,
+                    "pred_total_score": 84.8,
+                    "rule_total_score": 79.9,
+                    "score_scale_max": 100,
+                },
+            },
+        ]
+        mock_load_ground_truth.return_value = [
+            {
+                "id": "gt1",
+                "project_id": "p1",
+                "source_submission_id": "s1",
+                "final_score": 80.0,
+                "score_scale_max": 100,
+                "created_at": "2026-03-20T00:00:00+00:00",
+            },
+            {
+                "id": "gt2",
+                "project_id": "p1",
+                "source_submission_id": "s2",
+                "final_score": 80.2,
+                "score_scale_max": 100,
+                "created_at": "2026-03-21T00:00:00+00:00",
+            },
+            {
+                "id": "gt3",
+                "project_id": "p1",
+                "source_submission_id": "s3",
+                "final_score": 79.9,
+                "score_scale_max": 100,
+                "created_at": "2026-03-22T00:00:00+00:00",
+            },
+        ]
+        mock_load_evo_reports.return_value = {"p1": {}}
+        mock_resolve_scoring_context.return_value = (
+            {"01": 1.0},
+            None,
+            {"id": "p1", "meta": {"score_scale_max": 100}},
+        )
+
+        payload = _build_evolution_health_report(
+            "p1",
+            {"id": "p1", "meta": {"score_scale_max": 100}},
+        )
+
+        assert payload["summary"]["current_calibrator_version"] == "calib_auto_existing"
+        assert payload["summary"]["current_calibrator_source"] == "project"
+        assert payload["summary"]["current_calibrator_deployment_mode"] == "cv_validated"
+        assert payload["summary"]["current_calibrator_degraded"] is True
+        assert (
+            payload["summary"]["current_calibrator_degradation_reason"]
+            == "current_calibrator_recent_mae_worse_than_rule"
+        )
+        assert payload["summary"]["current_calibrator_recent_mae"] == pytest.approx(
+            4.7667, abs=1e-4
+        )
+        assert payload["summary"]["current_calibrator_recent_rule_mae"] == pytest.approx(
+            0.0, abs=1e-6
+        )
+        assert payload["summary"]["current_calibrator_recent_mae_delta_vs_rule"] == pytest.approx(
+            4.7667, abs=1e-4
+        )
+        assert payload["summary"]["current_calibrator_has_rollback_candidate"] is True
+        assert (
+            payload["summary"]["current_calibrator_rollback_candidate_version"] == "calib_auto_prev"
+        )
+        assert payload["summary"]["current_calibrator_rollback_candidate_model_type"] is None
+        assert (
+            payload["summary"]["current_calibrator_rollback_candidate_deployment_mode"]
+            == "cv_validated"
+        )
+        assert payload["summary"]["current_calibrator_rollback_candidate_cv_mae"] == pytest.approx(
+            1.1, abs=1e-6
+        )
+        assert any(
+            "当前项目级校准器近期误差已明显劣于规则基线" in str(item)
+            for item in payload["recommendations"]
+        )
+        assert any("calib_auto_prev" in str(item) for item in payload["recommendations"])
+
+    @patch("app.main.load_calibration_models")
+    @patch("app.main._resolve_project_scoring_context")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_evolution_reports")
+    def test_build_evolution_health_report_exposes_last_runtime_governance(
+        self,
+        mock_load_evo_reports,
+        mock_load_ground_truth,
+        mock_load_submissions,
+        mock_resolve_scoring_context,
+        mock_load_calibration_models,
+    ):
+        from app.main import _build_evolution_health_report
+
+        mock_load_calibration_models.return_value = []
+        mock_load_submissions.return_value = []
+        mock_load_ground_truth.return_value = []
+        mock_load_evo_reports.return_value = {
+            "p1": {
+                "calibrator_runtime_governance": {
+                    "action": "rollback",
+                    "reason": "rollback_preview_improved",
+                    "rollback_candidate_version": "calib_prev",
+                    "active_calibrator_version_after": "calib_prev",
+                    "degraded_after": False,
+                    "recovered_after": True,
+                    "updated_reports": 7,
+                    "updated_submissions": 7,
+                    "recorded_at": "2026-03-30T12:00:00+00:00",
+                }
+            }
+        }
+        mock_resolve_scoring_context.return_value = (
+            {"01": 1.0},
+            None,
+            {"id": "p1", "meta": {"score_scale_max": 100}},
+        )
+
+        payload = _build_evolution_health_report(
+            "p1",
+            {"id": "p1", "meta": {"score_scale_max": 100}},
+        )
+
+        assert payload["summary"]["last_calibrator_runtime_governance_action"] == "rollback"
+        assert (
+            payload["summary"]["last_calibrator_runtime_governance_reason"]
+            == "rollback_preview_improved"
+        )
+        assert payload["summary"]["last_calibrator_runtime_governance_candidate"] == "calib_prev"
+        assert payload["summary"]["last_calibrator_runtime_governance_updated_reports"] == 7
+        assert payload["summary"]["last_calibrator_runtime_governance_updated_submissions"] == 7
+        assert payload["summary"]["last_calibrator_runtime_governance_recorded_at"] == (
+            "2026-03-30T12:00:00+00:00"
+        )
+        assert payload["summary"]["last_calibrator_runtime_governance_active_version_after"] == (
+            "calib_prev"
+        )
+        assert payload["summary"]["last_calibrator_runtime_governance_degraded_after"] is False
+        assert payload["summary"]["last_calibrator_runtime_governance_recovered_after"] is True
+        assert any(
+            "最近一次运行时校准治理已自动切回历史更稳版本并完成评分回填，当前项目级校准器已恢复稳定。"
+            in str(item)
+            for item in payload["recommendations"]
+        )
 
     @patch("app.main._resolve_dwg_converter_binaries", return_value=[])
     @patch("app.main.load_materials")
@@ -5274,6 +12898,796 @@ class TestMaterialAdvancedParsing:
         assert "13" in (summary.get("focused_dimensions") or [])
         assert "11" in (summary.get("focused_dimensions") or [])
         assert summary["structured_quality_score"] > 0
+
+    def test_build_boq_structured_summary_stops_after_summary_tail(self):
+        from app.main import _build_boq_structured_summary
+
+        rows = ["项目编码,项目名称,单位,工程量,综合单价,合价"]
+        for idx in range(1, 41):
+            rows.append(
+                f"{idx:09d},土方开挖{idx},m3,{100 + idx},{35.5 + idx / 10:.1f},{(100 + idx) * (35.5 + idx / 10):.1f}"
+            )
+        rows.extend(
+            [
+                ",本页小计,,0,0,99999",
+                ",本章合计,,0,0,199999",
+            ]
+        )
+        rows.extend("" for _ in range(12))
+        rows.append("999999999,尾部噪音大额项目,m3,1,999999,999999")
+        summary = _build_boq_structured_summary("\n".join(rows).encode("utf-8"), "heavy_boq.csv")
+
+        first_sheet = summary["sheets"][0]
+        assert first_sheet["row_scan_stopped_early"] is True
+        assert first_sheet["scanned_rows"] < len(rows)
+        assert summary["total_parsed_items"] == 40
+        assert "尾部噪音大额项目" not in {
+            str(item.get("name") or "") for item in (first_sheet.get("top_items_by_amount") or [])
+        }
+
+    def test_build_boq_structured_summary_keeps_bounded_top_items_by_amount(self):
+        from app.main import _build_boq_structured_summary
+
+        rows = ["项目编码,项目名称,单位,工程量,综合单价,合价"]
+        for idx in range(1, 16):
+            rows.append(f"{idx:09d},清单项{idx},m3,1,{1000 + idx},{1000 + idx}")
+
+        summary = _build_boq_structured_summary("\n".join(rows).encode("utf-8"), "topk_boq.csv")
+
+        top_names = [
+            str(item.get("name") or "")
+            for item in (summary["sheets"][0].get("top_items_by_amount") or [])
+        ]
+        assert len(top_names) == 10
+        assert top_names[0] == "清单项15"
+        assert top_names[-1] == "清单项6"
+        assert "清单项5" not in top_names
+
+    def test_build_boq_structured_summary_records_pdf_preview_progress(self):
+        from app.main import _build_boq_structured_summary
+
+        summary = _build_boq_structured_summary(
+            b"%PDF-1.4\n",
+            "工程量清单.pdf",
+            parsed_text="[PDF_BACKEND:pymupdf]\n[PAGE:1]\n第一页\n\n[PAGE:2]\n第二页",
+            preview_only=True,
+        )
+
+        assert summary["detected_format"] == "pdf"
+        assert summary["parse_stage"] == "preview"
+        assert summary["preview_last_page"] == 2
+        assert summary["parsed_page_count"] == 2
+
+    def test_build_boq_structured_summary_records_pdf_resume_metadata(self):
+        from app.main import _build_boq_structured_summary
+
+        summary = _build_boq_structured_summary(
+            b"%PDF-1.4\n",
+            "工程量清单.pdf",
+            parsed_text=(
+                "[PDF_BACKEND:pymupdf]\n"
+                "[PAGE:1]\n第一页\n\n"
+                "[PAGE:2]\n第二页\n\n"
+                "[PAGE:3]\n第三页"
+            ),
+            prior_summary={"parse_stage": "preview", "preview_last_page": 2},
+        )
+
+        assert summary["detected_format"] == "pdf"
+        assert summary["scan_strategy"] == "preview_guided_full_pdf"
+        assert summary["resume_from_page"] == 3
+        assert summary["saved_page_count"] == 2
+        assert summary["parsed_page_count"] == 3
+
+    def test_build_boq_structured_summary_prioritizes_main_sheet_and_limits_aux_scan(self):
+        from app.main import (
+            DEFAULT_BOQ_PARSE_AUX_HEADER_SCAN_MAX_ROWS,
+            _build_boq_structured_summary,
+        )
+
+        class _FakeSheet:
+            def __init__(self, title, rows):
+                self.title = title
+                self._rows = rows
+
+            def iter_rows(self, values_only=True):
+                assert values_only is True
+                for row in self._rows:
+                    yield row
+
+        class _FakeWorkbook:
+            def __init__(self, worksheets):
+                self.worksheets = worksheets
+
+            def close(self):
+                return None
+
+        aux_rows = [("", "", "", "", "", "")] * 25
+        main_rows = [
+            ("项目编码", "项目名称", "单位", "工程量", "综合单价", "合价"),
+            ("010101001", "土方开挖", "m3", 100, 35.5, 3550),
+        ]
+        fake_wb = _FakeWorkbook(
+            [
+                _FakeSheet("封面说明", aux_rows),
+                _FakeSheet("分部分项工程量清单", main_rows),
+            ]
+        )
+        fake_openpyxl = SimpleNamespace(load_workbook=lambda *args, **kwargs: fake_wb)
+
+        with patch.dict(sys.modules, {"openpyxl": fake_openpyxl}):
+            summary = _build_boq_structured_summary(b"fake-xlsx", "boq.xlsx")
+
+        assert [sheet["sheet"] for sheet in summary["sheets"]] == ["分部分项工程量清单", "封面说明"]
+        main_sheet = summary["sheets"][0]
+        aux_sheet = summary["sheets"][1]
+        assert main_sheet["parsed_items"] == 1
+        assert aux_sheet["parsed_items"] == 0
+        assert aux_sheet["scanned_rows"] == DEFAULT_BOQ_PARSE_AUX_HEADER_SCAN_MAX_ROWS
+
+    def test_build_boq_structured_summary_preview_only_limits_sheet_count_and_rows(self):
+        from app.main import (
+            DEFAULT_MATERIAL_PARSE_PREVIEW_MAX_ROWS_BY_TYPE,
+            _build_boq_structured_summary,
+        )
+
+        class _FakeSheet:
+            def __init__(self, title, rows):
+                self.title = title
+                self._rows = rows
+
+            def iter_rows(self, values_only=True):
+                assert values_only is True
+                for row in self._rows:
+                    yield row
+
+        class _FakeWorkbook:
+            def __init__(self, worksheets):
+                self.worksheets = worksheets
+
+            def close(self):
+                return None
+
+        heavy_rows = [("项目编码", "项目名称", "单位", "工程量", "综合单价", "合价")]
+        heavy_rows.extend(
+            (f"{idx:09d}", f"清单项{idx}", "m3", idx, 10 + idx, (10 + idx) * idx)
+            for idx in range(1, 260)
+        )
+        fake_wb = _FakeWorkbook(
+            [
+                _FakeSheet("分部分项工程量清单", heavy_rows),
+                _FakeSheet("措施项目清单", heavy_rows),
+                _FakeSheet("其他项目清单", heavy_rows),
+            ]
+        )
+        fake_openpyxl = SimpleNamespace(load_workbook=lambda *args, **kwargs: fake_wb)
+
+        with patch.dict(sys.modules, {"openpyxl": fake_openpyxl}):
+            summary = _build_boq_structured_summary(
+                b"fake-xlsx",
+                "heavy_boq.xlsx",
+                parsed_text="工程量清单 预解析",
+                preview_only=True,
+            )
+
+        assert summary["parse_stage"] == "preview"
+        assert len(summary["sheets"]) == 2
+        assert summary["sheets"][0]["sheet"] == "分部分项工程量清单"
+        assert (
+            summary["sheets"][0]["scanned_rows"]
+            == DEFAULT_MATERIAL_PARSE_PREVIEW_MAX_ROWS_BY_TYPE["boq"]
+        )
+
+    def test_build_boq_structured_summary_full_mode_uses_preview_guidance_for_unconfirmed_sheets(
+        self,
+    ):
+        from app.main import (
+            DEFAULT_BOQ_PARSE_FULL_GUIDED_UNCONFIRMED_PRIMARY_SHEET_MAX_ROWS,
+            DEFAULT_BOQ_PARSE_FULL_GUIDED_WEAK_SHEET_MAX_ROWS,
+            DEFAULT_BOQ_PARSE_MAX_ROWS_PER_SHEET,
+            _build_boq_structured_summary,
+        )
+
+        class _FakeSheet:
+            def __init__(self, title, rows):
+                self.title = title
+                self._rows = rows
+
+            def iter_rows(self, values_only=True):
+                assert values_only is True
+                for row in self._rows:
+                    yield row
+
+        class _FakeWorkbook:
+            def __init__(self, worksheets):
+                self.worksheets = worksheets
+
+            def close(self):
+                return None
+
+        heavy_rows = [("项目编码", "项目名称", "单位", "工程量", "综合单价", "合价")]
+        heavy_rows.extend(
+            (f"{idx:09d}", f"清单项{idx}", "m3", idx, 10 + idx, (10 + idx) * idx)
+            for idx in range(1, 1605)
+        )
+        aux_rows = [("", "", "", "", "", "")] * 80
+        fake_wb = _FakeWorkbook(
+            [
+                _FakeSheet("封面说明", aux_rows),
+                _FakeSheet("其他项目清单", heavy_rows),
+                _FakeSheet("措施项目清单", heavy_rows),
+                _FakeSheet("分部分项工程量清单", heavy_rows),
+            ]
+        )
+        preview_summary = {
+            "parse_stage": "preview",
+            "total_parsed_items": 40,
+            "sheets": [
+                {
+                    "sheet": "分部分项工程量清单",
+                    "parsed_items": 36,
+                    "detected_columns": {"code": 0, "name": 1},
+                },
+                {
+                    "sheet": "措施项目清单",
+                    "parsed_items": 28,
+                    "detected_columns": {"code": 0, "name": 1},
+                },
+            ],
+        }
+        fake_openpyxl = SimpleNamespace(load_workbook=lambda *args, **kwargs: fake_wb)
+
+        with patch.dict(sys.modules, {"openpyxl": fake_openpyxl}):
+            summary = _build_boq_structured_summary(
+                b"fake-xlsx",
+                "heavy_boq.xlsx",
+                parsed_text="工程量清单 full parse",
+                prior_summary=preview_summary,
+            )
+
+        assert summary["scan_strategy"] == "preview_guided_full"
+        assert summary["scan_guidance_strength"] == "standard"
+        assert [sheet["sheet"] for sheet in summary["sheets"]] == [
+            "分部分项工程量清单",
+            "措施项目清单",
+            "其他项目清单",
+            "封面说明",
+        ]
+        assert summary["sheets"][0]["row_scan_budget"] == DEFAULT_BOQ_PARSE_MAX_ROWS_PER_SHEET
+        assert summary["sheets"][1]["row_scan_budget"] == DEFAULT_BOQ_PARSE_MAX_ROWS_PER_SHEET
+        assert (
+            summary["sheets"][2]["row_scan_budget"]
+            == DEFAULT_BOQ_PARSE_FULL_GUIDED_UNCONFIRMED_PRIMARY_SHEET_MAX_ROWS
+        )
+        assert (
+            summary["sheets"][2]["scanned_rows"]
+            == DEFAULT_BOQ_PARSE_FULL_GUIDED_UNCONFIRMED_PRIMARY_SHEET_MAX_ROWS
+        )
+        assert (
+            summary["sheets"][3]["row_scan_budget"]
+            == DEFAULT_BOQ_PARSE_FULL_GUIDED_WEAK_SHEET_MAX_ROWS
+        )
+
+    def test_build_boq_structured_summary_full_mode_uses_stronger_preview_guidance_for_high_confidence(
+        self,
+    ):
+        from app.main import (
+            DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_UNCONFIRMED_PRIMARY_SHEET_MAX_ROWS,
+            DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_WEAK_SHEET_MAX_ROWS,
+            DEFAULT_BOQ_PARSE_MAX_ROWS_PER_SHEET,
+            _build_boq_structured_summary,
+        )
+
+        class _FakeSheet:
+            def __init__(self, title, rows):
+                self.title = title
+                self._rows = rows
+
+            def iter_rows(self, values_only=True):
+                assert values_only is True
+                for row in self._rows:
+                    yield row
+
+        class _FakeWorkbook:
+            def __init__(self, worksheets):
+                self.worksheets = worksheets
+
+            def close(self):
+                return None
+
+        heavy_rows = [("项目编码", "项目名称", "单位", "工程量", "综合单价", "合价")]
+        heavy_rows.extend(
+            (f"{idx:09d}", f"清单项{idx}", "m3", idx, 10 + idx, (10 + idx) * idx)
+            for idx in range(1, 1605)
+        )
+        aux_rows = [("", "", "", "", "", "")] * 80
+        fake_wb = _FakeWorkbook(
+            [
+                _FakeSheet("封面说明", aux_rows),
+                _FakeSheet("其他项目清单", heavy_rows),
+                _FakeSheet("措施项目清单", heavy_rows),
+                _FakeSheet("分部分项工程量清单", heavy_rows),
+            ]
+        )
+        preview_summary = {
+            "parse_stage": "preview",
+            "total_parsed_items": 64,
+            "sheets": [
+                {
+                    "sheet": "分部分项工程量清单",
+                    "parsed_items": 36,
+                    "detected_columns": {"code": 0, "name": 1},
+                },
+                {
+                    "sheet": "措施项目清单",
+                    "parsed_items": 28,
+                    "detected_columns": {"code": 0, "name": 1},
+                },
+            ],
+        }
+        fake_openpyxl = SimpleNamespace(load_workbook=lambda *args, **kwargs: fake_wb)
+
+        with patch.dict(sys.modules, {"openpyxl": fake_openpyxl}):
+            summary = _build_boq_structured_summary(
+                b"fake-xlsx",
+                "heavy_boq.xlsx",
+                parsed_text="工程量清单 full parse",
+                prior_summary=preview_summary,
+            )
+
+        assert summary["scan_strategy"] == "preview_guided_full"
+        assert summary["scan_guidance_strength"] == "strong"
+        assert summary["sheets"][0]["row_scan_budget"] == DEFAULT_BOQ_PARSE_MAX_ROWS_PER_SHEET
+        assert summary["sheets"][1]["row_scan_budget"] == DEFAULT_BOQ_PARSE_MAX_ROWS_PER_SHEET
+        assert (
+            summary["sheets"][2]["row_scan_budget"]
+            == DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_UNCONFIRMED_PRIMARY_SHEET_MAX_ROWS
+        )
+        assert (
+            summary["sheets"][2]["scanned_rows"]
+            == DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_UNCONFIRMED_PRIMARY_SHEET_MAX_ROWS
+        )
+        assert (
+            summary["sheets"][3]["row_scan_budget"]
+            == DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_WEAK_SHEET_MAX_ROWS
+        )
+
+    def test_build_boq_structured_summary_full_mode_stops_after_empty_aux_tail_when_preview_is_strong(
+        self,
+    ):
+        from app.main import _build_boq_structured_summary
+
+        class _FakeSheet:
+            def __init__(self, title, rows):
+                self.title = title
+                self._rows = rows
+
+            def iter_rows(self, values_only=True):
+                assert values_only is True
+                for row in self._rows:
+                    yield row
+
+        class _FakeWorkbook:
+            def __init__(self, worksheets):
+                self.worksheets = worksheets
+
+            def close(self):
+                return None
+
+        heavy_rows = [("项目编码", "项目名称", "单位", "工程量", "综合单价", "合价")]
+        heavy_rows.extend(
+            (f"{idx:09d}", f"清单项{idx}", "m3", idx, 10 + idx, (10 + idx) * idx)
+            for idx in range(1, 120)
+        )
+        aux_rows = [("", "", "", "", "", "")] * 80
+        fake_wb = _FakeWorkbook(
+            [
+                _FakeSheet("分部分项工程量清单", heavy_rows),
+                _FakeSheet("措施项目清单", heavy_rows),
+                _FakeSheet("封面说明", aux_rows),
+                _FakeSheet("目录说明", aux_rows),
+                _FakeSheet("附录说明", aux_rows),
+            ]
+        )
+        preview_summary = {
+            "parse_stage": "preview",
+            "total_parsed_items": 64,
+            "sheets": [
+                {
+                    "sheet": "分部分项工程量清单",
+                    "parsed_items": 36,
+                    "detected_columns": {"code": 0, "name": 1},
+                },
+                {
+                    "sheet": "措施项目清单",
+                    "parsed_items": 28,
+                    "detected_columns": {"code": 0, "name": 1},
+                },
+            ],
+        }
+        fake_openpyxl = SimpleNamespace(load_workbook=lambda *args, **kwargs: fake_wb)
+
+        with patch.dict(sys.modules, {"openpyxl": fake_openpyxl}):
+            summary = _build_boq_structured_summary(
+                b"fake-xlsx",
+                "heavy_boq.xlsx",
+                parsed_text="工程量清单 full parse",
+                prior_summary=preview_summary,
+            )
+
+        assert summary["scan_strategy"] == "preview_guided_full"
+        assert summary["scan_guidance_strength"] == "strong"
+        assert summary["scan_tail_stop_reason"] == "strong_preview_empty_aux_tail"
+        assert summary["skipped_tail_sheets"] == 1
+        assert [sheet["sheet"] for sheet in summary["sheets"]] == [
+            "分部分项工程量清单",
+            "措施项目清单",
+            "封面说明",
+            "目录说明",
+        ]
+
+    def test_build_boq_structured_summary_full_mode_uses_preview_guidance_for_csv_standard(
+        self,
+    ):
+        from app.main import (
+            DEFAULT_BOQ_PARSE_FULL_GUIDED_CSV_MAX_ROWS,
+            _build_boq_structured_summary,
+        )
+
+        rows = ["项目编码,项目名称,单位,工程量,综合单价,合价"]
+        rows.extend(
+            f"{idx:09d},清单项{idx},m3,{idx},{10 + idx},{(10 + idx) * idx}"
+            for idx in range(1, 2205)
+        )
+        preview_summary = {
+            "parse_stage": "preview",
+            "total_parsed_items": 24,
+            "sheets": [{"sheet": "csv", "parsed_items": 24, "detected_columns": {"code": 0}}],
+        }
+
+        summary = _build_boq_structured_summary(
+            "\n".join(rows).encode("utf-8"),
+            "heavy_boq.csv",
+            parsed_text="工程量清单 full parse",
+            prior_summary=preview_summary,
+        )
+
+        assert summary["scan_strategy"] == "preview_guided_full"
+        assert summary["scan_guidance_strength"] == "standard"
+        assert summary["sheets"][0]["row_scan_budget"] == DEFAULT_BOQ_PARSE_FULL_GUIDED_CSV_MAX_ROWS
+        assert summary["sheets"][0]["scanned_rows"] == DEFAULT_BOQ_PARSE_FULL_GUIDED_CSV_MAX_ROWS
+
+    def test_build_boq_structured_summary_full_mode_uses_preview_guidance_for_csv_strong(
+        self,
+    ):
+        from app.main import (
+            DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_CSV_MAX_ROWS,
+            _build_boq_structured_summary,
+        )
+
+        rows = ["项目编码,项目名称,单位,工程量,综合单价,合价"]
+        rows.extend(
+            f"{idx:09d},清单项{idx},m3,{idx},{10 + idx},{(10 + idx) * idx}"
+            for idx in range(1, 2205)
+        )
+        preview_summary = {
+            "parse_stage": "preview",
+            "total_parsed_items": 64,
+            "sheets": [{"sheet": "csv", "parsed_items": 64, "detected_columns": {"code": 0}}],
+        }
+
+        summary = _build_boq_structured_summary(
+            "\n".join(rows).encode("utf-8"),
+            "heavy_boq.csv",
+            parsed_text="工程量清单 full parse",
+            prior_summary=preview_summary,
+        )
+
+        assert summary["scan_strategy"] == "preview_guided_full"
+        assert summary["scan_guidance_strength"] == "strong"
+        assert (
+            summary["sheets"][0]["row_scan_budget"]
+            == DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_CSV_MAX_ROWS
+        )
+        assert (
+            summary["sheets"][0]["scanned_rows"]
+            == DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_CSV_MAX_ROWS
+        )
+
+    def test_build_boq_structured_summary_full_mode_resumes_xlsx_from_preview_rows(
+        self,
+    ):
+        from app.main import _build_boq_structured_summary
+
+        class _FakeSheet:
+            def __init__(self, title, rows):
+                self.title = title
+                self._rows = rows
+                self.min_row_calls = []
+
+            def iter_rows(self, values_only=True, min_row=1):
+                assert values_only is True
+                self.min_row_calls.append(min_row)
+                for row in self._rows[min_row - 1 :]:
+                    yield row
+
+        class _FakeWorkbook:
+            def __init__(self, worksheets):
+                self.worksheets = worksheets
+
+            def close(self):
+                return None
+
+        heavy_rows = [("项目编码", "项目名称", "单位", "工程量", "综合单价", "合价")]
+        heavy_rows.extend(
+            (f"{idx:09d}", f"清单项{idx}", "m3", idx, 10 + idx, (10 + idx) * idx)
+            for idx in range(1, 520)
+        )
+        sheet = _FakeSheet("分部分项工程量清单", heavy_rows)
+        fake_wb = _FakeWorkbook([sheet])
+        preview_summary = {
+            "parse_stage": "preview",
+            "total_parsed_items": 179,
+            "sheets": [
+                {
+                    "sheet": "分部分项工程量清单",
+                    "scanned_rows": 180,
+                    "parsed_items": 179,
+                    "detected_columns": {
+                        "code": 0,
+                        "name": 1,
+                        "unit": 2,
+                        "quantity": 3,
+                        "amount": 5,
+                    },
+                    "quantity_sum": 16110.0,
+                    "amount_sum": 2573910.0,
+                    "quantity_rows": 179,
+                    "amount_rows": 179,
+                    "units": ["m3"],
+                    "top_items_by_amount": [],
+                }
+            ],
+        }
+        fake_openpyxl = SimpleNamespace(load_workbook=lambda *args, **kwargs: fake_wb)
+
+        with patch.dict(sys.modules, {"openpyxl": fake_openpyxl}):
+            summary = _build_boq_structured_summary(
+                b"fake-xlsx",
+                "heavy_boq.xlsx",
+                parsed_text="工程量清单 full parse",
+                prior_summary=preview_summary,
+            )
+
+        assert sheet.min_row_calls == [181]
+        assert summary["sheets"][0]["resumed_from_prior_summary"] is True
+        assert summary["sheets"][0]["resume_from_row"] == 181
+
+    def test_build_boq_structured_summary_full_mode_resumes_csv_from_preview_rows(
+        self,
+    ):
+        from app.main import (
+            DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_CSV_MAX_ROWS,
+            _build_boq_structured_summary,
+        )
+
+        rows = ["项目编码,项目名称,单位,工程量,综合单价,合价"]
+        rows.extend(
+            f"{idx:09d},清单项{idx},m3,{idx},{10 + idx},{(10 + idx) * idx}"
+            for idx in range(1, 2205)
+        )
+        preview_summary = {
+            "parse_stage": "preview",
+            "total_parsed_items": 179,
+            "sheets": [
+                {
+                    "sheet": "csv",
+                    "scanned_rows": 180,
+                    "parsed_items": 179,
+                    "detected_columns": {
+                        "code": 0,
+                        "name": 1,
+                        "unit": 2,
+                        "quantity": 3,
+                        "amount": 5,
+                    },
+                    "quantity_sum": 16110.0,
+                    "amount_sum": 2573910.0,
+                    "quantity_rows": 179,
+                    "amount_rows": 179,
+                    "units": ["m3"],
+                    "top_items_by_amount": [],
+                }
+            ],
+        }
+
+        summary = _build_boq_structured_summary(
+            "\n".join(rows).encode("utf-8"),
+            "heavy_boq.csv",
+            parsed_text="工程量清单 full parse",
+            prior_summary=preview_summary,
+        )
+
+        assert summary["scan_guidance_strength"] == "strong"
+        assert summary["sheets"][0]["resumed_from_prior_summary"] is True
+        assert summary["sheets"][0]["resume_from_row"] == 181
+        assert (
+            summary["sheets"][0]["scanned_rows"]
+            == DEFAULT_BOQ_PARSE_FULL_GUIDED_STRONG_CSV_MAX_ROWS
+        )
+
+    def test_extract_boq_tabular_resume_text_skips_previewed_rows_for_csv(self):
+        from app.main import _extract_boq_tabular_resume_text
+
+        rows = ["项目编码,项目名称,单位,工程量,综合单价,合价"]
+        rows.extend(
+            f"{idx:09d},清单项{idx},m3,{idx},{10 + idx},{(10 + idx) * idx}" for idx in range(1, 260)
+        )
+        resume_text = _extract_boq_tabular_resume_text(
+            "\n".join(rows).encode("utf-8"),
+            "heavy_boq.csv",
+            prior_summary={
+                "parse_stage": "preview",
+                "total_parsed_items": 179,
+                "sheets": [
+                    {
+                        "sheet": "csv",
+                        "scanned_rows": 180,
+                        "parsed_items": 179,
+                        "detected_columns": {"code": 0},
+                    }
+                ],
+            },
+            max_sheets=4,
+            max_rows_per_sheet=600,
+        )
+
+        non_empty_lines = [line for line in resume_text.splitlines() if line.strip()]
+        assert non_empty_lines[0].startswith("000000180\t清单项180")
+        assert "000000001\t清单项1\t" not in resume_text
+
+    @patch("app.main._read_uploaded_file_content_for_parse_mode")
+    @patch("app.main._build_boq_full_parse_text")
+    @patch("app.main.read_bytes")
+    def test_parse_material_record_payload_uses_boq_resume_text_in_full_mode(
+        self,
+        mock_read_bytes,
+        mock_build_boq_full_parse_text,
+        mock_read_uploaded_file_content_for_parse_mode,
+    ):
+        from app.main import _parse_material_record_payload
+
+        mock_read_bytes.return_value = b"fake-boq-content"
+        mock_build_boq_full_parse_text.return_value = "preview-head\nresume-tail"
+
+        with tempfile.NamedTemporaryFile(suffix=".xlsx") as handle:
+            _parse_material_record_payload(
+                {
+                    "id": "m3",
+                    "project_id": "p1",
+                    "material_type": "boq",
+                    "filename": "工程量清单.xlsx",
+                    "path": handle.name,
+                    "parsed_text": "preview-head",
+                    "boq_structured_summary": {
+                        "parse_stage": "preview",
+                        "total_parsed_items": 24,
+                        "sheets": [{"sheet": "分部分项工程量清单", "parsed_items": 24}],
+                    },
+                },
+                parse_mode="full",
+            )
+
+        mock_build_boq_full_parse_text.assert_called_once()
+        mock_read_uploaded_file_content_for_parse_mode.assert_not_called()
+
+    @patch("app.main.read_bytes")
+    def test_parse_material_record_payload_marks_boq_preview_as_not_gate_ready(
+        self, mock_read_bytes
+    ):
+        from app.main import _parse_material_record_payload
+
+        csv_content = (
+            "项目编码,项目名称,单位,工程量,综合单价,合价\n"
+            "010101001,土方开挖,m3,100,35.5,3550\n"
+            "010201001,钢筋制作,t,12.5,4300,53750\n"
+        ).encode("utf-8")
+        mock_read_bytes.return_value = csv_content
+        with tempfile.NamedTemporaryFile(suffix=".csv") as handle:
+            payload = _parse_material_record_payload(
+                {
+                    "id": "m1",
+                    "project_id": "p1",
+                    "material_type": "boq",
+                    "filename": "工程量清单.csv",
+                    "path": handle.name,
+                },
+                parse_mode="preview",
+            )
+
+            assert payload["parse_backend"] == "local_preview"
+            assert payload["parse_phase"] == "preview"
+            assert payload["parse_ready_for_gate"] is False
+            assert payload["boq_structured_summary"]["parse_stage"] == "preview"
+
+    @patch("app.main._build_boq_full_parse_text")
+    @patch("app.main._build_boq_structured_summary")
+    @patch("app.main._read_uploaded_file_content_for_parse_mode")
+    @patch("app.main.read_bytes")
+    def test_parse_material_record_payload_passes_preview_boq_summary_into_full_parse(
+        self,
+        mock_read_bytes,
+        mock_read_uploaded_file_content_for_parse_mode,
+        mock_build_boq_structured_summary,
+        mock_build_boq_full_parse_text,
+    ):
+        from app.main import _parse_material_record_payload
+
+        mock_read_bytes.return_value = b"fake-boq-content"
+        mock_build_boq_full_parse_text.return_value = "boq full excerpt"
+        preview_summary = {
+            "parse_stage": "preview",
+            "total_parsed_items": 24,
+            "sheets": [{"sheet": "分部分项工程量清单", "parsed_items": 24}],
+        }
+        mock_build_boq_structured_summary.return_value = {
+            "structured_quality_score": 0.7,
+            "sheets": [],
+            "total_parsed_items": 0,
+        }
+
+        with tempfile.NamedTemporaryFile(suffix=".xlsx") as handle:
+            _parse_material_record_payload(
+                {
+                    "id": "m2",
+                    "project_id": "p1",
+                    "material_type": "boq",
+                    "filename": "工程量清单.xlsx",
+                    "path": handle.name,
+                    "parse_phase": "preview",
+                    "parse_ready_for_gate": False,
+                    "boq_structured_summary": preview_summary,
+                },
+                parse_mode="full",
+            )
+
+        mock_build_boq_full_parse_text.assert_called_once()
+        mock_read_uploaded_file_content_for_parse_mode.assert_not_called()
+        mock_build_boq_structured_summary.assert_called_once()
+        assert (
+            mock_build_boq_structured_summary.call_args.kwargs["prior_summary"] == preview_summary
+        )
+
+    @patch("app.main._read_uploaded_file_content")
+    @patch("app.main._extract_boq_tabular_preview_text")
+    def test_read_uploaded_file_content_for_parse_mode_uses_boq_excerpt_in_full_mode(
+        self,
+        mock_extract_boq_excerpt,
+        mock_read_uploaded_file_content,
+    ):
+        from app.main import (
+            DEFAULT_MATERIAL_PARSE_TEXT_MAX_ROWS_BY_TYPE,
+            DEFAULT_MATERIAL_PARSE_TEXT_MAX_SHEETS_BY_TYPE,
+            _read_uploaded_file_content_for_parse_mode,
+        )
+
+        mock_extract_boq_excerpt.return_value = "boq-full-excerpt"
+
+        result = _read_uploaded_file_content_for_parse_mode(
+            b"fake-boq-content",
+            "工程量清单.xlsx",
+            material_type="boq",
+            parse_mode="full",
+        )
+
+        assert result == "boq-full-excerpt"
+        mock_extract_boq_excerpt.assert_called_once_with(
+            b"fake-boq-content",
+            "工程量清单.xlsx",
+            max_sheets=DEFAULT_MATERIAL_PARSE_TEXT_MAX_SHEETS_BY_TYPE["boq"],
+            max_rows_per_sheet=DEFAULT_MATERIAL_PARSE_TEXT_MAX_ROWS_BY_TYPE["boq"],
+        )
+        mock_read_uploaded_file_content.assert_not_called()
 
     def test_build_tender_qa_structured_summary_extracts_constraint_tags(self):
         from app.main import _build_tender_qa_structured_summary
@@ -6606,7 +15020,7 @@ class TestSubmissionsEndpoint:
         assert data[0]["report"]["pred_total_score"] == 4.2865
         assert data[0]["report"]["rule_total_score"] == 0.427
         assert data[0]["report"]["raw_rule_total_score_100"] == 8.54
-        assert data[0]["report"]["dual_track_summary"]["display_score_label"] == "逼近分"
+        assert data[0]["report"]["dual_track_summary"]["display_score_label"] == "当前分"
         assert data[0]["report"]["dual_track_summary"]["display_total_score"] == 4.2865
 
     @patch("app.main.load_qingtian_results")
@@ -6670,7 +15084,7 @@ class TestSubmissionsEndpoint:
         assert round(data[0]["report"]["pred_total_score"], 2) == 91.73
         assert data[0]["report"]["rule_total_score"] == 14.54
         assert data[0]["report"]["raw_rule_total_score_100"] == 14.54
-        assert data[0]["report"]["dual_track_summary"]["display_score_label"] == "逼近分"
+        assert data[0]["report"]["dual_track_summary"]["display_score_label"] == "当前分"
         assert round(data[0]["report"]["dual_track_summary"]["display_total_score"], 2) == 91.73
 
     @patch("app.main.load_qingtian_results")
@@ -6773,15 +15187,137 @@ class TestSubmissionsEndpoint:
         data = response.json()
         assert len(data) == 1
         summary = data[0]["report"]["dual_track_summary"]
-        assert summary["display_score_label"] == "逼近分"
+        assert summary["display_score_label"] == "当前分"
         assert summary["independent_score"] == 78.0
         assert summary["approximation_score"] == 82.0
         assert summary["qingtian_score"] == 84.0
+        assert summary["independent_abs_delta"] == 6.0
+        assert summary["approximation_abs_delta"] == 2.0
+        assert summary["abs_delta_improvement"] == 4.0
         assert summary["independent_abs_delta_100"] == 6.0
         assert summary["approximation_abs_delta_100"] == 2.0
         assert summary["abs_delta_improvement_100"] == 4.0
         assert summary["alignment_status"] == "approximation_better"
-        assert "逼近层当前更接近青天" in summary["governance_hint"]
+        assert "当前分层当前更接近青天" in summary["governance_hint"]
+
+    def test_list_submissions_dual_track_summary_keeps_five_scale_native_metrics(self, client):
+        submission = {
+            "id": "s1",
+            "project_id": "p1",
+            "filename": "f1.txt",
+            "total_score": 82.0,
+            "report": {
+                "scoring_status": "scored",
+                "total_score": 82.0,
+                "rule_total_score": 78.0,
+                "pred_total_score": 82.0,
+                "meta": {},
+            },
+            "text": "t1",
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+        with (
+            patch("app.main.ensure_data_dirs"),
+            patch(
+                "app.main.load_projects",
+                return_value=[{"id": "p1", "meta": {"score_scale_max": 5}}],
+            ),
+            patch("app.main.load_submissions", return_value=[submission]),
+            patch(
+                "app.main.load_qingtian_results",
+                return_value=[{"submission_id": "s1", "qt_total_score": 84.0}],
+            ),
+            patch(
+                "app.main._select_calibrator_model",
+                return_value={"calibrator_version": "calib_v1"},
+            ),
+            patch("app.main._build_material_knowledge_profile", return_value={}),
+            patch("app.main._ensure_report_score_self_awareness"),
+        ):
+            response = client.get("/api/v1/projects/p1/submissions")
+
+        assert response.status_code == 200
+        data = response.json()
+        summary = data[0]["report"]["dual_track_summary"]
+        assert summary["scale_label"] == "5分制"
+        assert summary["display_total_score"] == 4.1
+        assert summary["independent_score"] == 3.9
+        assert summary["approximation_score"] == 4.1
+        assert summary["qingtian_score"] == 4.2
+        assert summary["independent_abs_delta"] == 0.3
+        assert summary["approximation_abs_delta"] == 0.1
+        assert summary["abs_delta_improvement"] == 0.2
+
+    def test_list_submissions_marks_exact_ground_truth_as_real_score_in_dual_track_summary(
+        self, client
+    ):
+        submission = {
+            "id": "s1",
+            "project_id": "p1",
+            "filename": "f1.txt",
+            "total_score": 82.2,
+            "report": {
+                "scoring_status": "scored",
+                "total_score": 82.2,
+                "rule_total_score": 78.0,
+                "pred_total_score": 82.2,
+                "score_blend": {"mode": "ground_truth_exact"},
+                "meta": {"ground_truth_exact_match": True},
+            },
+            "text": "t1",
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+        with (
+            patch("app.main.ensure_data_dirs"),
+            patch("app.main.load_projects", return_value=[{"id": "p1"}]),
+            patch("app.main.load_submissions", return_value=[submission]),
+            patch("app.main.load_qingtian_results", return_value=[]),
+            patch(
+                "app.main._select_calibrator_model",
+                return_value={"calibrator_version": "calib_v1"},
+            ),
+            patch("app.main._build_material_knowledge_profile", return_value={}),
+            patch("app.main._ensure_report_score_self_awareness"),
+        ):
+            response = client.get("/api/v1/projects/p1/submissions")
+
+        assert response.status_code == 200
+        data = response.json()
+        summary = data[0]["report"]["dual_track_summary"]
+        assert summary["display_score_source"] == "ground_truth"
+        assert summary["display_score_label"] == "真实分"
+        assert summary["approximation_score"] is None
+        assert summary["has_approximation_score"] is False
+        assert summary["has_exact_ground_truth_score"] is True
+        assert summary["alignment_status"] == "ground_truth_exact"
+        assert "真实评标结果" in summary["governance_hint"]
+
+    def test_build_submission_dual_track_overview_prefers_real_score_headline(self):
+        from app.qingtian_dual_track import build_submission_dual_track_overview
+
+        overview = build_submission_dual_track_overview(
+            [
+                {
+                    "display_score_source": "ground_truth",
+                    "scale_label": "5分制",
+                    "has_approximation_score": False,
+                    "has_exact_ground_truth_score": True,
+                    "has_ground_truth": True,
+                    "independent_score": 78.0,
+                    "qingtian_score": 82.2,
+                    "independent_abs_delta": 0.21,
+                    "independent_abs_delta_100": 4.2,
+                    "approximation_abs_delta_100": None,
+                    "abs_delta_improvement_100": None,
+                }
+            ]
+        )
+
+        assert overview["exact_ground_truth_count"] == 1
+        assert overview["dual_track_count"] == 0
+        assert overview["scale_label"] == "5分制"
+        assert overview["independent_abs_delta_avg"] == 0.21
+        assert overview["headline"] == "当前默认展示真实分，并保留独立分作审计基线。"
 
     def test_list_submissions_with_latest_report_returns_ranked_rows(self, client):
         submissions = [
@@ -9490,6 +18026,52 @@ class TestEvolutionTotalScale:
         assert report["llm_total_score"] == 66.0
         assert report["total_score"] == 71.5
 
+    def test_apply_evolution_total_scale_skips_direct_project_calibrator_scores(self):
+        from app.main import _apply_evolution_total_scale
+
+        report = {
+            "total_score": 80.74,
+            "rule_total_score": 17.96,
+            "pred_total_score": 80.74,
+            "llm_total_score": None,
+            "score_blend": {
+                "mode": "project_calibrator_direct",
+                "reason": "cv_validated_project_calibrator",
+            },
+        }
+        with patch(
+            "app.main.load_evolution_reports",
+            return_value={"p1": {"scoring_evolution": {"total_score_scale": 1.15}}},
+        ):
+            _apply_evolution_total_scale("p1", report)
+
+        assert report["pred_total_score"] == 80.74
+        assert report["rule_total_score"] == 17.96
+        assert report["total_score"] == 80.74
+
+    def test_apply_evolution_total_scale_skips_exact_ground_truth_scores(self):
+        from app.main import _apply_evolution_total_scale
+
+        report = {
+            "total_score": 82.2,
+            "rule_total_score": 11.05,
+            "pred_total_score": 82.2,
+            "llm_total_score": None,
+            "score_blend": {
+                "mode": "ground_truth_exact",
+                "reason": "approved_exact_submission_match",
+            },
+        }
+        with patch(
+            "app.main.load_evolution_reports",
+            return_value={"p1": {"scoring_evolution": {"total_score_scale": 1.15}}},
+        ):
+            _apply_evolution_total_scale("p1", report)
+
+        assert report["pred_total_score"] == 82.2
+        assert report["rule_total_score"] == 11.05
+        assert report["total_score"] == 82.2
+
     def test_compute_multipliers_hash_empty(self):
         """Empty dict should produce valid hash."""
         from app.main import _compute_multipliers_hash
@@ -9497,6 +18079,429 @@ class TestEvolutionTotalScale:
         hash_value = _compute_multipliers_hash({})
         assert hash_value is not None
         assert len(hash_value) == 16  # 截断为 16 字符
+
+
+class TestProjectCalibratorDirectApply:
+    @patch("app.main.predict_with_model", return_value=(80.74, {"sigma": 1.0}))
+    @patch("app.main.build_feature_row", return_value={"x_features": {}})
+    def test_apply_prediction_uses_direct_project_calibrator_when_cv_validated(
+        self,
+        mock_build_row,
+        mock_predict,
+    ):
+        from app.main import _apply_prediction_to_report_with_model
+
+        report = {"rule_total_score": 14.21, "total_score": 14.21, "meta": {}}
+        submission = {"id": "s1", "project_id": "p1", "filename": "s1.pdf"}
+        project = {"id": "p1", "meta": {}}
+        model = {
+            "calibrator_version": "calib-1",
+            "deployed": True,
+            "train_filter": {"project_id": "p1"},
+            "calibrator_summary": {
+                "deployment_mode": "cv_validated",
+                "gate_passed": True,
+                "bootstrap_small_sample": False,
+                "sample_count": 7,
+                "cv_metrics": {"mae": 1.7},
+            },
+            "model_artifact": {"model_type": "isotonic1d"},
+        }
+
+        version = _apply_prediction_to_report_with_model(
+            report,
+            submission_like=submission,
+            project=project,
+            model_override=model,
+        )
+
+        assert mock_build_row.called
+        assert mock_predict.called
+        assert version == "calib-1"
+        assert report["pred_total_score"] == 80.74
+        assert report["total_score"] == 80.74
+        assert report["llm_total_score"] is None
+        assert report["score_blend"]["mode"] == "project_calibrator_direct"
+        assert report["score_blend"]["reason"] == "cv_validated_project_calibrator"
+        assert submission["total_score"] == 80.74
+
+    @patch("app.main.predict_with_model", return_value=(80.74, {"sigma": 1.0}))
+    @patch("app.main.build_feature_row", return_value={"x_features": {}})
+    def test_apply_prediction_keeps_conservative_blend_for_small_sample_calibrator(
+        self,
+        mock_build_row,
+        mock_predict,
+    ):
+        from app.main import _apply_prediction_to_report_with_model
+
+        report = {"rule_total_score": 14.21, "total_score": 14.21, "meta": {}}
+        submission = {"id": "s1", "project_id": "p1", "filename": "s1.pdf"}
+        project = {"id": "p1", "meta": {}}
+        model = {
+            "calibrator_version": "calib-small",
+            "deployed": True,
+            "train_filter": {"project_id": "p1"},
+            "calibrator_summary": {
+                "deployment_mode": "bootstrap_auto_deploy",
+                "gate_passed": True,
+                "bootstrap_small_sample": True,
+                "sample_count": 1,
+                "cv_metrics": {"mae": 1.0},
+            },
+            "model_artifact": {"model_type": "offset"},
+        }
+
+        _apply_prediction_to_report_with_model(
+            report,
+            submission_like=submission,
+            project=project,
+            model_override=model,
+        )
+
+        assert mock_build_row.called
+        assert mock_predict.called
+        assert report["pred_total_score"] < 80.74
+        assert report["score_blend"].get("mode") != "project_calibrator_direct"
+
+
+class TestExactGroundTruthOverride:
+    def test_ensure_report_score_self_awareness_refreshes_stale_exact_ground_truth_state(self):
+        from app.main import _ensure_report_score_self_awareness
+
+        report = {
+            "score_blend": {"mode": "ground_truth_exact"},
+            "meta": {
+                "ground_truth_exact_match": True,
+                "material_utilization_gate": {"blocked": False, "warned": False},
+                "score_self_awareness": {
+                    "level": "medium",
+                    "score_0_100": 68.1,
+                    "state": "normal",
+                    "reasons": ["历史旧状态"],
+                },
+                "score_confidence_level": "medium",
+            },
+        }
+
+        awareness = _ensure_report_score_self_awareness(
+            report,
+            project_id=None,
+            material_knowledge_snapshot={"summary": {"dimension_coverage_rate": 1.0}},
+        )
+
+        assert awareness["level"] == "high"
+        assert awareness["score_0_100"] == 100.0
+        assert awareness["state"] == "ground_truth_exact"
+        assert report["meta"]["score_confidence_level"] == "high"
+
+    def test_build_score_self_awareness_promotes_exact_ground_truth_to_high_confidence(self):
+        from app.main import _build_score_self_awareness
+
+        awareness = _build_score_self_awareness(
+            {
+                "score_blend": {"mode": "ground_truth_exact"},
+                "meta": {
+                    "material_utilization_gate": {"blocked": False, "warned": False},
+                    "evidence_trace": {"source_files_hit_count": 2, "mandatory_hit_rate": 0.7},
+                },
+                "pred_confidence": {"sigma": 0.8, "fused_sigma": 0.8},
+            },
+            material_knowledge_snapshot={"summary": {"dimension_coverage_rate": 1.0}},
+        )
+
+        assert awareness["level"] == "high"
+        assert awareness["score_0_100"] == 100.0
+        assert awareness["state"] == "ground_truth_exact"
+        assert "已命中真实评标" in awareness["reasons"][0]
+
+    def test_apply_prediction_prefers_exact_ground_truth_match(self):
+        from app.main import _apply_prediction_to_report_with_model
+
+        report = {
+            "total_score": 11.05,
+            "rule_total_score": 11.05,
+            "meta": {},
+        }
+        submission = {
+            "id": "sub-1",
+            "project_id": "p1",
+            "text": "same text",
+            "total_score": 11.05,
+        }
+        project = {"id": "p1", "score_scale_max": 100}
+        ground_truth_rows = [
+            {
+                "id": "gt-1",
+                "project_id": "p1",
+                "source_submission_id": "sub-1",
+                "final_score": 82.2,
+                "score_scale_max": 100,
+            }
+        ]
+
+        with (
+            patch("app.main._list_project_ground_truth_records", return_value=ground_truth_rows),
+            patch("app.main._learning_quality_gate_is_blocked", return_value=False),
+            patch("app.main._ground_truth_record_for_learning", return_value={"final_score": 82.2}),
+        ):
+            version = _apply_prediction_to_report_with_model(
+                report,
+                submission_like=submission,
+                project=project,
+                model_override=None,
+            )
+
+        assert version is None
+        assert report["pred_total_score"] == 82.2
+        assert report["total_score"] == 82.2
+        assert report["score_blend"]["mode"] == "ground_truth_exact"
+        assert report["meta"]["ground_truth_exact_match"] is True
+
+    def test_repair_ground_truth_record_final_score_if_needed_recomputes_zero_score(self):
+        from app.main import _repair_ground_truth_record_final_score_if_needed
+
+        record = {
+            "id": "gt-1",
+            "project_id": "p1",
+            "judge_scores": [4.33, 4.36, 4.35, 4.36, 4.8],
+            "score_scale_max": 5,
+            "final_score": 0.0,
+            "final_score_raw": 0.0,
+            "final_score_100": 0.0,
+        }
+        persisted_row = dict(record)
+        persisted_row.update(
+            {
+                "final_score": 4.44,
+                "final_score_raw": 4.44,
+                "final_score_100": 88.8,
+            }
+        )
+        finalized_row = dict(persisted_row)
+        finalized_row["feedback_guardrail"] = {"blocked": False}
+
+        with (
+            patch(
+                "app.main._resolve_project_ground_truth_score_rule",
+                return_value={
+                    "formula": "simple_mean",
+                    "auto_compute": True,
+                    "rounding_digits": 2,
+                },
+            ),
+            patch(
+                "app.main._persist_ground_truth_record_fields",
+                return_value=persisted_row,
+            ) as mock_persist,
+            patch(
+                "app.main._finalize_ground_truth_learning_record",
+                return_value=finalized_row,
+            ) as mock_finalize,
+        ):
+            repaired = _repair_ground_truth_record_final_score_if_needed(
+                "p1",
+                record,
+                project={"id": "p1", "meta": {"score_scale_max": 5}},
+            )
+
+        assert repaired["final_score"] == 4.44
+        assert repaired["final_score_raw"] == 4.44
+        assert repaired["final_score_100"] == 88.8
+        assert mock_persist.call_args.kwargs["updates"]["final_score"] == 4.44
+        assert mock_persist.call_args.kwargs["updates"]["final_score_raw"] == 4.44
+        assert mock_persist.call_args.kwargs["updates"]["final_score_100"] == 88.8
+        assert mock_finalize.call_args.args[1]["final_score"] == 4.44
+
+    def test_repair_ground_truth_record_final_score_if_needed_resyncs_stale_qingtian_snapshot(self):
+        from app.main import _repair_ground_truth_record_final_score_if_needed
+
+        record = {
+            "id": "gt-1",
+            "project_id": "p1",
+            "judge_scores": [4.33, 4.36, 4.35, 4.36, 4.8],
+            "score_scale_max": 5,
+            "final_score": 4.44,
+            "final_score_raw": 4.44,
+            "final_score_100": 88.8,
+        }
+        stale_qingtian_rows = [
+            {
+                "id": "qt-1",
+                "submission_id": "sub-1",
+                "qt_total_score": 0.0,
+                "raw_payload": {
+                    "ground_truth_record_id": "gt-1",
+                    "final_score": 0.0,
+                    "final_score_raw": 0.0,
+                    "final_score_100": 0.0,
+                    "score_scale_max": 5,
+                },
+            }
+        ]
+
+        with (
+            patch("app.main.load_qingtian_results", return_value=stale_qingtian_rows),
+            patch("app.main.load_ground_truth", return_value=[record]),
+            patch("app.main._sync_ground_truth_record_to_qingtian", return_value={}) as mock_sync,
+        ):
+            repaired = _repair_ground_truth_record_final_score_if_needed(
+                "p1",
+                dict(record),
+                project={"id": "p1", "meta": {"score_scale_max": 5}},
+            )
+
+        assert repaired["final_score"] == 4.44
+        assert repaired["final_score_raw"] == 4.44
+        assert repaired["final_score_100"] == 88.8
+        mock_sync.assert_called_once()
+        assert mock_sync.call_args.args[0] == "p1"
+        assert mock_sync.call_args.args[1]["id"] == "gt-1"
+
+    def test_apply_prediction_prefers_blocked_exact_ground_truth_match_after_auto_repair(self):
+        from app.main import _apply_prediction_to_report_with_model
+
+        report = {
+            "total_score": 11.05,
+            "rule_total_score": 11.05,
+            "meta": {},
+        }
+        submission = {
+            "id": "sub-1",
+            "project_id": "p1",
+            "text": "same text",
+            "total_score": 11.05,
+        }
+        project = {"id": "p1", "score_scale_max": 100}
+        ground_truth_rows = [
+            {
+                "id": "gt-1",
+                "project_id": "p1",
+                "source_submission_id": "sub-1",
+                "final_score": 0.0,
+                "final_score_raw": 0.0,
+                "final_score_100": 0.0,
+                "score_scale_max": 5,
+                "judge_scores": [4.33, 4.36, 4.35, 4.36, 4.8],
+                "feedback_guardrail": {"blocked": True},
+            }
+        ]
+
+        with (
+            patch(
+                "app.main._list_project_ground_truth_records",
+                return_value=ground_truth_rows,
+            ) as mock_list_records,
+            patch(
+                "app.main._repair_ground_truth_record_final_score_if_needed",
+                return_value={
+                    **ground_truth_rows[0],
+                    "final_score": 4.44,
+                    "final_score_raw": 4.44,
+                    "final_score_100": 88.8,
+                },
+            ),
+            patch("app.main._ground_truth_record_for_learning", return_value={"final_score": 88.8}),
+        ):
+            version = _apply_prediction_to_report_with_model(
+                report,
+                submission_like=submission,
+                project=project,
+                model_override=None,
+            )
+
+        assert version is None
+        assert report["pred_total_score"] == 88.8
+        assert report["total_score"] == 88.8
+        assert report["score_blend"]["mode"] == "ground_truth_exact"
+        assert report["meta"]["ground_truth_exact_match"] is True
+        mock_list_records.assert_called_once_with("p1", include_guardrail_blocked=True)
+
+    def test_apply_prediction_prefers_exact_ground_truth_filename_match(self):
+        from app.main import _apply_prediction_to_report_with_model
+
+        report = {
+            "total_score": 11.05,
+            "rule_total_score": 11.05,
+            "meta": {},
+        }
+        submission = {
+            "id": "sub-2",
+            "project_id": "p1",
+            "filename": "安徽中江建投-道路工程(1).pdf",
+            "text": "重新上传后的施组文本",
+            "total_score": 11.05,
+        }
+        project = {"id": "p1", "score_scale_max": 100}
+        ground_truth_rows = [
+            {
+                "id": "gt-1",
+                "project_id": "p1",
+                "source_submission_filename": "/tmp/安徽中江建投-道路工程(1).pdf",
+                "shigong_text": "历史录入时保存的旧文本",
+                "final_score": 77.9,
+                "score_scale_max": 100,
+            }
+        ]
+
+        with (
+            patch("app.main._list_project_ground_truth_records", return_value=ground_truth_rows),
+            patch("app.main._learning_quality_gate_is_blocked", return_value=False),
+            patch("app.main._ground_truth_record_for_learning", return_value={"final_score": 77.9}),
+        ):
+            version = _apply_prediction_to_report_with_model(
+                report,
+                submission_like=submission,
+                project=project,
+                model_override=None,
+            )
+
+        assert version is None
+        assert report["pred_total_score"] == 77.9
+        assert report["total_score"] == 77.9
+        assert report["score_blend"]["mode"] == "ground_truth_exact"
+        assert report["meta"]["ground_truth_exact_match"] is True
+
+    @patch("app.main.load_calibration_models")
+    @patch("app.main.load_projects")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_compare_marks_exact_ground_truth_scores_as_ground_truth_source(
+        self, mock_ensure, mock_load_submissions, mock_load_projects, mock_load_models, client
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "calibrator_version_locked": "calib1"}]
+        mock_load_models.return_value = [
+            {
+                "calibrator_version": "calib1",
+                "deployed": True,
+                "created_at": "2026-01-02T00:00:00Z",
+                "train_filter": {"project_id": "p1"},
+            }
+        ]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "exact.txt",
+                "total_score": 82.2,
+                "report": {
+                    "rule_total_score": 12.7,
+                    "pred_total_score": 82.2,
+                    "score_blend": {"mode": "ground_truth_exact"},
+                    "meta": {"ground_truth_exact_match": True},
+                    "dimension_scores": {},
+                    "penalties": [],
+                },
+                "created_at": "2026-01-02T00:00:00Z",
+            }
+        ]
+
+        response = client.get("/api/v1/projects/p1/compare")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["rankings"][0]["score_source"] == "ground_truth"
+        assert data["rankings"][0]["score_confidence_level"] == "high"
+        assert data["rankings"][0]["score_self_awareness"]["state"] == "ground_truth_exact"
 
 
 class TestPdfFallbackParser:
@@ -9517,6 +18522,170 @@ class TestPdfFallbackParser:
         text = _read_uploaded_file_content(b"%PDF-fallback", "sample.pdf")
         assert "[PDF_BACKEND:pypdf]" in text
         assert "这是 PDF 提取文本" in text
+
+    @patch("app.main._score_ocr_text_candidate", return_value=4.8)
+    @patch("app.main.pymupdf", None)
+    @patch("app.main.PdfReader")
+    def test_extract_pdf_text_with_pypdf_stops_early_when_tender_signals_are_sufficient(
+        self,
+        mock_pdf_reader,
+        _mock_score,
+    ):
+        from app.main import _extract_pdf_text
+
+        class _FakePage:
+            def __init__(self, text: str):
+                self._text = text
+                self.calls = 0
+
+            def extract_text(self):
+                self.calls += 1
+                return self._text
+
+        class _FakeReader:
+            def __init__(self, _stream):
+                self.pages = pages
+
+        repeated_intro = (
+            "施工组织设计总体部署 质量管理与验收标准 进度计划与节点控制 安全文明施工 "
+            "资源配置 危大工程专项方案 BIM 深化 "
+        ) * 14
+        scoring_page = (
+            "第四章 评分办法\n"
+            "评分细则：工期120日历天，质量90分，安全文明80分，专项方案加分。\n"
+            "投标文件必须响应关键节点，不得缺少危大工程专项方案。\n"
+        ) * 10
+        pages = [
+            _FakePage("第一章 招标公告\n" + repeated_intro),
+            _FakePage("第二章 投标人须知\n" + repeated_intro),
+            _FakePage("第三章 合同条款\n" + repeated_intro),
+            _FakePage(scoring_page),
+            _FakePage("不应继续扫描到这一页"),
+        ]
+
+        mock_pdf_reader.side_effect = _FakeReader
+        text = _extract_pdf_text(
+            b"%PDF-fallback",
+            "招标文件.pdf",
+            material_type="tender_qa",
+        )
+
+        assert "[PDF_BACKEND:pypdf]" in text
+        assert "[PDF_EARLY_STOP_AFTER_PAGE:4] tender_qa_enough_signals" in text
+        assert "[PAGE:5]" not in text
+        assert "不应继续扫描到这一页" not in text
+        assert pages[4].calls == 0
+
+    @patch("app.main._score_ocr_text_candidate", return_value=4.8)
+    @patch("app.main.pymupdf", None)
+    @patch("app.main.PdfReader")
+    def test_extract_pdf_text_with_pypdf_can_disable_early_stop_for_full_scan(
+        self,
+        mock_pdf_reader,
+        _mock_score,
+    ):
+        from app.main import _extract_pdf_text
+
+        class _FakePage:
+            def __init__(self, text: str):
+                self._text = text
+                self.calls = 0
+
+            def extract_text(self):
+                self.calls += 1
+                return self._text
+
+        class _FakeReader:
+            def __init__(self, _stream):
+                self.pages = pages
+
+        repeated_intro = (
+            "施工组织设计总体部署 质量管理与验收标准 进度计划与节点控制 安全文明施工 "
+            "资源配置 危大工程专项方案 BIM 深化 "
+        ) * 14
+        scoring_page = (
+            "第四章 评分办法\n"
+            "评分细则：工期120日历天，质量90分，安全文明80分，专项方案加分。\n"
+            "投标文件必须响应关键节点，不得缺少危大工程专项方案。\n"
+        ) * 10
+        pages = [
+            _FakePage("第一章 招标公告\n" + repeated_intro),
+            _FakePage("第二章 投标人须知\n" + repeated_intro),
+            _FakePage("第三章 合同条款\n" + repeated_intro),
+            _FakePage(scoring_page),
+            _FakePage(
+                "第七章 评标办法\n"
+                "本章第2.2.2(1)目属于技术文件详细评审内容，"
+                "以评标委员会各成员打分平均值确定。"
+            ),
+        ]
+
+        mock_pdf_reader.side_effect = _FakeReader
+        text = _extract_pdf_text(
+            b"%PDF-fallback",
+            "招标文件.pdf",
+            material_type="tender_qa",
+            allow_early_stop=False,
+        )
+
+        assert "[PDF_BACKEND:pypdf]" in text
+        assert "[PDF_EARLY_STOP_AFTER_PAGE:" not in text
+        assert "[PAGE:5]" in text
+        assert "评标委员会各成员打分平均值确定" in text
+        assert pages[4].calls == 1
+
+    @patch("app.main._score_ocr_text_candidate", return_value=4.8)
+    @patch("app.main.pymupdf", None)
+    @patch("app.main.PdfReader")
+    def test_extract_pdf_text_preview_with_pypdf_stops_incrementally(
+        self,
+        mock_pdf_reader,
+        _mock_score,
+    ):
+        from app.main import _extract_pdf_text_preview
+
+        class _FakePage:
+            def __init__(self, text: str):
+                self._text = text
+                self.calls = 0
+
+            def extract_text(self):
+                self.calls += 1
+                return self._text
+
+        class _FakeReader:
+            def __init__(self, _stream):
+                self.pages = pages
+
+        pages = [
+            _FakePage(
+                "建筑总平面图 轴线1-8 标高3.500 净高2.900 机电综合 碰撞 净高复核 "
+                "节点详图 梁 板 柱 消防 风管 桥架"
+            ),
+            _FakePage(
+                "平面布置图 轴线A-F 标高4.200 管径DN65 综合管线 BIM 深化 节点 大样 "
+                "给排水 电气 暖通 设备机房"
+            ),
+            _FakePage(
+                "剖面图 立面图 标高6.000 节点详图 洞口 预留预埋 套管 " "消防喷淋 管径 DN100 梁板柱"
+            ),
+            _FakePage("不应继续扫描到这一页"),
+        ]
+
+        mock_pdf_reader.side_effect = _FakeReader
+        text = _extract_pdf_text_preview(
+            b"%PDF-fallback",
+            "总图.pdf",
+            material_type="drawing",
+            max_pages=6,
+            max_chars=16000,
+        )
+
+        assert "[PDF_BACKEND:pypdf]" in text
+        assert "[PAGE:3]" in text
+        assert "[PAGE:4]" not in text
+        assert "不应继续扫描到这一页" not in text
+        assert pages[3].calls == 0
 
 
 class TestScoringContextEvolutionGuard:
@@ -9661,6 +18830,9 @@ class TestFeedbackClosedLoopSafety:
         assert payload.get("project_id") == "p1"
         assert payload.get("trigger") == "rescore"
 
+    @patch("app.main._rescore_project_submissions_internal")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_projects")
     @patch("app.main.auto_run_reflection_pipeline")
     @patch("app.main._sync_feedback_weights_to_evolution")
     @patch("app.main._auto_update_project_weights_from_delta_cases")
@@ -9675,6 +18847,9 @@ class TestFeedbackClosedLoopSafety:
         mock_auto_update,
         mock_sync_weights,
         mock_auto_run,
+        mock_load_projects,
+        mock_load_submissions,
+        mock_auto_rescore,
     ):
         from app.main import _run_feedback_closed_loop
 
@@ -9685,10 +18860,12 @@ class TestFeedbackClosedLoopSafety:
                 "feedback_guardrail": {
                     "blocked": True,
                     "abs_delta_100": 45.0,
-                    "warning_message": "预测与真实总分偏差过大，已暂停自动调权/自动校准。",
+                    "warning_message": "当前分与真实总分偏差过大，已暂停自动调权/自动校准。",
                 },
             }
         ]
+        mock_load_projects.return_value = [{"id": "p1", "scoring_engine_version_locked": "v2"}]
+        mock_load_submissions.return_value = [{"id": "s1", "project_id": "p1"}]
         mock_refresh_evo.return_value = {"refreshed": True, "sample_count": 0}
 
         payload = _run_feedback_closed_loop(
@@ -9708,6 +18885,73 @@ class TestFeedbackClosedLoopSafety:
         mock_auto_update.assert_not_called()
         mock_sync_weights.assert_not_called()
         mock_auto_run.assert_not_called()
+        mock_auto_rescore.assert_not_called()
+
+    @patch("app.main._rescore_project_submissions_internal")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_projects")
+    @patch("app.main.auto_run_reflection_pipeline")
+    @patch("app.main._sync_feedback_weights_to_evolution")
+    @patch("app.main._auto_update_project_weights_from_delta_cases")
+    @patch("app.main._refresh_evolution_report_from_ground_truth")
+    @patch("app.main._refresh_project_reflection_objects")
+    @patch("app.main.load_ground_truth")
+    def test_run_feedback_closed_loop_auto_rescores_project_before_auto_run_when_weights_sync(
+        self,
+        mock_load_ground_truth,
+        mock_refresh_reflection,
+        mock_refresh_evo,
+        mock_auto_update,
+        mock_sync_weights,
+        mock_auto_run,
+        mock_load_projects,
+        mock_load_submissions,
+        mock_auto_rescore,
+    ):
+        from app.main import _run_feedback_closed_loop
+
+        events = []
+        mock_load_ground_truth.return_value = [
+            {"id": "gt-1", "project_id": "p1", "feedback_guardrail": {"blocked": False}}
+        ]
+        mock_load_projects.return_value = [
+            {
+                "id": "p1",
+                "meta": {"score_scale_max": 100},
+                "scoring_engine_version_locked": "v2",
+            }
+        ]
+        mock_load_submissions.return_value = [{"id": "s1", "project_id": "p1", "text": "示例"}]
+        mock_auto_update.return_value = {
+            "updated": True,
+            "new_dimension_multipliers": {"01": 1.1},
+            "new_profile_id": "ep-1",
+        }
+        mock_sync_weights.return_value = {"synced": True, "candidate_profile_id": "ep-1"}
+        mock_auto_rescore.side_effect = lambda *args, **kwargs: events.append("rescore") or {
+            "ok": True,
+            "reports_generated": 1,
+            "submission_count": 1,
+        }
+        mock_auto_run.side_effect = lambda *args, **kwargs: events.append("auto_run") or {
+            "ok": True,
+            "calibrator_deployed": False,
+        }
+        mock_refresh_evo.return_value = {"refreshed": True, "sample_count": 1}
+
+        payload = _run_feedback_closed_loop("p1", locale="zh", trigger="ground_truth_add")
+
+        assert payload["ok"] is True
+        assert payload["auto_rescore"]["ok"] is True
+        assert payload["auto_rescore"]["reports_generated"] == 1
+        assert events == ["rescore", "auto_run"]
+        rescore_payload = mock_auto_rescore.call_args.args[1]
+        assert rescore_payload.scope == "project"
+        assert rescore_payload.force_unlock is True
+        assert mock_auto_rescore.call_args.kwargs["run_feedback_closed_loop"] is False
+        assert (
+            mock_auto_rescore.call_args.kwargs["history_trigger"] == "feedback_closed_loop_rescore"
+        )
 
     @patch("app.main.save_evolution_reports")
     @patch("app.main.load_evolution_reports")
@@ -9776,8 +19020,102 @@ class TestFeedbackClosedLoopSafety:
         assert payload["sample_count"] == 1
         mock_save_evolution_reports.assert_called_once()
 
+    @patch("app.main.save_evolution_reports")
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main._build_feature_confidence_summary")
+    @patch("app.main._build_material_knowledge_profile")
+    @patch("app.main.build_evolution_report")
+    @patch("app.main._merge_materials_text")
+    @patch("app.main.load_project_context")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_projects")
+    def test_refresh_evolution_report_preserves_runtime_governance_metadata(
+        self,
+        mock_load_projects,
+        mock_load_ground_truth,
+        mock_load_project_context,
+        mock_merge_materials_text,
+        mock_build_evolution_report,
+        mock_build_material_knowledge_profile,
+        mock_build_feature_confidence_summary,
+        mock_load_evolution_reports,
+        mock_save_evolution_reports,
+    ):
+        from app.main import _refresh_evolution_report_from_ground_truth
+
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 5}}]
+        mock_load_ground_truth.return_value = []
+        mock_load_project_context.return_value = {}
+        mock_merge_materials_text.return_value = ""
+        mock_build_material_knowledge_profile.return_value = {}
+        mock_build_feature_confidence_summary.return_value = {}
+        mock_build_evolution_report.return_value = {
+            "project_id": "p1",
+            "high_score_logic": [],
+            "writing_guidance": [],
+            "sample_count": 0,
+            "updated_at": "2026-03-30T12:00:00+00:00",
+            "scoring_evolution": {},
+            "compilation_instructions": {},
+        }
+        mock_load_evolution_reports.return_value = {
+            "p1": {
+                "calibrator_runtime_governance": {
+                    "action": "rollback",
+                    "reason": "rollback_preview_improved",
+                    "rollback_candidate_version": "calib_prev",
+                    "active_calibrator_version_after": "calib_prev",
+                    "degraded_after": False,
+                    "recovered_after": True,
+                }
+            }
+        }
+
+        _refresh_evolution_report_from_ground_truth("p1")
+
+        saved_reports = mock_save_evolution_reports.call_args.args[0]
+        assert saved_reports["p1"]["calibrator_runtime_governance"]["action"] == "rollback"
+        assert (
+            saved_reports["p1"]["calibrator_runtime_governance"]["rollback_candidate_version"]
+            == "calib_prev"
+        )
+        assert (
+            saved_reports["p1"]["calibrator_runtime_governance"]["active_calibrator_version_after"]
+            == "calib_prev"
+        )
+        assert saved_reports["p1"]["calibrator_runtime_governance"]["recovered_after"] is True
+
 
 class TestGroundTruthGuardrailRoutes:
+    @patch("app.main.load_ground_truth")
+    def test_build_manual_confirmation_detail_uses_project_scale_delta(
+        self,
+        mock_load_ground_truth,
+    ):
+        from app.main import _build_manual_confirmation_detail
+
+        mock_load_ground_truth.return_value = [
+            {
+                "id": "gt-1",
+                "project_id": "p1",
+                "final_score": 4.31,
+                "score_scale_max": 5,
+                "feedback_guardrail": {
+                    "blocked": True,
+                    "threshold_blocked": True,
+                    "abs_delta_100": 74.02,
+                    "relative_delta_ratio": 0.7402,
+                    "warning_message": "当前分与真实总分偏差 74.02 分（100分口径，74.0%）。",
+                },
+            }
+        ]
+
+        detail = _build_manual_confirmation_detail("p1", action_label="学习进化")
+
+        assert "5分制" in detail
+        assert "100分口径" not in detail
+        assert "confirm_extreme_sample=1" in detail
+
     @patch("app.main.load_submissions")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_projects")
@@ -9855,7 +19193,7 @@ class TestGroundTruthGuardrailRoutes:
         mock_sync_gt.return_value = {
             "feedback_guardrail": {
                 "blocked": True,
-                "warning_message": "预测与真实总分偏差 45.00 分（100分口径，45.0%）。",
+                "warning_message": "当前分与真实总分偏差 45.00 分（100分口径，45.0%）。",
             },
             "learning_quality_gate": {
                 "blocked": True,
@@ -9893,6 +19231,299 @@ class TestGroundTruthGuardrailRoutes:
         mock_run_closed_loop.assert_called_once()
         assert mock_run_closed_loop.call_args.kwargs["ground_truth_record_ids"]
 
+    @patch("app.main._run_feedback_closed_loop_safe")
+    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main.save_ground_truth")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_add_ground_truth_from_submission_auto_computes_zero_final_score_from_rule(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_submissions,
+        mock_load_ground_truth,
+        mock_save_ground_truth,
+        mock_sync_gt,
+        mock_run_closed_loop,
+        client,
+    ):
+        mock_load_projects.return_value = [
+            {
+                "id": "p1",
+                "meta": {
+                    "score_scale_max": 5,
+                    "ground_truth_final_score_formula": "simple_mean",
+                },
+            }
+        ]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "施组一.docx",
+                "created_at": "2026-03-24T10:16:57+00:00",
+                "text": "示例施组文本" * 20,
+            }
+        ]
+        mock_load_ground_truth.return_value = []
+        mock_sync_gt.return_value = {
+            "feedback_guardrail": {"blocked": False},
+            "learning_quality_gate": {"blocked": False},
+            "few_shot_distillation": {"captured": 0, "reason": "not_executed"},
+        }
+        mock_run_closed_loop.return_value = {"ok": True}
+
+        response = client.post(
+            "/api/v1/projects/p1/ground_truth/from_submission",
+            json={
+                "submission_id": "s1",
+                "judge_scores": [4.33, 4.36, 4.35, 4.36, 4.8],
+                "final_score": 0,
+                "source": "青天大模型",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["final_score"] == 4.44
+        assert data["final_score_raw"] == 4.44
+        assert data["final_score_100"] == 88.8
+        saved_rows = mock_save_ground_truth.call_args_list[0].args[0]
+        assert saved_rows[0]["final_score"] == 4.44
+        assert saved_rows[0]["final_score_raw"] == 4.44
+        assert saved_rows[0]["final_score_100"] == 88.8
+
+    @patch("app.main._refresh_project_reflection_objects")
+    @patch("app.main.save_qingtian_results")
+    @patch("app.main.load_qingtian_results")
+    @patch("app.main.save_ground_truth")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_config")
+    @patch("app.main._resolve_project_scoring_context")
+    @patch("app.main.load_projects")
+    def test_sync_ground_truth_record_to_qingtian_updates_existing_qingtian_score_after_repair(
+        self,
+        mock_load_projects,
+        mock_resolve_context,
+        mock_load_config,
+        mock_load_submissions,
+        mock_load_ground_truth,
+        mock_save_ground_truth,
+        mock_load_qingtian_results,
+        mock_save_qingtian_results,
+        mock_refresh_reflection,
+    ):
+        from app.main import _sync_ground_truth_record_to_qingtian
+
+        gt_record = {
+            "id": "gt-1",
+            "project_id": "p1",
+            "source": "青天大模型",
+            "shigong_text": "示例施组文本" * 20,
+            "judge_scores": [4.33, 4.36, 4.35, 4.36, 4.8],
+            "final_score": 4.44,
+            "final_score_raw": 4.44,
+            "final_score_100": 88.8,
+            "score_scale_max": 5,
+        }
+        mock_load_projects.return_value = [
+            {
+                "id": "p1",
+                "meta": {"score_scale_max": 5},
+                "scoring_engine_version_locked": "v2",
+            }
+        ]
+        mock_resolve_context.return_value = ({}, None, None)
+        mock_load_config.return_value = MagicMock(rubric={}, lexicon={})
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "施组一.docx",
+                "text": "示例施组文本" * 20,
+                "source_ground_truth_id": "gt-1",
+                "report": {
+                    "total_score": 88.8,
+                    "pred_total_score": 88.8,
+                    "rule_total_score": 2.93,
+                    "score_blend": {"mode": "ground_truth_exact"},
+                },
+            }
+        ]
+        mock_load_ground_truth.return_value = [{"id": "gt-1", "project_id": "p1"}]
+        mock_load_qingtian_results.return_value = [
+            {
+                "id": "qt-1",
+                "submission_id": "s1",
+                "qingtian_model_version": "old",
+                "qt_total_score": 0.0,
+                "qt_dim_scores": {"旧": 1},
+                "qt_reasons": [{"kind": "legacy", "text": "旧值"}],
+                "raw_payload": {
+                    "ground_truth_record_id": "gt-1",
+                    "final_score": 0.0,
+                    "final_score_raw": 0.0,
+                    "final_score_100": 0.0,
+                },
+                "created_at": "2026-03-31T00:00:00+00:00",
+            }
+        ]
+
+        with (
+            patch(
+                "app.feedback_learning.build_ground_truth_feedback_guardrail",
+                return_value={"blocked": False},
+            ),
+            patch(
+                "app.feedback_learning.build_ground_truth_learning_quality_gate",
+                return_value={"blocked": False},
+            ),
+            patch(
+                "app.feedback_learning.auto_update_feature_confidence_on_ground_truth",
+                return_value={"updated": 0, "retired": 0},
+            ),
+            patch(
+                "app.feedback_learning.capture_ground_truth_few_shot_features",
+                return_value={"captured": 0, "reason": "not_executed"},
+            ),
+        ):
+            _sync_ground_truth_record_to_qingtian("p1", gt_record)
+
+        saved_rows = mock_save_qingtian_results.call_args.args[0]
+        assert saved_rows[0]["qt_total_score"] == 88.8
+        assert saved_rows[0]["qt_dim_scores"] is None
+        assert saved_rows[0]["qt_reasons"][0]["kind"] == "ground_truth"
+        assert saved_rows[0]["raw_payload"]["final_score"] == 4.44
+        assert saved_rows[0]["raw_payload"]["final_score_raw"] == 4.44
+        assert saved_rows[0]["raw_payload"]["final_score_100"] == 88.8
+        assert saved_rows[0]["raw_payload"]["score_scale_max"] == 5
+        mock_save_ground_truth.assert_called_once()
+        mock_refresh_reflection.assert_called_once()
+
+    def test_build_ground_truth_feedback_guardrail_auto_approves_high_consensus_sample(self):
+        from app.main import _build_ground_truth_feedback_guardrail
+
+        report = {"pred_total_score": 22.97}
+        gt_record = {
+            "final_score": 82.2,
+            "score_scale_max": 100,
+            "judge_scores": [82.16, 82.19, 82.16, 82.18, 82.22, 82.19, 82.28],
+        }
+
+        guardrail = _build_ground_truth_feedback_guardrail(
+            report=report,
+            gt_record=gt_record,
+            project_score_scale_max=100,
+        )
+
+        assert guardrail["threshold_blocked"] is True
+        assert guardrail["blocked"] is False
+        assert guardrail["manual_review_status"] == "approved"
+        assert guardrail["auto_approved_consensus"] is True
+        assert guardrail["judge_score_span"] == 0.12
+        assert guardrail["judge_score_stddev"] <= 0.04
+
+    def test_build_ground_truth_feedback_guardrail_keeps_blocked_for_low_consensus_sample(self):
+        from app.main import _build_ground_truth_feedback_guardrail
+
+        report = {"pred_total_score": 22.97}
+        gt_record = {
+            "final_score": 82.2,
+            "score_scale_max": 100,
+            "judge_scores": [80.5, 81.4, 82.3, 83.1, 84.2, 85.0, 86.1],
+        }
+
+        guardrail = _build_ground_truth_feedback_guardrail(
+            report=report,
+            gt_record=gt_record,
+            project_score_scale_max=100,
+        )
+
+        assert guardrail["threshold_blocked"] is True
+        assert guardrail["blocked"] is True
+        assert guardrail["manual_review_status"] == "pending"
+        assert guardrail.get("auto_approved_consensus") is not True
+
+    @patch("app.main.upsert_distilled_features", return_value={"upserted": 1})
+    @patch("app.main.distill_feature_from_text")
+    @patch("app.main._collect_dimension_guidance_texts", return_value=["编制提示"])
+    @patch("app.main._collect_dimension_evidence_texts", return_value=["高分证据"])
+    @patch("app.main._flatten_ground_truth_qualitative_tags", return_value=["评委反馈"])
+    @patch("app.main._select_ground_truth_few_shot_dimensions", return_value=["01"])
+    def test_capture_ground_truth_few_shot_features_auto_adopts_high_consensus_sample(
+        self,
+        mock_select_dims,
+        mock_tags,
+        mock_evidence,
+        mock_guidance,
+        mock_distill,
+        mock_upsert,
+    ):
+        from app.feedback_learning import capture_ground_truth_few_shot_features
+
+        mock_distill.return_value = MagicMock(feature_id="F-1")
+        report = {"dimension_scores": {"01": {"score": 5.0}}}
+        gt_record = {
+            "final_score": 82.2,
+            "score_scale_max": 100,
+            "judge_scores": [82.16, 82.19, 82.16, 82.18, 82.22, 82.19, 82.28],
+        }
+
+        result = capture_ground_truth_few_shot_features(
+            report=report,
+            gt_record=gt_record,
+            project_score_scale_max=100,
+            feedback_guardrail={"blocked": False},
+            learning_quality_gate={"blocked": False},
+            feature_confidence_update={"updated": 1},
+        )
+
+        assert result["captured"] == 1
+        assert result["manual_review"]["status"] == "adopted"
+        assert result["manual_review"]["note"] == "high_consensus_auto_adopted"
+        assert result["auto_adopted_consensus"] is True
+        mock_select_dims.assert_called_once()
+        mock_upsert.assert_called_once()
+
+    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main.load_ground_truth")
+    def test_refresh_project_ground_truth_learning_records_refreshes_pending_few_shot_rows(
+        self,
+        mock_load_ground_truth,
+        mock_sync_gt,
+    ):
+        from app.feedback_learning import refresh_project_ground_truth_learning_records
+
+        mock_load_ground_truth.return_value = [
+            {
+                "id": "gt-1",
+                "project_id": "p1",
+                "few_shot_distillation": {
+                    "captured": 2,
+                    "reason": "captured",
+                    "manual_review": {"status": "pending"},
+                },
+            }
+        ]
+        mock_sync_gt.return_value = {
+            "feedback_guardrail": {"blocked": False},
+            "few_shot_distillation": {
+                "captured": 2,
+                "reason": "captured",
+                "manual_review": {"status": "adopted"},
+            },
+        }
+
+        result = refresh_project_ground_truth_learning_records("p1")
+
+        assert result["refreshed"] == 1
+        assert result["blocked_after"] == 0
+        assert result["auto_approved_after"] == 0
+        mock_sync_gt.assert_called_once_with("p1", mock_load_ground_truth.return_value[0])
+
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
     @patch("app.main._collect_blocked_ground_truth_guardrails")
@@ -9912,6 +19543,68 @@ class TestGroundTruthGuardrailRoutes:
 
         assert response.status_code == 409
         assert "confirm_extreme_sample=1" in response.json()["detail"]
+
+    @patch("app.main._refresh_project_reflection_objects")
+    @patch("app.main._build_feedback_governance_report")
+    @patch("app.main._collect_blocked_ground_truth_guardrails")
+    @patch("app.main._refresh_project_ground_truth_learning_records")
+    @patch("app.main.load_calibration_samples")
+    @patch("app.main.load_delta_cases")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_auto_run_reflection_refreshes_ground_truth_guardrails_before_block_check(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_delta_cases,
+        mock_load_calibration_samples,
+        mock_refresh_ground_truth,
+        mock_collect_blocked,
+        mock_build_governance,
+        mock_refresh_reflection,
+        client,
+    ):
+        events = []
+        mock_load_projects.return_value = [{"id": "p1"}]
+        mock_load_delta_cases.return_value = []
+        mock_load_calibration_samples.return_value = []
+        mock_build_governance.return_value = {
+            "summary": {
+                "manual_confirmation_required": False,
+                "pending_extreme_ground_truth_count": 0,
+                "blocked_ground_truth_count": 0,
+                "approved_extreme_ground_truth_count": 0,
+                "manual_override_hint": None,
+                "current_calibrator_deployment_mode": "prior_fallback",
+            },
+            "recommendations": ["当前链路未命中人工确认阻塞。"],
+        }
+        mock_refresh_ground_truth.side_effect = lambda project_id: events.append(
+            ("refresh", project_id)
+        ) or {"refreshed": 0}
+        mock_collect_blocked.side_effect = (
+            lambda *args, **kwargs: events.append(
+                ("collect", args[0] if args else kwargs.get("project_id"))
+            )
+            or []
+        )
+        mock_refresh_reflection.side_effect = lambda *args, **kwargs: events.append(
+            ("reflection", args[0] if args else kwargs.get("project_id"))
+        )
+
+        response = client.post("/api/v1/projects/p1/reflection/auto_run")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert events[:2] == [("refresh", "p1"), ("collect", "p1")]
+        assert data["manual_confirmation_audit"]["status"] == "clear"
+        assert data["manual_confirmation_audit"]["override_used"] is False
+        assert data["manual_confirmation_audit"]["before_pending_extreme_ground_truth_count"] == 0
+        assert data["manual_confirmation_audit"]["delta_pending_extreme_ground_truth_count"] == 0
+        assert data["manual_confirmation_audit"]["gate_cleared_after_reverify"] is False
+        assert str(
+            data["manual_confirmation_audit"]["current_calibrator_deployment_mode"] or ""
+        ).strip()
 
 
 class TestFeedbackGovernanceRoutes:
@@ -9969,7 +19662,7 @@ class TestFeedbackGovernanceRoutes:
                     "predicted_score_100": 30,
                     "abs_delta_100": 50,
                     "relative_delta_ratio": 0.5,
-                    "warning_message": "预测与真实总分偏差过大，已暂停自动调权/自动校准。",
+                    "warning_message": "当前分与真实总分偏差过大，已暂停自动调权/自动校准。",
                 },
                 "few_shot_distillation": {"captured": 0, "reason": "guardrail_blocked"},
             },
@@ -10100,9 +19793,16 @@ class TestFeedbackGovernanceRoutes:
         assert data["summary"]["few_shot_adopted_count"] == 1
         assert data["summary"]["pending_extreme_ground_truth_count"] == 1
         assert data["summary"]["few_shot_pending_review_count"] == 0
+        assert data["summary"]["current_calibrator_degraded"] is False
+        assert data["summary"]["current_calibrator_rollback_candidate_version"] is None
         assert data["blocked_samples"][0]["record_id"] == "gt-blocked"
+        assert data["blocked_samples"][0]["score_scale_label"] == "100分制"
+        assert data["blocked_samples"][0]["current_score"] == 30
+        assert data["blocked_samples"][0]["abs_delta"] == 50
+        assert data["blocked_samples"][0]["current_score_100"] == 30
         assert data["few_shot_recent"][0]["record_id"] == "gt-good"
         assert data["approved_samples"][0]["record_id"] == "gt-approved"
+        assert data["approved_samples"][0]["abs_delta"] == 46
         assert data["adopted_few_shot"][0]["record_id"] == "gt-good"
         assert (
             data["version_history"][0]["recent_versions"][0]["version_id"]
@@ -10111,6 +19811,72 @@ class TestFeedbackGovernanceRoutes:
         assert data["artifact_impacts"][0]["artifact"] == "high_score_features"
         assert data["artifact_impacts"][0]["changed_since_latest_snapshot"] is True
         assert data["score_preview"]["matched_submission_count"] == 0
+
+    @patch("app.main.load_expert_profiles", return_value=[])
+    @patch("app.main.load_calibration_models", return_value=[])
+    @patch("app.main.load_evolution_reports", return_value={})
+    @patch("app.main.load_high_score_features", return_value=[])
+    @patch("app.main.load_json_version", return_value=[])
+    @patch("app.main.list_json_versions", return_value=[])
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_feedback_governance_route_prefers_native_score_fields_for_five_scale_project(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_ground_truth,
+        _mock_list_versions,
+        _mock_load_json_version,
+        _mock_load_high_score_features,
+        _mock_load_evolution_reports,
+        _mock_load_calibration_models,
+        _mock_load_expert_profiles,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 5}}]
+        mock_load_ground_truth.return_value = [
+            {
+                "id": "gt-blocked",
+                "project_id": "p1",
+                "final_score": 4.14,
+                "final_score_raw": 4.14,
+                "final_score_100": 82.8,
+                "score_scale_max": 5,
+                "judge_scores": [4.15, 4.09, 4.15, 4.15, 4.21],
+                "source_submission_filename": "档案馆施工总承包(2).pdf",
+                "created_at": "2026-03-14T00:00:00+00:00",
+                "feedback_guardrail": {
+                    "blocked": True,
+                    "threshold_blocked": True,
+                    "actual_score_raw": 4.14,
+                    "predicted_score_raw": 0.5955,
+                    "current_score_raw": 0.5955,
+                    "actual_score_100": 82.8,
+                    "predicted_score_100": 11.91,
+                    "current_score_100": 11.91,
+                    "abs_delta_raw": 3.5445,
+                    "abs_delta_100": 70.89,
+                    "relative_delta_ratio": 0.7089,
+                },
+            }
+        ]
+
+        with (
+            patch("app.main.load_submissions", return_value=[]),
+            patch("app.main.load_score_reports", return_value=[]),
+            patch("app.main.load_qingtian_results", return_value=[]),
+        ):
+            response = client.get("/api/v1/projects/p1/feedback/governance")
+
+        assert response.status_code == 200
+        data = response.json()
+        blocked = data["blocked_samples"][0]
+        assert blocked["score_scale_label"] == "5分制"
+        assert blocked["actual_score"] == 4.14
+        assert blocked["current_score"] == 0.5955
+        assert blocked["abs_delta"] == 3.5445
+        assert "100分口径" not in (blocked["warning_message"] or "")
         assert any(row["artifact"] == "high_score_features" for row in data["version_history"])
 
     @patch("app.main.load_json_version")
@@ -10558,7 +20324,7 @@ class TestFeedbackGovernanceRoutes:
                     "actual_score_100": 81,
                     "predicted_score_100": 33,
                     "abs_delta_100": 48,
-                    "warning_message": "预测与真实总分偏差过大",
+                    "warning_message": "当前分与真实总分偏差过大",
                 },
             }
         ]
@@ -10758,6 +20524,7 @@ class TestFeedbackGovernanceRoutes:
         data = response.json()
         assert data["feedback_guardrail"]["manual_review_status"] == "approved"
         assert data["feedback_guardrail"]["blocked"] is False
+        assert data["feedback_guardrail"]["current_score_100"] == 30
         assert data["feedback_closed_loop"]["ok"] is True
         assert store[0]["feedback_guardrail"]["manual_review_status"] == "approved"
         assert store[0]["feedback_closed_loop"]["ok"] is True
@@ -10880,6 +20647,109 @@ class TestGroundTruthScoreRuleRoutes:
         assert data["source_page_hint"] == "第80页"
         assert "打分平均值" in data["label"]
 
+    @patch("app.main.pymupdf", None)
+    @patch("app.main.PdfReader")
+    def test_extract_ground_truth_score_rule_from_pdf_content_stops_when_rule_page_is_found(
+        self,
+        mock_pdf_reader,
+    ):
+        from app.main import _extract_ground_truth_score_rule_from_pdf_content
+
+        class _FakePage:
+            def __init__(self, text: str):
+                self._text = text
+                self.calls = 0
+
+            def extract_text(self):
+                self.calls += 1
+                return self._text
+
+        class _FakeReader:
+            def __init__(self, _stream):
+                self.pages = pages
+
+        pages = [
+            _FakePage("第一章 招标公告"),
+            _FakePage("第二章 投标人须知"),
+            _FakePage(
+                "第三章 商务文件详细评审\n"
+                "去除1个较高有效评标价和1个较低有效评标价，"
+                "取其他有效评标价进行算术平均。"
+            ),
+            _FakePage("第四章 详细评审标准"),
+            _FakePage(
+                "3.2.2 得分计算的确定\n"
+                "本章第2.2.2（1）目属于技术文件详细评审内容，"
+                "以评标委员会各成员打分平均值确定。"
+            ),
+            _FakePage("不应继续扫描到这一页"),
+        ]
+
+        mock_pdf_reader.side_effect = _FakeReader
+        candidate = _extract_ground_truth_score_rule_from_pdf_content(
+            b"%PDF-fallback",
+            filename="招标文件正文.pdf",
+        )
+
+        assert candidate is not None
+        assert candidate["formula"] == "simple_mean"
+        assert candidate["source_page_hint"] == "第5页"
+        assert pages[5].calls == 0
+
+    @patch("app.main._extract_ground_truth_score_rule_from_pdf_content")
+    @patch("app.main.read_bytes")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_ground_truth_scoring_rule_endpoint_falls_back_to_full_pdf_when_parsed_text_was_early_stopped(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        mock_read_bytes,
+        mock_extract_rule_from_pdf,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 5}}]
+        mock_read_bytes.return_value = b"%PDF-1.7"
+        mock_extract_rule_from_pdf.return_value = {
+            "formula": "simple_mean",
+            "label": "按招标文件：评标委员会各成员打分平均值",
+            "rounding_digits": 2,
+            "drop_highest_count": 0,
+            "drop_lowest_count": 0,
+            "detected": True,
+            "confidence": 100,
+            "source_filename": "招标文件正文.pdf",
+            "source_page_hint": "第75页",
+            "source_excerpt": "以评标委员会各成员打分平均值确定。",
+        }
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as temp_pdf:
+            mock_load_materials.return_value = [
+                {
+                    "project_id": "p1",
+                    "material_type": "tender_qa",
+                    "filename": "招标文件正文.pdf",
+                    "path": temp_pdf.name,
+                    "parsed_text": (
+                        "[PAGE:1]\n前文摘要\n"
+                        "[PDF_EARLY_STOP_AFTER_PAGE:16] tender_qa_enough_signals"
+                    ),
+                }
+            ]
+            response = client.get("/api/v1/projects/p1/ground_truth/scoring_rule")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["formula"] == "simple_mean"
+        assert data["auto_compute"] is True
+        assert data["source_filename"] == "招标文件正文.pdf"
+        assert data["source_page_hint"] == "第75页"
+        mock_extract_rule_from_pdf.assert_called_once_with(
+            b"%PDF-1.7",
+            filename="招标文件正文.pdf",
+        )
+
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
     @patch("app.main._collect_blocked_ground_truth_guardrails")
@@ -10900,6 +20770,7 @@ class TestGroundTruthScoreRuleRoutes:
         assert response.status_code == 409
         assert "confirm_extreme_sample=1" in response.json()["detail"]
 
+    @patch("app.main._build_feedback_governance_report")
     @patch("app.main.save_evolution_reports")
     @patch("app.main.load_evolution_reports")
     @patch("app.main.enhance_evolution_report_with_llm")
@@ -10920,6 +20791,7 @@ class TestGroundTruthScoreRuleRoutes:
         mock_enhance_evolution_report,
         mock_load_evolution_reports,
         mock_save_evolution_reports,
+        mock_build_governance,
         client,
     ):
         mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 5}}]
@@ -10941,6 +20813,17 @@ class TestGroundTruthScoreRuleRoutes:
         mock_merge_materials_text.return_value = ""
         mock_load_evolution_reports.return_value = {}
         mock_enhance_evolution_report.return_value = None
+        mock_build_governance.return_value = {
+            "summary": {
+                "manual_confirmation_required": False,
+                "pending_extreme_ground_truth_count": 0,
+                "blocked_ground_truth_count": 0,
+                "approved_extreme_ground_truth_count": 0,
+                "manual_override_hint": None,
+                "current_calibrator_deployment_mode": "prior_fallback",
+            },
+            "recommendations": ["当前无人工确认阻塞。"],
+        }
 
         def _build(project_id, records, project_context):
             assert project_id == "p1"
@@ -10965,8 +20848,93 @@ class TestGroundTruthScoreRuleRoutes:
         data = response.json()
         assert data["sample_count"] == 1
         assert data["high_score_logic"] == ["逻辑A"]
+        assert data["manual_confirmation_audit"]["status"] == "clear"
+        assert data["manual_confirmation_audit"]["override_used"] is False
+        assert data["manual_confirmation_audit"]["before_pending_extreme_ground_truth_count"] == 0
+        assert data["manual_confirmation_audit"]["delta_pending_extreme_ground_truth_count"] == 0
         mock_save_evolution_reports.assert_called_once()
 
+    @patch("app.main._build_feedback_governance_report")
+    @patch("app.main.save_evolution_reports")
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.enhance_evolution_report_with_llm")
+    @patch("app.main.build_evolution_report")
+    @patch("app.main._merge_materials_text")
+    @patch("app.main.load_project_context")
+    @patch("app.main._collect_blocked_ground_truth_guardrails")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_evolve_confirm_extreme_sample_returns_manual_confirmation_audit(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_ground_truth,
+        mock_collect_blocked,
+        mock_load_project_context,
+        mock_merge_materials_text,
+        mock_build_evolution_report,
+        mock_enhance_evolution_report,
+        mock_load_evolution_reports,
+        mock_save_evolution_reports,
+        mock_build_governance,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 5}}]
+        mock_collect_blocked.return_value = [{"record_id": "gt-1"}]
+        mock_load_ground_truth.return_value = [
+            {
+                "id": "gt-1",
+                "project_id": "p1",
+                "judge_scores": [4.2, 4.2, 4.2, 4.2, 4.2],
+                "final_score": 4.2,
+                "score_scale_max": 5,
+            }
+        ]
+        mock_load_project_context.return_value = {}
+        mock_merge_materials_text.return_value = ""
+        mock_load_evolution_reports.return_value = {}
+        mock_enhance_evolution_report.return_value = None
+        mock_build_governance.return_value = {
+            "summary": {
+                "manual_confirmation_required": False,
+                "pending_extreme_ground_truth_count": 0,
+                "blocked_ground_truth_count": 0,
+                "approved_extreme_ground_truth_count": 1,
+                "manual_override_hint": "confirm_extreme_sample=1",
+                "current_calibrator_deployment_mode": "prior_fallback",
+            },
+            "recommendations": ["人工确认后可继续自动学习。"],
+        }
+        mock_build_evolution_report.return_value = {
+            "project_id": "p1",
+            "high_score_logic": ["逻辑A"],
+            "writing_guidance": ["建议A"],
+            "sample_count": 1,
+            "updated_at": "2026-03-25T06:35:00+00:00",
+            "scoring_evolution": {},
+            "compilation_instructions": {},
+        }
+
+        response = client.post("/api/v1/projects/p1/evolve?confirm_extreme_sample=1")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["manual_confirmation_audit"]["status"] == "cleared"
+        assert data["manual_confirmation_audit"]["override_used"] is True
+        assert data["manual_confirmation_audit"]["before_pending_extreme_ground_truth_count"] == 1
+        assert data["manual_confirmation_audit"]["before_blocked_ground_truth_count"] == 1
+        assert data["manual_confirmation_audit"]["approved_extreme_ground_truth_count"] == 1
+        assert data["manual_confirmation_audit"]["delta_pending_extreme_ground_truth_count"] == -1
+        assert data["manual_confirmation_audit"]["delta_blocked_ground_truth_count"] == -1
+        assert data["manual_confirmation_audit"]["delta_approved_extreme_ground_truth_count"] == 1
+        assert data["manual_confirmation_audit"]["gate_cleared_after_reverify"] is True
+        assert "复验前待人工审核 1 条" in data["manual_confirmation_audit"]["reverify_summary"]
+        assert (
+            data["manual_confirmation_audit"]["manual_override_hint"] == "confirm_extreme_sample=1"
+        )
+
+    @patch("app.main._build_pending_feedback_scoring_points")
     @patch("app.main.load_evolution_reports")
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
@@ -10975,6 +20943,7 @@ class TestGroundTruthScoreRuleRoutes:
         mock_ensure,
         mock_load_projects,
         mock_load_evolution_reports,
+        mock_build_pending_feedback,
         client,
     ):
         mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
@@ -10993,6 +20962,10 @@ class TestGroundTruthScoreRuleRoutes:
                 "enhancement_review_notes": ["复核差异较大"],
             }
         }
+        mock_build_pending_feedback.return_value = {
+            "summary": {"pending_sample_count": 1, "pending_point_count": 2},
+            "patch_bundle": {"section_count": 1, "sections": [{"copy_block": "补丁A"}]},
+        }
 
         response = client.get("/api/v1/projects/p1/writing_guidance")
 
@@ -11004,6 +20977,89 @@ class TestGroundTruthScoreRuleRoutes:
         assert data["enhancement_review_status"] == "diverged"
         assert data["enhancement_review_similarity"] == pytest.approx(0.21, abs=1e-6)
         assert "已回退到规则版建议" in data["enhancement_governance_notes"][0]
+        assert data["pending_feedback_summary"]["pending_sample_count"] == 1
+        assert data["pending_feedback_patch_bundle"]["section_count"] == 1
+
+    @patch("app.main.get_writing_guidance")
+    def test_get_project_writing_guidance_markdown_and_download(
+        self,
+        mock_get_writing_guidance,
+        client,
+    ):
+        from app.schemas import WritingGuidance
+
+        mock_get_writing_guidance.return_value = WritingGuidance(
+            project_id="p1",
+            guidance=["建议A"],
+            high_score_logic=["逻辑A"],
+            pending_feedback_summary={"pending_sample_count": 2, "pending_point_count": 3},
+            pending_feedback_patch_bundle={
+                "section_count": 1,
+                "sections": [
+                    {
+                        "section_title": "05 四新技术应用",
+                        "operation_label": "在当前“盘扣式脚手架”相关段后插入该小节",
+                        "target": "盘扣式脚手架",
+                        "section_paragraphs": ["正文A", "正文B"],
+                        "copy_block": "### 05 四新技术应用\n\n写入方式：在当前“盘扣式脚手架”相关段后插入该小节",
+                    }
+                ],
+                "copy_markdown": "# 待确认真实评标改写补丁包\n\n## 1. 05 四新技术应用\n",
+            },
+            sample_count=1,
+            updated_at="2026-04-02T10:00:00+08:00",
+            enhancement_applied=True,
+        )
+
+        md_resp = client.get("/api/v1/projects/p1/writing_guidance/markdown")
+        assert md_resp.status_code == 200
+        md_data = md_resp.json()
+        assert md_data["project_id"] == "p1"
+        assert "## 编制指导" in md_data["markdown"]
+        assert "## 待确认反馈改写补丁包" in md_data["markdown"]
+        assert "待人工确认样本：`2`" in md_data["markdown"]
+
+        file_resp = client.get("/api/v1/projects/p1/writing_guidance.md")
+        assert file_resp.status_code == 200
+        assert "text/markdown" in file_resp.headers.get("content-type", "")
+        disposition = file_resp.headers.get("content-disposition", "")
+        assert "attachment; filename=" in disposition
+        assert "writing_guidance_p1.md" in disposition
+        assert "待确认反馈改写补丁包" in file_resp.text
+
+        patch_md_resp = client.get("/api/v1/projects/p1/writing_guidance_patch_bundle/markdown")
+        assert patch_md_resp.status_code == 200
+        patch_md_data = patch_md_resp.json()
+        assert patch_md_data["project_id"] == "p1"
+        assert "# 待确认反馈改写补丁包" in patch_md_data["markdown"]
+        assert "## 项目级补丁正文" in patch_md_data["markdown"]
+        assert "待人工确认样本：`2`" in patch_md_data["markdown"]
+
+        patch_file_resp = client.get("/api/v1/projects/p1/writing_guidance_patch_bundle.md")
+        assert patch_file_resp.status_code == 200
+        assert "text/markdown" in patch_file_resp.headers.get("content-type", "")
+        patch_disposition = patch_file_resp.headers.get("content-disposition", "")
+        assert "attachment; filename=" in patch_disposition
+        assert "writing_guidance_patch_bundle_p1.md" in patch_disposition
+        assert "待确认反馈改写补丁包" in patch_file_resp.text
+
+        patch_docx_resp = client.get("/api/v1/projects/p1/writing_guidance_patch_bundle.docx")
+        assert patch_docx_resp.status_code == 200
+        assert patch_docx_resp.content.startswith(b"PK")
+        assert (
+            patch_docx_resp.headers.get("content-type", "")
+            == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+        patch_docx_disposition = patch_docx_resp.headers.get("content-disposition", "")
+        assert "attachment; filename=" in patch_docx_disposition
+        assert "writing_guidance_patch_bundle_p1.docx" in patch_docx_disposition
+        if app_main.Document is not None:
+            doc = app_main.Document(BytesIO(patch_docx_resp.content))
+            doc_text = "\n".join(p.text for p in doc.paragraphs if p.text)
+            assert "待确认反馈改写补丁包" in doc_text
+            assert "项目级补丁正文" in doc_text
+            assert "05 四新技术应用" in doc_text
+            assert "写入方式：" in doc_text
 
 
 class TestDynamicBlendAdjustment:
