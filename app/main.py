@@ -124,6 +124,7 @@ from app.engine.evaluation import evaluate_project_variants
 from app.engine.evolution import build_evolution_report
 from app.engine.feature_distillation import (
     load_feature_kb,
+    save_feature_kb,
     select_top_logic_skeletons,
 )
 from app.engine.history import (
@@ -17113,13 +17114,13 @@ def _refresh_project_reflection_objects(
     projects = load_projects()
     project = next((p for p in projects if str(p.get("id")) == project_id), {})
     project_score_scale = _resolve_project_score_scale_max(project) if project else 100
-    guardrail_blocked_gt_ids = {
+    training_blocked_gt_ids = {
         str(row.get("id") or "").strip()
         for row in _list_project_ground_truth_records(
             project_id,
             include_guardrail_blocked=True,
         )
-        if _feedback_guardrail_is_blocked(row)
+        if _feedback_guardrail_blocks_training(row)
     }
     learning_quality_blocked_gt_ids = {
         str(row.get("id") or "").strip()
@@ -17166,7 +17167,7 @@ def _refresh_project_reflection_objects(
         if (
             not include_guardrail_blocked
             and gt_record_id
-            and gt_record_id in guardrail_blocked_gt_ids
+            and gt_record_id in training_blocked_gt_ids
         ):
             continue
         scoped_qt.append(q)
@@ -17570,6 +17571,7 @@ def _refresh_evolution_report_from_ground_truth(
         project_id,
         material_knowledge_profile=material_knowledge_profile,
     )
+    report["few_shot_examples"] = _build_project_few_shot_prompt_examples(project_id, limit=6)
     reports = load_evolution_reports()
     prev = reports.get(project_id) or {}
     # 自动闭环刷新时仅更新规则进化结果与编制指导；保留已有 LLM 增强来源标记。
@@ -17844,6 +17846,11 @@ def _normalize_learning_quality_gate_state(payload: object) -> Dict[str, object]
 def _feedback_guardrail_is_blocked(payload: object) -> bool:
     guardrail = _extract_feedback_guardrail(payload)
     return bool(guardrail.get("blocked"))
+
+
+def _feedback_guardrail_blocks_training(payload: object) -> bool:
+    guardrail = _extract_feedback_guardrail(payload)
+    return bool(guardrail.get("threshold_blocked"))
 
 
 def _learning_quality_gate_is_blocked(payload: object) -> bool:
@@ -18903,7 +18910,7 @@ def _list_governance_comparable_submission_snapshots(
             include_guardrail_blocked=True,
             rows_override=ground_truth_rows_override,
         )
-        if _feedback_guardrail_is_blocked(row)
+        if _feedback_guardrail_blocks_training(row)
     }
     latest_qingtian = _latest_records_by_submission(
         [
@@ -30334,7 +30341,7 @@ def rebuild_delta_cases(
     blocked_gt_ids = {
         str(row.get("id") or "").strip()
         for row in _list_project_ground_truth_records(project_id, include_guardrail_blocked=True)
-        if _feedback_guardrail_is_blocked(row)
+        if _feedback_guardrail_blocks_training(row)
     }
     latest_qt = _latest_records_by_submission(
         [
@@ -30404,7 +30411,7 @@ def rebuild_calibration_samples(
     blocked_gt_ids = {
         str(row.get("id") or "").strip()
         for row in _list_project_ground_truth_records(project_id, include_guardrail_blocked=True)
-        if _feedback_guardrail_is_blocked(row)
+        if _feedback_guardrail_blocks_training(row)
     }
     latest_qt = _latest_records_by_submission(
         [
@@ -32752,6 +32759,97 @@ def _apply_few_shot_review(
     return _normalize_few_shot_distillation_state(distillation)
 
 
+def _sync_feature_governance_review(
+    *,
+    feature_ids: List[str],
+    review_status: str,
+    reviewed_at: Optional[str] = None,
+) -> Dict[str, object]:
+    target_ids = {
+        str(item or "").strip() for item in (feature_ids or []) if str(item or "").strip()
+    }
+    if not target_ids:
+        return {"updated": 0, "feature_ids": []}
+    normalized_status = str(review_status or "").strip().lower()
+    if normalized_status not in {"pending", "adopted", "ignored", "auto_adopted"}:
+        normalized_status = "pending"
+    now = reviewed_at or _now_iso()
+    features = load_feature_kb()
+    updated = 0
+    for feature in features:
+        feature_id = str(getattr(feature, "feature_id", "") or "").strip()
+        if feature_id not in target_ids:
+            continue
+        feature.governance_status = normalized_status
+        feature.updated_at = now
+        if normalized_status == "ignored":
+            feature.active = False
+            feature.retired_at = now
+        else:
+            feature.active = True
+            feature.retired_at = None
+        updated += 1
+    if updated:
+        save_feature_kb(features)
+    return {
+        "updated": updated,
+        "feature_ids": sorted(target_ids),
+        "review_status": normalized_status,
+    }
+
+
+def _build_project_few_shot_prompt_examples(
+    project_id: str,
+    *,
+    limit: int = 6,
+) -> List[Dict[str, object]]:
+    rows = [
+        row for row in load_ground_truth() if str(row.get("project_id") or "") == str(project_id)
+    ]
+    eligible_feature_ids: set[str] = set()
+    for row in rows:
+        distillation = _normalize_few_shot_distillation_state(row.get("few_shot_distillation"))
+        if str(distillation.get("manual_review_status") or "").strip().lower() != "adopted":
+            continue
+        for feature_id in distillation.get("feature_ids") or []:
+            fid = str(feature_id or "").strip()
+            if fid:
+                eligible_feature_ids.add(fid)
+    if not eligible_feature_ids:
+        return []
+    candidates: List[Dict[str, object]] = []
+    for feature in load_feature_kb():
+        feature_id = str(getattr(feature, "feature_id", "") or "").strip()
+        if feature_id not in eligible_feature_ids or not bool(getattr(feature, "active", False)):
+            continue
+        governance_status = str(getattr(feature, "governance_status", "") or "").strip().lower()
+        if governance_status not in {"adopted", "auto_adopted"}:
+            continue
+        dim_id = str(getattr(feature, "dimension_id", "") or "").strip().upper()
+        candidates.append(
+            {
+                "feature_id": feature_id,
+                "dimension_id": dim_id,
+                "dimension_name": str((DIMENSIONS.get(dim_id) or {}).get("name") or dim_id).strip(),
+                "logic_skeleton": list(getattr(feature, "logic_skeleton", []) or [])[:3],
+                "source_highlights": list(getattr(feature, "source_highlights", []) or [])[:3],
+                "governance_status": governance_status,
+                "confidence_score": round(
+                    float(_to_float_or_none(getattr(feature, "confidence_score", None)) or 0.0), 4
+                ),
+                "usage_count": int(_to_float_or_none(getattr(feature, "usage_count", None)) or 0),
+            }
+        )
+    candidates.sort(
+        key=lambda item: (
+            float(_to_float_or_none(item.get("confidence_score")) or 0.0),
+            int(_to_float_or_none(item.get("usage_count")) or 0),
+        ),
+        reverse=True,
+    )
+    return candidates[: max(1, int(limit or 6))]
+
+
 @router.post(
     "/projects/{project_id}/ground_truth",
     response_model=GroundTruthRecord,
@@ -33110,6 +33208,7 @@ def evolve_project(
             (project_context + "\n\n" + materials_text) if project_context else materials_text
         )
     report = build_evolution_report(project_id, records, project_context)
+    report["few_shot_examples"] = _build_project_few_shot_prompt_examples(project_id, limit=6)
     enhanced = enhance_evolution_report_with_llm(project_id, report, records, project_context)
     if enhanced is not None:
         report["high_score_logic"] = enhanced.get("high_score_logic", report["high_score_logic"])

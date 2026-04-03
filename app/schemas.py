@@ -93,7 +93,7 @@ class LLMBackendStatus(BaseModel):
     )
     openai_pool_quality: Dict[str, float] = Field(
         default_factory=dict,
-        description="OpenAI 账号池质量摘要：average/best/worst quality score 与 rated_accounts",
+        description="OpenAI 账号池质量摘要：average/best/worst quality score、rated_accounts 与 sufficiently_rated_accounts",
     )
     openai_model: Optional[str] = Field(None, description="当前 OpenAI 模型")
     gemini_configured: bool = Field(..., description="是否已配置 GEMINI_API_KEY")
@@ -107,7 +107,7 @@ class LLMBackendStatus(BaseModel):
     )
     gemini_pool_quality: Dict[str, float] = Field(
         default_factory=dict,
-        description="Gemini 账号池质量摘要：average/best/worst quality score 与 rated_accounts",
+        description="Gemini 账号池质量摘要：average/best/worst quality score、rated_accounts 与 sufficiently_rated_accounts",
     )
     provider_health: Dict[str, str] = Field(
         default_factory=dict,
@@ -327,6 +327,8 @@ class MaterialRecord(BaseModel):
     created_at: str
     parse_status: Optional[str] = None
     parse_backend: Optional[str] = None
+    parse_phase: Optional[str] = None
+    parse_ready_for_gate: Optional[bool] = None
     parse_confidence: Optional[float] = None
     parse_error_class: Optional[str] = None
     parse_error_message: Optional[str] = None
@@ -376,16 +378,17 @@ class MaterialParseJobRecord(BaseModel):
     error_class: Optional[str] = None
     error_message: Optional[str] = None
     parse_confidence: Optional[float] = None
+    parse_mode: Optional[str] = None
 
 
 class MaterialParseStatusResponse(BaseModel):
     project_id: str
+    overview: Dict[str, Any] = Field(default_factory=dict)
     summary: Dict[str, Any] = Field(default_factory=dict)
+    debug_info: Dict[str, Any] = Field(default_factory=dict)
     jobs: List[MaterialParseJobRecord] = Field(default_factory=list)
     materials: List[MaterialRecord] = Field(default_factory=list)
-    overview: Dict[str, Any] = Field(default_factory=dict)
     generated_at: str
-    debug_info: Dict[str, Any] = Field(default_factory=dict)
 
 
 class MaterialDetailResponse(BaseModel):
@@ -700,6 +703,26 @@ class ScoringFactorsResponse(BaseModel):
     chapter_requirements: Dict[str, List[str]] = Field(
         default_factory=dict, description="章节/图文/要素要求"
     )
+    adaptive_summary: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="结合上传资料与真实评标生成的动态评分点摘要",
+    )
+    adaptive_scoring_points: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="动态评分点列表（资料锚点/反馈锚点/学习骨架）",
+    )
+    pending_feedback_summary: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="待人工确认的真实评标反馈点摘要（未正式生效）",
+    )
+    pending_feedback_scoring_points: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="待人工确认的真实评标反馈点列表（只读提示，不直接参与当前评分）",
+    )
+    pending_feedback_patch_bundle: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="待确认真实评标改写补丁包（项目级可复制补丁汇总）",
+    )
     capability_flags: Dict[str, bool] = Field(default_factory=dict, description="能力覆盖标识")
     source: Dict[str, str] = Field(default_factory=dict, description="数据来源说明")
     updated_at: str = Field(..., description="生成时间")
@@ -883,12 +906,15 @@ class ReflectionAutoRunResponse(BaseModel):
     calibrator_gate: Dict[str, Any] = Field(default_factory=dict)
     calibrator_auto_candidates: List[Dict[str, Any]] = Field(default_factory=list)
     calibrator_auto_review: Dict[str, Any] = Field(default_factory=dict)
+    calibrator_runtime_governance: Dict[str, Any] = Field(default_factory=dict)
+    post_run_health_summary: Dict[str, Any] = Field(default_factory=dict)
     prediction_updated_reports: int = 0
     prediction_updated_submissions: int = 0
     patch_id: Optional[str] = None
     patch_gate_passed: Optional[bool] = None
     patch_deployed: bool = False
     patch_auto_govern: Dict[str, Any] = Field(default_factory=dict)
+    manual_confirmation_audit: Dict[str, Any] = Field(default_factory=dict)
 
 
 class EvidenceTraceResponse(BaseModel):
@@ -950,11 +976,68 @@ class ProjectScoringDiagnosticResponse(BaseModel):
     recommendations: List[str] = Field(default_factory=list)
 
 
+class ProjectTrialPreflightResponse(BaseModel):
+    """项目级试车前综合体检（运行、自检、评分、学习、总封关）"""
+
+    project_id: str
+    project_name: str
+    generated_at: str
+    base_url: Optional[str] = None
+    trial_run_ready: bool
+    status: str
+    status_label: str
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+    signoff: Dict[str, Any] = Field(default_factory=dict)
+    warning_details: Dict[str, Any] = Field(default_factory=dict)
+    record_draft: Dict[str, Any] = Field(default_factory=dict)
+    strengths: List[str] = Field(default_factory=list)
+    blockers: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+    recommendations: List[str] = Field(default_factory=list)
+
+
+class ProjectTrialPreflightMarkdownResponse(BaseModel):
+    """项目级试车前综合体检 Markdown 导出"""
+
+    project_id: str
+    markdown: str
+    generated_at: str
+
+
+class SystemImprovementOverviewResponse(BaseModel):
+    """系统级继续完善总览（运行稳定性 / 数据卫生 / 学习对齐 / 总封关）"""
+
+    generated_at: str
+    base_url: Optional[str] = None
+    overall_ready: bool
+    status: str
+    status_label: str
+    summary_label: Optional[str] = None
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+    focus_workstreams: List[Dict[str, Any]] = Field(default_factory=list)
+    focus_workstream_status_summaries: List[Dict[str, Any]] = Field(default_factory=list)
+    ops_agent_quality_summary: Dict[str, Any] = Field(default_factory=dict)
+    closure_gate_details: List[Dict[str, Any]] = Field(default_factory=list)
+    project_gap_details: List[Dict[str, Any]] = Field(default_factory=list)
+    project_gate_gap_details: List[Dict[str, Any]] = Field(default_factory=list)
+    project_action_gap_details: List[Dict[str, Any]] = Field(default_factory=list)
+    global_action_gap_details: List[Dict[str, Any]] = Field(default_factory=list)
+    global_action_group_summaries: List[Dict[str, Any]] = Field(default_factory=list)
+    global_auto_action_gap_details: List[Dict[str, Any]] = Field(default_factory=list)
+    global_readonly_action_gap_details: List[Dict[str, Any]] = Field(default_factory=list)
+    global_manual_action_gap_details: List[Dict[str, Any]] = Field(default_factory=list)
+    strengths: List[str] = Field(default_factory=list)
+    blockers: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+    recommendations: List[str] = Field(default_factory=list)
+
+
 class ProjectEvaluationResponse(BaseModel):
     project_id: str
     sample_count_qt: int
     variants: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     acceptance: Dict[str, bool] = Field(default_factory=dict)
+    phase1_closure_readiness: Dict[str, Any] = Field(default_factory=dict)
     computed_at: str
 
 
@@ -963,6 +1046,7 @@ class EvaluationSummaryResponse(BaseModel):
     project_ids: List[str] = Field(default_factory=list)
     aggregate: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     acceptance_pass_count: Dict[str, int] = Field(default_factory=dict)
+    total_closure_readiness: Dict[str, Any] = Field(default_factory=dict)
     computed_at: str
 
 
@@ -1275,6 +1359,15 @@ class ExtractedFeature(BaseModel):
     )
     usage_count: int = Field(default=0, ge=0, description="特征被系统采纳次数")
     active: bool = Field(default=True, description="是否活跃（软删除后为False）")
+    governance_status: Optional[str] = Field(
+        None,
+        description="治理状态：legacy|pending|adopted|ignored|auto_adopted",
+    )
+    source_record_ids: List[str] = Field(default_factory=list, description="来源真实评标记录ID")
+    source_highlights: List[str] = Field(
+        default_factory=list,
+        description="来源高分信号摘要，用于 few-shot / prompt 注入",
+    )
     retired_at: Optional[str] = Field(None, description="软删除时间")
     created_at: Optional[str] = Field(None, description="创建时间")
     updated_at: Optional[str] = Field(None, description="更新时间")
@@ -1366,6 +1459,14 @@ class EvolutionReport(BaseModel):
         default_factory=list,
         description="增强复核说明",
     )
+    calibrator_runtime_governance: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="最近一次运行时校准治理摘要（自动回退/跳过/原因/回填结果）",
+    )
+    manual_confirmation_audit: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="人工确认 override 与复验后的治理审计摘要",
+    )
 
 
 class CompilationInstructions(BaseModel):
@@ -1386,6 +1487,14 @@ class WritingGuidance(BaseModel):
     project_id: str
     guidance: List[str] = Field(..., description="编制建议条目")
     high_score_logic: List[str] = Field(default_factory=list, description="高分逻辑摘要")
+    pending_feedback_summary: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="待人工确认真实评标反馈点摘要（用于提示尚未正式生效的改写建议）",
+    )
+    pending_feedback_patch_bundle: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="待确认真实评标改写补丁包（项目级可复制补丁汇总）",
+    )
     sample_count: int = 0
     updated_at: Optional[str] = None
     enhancement_applied: bool = True
@@ -1395,6 +1504,13 @@ class WritingGuidance(BaseModel):
     enhancement_review_status: str = "not_run"
     enhancement_review_similarity: Optional[float] = None
     enhancement_review_notes: List[str] = Field(default_factory=list)
+
+
+class WritingGuidanceMarkdownResponse(BaseModel):
+    """编制指导 Markdown 导出"""
+
+    project_id: str
+    markdown: str
 
 
 # ==================== 历史记录与趋势分析模型 ====================

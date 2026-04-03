@@ -11,6 +11,7 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from app.config import RESOURCES_DIR
+from app.engine.dimensions import DIMENSIONS
 from app.schemas import ExtractedFeature
 from app.storage import StorageDataError, load_high_score_features, save_high_score_features
 
@@ -58,6 +59,48 @@ def _coerce_feature(raw: Dict[str, Any]) -> ExtractedFeature | None:
     if not feature.logic_skeleton:
         return None
     return feature
+
+
+def _normalize_governance_status(value: object) -> str | None:
+    status = str(value or "").strip().lower()
+    if status in {"pending", "adopted", "ignored", "auto_adopted", "legacy"}:
+        return status
+    return None
+
+
+def _merge_unique_strings(*groups: Sequence[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for group in groups:
+        for item in group:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            out.append(text)
+    return out
+
+
+def _merge_governance_status(current: object, incoming: object) -> str | None:
+    current_status = _normalize_governance_status(current)
+    incoming_status = _normalize_governance_status(incoming)
+    adopted_statuses = {"adopted", "auto_adopted"}
+    if current_status in adopted_statuses or incoming_status in adopted_statuses:
+        if "adopted" in {current_status, incoming_status}:
+            return "adopted"
+        return "auto_adopted"
+    if current_status == "ignored" or incoming_status == "ignored":
+        return "ignored"
+    if current_status == "pending" or incoming_status == "pending":
+        return "pending"
+    return current_status or incoming_status
+
+
+def _feature_runtime_allowed(feature: ExtractedFeature) -> bool:
+    if not feature.active:
+        return False
+    governance_status = _normalize_governance_status(feature.governance_status)
+    return governance_status not in {"pending", "ignored"}
 
 
 def _load_bootstrap_features() -> List[ExtractedFeature]:
@@ -108,6 +151,9 @@ def distill_feature_from_text(
     dimension_id: str,
     source_text: str,
     confidence_score: float = 0.62,
+    governance_status: str | None = None,
+    source_record_ids: Sequence[str] | None = None,
+    source_highlights: Sequence[str] | None = None,
 ) -> ExtractedFeature | None:
     clean_text = str(source_text or "").strip()
     if not clean_text:
@@ -126,6 +172,9 @@ def distill_feature_from_text(
         confidence_score=_clip(_safe_float(confidence_score, 0.62), 0.0, 1.0),
         usage_count=0,
         active=True,
+        governance_status=_normalize_governance_status(governance_status),
+        source_record_ids=_merge_unique_strings(source_record_ids or []),
+        source_highlights=_merge_unique_strings(source_highlights or []),
         created_at=now,
         updated_at=now,
     )
@@ -158,6 +207,18 @@ def upsert_distilled_features(features: Sequence[ExtractedFeature]) -> Dict[str,
             1.0,
         )
         current.active = True
+        current.governance_status = _merge_governance_status(
+            current.governance_status,
+            feature.governance_status,
+        )
+        current.source_record_ids = _merge_unique_strings(
+            current.source_record_ids or [],
+            feature.source_record_ids or [],
+        )
+        current.source_highlights = _merge_unique_strings(
+            current.source_highlights or [],
+            feature.source_highlights or [],
+        )
         current.retired_at = None
         current.updated_at = _now_iso()
         updated += 1
@@ -295,9 +356,47 @@ def select_top_logic_skeletons(
 ) -> List[ExtractedFeature]:
     features = load_feature_kb()
     dim_set = {str(x) for x in dimension_ids}
-    candidates = [f for f in features if f.active and f.dimension_id in dim_set]
+    candidates = [f for f in features if _feature_runtime_allowed(f) and f.dimension_id in dim_set]
     candidates.sort(key=lambda f: (f.confidence_score, -f.usage_count), reverse=True)
     return candidates[: max(1, top_k)]
+
+
+def select_top_few_shot_prompt_examples(
+    *,
+    dimension_ids: Sequence[str] | None = None,
+    top_k: int = 4,
+) -> List[Dict[str, Any]]:
+    dim_set = {
+        str(item or "").strip().upper() for item in (dimension_ids or []) if str(item or "").strip()
+    }
+    candidates: List[ExtractedFeature] = []
+    for feature in load_feature_kb():
+        governance_status = _normalize_governance_status(feature.governance_status)
+        if governance_status not in {"adopted", "auto_adopted"}:
+            continue
+        if not _feature_runtime_allowed(feature):
+            continue
+        feature_dim_id = str(feature.dimension_id or "").strip().upper()
+        if dim_set and feature_dim_id not in dim_set:
+            continue
+        candidates.append(feature)
+    candidates.sort(key=lambda f: (f.confidence_score, -f.usage_count), reverse=True)
+    out: List[Dict[str, Any]] = []
+    for feature in candidates[: max(1, top_k)]:
+        dim_id = str(feature.dimension_id or "").strip().upper()
+        dim_name = str((DIMENSIONS.get(dim_id) or {}).get("name") or dim_id).strip()
+        out.append(
+            {
+                "feature_id": str(feature.feature_id or "").strip(),
+                "dimension_id": dim_id,
+                "dimension_name": dim_name,
+                "logic_skeleton": list(feature.logic_skeleton or [])[:3],
+                "source_highlights": list(feature.source_highlights or [])[:3],
+                "governance_status": governance_status,
+                "confidence_score": round(float(feature.confidence_score or 0.0), 4),
+            }
+        )
+    return out
 
 
 def update_feature_confidence(

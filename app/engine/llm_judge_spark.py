@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from app.engine.dimensions import DIMENSIONS
+from app.engine.feature_distillation import select_top_few_shot_prompt_examples
 from app.engine.openai_compat import call_openai_json, get_openai_api_key, get_openai_model
 from app.schemas import ScoreReport
 
@@ -207,6 +208,31 @@ def _sanitize_scoring_text(text: Any, *, fallback: str) -> str:
                 normalized = trimmed
                 break
     return normalized or fallback
+
+
+def _build_few_shot_prompt_context(top_k: int = 4) -> str:
+    rows = select_top_few_shot_prompt_examples(
+        dimension_ids=list(DIMENSIONS.keys()),
+        top_k=max(1, int(top_k or 4)),
+    )
+    if not rows:
+        return ""
+    lines = ["已采纳高分少样本逻辑骨架（仅用于评分一致性参考，仍必须以输入原文为唯一评分依据）："]
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        dim_name = str(item.get("dimension_name") or item.get("dimension_id") or "").strip()
+        logic = [str(x).strip() for x in (item.get("logic_skeleton") or []) if str(x).strip()]
+        highlights = [
+            str(x).strip() for x in (item.get("source_highlights") or []) if str(x).strip()
+        ]
+        if not dim_name or not logic:
+            continue
+        line = f"- {dim_name}：{'；'.join(logic[:2])}"
+        if highlights:
+            line += f"｜高分信号：{'；'.join(highlights[:2])}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _normalize_evidence_item(item: Any) -> Dict[str, Any]:
@@ -571,7 +597,12 @@ def run_spark_judge(
         )
 
     prompt_template = load_prompt(prompt_name)
-    user_message = f"{prompt_template}\n\n---\n输入文本：\n{text[:12000]}"
+    prompt_parts = [prompt_template]
+    few_shot_context = _build_few_shot_prompt_context()
+    if few_shot_context:
+        prompt_parts.extend(["\n---\n", few_shot_context])
+    prompt_parts.extend(["\n\n---\n输入文本：\n", text[:12000]])
+    user_message = "".join(prompt_parts)
     if len(text) > 12000:
         user_message += "\n\n（文本已截断）"
 

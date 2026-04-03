@@ -587,6 +587,47 @@ class TestRunSparkJudge:
             assert result["judge_source"] == "openai_api"
             assert "dimension_scores" in result
 
+    @patch("app.engine.llm_judge_spark.select_top_few_shot_prompt_examples")
+    @patch("app.engine.llm_judge_spark.load_prompt")
+    @patch("app.engine.llm_judge_spark._call_spark_http")
+    def test_injects_adopted_few_shot_examples_into_prompt(
+        self,
+        mock_call_http,
+        mock_load,
+        mock_select_few_shot,
+    ):
+        mock_load.return_value = "test prompt"
+        report = self._make_score_report()
+        payload = build_spark_payload_from_rules(report, {})
+        payload["judge_mode"] = "openai"
+        payload["model"] = "gpt-5.4"
+        payload["judge_source"] = "openai_api"
+        mock_select_few_shot.return_value = [
+            {
+                "dimension_name": "09 工期目标保障与进度控制措施",
+                "logic_skeleton": [
+                    "[前置条件] 关键线路明确 + [技术/动作] 周纠偏闭环 + [量化指标类型] 节点达成率"
+                ],
+                "source_highlights": ["评委表扬关键线路控制"],
+            }
+        ]
+
+        captured = {}
+
+        def _fake_call(message):
+            captured["message"] = message
+            return True, payload, ""
+
+        mock_call_http.side_effect = _fake_call
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}):
+            result = run_spark_judge("test text", {}, "prompt", report)
+
+        assert result["called_openai_api"] is True
+        assert "已采纳高分少样本逻辑骨架" in captured["message"]
+        assert "09 工期目标保障与进度控制措施" in captured["message"]
+        assert "评委表扬关键线路控制" in captured["message"]
+
     @patch("app.engine.llm_judge_spark.time.sleep")
     @patch("app.engine.llm_judge_spark.load_prompt")
     @patch("app.engine.llm_judge_spark._call_spark_http")

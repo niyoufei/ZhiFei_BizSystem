@@ -18,7 +18,7 @@ from app.engine.llm_evolution import (
     get_evolution_llm_provider_chain,
     get_llm_backend_status,
 )
-from app.engine.llm_evolution_common import parse_api_key_pool
+from app.engine.llm_evolution_common import build_evolution_prompt, parse_api_key_pool
 from app.engine.llm_evolution_gemini import (
     _GEMINI_KEY_FAILURES,
     get_gemini_evolution_pool_quality,
@@ -138,6 +138,32 @@ class TestApiKeyPoolParsing:
         keys = parse_api_key_pool("key-b", "key-a, key-b , key-c")
         assert keys == ["key-a", "key-b", "key-c"]
 
+    def test_build_evolution_prompt_includes_adopted_few_shot_examples(self):
+        report = {
+            "high_score_logic": ["规则逻辑1"],
+            "writing_guidance": ["规则指导1"],
+            "sample_count": 2,
+            "few_shot_examples": [
+                {
+                    "dimension_name": "09 工期目标保障与进度控制措施",
+                    "logic_skeleton": [
+                        "[前置条件] 关键线路明确 + [技术/动作] 周纠偏闭环 + [量化指标类型] 节点达成率"
+                    ],
+                    "source_highlights": ["评委表扬关键线路控制", "周纠偏责任到岗"],
+                }
+            ],
+        }
+
+        prompt = build_evolution_prompt(
+            report,
+            [{"final_score": 92.0}, {"final_score": 95.0}],
+            "项目背景摘要",
+        )
+
+        assert "已采纳高分少样本示例" in prompt
+        assert "09 工期目标保障与进度控制措施" in prompt
+        assert "评委表扬关键线路控制" in prompt
+
 
 class TestLlmRuntimeStateCompaction:
     def test_provider_review_stats_use_bounded_history_window(self):
@@ -188,7 +214,9 @@ class TestEnhanceEvolutionReportWithLlm:
             quality = get_openai_evolution_pool_quality()
 
         assert quality["rated_accounts"] == 2.0
-        assert quality["best_quality_score"] > quality["worst_quality_score"]
+        assert quality["sufficiently_rated_accounts"] == 0.0
+        assert quality["best_quality_score"] == 50.0
+        assert quality["worst_quality_score"] == 50.0
 
     def test_openai_key_attempt_order_deprioritizes_low_quality_key_when_better_ready_key_exists(
         self,
@@ -236,7 +264,28 @@ class TestEnhanceEvolutionReportWithLlm:
             quality = get_gemini_evolution_pool_quality()
 
         assert quality["rated_accounts"] == 2.0
-        assert quality["average_quality_score"] > 0.0
+        assert quality["sufficiently_rated_accounts"] == 0.0
+        assert quality["average_quality_score"] == 50.0
+
+    def test_openai_pool_quality_stays_neutral_until_accounts_have_enough_history(self):
+        llm_runtime_state.record_account_request_outcome(
+            "openai", "openai-key-1", "failure", time.time()
+        )
+        llm_runtime_state.record_account_request_outcome(
+            "openai", "openai-key-2", "failure", time.time()
+        )
+
+        with patch.dict(
+            os.environ,
+            {"OPENAI_API_KEYS": "openai-key-1,openai-key-2"},
+            clear=True,
+        ):
+            quality = get_openai_evolution_pool_quality()
+
+        assert quality["rated_accounts"] == 2.0
+        assert quality["sufficiently_rated_accounts"] == 0.0
+        assert quality["average_quality_score"] == 50.0
+        assert quality["low_quality_accounts"] == 0.0
 
     def test_gemini_key_attempt_order_deprioritizes_low_quality_key_when_better_ready_key_exists(
         self,
@@ -348,6 +397,7 @@ class TestEnhanceEvolutionReportWithLlm:
         assert status["openai_pool_quality"] == {
             "total_accounts": 2.0,
             "rated_accounts": 0.0,
+            "sufficiently_rated_accounts": 0.0,
             "average_quality_score": 50.0,
             "best_quality_score": 50.0,
             "worst_quality_score": 50.0,
@@ -361,6 +411,7 @@ class TestEnhanceEvolutionReportWithLlm:
         assert status["gemini_pool_quality"] == {
             "total_accounts": 2.0,
             "rated_accounts": 0.0,
+            "sufficiently_rated_accounts": 0.0,
             "average_quality_score": 50.0,
             "best_quality_score": 50.0,
             "worst_quality_score": 50.0,

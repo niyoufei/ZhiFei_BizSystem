@@ -3,6 +3,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from app.main import (
     _auto_update_feature_confidence_on_ground_truth,
     _build_ground_truth_feedback_guardrail,
@@ -130,6 +132,29 @@ def test_build_ground_truth_feedback_guardrail_blocks_extreme_delta() -> None:
     assert "暂停自动调权" in (out["warning_message"] or "")
 
 
+def test_build_ground_truth_feedback_guardrail_formats_warning_in_five_scale() -> None:
+    gt_record = {
+        "id": "gt-guardrail-five",
+        "final_score": 4.31,
+        "score_scale_max": 5,
+        "judge_scores": [4.27, 4.25, 4.27, 4.28, 4.31, 4.33, 4.35],
+    }
+    report = {"pred_total_score": 0.609}
+
+    out = _build_ground_truth_feedback_guardrail(
+        report=report,
+        gt_record=gt_record,
+        project_score_scale_max=5,
+    )
+
+    assert out["blocked"] is True
+    assert out["score_scale_max"] == 5
+    assert out["abs_delta_100"] == pytest.approx(74.02, abs=1e-2)
+    assert out["abs_delta_raw"] == pytest.approx(3.701, abs=1e-4)
+    assert "5分制" in (out["warning_message"] or "")
+    assert "100分口径" not in (out["warning_message"] or "")
+
+
 def test_build_ground_truth_learning_quality_gate_blocks_low_quality_sample() -> None:
     gt_record = {
         "id": "gt-quality",
@@ -186,6 +211,7 @@ def test_capture_ground_truth_few_shot_features_distills_evidence(monkeypatch) -
 
     def _fake_upsert(features):
         captured["count"] = len(features)
+        captured["features"] = features
         return {"added": len(features), "updated": 0, "total": len(features)}
 
     monkeypatch.setattr("app.main.upsert_distilled_features", _fake_upsert)
@@ -203,6 +229,9 @@ def test_capture_ground_truth_few_shot_features_distills_evidence(monkeypatch) -
     assert out["reason"] == "captured"
     assert out["dimension_ids"] == ["09"]
     assert captured["count"] == 1
+    assert captured["features"][0].governance_status == "pending"
+    assert captured["features"][0].source_record_ids == ["gt-logic"]
+    assert captured["features"][0].source_highlights
 
 
 def test_capture_ground_truth_few_shot_features_skips_learning_quality_blocked() -> None:
@@ -222,3 +251,42 @@ def test_capture_ground_truth_few_shot_features_skips_learning_quality_blocked()
 
     assert out["captured"] == 0
     assert out["reason"] == "learning_quality_blocked"
+
+
+def test_capture_ground_truth_few_shot_features_auto_adopts_high_consensus(monkeypatch) -> None:
+    report = {
+        "dimension_scores": {
+            "09": {
+                "score": 9.3,
+                "evidence": [{"anchor_label": "进度计划网", "quote": "关键节点周纠偏闭环。"}],
+            }
+        },
+        "suggestions": [{"dimension_id": "09", "text": "补强节点计划闭环。"}],
+    }
+    gt_record = {
+        "id": "gt-consensus",
+        "final_score": 86.0,
+        "score_scale_max": 100,
+        "judge_scores": [86.0, 86.1, 85.9, 86.05, 85.95, 86.0, 86.05],
+        "qualitative_tags_by_judge": [["工期逻辑清晰"]],
+    }
+    captured = {}
+
+    def _fake_upsert(features):
+        captured["features"] = features
+        return {"added": len(features), "updated": 0, "total": len(features)}
+
+    monkeypatch.setattr("app.main.upsert_distilled_features", _fake_upsert)
+
+    out = _capture_ground_truth_few_shot_features(
+        report=report,
+        gt_record=gt_record,
+        project_score_scale_max=100,
+        feedback_guardrail={"blocked": False, "threshold_blocked": False},
+        learning_quality_gate={"blocked": False},
+        feature_confidence_update={"applied_dimension_ids": ["09"]},
+    )
+
+    assert out["captured"] == 1
+    assert out["manual_review"]["status"] == "adopted"
+    assert captured["features"][0].governance_status == "auto_adopted"

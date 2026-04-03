@@ -19508,6 +19508,66 @@ class TestFeedbackClosedLoopSafety:
             mock_auto_rescore.call_args.kwargs["history_trigger"] == "feedback_closed_loop_rescore"
         )
 
+    @patch("app.main._rescore_project_submissions_internal")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_projects")
+    @patch("app.main.auto_run_reflection_pipeline")
+    @patch("app.main._sync_feedback_weights_to_evolution")
+    @patch("app.main._auto_update_project_weights_from_delta_cases")
+    @patch("app.main._refresh_evolution_report_from_ground_truth")
+    @patch("app.main._refresh_project_reflection_objects")
+    @patch("app.main.load_ground_truth")
+    def test_run_feedback_closed_loop_skips_training_when_extreme_delta_manually_approved(
+        self,
+        mock_load_ground_truth,
+        mock_refresh_reflection,
+        mock_refresh_evo,
+        mock_auto_update,
+        mock_sync_weights,
+        mock_auto_run,
+        mock_load_projects,
+        mock_load_submissions,
+        mock_auto_rescore,
+    ):
+        from app.main import _run_feedback_closed_loop
+
+        mock_load_ground_truth.return_value = [
+            {
+                "id": "gt-1",
+                "project_id": "p1",
+                "feedback_guardrail": {
+                    "threshold_blocked": True,
+                    "blocked": False,
+                    "manual_review_status": "approved",
+                    "manual_review": {"status": "approved"},
+                    "abs_delta_100": 45.0,
+                    "warning_message": "当前分与真实总分偏差过大，已暂停自动调权/自动校准。",
+                },
+            }
+        ]
+        mock_load_projects.return_value = [{"id": "p1", "scoring_engine_version_locked": "v2"}]
+        mock_load_submissions.return_value = [{"id": "s1", "project_id": "p1"}]
+        mock_refresh_evo.return_value = {"refreshed": True, "sample_count": 1}
+
+        payload = _run_feedback_closed_loop(
+            "p1",
+            locale="zh",
+            trigger="ground_truth_manual_review",
+            ground_truth_record_ids=["gt-1"],
+        )
+
+        assert payload["ok"] is True
+        assert payload["training_blocked"] is True
+        assert payload["auto_update_skipped"] is True
+        assert payload["anomaly_warning"]["code"] == "extreme_delta_training_blocked"
+        assert payload["weight_update"]["reason"] == "extreme_delta_training_blocked"
+        mock_refresh_reflection.assert_called_once()
+        mock_refresh_evo.assert_called_once()
+        mock_auto_update.assert_not_called()
+        mock_sync_weights.assert_not_called()
+        mock_auto_run.assert_not_called()
+        mock_auto_rescore.assert_not_called()
+
     @patch("app.main.save_evolution_reports")
     @patch("app.main.load_evolution_reports")
     @patch("app.main._build_feature_confidence_summary")
@@ -21085,6 +21145,8 @@ class TestFeedbackGovernanceRoutes:
         assert store[0]["feedback_closed_loop"]["ok"] is True
         mock_run_closed_loop.assert_called_once()
 
+    @patch("app.main.save_feature_kb")
+    @patch("app.main.load_feature_kb")
     @patch("app.main.save_ground_truth")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_projects")
@@ -21095,8 +21157,12 @@ class TestFeedbackGovernanceRoutes:
         mock_load_projects,
         mock_load_ground_truth,
         mock_save_ground_truth,
+        mock_load_feature_kb,
+        mock_save_feature_kb,
         client,
     ):
+        from app.schemas import ExtractedFeature
+
         store = [
             {
                 "id": "gt-2",
@@ -21108,13 +21174,28 @@ class TestFeedbackGovernanceRoutes:
                 },
             }
         ]
+        feature_store = [
+            ExtractedFeature(
+                feature_id="F-1",
+                dimension_id="09",
+                logic_skeleton=[
+                    "[前置条件] 风险识别 + [技术/动作] 计划纠偏 + [量化指标类型] 节点达成率"
+                ],
+                confidence_score=0.82,
+                usage_count=2,
+                active=True,
+                governance_status="pending",
+            )
+        ]
         mock_load_projects.return_value = [{"id": "p1"}]
         mock_load_ground_truth.side_effect = lambda: copy.deepcopy(store)
+        mock_load_feature_kb.side_effect = lambda: feature_store
 
         def _save(rows):
             store[:] = copy.deepcopy(rows)
 
         mock_save_ground_truth.side_effect = _save
+        mock_save_feature_kb.side_effect = lambda rows: None
 
         response = client.post(
             "/api/v1/projects/p1/feedback/governance/few_shot/gt-2/review",
@@ -21125,6 +21206,8 @@ class TestFeedbackGovernanceRoutes:
         data = response.json()
         assert data["few_shot_distillation"]["manual_review_status"] == "adopted"
         assert store[0]["few_shot_distillation"]["manual_review_status"] == "adopted"
+        assert feature_store[0].governance_status == "adopted"
+        assert feature_store[0].active is True
 
     @patch("app.main.list_json_versions")
     @patch("app.main.ensure_data_dirs")

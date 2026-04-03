@@ -176,3 +176,67 @@ def test_generate_tailored_advice_prompt_and_error_handling() -> None:
     )
     assert err["advice"] is None
     assert "llm_invoke_failed" in err["error"]
+
+
+def test_select_top_logic_skeletons_excludes_pending_and_ignored(monkeypatch) -> None:
+    pending = ExtractedFeature(
+        feature_id="F-pending",
+        dimension_id="09",
+        logic_skeleton=["[前置条件] 场景明确 + [技术/动作] 节点策划 + [量化指标类型] 闭环验收"],
+        confidence_score=0.95,
+        usage_count=5,
+        active=True,
+        governance_status="pending",
+    )
+    adopted = ExtractedFeature(
+        feature_id="F-adopted",
+        dimension_id="09",
+        logic_skeleton=["[前置条件] 风险识别 + [技术/动作] 计划纠偏 + [量化指标类型] 节点达成率"],
+        confidence_score=0.82,
+        usage_count=3,
+        active=True,
+        governance_status="adopted",
+    )
+    ignored = ExtractedFeature(
+        feature_id="F-ignored",
+        dimension_id="09",
+        logic_skeleton=["[前置条件] 条件约束 + [技术/动作] 资源联动 + [量化指标类型] 到位时效"],
+        confidence_score=0.99,
+        usage_count=6,
+        active=True,
+        governance_status="ignored",
+    )
+    monkeypatch.setattr(fd, "load_feature_kb", lambda: [pending, adopted, ignored])
+
+    out = fd.select_top_logic_skeletons(dimension_ids=["09"], top_k=3)
+
+    assert [item.feature_id for item in out] == ["F-adopted"]
+
+
+def test_select_top_few_shot_prompt_examples_only_uses_adopted_features(monkeypatch) -> None:
+    adopted = ExtractedFeature(
+        feature_id="F-adopted",
+        dimension_id="09",
+        logic_skeleton=["[前置条件] 风险识别 + [技术/动作] 计划纠偏 + [量化指标类型] 节点达成率"],
+        confidence_score=0.82,
+        usage_count=3,
+        active=True,
+        governance_status="auto_adopted",
+        source_highlights=["评委表扬关键线路纠偏闭环", "节点验收责任明确"],
+    )
+    legacy = ExtractedFeature(
+        feature_id="F-legacy",
+        dimension_id="09",
+        logic_skeleton=["[前置条件] 场景明确 + [技术/动作] 资源统筹 + [量化指标类型] 达成率"],
+        confidence_score=0.99,
+        usage_count=10,
+        active=True,
+    )
+    monkeypatch.setattr(fd, "load_feature_kb", lambda: [adopted, legacy])
+
+    out = fd.select_top_few_shot_prompt_examples(dimension_ids=["09"], top_k=3)
+
+    assert len(out) == 1
+    assert out[0]["feature_id"] == "F-adopted"
+    assert out[0]["dimension_name"]
+    assert out[0]["source_highlights"] == ["评委表扬关键线路纠偏闭环", "节点验收责任明确"]

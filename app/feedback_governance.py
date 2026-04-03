@@ -696,3 +696,12 @@ def execute_feedback_few_shot_review(
         ),
         "updated_at": str(updated_record.get("updated_at") or main._now_iso()),
     }
+    main._sync_feature_governance_review(
+        feature_ids=[
+            str(item or "").strip()
+            for item in (updated_distillation.get("feature_ids") or [])
+            if str(item or "").strip()
+        ],
+        review_status=str(updated_distillation.get("manual_review_status") or "pending"),
+        reviewed_at=str(updated_distillation.get("manual_reviewed_at") or "") or None,
+    )
