@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -1594,9 +1594,9 @@ class TestMaterialParseWorkerLifecycle:
             main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_PRIORITY_BY_JOB_ID.update(
                 original_preview_priority_by_job_id
             )
-            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES[
-                :
-            ] = original_candidate_indices
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES[:] = (
+                original_candidate_indices
+            )
             main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE.clear()
             main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE.update(
                 original_candidate_indices_by_mode
@@ -1806,9 +1806,9 @@ class TestMaterialParseWorkerLifecycle:
             main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_PRIORITY_BY_JOB_ID.update(
                 original_preview_priority_by_job_id
             )
-            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES[
-                :
-            ] = original_candidate_indices
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES[:] = (
+                original_candidate_indices
+            )
             main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE.clear()
             main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE.update(
                 original_candidate_indices_by_mode
@@ -3093,6 +3093,49 @@ class TestMaterialParseWorkerLifecycle:
         assert kwargs["failed"] is False
         assert kwargs["followup_parse_mode"] is None
 
+    @patch("app.main._complete_material_parse_job")
+    @patch("app.main._parse_material_record_payload")
+    @patch("app.main.load_materials")
+    def test_process_material_parse_job_persists_standardized_parse_failure(
+        self,
+        mock_load_materials,
+        mock_parse_payload,
+        mock_complete_job,
+    ):
+        from app.main import _process_material_parse_job
+
+        mock_load_materials.return_value = [
+            {
+                "id": "m-target",
+                "project_id": "p1",
+                "material_type": "drawing",
+                "filename": "损坏图纸.pdf",
+                "path": "/tmp/损坏图纸.pdf",
+                "parse_status": "processing",
+            }
+        ]
+        mock_parse_payload.side_effect = ValueError("EOF marker not found")
+
+        _process_material_parse_job(
+            {
+                "id": "j-target",
+                "material_id": "m-target",
+                "project_id": "p1",
+                "material_type": "drawing",
+                "filename": "损坏图纸.pdf",
+                "status": "processing",
+                "parse_mode": "full",
+            }
+        )
+
+        mock_complete_job.assert_called_once()
+        args, kwargs = mock_complete_job.call_args
+        assert args[0] == "j-target"
+        assert args[1]["parse_error_class"] == "document_corrupted"
+        assert "文件已损坏" in args[1]["parse_error_message"]
+        assert args[1]["project_id"] == "p1"
+        assert kwargs["failed"] is True
+
     def test_build_material_parse_runtime_details_marks_previewed_backfill_state(self):
         from app.main import _build_material_parse_runtime_details
 
@@ -3945,9 +3988,9 @@ class TestMaterialParsePerformanceGuards:
         finally:
             main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE = original_signature
             main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_JOBS[:] = original_jobs
-            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES[
-                :
-            ] = original_candidate_indices
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES[:] = (
+                original_candidate_indices
+            )
             main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_QUEUED_CANDIDATES = (
                 original_has_queued
             )
@@ -6460,7 +6503,7 @@ class TestWebCreateProjectFallback:
         assert mock_create_project.called
         assert mock_create_project.call_args.kwargs["api_key"] is None
 
-    @patch("app.main.create_project_from_tender")
+    @patch("app.main.create_project_from_tender", new_callable=AsyncMock)
     def test_web_create_project_from_tender_success_redirects_ok(
         self, mock_create_from_tender, client
     ):
@@ -7062,7 +7105,7 @@ class TestProjectsEndpoints:
         mock_save_projects.assert_called_once()
         mock_save_profiles.assert_called_once()
 
-    @patch("app.main.upload_material")
+    @patch("app.main._store_uploaded_material_from_local_path", new_callable=AsyncMock)
     @patch("app.main.save_projects")
     @patch("app.main.load_projects")
     @patch("app.main._read_uploaded_file_content")
@@ -7075,7 +7118,7 @@ class TestProjectsEndpoints:
         mock_full_reader,
         mock_load,
         mock_save,
-        mock_upload_material,
+        mock_store_material,
         client,
     ):
         mock_load.return_value = []
@@ -7086,19 +7129,21 @@ class TestProjectsEndpoints:
             "full parser should not run during auto-create"
         )
 
-        def _fake_upload_material(project_id, file, material_type, api_key, locale):
+        def _fake_store_material(
+            *, project_id, source_path, normalized_name, normalized_material_type, locale
+        ):
             return {
                 "material": {
                     "id": "m1",
                     "project_id": project_id,
-                    "material_type": material_type,
-                    "filename": "招标文件.txt",
+                    "material_type": normalized_material_type,
+                    "filename": normalized_name,
                     "path": f"/tmp/materials/{project_id}/tender_qa/招标文件.txt",
                     "created_at": "2026-03-19T00:00:00+00:00",
                 }
             }
 
-        mock_upload_material.side_effect = _fake_upload_material
+        mock_store_material.side_effect = _fake_store_material
 
         response = client.post(
             "/api/v1/projects/create_from_tender",
@@ -7122,7 +7167,7 @@ class TestProjectsEndpoints:
         mock_preview_reader.assert_called_once()
         mock_full_reader.assert_not_called()
 
-    @patch("app.main.upload_material")
+    @patch("app.main._store_uploaded_material_from_local_path", new_callable=AsyncMock)
     @patch("app.main.save_projects")
     @patch("app.main.load_projects")
     @patch("app.main._read_uploaded_file_content")
@@ -7135,7 +7180,7 @@ class TestProjectsEndpoints:
         mock_full_reader,
         mock_load,
         mock_save,
-        mock_upload_material,
+        mock_store_material,
         client,
     ):
         mock_load.return_value = [
@@ -7160,19 +7205,21 @@ class TestProjectsEndpoints:
             "full parser should not run during auto-create"
         )
 
-        def _fake_upload_material(project_id, file, material_type, api_key, locale):
+        def _fake_store_material(
+            *, project_id, source_path, normalized_name, normalized_material_type, locale
+        ):
             return {
                 "material": {
                     "id": "m1",
                     "project_id": project_id,
-                    "material_type": material_type,
-                    "filename": "招标文件.txt",
+                    "material_type": normalized_material_type,
+                    "filename": normalized_name,
                     "path": f"/tmp/materials/{project_id}/tender_qa/招标文件.txt",
                     "created_at": "2026-03-19T00:00:00+00:00",
                 }
             }
 
-        mock_upload_material.side_effect = _fake_upload_material
+        mock_store_material.side_effect = _fake_store_material
 
         response = client.post(
             "/api/v1/projects/create_from_tender",
@@ -8044,7 +8091,7 @@ class TestProjectsEndpoints:
             == "包河经开区延边路(繁华大道-沈阳路)、月谭路(饮马井路-南淝河路)、饮马井路(月谭路-长春路)等3条道路工程"
         )
 
-    @patch("app.main.upload_material")
+    @patch("app.main._store_uploaded_material_from_local_path", new_callable=AsyncMock)
     @patch("app.main.save_projects")
     @patch("app.main.load_projects")
     @patch("app.main._read_uploaded_file_preview_for_project_name")
@@ -8055,25 +8102,27 @@ class TestProjectsEndpoints:
         mock_preview_reader,
         mock_load_projects,
         mock_save_projects,
-        mock_upload_material,
+        mock_store_material,
         client,
     ):
         mock_load_projects.return_value = []
         mock_preview_reader.return_value = "招标文件正文"
 
-        def _fake_upload_material(project_id, file, material_type, api_key, locale):
+        def _fake_store_material(
+            *, project_id, source_path, normalized_name, normalized_material_type, locale
+        ):
             return {
                 "material": {
                     "id": "m1",
                     "project_id": project_id,
-                    "material_type": material_type,
-                    "filename": "招标文件正文.pdf",
+                    "material_type": normalized_material_type,
+                    "filename": normalized_name,
                     "path": f"/tmp/materials/{project_id}/tender_qa/招标文件正文.pdf",
                     "created_at": "2026-03-26T00:00:00+00:00",
                 }
             }
 
-        mock_upload_material.side_effect = _fake_upload_material
+        mock_store_material.side_effect = _fake_store_material
 
         response = client.post(
             "/api/v1/projects/create_from_tender",
@@ -8785,6 +8834,30 @@ class TestMaterialsEndpoint:
         )
         assert response.status_code == 404
         assert "项目不存在" in response.json()["detail"]
+
+    @patch("app.main._store_uploaded_material_from_local_path", new_callable=AsyncMock)
+    def test_upload_material_returns_standardized_parse_error(
+        self,
+        mock_store_uploaded_material,
+        client,
+    ):
+        from app.main import DocumentParseError
+
+        mock_store_uploaded_material.side_effect = DocumentParseError(
+            "document_encrypted",
+            "解析失败：文件已加密或受密码保护，请解除保护后重试。",
+        )
+
+        response = client.post(
+            "/api/v1/projects/p1/materials",
+            files={"file": ("受保护图纸.pdf", BytesIO(b"%PDF-test"), "application/pdf")},
+        )
+
+        assert response.status_code == 422
+        assert response.json() == {
+            "detail": "解析失败：文件已加密或受密码保护，请解除保护后重试。",
+            "error_code": "document_encrypted",
+        }
 
     @patch("app.main._validate_material_gate_for_scoring")
     @patch("app.main.load_projects")
@@ -12500,6 +12573,30 @@ class TestShigongEndpoint:
         )
         assert response.status_code == 404
 
+    @patch("app.main._build_submission_record_from_local_path", new_callable=AsyncMock)
+    def test_upload_shigong_returns_standardized_parse_error(
+        self,
+        mock_build_submission_record,
+        client,
+    ):
+        from app.main import DocumentParseError
+
+        mock_build_submission_record.side_effect = DocumentParseError(
+            "document_parse_failed",
+            "解析失败：.pdf 文件无法完成解析，请检查文件格式、内容完整性后重试。",
+        )
+
+        response = client.post(
+            "/api/v1/projects/p1/shigong",
+            files={"file": ("异常施组.pdf", BytesIO(b"%PDF-test"), "application/pdf")},
+        )
+
+        assert response.status_code == 422
+        assert response.json() == {
+            "detail": "解析失败：.pdf 文件无法完成解析，请检查文件格式、内容完整性后重试。",
+            "error_code": "document_parse_failed",
+        }
+
     @patch("app.main.record_history_score")
     @patch("app.main.save_submissions")
     @patch("app.main.load_submissions")
@@ -12554,6 +12651,37 @@ class TestShigongEndpoint:
         assert mock_save_sub.call_count == 1
         assert mock_score.call_count == 0
         mock_record_history.assert_not_called()
+
+
+class TestGroundTruthUploadEndpoints:
+    @patch("app.main._build_ground_truth_record_from_uploaded_path")
+    def test_add_ground_truth_from_file_returns_standardized_parse_error(
+        self,
+        mock_build_ground_truth,
+        client,
+    ):
+        from app.main import DocumentParseError
+
+        mock_build_ground_truth.side_effect = DocumentParseError(
+            "document_corrupted",
+            "解析失败：文件已损坏、结构异常或不是有效文档，请更换文件后重试。",
+        )
+
+        response = client.post(
+            "/api/v1/projects/p1/ground_truth/from_file",
+            data={
+                "judge_scores": "[4.1,4.2,4.0,4.3,4.2]",
+                "final_score": "4.16",
+                "source": "青天大模型",
+            },
+            files={"file": ("异常施组.pdf", BytesIO(b"%PDF-test"), "application/pdf")},
+        )
+
+        assert response.status_code == 422
+        assert response.json() == {
+            "detail": "解析失败：文件已损坏、结构异常或不是有效文档，请更换文件后重试。",
+            "error_code": "document_corrupted",
+        }
 
 
 class TestDXFParser:

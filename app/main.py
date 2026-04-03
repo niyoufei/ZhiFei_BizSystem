@@ -72,6 +72,7 @@ from fastapi import (
 )
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse, RedirectResponse, Response
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app import feedback_governance as feedback_governance_module
@@ -313,7 +314,6 @@ from app.storage import (
     prepare_secure_runtime,
     read_bytes,
     restore_json_version,
-    save_bytes,
     save_calibration_models,
     save_calibration_samples,
     save_delta_cases,
@@ -699,9 +699,9 @@ _MATERIAL_PARSE_CLAIM_SNAPSHOT_SIGNATURE: Optional[tuple[tuple[int, int], tuple[
 _MATERIAL_PARSE_CLAIM_SNAPSHOT_MATERIALS: List[Dict[str, object]] = []
 _MATERIAL_PARSE_CLAIM_SNAPSHOT_JOBS: List[Dict[str, object]] = []
 _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_LOCK = threading.RLock()
-_MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE: Optional[
-    tuple[tuple[int, int], tuple[int, int]]
-] = None
+_MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE: Optional[tuple[tuple[int, int], tuple[int, int]]] = (
+    None
+)
 _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIALS: List[Dict[str, object]] = []
 _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_JOBS: List[Dict[str, object]] = []
 _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_BY_ID: Dict[str, Dict[str, object]] = {}
@@ -718,9 +718,9 @@ _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_QUEUED_CANDIDATES = False
 _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_RETRYABLE_FAILED_WITHOUT_DUE = False
 _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_EARLIEST_RETRYABLE_FAILED_AT: Optional[datetime] = None
 _MATERIAL_PARSE_PROJECT_STAGE_CACHE_LOCK = threading.RLock()
-_MATERIAL_PARSE_PROJECT_STAGE_CACHE_SIGNATURE: Optional[
-    tuple[tuple[int, int], tuple[str, ...]]
-] = None
+_MATERIAL_PARSE_PROJECT_STAGE_CACHE_SIGNATURE: Optional[tuple[tuple[int, int], tuple[str, ...]]] = (
+    None
+)
 _MATERIAL_PARSE_PROJECT_STAGE_CACHE_RANKS: Dict[str, int] = {}
 _MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_LOCK = threading.RLock()
 _MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_SIGNATURE: Optional[
@@ -737,9 +737,9 @@ _MATERIAL_PARSE_STATUS_MATERIALS_CACHE_SIGNATURE: Optional[
 ] = None
 _MATERIAL_PARSE_STATUS_MATERIALS_CACHE: Dict[str, Dict[str, object]] = {}
 _MATERIAL_PARSE_STATUS_CORE_CACHE_LOCK = threading.RLock()
-_MATERIAL_PARSE_STATUS_CORE_CACHE_SIGNATURE: Optional[
-    tuple[tuple[int, int], tuple[int, int]]
-] = None
+_MATERIAL_PARSE_STATUS_CORE_CACHE_SIGNATURE: Optional[tuple[tuple[int, int], tuple[int, int]]] = (
+    None
+)
 _MATERIAL_PARSE_STATUS_CORE_CACHE: Dict[str, Dict[str, object]] = {}
 
 
@@ -824,9 +824,9 @@ def _invalidate_material_parse_claim_snapshot() -> None:
     _invalidate_material_parse_priority_snapshot()
 
 
-def _material_parse_priority_snapshot_signature() -> (
-    tuple[tuple[tuple[int, int], tuple[int, int]], tuple[int, int]]
-):
+def _material_parse_priority_snapshot_signature() -> tuple[
+    tuple[tuple[int, int], tuple[int, int]], tuple[int, int]
+]:
     return (
         _material_parse_state_files_signature(),
         _material_parse_state_file_signature(SUBMISSIONS_PATH),
@@ -886,9 +886,9 @@ def _invalidate_material_parse_status_core_cache() -> None:
         _MATERIAL_PARSE_STATUS_CORE_CACHE.clear()
 
 
-def _load_material_parse_state_snapshot() -> (
-    tuple[List[Dict[str, object]], List[Dict[str, object]]]
-):
+def _load_material_parse_state_snapshot() -> tuple[
+    List[Dict[str, object]], List[Dict[str, object]]
+]:
     global _MATERIAL_PARSE_CLAIM_SNAPSHOT_SIGNATURE
     if not _material_parse_claim_cache_enabled():
         return (
@@ -913,24 +913,22 @@ def _load_material_parse_state_snapshot() -> (
     return materials, jobs
 
 
-def _load_material_parse_claim_context_view() -> (
-    tuple[
-        List[Dict[str, object]],
-        List[Dict[str, object]],
-        Dict[str, Dict[str, object]],
-        Dict[str, int],
-        Dict[str, int],
-        Dict[str, Optional[datetime]],
-        Dict[str, tuple[str, str, str]],
-        Dict[str, tuple[int, int, int]],
-        List[int],
-        Dict[str, List[int]],
-        Dict[int, List[int]],
-        Dict[int, List[int]],
-        bool,
-        bool,
-    ]
-):
+def _load_material_parse_claim_context_view() -> tuple[
+    List[Dict[str, object]],
+    List[Dict[str, object]],
+    Dict[str, Dict[str, object]],
+    Dict[str, int],
+    Dict[str, int],
+    Dict[str, Optional[datetime]],
+    Dict[str, tuple[str, str, str]],
+    Dict[str, tuple[int, int, int]],
+    List[int],
+    Dict[str, List[int]],
+    Dict[int, List[int]],
+    Dict[int, List[int]],
+    bool,
+    bool,
+]:
     global _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE
     if _material_parse_claim_context_cache_enabled():
         signature = _material_parse_state_files_signature()
@@ -1139,24 +1137,22 @@ def _load_material_parse_claim_context_view() -> (
     )
 
 
-def _load_material_parse_claim_context() -> (
-    tuple[
-        List[Dict[str, object]],
-        List[Dict[str, object]],
-        Dict[str, Dict[str, object]],
-        Dict[str, int],
-        Dict[str, int],
-        Dict[str, Optional[datetime]],
-        Dict[str, tuple[str, str, str]],
-        Dict[str, tuple[int, int, int]],
-        List[int],
-        Dict[str, List[int]],
-        Dict[int, List[int]],
-        Dict[int, List[int]],
-        bool,
-        bool,
-    ]
-):
+def _load_material_parse_claim_context() -> tuple[
+    List[Dict[str, object]],
+    List[Dict[str, object]],
+    Dict[str, Dict[str, object]],
+    Dict[str, int],
+    Dict[str, int],
+    Dict[str, Optional[datetime]],
+    Dict[str, tuple[str, str, str]],
+    Dict[str, tuple[int, int, int]],
+    List[int],
+    Dict[str, List[int]],
+    Dict[int, List[int]],
+    Dict[int, List[int]],
+    bool,
+    bool,
+]:
     (
         materials,
         jobs,
@@ -1953,14 +1949,12 @@ def _touch_material_parse_active_project_type(project_id: str, material_type: ob
     _touch_material_parse_active_window(project_id, material_type, touch_project=False)
 
 
-def _collect_material_parse_active_window_state() -> (
-    tuple[
-        Set[str],
-        Set[tuple[str, str]],
-        int,
-        int,
-    ]
-):
+def _collect_material_parse_active_window_state() -> tuple[
+    Set[str],
+    Set[tuple[str, str]],
+    int,
+    int,
+]:
     now = time.monotonic()
     with _MATERIAL_PARSE_ACTIVE_PROJECTS_LOCK:
         expired = [
@@ -2880,6 +2874,183 @@ def _material_parse_has_terminal_payload(material_row: Dict[str, object]) -> boo
 
 def _compute_material_content_hash(content: bytes) -> str:
     return hashlib.sha1(bytes(content)).hexdigest()
+
+
+class DocumentParseError(Exception):
+    def __init__(
+        self,
+        code: str,
+        detail: str,
+        *,
+        debug_detail: Optional[str] = None,
+        status_code: int = 422,
+    ) -> None:
+        super().__init__(detail)
+        self.code = str(code or "document_parse_failed").strip() or "document_parse_failed"
+        self.detail = str(detail or "解析失败").strip() or "解析失败"
+        self.debug_detail = str(debug_detail or "").strip() or None
+        self.status_code = int(status_code)
+
+
+def _compute_material_content_hash_from_file(
+    path: Path,
+    *,
+    chunk_size: int = 1024 * 1024,
+) -> tuple[str, int]:
+    if not path.exists():
+        raise FileNotFoundError(path)
+    digest = hashlib.sha1()
+    total_size = 0
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(max(1024, int(chunk_size)))
+            if not chunk:
+                break
+            digest.update(chunk)
+            total_size += len(chunk)
+    return digest.hexdigest(), total_size
+
+
+def _sync_copy_fileobj_to_path_with_hash(
+    file_obj: object,
+    target_path: str,
+    *,
+    chunk_size: int = 1024 * 1024,
+) -> Dict[str, object]:
+    path = Path(target_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha1()
+    total_size = 0
+    seek = getattr(file_obj, "seek", None)
+    if callable(seek):
+        seek(0)
+    with path.open("wb") as out:
+        while True:
+            chunk = file_obj.read(max(1024, int(chunk_size)))
+            if not chunk:
+                break
+            if not isinstance(chunk, (bytes, bytearray)):
+                chunk = bytes(chunk)
+            out.write(chunk)
+            digest.update(bytes(chunk))
+            total_size += len(chunk)
+    return {
+        "path": str(path),
+        "content_hash": digest.hexdigest(),
+        "size_bytes": total_size,
+    }
+
+
+def _sync_copy_path_to_path_with_hash(
+    source_path: str,
+    target_path: str,
+    *,
+    chunk_size: int = 1024 * 1024,
+) -> Dict[str, object]:
+    source = Path(source_path)
+    target = Path(target_path)
+    if not source.exists():
+        raise FileNotFoundError(source)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha1()
+    total_size = 0
+    with source.open("rb") as src, target.open("wb") as dst:
+        while True:
+            chunk = src.read(max(1024, int(chunk_size)))
+            if not chunk:
+                break
+            dst.write(chunk)
+            digest.update(chunk)
+            total_size += len(chunk)
+    return {
+        "path": str(target),
+        "content_hash": digest.hexdigest(),
+        "size_bytes": total_size,
+    }
+
+
+async def _stage_upload_file_to_temp_path(
+    file: UploadFile,
+    *,
+    filename: str,
+) -> Dict[str, object]:
+    suffix = Path(str(filename or "")).suffix or ".bin"
+    with tempfile.NamedTemporaryFile(prefix="zhifei_upload_", suffix=suffix, delete=False) as tmp:
+        temp_path = Path(tmp.name)
+    try:
+        copied = await run_in_threadpool(
+            _sync_copy_fileobj_to_path_with_hash,
+            file.file,
+            str(temp_path),
+        )
+        copied["path"] = temp_path
+        copied["filename"] = filename
+        return copied
+    except Exception:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
+def _remove_temp_file(path: object) -> None:
+    try:
+        Path(str(path or "")).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _coerce_document_parse_error(
+    exc: Exception,
+    *,
+    filename: str = "",
+) -> DocumentParseError:
+    if isinstance(exc, DocumentParseError):
+        return exc
+    lower = str(exc or "").strip().lower()
+    if isinstance(exc, FileNotFoundError):
+        return DocumentParseError(
+            "source_file_missing",
+            "解析失败：源文件不存在，请重新上传后重试。",
+            debug_detail=str(exc),
+        )
+    if any(token in lower for token in ("password", "encrypted", "needs pass", "decrypt")):
+        return DocumentParseError(
+            "document_encrypted",
+            "解析失败：文件已加密或受密码保护，请解除保护后重试。",
+            debug_detail=str(exc),
+        )
+    if "仅支持" in str(exc) or "unsupported" in lower or "not support" in lower:
+        return DocumentParseError(
+            "unsupported_document_format",
+            "解析失败：文件格式不受支持，请转换为系统支持的文档格式后重试。",
+            debug_detail=str(exc),
+        )
+    if any(
+        token in lower
+        for token in (
+            "cannot open broken document",
+            "eof marker not found",
+            "malformed pdf",
+            "trailer",
+            "xref",
+            "corrupt",
+            "damaged",
+            "bad offset",
+        )
+    ):
+        return DocumentParseError(
+            "document_corrupted",
+            "解析失败：文件已损坏、结构异常或不是有效文档，请更换文件后重试。",
+            debug_detail=str(exc),
+        )
+    suffix = Path(str(filename or "")).suffix.lower() or "该"
+    return DocumentParseError(
+        "document_parse_failed",
+        f"解析失败：{suffix} 文件无法完成解析，请检查文件格式、内容完整性后重试。",
+        debug_detail=str(exc),
+    )
 
 
 def _material_parse_cache_key(
@@ -5067,10 +5238,12 @@ def _build_site_photo_evidence_summary(
 
 
 def _augment_tender_summary_with_gpt(
-    content: bytes,
+    content: Optional[bytes],
     filename: str,
     parsed_text: str,
     local_summary: Dict[str, object],
+    *,
+    file_path: Optional[Path] = None,
 ) -> tuple[Dict[str, object], str, float, str]:
     gpt_backend = "local"
     gpt_error = ""
@@ -5103,9 +5276,12 @@ def _augment_tender_summary_with_gpt(
     else:
         tender_pdf_page_budget = 8
     page_structures: List[Dict[str, object]] = []
+    resolved_content: Optional[bytes] = None
     pages = (
         _render_pdf_page_pngs_for_gpt(
-            content,
+            resolved_content
+            if resolved_content is not None
+            else _resolve_document_bytes(content, file_path),
             max_pages=tender_pdf_page_budget,
             preferred_tokens=tender_focus_tokens,
             always_include_first_pages=1,
@@ -5254,10 +5430,12 @@ def _augment_tender_summary_with_gpt(
 
 
 def _augment_drawing_summary_with_gpt(
-    content: bytes,
+    content: Optional[bytes],
     filename: str,
     parsed_text: str,
     local_summary: Dict[str, object],
+    *,
+    file_path: Optional[Path] = None,
 ) -> tuple[Dict[str, object], str, float, str]:
     merged = dict(local_summary)
     parse_confidence = float(_clip_score01(local_summary.get("structured_quality_score") or 0.0))
@@ -5266,6 +5444,7 @@ def _augment_drawing_summary_with_gpt(
         return merged, "local", round(parse_confidence, 4), ""
     image_bytes: Optional[bytes] = None
     image_mime = "image/png"
+    resolved_content: Optional[bytes] = None
     ext = Path(filename).suffix.lower()
     drawing_focus_tokens = _build_drawing_gpt_focus_tokens(local_summary)
     text_only_gpt_ok = _should_use_text_only_gpt_for_drawing_summary(
@@ -5282,7 +5461,9 @@ def _augment_drawing_summary_with_gpt(
             page_candidates: Optional[List[Dict[str, object]]] = None
             if drawing_focus_tokens:
                 page_candidates = _collect_pdf_page_candidates_for_gpt(
-                    content,
+                    resolved_content
+                    if resolved_content is not None
+                    else _resolve_document_bytes(content, file_path),
                     preferred_tokens=drawing_focus_tokens,
                     always_include_first_pages=0,
                 )
@@ -5293,7 +5474,9 @@ def _augment_drawing_summary_with_gpt(
                 merged["gpt_page_vision_skip_reason"] = "focus_page_not_distinct_enough"
             else:
                 previews = _render_pdf_page_pngs_for_gpt(
-                    content,
+                    resolved_content
+                    if resolved_content is not None
+                    else _resolve_document_bytes(content, file_path),
                     max_pages=1,
                     preferred_tokens=drawing_focus_tokens,
                     always_include_first_pages=0 if drawing_focus_tokens else 1,
@@ -5306,10 +5489,13 @@ def _augment_drawing_summary_with_gpt(
                         else None
                     )
     elif ext in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
-        image_bytes = content
+        image_bytes = _resolve_document_bytes(content, file_path)
         image_mime = f"image/{'jpeg' if ext in {'.jpg', '.jpeg'} else ext.lstrip('.')}"
     elif ext == ".dwg":
-        dwg_binary_markers = _extract_dwg_binary_marker_terms(content, limit=18)
+        dwg_binary_markers = _extract_dwg_binary_marker_terms(
+            _resolve_document_bytes(content, file_path),
+            limit=18,
+        )
         if dwg_binary_markers:
             merged["dwg_binary_markers"] = dwg_binary_markers[:12]
             merged["binary_marker_terms"] = _merge_unique_text_values(
@@ -5430,10 +5616,12 @@ def _should_fastpath_drawing_local_summary(
 
 
 def _augment_site_photo_summary_with_gpt(
-    content: bytes,
+    content: Optional[bytes],
     filename: str,
     parsed_text: str,
     local_summary: Dict[str, object],
+    *,
+    file_path: Optional[Path] = None,
 ) -> tuple[Dict[str, object], str, float, str]:
     merged = dict(local_summary)
     parse_confidence = float(_clip_score01(local_summary.get("structured_quality_score") or 0.0))
@@ -5451,7 +5639,7 @@ def _augment_site_photo_summary_with_gpt(
     image_mime = f"image/{'jpeg' if ext in {'.jpg', '.jpeg'} else ext.lstrip('.')}"
     ok, payload, err = _call_gpt_material_parser(
         _build_gpt_site_photo_prompt(filename, parsed_text),
-        image_bytes=content,
+        image_bytes=_resolve_document_bytes(content, file_path),
         image_mime=image_mime,
     )
     if not ok:
@@ -5545,10 +5733,10 @@ def _parse_material_record_payload(
     path = Path(str(row.get("path") or "").strip())
     if not path.exists():
         raise FileNotFoundError("path_not_exists")
-    content = read_bytes(path)
-    content_hash = str(row.get("content_hash") or "").strip() or _compute_material_content_hash(
-        content
-    )
+    content: Optional[bytes] = None
+    content_hash = str(row.get("content_hash") or "").strip()
+    if not content_hash:
+        content_hash, _ = _compute_material_content_hash_from_file(path)
     filename = path.name
     material_type = _normalize_material_type(row.get("material_type"), filename=filename)
     normalized_parse_mode = str(parse_mode or "full").strip().lower() or "full"
@@ -5566,6 +5754,7 @@ def _parse_material_record_payload(
             filename,
             prior_text=str(row.get("parsed_text") or ""),
             prior_summary=prior_boq_summary,
+            file_path=path,
         )
     else:
         parsed_text = _read_uploaded_file_content_for_parse_mode(
@@ -5573,6 +5762,7 @@ def _parse_material_record_payload(
             filename,
             material_type=material_type,
             parse_mode=normalized_parse_mode,
+            file_path=path,
         )
     text_value = str(parsed_text or "")
     chunks = _split_material_text_chunks(text_value, max_chars=900)
@@ -5595,7 +5785,10 @@ def _parse_material_record_payload(
     type_specific: Dict[str, object] = {}
     if material_type == "tender_qa":
         local_summary = _build_tender_qa_structured_summary(
-            content, filename, parsed_text=text_value
+            content,
+            filename,
+            parsed_text=text_value,
+            file_path=path,
         )
         if preview_only:
             structured_summary = local_summary
@@ -5615,6 +5808,7 @@ def _parse_material_record_payload(
                 filename,
                 text_value,
                 local_summary,
+                file_path=path,
             )
             if gpt_error and backend == "local":
                 parse_error_class = "gpt_parse_failed"
@@ -5627,6 +5821,7 @@ def _parse_material_record_payload(
             parsed_text=text_value,
             preview_only=preview_only,
             prior_summary=prior_boq_summary,
+            file_path=path,
         )
         if preview_only:
             backend = "local_preview"
@@ -5636,7 +5831,12 @@ def _parse_material_record_payload(
         )
         type_specific["boq_structured_summary"] = structured_summary
     elif material_type == "drawing":
-        local_summary = _build_drawing_structured_summary(content, filename, parsed_text=text_value)
+        local_summary = _build_drawing_structured_summary(
+            content,
+            filename,
+            parsed_text=text_value,
+            file_path=path,
+        )
         if preview_only:
             structured_summary = local_summary
             backend = "local_preview"
@@ -5655,6 +5855,7 @@ def _parse_material_record_payload(
                 filename,
                 text_value,
                 local_summary,
+                file_path=path,
             )
             if gpt_error and backend == "local":
                 parse_error_class = "gpt_parse_failed"
@@ -5662,7 +5863,10 @@ def _parse_material_record_payload(
         type_specific["drawing_structured_summary"] = structured_summary
     elif material_type == "site_photo":
         local_summary = _build_site_photo_structured_summary(
-            content, filename, parsed_text=text_value
+            content,
+            filename,
+            parsed_text=text_value,
+            file_path=path,
         )
         (
             structured_summary,
@@ -5674,6 +5878,7 @@ def _parse_material_record_payload(
             filename,
             text_value,
             local_summary,
+            file_path=path,
         )
         type_specific["site_photo_structured_summary"] = structured_summary
         if gpt_error and backend == "local":
@@ -6116,14 +6321,33 @@ def _process_material_parse_job(job: Dict[str, object]) -> None:
             followup_parse_mode=followup_parse_mode,
         )
     except Exception as exc:
+        normalized_exc = (
+            exc
+            if isinstance(exc, DocumentParseError)
+            else _coerce_document_parse_error(exc, filename=str(row.get("filename") or ""))
+        )
+        if isinstance(exc, DocumentParseError):
+            logger.warning(
+                "material_parse_failed code=%s detail=%s material_id=%s job_id=%s",
+                normalized_exc.code,
+                normalized_exc.detail,
+                material_id,
+                str(job.get("id") or ""),
+            )
+        else:
+            logger.exception(
+                "material_parse_failed_unexpected material_id=%s job_id=%s",
+                material_id,
+                str(job.get("id") or ""),
+            )
         _complete_material_parse_job(
             str(job.get("id") or ""),
             {
                 "project_id": str(row.get("project_id") or ""),
                 "parse_backend": "local",
                 "parse_confidence": 0.0,
-                "parse_error_class": type(exc).__name__,
-                "parse_error_message": str(exc),
+                "parse_error_class": normalized_exc.code,
+                "parse_error_message": normalized_exc.detail,
                 "parse_finished_at": _now_iso(),
                 "parse_version": DEFAULT_MATERIAL_PARSE_VERSION,
             },
@@ -6935,6 +7159,196 @@ def _read_tender_upload_and_infer_project_name(
         project_name_override=project_name_override,
     )
     return normalized_filename, content, inferred_name
+
+
+def _read_tender_upload_and_infer_project_name_from_path(
+    file_path: Path,
+    *,
+    filename: str,
+    project_name_override: object = "",
+) -> tuple[str, str]:
+    normalized_filename = _normalize_uploaded_filename(filename)
+    if not normalized_filename:
+        raise HTTPException(status_code=422, detail="招标文件名为空，请重试或重命名后上传。")
+    try:
+        preview_text = _read_uploaded_file_preview_for_project_name(
+            None,
+            normalized_filename,
+            file_path=file_path,
+        )
+    except Exception as exc:
+        raise _coerce_document_parse_error(exc, filename=normalized_filename) from exc
+    inferred_name = _resolve_tender_project_name(
+        preview_text,
+        normalized_filename,
+        project_name_override=project_name_override,
+    )
+    return normalized_filename, inferred_name
+
+
+async def _store_uploaded_material_from_local_path(
+    project_id: str,
+    *,
+    source_path: Path,
+    normalized_name: str,
+    normalized_material_type: str,
+    locale: str,
+) -> dict:
+    ensure_data_dirs()
+    projects = load_projects()
+    if not any(p["id"] == project_id for p in projects):
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    project_dir = MATERIALS_DIR / project_id / normalized_material_type
+    project_dir.mkdir(parents=True, exist_ok=True)
+    target = project_dir / normalized_name
+    stored = await run_in_threadpool(_sync_copy_path_to_path_with_hash, source_path, target)
+    size_bytes = int(_to_float_or_none(stored.get("size_bytes")) or 0)
+    content_hash = str(stored.get("content_hash") or "").strip()
+    initial_parse_mode = (
+        "preview"
+        if _material_should_use_preview_stage(
+            None,
+            normalized_name,
+            material_type=normalized_material_type,
+            size_bytes=size_bytes,
+        )
+        else "full"
+    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    record = {
+        "id": str(uuid4()),
+        "project_id": project_id,
+        "material_type": normalized_material_type,
+        "filename": normalized_name,
+        "path": str(target),
+        "content_hash": content_hash,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "parse_status": "queued",
+        "parse_backend": "queued",
+        "parse_phase": None,
+        "parse_ready_for_gate": False,
+        "parse_confidence": 0.0,
+        "parse_error_class": None,
+        "parse_error_message": None,
+        "parse_started_at": None,
+        "parse_finished_at": None,
+        "parse_version": DEFAULT_MATERIAL_PARSE_VERSION,
+        "structured_summary": None,
+        "parsed_text": "",
+        "parsed_chars": 0,
+        "parsed_chunks": [],
+        "numeric_terms_norm": [],
+        "lexical_terms": [],
+    }
+    with _MATERIAL_PARSE_STATE_LOCK:
+        materials = load_materials()
+        existing_ids = [
+            str(m.get("id"))
+            for m in materials
+            if m.get("project_id") == project_id
+            and _normalize_material_type(m.get("material_type"), filename=m.get("filename"))
+            == normalized_material_type
+            and _normalize_uploaded_filename(m.get("filename", "")) == normalized_name
+            and m.get("id")
+        ]
+        materials = [
+            m
+            for m in materials
+            if not (
+                m.get("project_id") == project_id
+                and _normalize_material_type(m.get("material_type"), filename=m.get("filename"))
+                == normalized_material_type
+                and _normalize_uploaded_filename(m.get("filename", "")) == normalized_name
+            )
+        ]
+        record["id"] = existing_ids[0] if existing_ids else str(uuid4())
+        jobs = load_material_parse_jobs()
+        jobs, job_id, _, _ = _requeue_material_parse_job(
+            jobs,
+            record,
+            parse_mode=initial_parse_mode,
+        )
+        record["job_id"] = job_id
+        materials.append(record)
+        save_materials(materials)
+        save_material_parse_jobs(jobs)
+        _invalidate_material_parse_claim_snapshot()
+    _notify_material_parse_workers()
+    _invalidate_material_index_cache(project_id)
+    return {
+        "status": "ok",
+        "material": record,
+        "parse_job": {
+            "id": job_id,
+            "status": "queued",
+            "material_id": record["id"],
+            "project_id": project_id,
+        },
+        "constraint_sync": {"rebuilt": False, "mode": "async_parse_pending"},
+    }
+
+
+async def _build_submission_record_from_local_path(
+    project_id: str,
+    *,
+    source_path: Path,
+    normalized_filename: str,
+    locale: str,
+) -> SubmissionRecord:
+    ensure_data_dirs()
+    projects = load_projects()
+    if not any(p["id"] == project_id for p in projects):
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    try:
+        text = await run_in_threadpool(
+            _read_uploaded_file_content,
+            None,
+            normalized_filename,
+            file_path=source_path,
+        )
+    except Exception as exc:
+        raise _coerce_document_parse_error(exc, filename=normalized_filename) from exc
+    submissions = load_submissions()
+    now_utc = datetime.now(timezone.utc)
+    duplicate = _find_recent_duplicate_submission(
+        submissions,
+        project_id=project_id,
+        filename=normalized_filename,
+        text=text,
+        now_utc=now_utc,
+    )
+    if duplicate is not None:
+        return SubmissionRecord(**duplicate)
+
+    _, profile_snapshot, project = _resolve_project_scoring_context(project_id)
+    scoring_engine_version = str(project.get("scoring_engine_version_locked") or "v1")
+    submission_id = str(uuid4())
+    report = _build_pending_submission_report(
+        project=project,
+        scoring_engine_version=scoring_engine_version,
+    )
+    if profile_snapshot:
+        report_meta = report.get("meta")
+        report_meta = report_meta if isinstance(report_meta, dict) else {}
+        report_meta["expert_profile_snapshot"] = profile_snapshot
+        report_meta["expert_profile_id"] = profile_snapshot.get("id")
+        report["meta"] = report_meta
+
+    record = {
+        "id": submission_id,
+        "project_id": project_id,
+        "filename": normalized_filename,
+        "total_score": 0.0,
+        "report": report,
+        "text": text,
+        "created_at": now_utc.isoformat(),
+        "updated_at": now_utc.isoformat(),
+        "expert_profile_id_used": profile_snapshot.get("id") if profile_snapshot else None,
+    }
+    submissions.append(record)
+    save_submissions(submissions)
+    return SubmissionRecord(**record)
 
 
 def _mark_project_expert_profile_read_only(
@@ -17219,9 +17633,9 @@ def _normalize_feedback_guardrail_state(payload: object) -> Dict[str, object]:
                     "已暂停自动调权/自动校准，请人工确认后再执行「学习进化」或「一键闭环执行」。"
                 )
             else:
-                normalized[
-                    "warning_message"
-                ] = "检测到极端偏差样本，已暂停自动调权/自动校准，请人工确认后再执行。"
+                normalized["warning_message"] = (
+                    "检测到极端偏差样本，已暂停自动调权/自动校准，请人工确认后再执行。"
+                )
     return normalized
 
 
@@ -18748,9 +19162,9 @@ def _build_governance_sandbox_preview(
             requirements = stored_requirements
         else:
             base_payload["constraints_ready"] = False
-            base_payload[
-                "constraints_warning"
-            ] = "当前项目尚无已固化的目录锚点/要求约束，沙箱重评分暂不执行，以避免治理面板触发写入式重建。"
+            base_payload["constraints_warning"] = (
+                "当前项目尚无已固化的目录锚点/要求约束，沙箱重评分暂不执行，以避免治理面板触发写入式重建。"
+            )
             return base_payload
 
     rows: List[Dict[str, object]] = []
@@ -19675,6 +20089,27 @@ def _build_ground_truth_record_from_uploaded_file(
     )
 
 
+def _build_ground_truth_record_from_uploaded_path(
+    project_id: str,
+    *,
+    filename: str,
+    file_path: Path,
+    judge_scores_form: str,
+    final_score: float,
+    source: str,
+    locale: str,
+) -> Dict[str, object]:
+    return ground_truth_intake_module.build_ground_truth_record_from_uploaded_path(
+        project_id,
+        filename=filename,
+        file_path=file_path,
+        judge_scores_form=judge_scores_form,
+        final_score=final_score,
+        source=source,
+        locale=locale,
+    )
+
+
 def _build_ground_truth_batch_items_from_uploaded_files(
     project_id: str,
     *,
@@ -19685,6 +20120,25 @@ def _build_ground_truth_batch_items_from_uploaded_files(
     locale: str,
 ) -> tuple[List[Dict[str, object]], List[Dict[str, object]]]:
     return ground_truth_intake_module.build_ground_truth_batch_items_from_uploaded_files(
+        project_id,
+        uploads=uploads,
+        judge_scores_form=judge_scores_form,
+        final_score=final_score,
+        source=source,
+        locale=locale,
+    )
+
+
+def _build_ground_truth_batch_items_from_uploaded_paths(
+    project_id: str,
+    *,
+    uploads: List[tuple[str, Path]],
+    judge_scores_form: str,
+    final_score: float,
+    source: str,
+    locale: str,
+) -> tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    return ground_truth_intake_module.build_ground_truth_batch_items_from_uploaded_paths(
         project_id,
         uploads=uploads,
         judge_scores_form=judge_scores_form,
@@ -19880,6 +20334,25 @@ async def _storage_data_error_handler(request: Request, exc: StorageDataError):
             "detail": exc.detail,
             "error_code": exc.code,
             "file": exc.path.name,
+        },
+    )
+
+
+@app.exception_handler(DocumentParseError)
+async def _document_parse_error_handler(request: Request, exc: DocumentParseError):
+    logger.warning(
+        "document_parse_error code=%s detail=%s debug=%s request_id=%s path=%s",
+        exc.code,
+        exc.detail,
+        exc.debug_detail,
+        getattr(request.state, "request_id", ""),
+        request.url.path,
+    )
+    return JSONResponse(
+        status_code=int(exc.status_code or 422),
+        content={
+            "detail": exc.detail,
+            "error_code": exc.code,
         },
     )
 
@@ -20770,17 +21243,37 @@ def create_project(
     tags=["项目管理"],
     responses={**RESPONSES_401, **RESPONSES_422},
 )
-def infer_project_name_from_tender(
+async def infer_project_name_from_tender(
     file: UploadFile = File(...),
     api_key: Optional[str] = Depends(verify_api_key),
 ) -> ProjectInferTenderNameResponse:
     """上传招标文件，仅做项目名称识别，不创建项目。"""
     ensure_data_dirs()
-    normalized_filename, _, inferred_name = _read_tender_upload_and_infer_project_name(file)
-    return ProjectInferTenderNameResponse(
-        inferred_name=inferred_name,
-        filename=normalized_filename,
-    )
+    raw_filename = file.filename or ""
+    normalized_filename = _normalize_uploaded_filename(raw_filename)
+    if not normalized_filename:
+        raise HTTPException(status_code=422, detail="招标文件名为空，请重试或重命名后上传。")
+    if not _is_allowed_material_upload(normalized_filename, file.content_type or "", "tender_qa"):
+        raise HTTPException(
+            status_code=422,
+            detail="招标文件和答疑支持：" + _material_type_ext_hint("tender_qa"),
+        )
+    staged = await _stage_upload_file_to_temp_path(file, filename=normalized_filename)
+    try:
+        if int(_to_float_or_none(staged.get("size_bytes")) or 0) <= 0:
+            raise HTTPException(status_code=422, detail="招标文件为空，请重新选择文件。")
+        _, inferred_name = await run_in_threadpool(
+            _read_tender_upload_and_infer_project_name_from_path,
+            staged["path"],
+            filename=normalized_filename,
+            project_name_override="",
+        )
+        return ProjectInferTenderNameResponse(
+            inferred_name=inferred_name,
+            filename=normalized_filename,
+        )
+    finally:
+        _remove_temp_file(staged.get("path"))
 
 
 @router.post(
@@ -20789,7 +21282,7 @@ def infer_project_name_from_tender(
     tags=["项目管理"],
     responses={**RESPONSES_401, **RESPONSES_422},
 )
-def create_project_from_tender(
+async def create_project_from_tender(
     file: UploadFile = File(...),
     project_name_override: Optional[str] = Form(None),
     api_key: Optional[str] = Depends(verify_api_key),
@@ -20797,48 +21290,61 @@ def create_project_from_tender(
 ) -> ProjectCreateFromTenderResponse:
     """上传招标文件并自动识别项目名称，创建或复用项目后归档资料。"""
     ensure_data_dirs()
-    normalized_filename, content, inferred_name = _read_tender_upload_and_infer_project_name(
-        file,
-        project_name_override=project_name_override or "",
-    )
-
-    projects = load_projects()
-    changed = False
-    for project in projects:
-        if isinstance(project, dict):
-            changed = _ensure_project_v2_fields(project) or changed
-    if changed:
-        save_projects(projects)
-
-    existing = _find_project_by_name(projects, inferred_name)
-    created = False
-    if existing is None:
-        project_row = _build_project_record(inferred_name, {})
-        projects.append(project_row)
-        save_projects(projects)
-        created = True
-    else:
-        project_row = existing
-
+    raw_filename = file.filename or ""
+    normalized_filename = _normalize_uploaded_filename(raw_filename)
+    if not normalized_filename:
+        raise HTTPException(status_code=422, detail="招标文件名为空，请重试或重命名后上传。")
+    if not _is_allowed_material_upload(normalized_filename, file.content_type or "", "tender_qa"):
+        raise HTTPException(
+            status_code=422,
+            detail="招标文件和答疑支持：" + _material_type_ext_hint("tender_qa"),
+        )
+    staged = await _stage_upload_file_to_temp_path(file, filename=normalized_filename)
     try:
-        file.file.seek(0)
-    except Exception:
-        file.file = io.BytesIO(content)
-    upload_result = upload_material(
-        project_id=str(project_row.get("id") or ""),
-        file=file,
-        material_type="tender_qa",
-        api_key=api_key,
-        locale=locale,
-    )
-    material_row = dict(upload_result.get("material") or {})
-    return ProjectCreateFromTenderResponse(
-        project=ProjectRecord(**project_row),
-        material=MaterialRecord(**material_row),
-        inferred_name=inferred_name,
-        created=created,
-        reused_existing=not created,
-    )
+        if int(_to_float_or_none(staged.get("size_bytes")) or 0) <= 0:
+            raise HTTPException(status_code=422, detail="招标文件为空，请重新选择文件。")
+        _, inferred_name = await run_in_threadpool(
+            _read_tender_upload_and_infer_project_name_from_path,
+            staged["path"],
+            filename=normalized_filename,
+            project_name_override=project_name_override or "",
+        )
+
+        projects = load_projects()
+        changed = False
+        for project in projects:
+            if isinstance(project, dict):
+                changed = _ensure_project_v2_fields(project) or changed
+        if changed:
+            save_projects(projects)
+
+        existing = _find_project_by_name(projects, inferred_name)
+        created = False
+        if existing is None:
+            project_row = _build_project_record(inferred_name, {})
+            projects.append(project_row)
+            save_projects(projects)
+            created = True
+        else:
+            project_row = existing
+
+        upload_result = await _store_uploaded_material_from_local_path(
+            project_id=str(project_row.get("id") or ""),
+            source_path=Path(staged["path"]),
+            normalized_name=normalized_filename,
+            normalized_material_type="tender_qa",
+            locale=locale,
+        )
+        material_row = dict(upload_result.get("material") or {})
+        return ProjectCreateFromTenderResponse(
+            project=ProjectRecord(**project_row),
+            material=MaterialRecord(**material_row),
+            inferred_name=inferred_name,
+            created=created,
+            reused_existing=not created,
+        )
+    finally:
+        _remove_temp_file(staged.get("path"))
 
 
 @router.get("/projects", response_model=list[ProjectRecord], tags=["项目管理"])
@@ -21779,7 +22285,7 @@ def _find_recent_duplicate_submission(
     tags=["项目管理"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
-def upload_material(
+async def upload_material(
     project_id: str,
     file: UploadFile = File(...),
     material_type: str = Form(MATERIAL_TYPE_DEFAULT),
@@ -21816,97 +22322,19 @@ def upload_material(
                 + _material_type_ext_hint(normalized_material_type)
             ),
         )
-    projects = load_projects()
-    if not any(p["id"] == project_id for p in projects):
-        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    project_dir = MATERIALS_DIR / project_id / normalized_material_type
-    project_dir.mkdir(parents=True, exist_ok=True)
-    target = project_dir / normalized_name
-    content = file.file.read()
-    save_bytes(target, content)
-    content_hash = _compute_material_content_hash(content)
-    initial_parse_mode = (
-        "preview"
-        if _material_should_use_preview_stage(
-            content,
-            normalized_name,
-            material_type=normalized_material_type,
+    staged = await _stage_upload_file_to_temp_path(file, filename=normalized_name)
+    try:
+        if int(_to_float_or_none(staged.get("size_bytes")) or 0) <= 0:
+            raise HTTPException(status_code=422, detail="资料文件为空，请重新选择文件。")
+        return await _store_uploaded_material_from_local_path(
+            project_id=project_id,
+            source_path=Path(staged["path"]),
+            normalized_name=normalized_name,
+            normalized_material_type=normalized_material_type,
+            locale=locale,
         )
-        else "full"
-    )
-
-    record = {
-        "id": str(uuid4()),
-        "project_id": project_id,
-        "material_type": normalized_material_type,
-        "filename": normalized_name,
-        "path": str(target),
-        "content_hash": content_hash,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "parse_status": "queued",
-        "parse_backend": "queued",
-        "parse_phase": None,
-        "parse_ready_for_gate": False,
-        "parse_confidence": 0.0,
-        "parse_error_class": None,
-        "parse_error_message": None,
-        "parse_started_at": None,
-        "parse_finished_at": None,
-        "parse_version": DEFAULT_MATERIAL_PARSE_VERSION,
-        "structured_summary": None,
-        "parsed_text": "",
-        "parsed_chars": 0,
-        "parsed_chunks": [],
-        "numeric_terms_norm": [],
-        "lexical_terms": [],
-    }
-    with _MATERIAL_PARSE_STATE_LOCK:
-        materials = load_materials()
-        existing_ids = [
-            str(m.get("id"))
-            for m in materials
-            if m.get("project_id") == project_id
-            and _normalize_material_type(m.get("material_type"), filename=m.get("filename"))
-            == normalized_material_type
-            and _normalize_uploaded_filename(m.get("filename", "")) == normalized_name
-            and m.get("id")
-        ]
-        materials = [
-            m
-            for m in materials
-            if not (
-                m.get("project_id") == project_id
-                and _normalize_material_type(m.get("material_type"), filename=m.get("filename"))
-                == normalized_material_type
-                and _normalize_uploaded_filename(m.get("filename", "")) == normalized_name
-            )
-        ]
-        record["id"] = existing_ids[0] if existing_ids else str(uuid4())
-        jobs = load_material_parse_jobs()
-        jobs, job_id, _, _ = _requeue_material_parse_job(
-            jobs,
-            record,
-            parse_mode=initial_parse_mode,
-        )
-        record["job_id"] = job_id
-        materials.append(record)
-        save_materials(materials)
-        save_material_parse_jobs(jobs)
-        _invalidate_material_parse_claim_snapshot()
-    _notify_material_parse_workers()
-    _invalidate_material_index_cache(project_id)
-    return {
-        "status": "ok",
-        "material": record,
-        "parse_job": {
-            "id": job_id,
-            "status": "queued",
-            "material_id": record["id"],
-            "project_id": project_id,
-        },
-        "constraint_sync": {"rebuilt": False, "mode": "async_parse_pending"},
-    }
+    finally:
+        _remove_temp_file(staged.get("path"))
 
 
 @router.get(
@@ -22072,18 +22500,20 @@ def reparse_project_materials(
             continue
         normalized, _ = _normalize_material_row_for_parse(dict(row))
         try:
-            parse_content = read_bytes(Path(str(normalized.get("path") or "").strip()))
+            content_hash, size_bytes = _compute_material_content_hash_from_file(
+                Path(str(normalized.get("path") or "").strip())
+            )
         except OSError:
             parse_mode = "full"
             content_hash = str(normalized.get("content_hash") or "").strip() or None
         else:
-            content_hash = _compute_material_content_hash(parse_content)
             parse_mode = (
                 "preview"
                 if _material_should_use_preview_stage(
-                    parse_content,
+                    None,
                     str(normalized.get("filename") or ""),
                     material_type=normalized.get("material_type"),
+                    size_bytes=size_bytes,
                 )
                 else "full"
             )
@@ -24137,10 +24567,11 @@ def _infer_focus_dimensions_from_tender_terms(
 
 
 def _build_tender_qa_structured_summary(
-    content: bytes,
+    content: Optional[bytes],
     filename: str,
     *,
     parsed_text: str = "",
+    file_path: Optional[Path] = None,
 ) -> Dict[str, object]:
     text = str(parsed_text or "")
     corpus = f"{filename}\n{text}"
@@ -24212,7 +24643,15 @@ def _build_tender_qa_structured_summary(
     return {
         "filename": filename,
         "detected_format": Path(filename).suffix.lower().lstrip("."),
-        "bytes": len(content or b""),
+        "bytes": (
+            len(content or b"")
+            if content is not None
+            else int(
+                Path(file_path).stat().st_size
+                if file_path is not None and Path(file_path).exists()
+                else 0
+            )
+        ),
         "constraint_tags": constraint_tags,
         "section_titles": section_titles,
         "scoring_point_terms": scoring_point_terms,
@@ -24313,10 +24752,11 @@ def _finalize_boq_structured_summary(
 
 
 def _build_drawing_structured_summary(
-    content: bytes,
+    content: Optional[bytes],
     filename: str,
     *,
     parsed_text: str = "",
+    file_path: Optional[Path] = None,
 ) -> Dict[str, object]:
     ext = Path(filename).suffix.lower()
     text = str(parsed_text or "")
@@ -24339,7 +24779,7 @@ def _build_drawing_structured_summary(
     if detected_format == "dwg":
         binary_marker_terms = _merge_unique_text_values(
             binary_marker_terms,
-            _extract_dwg_binary_marker_terms(content, limit=14),
+            _extract_dwg_binary_marker_terms(_resolve_document_bytes(content, file_path), limit=14),
             limit=14,
         )
     entity_counts = _parse_summary_count_line(text, "实体统计", limit=12)
@@ -24432,7 +24872,15 @@ def _build_drawing_structured_summary(
     return {
         "filename": filename,
         "detected_format": detected_format,
-        "bytes": len(content or b""),
+        "bytes": (
+            len(content or b"")
+            if content is not None
+            else int(
+                Path(file_path).stat().st_size
+                if file_path is not None and Path(file_path).exists()
+                else 0
+            )
+        ),
         "entity_counts": entity_counts,
         "top_layers": top_layers,
         "top_blocks": top_blocks,
@@ -24452,10 +24900,11 @@ def _build_drawing_structured_summary(
 
 
 def _build_site_photo_structured_summary(
-    content: bytes,
+    content: Optional[bytes],
     filename: str,
     *,
     parsed_text: str = "",
+    file_path: Optional[Path] = None,
 ) -> Dict[str, object]:
     ext = Path(filename).suffix.lower().lstrip(".")
     text = str(parsed_text or "")
@@ -24531,7 +24980,15 @@ def _build_site_photo_structured_summary(
     return {
         "filename": filename,
         "detected_format": ext or "image",
-        "bytes": len(content or b""),
+        "bytes": (
+            len(content or b"")
+            if content is not None
+            else int(
+                Path(file_path).stat().st_size
+                if file_path is not None and Path(file_path).exists()
+                else 0
+            )
+        ),
         "visual_capability": visual_capability,
         "ocr_mode": ocr_mode,
         "ocr_quality_score": round(ocr_quality_score, 4),
@@ -24704,11 +25161,12 @@ def _should_stop_boq_full_scan_after_aux_tail(
 
 
 def _extract_boq_tabular_preview_text(
-    content: bytes,
+    content: Optional[bytes],
     filename: str,
     *,
     max_sheets: int,
     max_rows_per_sheet: int,
+    file_path: Optional[Path] = None,
 ) -> str:
     ext = Path(filename).suffix.lower()
     parts: List[str] = []
@@ -24716,7 +25174,10 @@ def _extract_boq_tabular_preview_text(
         try:
             import openpyxl
 
-            wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+            workbook_source: object = (
+                str(file_path) if file_path is not None else io.BytesIO(bytes(content or b""))
+            )
+            wb = openpyxl.load_workbook(workbook_source, read_only=True, data_only=True)
             try:
                 sorted_worksheets = sorted(
                     wb.worksheets,
@@ -24739,7 +25200,19 @@ def _extract_boq_tabular_preview_text(
         return "\n".join(parts).strip()
     if ext == ".csv":
         try:
-            decoded = content.decode("utf-8", errors="ignore")
+            if file_path is not None:
+                with Path(file_path).open(
+                    "r", encoding="utf-8", errors="ignore", newline=""
+                ) as csv_handle:
+                    reader = csv.reader(csv_handle)
+                    for idx, row in enumerate(reader, start=1):
+                        if idx > max(1, int(max_rows_per_sheet)):
+                            break
+                        line = "\t".join(str(cell or "") for cell in row).strip()
+                        if line:
+                            parts.append(line)
+                return "\n".join(parts).strip()
+            decoded = bytes(content or b"").decode("utf-8", errors="ignore")
             reader = csv.reader(io.StringIO(decoded))
             for idx, row in enumerate(reader, start=1):
                 if idx > max(1, int(max_rows_per_sheet)):
@@ -24754,12 +25227,13 @@ def _extract_boq_tabular_preview_text(
 
 
 def _extract_boq_tabular_resume_text(
-    content: bytes,
+    content: Optional[bytes],
     filename: str,
     *,
     prior_summary: Optional[Dict[str, object]],
     max_sheets: int,
     max_rows_per_sheet: int,
+    file_path: Optional[Path] = None,
 ) -> str:
     if not isinstance(prior_summary, dict):
         return ""
@@ -24770,7 +25244,10 @@ def _extract_boq_tabular_resume_text(
         try:
             import openpyxl
 
-            wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+            workbook_source: object = (
+                str(file_path) if file_path is not None else io.BytesIO(bytes(content or b""))
+            )
+            wb = openpyxl.load_workbook(workbook_source, read_only=True, data_only=True)
             try:
                 prior_sheet_summaries: Dict[str, Dict[str, object]] = {}
                 for prior_sheet in prior_summary.get("sheets") or []:
@@ -24855,7 +25332,21 @@ def _extract_boq_tabular_resume_text(
             )
             if resume_from_row >= row_budget:
                 return ""
-            decoded = content.decode("utf-8", errors="ignore")
+            if file_path is not None:
+                with Path(file_path).open(
+                    "r", encoding="utf-8", errors="ignore", newline=""
+                ) as csv_handle:
+                    reader = csv.reader(csv_handle)
+                    if resume_from_row > 0:
+                        reader = itertools.islice(reader, resume_from_row, None)
+                    for absolute_row_index, row in enumerate(reader, start=resume_from_row + 1):
+                        if absolute_row_index > row_budget:
+                            break
+                        line = "\t".join(str(cell or "") for cell in row).strip()
+                        if line:
+                            parts.append(line)
+                return "\n".join(parts).strip()
+            decoded = bytes(content or b"").decode("utf-8", errors="ignore")
             reader = csv.reader(io.StringIO(decoded))
             if resume_from_row > 0:
                 reader = itertools.islice(reader, resume_from_row, None)
@@ -24872,11 +25363,12 @@ def _extract_boq_tabular_resume_text(
 
 
 def _build_boq_full_parse_text(
-    content: bytes,
+    content: Optional[bytes],
     filename: str,
     *,
     prior_text: str = "",
     prior_summary: Optional[Dict[str, object]] = None,
+    file_path: Optional[Path] = None,
 ) -> str:
     ext = Path(filename).suffix.lower()
     if ext == ".pdf":
@@ -24893,6 +25385,7 @@ def _build_boq_full_parse_text(
                     material_type="boq",
                     start_page=preview_last_page + 1,
                     prior_text=prior_text,
+                    file_path=file_path,
                 )
             )
             merged_text = "\n\n".join(
@@ -24902,13 +25395,14 @@ def _build_boq_full_parse_text(
             )
             if merged_text:
                 return merged_text[:DEFAULT_BOQ_PARSE_TEXT_MERGED_MAX_CHARS]
-    delta_text = _extract_boq_tabular_resume_text(
-        content,
-        filename,
-        prior_summary=prior_summary,
-        max_sheets=int(DEFAULT_MATERIAL_PARSE_TEXT_MAX_SHEETS_BY_TYPE.get("boq", 4)),
-        max_rows_per_sheet=int(DEFAULT_MATERIAL_PARSE_TEXT_MAX_ROWS_BY_TYPE.get("boq", 600)),
-    )
+        delta_text = _extract_boq_tabular_resume_text(
+            content,
+            filename,
+            prior_summary=prior_summary,
+            max_sheets=int(DEFAULT_MATERIAL_PARSE_TEXT_MAX_SHEETS_BY_TYPE.get("boq", 4)),
+            max_rows_per_sheet=int(DEFAULT_MATERIAL_PARSE_TEXT_MAX_ROWS_BY_TYPE.get("boq", 600)),
+            file_path=file_path,
+        )
     segments = [str(prior_text or "").strip(), str(delta_text or "").strip()]
     merged_text = "\n".join(segment for segment in segments if segment)
     if merged_text:
@@ -24918,10 +25412,11 @@ def _build_boq_full_parse_text(
         filename,
         max_sheets=int(DEFAULT_MATERIAL_PARSE_TEXT_MAX_SHEETS_BY_TYPE.get("boq", 4)),
         max_rows_per_sheet=int(DEFAULT_MATERIAL_PARSE_TEXT_MAX_ROWS_BY_TYPE.get("boq", 600)),
+        file_path=file_path,
     )
     if boq_excerpt:
         return boq_excerpt[:DEFAULT_BOQ_PARSE_TEXT_MERGED_MAX_CHARS]
-    return _read_uploaded_file_content(content, filename, material_type="boq")
+    return _read_uploaded_file_content(content, filename, material_type="boq", file_path=file_path)
 
 
 def _iter_boq_excel_rows(sheet: Any, *, start_row: int = 1) -> Any:
@@ -24938,12 +25433,13 @@ def _iter_boq_excel_rows(sheet: Any, *, start_row: int = 1) -> Any:
 
 
 def _build_boq_structured_summary(
-    content: bytes,
+    content: Optional[bytes],
     filename: str,
     *,
     parsed_text: str = "",
     preview_only: bool = False,
     prior_summary: Optional[Dict[str, object]] = None,
+    file_path: Optional[Path] = None,
 ) -> Dict[str, object]:
     summary: Dict[str, object] = {
         "filename": filename,
@@ -25194,7 +25690,10 @@ def _build_boq_structured_summary(
         try:
             import openpyxl
 
-            wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+            workbook_source: object = (
+                str(file_path) if file_path is not None else io.BytesIO(bytes(content or b""))
+            )
+            wb = openpyxl.load_workbook(workbook_source, read_only=True, data_only=True)
             sheet_summaries: List[Dict[str, object]] = []
             total_items = 0
             total_qty = 0.0
@@ -25331,21 +25830,40 @@ def _build_boq_structured_summary(
                 _to_float_or_none(prior_csv_summary.get("scanned_rows") if prior_csv_summary else 0)
                 or 0
             )
-            decoded = content.decode("utf-8", errors="ignore")
-            reader = csv.reader(io.StringIO(decoded))
-            if resume_from_row > 0:
-                reader = itertools.islice(reader, resume_from_row, None)
-            csv_summary = _sheet_struct_from_row_iter(
-                reader,
-                "csv",
-                max_rows_per_sheet=(
-                    int(DEFAULT_MATERIAL_PARSE_PREVIEW_MAX_ROWS_BY_TYPE.get("boq", 180))
-                    if preview_only
-                    else _boq_full_csv_row_budget(full_scan_guidance=full_scan_guidance)
-                ),
-                seed_summary=(None if preview_only else prior_csv_summary),
-                resume_from_row=(resume_from_row + 1 if resume_from_row > 0 else 1),
-            )
+            if file_path is not None:
+                with Path(file_path).open(
+                    "r", encoding="utf-8", errors="ignore", newline=""
+                ) as csv_handle:
+                    reader = csv.reader(csv_handle)
+                    if resume_from_row > 0:
+                        reader = itertools.islice(reader, resume_from_row, None)
+                    csv_summary = _sheet_struct_from_row_iter(
+                        reader,
+                        "csv",
+                        max_rows_per_sheet=(
+                            int(DEFAULT_MATERIAL_PARSE_PREVIEW_MAX_ROWS_BY_TYPE.get("boq", 180))
+                            if preview_only
+                            else _boq_full_csv_row_budget(full_scan_guidance=full_scan_guidance)
+                        ),
+                        seed_summary=(None if preview_only else prior_csv_summary),
+                        resume_from_row=(resume_from_row + 1 if resume_from_row > 0 else 1),
+                    )
+            else:
+                decoded = bytes(content or b"").decode("utf-8", errors="ignore")
+                reader = csv.reader(io.StringIO(decoded))
+                if resume_from_row > 0:
+                    reader = itertools.islice(reader, resume_from_row, None)
+                csv_summary = _sheet_struct_from_row_iter(
+                    reader,
+                    "csv",
+                    max_rows_per_sheet=(
+                        int(DEFAULT_MATERIAL_PARSE_PREVIEW_MAX_ROWS_BY_TYPE.get("boq", 180))
+                        if preview_only
+                        else _boq_full_csv_row_budget(full_scan_guidance=full_scan_guidance)
+                    ),
+                    seed_summary=(None if preview_only else prior_csv_summary),
+                    resume_from_row=(resume_from_row + 1 if resume_from_row > 0 else 1),
+                )
             summary["sheets"] = [csv_summary]
             summary["total_parsed_items"] = int(csv_summary.get("parsed_items", 0))
             summary["total_quantity"] = float(csv_summary.get("quantity_sum", 0.0))
@@ -25392,6 +25910,18 @@ def _build_boq_structured_summary(
     return _finalize_boq_structured_summary(summary, parsed_text=parsed_text)
 
 
+def _read_document_bytes_from_path(file_path: Optional[Path]) -> bytes:
+    if file_path is None:
+        return b""
+    return read_bytes(Path(file_path))
+
+
+def _resolve_document_bytes(content: Optional[bytes], file_path: Optional[Path]) -> bytes:
+    if content is not None:
+        return content
+    return _read_document_bytes_from_path(file_path)
+
+
 def _extract_binary_text_snippet(content: bytes, *, max_chars: int = 4000) -> str:
     decoded = content.decode("utf-8", errors="ignore")
     cleaned = "".join(ch if ch.isprintable() else " " for ch in decoded)
@@ -25401,13 +25931,22 @@ def _extract_binary_text_snippet(content: bytes, *, max_chars: int = 4000) -> st
     return compact[: max(256, int(max_chars))]
 
 
-def _extract_image_content(content: bytes, filename: str) -> str:
-    lines = [f"[图像资料] 文件: {filename}", f"字节数: {len(content)}"]
+def _extract_image_content(
+    content: Optional[bytes],
+    filename: str,
+    *,
+    file_path: Optional[Path] = None,
+) -> str:
+    resolved_bytes = _resolve_document_bytes(content, file_path)
+    lines = [f"[图像资料] 文件: {filename}", f"字节数: {len(resolved_bytes)}"]
     if Image is None:
         lines.append("图像解析: 当前环境未安装 Pillow，已纳入文件元信息。")
         return "\n".join(lines)
     try:
-        with Image.open(io.BytesIO(content)) as img:
+        image_source: object = (
+            str(file_path) if file_path is not None else io.BytesIO(resolved_bytes)
+        )
+        with Image.open(image_source) as img:
             lines.append(f"格式: {img.format or '未知'}")
             lines.append(f"尺寸: {img.width}x{img.height}")
             lines.append(f"模式: {img.mode}")
@@ -25442,7 +25981,7 @@ def _pdf_backend_name() -> str:
 
 
 def _extract_pdf_text_with_pypdf(
-    content: bytes,
+    content: Optional[bytes],
     *,
     filename: str = "",
     material_type: object = None,
@@ -25453,14 +25992,20 @@ def _extract_pdf_text_with_pypdf(
     start_page: int = 1,
     prior_text: str = "",
     allow_early_stop: bool = True,
+    file_path: Optional[Path] = None,
 ) -> str:
     if PdfReader is None:
         return ""
-    if not bytes(content or b"").lstrip().startswith(b"%PDF"):
+    if file_path is None and not bytes(content or b"").lstrip().startswith(b"%PDF"):
         return ""
     normalized_type = _normalize_material_type(material_type, filename=filename)
     try:
-        reader = PdfReader(io.BytesIO(content))
+        reader_source: object
+        if file_path is not None:
+            reader_source = str(file_path)
+        else:
+            reader_source = io.BytesIO(bytes(content or b""))
+        reader = PdfReader(reader_source)
     except Exception:
         return ""
     parts: List[str] = []
@@ -25744,19 +26289,24 @@ def _should_early_stop_pdf_full_parse(
 
 
 def _extract_pdf_text(
-    content: bytes,
+    content: Optional[bytes],
     filename: str,
     *,
     material_type: object = None,
     start_page: int = 1,
     prior_text: str = "",
     allow_early_stop: bool = True,
+    file_path: Optional[Path] = None,
 ) -> str:
     normalized_type = _normalize_material_type(material_type, filename=filename)
     normalized_start_page = max(1, int(start_page))
     normalized_prior_text = _strip_pdf_backend_prefix(prior_text)
     if pymupdf is not None:
-        doc = pymupdf.open(stream=content, filetype="pdf")
+        doc = (
+            pymupdf.open(str(file_path))
+            if file_path is not None
+            else pymupdf.open(stream=content, filetype="pdf")
+        )
         try:
             parts: List[str] = []
             filename_terms = _extract_terms(filename, max_terms=10)
@@ -25843,6 +26393,7 @@ def _extract_pdf_text(
         start_page=normalized_start_page,
         prior_text=normalized_prior_text,
         allow_early_stop=allow_early_stop,
+        file_path=file_path,
     )
     if pypdf_text:
         return f"[PDF_BACKEND:pypdf]\n{pypdf_text}"
@@ -25851,6 +26402,12 @@ def _extract_pdf_text(
         raise ValueError(
             "PDF 解析不可用：请安装与当前系统架构兼容的 PyMuPDF，或安装 pypdf 作为兼容解析后端。"
         )
+    if file_path is not None:
+        snippet = _extract_binary_text_snippet(
+            _read_document_bytes_from_path(file_path), max_chars=4000
+        )
+        if snippet:
+            return snippet
     return f"[PDF资料] 文件: {filename}（未提取到有效文本）"
 
 
@@ -25967,7 +26524,7 @@ def _should_early_stop_pdf_preview(
 
 
 def _extract_pdf_text_preview(
-    content: bytes,
+    content: Optional[bytes],
     filename: str,
     *,
     material_type: object = "tender_qa",
@@ -25975,10 +26532,15 @@ def _extract_pdf_text_preview(
     max_chars: int = 16000,
     ocr_pages: int = 2,
     stop_when_project_name_found: bool = False,
+    file_path: Optional[Path] = None,
 ) -> str:
     normalized_type = _normalize_material_type(material_type, filename=filename)
     if pymupdf is not None:
-        doc = pymupdf.open(stream=content, filetype="pdf")
+        doc = (
+            pymupdf.open(str(file_path))
+            if file_path is not None
+            else pymupdf.open(stream=content, filetype="pdf")
+        )
         try:
             parts: List[str] = []
             filename_terms = _extract_terms(filename, max_terms=10)
@@ -26073,45 +26635,63 @@ def _extract_pdf_text_preview(
         max_pages=max_pages,
         max_chars=max_chars,
         stop_when_project_name_found=stop_when_project_name_found,
+        file_path=file_path,
     )
     if pypdf_text:
         return f"[PDF_BACKEND:pypdf]\n{pypdf_text[: max(4000, int(max_chars))]}"
 
-    snippet = _extract_binary_text_snippet(content, max_chars=max_chars)
+    snippet = _extract_binary_text_snippet(
+        _resolve_document_bytes(content, file_path),
+        max_chars=max_chars,
+    )
     if snippet:
         return snippet
     return f"[PDF资料] 文件: {filename}（预览未提取到有效文本）"
 
 
 def _read_uploaded_file_content(
-    content: bytes,
+    content: Optional[bytes],
     filename: str,
     *,
     material_type: object = None,
+    file_path: Optional[Path] = None,
 ) -> str:
     """根据文件名解析上传文件为文本，覆盖招标/清单/图纸/现场照片常见格式。"""
     name = filename.lower()
     if name.endswith(".txt") or name.endswith(".md") or name.endswith(".csv"):
-        return content.decode("utf-8", errors="ignore")
+        if file_path is not None:
+            return Path(file_path).read_text(encoding="utf-8", errors="ignore")
+        return bytes(content or b"").decode("utf-8", errors="ignore")
     if name.endswith(".docx"):
         if Document is None:
             raise ValueError("DOCX 解析不可用：请安装与当前系统架构兼容的 python-docx/lxml。")
-        doc = Document(io.BytesIO(content))
+        doc = (
+            Document(str(file_path))
+            if file_path is not None
+            else Document(io.BytesIO(bytes(content or b"")))
+        )
         return "\n".join(p.text for p in doc.paragraphs)
     if name.endswith(".doc") or name.endswith(".docm"):
-        snippet = _extract_binary_text_snippet(content)
+        snippet = _extract_binary_text_snippet(_resolve_document_bytes(content, file_path))
         if snippet:
             return snippet
         return f"[DOC资料] 文件: {filename}（当前环境未启用结构化解析，已纳入文件元信息）"
     if name.endswith(".pdf"):
-        return _extract_pdf_text(content, filename, material_type=material_type)
+        return _extract_pdf_text(
+            content, filename, material_type=material_type, file_path=file_path
+        )
     if name.endswith(".json"):
-        return content.decode("utf-8", errors="ignore")
+        if file_path is not None:
+            return Path(file_path).read_text(encoding="utf-8", errors="ignore")
+        return bytes(content or b"").decode("utf-8", errors="ignore")
     if name.endswith(".xlsx") or name.endswith(".xls") or name.endswith(".xlsm"):
         try:
             import openpyxl
 
-            wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+            workbook_source: object = (
+                str(file_path) if file_path is not None else io.BytesIO(bytes(content or b""))
+            )
+            wb = openpyxl.load_workbook(workbook_source, read_only=True, data_only=True)
             parts = []
             for sheet in wb.worksheets:
                 for row in sheet.iter_rows(values_only=True):
@@ -26122,16 +26702,18 @@ def _read_uploaded_file_content(
             raise ValueError(f"Excel 解析失败: {e}") from e
     if name.endswith(".dxf"):
         try:
-            return _extract_dxf_text(content)
+            return _extract_dxf_text(_resolve_document_bytes(content, file_path))
         except ValueError:
             raise
         except Exception as e:
             raise ValueError(f"DXF 解析失败: {e}") from e
     if name.endswith(".dwg"):
-        return _extract_dwg_text(content, filename)
+        return _extract_dwg_text(_resolve_document_bytes(content, file_path), filename)
     if name.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")):
-        return _extract_image_content(content, filename)
-    snippet = _extract_binary_text_snippet(content, max_chars=2000)
+        return _extract_image_content(content, filename, file_path=file_path)
+    snippet = _extract_binary_text_snippet(
+        _resolve_document_bytes(content, file_path), max_chars=2000
+    )
     if snippet:
         return snippet
     raise ValueError(
@@ -26139,7 +26721,12 @@ def _read_uploaded_file_content(
     )
 
 
-def _read_uploaded_file_preview_for_project_name(content: bytes, filename: str) -> str:
+def _read_uploaded_file_preview_for_project_name(
+    content: Optional[bytes],
+    filename: str,
+    *,
+    file_path: Optional[Path] = None,
+) -> str:
     """为项目名识别提取轻量预览文本，避免自动创建时深解析整份大文件。"""
     name = filename.lower()
     if (
@@ -26148,11 +26735,17 @@ def _read_uploaded_file_preview_for_project_name(content: bytes, filename: str) 
         or name.endswith(".csv")
         or name.endswith(".json")
     ):
-        return content.decode("utf-8", errors="ignore")[:12000]
+        if file_path is not None:
+            return Path(file_path).read_text(encoding="utf-8", errors="ignore")[:12000]
+        return bytes(content or b"").decode("utf-8", errors="ignore")[:12000]
     if name.endswith(".docx"):
         if Document is None:
             raise ValueError("DOCX 解析不可用：请安装与当前系统架构兼容的 python-docx/lxml。")
-        doc = Document(io.BytesIO(content))
+        doc = (
+            Document(str(file_path))
+            if file_path is not None
+            else Document(io.BytesIO(bytes(content or b"")))
+        )
         parts: List[str] = []
         total_chars = 0
         for paragraph in doc.paragraphs:
@@ -26165,7 +26758,10 @@ def _read_uploaded_file_preview_for_project_name(content: bytes, filename: str) 
                 break
         return "\n".join(parts)
     if name.endswith(".doc") or name.endswith(".docm"):
-        snippet = _extract_binary_text_snippet(content, max_chars=12000)
+        snippet = _extract_binary_text_snippet(
+            _resolve_document_bytes(content, file_path),
+            max_chars=12000,
+        )
         if snippet:
             return snippet
         return f"[DOC资料] 文件: {filename}（当前环境未启用结构化解析，已纳入文件元信息）"
@@ -26178,14 +26774,17 @@ def _read_uploaded_file_preview_for_project_name(content: bytes, filename: str) 
             max_chars=32000,
             ocr_pages=3,
             stop_when_project_name_found=True,
+            file_path=file_path,
         )
     if name.endswith(".xlsx") or name.endswith(".xls") or name.endswith(".xlsm"):
-        return _read_uploaded_file_content(content, filename)[:12000]
+        return _read_uploaded_file_content(content, filename, file_path=file_path)[:12000]
     if name.endswith(".dxf") or name.endswith(".dwg"):
-        return _read_uploaded_file_content(content, filename)[:12000]
+        return _read_uploaded_file_content(content, filename, file_path=file_path)[:12000]
     if name.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")):
-        return _read_uploaded_file_content(content, filename)[:12000]
-    snippet = _extract_binary_text_snippet(content, max_chars=12000)
+        return _read_uploaded_file_content(content, filename, file_path=file_path)[:12000]
+    snippet = _extract_binary_text_snippet(
+        _resolve_document_bytes(content, file_path), max_chars=12000
+    )
     if snippet:
         return snippet
     raise ValueError(
@@ -26194,16 +26793,17 @@ def _read_uploaded_file_preview_for_project_name(content: bytes, filename: str) 
 
 
 def _material_should_use_preview_stage(
-    content: bytes,
+    content: Optional[bytes],
     filename: str,
     *,
     material_type: object,
+    size_bytes: Optional[int] = None,
 ) -> bool:
     normalized_type = _normalize_material_type(material_type, filename=filename)
     ext = Path(str(filename or "")).suffix.lower()
-    size_bytes = len(content or b"")
+    effective_size_bytes = int(size_bytes) if size_bytes is not None else len(content or b"")
     min_bytes = int(DEFAULT_MATERIAL_PARSE_PREVIEW_MIN_BYTES_BY_TYPE.get(normalized_type, 0))
-    if min_bytes <= 0 or size_bytes < min_bytes:
+    if min_bytes <= 0 or effective_size_bytes < min_bytes:
         return False
     return bool(
         (normalized_type in {"tender_qa", "drawing", "boq"} and ext == ".pdf")
@@ -26212,11 +26812,12 @@ def _material_should_use_preview_stage(
 
 
 def _read_uploaded_file_content_for_parse_mode(
-    content: bytes,
+    content: Optional[bytes],
     filename: str,
     *,
     material_type: object,
     parse_mode: str = "full",
+    file_path: Optional[Path] = None,
 ) -> str:
     normalized_mode = str(parse_mode or "full").strip().lower()
     normalized_type = _normalize_material_type(material_type, filename=filename)
@@ -26236,6 +26837,7 @@ def _read_uploaded_file_content_for_parse_mode(
                 max_chars=max_chars,
                 ocr_pages=ocr_pages,
                 stop_when_project_name_found=False,
+                file_path=file_path,
             )
         if normalized_type == "boq" and ext in {".xlsx", ".xls", ".xlsm", ".csv"}:
             preview_text = _extract_boq_tabular_preview_text(
@@ -26245,20 +26847,32 @@ def _read_uploaded_file_content_for_parse_mode(
                 max_rows_per_sheet=int(
                     DEFAULT_MATERIAL_PARSE_PREVIEW_MAX_ROWS_BY_TYPE.get("boq", 180)
                 ),
+                file_path=file_path,
             )
             if preview_text:
                 return preview_text[:max_chars]
-        return _read_uploaded_file_content(content, filename, material_type=material_type)
+        return _read_uploaded_file_content(
+            content,
+            filename,
+            material_type=material_type,
+            file_path=file_path,
+        )
     if normalized_type == "boq" and ext in {".xlsx", ".xls", ".xlsm", ".csv"}:
         boq_excerpt = _extract_boq_tabular_preview_text(
             content,
             filename,
             max_sheets=int(DEFAULT_MATERIAL_PARSE_TEXT_MAX_SHEETS_BY_TYPE.get("boq", 4)),
             max_rows_per_sheet=int(DEFAULT_MATERIAL_PARSE_TEXT_MAX_ROWS_BY_TYPE.get("boq", 600)),
+            file_path=file_path,
         )
         if boq_excerpt:
             return boq_excerpt
-    return _read_uploaded_file_content(content, filename, material_type=material_type)
+    return _read_uploaded_file_content(
+        content,
+        filename,
+        material_type=material_type,
+        file_path=file_path,
+    )
 
 
 def _merge_materials_text(project_id: str) -> str:
@@ -28729,7 +29343,7 @@ def _apply_evolution_total_scale(project_id: str, report: Dict[str, object]) -> 
     tags=["施组提交"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
-def upload_shigong(
+async def upload_shigong(
     project_id: str,
     file: UploadFile = File(...),
     api_key: Optional[str] = Depends(verify_api_key),
@@ -28753,53 +29367,18 @@ def upload_shigong(
     normalized_filename = _normalize_uploaded_filename(raw_filename)
     if not normalized_filename:
         raise HTTPException(status_code=422, detail="施组文件名为空，请重试或重命名后上传。")
-    content = file.file.read()
+    staged = await _stage_upload_file_to_temp_path(file, filename=normalized_filename)
     try:
-        text = _read_uploaded_file_content(content, normalized_filename)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    submissions = load_submissions()
-    now_utc = datetime.now(timezone.utc)
-    duplicate = _find_recent_duplicate_submission(
-        submissions,
-        project_id=project_id,
-        filename=normalized_filename,
-        text=text,
-        now_utc=now_utc,
-    )
-    if duplicate is not None:
-        return SubmissionRecord(**duplicate)
-
-    _, profile_snapshot, project = _resolve_project_scoring_context(project_id)
-    scoring_engine_version = str(project.get("scoring_engine_version_locked") or "v1")
-    submission_id = str(uuid4())
-
-    report = _build_pending_submission_report(
-        project=project,
-        scoring_engine_version=scoring_engine_version,
-    )
-    if profile_snapshot:
-        report_meta = report.get("meta")
-        report_meta = report_meta if isinstance(report_meta, dict) else {}
-        report_meta["expert_profile_snapshot"] = profile_snapshot
-        report_meta["expert_profile_id"] = profile_snapshot.get("id")
-        report["meta"] = report_meta
-
-    record = {
-        "id": submission_id,
-        "project_id": project_id,
-        "filename": normalized_filename,
-        "total_score": 0.0,
-        "report": report,
-        "text": text,
-        "created_at": now_utc.isoformat(),
-        "updated_at": now_utc.isoformat(),
-        "expert_profile_id_used": profile_snapshot.get("id") if profile_snapshot else None,
-    }
-    submissions.append(record)
-    save_submissions(submissions)
-
-    return SubmissionRecord(**record)
+        if int(_to_float_or_none(staged.get("size_bytes")) or 0) <= 0:
+            raise HTTPException(status_code=422, detail="施组文件为空，请重新选择文件。")
+        return await _build_submission_record_from_local_path(
+            project_id,
+            source_path=Path(staged["path"]),
+            normalized_filename=normalized_filename,
+            locale=locale,
+        )
+    finally:
+        _remove_temp_file(staged.get("path"))
 
 
 @router.post(
@@ -32149,16 +32728,25 @@ async def add_ground_truth_from_file(
     用于界面简洁录入：选文件 + 评委分 + 最终分即可。
     """
     ensure_data_dirs()
-    content = await file.read()
-    record = _build_ground_truth_record_from_uploaded_file(
-        project_id,
-        filename=file.filename or "",
-        content=content,
-        judge_scores_form=judge_scores,
-        final_score=final_score,
-        source=source,
-        locale=locale,
+    normalized_filename = (
+        _normalize_uploaded_filename(file.filename or "") or "ground_truth_upload.bin"
     )
+    staged = await _stage_upload_file_to_temp_path(file, filename=normalized_filename)
+    try:
+        if int(_to_float_or_none(staged.get("size_bytes")) or 0) <= 0:
+            raise HTTPException(status_code=422, detail="施组文件为空，请重新选择文件。")
+        record = await run_in_threadpool(
+            _build_ground_truth_record_from_uploaded_path,
+            project_id,
+            filename=normalized_filename,
+            file_path=Path(staged["path"]),
+            judge_scores_form=judge_scores,
+            final_score=final_score,
+            source=source,
+            locale=locale,
+        )
+    finally:
+        _remove_temp_file(staged.get("path"))
     records = load_ground_truth()
     records.append(record)
     save_ground_truth(records)
@@ -32190,15 +32778,24 @@ async def add_ground_truth_from_files(
     通过上传多个施组文件批量录入真实评标。后端将逐个解析并保存。
     """
     ensure_data_dirs()
-    uploads = [(file.filename or "unknown", await file.read()) for file in files]
-    items, success_records = _build_ground_truth_batch_items_from_uploaded_files(
-        project_id,
-        uploads=uploads,
-        judge_scores_form=judge_scores,
-        final_score=final_score,
-        source=source,
-        locale=locale,
-    )
+    staged_uploads: List[tuple[str, Path]] = []
+    try:
+        for uploaded in files:
+            normalized_filename = _normalize_uploaded_filename(uploaded.filename or "") or "unknown"
+            staged = await _stage_upload_file_to_temp_path(uploaded, filename=normalized_filename)
+            staged_uploads.append((normalized_filename, Path(staged["path"])))
+        items, success_records = await run_in_threadpool(
+            _build_ground_truth_batch_items_from_uploaded_paths,
+            project_id,
+            uploads=staged_uploads,
+            judge_scores_form=judge_scores,
+            final_score=final_score,
+            source=source,
+            locale=locale,
+        )
+    finally:
+        for _, staged_path in staged_uploads:
+            _remove_temp_file(staged_path)
 
     if success_records:
         records = load_ground_truth()
@@ -32862,12 +33459,26 @@ def get_compilation_instructions(
 )
 async def parse_file_to_text(file: UploadFile = File(...)) -> Dict[str, str]:
     """解析上传文件为纯文本。支持 .txt、.docx、.pdf、.json、.xlsx/.xls、.dxf"""
-    content = await file.read()
+    normalized_filename = _normalize_uploaded_filename(file.filename or "")
+    staged = await _stage_upload_file_to_temp_path(
+        file, filename=normalized_filename or "upload.bin"
+    )
     try:
-        text = _read_uploaded_file_content(content, file.filename or "")
+        if int(_to_float_or_none(staged.get("size_bytes")) or 0) <= 0:
+            raise HTTPException(status_code=422, detail="文件为空，请重新选择文件。")
+        text = await run_in_threadpool(
+            _read_uploaded_file_content,
+            None,
+            normalized_filename or str(staged.get("filename") or ""),
+            file_path=staged["path"],
+        )
         return {"text": text}
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _coerce_document_parse_error(exc, filename=normalized_filename) from exc
+    finally:
+        _remove_temp_file(staged.get("path"))
 
 
 # API 兼容路由（与执行文档中的 /api/projects/... 路径保持一致）
@@ -33382,7 +33993,7 @@ def web_create_project(
 
 
 @app.post("/web/create_project_from_tender", include_in_schema=False)
-def web_create_project_from_tender(
+async def web_create_project_from_tender(
     request: Request,
     file: UploadFile = File(...),
     api_key: str = Form(""),
@@ -33400,7 +34011,7 @@ def web_create_project_from_tender(
     if redirect is not None:
         return redirect
     try:
-        result = create_project_from_tender(
+        result = await create_project_from_tender(
             file=file,
             project_name_override=project_name_override,
             api_key=verified_api_key,
@@ -33459,7 +34070,7 @@ def web_delete_project(
 
 
 @app.post("/web/upload_materials", include_in_schema=False)
-def web_upload_materials(
+async def web_upload_materials(
     request: Request,
     project_id: str = Form(""),
     material_type: str = Form(MATERIAL_TYPE_DEFAULT),
@@ -33500,7 +34111,7 @@ def web_upload_materials(
     first_error = ""
     for f in files:
         try:
-            upload_material(
+            await upload_material(
                 project_id=pid,
                 file=f,
                 material_type=material_type,
@@ -33508,6 +34119,10 @@ def web_upload_materials(
                 locale="zh",
             )
             ok_count += 1
+        except DocumentParseError as exc:
+            fail_count += 1
+            if not first_error:
+                first_error = exc.detail
         except Exception as exc:  # noqa: BLE001 - web fallback should keep processing
             fail_count += 1
             if not first_error:
@@ -33556,7 +34171,7 @@ def web_upload_materials_get_fallback(project_id: str = ""):
 
 
 @app.post("/web/upload_shigong", include_in_schema=False)
-def web_upload_shigong(
+async def web_upload_shigong(
     request: Request,
     project_id: str = Form(""),
     file: List[UploadFile] = File(default=[]),
@@ -33596,8 +34211,12 @@ def web_upload_shigong(
     first_error = ""
     for f in files:
         try:
-            upload_shigong(project_id=pid, file=f, api_key=verified_api_key, locale="zh")
+            await upload_shigong(project_id=pid, file=f, api_key=verified_api_key, locale="zh")
             ok_count += 1
+        except DocumentParseError as exc:
+            fail_count += 1
+            if not first_error:
+                first_error = exc.detail
         except Exception as exc:  # noqa: BLE001 - web fallback should keep processing
             fail_count += 1
             if not first_error:
