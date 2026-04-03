@@ -10,6 +10,8 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib import error, request
 from urllib.parse import urlparse
 
+from app.storage import load_json, save_json
+
 OPS_AUDIT_PREPARATION_STATUSES = {"scoring_preparation", "draft", "created"}
 OPS_AUDIT_SYNTHETIC_PREFIXES = ("ops_", "ops招标项目_", "e2e_")
 OPS_RUNTIME_REPAIRABLE_ITEMS = frozenset(
@@ -480,7 +482,7 @@ def _run_restart_command(restart_cmd: List[str]) -> Dict[str, Any]:
 def _load_smoke_runtime_retry_state(path: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
     retry_path = path or OPS_SMOKE_RUNTIME_RETRY_STATE_PATH
     try:
-        payload = json.loads(retry_path.read_text(encoding="utf-8"))
+        payload = load_json(retry_path, {})
     except Exception:
         return {}
     if not isinstance(payload, dict):
@@ -497,11 +499,7 @@ def _save_smoke_runtime_retry_state(
     path: Optional[Path] = None,
 ) -> None:
     retry_path = path or OPS_SMOKE_RUNTIME_RETRY_STATE_PATH
-    retry_path.parent.mkdir(parents=True, exist_ok=True)
-    retry_path.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    save_json(retry_path, state)
 
 
 def _smoke_runtime_retry_cooldown_remaining(

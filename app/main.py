@@ -28119,6 +28119,40 @@ def _build_scoring_readiness(project_id: str, project: Dict[str, object]) -> Dic
     }
 
 
+def _build_evolution_readiness(project_id: str, project: Dict[str, object]) -> Dict[str, object]:
+    scoring_readiness = _build_scoring_readiness(project_id, project)
+    submissions = (
+        scoring_readiness.get("submissions")
+        if isinstance(scoring_readiness.get("submissions"), dict)
+        else {}
+    )
+    non_empty_submission_count = int(submissions.get("non_empty") or 0)
+    scored_submission_count = int(submissions.get("scored") or 0)
+
+    issues: List[str] = []
+    if non_empty_submission_count <= 0:
+        issues.append("尚未上传并完成施组评分，请先上传施组并执行评分。")
+    elif scored_submission_count <= 0:
+        scoring_issues = [
+            str(item).strip()
+            for item in (scoring_readiness.get("issues") or [])
+            if str(item).strip()
+        ]
+        if scoring_issues:
+            issues.append(f"请先完成施组评分后再执行学习与校准：{scoring_issues[0]}")
+        else:
+            issues.append("请先完成施组评分后再执行学习与校准。")
+
+    return {
+        "project_id": project_id,
+        "ready": scored_submission_count > 0,
+        "issues": issues,
+        "submissions": submissions,
+        "scoring_readiness": scoring_readiness,
+        "generated_at": _now_iso(),
+    }
+
+
 def _build_project_mece_audit(project_id: str, project: Dict[str, object]) -> Dict[str, object]:
     """
     项目级 MECE 审计（Mutually Exclusive, Collectively Exhaustive）。
@@ -33173,6 +33207,17 @@ def evolve_project(
     project = next((p for p in projects if p["id"] == project_id), None)
     if project is None:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    evolution_readiness = _build_evolution_readiness(project_id, project)
+    if not bool(evolution_readiness.get("ready")):
+        issue_texts = [
+            str(item).strip()
+            for item in (evolution_readiness.get("issues") or [])
+            if str(item).strip()
+        ]
+        raise HTTPException(
+            status_code=422,
+            detail=issue_texts[0] if issue_texts else "请先完成施组评分后再执行学习与校准。",
+        )
     _refresh_project_ground_truth_learning_records(project_id)
     blocked_guardrails = _collect_blocked_ground_truth_guardrails(project_id)
     before_manual_confirmation_payload = _build_manual_confirmation_audit_payload(
@@ -35314,7 +35359,7 @@ def index(
               if (window.renderScoringDiagnosticPanel && typeof window.renderScoringDiagnosticPanel === 'function') {
                 window.renderScoringDiagnosticPanel(data || {});
               } else {
-                setResultHtml(cfg.resultId, '<strong>评分证据链诊断</strong><pre>' + esc(JSON.stringify(data || {}, null, 2)) + '</pre>');
+                setResultHtml(cfg.resultId, renderCompactResultSummaryHtml('评分证据链诊断', data || {}));
               }
               return true;
             }
@@ -35427,7 +35472,7 @@ def index(
               if (window.renderSystemImprovementOverviewPanel && typeof window.renderSystemImprovementOverviewPanel === 'function') {
                 window.renderSystemImprovementOverviewPanel(data || {});
               } else {
-                setResultHtml(cfg.resultId, '<strong>系统继续完善总览</strong><pre>' + esc(JSON.stringify(data || {}, null, 2)) + '</pre>');
+                setResultHtml(cfg.resultId, renderCompactResultSummaryHtml('系统继续完善总览', data || {}));
               }
               return true;
             }
@@ -35435,7 +35480,7 @@ def index(
               if (typeof renderSelfCheckPanel === 'function') {
                 renderSelfCheckPanel(data || {});
               } else {
-                setResultHtml(cfg.resultId, '<strong>系统自检</strong><pre>' + esc(JSON.stringify(data || {}, null, 2)) + '</pre>');
+                setResultHtml(cfg.resultId, renderCompactResultSummaryHtml('系统自检', data || {}));
               }
               return true;
             }
@@ -35443,7 +35488,7 @@ def index(
               if (window.renderDataHygienePanel && typeof window.renderDataHygienePanel === 'function') {
                 window.renderDataHygienePanel(data || {});
               } else {
-                setResultHtml(cfg.resultId, '<strong>数据卫生巡检</strong><pre>' + esc(JSON.stringify(data || {}, null, 2)) + '</pre>');
+                setResultHtml(cfg.resultId, renderCompactResultSummaryHtml('数据卫生巡检', data || {}));
               }
               return true;
             }
@@ -35456,7 +35501,7 @@ def index(
               if (window.renderTrialPreflightPanel && typeof window.renderTrialPreflightPanel === 'function') {
                 window.renderTrialPreflightPanel(data || {});
               } else {
-                setResultHtml(cfg.resultId, '<strong>试车前综合体检</strong><pre>' + esc(JSON.stringify(data || {}, null, 2)) + '</pre>');
+                setResultHtml(cfg.resultId, renderCompactResultSummaryHtml('试车前综合体检', data || {}));
               }
               return true;
             }
@@ -36414,7 +36459,7 @@ def index(
               if (window.renderSystemImprovementOverviewPanel && typeof window.renderSystemImprovementOverviewPanel === 'function') {
                 window.renderSystemImprovementOverviewPanel(data || {});
               } else {
-                fallbackSetResultHtml(resultId, '<strong>系统继续完善总览</strong><pre>' + fallbackEscapeHtml(text || '{}') + '</pre>');
+                fallbackSetResultHtml(resultId, renderCompactResultSummaryHtml('系统继续完善总览', data || {}));
               }
               return true;
             }
@@ -36422,7 +36467,7 @@ def index(
               if (typeof renderSelfCheckPanel === 'function') {
                 renderSelfCheckPanel(data || {});
               } else {
-                fallbackSetResultHtml(resultId, '<strong>系统自检</strong><pre>' + fallbackEscapeHtml(text || '{}') + '</pre>');
+                fallbackSetResultHtml(resultId, renderCompactResultSummaryHtml('系统自检', data || {}));
               }
               return true;
             }
@@ -36430,7 +36475,7 @@ def index(
               if (window.renderDataHygienePanel && typeof window.renderDataHygienePanel === 'function') {
                 window.renderDataHygienePanel(data || {});
               } else {
-                fallbackSetResultHtml(resultId, '<strong>数据卫生巡检</strong><pre>' + fallbackEscapeHtml(text || '{}') + '</pre>');
+                fallbackSetResultHtml(resultId, renderCompactResultSummaryHtml('数据卫生巡检', data || {}));
               }
               return true;
             }
@@ -36443,7 +36488,7 @@ def index(
               if (window.renderTrialPreflightPanel && typeof window.renderTrialPreflightPanel === 'function') {
                 window.renderTrialPreflightPanel(data || {});
               } else {
-                fallbackSetResultHtml(resultId, '<strong>试车前综合体检</strong><pre>' + fallbackEscapeHtml(text || '{}') + '</pre>');
+                fallbackSetResultHtml(resultId, renderCompactResultSummaryHtml('试车前综合体检', data || {}));
               }
               return true;
             }
@@ -36451,12 +36496,12 @@ def index(
               if (window.renderScoringDiagnosticPanel && typeof window.renderScoringDiagnosticPanel === 'function') {
                 window.renderScoringDiagnosticPanel(data || {});
               } else {
-                fallbackSetResultHtml(resultId, '<strong>评分证据链诊断</strong><pre>' + fallbackEscapeHtml(text || '{}') + '</pre>');
+                fallbackSetResultHtml(resultId, renderCompactResultSummaryHtml('评分证据链诊断', data || {}));
               }
               return true;
             }
             if (aid === 'btnAdaptive' || aid === 'btnAdaptivePatch' || aid === 'btnAdaptiveValidate' || aid === 'btnAdaptiveApply') {
-              fallbackSetResultHtml(resultId, '<strong>自适应结果</strong><pre>' + fallbackEscapeHtml(text || '{}') + '</pre>');
+              fallbackSetResultHtml(resultId, renderCompactResultSummaryHtml('自适应结果', data || {}));
               return true;
             }
             if (aid === 'btnMaterialDepthReport') {
@@ -37166,7 +37211,6 @@ def index(
       <script>
         function reportClientError(prefix, err) {
           const msg = prefix + ': ' + String((err && (err.message || err.reason || err)) || '未知错误');
-          console.error(msg, err);
           setHiddenExecutionSummaryText(msg);
         }
         function stashExecutionSummaryState(patch) {
@@ -37840,6 +37884,12 @@ def index(
         let expertProfileRescoreInFlight = false;
         let projectMetaById = {};
         let scoringReadinessState = { project_id: '', ready: false, gate_passed: false, issues: [] };
+        let evolutionReadinessState = {
+          project_id: '',
+          ready: false,
+          issues: ['请先完成施组评分后再执行学习与校准。'],
+          submissions: { total: 0, non_empty: 0, scored: 0 },
+        };
         let scoringReadinessPanelState = null;
         let systemClosureSummaryState = null;
         let materialParseSummaryState = { summary: null, materials: [] };
@@ -38123,6 +38173,11 @@ def index(
           PROJECT_REQUIRED_BUTTON_IDS.forEach((id) => {
             const el = document.getElementById(id);
             if (!el) return;
+            if (id === 'btnEvolve' && hasProject) {
+              el.disabled = true;
+              el.title = '正在核对评分状态，请稍候。';
+              return;
+            }
             el.disabled = !hasProject;
             el.title = title;
           });
@@ -40978,7 +41033,7 @@ def index(
             }
           };
         } else {
-          console.error('createProject form not found');
+          setHiddenExecutionSummaryText('createProject form not found');
         }
         const formCreateFromTender = document.getElementById('createProjectFromTender');
         let createProjectFromTenderInFlight = false;
@@ -41155,7 +41210,7 @@ def index(
             }
           };
         } else {
-          console.error('createProjectFromTender form not found');
+          setHiddenExecutionSummaryText('createProjectFromTender form not found');
         }
         const createProjectNameInput = document.getElementById('createProjectNameInput');
         if (createProjectNameInput) {
@@ -42721,6 +42776,27 @@ def index(
             .replace(/\"/g, '&quot;')
             .replace(/'/g, '&#39;');
         }
+        function renderCompactResultSummaryHtml(title, data, options=null) {
+          const opts = (options && typeof options === 'object') ? options : {};
+          const providedLines = Array.isArray(opts.lines) ? opts.lines : null;
+          const lines = (providedLines || buildCompactOutputLines(data))
+            .map((item) => String(item || '').trim())
+            .filter((item) => !!item)
+            .slice(0, 8);
+          let html = '<strong>' + escapeHtmlText(String(title || '操作结果')) + '</strong>';
+          if (opts.message) {
+            html += '<p style="margin:6px 0 0 0;color:#475569">' + escapeHtmlText(String(opts.message || '')) + '</p>';
+          }
+          if (lines.length) {
+            html += '<ul style="margin:6px 0 0 18px;color:#334155">';
+            html += lines.map((item) => '<li>' + escapeHtmlText(item) + '</li>').join('');
+            html += '</ul>';
+          } else {
+            html += '<p class="muted" style="margin:6px 0 0 0">' + escapeHtmlText(String(opts.emptyText || '暂无更多结构化信息。')) + '</p>';
+          }
+          return html;
+        }
+        window.renderCompactResultSummaryHtml = renderCompactResultSummaryHtml;
         function toFiniteNumber(v) {
           if (v == null) return null;
           if (typeof v === 'string' && !v.trim()) return null;
@@ -45285,6 +45361,7 @@ def index(
             gate_passed: gatePassed,
             issues: issues,
           };
+          applyEvolutionReadiness(data);
           const btn = document.getElementById('btnScoreShigong');
           if (!btn) return;
           const sameProject = payloadProjectId && currentProjectId && payloadProjectId === currentProjectId;
@@ -45302,6 +45379,72 @@ def index(
           const reason = issues.length ? String(issues[0]) : '评分前置条件未满足';
           btn.title = reason;
         }
+        function buildEvolutionReadinessFromScoringPayload(payload) {
+          const data = (payload && typeof payload === 'object') ? payload : {};
+          const submissions = (data.submissions && typeof data.submissions === 'object')
+            ? data.submissions
+            : {};
+          const nonEmptyCount = Number(submissions.non_empty || 0);
+          const scoredCount = Number(submissions.scored || 0);
+          const scoringIssues = Array.isArray(data.issues) ? data.issues : [];
+          const issues = [];
+          if (nonEmptyCount <= 0) {
+            issues.push('请先上传施组并完成评分后再执行学习与校准。');
+          } else if (scoredCount <= 0) {
+            const detail = scoringIssues.length ? String(scoringIssues[0] || '').trim() : '';
+            issues.push(detail
+              ? ('请先完成施组评分后再执行学习与校准：' + detail)
+              : '请先完成施组评分后再执行学习与校准。');
+          }
+          return {
+            project_id: String(data.project_id || '').trim(),
+            ready: scoredCount > 0,
+            issues: issues,
+            submissions: {
+              total: Number(submissions.total || 0),
+              non_empty: nonEmptyCount,
+              scored: scoredCount,
+            },
+          };
+        }
+        function applyEvolutionReadiness(payload) {
+          const data = buildEvolutionReadinessFromScoringPayload(payload);
+          evolutionReadinessState = data;
+          const btn = document.getElementById('btnEvolve');
+          if (!btn) return;
+          const currentProjectId = pid();
+          const payloadProjectId = String(data.project_id || currentProjectId || '');
+          const sameProject = payloadProjectId && currentProjectId && payloadProjectId === currentProjectId;
+          if (!sameProject) {
+            btn.disabled = true;
+            btn.title = currentProjectId ? '正在核对评分状态，请稍候。' : '请先选择项目';
+            return;
+          }
+          if (data.ready) {
+            btn.disabled = false;
+            btn.title = '';
+            return;
+          }
+          btn.disabled = true;
+          btn.title = data.issues.length
+            ? String(data.issues[0] || '').trim()
+            : '请先完成施组评分后再执行学习与校准。';
+        }
+        function currentEvolutionReadinessIssue(projectId='') {
+          const currentProjectId = String(projectId || pid() || '').trim();
+          if (!currentProjectId) return '请先选择项目';
+          const readinessProjectId = String(evolutionReadinessState.project_id || '').trim();
+          if (!readinessProjectId || readinessProjectId !== currentProjectId) {
+            return '正在核对评分状态，请稍候。';
+          }
+          if (evolutionReadinessState.ready) return '';
+          const issues = Array.isArray(evolutionReadinessState.issues)
+            ? evolutionReadinessState.issues
+            : [];
+          return issues.length
+            ? String(issues[0] || '').trim()
+            : '请先完成施组评分后再执行学习与校准。';
+        }
         function clearScoringReadinessPanel() {
           const el = document.getElementById('scoringReadinessResult');
           if (!el) return;
@@ -45312,6 +45455,7 @@ def index(
           clearProjectClosureZoneHint('shigongClosureHint');
           updateShigongGateSummary({ project_id: pid(), ready: false, gate_passed: false, issues: ['评分前置检查未完成'] });
           applyScoringReadiness({ project_id: pid(), ready: false, gate_passed: false, issues: ['评分前置检查未完成'] });
+          applyEvolutionReadiness({ project_id: pid(), submissions: { total: 0, non_empty: 0, scored: 0 }, issues: ['评分前置检查未完成'] });
         }
         function materialTypeUploadAnchor(materialType) {
           const mt = String(materialType || '').trim();
@@ -47480,7 +47624,7 @@ def index(
               html += '<strong>常见扣分</strong><ul>' + data.frequent_penalties.map(p => '<li>' + (p.code || '') + ': ' + (p.count || 0) + ' 次</li>').join('') + '</ul>';
             if (data.recommendations && data.recommendations.length)
               html += '<strong>建议</strong><ul>' + data.recommendations.map(r => '<li>' + (r.reason || '') + ' — ' + (r.action || '') + '</li>').join('') + '</ul>';
-            el.innerHTML = html || '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
+            el.innerHTML = html || renderCompactResultSummaryHtml('洞察分析', data);
           } else {
             el.innerHTML = '<span class="error">' + (data.detail || '请求失败') + '</span>';
           }
@@ -47499,9 +47643,26 @@ def index(
           document.getElementById('insightsResult').style.display = 'none';
           try {
             const data = JSON.parse(text);
-            el.innerHTML = '<p class="success">学习画像已生成/更新</p><pre>' + JSON.stringify(data.dimension_multipliers || {}, null, 2) + '</pre>';
+            const multipliers = (data.dimension_multipliers && typeof data.dimension_multipliers === 'object')
+              ? Object.entries(data.dimension_multipliers)
+              : [];
+            let html = '<p class="success">学习画像已生成/更新</p>';
+            if (multipliers.length) {
+              html += '<table><tr><th>维度</th><th>倍率</th></tr>'
+                + multipliers.slice(0, 16).map(([dimId, multiplier]) => '<tr>'
+                  + '<td>' + escapeHtmlText(String(DIMENSION_LABELS[String(dimId || '').padStart(2, '0')] || dimId || '-')) + '</td>'
+                  + '<td>' + escapeHtmlText(String(multiplier != null ? multiplier : '-')) + '</td>'
+                  + '</tr>').join('')
+                + '</table>';
+            } else {
+              html += renderCompactResultSummaryHtml('学习画像摘要', data, { emptyText: '当前无可展示的学习倍率。' });
+            }
+            el.innerHTML = html;
           } catch (_) {
-            el.innerHTML = '<pre>' + text + '</pre>';
+            el.innerHTML = renderCompactResultSummaryHtml('学习画像结果', {
+              message: '学习画像已执行完成',
+              detail: summarizeOutputScalar(text, 240),
+            });
           }
         });
 
@@ -47696,8 +47857,8 @@ def index(
             if (data.penalty_stats && Object.keys(data.penalty_stats).length)
               html += '<strong>扣分统计</strong><ul>' + Object.entries(data.penalty_stats).map(([k,v]) => '<li>' + k + ': ' + v + '</li>').join('') + '</ul>';
             if (data.suggestions && data.suggestions.length)
-              html += '<strong>建议</strong><ul>' + data.suggestions.map(s => '<li>' + (s.message || JSON.stringify(s)) + '</li>').join('') + '</ul>';
-            el.innerHTML = html || '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
+              html += '<strong>建议</strong><ul>' + data.suggestions.map(s => '<li>' + escapeHtmlText(s.message || summarizeOutputValue(s)) + '</li>').join('') + '</ul>';
+            el.innerHTML = html || renderCompactResultSummaryHtml('自适应建议', data);
           } else {
             el.innerHTML = '<span class="error">' + (data.detail || '请求失败') + '</span>';
           }
@@ -47716,11 +47877,28 @@ def index(
           document.getElementById('adaptiveApplyResult').style.display = 'none';
           if (res.ok) {
             let html = '';
-            if (data.lexicon_additions && Object.keys(data.lexicon_additions).length)
-              html += '<strong>词库补丁</strong><details><summary>展开</summary><pre>' + JSON.stringify(data.lexicon_additions, null, 2) + '</pre></details>';
-            if (data.rubric_adjustments && Object.keys(data.rubric_adjustments).length)
-              html += '<strong>规则补丁</strong><details><summary>展开</summary><pre>' + JSON.stringify(data.rubric_adjustments, null, 2) + '</pre></details>';
-            el.innerHTML = html || '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
+            const lexiconKeys = (data.lexicon_additions && typeof data.lexicon_additions === 'object')
+              ? Object.keys(data.lexicon_additions)
+              : [];
+            const rubricKeys = Array.isArray(data.rubric_adjustments)
+              ? data.rubric_adjustments.map((row, index) => {
+                const item = (row && typeof row === 'object') ? row : {};
+                return String(item.dimension_id || item.code || ('规则项' + String(index + 1))).trim();
+              }).filter((item) => !!item)
+              : ((data.rubric_adjustments && typeof data.rubric_adjustments === 'object')
+                ? Object.keys(data.rubric_adjustments)
+                : []);
+            if (lexiconKeys.length) {
+              html += '<strong>词库补丁</strong><ul>'
+                + lexiconKeys.slice(0, 8).map((key) => '<li>' + escapeHtmlText(key) + '</li>').join('')
+                + '</ul>';
+            }
+            if (rubricKeys.length) {
+              html += '<strong>规则补丁</strong><ul>'
+                + rubricKeys.slice(0, 8).map((key) => '<li>' + escapeHtmlText(key) + '</li>').join('')
+                + '</ul>';
+            }
+            el.innerHTML = html || renderCompactResultSummaryHtml('自适应补丁', data);
           } else {
             el.innerHTML = '<span class="error">' + (data.detail || '请求失败') + '</span>';
           }
@@ -47742,7 +47920,9 @@ def index(
               data.comparisons.map(c => '<tr><td>' + c.filename + '</td><td>' + c.old_score + '</td><td>' + c.new_score + '</td><td>' + c.delta + '</td></tr>').join('') + '</table>';
             el.innerHTML = html;
           } else {
-            el.innerHTML = res.ok ? '<pre>' + JSON.stringify(data, null, 2) + '</pre>' : '<span class="error">' + (data.detail || '请求失败') + '</span>';
+            el.innerHTML = res.ok
+              ? renderCompactResultSummaryHtml('自适应验证结果', data)
+              : '<span class="error">' + (data.detail || '请求失败') + '</span>';
           }
         });
 
@@ -47767,7 +47947,10 @@ def index(
             const data = JSON.parse(text);
             el.innerHTML = data.applied ? '<p class="success">已应用。变更: ' + (data.changes || []).join(', ') + '</p><p>备份: ' + (data.backup_path || '') + '</p>' : '<p class="error">' + (data.detail || text) + '</p>';
           } catch (_) {
-            el.innerHTML = '<pre>' + text + '</pre>';
+            el.innerHTML = renderCompactResultSummaryHtml('补丁应用结果', {
+              message: '补丁应用已返回文本结果',
+              detail: summarizeOutputScalar(text, 240),
+            });
           }
         });
 
@@ -48020,6 +48203,11 @@ def index(
         safeClick('btnEvolve', async () => {
           if (!ensureProjectForAction('evolveResult')) return;
           const projectId = actionProjectId();
+          const evolutionIssue = currentEvolutionReadinessIssue(projectId);
+          if (evolutionIssue) {
+            setResultError('evolveResult', evolutionIssue);
+            return;
+          }
           const currentDraft = currentGroundTruthDraftFormState();
           let autoRecordedBeforeEvolve = false;
           if (currentDraft.hasAnyInput) {
@@ -48062,8 +48250,14 @@ def index(
             if (data.high_score_logic && data.high_score_logic.length) html += '<strong>高分逻辑</strong><ul>' + data.high_score_logic.map(l => '<li>' + l + '</li>').join('') + '</ul>';
             if (data.writing_guidance && data.writing_guidance.length) html += '<strong>编制指导</strong><ul>' + data.writing_guidance.map(l => '<li>' + l + '</li>').join('') + '</ul>';
             if (data.scoring_evolution && data.scoring_evolution.dimension_multipliers && Object.keys(data.scoring_evolution.dimension_multipliers).length) {
+              const multiplierRows = Object.entries(data.scoring_evolution.dimension_multipliers || {});
               html += '<strong>评分进化（贴近青天）</strong><p style="font-size:12px;color:#64748b">' + (data.scoring_evolution.goal || '') + '</p>';
-              html += '<details><summary>维度权重建议</summary><pre style="margin:4px 0">' + JSON.stringify(data.scoring_evolution.dimension_multipliers, null, 2) + '</pre></details>';
+              html += '<details><summary>维度权重建议</summary><table><tr><th>维度</th><th>倍率</th></tr>'
+                + multiplierRows.slice(0, 16).map(([dimId, multiplier]) => '<tr>'
+                  + '<td>' + escapeHtmlText(String(DIMENSION_LABELS[String(dimId || '').padStart(2, '0')] || dimId || '-')) + '</td>'
+                  + '<td>' + escapeHtmlText(String(multiplier != null ? multiplier : '-')) + '</td>'
+                  + '</tr>').join('')
+                + '</table></details>';
             }
             html += '<p style="font-size:12px;margin-top:8px">点击「编制系统指令」可查看/导出编制约束（必备章节、图表、禁止表述等）。</p>';
             el.innerHTML = html;
@@ -48239,7 +48433,7 @@ def index(
                 html += '<p style="font-size:12px;margin-top:8px;color:#9a3412">保密模式下已禁用改写补丁包下载。</p>';
               }
             }
-            el.innerHTML = html || '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
+            el.innerHTML = html || renderCompactResultSummaryHtml('高分编制指导', data);
             const inlinePatchDocxBtn = document.getElementById('btnGuidancePatchBundleInlineDownloadDocx');
             if (inlinePatchDocxBtn) {
               inlinePatchDocxBtn.onclick = () => {
@@ -48356,7 +48550,8 @@ def index(
           el.style.display = 'block';
           clearSystemClosureActionHint(id);
           const klass = ok ? 'success' : 'error';
-          el.innerHTML = '<p class="' + klass + '">' + title + '</p><pre style="margin:0">' + JSON.stringify(payload, null, 2) + '</pre>';
+          el.innerHTML = '<p class="' + klass + '">' + title + '</p>'
+            + renderCompactResultSummaryHtml(title, payload, { emptyText: '暂无更多结构化信息。' });
         }
         function renderEvaluationSummaryBlock(id, ok, title, payload) {
           const el = document.getElementById(id);
@@ -48364,7 +48559,8 @@ def index(
           el.style.display = 'block';
           const klass = ok ? 'success' : 'error';
           if (!ok) {
-            el.innerHTML = '<p class="' + klass + '">' + title + '</p><pre style="margin:0">' + JSON.stringify(payload, null, 2) + '</pre>';
+            el.innerHTML = '<p class="' + klass + '">' + title + '</p>'
+              + renderCompactResultSummaryHtml(title, payload, { emptyText: '请求失败，暂无更多结构化信息。' });
             return;
           }
           const data = (payload && typeof payload === 'object') ? payload : {};
@@ -48431,7 +48627,8 @@ def index(
           el.style.display = 'block';
           const klass = ok ? 'success' : 'error';
           if (!ok) {
-            el.innerHTML = '<p class="' + klass + '">' + title + '</p><pre style="margin:0">' + JSON.stringify(payload, null, 2) + '</pre>';
+            el.innerHTML = '<p class="' + klass + '">' + title + '</p>'
+              + renderCompactResultSummaryHtml(title, payload, { emptyText: '请求失败，暂无更多结构化信息。' });
             return;
           }
           const data = (payload && typeof payload === 'object') ? payload : {};
@@ -49003,9 +49200,9 @@ def index(
             }
             html += renderPostAutoRunRefreshSummaryBlock(data.post_auto_run_refresh_summary);
           }
-          html += '<details style="margin:6px 0 0 0"><summary>运行明细（已折叠）</summary><pre style="margin:6px 0 0 0">'
-            + escapeHtmlText(JSON.stringify(payload, null, 2))
-            + '</pre></details>';
+          html += '<details style="margin:6px 0 0 0"><summary>运行明细（已折叠）</summary>'
+            + renderCompactResultSummaryHtml('运行明细', payload, { emptyText: '暂无更多结构化运行摘要。' })
+            + '</details>';
           el.innerHTML = html;
         }
         safeClick('btnRebuildDelta', async () => {

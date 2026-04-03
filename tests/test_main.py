@@ -5351,6 +5351,8 @@ class TestIndexEndpoint:
         assert response.status_code == 200
         page = response.text
         assert "执行结果摘要（最近一次操作）" not in page
+        assert 'id="output"' not in page
+        assert "console.error(" not in page
         assert (
             "window.__ZHIFEI_EXECUTION_SUMMARY_STATE = window.__ZHIFEI_EXECUTION_SUMMARY_STATE || {"
             in page
@@ -5483,6 +5485,20 @@ class TestIndexEndpoint:
         assert "reason: 'upload_shigong'" in page
         assert "reason: 'score_shigong'" in page
         assert "reason: 'ground_truth_add'" in page
+
+    def test_index_frontend_blocks_evolution_until_scoring_ready(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert "let evolutionReadinessState = {" in page
+        assert "function buildEvolutionReadinessFromScoringPayload(payload)" in page
+        assert "function applyEvolutionReadiness(payload)" in page
+        assert "function currentEvolutionReadinessIssue(projectId='')" in page
+        assert "if (id === 'btnEvolve' && hasProject)" in page
+        assert "正在核对评分状态，请稍候。" in page
+        assert "const evolutionIssue = currentEvolutionReadinessIssue(projectId);" in page
+        assert "setResultError('evolveResult', evolutionIssue);" in page
+        assert "请先完成施组评分后再执行学习与校准。" in page
         assert "autoFocusEntrypoint: true" not in page
         assert "skipClosureSummaryRefresh: true" in page
         assert "reason: 'project_changed'" in page
@@ -21391,14 +21407,22 @@ class TestGroundTruthScoreRuleRoutes:
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
     @patch("app.main._collect_blocked_ground_truth_guardrails")
+    @patch("app.main._build_evolution_readiness")
     def test_evolve_requires_manual_confirm_when_guardrail_blocked(
         self,
+        mock_build_evolution_readiness,
         mock_collect_blocked,
         mock_ensure,
         mock_load_projects,
         client,
     ):
         mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 100}}]
+        mock_build_evolution_readiness.return_value = {
+            "project_id": "p1",
+            "ready": True,
+            "issues": [],
+            "submissions": {"total": 1, "non_empty": 1, "scored": 1},
+        }
         mock_collect_blocked.return_value = [
             {"record_id": "gt-1", "feedback_guardrail": {"blocked": True, "abs_delta_100": 42.0}}
         ]
@@ -21407,6 +21431,29 @@ class TestGroundTruthScoreRuleRoutes:
 
         assert response.status_code == 409
         assert "confirm_extreme_sample=1" in response.json()["detail"]
+
+    @patch("app.main._build_evolution_readiness")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_evolve_requires_scoring_readiness_before_learning(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_build_evolution_readiness,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 5}}]
+        mock_build_evolution_readiness.return_value = {
+            "project_id": "p1",
+            "ready": False,
+            "issues": ["请先完成施组评分后再执行学习与校准。"],
+            "submissions": {"total": 1, "non_empty": 1, "scored": 0},
+        }
+
+        response = client.post("/api/v1/projects/p1/evolve")
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == "请先完成施组评分后再执行学习与校准。"
 
     @patch("app.main._build_feedback_governance_report")
     @patch("app.main.save_evolution_reports")
@@ -21418,8 +21465,10 @@ class TestGroundTruthScoreRuleRoutes:
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
+    @patch("app.main._build_evolution_readiness")
     def test_evolve_uses_learning_quality_blocked_ground_truth_samples_for_report(
         self,
+        mock_build_evolution_readiness,
         mock_ensure,
         mock_load_projects,
         mock_load_ground_truth,
@@ -21433,6 +21482,12 @@ class TestGroundTruthScoreRuleRoutes:
         client,
     ):
         mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 5}}]
+        mock_build_evolution_readiness.return_value = {
+            "project_id": "p1",
+            "ready": True,
+            "issues": [],
+            "submissions": {"total": 1, "non_empty": 1, "scored": 1},
+        }
         mock_load_ground_truth.return_value = [
             {
                 "id": "gt-1",
@@ -21503,8 +21558,10 @@ class TestGroundTruthScoreRuleRoutes:
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
+    @patch("app.main._build_evolution_readiness")
     def test_evolve_confirm_extreme_sample_returns_manual_confirmation_audit(
         self,
+        mock_build_evolution_readiness,
         mock_ensure,
         mock_load_projects,
         mock_load_ground_truth,
@@ -21519,6 +21576,12 @@ class TestGroundTruthScoreRuleRoutes:
         client,
     ):
         mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 5}}]
+        mock_build_evolution_readiness.return_value = {
+            "project_id": "p1",
+            "ready": True,
+            "issues": [],
+            "submissions": {"total": 1, "non_empty": 1, "scored": 1},
+        }
         mock_collect_blocked.return_value = [{"record_id": "gt-1"}]
         mock_load_ground_truth.return_value = [
             {

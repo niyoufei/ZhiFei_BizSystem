@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import threading
 from pathlib import Path
 from typing import Any, Dict
+
+from app.storage import load_json, save_json
 
 LLM_RUNTIME_STATE_PATH = Path(__file__).resolve().parents[2] / "build" / "llm_runtime_state.json"
 _STATE_LOCK = threading.Lock()
@@ -53,7 +54,7 @@ def _runtime_state_path() -> Path:
 def _load_state_unlocked() -> Dict[str, Any]:
     path = _runtime_state_path()
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = load_json(path, _empty_state())
     except Exception:
         return _empty_state()
     if not isinstance(payload, dict):
@@ -130,11 +131,7 @@ def _load_state_unlocked() -> Dict[str, Any]:
 
 def _save_state_unlocked(state: Dict[str, Any]) -> None:
     path = _runtime_state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    save_json(path, state)
 
 
 def _normalize_timestamp(value: Any) -> float | None:

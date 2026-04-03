@@ -782,6 +782,33 @@ def test_run_ops_agents_cycle_skips_smoke_restart_during_cooldown(
     assert any("冷却期" in row for row in result["agents"]["project_flow"]["recommendations"])
 
 
+
+def test_smoke_runtime_retry_state_uses_storage_helpers(monkeypatch, tmp_path: Path):
+    retry_state_path = tmp_path / "ops_agents_smoke_retry_state.json"
+    load_calls: dict[str, object] = {}
+    save_calls: dict[str, object] = {}
+
+    def fake_load_json(path, default):
+        load_calls["path"] = path
+        load_calls["default"] = default
+        return {"project_flow": {"attempted_at": "2026-04-03T00:00:00+00:00"}}
+
+    def fake_save_json(path, payload):
+        save_calls["path"] = path
+        save_calls["payload"] = payload
+
+    monkeypatch.setattr(oa, "load_json", fake_load_json)
+    monkeypatch.setattr(oa, "save_json", fake_save_json)
+
+    state = oa._load_smoke_runtime_retry_state(retry_state_path)
+    oa._save_smoke_runtime_retry_state({"project_flow": {"outcome": "restart_ok"}}, retry_state_path)
+
+    assert load_calls["path"] == retry_state_path
+    assert load_calls["default"] == {}
+    assert state["project_flow"]["attempted_at"] == "2026-04-03T00:00:00+00:00"
+    assert save_calls["path"] == retry_state_path
+    assert save_calls["payload"] == {"project_flow": {"outcome": "restart_ok"}}
+
 def test_learning_calibration_agent_auto_runs_evolve_and_reflection():
     recent_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
     calls = {"health": 0, "governance": 0}

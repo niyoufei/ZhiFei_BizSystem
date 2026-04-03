@@ -166,6 +166,41 @@ class TestApiKeyPoolParsing:
 
 
 class TestLlmRuntimeStateCompaction:
+    def test_runtime_state_uses_storage_helpers(self, monkeypatch, tmp_path):
+        runtime_state_path = tmp_path / "llm_runtime_state.json"
+        load_calls: dict[str, object] = {}
+        save_calls: dict[str, object] = {}
+
+        def fake_load_json(path, default):
+            load_calls["path"] = path
+            load_calls["default"] = default
+            return {
+                "provider_failures": {"openai": 1712102400.0},
+                "provider_quality_degraded": {},
+                "provider_review_stats": {},
+                "account_failures": {},
+                "account_request_stats": {},
+            }
+
+        def fake_save_json(path, payload):
+            save_calls["path"] = path
+            save_calls["payload"] = payload
+
+        monkeypatch.setattr(llm_runtime_state, "LLM_RUNTIME_STATE_PATH", runtime_state_path)
+        monkeypatch.setattr(llm_runtime_state, "load_json", fake_load_json)
+        monkeypatch.setattr(llm_runtime_state, "save_json", fake_save_json)
+
+        state = llm_runtime_state._load_state_unlocked()
+        llm_runtime_state._save_state_unlocked(state)
+
+        assert load_calls["path"] == runtime_state_path
+        assert isinstance(load_calls["default"], dict)
+        assert state["provider_failures"]["openai"] == pytest.approx(1712102400.0, abs=1e-6)
+        assert save_calls["path"] == runtime_state_path
+        assert save_calls["payload"]["provider_failures"]["openai"] == pytest.approx(
+            1712102400.0, abs=1e-6
+        )
+
     def test_provider_review_stats_use_bounded_history_window(self):
         for _ in range(llm_runtime_state.LLM_RUNTIME_STATE_MAX_HISTORY + 7):
             llm_runtime_state.record_provider_review_outcome("openai", "confirmed", time.time())
