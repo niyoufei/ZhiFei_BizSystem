@@ -699,9 +699,9 @@ _MATERIAL_PARSE_CLAIM_SNAPSHOT_SIGNATURE: Optional[tuple[tuple[int, int], tuple[
 _MATERIAL_PARSE_CLAIM_SNAPSHOT_MATERIALS: List[Dict[str, object]] = []
 _MATERIAL_PARSE_CLAIM_SNAPSHOT_JOBS: List[Dict[str, object]] = []
 _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_LOCK = threading.RLock()
-_MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE: Optional[tuple[tuple[int, int], tuple[int, int]]] = (
-    None
-)
+_MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE: Optional[
+    tuple[tuple[int, int], tuple[int, int]]
+] = None
 _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIALS: List[Dict[str, object]] = []
 _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_JOBS: List[Dict[str, object]] = []
 _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_MATERIAL_BY_ID: Dict[str, Dict[str, object]] = {}
@@ -718,9 +718,9 @@ _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_QUEUED_CANDIDATES = False
 _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_RETRYABLE_FAILED_WITHOUT_DUE = False
 _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_EARLIEST_RETRYABLE_FAILED_AT: Optional[datetime] = None
 _MATERIAL_PARSE_PROJECT_STAGE_CACHE_LOCK = threading.RLock()
-_MATERIAL_PARSE_PROJECT_STAGE_CACHE_SIGNATURE: Optional[tuple[tuple[int, int], tuple[str, ...]]] = (
-    None
-)
+_MATERIAL_PARSE_PROJECT_STAGE_CACHE_SIGNATURE: Optional[
+    tuple[tuple[int, int], tuple[str, ...]]
+] = None
 _MATERIAL_PARSE_PROJECT_STAGE_CACHE_RANKS: Dict[str, int] = {}
 _MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_LOCK = threading.RLock()
 _MATERIAL_PARSE_PRIORITY_CONTEXT_CACHE_SIGNATURE: Optional[
@@ -737,9 +737,9 @@ _MATERIAL_PARSE_STATUS_MATERIALS_CACHE_SIGNATURE: Optional[
 ] = None
 _MATERIAL_PARSE_STATUS_MATERIALS_CACHE: Dict[str, Dict[str, object]] = {}
 _MATERIAL_PARSE_STATUS_CORE_CACHE_LOCK = threading.RLock()
-_MATERIAL_PARSE_STATUS_CORE_CACHE_SIGNATURE: Optional[tuple[tuple[int, int], tuple[int, int]]] = (
-    None
-)
+_MATERIAL_PARSE_STATUS_CORE_CACHE_SIGNATURE: Optional[
+    tuple[tuple[int, int], tuple[int, int]]
+] = None
 _MATERIAL_PARSE_STATUS_CORE_CACHE: Dict[str, Dict[str, object]] = {}
 
 
@@ -824,9 +824,9 @@ def _invalidate_material_parse_claim_snapshot() -> None:
     _invalidate_material_parse_priority_snapshot()
 
 
-def _material_parse_priority_snapshot_signature() -> tuple[
-    tuple[tuple[int, int], tuple[int, int]], tuple[int, int]
-]:
+def _material_parse_priority_snapshot_signature() -> (
+    tuple[tuple[tuple[int, int], tuple[int, int]], tuple[int, int]]
+):
     return (
         _material_parse_state_files_signature(),
         _material_parse_state_file_signature(SUBMISSIONS_PATH),
@@ -886,9 +886,9 @@ def _invalidate_material_parse_status_core_cache() -> None:
         _MATERIAL_PARSE_STATUS_CORE_CACHE.clear()
 
 
-def _load_material_parse_state_snapshot() -> tuple[
-    List[Dict[str, object]], List[Dict[str, object]]
-]:
+def _load_material_parse_state_snapshot() -> (
+    tuple[List[Dict[str, object]], List[Dict[str, object]]]
+):
     global _MATERIAL_PARSE_CLAIM_SNAPSHOT_SIGNATURE
     if not _material_parse_claim_cache_enabled():
         return (
@@ -913,22 +913,24 @@ def _load_material_parse_state_snapshot() -> tuple[
     return materials, jobs
 
 
-def _load_material_parse_claim_context_view() -> tuple[
-    List[Dict[str, object]],
-    List[Dict[str, object]],
-    Dict[str, Dict[str, object]],
-    Dict[str, int],
-    Dict[str, int],
-    Dict[str, Optional[datetime]],
-    Dict[str, tuple[str, str, str]],
-    Dict[str, tuple[int, int, int]],
-    List[int],
-    Dict[str, List[int]],
-    Dict[int, List[int]],
-    Dict[int, List[int]],
-    bool,
-    bool,
-]:
+def _load_material_parse_claim_context_view() -> (
+    tuple[
+        List[Dict[str, object]],
+        List[Dict[str, object]],
+        Dict[str, Dict[str, object]],
+        Dict[str, int],
+        Dict[str, int],
+        Dict[str, Optional[datetime]],
+        Dict[str, tuple[str, str, str]],
+        Dict[str, tuple[int, int, int]],
+        List[int],
+        Dict[str, List[int]],
+        Dict[int, List[int]],
+        Dict[int, List[int]],
+        bool,
+        bool,
+    ]
+):
     global _MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE
     if _material_parse_claim_context_cache_enabled():
         signature = _material_parse_state_files_signature()
@@ -1137,22 +1139,24 @@ def _load_material_parse_claim_context_view() -> tuple[
     )
 
 
-def _load_material_parse_claim_context() -> tuple[
-    List[Dict[str, object]],
-    List[Dict[str, object]],
-    Dict[str, Dict[str, object]],
-    Dict[str, int],
-    Dict[str, int],
-    Dict[str, Optional[datetime]],
-    Dict[str, tuple[str, str, str]],
-    Dict[str, tuple[int, int, int]],
-    List[int],
-    Dict[str, List[int]],
-    Dict[int, List[int]],
-    Dict[int, List[int]],
-    bool,
-    bool,
-]:
+def _load_material_parse_claim_context() -> (
+    tuple[
+        List[Dict[str, object]],
+        List[Dict[str, object]],
+        Dict[str, Dict[str, object]],
+        Dict[str, int],
+        Dict[str, int],
+        Dict[str, Optional[datetime]],
+        Dict[str, tuple[str, str, str]],
+        Dict[str, tuple[int, int, int]],
+        List[int],
+        Dict[str, List[int]],
+        Dict[int, List[int]],
+        Dict[int, List[int]],
+        bool,
+        bool,
+    ]
+):
     (
         materials,
         jobs,
@@ -1949,12 +1953,14 @@ def _touch_material_parse_active_project_type(project_id: str, material_type: ob
     _touch_material_parse_active_window(project_id, material_type, touch_project=False)
 
 
-def _collect_material_parse_active_window_state() -> tuple[
-    Set[str],
-    Set[tuple[str, str]],
-    int,
-    int,
-]:
+def _collect_material_parse_active_window_state() -> (
+    tuple[
+        Set[str],
+        Set[tuple[str, str]],
+        int,
+        int,
+    ]
+):
     now = time.monotonic()
     with _MATERIAL_PARSE_ACTIVE_PROJECTS_LOCK:
         expired = [
@@ -14112,6 +14118,14 @@ def _clip_score(value: float, low: float = 0.0, high: float = 100.0) -> float:
     return max(low, min(high, float(value)))
 
 
+def _quantize_hundred_scale_score(value: object) -> Optional[float]:
+    numeric = _to_float_or_none(value)
+    if numeric is None:
+        return None
+    clipped = Decimal(str(_clip_score(numeric, 0.0, 100.0)))
+    return _quantize_decimal_score(clipped, score_scale_max=100)
+
+
 def _normalize_score_scale_max(value: object, default: int = DEFAULT_SCORE_SCALE_MAX) -> int:
     try:
         numeric = int(float(value))
@@ -15274,8 +15288,8 @@ def _fuse_rule_and_llm_scores(
     project: Dict[str, object],
     report: Optional[Dict[str, object]] = None,
 ) -> tuple[float, float, Dict[str, object]]:
-    rule = _clip_score(rule_total)
-    llm_raw = _clip_score(llm_total_raw)
+    rule = float(_quantize_hundred_scale_score(rule_total) or 0.0)
+    llm_raw = float(_quantize_hundred_scale_score(llm_total_raw) or 0.0)
     rule_w, llm_w, delta_cap = _resolve_score_blend_weights(project)
     coverage_meta: Dict[str, object] = {}
     if isinstance(report, dict):
@@ -15288,15 +15302,17 @@ def _fuse_rule_and_llm_scores(
         else:
             rule_w, llm_w = 1.0, 0.0
         delta_cap *= delta_cap_scale
-    llm_bounded = _clip_score(max(rule - delta_cap, min(rule + delta_cap, llm_raw)))
-    fused = _clip_score(rule * rule_w + llm_bounded * llm_w)
+    llm_bounded = float(
+        _quantize_hundred_scale_score(max(rule - delta_cap, min(rule + delta_cap, llm_raw))) or 0.0
+    )
+    fused = float(_quantize_hundred_scale_score(rule * rule_w + llm_bounded * llm_w) or 0.0)
     blend_info = {
         "rule_weight": round(rule_w, 4),
         "llm_weight": round(llm_w, 4),
-        "llm_delta_cap": round(delta_cap, 2),
+        "llm_delta_cap": float(_quantize_hundred_scale_score(delta_cap) or 0.0),
         "dynamic_coverage": coverage_meta,
     }
-    return round(fused, 2), round(llm_bounded, 2), blend_info
+    return fused, llm_bounded, blend_info
 
 
 def _should_direct_apply_calibrator_prediction(model: Dict[str, object]) -> bool:
@@ -15391,6 +15407,88 @@ def _build_submission_prediction_context(
     return context
 
 
+CURRENT_SCORE_RETRY_ATTEMPTS = 3
+CURRENT_SCORE_INITIAL_BACKOFF_SECONDS = 0.5
+CURRENT_SCORE_FAILURE_MESSAGE = "计算中断异常：校准引擎处理失败，请重试"
+_CURRENT_SCORE_RETRYABLE_ERROR_MARKERS = (
+    "timeout",
+    "timed out",
+    "time out",
+    "truncated",
+    "truncate",
+    "token",
+    "connection reset",
+    "temporarily unavailable",
+    "service unavailable",
+    "remote end closed",
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+)
+
+
+class _CurrentScorePredictionInterrupted(RuntimeError):
+    def __init__(self, message: str, *, attempts: int, error_code: str) -> None:
+        super().__init__(message)
+        self.attempts = int(attempts)
+        self.error_code = str(error_code or "current_score_prediction_failed")
+
+
+def _is_retryable_current_score_error(exc: Exception) -> bool:
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    normalized = str(exc or "").strip().lower()
+    if not normalized:
+        return False
+    return any(marker in normalized for marker in _CURRENT_SCORE_RETRYABLE_ERROR_MARKERS)
+
+
+def _predict_with_model_with_retry(
+    model_artifact: Dict[str, Any],
+    x_features: Dict[str, Any],
+) -> tuple[float, Dict[str, float], int]:
+    attempt = 0
+    backoff_seconds = CURRENT_SCORE_INITIAL_BACKOFF_SECONDS
+    last_error: Optional[Exception] = None
+    while attempt < CURRENT_SCORE_RETRY_ATTEMPTS:
+        attempt += 1
+        try:
+            pred, conf = predict_with_model(model_artifact, x_features)
+            return pred, conf, attempt
+        except Exception as exc:
+            last_error = exc
+            retryable = _is_retryable_current_score_error(exc)
+            if attempt >= CURRENT_SCORE_RETRY_ATTEMPTS or not retryable:
+                error_code = (
+                    "current_score_prediction_timeout"
+                    if retryable
+                    else "current_score_prediction_failed"
+                )
+                raise _CurrentScorePredictionInterrupted(
+                    f"{type(exc).__name__}: {exc}",
+                    attempts=attempt,
+                    error_code=error_code,
+                ) from exc
+            logger.warning(
+                "current_score_prediction_retry attempt=%s/%s reason=%s",
+                attempt,
+                CURRENT_SCORE_RETRY_ATTEMPTS,
+                f"{type(exc).__name__}: {exc}",
+            )
+            time.sleep(backoff_seconds)
+            backoff_seconds *= 2
+    error_message = (
+        f"{type(last_error).__name__}: {last_error}" if last_error is not None else "unknown"
+    )
+    raise _CurrentScorePredictionInterrupted(
+        error_message,
+        attempts=max(1, attempt),
+        error_code="current_score_prediction_failed",
+    )
+
+
 def _apply_prediction_to_report_with_model(
     report: Dict[str, object],
     *,
@@ -15463,7 +15561,10 @@ def _apply_prediction_to_report_with_model(
         return None
     row = build_feature_row(report, submission=submission_like)
     try:
-        pred, conf = predict_with_model(artifact, row.get("x_features") or {})
+        pred, conf, retry_attempts = _predict_with_model_with_retry(
+            artifact,
+            row.get("x_features") or {},
+        )
     except Exception as e:
         # 当前分层失败不应伪装成“正常仅有独立分”；保留 rule 分，同时显式标记失败。
         report["pred_total_score"] = None
@@ -15476,6 +15577,12 @@ def _apply_prediction_to_report_with_model(
         )
         submission_like["total_score"] = float(report.get("total_score", 0.0))
         error_message = f"{type(e).__name__}: {e}"
+        error_code = (
+            e.error_code
+            if isinstance(e, _CurrentScorePredictionInterrupted)
+            else "current_score_prediction_failed"
+        )
+        retry_attempts = e.attempts if isinstance(e, _CurrentScorePredictionInterrupted) else 1
         logger.exception(
             "current_score_prediction_failed project_id=%s submission_id=%s calibrator_version=%s",
             project_id,
@@ -15486,6 +15593,8 @@ def _apply_prediction_to_report_with_model(
             report,
             calibrator_version=str(model.get("calibrator_version") or "").strip(),
             error_message=error_message,
+            error_code=error_code,
+            retry_attempts=retry_attempts,
         )
         return str(model.get("calibrator_version") or "")
 
@@ -15574,6 +15683,7 @@ def _apply_prediction_to_report_with_model(
     submission_like["total_score"] = float(fused_total)
     report.setdefault("meta", {})
     report["meta"]["calibrator_version"] = model.get("calibrator_version")
+    report["meta"]["calibrator_retry_attempts"] = int(retry_attempts)
     return str(model.get("calibrator_version") or "")
 
 
@@ -15606,12 +15716,16 @@ def _set_report_current_score_failure(
     *,
     calibrator_version: str,
     error_message: str,
+    error_code: str = "current_score_prediction_failed",
+    retry_attempts: int = 1,
 ) -> Dict[str, object]:
     meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
     failure = {
         "failed": True,
-        "message": "校准引擎处理失败，请重试",
+        "message": CURRENT_SCORE_FAILURE_MESSAGE,
         "error": str(error_message or "").strip(),
+        "error_code": str(error_code or "current_score_prediction_failed"),
+        "retry_attempts": max(1, int(retry_attempts or 1)),
         "calibrator_version": calibrator_version or None,
         "failed_at": _now_iso(),
     }
@@ -15691,7 +15805,9 @@ def _resolve_submission_score_fields(
     pred_total = None
     rule_total = None
     score_source = "rule"
+    current_score_failed = False
     if isinstance(report, dict):
+        current_score_failed = bool(_report_current_score_failure(report))
         pred_total = _to_float_or_none(report.get("pred_total_score"))
         if not allow_pred_score:
             pred_total = None
@@ -15700,6 +15816,8 @@ def _resolve_submission_score_fields(
             rule_total = _to_float_or_none(report.get("total_score"))
         if _report_uses_exact_ground_truth_score(report):
             score_source = "ground_truth"
+        elif current_score_failed:
+            score_source = "interrupted"
         elif pred_total is not None:
             score_source = "pred"
     fallback_total = _to_float_or_none(submission.get("total_score"))
@@ -17633,9 +17751,9 @@ def _normalize_feedback_guardrail_state(payload: object) -> Dict[str, object]:
                     "已暂停自动调权/自动校准，请人工确认后再执行「学习进化」或「一键闭环执行」。"
                 )
             else:
-                normalized["warning_message"] = (
-                    "检测到极端偏差样本，已暂停自动调权/自动校准，请人工确认后再执行。"
-                )
+                normalized[
+                    "warning_message"
+                ] = "检测到极端偏差样本，已暂停自动调权/自动校准，请人工确认后再执行。"
     return normalized
 
 
@@ -19162,9 +19280,9 @@ def _build_governance_sandbox_preview(
             requirements = stored_requirements
         else:
             base_payload["constraints_ready"] = False
-            base_payload["constraints_warning"] = (
-                "当前项目尚无已固化的目录锚点/要求约束，沙箱重评分暂不执行，以避免治理面板触发写入式重建。"
-            )
+            base_payload[
+                "constraints_warning"
+            ] = "当前项目尚无已固化的目录锚点/要求约束，沙箱重评分暂不执行，以避免治理面板触发写入式重建。"
             return base_payload
 
     rows: List[Dict[str, object]] = []
@@ -42549,7 +42667,7 @@ def index(
           if (raw === 'await_approximation') return '已录入青天，等待当前分收敛';
           if (raw === 'await_ground_truth') return '等待青天结果验证';
           if (raw === 'ground_truth_exact') return '已命中真实评标';
-          if (raw === 'current_score_failed') return '校准引擎处理失败，请重试';
+          if (raw === 'current_score_failed') return '计算中断异常';
           if (raw === 'independent_only') return '当前仅有独立评分';
           return raw || '待生成';
         }
@@ -42559,7 +42677,7 @@ def index(
           if (flags.isPending) return '<span class="note">待评分</span>';
           const summary = getSubmissionDualTrackSummary(submission);
           const currentScoreFailed = !!summary.current_score_failed;
-          const currentScoreFailureMessage = String(summary.current_score_failure_message || '校准引擎处理失败，请重试').trim();
+          const currentScoreFailureMessage = String(summary.current_score_failure_message || '计算中断异常：校准引擎处理失败，请重试').trim();
           const detailTokens = [];
           const independentScore = toFiniteNumber(summary.independent_score);
           const approximationScore = toFiniteNumber(summary.approximation_score);
@@ -42597,7 +42715,7 @@ def index(
           if (flags.isPending) return '<span class="note">待评分后生成双轨诊断。</span>';
           const summary = getSubmissionDualTrackSummary(submission);
           const currentScoreFailed = !!summary.current_score_failed;
-          const currentScoreFailureMessage = String(summary.current_score_failure_message || '校准引擎处理失败，请重试').trim();
+          const currentScoreFailureMessage = String(summary.current_score_failure_message || '计算中断异常：校准引擎处理失败，请重试').trim();
           const utilGate = getSubmissionMaterialUtilizationGate(submission);
           const gateReasons = Array.isArray(summary.material_gate_reasons) && summary.material_gate_reasons.length
             ? summary.material_gate_reasons
@@ -42612,7 +42730,7 @@ def index(
           let html = '';
           if (currentScoreFailed) {
             html += '<div class="error"><strong>' + esc(currentScoreFailureMessage) + '</strong></div>';
-            html += '<div class="note">当前仅保留独立分，未生成当前分层结果。</div>';
+            html += '<div class="note">当前分层计算已中断，独立分仅保留为审计基线，不能视为当前分。</div>';
           } else if (flags.isBlocked) {
             html += '<div class="warn"><strong>已评分，但本施组对部分项目资料未形成足够证据关联。</strong></div>';
             if (gateReasons.length) {

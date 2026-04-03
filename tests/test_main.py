@@ -1594,9 +1594,9 @@ class TestMaterialParseWorkerLifecycle:
             main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_PRIORITY_BY_JOB_ID.update(
                 original_preview_priority_by_job_id
             )
-            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES[:] = (
-                original_candidate_indices
-            )
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES[
+                :
+            ] = original_candidate_indices
             main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE.clear()
             main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE.update(
                 original_candidate_indices_by_mode
@@ -1806,9 +1806,9 @@ class TestMaterialParseWorkerLifecycle:
             main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_PREVIEW_PRIORITY_BY_JOB_ID.update(
                 original_preview_priority_by_job_id
             )
-            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES[:] = (
-                original_candidate_indices
-            )
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES[
+                :
+            ] = original_candidate_indices
             main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE.clear()
             main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES_BY_MODE.update(
                 original_candidate_indices_by_mode
@@ -3988,9 +3988,9 @@ class TestMaterialParsePerformanceGuards:
         finally:
             main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_SIGNATURE = original_signature
             main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_JOBS[:] = original_jobs
-            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES[:] = (
-                original_candidate_indices
-            )
+            main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_CANDIDATE_INDICES[
+                :
+            ] = original_candidate_indices
             main_module._MATERIAL_PARSE_CLAIM_CONTEXT_CACHE_HAS_QUEUED_CANDIDATES = (
                 original_has_queued
             )
@@ -5509,7 +5509,7 @@ class TestIndexEndpoint:
         assert "clearSystemClosureEntrypointActionFocus();" in page
         assert "previewed_materials" in page
         assert "预解析完成" in page
-        assert "if (raw === 'current_score_failed') return '校准引擎处理失败，请重试';" in page
+        assert "if (raw === 'current_score_failed') return '计算中断异常';" in page
 
     def test_index_frontend_inline_scripts_are_valid_javascript(self, client):
         response = client.get("/")
@@ -18616,8 +18616,16 @@ class TestProjectCalibratorDirectApply:
         assert report["meta"]["calibrator_version"] == "calib-timeout"
         assert "TimeoutError: predict timeout" in report["meta"]["calibrator_error"]
         assert report["meta"]["current_score_failure"]["failed"] is True
-        assert report["meta"]["current_score_failure"]["message"] == "校准引擎处理失败，请重试"
+        assert (
+            report["meta"]["current_score_failure"]["message"]
+            == "计算中断异常：校准引擎处理失败，请重试"
+        )
         assert report["meta"]["current_score_failure"]["calibrator_version"] == "calib-timeout"
+        assert report["meta"]["current_score_failure"]["retry_attempts"] == 3
+        assert (
+            report["meta"]["current_score_failure"]["error_code"]
+            == "current_score_prediction_timeout"
+        )
 
     def test_submission_dual_track_summary_marks_current_score_failure(self):
         from app.qingtian_dual_track import (
@@ -18638,7 +18646,7 @@ class TestProjectCalibratorDirectApply:
                 "meta": {
                     "current_score_failure": {
                         "failed": True,
-                        "message": "校准引擎处理失败，请重试",
+                        "message": "计算中断异常：校准引擎处理失败，请重试",
                         "error": "TimeoutError: predict timeout",
                     }
                 },
@@ -18653,15 +18661,62 @@ class TestProjectCalibratorDirectApply:
         )
 
         assert summary["alignment_status"] == "current_score_failed"
-        assert summary["governance_hint"] == "校准引擎处理失败，请重试"
+        assert summary["governance_hint"] == "计算中断异常：校准引擎处理失败，请重试"
         assert summary["current_score_failed"] is True
+        assert summary["display_total_score"] is None
+        assert summary["display_score_label"] == "计算中断异常"
         assert 'class="error"' in render_submission_dual_track_score_html(summary)
         diagnostic_html = render_submission_dual_track_diagnostic_html(
             summary,
             project_id="p1",
         )
-        assert "校准引擎处理失败，请重试" in diagnostic_html
-        assert "当前仅保留独立分" in diagnostic_html
+        assert "计算中断异常：校准引擎处理失败，请重试" in diagnostic_html
+        assert "独立分仅保留为审计基线" in diagnostic_html
+
+    @patch("app.main.load_qingtian_results")
+    @patch("app.main.load_projects")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_submissions_hides_display_total_when_current_score_failed(
+        self,
+        mock_ensure,
+        mock_load_submissions,
+        mock_load_projects,
+        mock_load_qingtian_results,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 5}}]
+        mock_load_qingtian_results.return_value = []
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "f1.txt",
+                "total_score": 20.01,
+                "report": {
+                    "scoring_status": "scored",
+                    "total_score": 20.01,
+                    "rule_total_score": 20.01,
+                    "pred_total_score": None,
+                    "meta": {
+                        "current_score_failure": {
+                            "failed": True,
+                            "message": "计算中断异常：校准引擎处理失败，请重试",
+                            "error": "TimeoutError: predict timeout",
+                        }
+                    },
+                },
+                "text": "t1",
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+
+        response = client.get("/api/v1/projects/p1/submissions")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data[0]["report"]["dual_track_summary"]["display_total_score"] is None
+        assert data[0]["report"]["dual_track_summary"]["display_score_label"] == "计算中断异常"
 
 
 class TestExactGroundTruthOverride:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -13,6 +15,43 @@ from app.schemas import ScoreReport
 # 兼容保留：历史文件名/函数名不变，但实际 provider 已切到 OpenAI GPT-5.4。
 SPARK_DEFAULT_MODEL = "gpt-5.4"
 LEGACY_SPARK_ENV_KEYS = ("SPARK_APIPASSWORD", "SPARK_APP_ID", "SPARK_API_KEY", "SPARK_API_SECRET")
+LLM_JUDGE_MAX_ATTEMPTS = 3
+LLM_JUDGE_INITIAL_BACKOFF_SECONDS = 1.0
+LLM_JUDGE_INTERRUPT_MESSAGE = "计算中断异常，请重试"
+_DIRECTORY_LINE_RE = re.compile(r"[.．·•\-\s]{4,}")
+_PAGE_HINT_RE = re.compile(r"\[PAGE:(\d+)\]|\[PAGE_SECTION_HINTS:(\d+)\]|第\s*(\d+)\s*页")
+_RETRYABLE_ERROR_MARKERS = (
+    "timeout",
+    "timed out",
+    "time out",
+    "json_parse_failed",
+    "empty_content",
+    "invalid_response_no_choices",
+    "truncated",
+    "truncate",
+    "context length",
+    "max_tokens",
+    "token",
+    "rate limit",
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+    "temporarily unavailable",
+    "connection reset",
+    "remote end closed",
+)
+_GENERIC_SCORING_PHRASES = (
+    "由项目经理牵头",
+    "项目经理牵头",
+    "按每周1次",
+    "按每周一次",
+    "建议由项目经理牵头",
+    "由项目部牵头",
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _get_spark_model() -> str:
@@ -121,6 +160,55 @@ def _is_valid_evidence_item(item: Any) -> bool:
     return bool(snippet and quote and anchor_label)
 
 
+def _extract_page_hint(text: Any) -> str:
+    raw = str(text or "")
+    matches = _PAGE_HINT_RE.findall(raw)
+    if not matches:
+        return ""
+    for page_a, page_b, page_c in reversed(matches):
+        page_no = str(page_a or page_b or page_c).strip()
+        if page_no:
+            return f"第{page_no}页"
+    return ""
+
+
+def _looks_like_directory_fragment(text: Any) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return False
+    if "........" in value or "……" in value:
+        return True
+    if (
+        _DIRECTORY_LINE_RE.search(value)
+        and len(value.replace(".", "").replace("．", "").strip()) < 16
+    ):
+        return True
+    return False
+
+
+def _normalize_anchor_label(anchor_label: Any, *, snippet: str, quote: str) -> str:
+    anchor = str(anchor_label or "").strip() or "正文片段"
+    page_hint = (
+        _extract_page_hint(anchor) or _extract_page_hint(snippet) or _extract_page_hint(quote)
+    )
+    if page_hint and page_hint not in anchor:
+        anchor = f"{page_hint}｜{anchor}"
+    return anchor
+
+
+def _sanitize_scoring_text(text: Any, *, fallback: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not normalized:
+        return fallback
+    for phrase in _GENERIC_SCORING_PHRASES:
+        if normalized.startswith(phrase):
+            trimmed = normalized[len(phrase) :].lstrip("，,：:；; ")
+            if len(trimmed) >= 10:
+                normalized = trimmed
+                break
+    return normalized or fallback
+
+
 def _normalize_evidence_item(item: Any) -> Dict[str, Any]:
     if not isinstance(item, dict):
         return _placeholder_evidence()
@@ -135,8 +223,14 @@ def _normalize_evidence_item(item: Any) -> Dict[str, Any]:
         end_index = int(item.get("end_index") or 0)
     except (TypeError, ValueError):
         end_index = 0
-    anchor_label = str(item.get("anchor_label") or "").strip() or "正文片段"
     quote = str(item.get("quote") or snippet).strip()
+    if _looks_like_directory_fragment(snippet):
+        return _placeholder_evidence()
+    anchor_label = _normalize_anchor_label(
+        item.get("anchor_label"),
+        snippet=snippet,
+        quote=quote,
+    )
     return {
         "start_index": max(0, start_index),
         "end_index": max(0, end_index),
@@ -159,6 +253,12 @@ def post_process_llm_output(payload: Dict[str, Any], rubric: Dict[str, Any]) -> 
         def_points = dim.get("definition_points") or []
         if not isinstance(def_points, list) or len(def_points) == 0:
             dim["definition_points"] = ["未在文本中提取到明确的定义要点。"]
+        else:
+            dim["definition_points"] = [
+                _sanitize_scoring_text(item, fallback="未在文本中提取到明确的定义要点。")
+                for item in def_points
+                if str(item or "").strip()
+            ] or ["未在文本中提取到明确的定义要点。"]
 
         defects = dim.get("defects") or []
         if not isinstance(defects, list) or len(defects) == 0:
@@ -166,6 +266,15 @@ def post_process_llm_output(payload: Dict[str, Any], rubric: Dict[str, Any]) -> 
                 "文本对本维度的关键要素表述不足，存在参数/频次/验收/责任等落实要素缺失风险。"
             ]
             default_used = True
+        else:
+            defects = [
+                _sanitize_scoring_text(
+                    item,
+                    fallback="文本对本维度的关键要素表述不足，存在参数/频次/验收/责任等落实要素缺失风险。",
+                )
+                for item in defects
+                if str(item or "").strip()
+            ]
         dim["defects"] = defects
 
         improvements = dim.get("improvements") or []
@@ -174,6 +283,15 @@ def post_process_llm_output(payload: Dict[str, Any], rubric: Dict[str, Any]) -> 
                 "建议补充可量化控制指标（阈值/参数）与管理频次（日报/周检），并明确责任岗位与验收闭环（报验/签认）。"
             ]
             default_used = True
+        else:
+            improvements = [
+                _sanitize_scoring_text(
+                    item,
+                    fallback="建议补充可量化控制指标（阈值/参数）与管理频次（日报/周检），并明确责任岗位与验收闭环（报验/签认）。",
+                )
+                for item in improvements
+                if str(item or "").strip()
+            ]
         dim["improvements"] = improvements
 
         evidence_raw = dim.get("evidence") or []
@@ -207,6 +325,34 @@ def post_process_llm_output(payload: Dict[str, Any], rubric: Dict[str, Any]) -> 
         "high_priority_multiplier": high_mul,
         "normal_multiplier": normal_mul,
     }
+    raw_penalties = payload.get("penalties") or []
+    normalized_penalties: List[Dict[str, Any]] = []
+    if isinstance(raw_penalties, list):
+        for idx, penalty in enumerate(raw_penalties):
+            if not isinstance(penalty, dict):
+                continue
+            evidence = _normalize_evidence_item(penalty.get("evidence"))
+            if evidence == _placeholder_evidence():
+                continue
+            try:
+                deduct = float(penalty.get("deduct") or 0.0)
+            except (TypeError, ValueError):
+                deduct = 0.0
+            if deduct <= 0:
+                continue
+            normalized_penalties.append(
+                {
+                    "code": str(penalty.get("code") or f"LLM_PENALTY_{idx + 1}").strip()
+                    or f"LLM_PENALTY_{idx + 1}",
+                    "message": _sanitize_scoring_text(
+                        penalty.get("message"),
+                        fallback="该扣分项未提供可核验原文证据，已从结果中移除。",
+                    ),
+                    "deduct": round(deduct, 2),
+                    "evidence": evidence,
+                }
+            )
+    payload["penalties"] = normalized_penalties
     return payload
 
 
@@ -359,6 +505,43 @@ def _call_spark_http(
     )
 
 
+def _is_retryable_llm_failure(reason: str) -> bool:
+    normalized = str(reason or "").strip().lower()
+    if not normalized:
+        return False
+    return any(marker in normalized for marker in _RETRYABLE_ERROR_MARKERS)
+
+
+def _build_llm_interrupted_payload(
+    *,
+    reason: str,
+    error_message: str,
+    retry_attempts: int,
+    prompt_version: str = "qingtian_v1",
+    legacy_spark_env_keys: List[str] | None = None,
+    migration_hint: str | None = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "called_spark_api": False,
+        "called_openai_api": False,
+        "judge_mode": "openai_interrupted",
+        "judge_source": "openai_api",
+        "processing_interrupted": True,
+        "error_code": "llm_processing_interrupted",
+        "message": LLM_JUDGE_INTERRUPT_MESSAGE,
+        "reason": str(reason or "llm_processing_interrupted").strip()
+        or "llm_processing_interrupted",
+        "fallback_reason": str(error_message or "").strip() or str(reason or "").strip(),
+        "retry_attempts": max(1, int(retry_attempts or 1)),
+        "prompt_version": prompt_version,
+    }
+    if legacy_spark_env_keys:
+        payload["legacy_spark_env_keys"] = legacy_spark_env_keys
+    if migration_hint:
+        payload["migration_hint"] = migration_hint
+    return payload
+
+
 def run_spark_judge(
     text: str,
     rubric: Dict[str, Any],
@@ -373,18 +556,19 @@ def run_spark_judge(
     token = _get_spark_bearer_token()
     legacy_spark_env_keys = _list_legacy_spark_env_keys()
     if not token:
-        payload: Dict[str, Any] = {
-            "called_spark_api": False,
-            "called_openai_api": False,
-            "reason": "missing_openai_api_key",
-        }
+        migration_hint = None
         if legacy_spark_env_keys:
-            payload["legacy_spark_env_keys"] = legacy_spark_env_keys
-            payload["migration_hint"] = (
+            migration_hint = (
                 "当前评分兼容层已迁移到 OpenAI；请配置 OPENAI_API_KEY，"
                 "旧 Spark 凭证不会再作为真实评分凭证使用。"
             )
-        return payload
+        return _build_llm_interrupted_payload(
+            reason="missing_openai_api_key",
+            error_message="missing_openai_api_key",
+            retry_attempts=1,
+            legacy_spark_env_keys=legacy_spark_env_keys,
+            migration_hint=migration_hint,
+        )
 
     prompt_template = load_prompt(prompt_name)
     user_message = f"{prompt_template}\n\n---\n输入文本：\n{text[:12000]}"
@@ -392,25 +576,52 @@ def run_spark_judge(
         user_message += "\n\n（文本已截断）"
 
     if token:
-        ok, parsed, err_msg = _call_spark_http(user_message)
-        if ok and parsed:
-            payload = post_process_llm_output(parsed, rubric)
-            valid, err = validate_llm_judge_json(payload)
-            if valid:
-                payload["called_spark_api"] = True
-                payload["called_openai_api"] = True
-                payload.setdefault("judge_mode", "openai")
-                payload.setdefault("model", _get_spark_model())
-                payload.setdefault("judge_source", "openai_api")
-                return payload
-        # API 失败或校验不通过：回退到规则结果
-        payload = _build_from_rules(rules_report, rubric)
-        payload = post_process_llm_output(payload, rubric)
-        payload["called_spark_api"] = False
-        payload["called_openai_api"] = False
-        payload["reason"] = "api_error" if ok else "request_failed"
-        if err_msg:
-            payload["fallback_reason"] = err_msg
-        if legacy_spark_env_keys:
-            payload["legacy_spark_env_keys"] = legacy_spark_env_keys
-        return payload
+        attempt = 0
+        backoff_seconds = LLM_JUDGE_INITIAL_BACKOFF_SECONDS
+        last_reason = "request_failed"
+        last_error_message = ""
+        while attempt < LLM_JUDGE_MAX_ATTEMPTS:
+            attempt += 1
+            ok, parsed, err_msg = _call_spark_http(user_message)
+            if ok and parsed:
+                payload = post_process_llm_output(parsed, rubric)
+                valid, err = validate_llm_judge_json(payload)
+                if valid:
+                    payload["called_spark_api"] = True
+                    payload["called_openai_api"] = True
+                    payload.setdefault("judge_mode", "openai")
+                    payload.setdefault("model", _get_spark_model())
+                    payload.setdefault("judge_source", "openai_api")
+                    payload["retry_attempts"] = attempt
+                    return payload
+                last_reason = (
+                    str(err.get("error") or "llm_output_invalid").strip() or "llm_output_invalid"
+                )
+                last_error_message = "; ".join(str(x) for x in (err.get("details") or [])[:4])
+                retryable = True
+            else:
+                last_reason = "request_failed"
+                last_error_message = str(err_msg or "").strip() or "request_failed"
+                retryable = _is_retryable_llm_failure(last_error_message)
+
+            if attempt >= LLM_JUDGE_MAX_ATTEMPTS or not retryable:
+                return _build_llm_interrupted_payload(
+                    reason=last_reason,
+                    error_message=last_error_message,
+                    retry_attempts=attempt,
+                )
+            logger.warning(
+                "llm_judge_retry prompt=%s attempt=%s/%s reason=%s detail=%s",
+                prompt_name,
+                attempt,
+                LLM_JUDGE_MAX_ATTEMPTS,
+                last_reason,
+                last_error_message,
+            )
+            time.sleep(backoff_seconds)
+            backoff_seconds *= 2
+        return _build_llm_interrupted_payload(
+            reason=last_reason,
+            error_message=last_error_message,
+            retry_attempts=attempt,
+        )

@@ -72,6 +72,25 @@ warmup_app = typer.Typer(help="预热评分缓存（从文件加载文本并写�
 app.add_typer(warmup_app, name="warmup")
 
 
+def _build_llm_interrupted_output(
+    *,
+    judge_mode: str,
+    llm_payload: dict,
+) -> str:
+    payload = {
+        "judge_mode": judge_mode,
+        "judge_source": "openai_api",
+        "spark_called": False,
+        "processing_interrupted": True,
+        "message": llm_payload.get("message") or "计算中断异常，请重试",
+        "error_code": llm_payload.get("error_code") or "llm_processing_interrupted",
+        "fallback_reason": llm_payload.get("fallback_reason") or llm_payload.get("reason"),
+        "retry_attempts": llm_payload.get("retry_attempts"),
+        "prompt_version": llm_payload.get("prompt_version"),
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 @score_app.callback()
 def score_command(
     input: str = typer.Option(..., "--input", "-i", help="施组文本路径（支持 .txt 和 .docx）"),
@@ -114,6 +133,11 @@ def score_command(
             llm_payload["judge_mode"] = "openai"
             llm_payload["judge_source"] = "openai_api"
             output = json.dumps(llm_payload, ensure_ascii=False, indent=2)
+        elif llm_payload.get("processing_interrupted"):
+            output = _build_llm_interrupted_output(
+                judge_mode="openai_interrupted",
+                llm_payload=llm_payload,
+            )
         else:
             reason = llm_payload.get("reason", "unknown")
             rules_report.judge_mode = "fallback_rules"
@@ -142,6 +166,11 @@ def score_command(
                 },
                 ensure_ascii=False,
                 indent=2,
+            )
+        elif llm_payload.get("processing_interrupted"):
+            output = _build_llm_interrupted_output(
+                judge_mode="hybrid_interrupted",
+                llm_payload=llm_payload,
             )
         else:
             reason = llm_payload.get("reason", "unknown")
@@ -240,6 +269,21 @@ def _process_single_file(
         "total_score": report_data.get("total_score", 0),
         "status": "success",
     }
+
+
+def _is_process_pool_infra_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    if isinstance(exc, PermissionError):
+        return True
+    if isinstance(exc, ImportError) and (
+        "_posixshmem" in text or "library load denied" in text or "shared_memory" in text
+    ):
+        return True
+    if isinstance(exc, OSError) and (
+        "_posixshmem" in text or "library load denied" in text or "shared_memory" in text
+    ):
+        return True
+    return False
 
 
 @batch_app.callback(invoke_without_command=True)
@@ -456,8 +500,8 @@ def batch_command(
         executor_class = ProcessPoolExecutor if executor == "process" else ThreadPoolExecutor
         try:
             _run_parallel_with(executor_class)
-        except PermissionError:
-            if executor == "process":
+        except Exception as exc:
+            if executor == "process" and _is_process_pool_infra_error(exc):
                 print("检测到当前环境不允许进程池，已自动回退为线程池。")
                 completed_count = 0
                 _run_parallel_with(ThreadPoolExecutor)

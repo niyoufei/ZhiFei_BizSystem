@@ -525,6 +525,7 @@ class TestRunSparkJudge:
             assert result["called_spark_api"] is False
             assert result["called_openai_api"] is False
             assert result["reason"] == "missing_openai_api_key"
+            assert result["processing_interrupted"] is True
 
     def test_returns_missing_openai_credentials_with_legacy_spark_env(self):
         """仅有旧 Spark 环境变量时，应明确提示迁移到 OPENAI_API_KEY。"""
@@ -535,6 +536,7 @@ class TestRunSparkJudge:
             assert result["called_spark_api"] is False
             assert result["called_openai_api"] is False
             assert result["reason"] == "missing_openai_api_key"
+            assert result["processing_interrupted"] is True
             assert result["legacy_spark_env_keys"] == ["SPARK_APP_ID"]
             assert "OPENAI_API_KEY" in result["migration_hint"]
 
@@ -557,6 +559,7 @@ class TestRunSparkJudge:
             mock_load.assert_called_once_with("test_prompt")
             assert result["called_spark_api"] is False
             assert result["reason"] == "request_failed"
+            assert result["processing_interrupted"] is True
 
     @patch("app.engine.llm_judge_spark.load_prompt")
     @patch("app.engine.llm_judge_spark._call_spark_http")
@@ -584,6 +587,59 @@ class TestRunSparkJudge:
             assert result["judge_source"] == "openai_api"
             assert "dimension_scores" in result
 
+    @patch("app.engine.llm_judge_spark.time.sleep")
+    @patch("app.engine.llm_judge_spark.load_prompt")
+    @patch("app.engine.llm_judge_spark._call_spark_http")
+    def test_retries_retryable_llm_failures_before_success(
+        self,
+        mock_call_http,
+        mock_load,
+        mock_sleep,
+    ):
+        mock_load.return_value = "test prompt"
+        report = self._make_score_report()
+        payload = build_spark_payload_from_rules(report, {})
+        payload["judge_mode"] = "openai"
+        payload["model"] = "gpt-5.4"
+        payload["judge_source"] = "openai_api"
+        mock_call_http.side_effect = [
+            (False, None, "timed out"),
+            (False, None, "json_parse_failed"),
+            (True, payload, ""),
+        ]
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}):
+            result = run_spark_judge("test text", {}, "prompt", report)
+
+        assert result["called_spark_api"] is True
+        assert result["retry_attempts"] == 3
+        assert mock_call_http.call_count == 3
+        assert mock_sleep.call_count == 2
+
+    @patch("app.engine.llm_judge_spark.time.sleep")
+    @patch("app.engine.llm_judge_spark.load_prompt")
+    @patch("app.engine.llm_judge_spark._call_spark_http")
+    def test_returns_interrupted_payload_when_retry_exhausted(
+        self,
+        mock_call_http,
+        mock_load,
+        mock_sleep,
+    ):
+        mock_load.return_value = "test prompt"
+        report = self._make_score_report()
+        mock_call_http.return_value = (False, None, "timed out")
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}):
+            result = run_spark_judge("test text", {}, "prompt", report)
+
+        assert result["called_spark_api"] is False
+        assert result["processing_interrupted"] is True
+        assert result["judge_mode"] == "openai_interrupted"
+        assert result["error_code"] == "llm_processing_interrupted"
+        assert result["retry_attempts"] == 3
+        assert mock_call_http.call_count == 3
+        assert mock_sleep.call_count == 2
+
 
 class TestEdgeCases:
     """Tests for edge cases and boundary conditions."""
@@ -600,6 +656,37 @@ class TestEdgeCases:
         rubric = {}
         result = post_process_llm_output(payload, rubric)
         assert result["dimension_scores"] == {}
+
+    def test_post_process_drops_penalty_without_evidence(self):
+        payload = {
+            "dimension_scores": {
+                "01": {
+                    "score_0_10": 7.0,
+                    "definition_points": ["已提供定义"],
+                    "defects": ["问题存在"],
+                    "improvements": ["建议补充参数"],
+                    "evidence": [
+                        {
+                            "snippet": "第3页 施工部署明确。",
+                            "quote": "施工部署明确。",
+                            "anchor_label": "第3页｜正文片段",
+                        }
+                    ],
+                }
+            },
+            "penalties": [
+                {
+                    "code": "P-01",
+                    "message": "无证据扣分",
+                    "deduct": 2.0,
+                    "evidence": {"snippet": "", "quote": "", "anchor_label": ""},
+                }
+            ],
+        }
+
+        result = post_process_llm_output(payload, {})
+
+        assert result["penalties"] == []
 
     def test_validate_with_extra_dimensions(self):
         """Extra dimensions beyond 16 should still pass if all required present."""

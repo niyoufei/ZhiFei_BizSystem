@@ -227,18 +227,23 @@ class TestScoreSparkMode:
         assert output.get("judge_source") == "openai_api"
 
     @patch("app.cli.run_spark_judge")
-    def test_spark_mode_fallback_to_rules(self, mock_spark, sample_shigong_path):
-        """Test spark mode fallback when API fails."""
+    def test_spark_mode_returns_interrupted_payload_when_api_fails(
+        self, mock_spark, sample_shigong_path
+    ):
+        """Test spark mode surfaces interruption instead of silently falling back."""
         mock_spark.return_value = {
             "called_spark_api": False,
+            "processing_interrupted": True,
+            "message": "计算中断异常，请重试",
             "reason": "API unavailable",
         }
         result = runner.invoke(app, ["score", "-i", sample_shigong_path, "--mode", "spark"])
         assert result.exit_code == 0
         output = json.loads(result.stdout)
-        assert output.get("judge_mode") == "fallback_rules"
-        assert output.get("judge_source") == "rules_engine"
+        assert output.get("judge_mode") == "openai_interrupted"
+        assert output.get("judge_source") == "openai_api"
         assert output.get("spark_called") is False
+        assert output.get("processing_interrupted") is True
         assert "fallback_reason" in output
 
 
@@ -281,19 +286,23 @@ class TestScoreHybridMode:
         assert abs(output.get("llm_adjustment", 0)) <= 10.0
 
     @patch("app.cli.run_spark_judge")
-    def test_hybrid_mode_fallback_to_rules(self, mock_spark, sample_shigong_path):
-        """Test hybrid mode fallback when API fails."""
+    def test_hybrid_mode_returns_interrupted_payload_when_api_fails(
+        self, mock_spark, sample_shigong_path
+    ):
+        """Test hybrid mode surfaces interruption instead of silently falling back."""
         mock_spark.return_value = {
             "called_spark_api": False,
+            "processing_interrupted": True,
+            "message": "计算中断异常，请重试",
             "reason": "Connection timeout",
         }
         result = runner.invoke(app, ["score", "-i", sample_shigong_path, "--mode", "hybrid"])
         assert result.exit_code == 0
         output = json.loads(result.stdout)
-        assert output.get("judge_mode") == "hybrid_fallback_rules"
-        assert output.get("judge_source") == "rules_engine"
+        assert output.get("judge_mode") == "hybrid_interrupted"
+        assert output.get("judge_source") == "openai_api"
         assert output.get("spark_called") is False
-        assert output.get("llm_adjustment") == 0.0
+        assert output.get("processing_interrupted") is True
         assert "fallback_reason" in output
 
 
@@ -986,6 +995,43 @@ class TestProcessPoolExecutor:
         assert (output_dir / "doc0_report.docx").exists()
         assert (output_dir / "doc1_report.json").exists()
         assert (output_dir / "doc1_report.docx").exists()
+
+    @patch("app.cli.ProcessPoolExecutor")
+    def test_batch_process_executor_falls_back_when_process_pool_infra_unavailable(
+        self,
+        mock_process_executor,
+        temp_dir,
+    ):
+        """Test batch auto-falls back to thread pool when process infra is blocked."""
+        input_dir = Path(temp_dir) / "inputs"
+        input_dir.mkdir()
+        (input_dir / "test1.txt").write_text("施工组织设计测试1", encoding="utf-8")
+        (input_dir / "test2.txt").write_text("施工组织设计测试2", encoding="utf-8")
+        output_dir = Path(temp_dir) / "outputs"
+
+        mock_process_executor.side_effect = ImportError(
+            "dlopen(_posixshmem): library load denied by system policy"
+        )
+
+        result = runner.invoke(
+            app,
+            [
+                "batch",
+                "-i",
+                str(input_dir),
+                "-o",
+                str(output_dir),
+                "--workers",
+                "2",
+                "--executor",
+                "process",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert "已自动回退为线程池" in result.output
+        assert (output_dir / "test1_report.json").exists()
+        assert (output_dir / "test2_report.json").exists()
 
     def test_batch_executor_default_is_thread(self, temp_dir):
         """Test that default executor is thread (need 2+ files for parallel)."""
