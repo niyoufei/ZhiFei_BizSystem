@@ -1,9 +1,11 @@
 # 施工组织设计评标评分系统 Makefile
 # 提供一键操作命令
 
-.PHONY: install test smoke score docx batch clean help coverage lint-fix pre-commit web run api restart stop status daemon-start daemon-stop daemon-status analysis-bundle analysis-bundle-all doctor e2e-flow mece-audit data-hygiene ops-agents-run ops-agents-start ops-agents-stop ops-agents-status spec-coverage acceptance acceptance-fast
+.PHONY: install test smoke score docx batch clean help coverage lint-fix pre-commit web run api restart stop status daemon-start daemon-stop daemon-status analysis-bundle analysis-bundle-all doctor soak trial-preflight e2e-flow mece-audit data-hygiene ops-agents-run ops-agents-start ops-agents-stop ops-agents-status spec-coverage acceptance acceptance-fast
 
 PYTHON ?= $(shell if [ -x .venv/bin/python ]; then echo .venv/bin/python; else echo python3; fi)
+SOAK_DURATION ?= 600
+SOAK_INTERVAL ?= 30
 
 # 默认目标
 help:
@@ -18,9 +20,11 @@ help:
 	@echo "  make daemon-start - 用 launchd 常驻启动（macOS）"
 	@echo "  make daemon-status - 查看 launchd 常驻状态（macOS）"
 	@echo "  make daemon-stop - 停止 launchd 常驻服务（macOS）"
-	@echo "  make doctor   - 自动诊断（必要时自动重启并执行后端自检）"
-	@echo "  make acceptance - 严格验收（doctor + e2e + spec-coverage + pytest）"
-	@echo "  make acceptance-fast - 快速严格验收（跳过pytest）"
+	@echo "  make doctor   - 自动诊断（必要时自动重启 + 后端自检 + OpenAPI覆盖 + Web按钮契约）"
+	@echo "  make soak SOAK_DURATION=600 SOAK_INTERVAL=30 - 正式应用前长期稳定性巡航（输出 build/stability_soak_latest.*）"
+	@echo "  make trial-preflight PROJECT_ID=<id> - 生成当前项目试车前综合体检（build/trial_preflight_latest.*）"
+	@echo "  make acceptance - 严格验收（doctor + e2e + browser smoke + mece + data hygiene + spec-coverage + pytest）"
+	@echo "  make acceptance-fast - 快速严格验收（同上，但跳过pytest）"
 	@echo "  make mece-audit - 生成项目级 MECE 诊断汇总（build/mece_audit_latest.*）"
 	@echo "  make data-hygiene - 生成数据卫生巡检（build/data_hygiene_latest.*）"
 	@echo "  make ops-agents-run - 运行一轮4智能体协同巡检（SRE/数据卫生/评分质量/进化）"
@@ -137,6 +141,19 @@ daemon-status:
 # 自动诊断（必要时重启 + 调用后端自检）
 doctor:
 	./scripts/doctor.sh
+
+# 长时稳定性巡航（默认10分钟）
+soak:
+	$(PYTHON) scripts/stability_soak.py --strict --duration-seconds "$(SOAK_DURATION)" --interval-seconds "$(SOAK_INTERVAL)"
+
+# 当前项目试车前综合体检
+trial-preflight:
+	@if [ -n "$(PROJECT_ID)" ]; then \
+		$(PYTHON) scripts/trial_preflight.py --project-id "$(PROJECT_ID)"; \
+	else \
+		echo "缺少 PROJECT_ID，例如：make trial-preflight PROJECT_ID=<id>"; \
+		exit 1; \
+	fi
 
 # 导出项目分析包 Markdown
 analysis-bundle:

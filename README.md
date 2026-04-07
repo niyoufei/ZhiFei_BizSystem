@@ -127,6 +127,23 @@ python3 -m app.cli warmup -i filelist.txt --no-skip-existing --ttl 7200
 python3 -m app.main
 ```
 
+### 试车前综合体检（推荐）
+
+在正式试车前，建议对当前项目执行一次综合体检，把系统自检、评分前置、MECE 诊断、学习进化状态和系统总封关状态收拢成一份报告：
+
+```bash
+make trial-preflight PROJECT_ID=<你的项目ID>
+```
+
+产物会写入：
+- `build/trial_preflight_latest.json`
+- `build/trial_preflight_latest.md`
+
+说明：
+- 该检查是只读的，不会改动项目数据。
+- `trial_run_ready=true` 代表当前项目可进入试车。
+- 即使报告含警告项，也会明确区分“阻断试车”与“仅影响系统长期收敛/总封关”的问题。
+
 API 启动后访问 `POST http://localhost:8000/score`，请求示例：
 
 ```json
@@ -263,23 +280,27 @@ python3 -m app.main
 make restart   # 后台重启（自动停旧进程）
 make status    # 查看端口与健康检查
 make stop      # 停止后台服务
-make doctor    # 自动诊断（必要时自动重启 + 后端自检）
+make doctor    # 自动诊断（必要时自动重启 + 后端自检 + OpenAPI覆盖 + Web按钮契约）
+make soak SOAK_DURATION=600 SOAK_INTERVAL=30  # 正式应用前长期稳定性巡航（默认10分钟）
 # macOS 常驻模式（推荐长期开机运行）
 make daemon-start
 make daemon-status
 make daemon-stop
 # 严格诊断：缺少关键V2接口时返回失败
 STRICT=1 make doctor
-# 一键严格验收（doctor + e2e + 覆盖检查 + 测试）
+# 一键严格验收（doctor + e2e + browser smoke + mece + data hygiene + 覆盖检查 + 测试）
 make acceptance
 
-# 快速严格验收（跳过 pytest）
+# 快速严格验收（同上，但跳过 pytest）
 make acceptance-fast
 ```
 
 功能包括：创建项目、刷新项目列表、上传资料/施组、对比排名、对比报告（叙述）、洞察、生成学习画像、自适应建议、生成补丁、验证效果、应用补丁（需 API Key）。应用补丁会同时更新 `lexicon.yaml` 与 `rubric.yaml` 并自动备份。
 
-`make doctor` 现在会额外检查运行中服务的 OpenAPI 是否包含关键 V2 端点（如 `expert-profile`、`rescore`、`ground_truth/from_files`、`scoring/factors`、`system/self_check`），便于快速识别“服务版本偏旧”问题。
+`make doctor` 现在会额外检查运行中服务的 OpenAPI 是否包含关键 V2 端点（如 `expert-profile`、`rescore`、`ground_truth/from_files`、`scoring/factors`、`system/self_check`），并校验首页关键按钮的 Web 契约与 smoke 覆盖门禁，便于快速识别“服务版本偏旧”或“按钮存在但未纳入自动验收”的问题。
+`make soak` 会在正式应用前执行一轮长时稳定性巡航：先跑严格 `doctor`，再按周期采样监听进程、`/health`、`/api/v1/system/self_check` 与首页可达性，最后再次跑严格 `doctor`，并输出：
+- `/Users/youfeini/Desktop/ZhiFei_BizSystem/build/stability_soak_latest.json`
+- `/Users/youfeini/Desktop/ZhiFei_BizSystem/build/stability_soak_latest.md`
 如果你希望服务持续在线（而不是按需拉起），可在 macOS 上使用 `make daemon-start`。
 说明：如果项目位于 `Desktop` 路径且未授权给 launchd 访问，脚本会自动回退到普通后台重启模式；此时不是严格 keepalive，可用 `make daemon-status` 查看当前模式与原因。
 `make daemon-status` 在 `mode=fallback` 且服务掉线时，会自动尝试重启一次（auto-heal），方便快速恢复。仅查看状态而不自动重启可用：`AUTO_HEAL=0 make daemon-status`。
@@ -440,8 +461,11 @@ STRICT=1 make e2e-flow
 # V2 规格覆盖度检查（关键文件 + API 覆盖）
 make spec-coverage
 
-# 一键严格验收（doctor + e2e + spec-coverage + pytest）
+# 一键严格验收（doctor + e2e + browser smoke + mece + data hygiene + spec-coverage + pytest）
 make acceptance
+
+# 正式应用前建议追加一次长时稳定性巡航（默认10分钟）
+make soak
 ```
 
 说明：
@@ -449,9 +473,15 @@ make acceptance
 - 当补丁状态为 `deployed` 时，后续预评分会自动应用补丁中的 `penalty_multiplier`（影响 `rule_total_score`）。
 - `make e2e-flow` 默认带兼容回退（会自动尝试 `/api/v1`、`/api` 及旧单文件端点）；若你要做新版本强约束验收，请加 `STRICT=1`。
 - `make spec-coverage` 会产出 `build/v2_spec_coverage.json` 和 `build/v2_spec_coverage.md`，用于核对重构关键项是否齐全。
-- `make acceptance` 会串行执行严格验收链路：`doctor(strict)` → `e2e-flow(strict)` → `spec-coverage(strict)` → `pytest`。
+- `make acceptance` 会串行执行严格验收链路：`doctor(strict)` → `e2e-flow(strict)` → `browser_button_smoke` → `mece_audit(strict)` → `data_hygiene(auto-repair)` → `spec-coverage(strict)` → `pytest`。
 - `make acceptance` 还会输出结构化验收摘要：`/Users/youfeini/Desktop/ZhiFei_BizSystem/build/acceptance_summary.json`（可直接发给 ChatGPT 做分析）。
+- `make acceptance` 还会额外产出：
+  - `/Users/youfeini/Desktop/ZhiFei_BizSystem/build/e2e_flow/acceptance_e2e.log`
+  - `/Users/youfeini/Desktop/ZhiFei_BizSystem/build/browser_button_smoke.md`
+  - `/Users/youfeini/Desktop/ZhiFei_BizSystem/build/web_button_contract.md`
 - `make acceptance-fast` 与 `make acceptance` 相同，但跳过 `pytest`，适合高频快速自检。
+- 当前关键按钮已全部进入 browser smoke，`web_button_contract.json` 中 `smoke_gap_count=0`，可直接用于判断“关键按钮是否还有漏网未进验收”。
+- `make soak` 适合在准备进入正式应用前跑最后一轮巡航；若 `status=PASS`，代表起检、周期采样、收检三段都已通过。
 - 验收摘要中的 `git` 字段会说明当前分支、是否已有提交、工作区是否有未提交变更，便于溯源。
 
 golden_dataset 回放脚本：
@@ -460,7 +490,7 @@ golden_dataset 回放脚本：
 # 生成 golden_dataset（优先选择样本数>=5的项目）
 .venv/bin/python scripts/build_golden_dataset.py --min-samples 5
 
-# 输出 V1/V2/V2+Calib 对比结果（JSON + Markdown）
+# 输出 V1/V2/当前分/V2+Calib 对比结果（JSON + Markdown）
 .venv/bin/python scripts/evaluate_golden_dataset.py
 ```
 

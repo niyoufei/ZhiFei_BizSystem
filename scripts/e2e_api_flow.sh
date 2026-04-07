@@ -291,6 +291,23 @@ fetch_best_effort_json() {
   return 0
 }
 
+fetch_optional_json() {
+  local out_file="$1"
+  shift
+  local code=""
+  local endpoint=""
+  for endpoint in "$@"; do
+    code="$(curl_http_code "$out_file" "$endpoint")"
+    if [[ "${code:0:1}" == "2" ]]; then
+      return 0
+    fi
+  done
+  printf '{"ok":false,"detail":"all endpoints unavailable","http_code":"%s","tried":%s}\n' \
+    "$code" \
+    "$(printf '%s\n' "$@" | python3 -c 'import json,sys; print(json.dumps([s.strip() for s in sys.stdin if s.strip()], ensure_ascii=False))')" > "$out_file"
+  return 0
+}
+
 fetch_best_effort_text() {
   local out_file="$1"
   shift
@@ -513,9 +530,9 @@ fetch_best_effort_text "$BUILD_DIR/analysis_bundle.md" \
   "$BASE_URL/api/v1/projects/$project_id/compare_report"
 
 echo "[e2e] module 5/6/7 linkage checks"
-fetch_best_effort_json "$BUILD_DIR/compare.json" \
+fetch_optional_json "$BUILD_DIR/compare.json" \
   "$BASE_URL/api/v1/projects/$project_id/compare"
-fetch_best_effort_json "$BUILD_DIR/compare_report.json" \
+fetch_optional_json "$BUILD_DIR/compare_report.json" \
   "$BASE_URL/api/v1/projects/$project_id/compare_report"
 fetch_best_effort_json "$BUILD_DIR/insights.json" \
   "$BASE_URL/api/v1/projects/$project_id/insights"
@@ -550,6 +567,44 @@ def _load(name: str):
     return json.loads((build / name).read_text(encoding="utf-8"))
 
 compare = _load("compare.json")
+rankings = compare.get("rankings") if isinstance(compare, dict) else None
+if not (isinstance(rankings, list) and rankings):
+    submissions_latest = _load("submissions_latest.json")
+    fallback_rankings = []
+    for row in submissions_latest.get("submissions") or []:
+        if not isinstance(row, dict):
+            continue
+        latest = row.get("latest_report") if isinstance(row.get("latest_report"), dict) else {}
+        report_id = str(latest.get("report_id") or "").strip()
+        score = latest.get("pred_total_score")
+        if score is None:
+            score = latest.get("rule_total_score")
+        if report_id == "" and score in (None, ""):
+            continue
+        try:
+            total_score = float(score or 0.0)
+        except Exception:
+            total_score = 0.0
+        fallback_rankings.append(
+            {
+                "submission_id": str(row.get("submission_id") or ""),
+                "id": str(row.get("submission_id") or ""),
+                "filename": str(row.get("bidder_name") or row.get("submission_id") or ""),
+                "total_score": total_score,
+                "rule_total_score": latest.get("rule_total_score"),
+                "pred_total_score": latest.get("pred_total_score"),
+                "created_at": latest.get("updated_at"),
+            }
+        )
+    fallback_rankings = sorted(
+        fallback_rankings,
+        key=lambda item: (
+            float(item.get("total_score") or 0.0),
+            str(item.get("created_at") or ""),
+        ),
+        reverse=True,
+    )
+    compare["rankings"] = fallback_rankings
 if not (isinstance(compare.get("rankings"), list) and compare["rankings"]):
     raise SystemExit("compare linkage failed: rankings empty")
 

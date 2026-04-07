@@ -7,17 +7,17 @@ cd "$ROOT_DIR"
 PORT="${PORT:-8000}"
 API_KEY="${API_KEY:-}"
 STRICT="${STRICT:-0}"
+if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+  PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
+else
+  PYTHON_BIN="python3"
+fi
 HEALTH_URL="http://127.0.0.1:${PORT}/health"
 SELF_CHECK_URL="http://127.0.0.1:${PORT}/api/v1/system/self_check"
 SELF_CHECK_COMPAT_URL="http://127.0.0.1:${PORT}/api/system/self_check"
 OPENAPI_URL="http://127.0.0.1:${PORT}/openapi.json"
 
 if [[ -z "$API_KEY" ]]; then
-  if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
-    PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
-  else
-    PYTHON_BIN="python3"
-  fi
   API_KEY="$("$PYTHON_BIN" "$ROOT_DIR/scripts/resolve_api_key.py" --preferred-role ops --fallback-role admin 2>/dev/null || true)"
 fi
 
@@ -106,6 +106,18 @@ if openapi_payload="$(curl_with_auth "$OPENAPI_URL" 2>/dev/null)"; then
 else
   echo "[doctor] WARN: openapi endpoint unavailable, skipped API surface check."
 fi
+
+echo "[doctor] checking web button contract..."
+button_contract_args=(
+  --base-url "http://127.0.0.1:${PORT}/"
+  --output-json "$ROOT_DIR/build/web_button_contract.json"
+  --output-md "$ROOT_DIR/build/web_button_contract.md"
+)
+if [[ "$STRICT" == "1" ]]; then
+  button_contract_args+=(--strict)
+fi
+"$PYTHON_BIN" "$ROOT_DIR/scripts/check_web_button_contract.py" \
+  "${button_contract_args[@]}"
 
 echo "[doctor] PASS"
 exit 0
