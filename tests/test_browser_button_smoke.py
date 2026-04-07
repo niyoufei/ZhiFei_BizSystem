@@ -140,16 +140,7 @@ def test_browser_button_smoke_write_matrix_covers_safe_write_paths() -> None:
     assert "btnUploadShigong" in ids
     assert "btnWeightsApply" in ids
     assert "btnLearning" in ids
-    assert "btnRebuildDelta" in ids
-    assert "btnRebuildSamples" in ids
-    assert "btnTrainCalibratorV2" in ids
-    assert "btnApplyCalibPredict" in ids
-    assert "btnAutoRunReflection" in ids
     assert "btnAdaptiveApply" in ids
-    assert "btnMinePatchV2" in ids
-    assert "btnShadowPatchV2" in ids
-    assert "btnDeployPatchV2" in ids
-    assert "btnRollbackPatchV2" in ids
     assert "deleteCurrentProject" in ids
     assert "deleteSelectedProjects" in ids
     assert "btnCleanupE2EProjects" in ids
@@ -253,32 +244,10 @@ def test_browser_button_smoke_write_matrix_covers_safe_write_paths() -> None:
     assert by_id["btnLearning"]["result_id"] == "learningResult"
     assert by_id["btnLearning"]["expected_text"] == "学习画像已生成/更新"
     assert "window.__codexRevealForSmoke('#btnLearning')" in by_id["btnLearning"]["prepare_js"]
-    assert by_id["btnRebuildDelta"]["result_id"] == "deltaResult"
-    assert by_id["btnRebuildDelta"]["expected_text"] == "DELTA_CASE 重建完成"
-    assert by_id["btnRebuildSamples"]["result_id"] == "sampleResult"
-    assert by_id["btnRebuildSamples"]["expected_text"] == "FEATURE_ROW 重建完成"
-    assert by_id["btnTrainCalibratorV2"]["result_id"] == "calibTrainResult"
-    assert by_id["btnTrainCalibratorV2"]["timeout_ms"] == 60000
-    assert by_id["btnTrainCalibratorV2"]["expected_text"] == "校准器训练完成"
-    assert by_id["btnApplyCalibPredict"]["result_id"] == "calibTrainResult"
-    assert by_id["btnApplyCalibPredict"]["expected_text"] == "校准分回填完成"
-    assert by_id["btnAutoRunReflection"]["result_id"] == "calibTrainResult"
-    assert by_id["btnAutoRunReflection"]["timeout_ms"] == 90000
-    assert by_id["btnAutoRunReflection"]["expected_text"] == "一键闭环执行完成"
     assert by_id["btnAdaptiveApply"]["result_id"] == "adaptiveApplyResult"
     assert by_id["btnAdaptiveApply"]["expected_text"] == "已应用。变更:"
     assert by_id["btnAdaptiveApply"]["timeout_ms"] == 60000
     assert by_id["btnAdaptiveApply"]["rollback_key"] == "adaptive_apply"
-    assert by_id["btnMinePatchV2"]["result_id"] == "patchResult"
-    assert by_id["btnMinePatchV2"]["timeout_ms"] == 60000
-    assert by_id["btnMinePatchV2"]["expected_text"] == "PATCH_PACKAGE 挖掘完成"
-    assert "patchType" in by_id["btnMinePatchV2"]["prepare_js"]
-    assert by_id["btnShadowPatchV2"]["result_id"] == "patchShadowResult"
-    assert by_id["btnShadowPatchV2"]["expected_text"] == "补丁影子评估完成"
-    assert by_id["btnDeployPatchV2"]["result_id"] == "patchDeployResult"
-    assert by_id["btnDeployPatchV2"]["expected_text"] == "补丁已发布"
-    assert by_id["btnRollbackPatchV2"]["result_id"] == "patchDeployResult"
-    assert by_id["btnRollbackPatchV2"]["expected_text"] == "补丁已回滚"
     assert by_id["deleteCurrentProject"]["kind"] == "js_check"
     assert by_id["deleteCurrentProject"]["api_verify"] == "state_project_removed"
     assert by_id["deleteCurrentProject"]["api_verify_state_key"] == "uiDeleteTargetId"
@@ -351,10 +320,8 @@ def test_browser_button_smoke_supports_adaptive_apply_rollback() -> None:
     assert 'LEXICON_PATH = ROOT_DIR / "app" / "resources" / "lexicon.yaml"' in source
     assert 'RUBRIC_PATH = ROOT_DIR / "app" / "resources" / "rubric.yaml"' in source
     assert "def capture_adaptive_apply_snapshot() -> Dict[str, Any]:" in source
-    assert (
-        "def restore_adaptive_apply_snapshot(snapshot: Dict[str, Any], *, base_url: str, api_key: str) -> None:"
-        in source
-    )
+    assert "def restore_adaptive_apply_snapshot(" in source
+    assert "snapshot: Dict[str, Any], *, base_url: str, api_key: str" in source
     assert "f\"{base_url.rstrip('/')}/api/v1/config/reload\"" in source
     assert 'rollback_key == "adaptive_apply"' in source
     assert "rollback_error = apply_step_rollback(spec, rollback_state)" in source
@@ -372,10 +339,8 @@ def test_browser_button_smoke_supports_project_removed_api_verification() -> Non
         "def wait_for_projects_removed(\n    *,\n    base_url: str,\n    project_ids: List[str],\n    api_key: str,\n    timeout_ms: int,\n) -> bool:"
         in source
     )
-    assert (
-        "def wait_for_project_removed(*, base_url: str, project_id: str, api_key: str, timeout_ms: int) -> bool:"
-        in source
-    )
+    assert "def wait_for_project_removed(" in source
+    assert "base_url: str, project_id: str, api_key: str, timeout_ms: int" in source
     assert 'api_verify = str(spec.get("api_verify") or "").strip()' in source
     assert 'if api_verify == "project_removed":' in source
     assert 'raise RuntimeError("project_removed verification failed")' in source

@@ -337,18 +337,18 @@ def build_selected_project_submission_render_context(
                 str(item).strip() for item in awareness_reasons[:1] if str(item).strip()
             )
             score_cell += (
-                '<div class="note">评分置信度: '
+                '<div class="note">评分置信等级（内部指数）: '
                 + html.escape(awareness_label)
                 + (
                     ""
                     if awareness_score is None
-                    else "（" + html.escape(f"{awareness_score:.1f}") + "）"
+                    else "（内部指数 " + html.escape(f"{awareness_score:.1f}") + "/100）"
                 )
                 + ("" if not reason_preview else " / " + html.escape(reason_preview))
                 + "</div>"
             )
         if util_blocked:
-            score_cell += '<div class="error">资料利用门禁未达标（建议补齐资料后重评分）</div>'
+            score_cell += '<div class="warn">资料利用门禁未达标（建议补齐资料后重评分）</div>'
         elif is_warned:
             score_cell += '<div class="note">资料利用存在补强提示（不阻断当前评分）。</div>'
 
@@ -356,13 +356,13 @@ def build_selected_project_submission_render_context(
         filename_raw = str(view.get("filename", ""))
         created_at = html.escape(str(view.get("created_at", ""))[:19])
         rows_html.append(
-            "<tr>"
-            + f"<td>{html.escape(filename_raw)}</td>"
-            + f"<td>{score_cell}</td>"
-            + f"<td>{diagnostic_cell}</td>"
-            + f"<td>{created_at}</td>"
+            '<tr class="submission-row">'
+            + f'<td class="submission-file-cell"><div class="submission-filename">{html.escape(filename_raw)}</div></td>'
+            + f'<td class="submission-score-cell"><div class="submission-stack">{score_cell}</div></td>'
+            + f'<td class="submission-diagnostic-cell"><div class="submission-stack">{diagnostic_cell}</div></td>'
+            + f'<td class="submission-created-cell">{created_at}</td>'
             + (
-                "<td>"
+                '<td class="submission-actions-cell">'
                 + f'<button type="button" class="btn-danger js-delete-submission" data-submission-id="{submission_id}" data-project-id="{html.escape(str(view.get("project_id") or ""))}" data-filename="{html.escape(filename_raw)}" onclick="return window.__zhifeiFallbackDelete(event, \'submission\', this.getAttribute(\'data-submission-id\'), this.getAttribute(\'data-filename\'), this.getAttribute(\'data-project-id\'))">删除</button>'
                 + "</td>"
             )

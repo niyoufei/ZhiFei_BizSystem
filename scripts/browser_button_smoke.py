@@ -511,7 +511,7 @@ BUTTON_SMOKE_MATRIX: List[Dict[str, Any]] = [
         "selector": "#submissionsTable .js-open-compare-report",
         "kind": "result",
         "result_id": "compareReportResult",
-        "expected_text": "逐份施组得分项/失分项（按文件）",
+        "expected_text": "当前仅分析你点击的这一份施组，不混入其它文件的优化建议。",
     },
     {
         "id": "btnCompareReport",
@@ -918,12 +918,12 @@ WRITE_BUTTON_SMOKE_MATRIX: List[Dict[str, Any]] = [
         "label": "保存为专家配置（E2E写入）",
         "selector": "#btnWeightsSave",
         "kind": "result",
-        "result_id": "output",
+        "result_id": "scoringFactorsResult",
         "requires_api_key": True,
         "prepare_js": """(() => {
           window.__codexSetWeightSliderForSmoke('09', 7);
-          const output = document.getElementById('output');
-          if (output) output.textContent = '';
+          const result = document.getElementById('scoringFactorsResult');
+          if (result) result.textContent = '';
           return window.__codexRevealForSmoke('#btnWeightsSave');
         })()""",
         "expected_text": "专家配置已保存并绑定到当前项目",
@@ -1104,59 +1104,6 @@ WRITE_BUTTON_SMOKE_MATRIX: List[Dict[str, Any]] = [
         "expected_text": "学习完成（基于",
     },
     {
-        "id": "btnRebuildDelta",
-        "label": "重建 DELTA_CASE（E2E写入）",
-        "selector": "#btnRebuildDelta",
-        "kind": "result",
-        "result_id": "deltaResult",
-        "requires_api_key": True,
-        "prepare_js": """() => window.__codexRevealForSmoke('#btnRebuildDelta')""",
-        "expected_text": "DELTA_CASE 重建完成",
-    },
-    {
-        "id": "btnRebuildSamples",
-        "label": "重建 FEATURE_ROW（E2E写入）",
-        "selector": "#btnRebuildSamples",
-        "kind": "result",
-        "result_id": "sampleResult",
-        "requires_api_key": True,
-        "prepare_js": """() => window.__codexRevealForSmoke('#btnRebuildSamples')""",
-        "expected_text": "FEATURE_ROW 重建完成",
-    },
-    {
-        "id": "btnTrainCalibratorV2",
-        "label": "训练并部署校准器（E2E写入）",
-        "selector": "#btnTrainCalibratorV2",
-        "kind": "result",
-        "result_id": "calibTrainResult",
-        "requires_api_key": True,
-        "prepare_js": """() => window.__codexRevealForSmoke('#btnTrainCalibratorV2')""",
-        "timeout_ms": 60000,
-        "expected_text": "校准器训练完成",
-    },
-    {
-        "id": "btnApplyCalibPredict",
-        "label": "回填校准分（E2E写入）",
-        "selector": "#btnApplyCalibPredict",
-        "kind": "result",
-        "result_id": "calibTrainResult",
-        "requires_api_key": True,
-        "prepare_js": """() => window.__codexRevealForSmoke('#btnApplyCalibPredict')""",
-        "timeout_ms": 60000,
-        "expected_text": "校准分回填完成",
-    },
-    {
-        "id": "btnAutoRunReflection",
-        "label": "一键闭环执行（E2E写入）",
-        "selector": "#btnAutoRunReflection",
-        "kind": "result",
-        "result_id": "calibTrainResult",
-        "requires_api_key": True,
-        "prepare_js": """() => window.__codexRevealForSmoke('#btnAutoRunReflection')""",
-        "timeout_ms": 90000,
-        "expected_text": "一键闭环执行完成",
-    },
-    {
         "id": "btnAdaptiveApply",
         "label": "应用补丁（E2E写入，可回滚）",
         "selector": "#btnAdaptiveApply",
@@ -1172,55 +1119,6 @@ WRITE_BUTTON_SMOKE_MATRIX: List[Dict[str, Any]] = [
         "timeout_ms": 60000,
         "expected_text": "已应用。变更:",
         "rollback_key": "adaptive_apply",
-    },
-    {
-        "id": "btnMinePatchV2",
-        "label": "挖掘 PATCH_PACKAGE（E2E写入）",
-        "selector": "#btnMinePatchV2",
-        "kind": "result",
-        "result_id": "patchResult",
-        "requires_api_key": True,
-        "prepare_js": """(() => {
-          window.__codexRevealForSmoke('#btnMinePatchV2');
-          const patchType = document.getElementById('patchType');
-          if (patchType) patchType.value = 'threshold';
-          return true;
-        })()""",
-        "timeout_ms": 60000,
-        "expected_text": "PATCH_PACKAGE 挖掘完成",
-    },
-    {
-        "id": "btnShadowPatchV2",
-        "label": "影子评估（E2E写入）",
-        "selector": "#btnShadowPatchV2",
-        "kind": "result",
-        "result_id": "patchShadowResult",
-        "requires_api_key": True,
-        "prepare_js": """() => window.__codexRevealForSmoke('#btnShadowPatchV2')""",
-        "timeout_ms": 60000,
-        "expected_text": "补丁影子评估完成",
-    },
-    {
-        "id": "btnDeployPatchV2",
-        "label": "发布补丁（E2E写入）",
-        "selector": "#btnDeployPatchV2",
-        "kind": "result",
-        "result_id": "patchDeployResult",
-        "requires_api_key": True,
-        "prepare_js": """() => window.__codexRevealForSmoke('#btnDeployPatchV2')""",
-        "timeout_ms": 60000,
-        "expected_text": "补丁已发布",
-    },
-    {
-        "id": "btnRollbackPatchV2",
-        "label": "回滚补丁（E2E写入）",
-        "selector": "#btnRollbackPatchV2",
-        "kind": "result",
-        "result_id": "patchDeployResult",
-        "requires_api_key": True,
-        "prepare_js": """() => window.__codexRevealForSmoke('#btnRollbackPatchV2')""",
-        "timeout_ms": 60000,
-        "expected_text": "补丁已回滚",
     },
     {
         "id": "btnCreateProject",

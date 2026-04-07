@@ -35969,8 +35969,8 @@ def index(
             bootScoreScaleEl.value = BOOTSTRAP_SCORE_SCALE_MAX === '5' ? '5' : '100';
           }
           const FALLBACK_ACTIONS = Object.assign(window.__ZHIFEI_FALLBACK_ACTIONS || {}, {
-            btnWeightsSave: { resultId: 'output', method: 'PUT', path: (pid) => '/api/v1/projects/' + pid + '/expert-profile', loading: '专家配置保存中...' },
-            btnWeightsApply: { resultId: 'output', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/rescore', loading: '按当前关注度重算中...' },
+            btnWeightsSave: { resultId: 'scoringFactorsResult', method: 'PUT', path: (pid) => '/api/v1/projects/' + pid + '/expert-profile', loading: '专家配置保存中...' },
+            btnWeightsApply: { resultId: 'scoringFactorsResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/rescore', loading: '按当前关注度重算中...' },
             btnUploadMaterials: { resultId: 'materialsActionStatus', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/materials', loading: '资料上传中...' },
             btnUploadBoq: { resultId: 'materialsActionStatusBoq', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/materials', loading: '清单上传中...' },
             btnUploadDrawing: { resultId: 'materialsActionStatusDrawing', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/materials', loading: '图纸上传中...' },
@@ -39221,9 +39221,18 @@ def index(
             return { ok: false, status: res.status, lockedConflict: false, data: data || {} };
           }
           const profile = (data && data.expert_profile) || {};
+          const saveSummary = buildExpertProfileSaveOutputSummary(data);
           setExpertProfileStatus('已保存并绑定配置：' + (profile.name || '-') + '（' + (profile.id || '-') + '）');
           applyWeightsRaw(profile.weights_raw || {});
-          showJson('output', buildExpertProfileSaveOutputSummary(data));
+          const saveResultEl = document.getElementById('scoringFactorsResult');
+          if (saveResultEl) {
+            saveResultEl.style.display = 'block';
+            saveResultEl.innerHTML = renderCompactResultSummaryHtml(
+              '专家配置保存结果',
+              saveSummary,
+            );
+          }
+          showOutputSummary(saveSummary);
           return { ok: true, status: res.status, lockedConflict: false, data: data || {}, profile };
         }
         async function applyExpertProfileAndRescore() {

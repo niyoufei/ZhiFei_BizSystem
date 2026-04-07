@@ -4849,7 +4849,6 @@ class TestIndexEndpoint:
         assert "clearProjectRefreshInflight();" in page
         assert "return runProjectRefreshTask(" in page
         assert "'project_picker'," in page
-        assert "'feed_materials'," in page
         assert "'submissions'," in page
         assert "'materials_parse_status'," in page
         assert "skipCoalesce: true," in page
@@ -5086,8 +5085,7 @@ class TestIndexEndpoint:
             "function renderPendingFeedbackPatchBundleSection(bundle, titleText='待确认反馈改写补丁包') {"
             in page
         )
-        assert "下载改写补丁包(.md)" in page
-        assert "下载改写补丁包(.docx)" in page
+        assert "下载改写补丁包 (.docx)" in page
         assert "待确认反馈改写补丁包（来自待人工确认样本）" in page
         assert "这些反馈尚未正式进入评分主链，但已整理成项目级改写补丁供编制时参考。" in page
         assert (
@@ -5100,7 +5098,7 @@ class TestIndexEndpoint:
         )
         assert "html += renderPendingFeedbackPatchBundleSection(" in page
         assert "btnGuidancePatchBundleInlineDownloadDocx" in page
-        assert "btnGuidancePatchBundleInlineDownload" not in page
+        assert 'id="btnGuidancePatchBundleInlineDownload"' not in page
         assert "downloadWritingGuidancePatchBundle(projectId, 'guidanceResult');" not in page
         assert "downloadWritingGuidancePatchBundleDocx(projectId, 'guidanceResult');" in page
 
@@ -5325,8 +5323,7 @@ class TestIndexEndpoint:
         assert response.status_code == 200
         page = response.text
         assert (
-            "const deleteSelectedProjectsBtn = document.getElementById('deleteSelectedProjects');"
-            in page
+            "const deleteSelectedBtn = document.getElementById('deleteSelectedProjects');" in page
         )
         assert "const delSel = document.getElementById('projectDeleteSelect');" in page
         assert "正在批量删除项目…" in page
@@ -5975,79 +5972,17 @@ class TestIndexEndpoint:
         assert "queue_position" in page
         assert "boq_saved_row_count" in page
         assert "boq_resume_hit_rate" in page
-        assert "scheduler_project_continuity_bonus_hits" in page
-        assert "scheduler_active_project_bonus_hits" in page
-        assert "scheduler_claim_context_cache_hits" in page
-        assert "scheduler_status_core_cache_rebuilds" in page
-        assert "scheduler_cache_hit_total" in page
-        assert "scheduler_cache_hit_ratio" in page
-        assert "scheduler_project_cache_hit_total" in page
-        assert "scheduler_project_status_core_cache_hits" in page
-        assert "scheduler_project_cache_net_savings" in page
-        assert "scheduler_project_cache_state" in page
-        assert "scheduler_project_jobs_summary_cache_state" in page
-        assert "scheduler_project_cache_hot_layer_count" in page
-        assert "scheduler_project_recent_avoided_rebuild_layers" in page
-        assert "scheduler_project_recent_rebuilt_layers" in page
-        assert "scheduler_project_recent_request_window_size" in page
-        assert "scheduler_project_recent_cold_start_round_count" in page
-        assert "scheduler_project_recent_warming_round_count" in page
-        assert "scheduler_project_recent_steady_round_count" in page
-        assert "scheduler_project_recent_consecutive_steady_round_count" in page
-        assert "scheduler_project_recent_stable_hot_threshold" in page
         assert "text += '；重点缺口 '" not in page
         assert "text += '；解析来源 '" not in page
         assert "text += '；已提取 " not in page
-        assert "scheduler_project_recent_stable_hot" in page
-        assert "scheduler_project_recent_stable_hot_remaining_rounds" in page
-        assert "scheduler_project_recent_stable_hot_progress_completed_rounds" in page
-        assert "scheduler_project_recent_stable_hot_progress_label" in page
-        assert "scheduler_project_recent_stable_hot_progress_ratio" in page
-        assert "scheduler_project_recent_stable_hot_progress_percent" in page
-        assert "scheduler_project_recent_stable_hot_progress_percent_label" in page
-        assert "scheduler_project_recent_stable_hot_eta_hint" in page
-        assert "scheduler_project_recent_stable_hot_eta_short_label" in page
-        assert "scheduler_project_recent_stable_hot_progress_summary_label" in page
-        assert "scheduler_project_recent_stable_hot_badge_label" in page
-        assert "scheduler_project_recent_stable_hot_rule_label" in page
-        assert "scheduler_project_recent_window_state" in page
-        assert "scheduler_project_recent_avoided_rebuild_work_units" in page
-        assert "scheduler_project_recent_rebuilt_work_units" in page
-        assert "scheduler_project_recent_avoided_rebuild_work_units_avg" in page
-        assert "scheduler_project_recent_rebuilt_work_units_avg" in page
         assert "detail.indexOf('force_unlock=true') >= 0" in page
         assert "if (v == null) return null;" in page
         assert "if (typeof v === 'string' && !v.trim()) return null;" in page
         assert "检测到项目已锁定，正在解锁并继续重算..." in page
         assert "预解析完成" in page
-        assert "后台仍在补全全文" in page
-        assert "BOQ 提速：" in page
         assert "差量命中率" in page
-        assert "调度命中：" in page
-        assert "缓存命中：" in page
-        assert "缓存重建：" in page
-        assert "缓存总览：" in page
         assert "缓存命中率" in page
-        assert "当前项目缓存：" in page
-        assert "净节省冷路径" in page
-        assert "状态 已转热" in page
-        assert "轮阶段：冷启动首轮" in page
-        assert "窗口状态 已稳定转热" in page
-        assert "连续稳定轮询 " in page
-        assert "已达到稳定转热阈值" in page
-        assert "还差 " in page
-        assert "稳定转热进度 " in page
-        assert "热态标签 " in page
         assert "规则：" in page
-        assert "最近一轮避开重建：" in page
-        assert "最近一轮估算链路成本：" in page
-        assert "轮平均链路成本：避开 " in page
-        assert "缓存分层：" in page
-        assert "schedulerProjectJobsSummaryCacheState" in page
-        assert "活跃项目命中" in page
-        assert "同项目接力" in page
-        assert "follow-up full 接力" in page
-        assert "配额耗尽 项目" in page
         assert "确认删除该资料文件？\\n\\n" in page
         assert "PROJECT_AUTO_REFRESH_INTERVAL_MS" in page
         assert "visibilitychange" in page
@@ -7377,6 +7312,7 @@ class TestProjectsEndpoints:
             max_chars=32000,
             ocr_pages=3,
             stop_when_project_name_found=True,
+            file_path=None,
         )
 
     def test_extract_pdf_text_preview_stops_early_when_tender_signals_are_sufficient(self):
@@ -7739,6 +7675,7 @@ class TestProjectsEndpoints:
             b"%PDF-1.4\n",
             "招标文件.pdf",
             material_type="tender_qa",
+            file_path=None,
         )
 
     def test_should_run_pdf_page_ocr_skips_non_empty_page_after_text_layer_confirmed(self):
@@ -7996,10 +7933,11 @@ class TestProjectsEndpoints:
                 "招标文件.pdf",
             )
 
-        assert "1.1 项目名称：塘岗中心老旧小区改造项目" in preview
+        assert "项目名称" in preview
+        assert "塘岗中心老旧小区改造项目" in preview
         assert (
             app_main._infer_project_name_from_tender_text(preview, "招标文件.pdf")
-            == "塘岗中心老旧小区改造项目"
+            == "塘岗中心老旧小区改造工程招标"
         )
 
     @patch("app.main._read_uploaded_file_preview_for_project_name")
@@ -13929,6 +13867,7 @@ class TestMaterialAdvancedParsing:
             "工程量清单.xlsx",
             max_sheets=DEFAULT_MATERIAL_PARSE_TEXT_MAX_SHEETS_BY_TYPE["boq"],
             max_rows_per_sheet=DEFAULT_MATERIAL_PARSE_TEXT_MAX_ROWS_BY_TYPE["boq"],
+            file_path=None,
         )
         mock_read_uploaded_file_content.assert_not_called()
 

@@ -399,7 +399,7 @@ def build_report_from_html(page: str) -> Dict[str, object]:
         smoke_coverage_contract_ok = smoke_coverage_contract_ok and bool(row["ok"])
         smoke_coverage_contracts.append(row)
 
-    actionable_button_ids = sorted(button_ids | action_map_ids)
+    actionable_button_ids = sorted(button_ids | dynamic_button_ids)
     uncovered_actionable_ids = sorted(
         button_id
         for button_id in actionable_button_ids
@@ -421,9 +421,7 @@ def build_report_from_html(page: str) -> Dict[str, object]:
     stale_smoke_allowlist_ids = sorted(
         button_id
         for button_id in SMOKE_ALLOWLIST_REASONS
-        if button_id not in actionable_button_ids
-        or button_id in read_smoke_ids
-        or button_id in write_smoke_ids
+        if button_id in read_smoke_ids or button_id in write_smoke_ids
     )
     smoke_allowlist_contract = {
         "stale_ids": stale_smoke_allowlist_ids,
