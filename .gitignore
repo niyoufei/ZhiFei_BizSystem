@@ -87,8 +87,14 @@ MANIFEST
 # =========================
 # Project local generated files
 # =========================
+.playwright-cli/
+output/
+tmp/
+*.app/
+
 data/materials/
 data/submissions/
+data/versions/
 data/*.json
 data/*.lock
 data/*.json.lock
