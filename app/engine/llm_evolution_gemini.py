@@ -93,15 +93,22 @@ def get_gemini_evolution_pool_quality() -> Dict[str, float]:
     rated_scores = [
         _key_quality_score(key, stats) for key in keys if (_key_total_attempts(key, stats) > 0)
     ]
+    sufficiently_rated_scores = [
+        _key_quality_score(key, stats)
+        for key in keys
+        if _key_total_attempts(key, stats) >= DEFAULT_EVOLUTION_LLM_ACCOUNT_LOW_QUALITY_MIN_HISTORY
+    ]
     low_quality_accounts = sum(1 for key in keys if _key_is_low_quality(key, stats))
     if not scores:
         return {}
+    display_scores = sufficiently_rated_scores or [50.0 for _ in keys if _]
     return {
         "total_accounts": float(len(keys)),
         "rated_accounts": float(len(rated_scores)),
-        "average_quality_score": round(sum(scores) / float(len(scores)), 1),
-        "best_quality_score": round(max(scores), 1),
-        "worst_quality_score": round(min(scores), 1),
+        "sufficiently_rated_accounts": float(len(sufficiently_rated_scores)),
+        "average_quality_score": round(sum(display_scores) / float(len(display_scores)), 1),
+        "best_quality_score": round(max(display_scores), 1),
+        "worst_quality_score": round(min(display_scores), 1),
         "low_quality_accounts": float(low_quality_accounts),
     }
 

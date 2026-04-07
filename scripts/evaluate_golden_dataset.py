@@ -24,26 +24,27 @@ def _render_markdown(project_rows: List[Dict[str, Any]]) -> str:
     lines = [
         "# Golden Dataset Evaluation",
         "",
-        "| Project | Samples(QT) | V1 MAE | V2 MAE | V2+Calib MAE | V1 Spearman | V2 Spearman | V2+Calib Spearman |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| Project | Samples(QT) | V1 MAE | V2 MAE | Current MAE | V2+Calib MAE | V1 Spearman | V2 Spearman | Current Spearman | V2+Calib Spearman |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in project_rows:
         pid = row.get("project_id")
         variants = row.get("variants") or {}
         v1 = variants.get("v1") or {}
         v2 = variants.get("v2") or {}
+        current = variants.get("current") or {}
         v2c = variants.get("v2_calib") or {}
         lines.append(
             f"| {pid} | {row.get('sample_count_qt', 0)} | "
-            f"{v1.get('mae', 0)} | {v2.get('mae', 0)} | {v2c.get('mae', 0)} | "
-            f"{v1.get('spearman', 0)} | {v2.get('spearman', 0)} | {v2c.get('spearman', 0)} |"
+            f"{v1.get('mae', 0)} | {v2.get('mae', 0)} | {current.get('mae', 0)} | {v2c.get('mae', 0)} | "
+            f"{v1.get('spearman', 0)} | {v2.get('spearman', 0)} | {current.get('spearman', 0)} | {v2c.get('spearman', 0)} |"
         )
     return "\n".join(lines)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Evaluate V1/V2/V2+Calib on golden dataset projects."
+        description="Evaluate V1/V2/current/V2+Calib on golden dataset projects."
     )
     parser.add_argument(
         "--input", type=str, default="build/golden_dataset.json", help="Golden dataset path."

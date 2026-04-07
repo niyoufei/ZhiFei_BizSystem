@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import scripts.ops_agents as soa
 from app.engine import ops_agents as oa
 
 
@@ -72,6 +73,7 @@ def _ok_llm_status_response(
         else {
             "total_accounts": 4.0,
             "rated_accounts": 0.0,
+            "sufficiently_rated_accounts": 0.0,
             "average_quality_score": 50.0,
             "best_quality_score": 50.0,
             "worst_quality_score": 50.0,
@@ -84,6 +86,7 @@ def _ok_llm_status_response(
         else {
             "total_accounts": 2.0,
             "rated_accounts": 0.0,
+            "sufficiently_rated_accounts": 0.0,
             "average_quality_score": 50.0,
             "best_quality_score": 50.0,
             "worst_quality_score": 50.0,
@@ -110,6 +113,59 @@ def _ok_llm_status_response(
             "gemini_pool_quality": gemini_quality,
         },
         "error": None,
+    }
+
+
+def _ops_agents_status_payload(
+    *,
+    overall_status: str = "warn",
+    learning_metrics: dict | None = None,
+    runtime_metrics: dict | None = None,
+    runtime_actions: dict | None = None,
+    learning_recommendations: list[str] | None = None,
+    runtime_recommendations: list[str] | None = None,
+    recommendations: list[str] | None = None,
+    manual_confirmation_rows: list[dict] | None = None,
+) -> dict:
+    return {
+        "generated_at": "2026-04-01T00:00:00+00:00",
+        "overall": {
+            "status": overall_status,
+            "pass_count": 0,
+            "warn_count": 1 if overall_status == "warn" else 0,
+            "fail_count": 1 if overall_status == "fail" else 0,
+            "duration_ms": 12,
+        },
+        "settings": {
+            "auto_repair": True,
+            "auto_evolve": True,
+        },
+        "agent_count": 4,
+        "agents": {
+            "runtime_repair": {
+                "status": "pass",
+                "metrics": runtime_metrics or {},
+                "actions": runtime_actions or {},
+                "recommendations": runtime_recommendations or [],
+            },
+            "data_hygiene": {
+                "status": "pass",
+                "actions": {},
+                "recommendations": [],
+            },
+            "learning_calibration": {
+                "status": "warn",
+                "metrics": learning_metrics or {},
+                "manual_confirmation_rows": manual_confirmation_rows or [],
+                "recommendations": learning_recommendations or [],
+            },
+            "evolution": {
+                "status": "pass",
+                "metrics": {},
+                "recommendations": [],
+            },
+        },
+        "recommendations": recommendations or [],
     }
 
 
@@ -782,7 +838,6 @@ def test_run_ops_agents_cycle_skips_smoke_restart_during_cooldown(
     assert any("冷却期" in row for row in result["agents"]["project_flow"]["recommendations"])
 
 
-
 def test_smoke_runtime_retry_state_uses_storage_helpers(monkeypatch, tmp_path: Path):
     retry_state_path = tmp_path / "ops_agents_smoke_retry_state.json"
     load_calls: dict[str, object] = {}
@@ -801,13 +856,16 @@ def test_smoke_runtime_retry_state_uses_storage_helpers(monkeypatch, tmp_path: P
     monkeypatch.setattr(oa, "save_json", fake_save_json)
 
     state = oa._load_smoke_runtime_retry_state(retry_state_path)
-    oa._save_smoke_runtime_retry_state({"project_flow": {"outcome": "restart_ok"}}, retry_state_path)
+    oa._save_smoke_runtime_retry_state(
+        {"project_flow": {"outcome": "restart_ok"}}, retry_state_path
+    )
 
     assert load_calls["path"] == retry_state_path
     assert load_calls["default"] == {}
     assert state["project_flow"]["attempted_at"] == "2026-04-03T00:00:00+00:00"
     assert save_calls["path"] == retry_state_path
     assert save_calls["payload"] == {"project_flow": {"outcome": "restart_ok"}}
+
 
 def test_learning_calibration_agent_auto_runs_evolve_and_reflection():
     recent_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
@@ -1083,12 +1141,19 @@ def test_learning_calibration_agent_warns_when_manual_confirmation_required():
                 "json": {
                     "summary": {
                         "manual_confirmation_required": True,
+                        "pending_extreme_ground_truth_count": 4,
+                        "manual_override_hint": "confirm_extreme_sample=1",
+                        "current_calibrator_deployment_mode": "prior_fallback",
                         "few_shot_pending_review_count": 0,
                     },
                     "score_preview": {
                         "current_calibrator_version": "prior_five_scale_global_offset_v1",
+                        "matched_submission_count": 0,
                     },
                     "version_history": [],
+                    "recommendations": [
+                        "存在 4 条极端偏差样本，自动调权/自动校准已被暂停；人工确认后再执行学习进化或一键闭环。"
+                    ],
                 },
                 "error": None,
             }
@@ -1107,6 +1172,18 @@ def test_learning_calibration_agent_warns_when_manual_confirmation_required():
     assert result["metrics"]["manual_confirmation_required_count"] == 1
     assert result["metrics"]["pending_calibration_after"] == 1
     assert result["metrics"]["reflection_attempted_count"] == 0
+    assert result["manual_confirmation_rows"][0]["project_id"] == "p1"
+    assert result["manual_confirmation_rows"][0]["project_name"] == "真实项目A"
+    assert result["manual_confirmation_rows"][0]["pending_extreme_ground_truth_count"] == 4
+    assert (
+        result["manual_confirmation_rows"][0]["manual_override_hint"] == "confirm_extreme_sample=1"
+    )
+    assert result["manual_confirmation_rows"][0]["matched_submission_count"] == 0
+    assert result["manual_confirmation_rows"][0]["entrypoint_key"] == "ground_truth"
+    assert (
+        result["manual_confirmation_rows"][0]["entrypoint_label"]
+        == "前往「5) 自我学习与进化」录入真实评标"
+    )
     assert any("极端偏差样本" in row for row in result["recommendations"])
 
 
@@ -1282,6 +1359,224 @@ def test_learning_calibration_agent_reports_bootstrap_review_failures():
     assert result["metrics"]["pending_calibration_after"] == 1
     assert result["metrics"]["bootstrap_review_failed_count"] == 1
     assert any("自动阻止部署" in row for row in result["recommendations"])
+
+
+def test_learning_calibration_agent_retries_when_current_calibrator_is_degraded():
+    recent_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    calls = {"health": 0, "governance": 0, "reflection": 0}
+
+    def fake_requester(**kwargs):
+        method = str(kwargs.get("method") or "")
+        url = str(kwargs.get("url") or "")
+        if method == "GET" and url.endswith("/api/v1/config/llm_status"):
+            return _ok_llm_status_response()
+        if method == "GET" and url.endswith("/api/v1/projects"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": [
+                    {
+                        "id": "p1",
+                        "name": "真实项目A",
+                        "status": "submitted_to_qingtian",
+                        "updated_at": recent_iso,
+                    }
+                ],
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/evolution/health"):
+            calls["health"] += 1
+            degraded = calls["health"] == 1
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "ground_truth_count": 4,
+                        "eligible_learning_ground_truth_count": 3,
+                        "matched_prediction_count": 3,
+                        "matched_score_record_count": 3,
+                        "guardrail_blocked_count": 0,
+                        "has_evolved_multipliers": True,
+                        "evolution_weights_usable": True,
+                        "current_calibrator_degraded": degraded,
+                        "current_calibrator_has_rollback_candidate": degraded,
+                    },
+                    "drift": {"level": "low"},
+                },
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/feedback/governance"):
+            calls["governance"] += 1
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "manual_confirmation_required": False,
+                        "few_shot_pending_review_count": 0,
+                    },
+                    "score_preview": {
+                        "current_calibrator_version": "calib_auto_existing",
+                    },
+                    "version_history": [
+                        {"artifact": "calibration_models", "latest_created_at": ""}
+                    ],
+                },
+                "error": None,
+            }
+        if method == "POST" and url.endswith("/api/v1/projects/p1/reflection/auto_run"):
+            calls["reflection"] += 1
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "ok": True,
+                    "calibrator_deployed": True,
+                    "calibrator_runtime_governance": {
+                        "action": "rollback",
+                        "updated_reports": 7,
+                        "updated_submissions": 7,
+                        "degraded_after": False,
+                        "recovered_after": True,
+                    },
+                    "patch_deployed": False,
+                    "patch_auto_govern": {"action": "skip"},
+                },
+                "error": None,
+            }
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    result = oa._run_learning_calibration_agent(
+        base_url="http://127.0.0.1:8000",
+        api_key=None,
+        timeout=5.0,
+        auto_evolve=True,
+        min_samples=3,
+        requester=fake_requester,
+    )
+
+    assert result["status"] == "pass"
+    assert calls["reflection"] == 1
+    assert result["metrics"]["reflection_attempted_count"] == 1
+    assert result["metrics"]["calibrator_degraded_before_count"] == 1
+    assert result["metrics"]["calibrator_degraded_after_count"] == 0
+    assert result["metrics"]["calibrator_rollback_candidate_count"] == 1
+    assert result["metrics"]["calibrator_runtime_rollback_count"] == 1
+    assert result["metrics"]["calibrator_runtime_rollback_success_count"] == 1
+    assert result["metrics"]["calibrator_runtime_rollback_recovered_count"] == 1
+    assert result["metrics"]["calibrator_runtime_rollback_unrecovered_count"] == 0
+
+
+def test_learning_calibration_agent_warns_when_runtime_rollback_does_not_recover():
+    recent_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    calls = {"health": 0, "governance": 0, "reflection": 0}
+
+    def fake_requester(**kwargs):
+        method = str(kwargs.get("method") or "")
+        url = str(kwargs.get("url") or "")
+        if method == "GET" and url.endswith("/api/v1/config/llm_status"):
+            return _ok_llm_status_response()
+        if method == "GET" and url.endswith("/api/v1/projects"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": [
+                    {
+                        "id": "p1",
+                        "name": "真实项目A",
+                        "status": "submitted_to_qingtian",
+                        "updated_at": recent_iso,
+                    }
+                ],
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/evolution/health"):
+            calls["health"] += 1
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "ground_truth_count": 4,
+                        "eligible_learning_ground_truth_count": 3,
+                        "matched_prediction_count": 3,
+                        "matched_score_record_count": 3,
+                        "guardrail_blocked_count": 0,
+                        "has_evolved_multipliers": True,
+                        "evolution_weights_usable": True,
+                        "current_calibrator_degraded": True,
+                        "current_calibrator_has_rollback_candidate": True,
+                    },
+                    "drift": {"level": "low"},
+                },
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/feedback/governance"):
+            calls["governance"] += 1
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "manual_confirmation_required": False,
+                        "few_shot_pending_review_count": 0,
+                    },
+                    "score_preview": {
+                        "current_calibrator_version": "calib_auto_existing",
+                    },
+                    "version_history": [
+                        {"artifact": "calibration_models", "latest_created_at": ""}
+                    ],
+                },
+                "error": None,
+            }
+        if method == "POST" and url.endswith("/api/v1/projects/p1/reflection/auto_run"):
+            calls["reflection"] += 1
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "ok": True,
+                    "calibrator_deployed": True,
+                    "calibrator_runtime_governance": {
+                        "action": "rollback",
+                        "updated_reports": 7,
+                        "updated_submissions": 7,
+                        "degraded_after": True,
+                        "recovered_after": False,
+                    },
+                    "patch_deployed": False,
+                    "patch_auto_govern": {"action": "skip"},
+                },
+                "error": None,
+            }
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    result = oa._run_learning_calibration_agent(
+        base_url="http://127.0.0.1:8000",
+        api_key=None,
+        timeout=5.0,
+        auto_evolve=True,
+        min_samples=3,
+        requester=fake_requester,
+    )
+
+    assert result["status"] == "warn"
+    assert calls["reflection"] == 1
+    assert result["metrics"]["calibrator_runtime_rollback_count"] == 1
+    assert result["metrics"]["calibrator_runtime_rollback_success_count"] == 1
+    assert result["metrics"]["calibrator_runtime_rollback_recovered_count"] == 0
+    assert result["metrics"]["calibrator_runtime_rollback_unrecovered_count"] == 1
+    assert any("运行时回退后依旧显示退化" in item for item in result["recommendations"])
 
 
 def test_learning_calibration_agent_warns_when_enhancement_review_diverged():
@@ -1797,6 +2092,7 @@ def test_learning_calibration_agent_warns_when_llm_account_pool_quality_is_low()
                 openai_pool_quality={
                     "total_accounts": 4.0,
                     "rated_accounts": 3.0,
+                    "sufficiently_rated_accounts": 3.0,
                     "average_quality_score": 32.0,
                     "best_quality_score": 54.0,
                     "worst_quality_score": 18.0,
@@ -1866,6 +2162,87 @@ def test_learning_calibration_agent_warns_when_llm_account_pool_quality_is_low()
     assert any("账号池历史质量分偏低" in row for row in result["recommendations"])
 
 
+def test_learning_calibration_agent_does_not_warn_on_low_sample_pool_scores():
+    recent_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+
+    def fake_requester(**kwargs):
+        method = str(kwargs.get("method") or "")
+        url = str(kwargs.get("url") or "")
+        if method == "GET" and url.endswith("/api/v1/config/llm_status"):
+            return _ok_llm_status_response(
+                openai_pool_quality={
+                    "total_accounts": 4.0,
+                    "rated_accounts": 3.0,
+                    "sufficiently_rated_accounts": 0.0,
+                    "average_quality_score": 30.0,
+                    "best_quality_score": 30.0,
+                    "worst_quality_score": 30.0,
+                    "low_quality_accounts": 0.0,
+                }
+            )
+        if method == "GET" and url.endswith("/api/v1/projects"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": [
+                    {
+                        "id": "p1",
+                        "name": "真实项目A",
+                        "status": "submitted_to_qingtian",
+                        "updated_at": recent_iso,
+                    }
+                ],
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/evolution/health"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "ground_truth_count": 3,
+                        "eligible_learning_ground_truth_count": 3,
+                        "matched_prediction_count": 3,
+                        "guardrail_blocked_count": 0,
+                        "has_evolved_multipliers": True,
+                        "evolution_weights_usable": True,
+                    },
+                    "drift": {"level": "low"},
+                },
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/p1/feedback/governance"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {
+                    "summary": {
+                        "manual_confirmation_required": False,
+                        "few_shot_pending_review_count": 0,
+                    },
+                    "score_preview": {"current_calibrator_version": "calib_auto_existing"},
+                    "version_history": [],
+                },
+                "error": None,
+            }
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    result = oa._run_learning_calibration_agent(
+        base_url="http://127.0.0.1:8000",
+        api_key=None,
+        timeout=5.0,
+        auto_evolve=True,
+        min_samples=1,
+        requester=fake_requester,
+    )
+
+    assert result["status"] == "pass"
+    assert result["metrics"]["llm_account_low_quality_pool_count"] == 0
+
+
 def test_learning_calibration_agent_warns_when_llm_accounts_are_deprioritized():
     recent_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
 
@@ -1877,6 +2254,7 @@ def test_learning_calibration_agent_warns_when_llm_accounts_are_deprioritized():
                 openai_pool_quality={
                     "total_accounts": 4.0,
                     "rated_accounts": 3.0,
+                    "sufficiently_rated_accounts": 3.0,
                     "average_quality_score": 61.0,
                     "best_quality_score": 92.0,
                     "worst_quality_score": 21.0,
@@ -2359,7 +2737,126 @@ def test_project_flow_agent_smoke_success():
     assert result["metrics"]["created_ok"] == 1
     assert result["metrics"]["listed_after_create"] == 1
     assert result["metrics"]["delete_ok"] == 1
+    assert result["metrics"]["projects_after_delete_ok"] == 1
     assert result["metrics"]["removed_after_delete"] == 1
+
+
+def test_project_flow_agent_fails_when_projects_unreachable_after_delete():
+    state = {"created": False, "deleted": False}
+
+    def fake_requester(**kwargs):
+        method = str(kwargs.get("method") or "")
+        url = str(kwargs.get("url") or "")
+        payload = kwargs.get("payload") or {}
+        if method == "GET" and url.endswith("/api/v1/projects"):
+            if state["deleted"]:
+                return {
+                    "ok": False,
+                    "status_code": 0,
+                    "elapsed_ms": 0,
+                    "json": {},
+                    "error": "URLError: <urlopen error [Errno 61] Connection refused>",
+                }
+            rows = [{"id": "p1", "name": "项目1"}]
+            if state["created"]:
+                rows.append({"id": "ops-p1", "name": "OPS_SMOKE_TEST"})
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": rows,
+                "error": None,
+            }
+        if method == "POST" and url.endswith("/api/v1/projects"):
+            state["created"] = True
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {"id": "ops-p1", "name": payload.get("name")},
+                "error": None,
+            }
+        if method == "DELETE" and url.endswith("/api/v1/projects/ops-p1"):
+            state["deleted"] = True
+            return {
+                "ok": True,
+                "status_code": 204,
+                "elapsed_ms": 1,
+                "json": {},
+                "error": None,
+            }
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    result = oa._run_project_flow_agent(
+        base_url="http://127.0.0.1:8000",
+        api_key=None,
+        timeout=5.0,
+        requester=fake_requester,
+    )
+    assert result["status"] == "fail"
+    assert result["metrics"]["delete_ok"] == 1
+    assert result["metrics"]["projects_after_delete_ok"] == 0
+    assert result["metrics"]["removed_after_delete"] == 0
+    assert "项目列表不可达" in result["recommendations"][0]
+
+
+def test_request_with_local_read_retry_recovers_connection_refused_once():
+    calls = {"count": 0}
+
+    def fake_requester(**kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {
+                "ok": False,
+                "status_code": 0,
+                "elapsed_ms": 0,
+                "json": {},
+                "error": "URLError: <urlopen error [Errno 61] Connection refused>",
+            }
+        return {
+            "ok": True,
+            "status_code": 200,
+            "elapsed_ms": 1,
+            "json": [{"id": "p1"}],
+            "error": None,
+        }
+
+    original_sleep = oa.time.sleep
+    oa.time.sleep = lambda _seconds: None
+    try:
+        result = oa._request_with_local_read_retry(
+            requester=fake_requester,
+            method="GET",
+            url="http://127.0.0.1:8000/api/v1/projects",
+            timeout=5.0,
+        )
+    finally:
+        oa.time.sleep = original_sleep
+    assert calls["count"] == 2
+    assert result["status_code"] == 200
+
+
+def test_request_with_local_read_retry_does_not_retry_non_local_post():
+    calls = {"count": 0}
+
+    def fake_requester(**kwargs):
+        calls["count"] += 1
+        return {
+            "ok": False,
+            "status_code": 0,
+            "elapsed_ms": 0,
+            "json": {},
+            "error": "URLError: <urlopen error [Errno 61] Connection refused>",
+        }
+
+    result = oa._request_with_local_read_retry(
+        requester=fake_requester,
+        method="POST",
+        url="https://example.com/api/v1/projects",
+        timeout=5.0,
+    )
+    assert calls["count"] == 1
+    assert result["status_code"] == 0
 
 
 def test_tender_project_flow_agent_smoke_success():
@@ -2422,7 +2919,76 @@ def test_tender_project_flow_agent_smoke_success():
     assert result["metrics"]["elapsed_ok"] == 1
     assert result["metrics"]["listed_after_create"] == 1
     assert result["metrics"]["delete_ok"] == 1
+    assert result["metrics"]["projects_after_delete_ok"] == 1
     assert result["metrics"]["removed_after_delete"] == 1
+
+
+def test_tender_project_flow_agent_fails_when_projects_unreachable_after_delete():
+    state = {"created": False, "deleted": False}
+
+    def fake_requester(**kwargs):
+        method = str(kwargs.get("method") or "")
+        url = str(kwargs.get("url") or "")
+        files = kwargs.get("files") or []
+        if method == "POST" and url.endswith("/api/v1/projects/create_from_tender"):
+            assert files and files[0]["filename"] == "ops_tender_smoke.txt"
+            state["created"] = True
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1200,
+                "json": {
+                    "project": {"id": "ops-tender-p1", "name": "OPS招标项目1工程"},
+                    "inferred_name": "OPS招标项目1工程",
+                },
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects"):
+            if state["deleted"]:
+                return {
+                    "ok": False,
+                    "status_code": 0,
+                    "elapsed_ms": 0,
+                    "json": {},
+                    "error": "URLError: <urlopen error [Errno 61] Connection refused>",
+                }
+            rows = [{"id": "p1", "name": "项目1"}]
+            if state["created"]:
+                rows.append({"id": "ops-tender-p1", "name": "OPS招标项目1工程"})
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": rows,
+                "error": None,
+            }
+        if method == "DELETE" and url.endswith("/api/v1/projects/ops-tender-p1"):
+            state["deleted"] = True
+            return {
+                "ok": True,
+                "status_code": 204,
+                "elapsed_ms": 1,
+                "json": {},
+                "error": None,
+            }
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    original_time = oa.time.time
+    oa.time.time = lambda: 0.001
+    try:
+        result = oa._run_tender_project_flow_agent(
+            base_url="http://127.0.0.1:8000",
+            api_key=None,
+            timeout=5.0,
+            requester=fake_requester,
+        )
+    finally:
+        oa.time.time = original_time
+    assert result["status"] == "fail"
+    assert result["metrics"]["delete_ok"] == 1
+    assert result["metrics"]["projects_after_delete_ok"] == 0
+    assert result["metrics"]["removed_after_delete"] == 0
+    assert "项目列表不可达" in result["recommendations"][0]
 
 
 def test_upload_flow_agent_smoke_success():
@@ -2516,4 +3082,313 @@ def test_upload_flow_agent_smoke_success():
     assert result["metrics"]["shigong_upload_ok"] == 1
     assert result["metrics"]["submission_listed"] == 1
     assert result["metrics"]["delete_ok"] == 1
+    assert result["metrics"]["projects_after_delete_ok"] == 1
     assert result["metrics"]["removed_after_delete"] == 1
+
+
+def test_upload_flow_agent_fails_when_projects_unreachable_after_delete():
+    state = {"created": False, "deleted": False, "material": False, "submission": False}
+
+    def fake_requester(**kwargs):
+        method = str(kwargs.get("method") or "")
+        url = str(kwargs.get("url") or "")
+        if method == "POST" and url.endswith("/api/v1/projects"):
+            state["created"] = True
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {"id": "ops-upload-p1", "name": "OPS上传项目_1"},
+                "error": None,
+            }
+        if method == "POST" and url.endswith("/api/v1/projects/ops-upload-p1/materials"):
+            state["material"] = True
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {"material": {"id": "m1", "filename": "ops_material.txt"}},
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/ops-upload-p1/materials"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": [{"id": "m1", "filename": "ops_material.txt"}] if state["material"] else [],
+                "error": None,
+            }
+        if method == "POST" and url.endswith("/api/v1/projects/ops-upload-p1/shigong"):
+            state["submission"] = True
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {"id": "s1", "filename": "ops_shigong.txt"},
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/ops-upload-p1/submissions"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": [{"id": "s1", "filename": "ops_shigong.txt"}]
+                if state["submission"]
+                else [],
+                "error": None,
+            }
+        if method == "DELETE" and url.endswith("/api/v1/projects/ops-upload-p1"):
+            state["deleted"] = True
+            return {
+                "ok": True,
+                "status_code": 204,
+                "elapsed_ms": 1,
+                "json": {},
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects"):
+            if state["deleted"]:
+                return {
+                    "ok": False,
+                    "status_code": 0,
+                    "elapsed_ms": 0,
+                    "json": {},
+                    "error": "URLError: <urlopen error [Errno 61] Connection refused>",
+                }
+            rows = [{"id": "p1", "name": "项目1"}]
+            if state["created"]:
+                rows.append({"id": "ops-upload-p1", "name": "OPS上传项目_1"})
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": rows,
+                "error": None,
+            }
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    original_time = oa.time.time
+    oa.time.time = lambda: 0.001
+    try:
+        result = oa._run_upload_flow_agent(
+            base_url="http://127.0.0.1:8000",
+            api_key=None,
+            timeout=5.0,
+            requester=fake_requester,
+        )
+    finally:
+        oa.time.time = original_time
+    assert result["status"] == "fail"
+    assert result["metrics"]["delete_ok"] == 1
+    assert result["metrics"]["projects_after_delete_ok"] == 0
+    assert result["metrics"]["removed_after_delete"] == 0
+    assert "项目列表不可达" in result["recommendations"][0]
+
+
+def test_upload_flow_agent_recovers_when_projects_after_delete_retries_once():
+    state = {
+        "created": False,
+        "deleted": False,
+        "material": False,
+        "submission": False,
+        "post_delete_list_attempts": 0,
+    }
+
+    def fake_requester(**kwargs):
+        method = str(kwargs.get("method") or "")
+        url = str(kwargs.get("url") or "")
+        if method == "POST" and url.endswith("/api/v1/projects"):
+            state["created"] = True
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {"id": "ops-upload-p1", "name": "OPS上传项目_1"},
+                "error": None,
+            }
+        if method == "POST" and url.endswith("/api/v1/projects/ops-upload-p1/materials"):
+            state["material"] = True
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {"material": {"id": "m1", "filename": "ops_material.txt"}},
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/ops-upload-p1/materials"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": [{"id": "m1", "filename": "ops_material.txt"}] if state["material"] else [],
+                "error": None,
+            }
+        if method == "POST" and url.endswith("/api/v1/projects/ops-upload-p1/shigong"):
+            state["submission"] = True
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": {"id": "s1", "filename": "ops_shigong.txt"},
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects/ops-upload-p1/submissions"):
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": [{"id": "s1", "filename": "ops_shigong.txt"}]
+                if state["submission"]
+                else [],
+                "error": None,
+            }
+        if method == "DELETE" and url.endswith("/api/v1/projects/ops-upload-p1"):
+            state["deleted"] = True
+            return {
+                "ok": True,
+                "status_code": 204,
+                "elapsed_ms": 1,
+                "json": {},
+                "error": None,
+            }
+        if method == "GET" and url.endswith("/api/v1/projects"):
+            if state["deleted"]:
+                state["post_delete_list_attempts"] += 1
+                if state["post_delete_list_attempts"] == 1:
+                    return {
+                        "ok": False,
+                        "status_code": 0,
+                        "elapsed_ms": 0,
+                        "json": {},
+                        "error": "URLError: <urlopen error [Errno 61] Connection refused>",
+                    }
+                return {
+                    "ok": True,
+                    "status_code": 200,
+                    "elapsed_ms": 1,
+                    "json": [{"id": "p1", "name": "项目1"}],
+                    "error": None,
+                }
+            rows = [{"id": "p1", "name": "项目1"}]
+            if state["created"]:
+                rows.append({"id": "ops-upload-p1", "name": "OPS上传项目_1"})
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 1,
+                "json": rows,
+                "error": None,
+            }
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    original_time = oa.time.time
+    original_sleep = oa.time.sleep
+    oa.time.time = lambda: 0.001
+    oa.time.sleep = lambda _seconds: None
+    try:
+        result = oa._run_upload_flow_agent(
+            base_url="http://127.0.0.1:8000",
+            api_key=None,
+            timeout=5.0,
+            requester=fake_requester,
+        )
+    finally:
+        oa.time.time = original_time
+        oa.time.sleep = original_sleep
+    assert state["post_delete_list_attempts"] == 2
+    assert result["status"] == "pass"
+    assert result["metrics"]["projects_after_delete_ok"] == 1
+    assert result["metrics"]["removed_after_delete"] == 1
+
+
+def test_ops_agents_history_entry_prefers_manual_confirmation_recommendation():
+    payload = _ops_agents_status_payload(
+        learning_metrics={
+            "manual_confirmation_required_count": 1,
+            "llm_account_low_quality_pool_count": 2,
+        },
+        manual_confirmation_rows=[
+            {
+                "project_id": "p-manual",
+                "project_name": "真实项目A",
+                "detail": "待人工确认极端样本 4 条；当前暂无可关联预测样本",
+            }
+        ],
+        learning_recommendations=[
+            "有 2 个 provider 的账号池历史质量分偏低，系统会优先避开弱 key，但建议继续补强冗余账号。",
+            "有 1 个项目的自动学习结论仍需人工确认，建议优先处理待审核项。",
+        ],
+        recommendations=[
+            "建议继续观察巡检趋势。",
+        ],
+    )
+
+    result = soa._build_history_entry(payload)
+
+    assert result["quality_reason_code"] == "manual_confirmation_required"
+    assert result["quality_reason_label"] == "自动学习需人工确认"
+    assert (
+        result["top_recommendation"]
+        == "有 1 个项目的自动学习结论仍需人工确认，建议优先处理待审核项。"
+    )
+    assert result["quality_reason_project_id"] == "p-manual"
+    assert result["quality_reason_project_name"] == "真实项目A"
+    assert (
+        result["quality_reason_project_detail"] == "待人工确认极端样本 4 条；当前暂无可关联预测样本"
+    )
+
+
+def test_ops_agents_history_entry_prefers_low_quality_pool_recommendation():
+    payload = _ops_agents_status_payload(
+        learning_metrics={
+            "llm_account_low_quality_pool_count": 2,
+        },
+        learning_recommendations=[
+            "建议继续处理待审核项。",
+            "有 2 个 provider 的账号池历史质量分偏低，系统会优先避开弱 key，但建议继续补强冗余账号。",
+        ],
+        recommendations=[
+            "建议继续观察巡检趋势。",
+        ],
+    )
+
+    result = soa._build_history_entry(payload)
+
+    assert result["quality_reason_code"] == "llm_low_quality_pool"
+    assert result["quality_reason_label"] == "LLM 账号池质量偏低"
+    assert (
+        result["top_recommendation"]
+        == "有 2 个 provider 的账号池历史质量分偏低，系统会优先避开弱 key，但建议继续补强冗余账号。"
+    )
+
+
+def test_ops_agents_history_entry_prefers_auto_action_recommendation():
+    payload = _ops_agents_status_payload(
+        learning_metrics={
+            "evolve_attempted_count": 1,
+            "evolve_success_count": 1,
+        },
+        runtime_actions={
+            "repair_data_hygiene": {
+                "attempted": False,
+                "ok": False,
+            },
+            "restart_runtime": {
+                "attempted": False,
+                "ok": False,
+            },
+        },
+        runtime_recommendations=[
+            "建议继续观察巡检趋势。",
+            "已执行自动修复并完成自动学习，建议继续做修复后复验。",
+        ],
+        recommendations=[
+            "建议继续观察巡检趋势。",
+        ],
+    )
+
+    result = soa._build_history_entry(payload)
+
+    assert result["quality_reason_code"] == "auto_actions_executed"
+    assert result["quality_reason_label"] == "已执行自动动作"
+    assert result["top_recommendation"] == "已执行自动修复并完成自动学习，建议继续做修复后复验。"

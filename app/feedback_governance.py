@@ -60,8 +60,20 @@ def build_feedback_governance_report(
                 "created_at": str(row.get("created_at") or ""),
                 "source_submission_filename": str(row.get("source_submission_filename") or ""),
                 "source": str(row.get("source") or ""),
+                "score_scale_max": int(
+                    main._to_float_or_none(guardrail.get("score_scale_max")) or project_score_scale
+                ),
+                "score_scale_label": str(
+                    guardrail.get("score_scale_label")
+                    or main._score_scale_label(project_score_scale)
+                ),
+                "actual_score": main._to_float_or_none(guardrail.get("actual_score_raw")),
+                "predicted_score": main._to_float_or_none(guardrail.get("predicted_score_raw")),
+                "current_score": main._to_float_or_none(guardrail.get("current_score_raw")),
+                "abs_delta": main._to_float_or_none(guardrail.get("abs_delta_raw")),
                 "actual_score_100": main._to_float_or_none(guardrail.get("actual_score_100")),
                 "predicted_score_100": main._to_float_or_none(guardrail.get("predicted_score_100")),
+                "current_score_100": main._to_float_or_none(guardrail.get("current_score_100")),
                 "abs_delta_100": main._to_float_or_none(guardrail.get("abs_delta_100")),
                 "relative_delta_ratio": main._to_float_or_none(
                     guardrail.get("relative_delta_ratio")
@@ -110,11 +122,32 @@ def build_feedback_governance_report(
                             ),
                             "reviewed_at": str(guardrail.get("manual_reviewed_at") or ""),
                             "review_note": str(guardrail.get("manual_review_note") or ""),
+                            "score_scale_max": int(
+                                main._to_float_or_none(guardrail.get("score_scale_max"))
+                                or project_score_scale
+                            ),
+                            "score_scale_label": str(
+                                guardrail.get("score_scale_label")
+                                or main._score_scale_label(project_score_scale)
+                            ),
+                            "actual_score": main._to_float_or_none(
+                                guardrail.get("actual_score_raw")
+                            ),
+                            "predicted_score": main._to_float_or_none(
+                                guardrail.get("predicted_score_raw")
+                            ),
+                            "current_score": main._to_float_or_none(
+                                guardrail.get("current_score_raw")
+                            ),
+                            "abs_delta": main._to_float_or_none(guardrail.get("abs_delta_raw")),
                             "actual_score_100": main._to_float_or_none(
                                 guardrail.get("actual_score_100")
                             ),
                             "predicted_score_100": main._to_float_or_none(
                                 guardrail.get("predicted_score_100")
+                            ),
+                            "current_score_100": main._to_float_or_none(
+                                guardrail.get("current_score_100")
                             ),
                             "abs_delta_100": main._to_float_or_none(guardrail.get("abs_delta_100")),
                             "closed_loop_effect": {
@@ -185,6 +218,19 @@ def build_feedback_governance_report(
             {
                 "record_id": str(row.get("id") or ""),
                 "created_at": str(row.get("updated_at") or row.get("created_at") or ""),
+                "score_scale_max": int(
+                    main._to_float_or_none(normalized_row.get("score_scale_max"))
+                    or project_score_scale
+                ),
+                "score_scale_label": str(
+                    main._score_scale_label(
+                        int(
+                            main._to_float_or_none(normalized_row.get("score_scale_max"))
+                            or project_score_scale
+                        )
+                    )
+                ),
+                "actual_score": main._to_float_or_none(normalized_row.get("final_score_raw")),
                 "actual_score_100": main._to_float_or_none(normalized_row.get("final_score")),
                 "captured": captured,
                 "reason": reason_text,
@@ -254,6 +300,12 @@ def build_feedback_governance_report(
         artifact_payload_overrides=artifact_payload_overrides,
         ground_truth_rows_override=ground_truth_rows_override,
     )
+    evolution_health = main._build_evolution_health_report(project_id, project)
+    evolution_summary = (
+        evolution_health.get("summary")
+        if isinstance(evolution_health, dict) and isinstance(evolution_health.get("summary"), dict)
+        else {}
+    )
 
     recommendations: List[str] = []
     blocked_count = int(summary_guardrail.get("blocked_count") or 0)
@@ -271,7 +323,7 @@ def build_feedback_governance_report(
         )
     if blocked_count <= 0 and captured_recent_count > 0:
         recommendations.append(
-            "当前闭环处于可进化状态，可继续观察 few-shot 蒸馏是否带来评分逼近提升。"
+            "当前闭环处于可进化状态，可继续观察 few-shot 蒸馏是否带来评分贴近真实结果。"
         )
     if any(bool(item.get("changed_since_latest_snapshot")) for item in artifact_impacts):
         recommendations.append(
@@ -331,10 +383,14 @@ def build_feedback_governance_report(
     latest_project_auto_review = main._normalize_calibrator_auto_review_state(
         calibrator_state.get("latest_project_calibrator_auto_review")
     )
+    current_calibrator_degraded = bool(evolution_summary.get("current_calibrator_degraded"))
+    current_calibrator_rollback_candidate_version = str(
+        evolution_summary.get("current_calibrator_rollback_candidate_version") or ""
+    ).strip()
     if latest_project_calibrator_version:
         if latest_project_calibrator_mode == "bootstrap_auto_deploy":
             recommendations.append(
-                "当前项目级校准器处于小样本 bootstrap 监控态，已可参与逼近评分；建议继续补录真实评标样本，尽快升级为完整 CV 校准。"
+                "当前项目级校准器处于小样本 bootstrap 监控态，已可参与校准评分；建议继续补录真实评标样本，尽快升级为完整 CV 校准。"
             )
         elif latest_project_calibrator_mode == "bootstrap_candidate_only":
             if str(latest_project_auto_review.get("action") or "") == "rollback":
@@ -345,6 +401,14 @@ def build_feedback_governance_report(
                 recommendations.append(
                     "最新小样本 bootstrap 校准器尚未正式部署，建议继续补录真实评标样本后再自动复核。"
                 )
+    if current_calibrator_degraded:
+        recommendations.append(
+            "当前项目级校准器近期误差已明显劣于规则基线，建议优先执行 V2 一键闭环。"
+        )
+        if current_calibrator_rollback_candidate_version:
+            recommendations.append(
+                f"当前项目级校准器存在历史回退候选 {current_calibrator_rollback_candidate_version}，如需保守自救可优先切回该版本。"
+            )
 
     return {
         "project_id": project_id,
@@ -395,6 +459,32 @@ def build_feedback_governance_report(
             ),
             "current_calibrator_auto_review": calibrator_state.get("current_calibrator_auto_review")
             or {},
+            "current_calibrator_degraded": current_calibrator_degraded,
+            "current_calibrator_degradation_reason": evolution_summary.get(
+                "current_calibrator_degradation_reason"
+            ),
+            "current_calibrator_recent_mae": evolution_summary.get("current_calibrator_recent_mae"),
+            "current_calibrator_recent_rule_mae": evolution_summary.get(
+                "current_calibrator_recent_rule_mae"
+            ),
+            "current_calibrator_recent_mae_delta_vs_rule": evolution_summary.get(
+                "current_calibrator_recent_mae_delta_vs_rule"
+            ),
+            "current_calibrator_has_rollback_candidate": bool(
+                evolution_summary.get("current_calibrator_has_rollback_candidate")
+            ),
+            "current_calibrator_rollback_candidate_version": evolution_summary.get(
+                "current_calibrator_rollback_candidate_version"
+            ),
+            "current_calibrator_rollback_candidate_model_type": evolution_summary.get(
+                "current_calibrator_rollback_candidate_model_type"
+            ),
+            "current_calibrator_rollback_candidate_deployment_mode": evolution_summary.get(
+                "current_calibrator_rollback_candidate_deployment_mode"
+            ),
+            "current_calibrator_rollback_candidate_cv_mae": evolution_summary.get(
+                "current_calibrator_rollback_candidate_cv_mae"
+            ),
             "latest_project_calibrator_version": calibrator_state.get(
                 "latest_project_calibrator_version"
             ),
@@ -687,15 +777,6 @@ def execute_feedback_few_shot_review(
         record_id,
         updates={"few_shot_distillation": updated_distillation},
     )
-    return {
-        "ok": True,
-        "project_id": project_id,
-        "record_id": record_id,
-        "few_shot_distillation": main._normalize_few_shot_distillation_state(
-            updated_record.get("few_shot_distillation")
-        ),
-        "updated_at": str(updated_record.get("updated_at") or main._now_iso()),
-    }
     main._sync_feature_governance_review(
         feature_ids=[
             str(item or "").strip()
@@ -705,3 +786,12 @@ def execute_feedback_few_shot_review(
         review_status=str(updated_distillation.get("manual_review_status") or "pending"),
         reviewed_at=str(updated_distillation.get("manual_reviewed_at") or "") or None,
     )
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "record_id": record_id,
+        "few_shot_distillation": main._normalize_few_shot_distillation_state(
+            updated_record.get("few_shot_distillation")
+        ),
+        "updated_at": str(updated_record.get("updated_at") or main._now_iso()),
+    }

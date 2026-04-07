@@ -107,6 +107,29 @@ def _latest_reports_by_engine(
     return latest
 
 
+def _report_uses_exact_ground_truth_score(report: Dict[str, Any]) -> bool:
+    if not isinstance(report, dict):
+        return False
+    blend = report.get("score_blend") or {}
+    if (
+        isinstance(blend, dict)
+        and str(blend.get("mode") or "").strip().lower() == "ground_truth_exact"
+    ):
+        return True
+    meta = report.get("meta") or {}
+    return bool(meta.get("ground_truth_exact_match")) if isinstance(meta, dict) else False
+
+
+def _resolve_current_display_score(report: Dict[str, Any]) -> float | None:
+    if not isinstance(report, dict):
+        return None
+    for key in ("total_score", "pred_total_score", "rule_total_score"):
+        value = report.get(key)
+        if value is not None:
+            return _safe_float(value)
+    return None
+
+
 def _dimension_vector_from_report(report: Dict[str, Any]) -> Dict[str, float]:
     vec: Dict[str, float] = {}
     rule_dim_scores = report.get("rule_dim_scores") or {}
@@ -197,6 +220,7 @@ def evaluate_project_variants(
         "v1": {"pairs": []},
         "v2": {"pairs": []},
         "v2_calib": {"pairs": []},
+        "current": {"pairs": []},
     }
 
     for sid in sorted(project_submission_ids):
@@ -237,8 +261,20 @@ def evaluate_project_variants(
                     v2_report,
                 )
             )
+            current_score = _resolve_current_display_score(v2_report)
+            if current_score is not None:
+                variants["current"]["pairs"].append(
+                    (
+                        sid,
+                        qt_total,
+                        current_score,
+                        qt_dim,
+                        reasons,
+                        v2_report,
+                    )
+                )
             pred = v2_report.get("pred_total_score")
-            if pred is not None:
+            if pred is not None and not _report_uses_exact_ground_truth_score(v2_report):
                 variants["v2_calib"]["pairs"].append(
                     (sid, qt_total, _safe_float(pred), qt_dim, reasons, v2_report)
                 )
@@ -291,6 +327,7 @@ def evaluate_project_variants(
     v1 = result["variants"].get("v1") or {}
     v2 = result["variants"].get("v2") or {}
     v2c = result["variants"].get("v2_calib") or {}
+    current = result["variants"].get("current") or {}
 
     def _num(x: Any) -> float:
         return _safe_float(x, 0.0)
@@ -308,6 +345,20 @@ def evaluate_project_variants(
             v2.get("penalty_hit_rate") is not None
             and v1.get("penalty_hit_rate") is not None
             and _num(v2.get("penalty_hit_rate")) > _num(v1.get("penalty_hit_rate"))
+        ),
+        "current_mae_rmse_not_worse_than_v2": (
+            int(current.get("sample_count") or 0) > 0
+            and _num(current.get("mae")) <= _num(v2.get("mae"))
+            and _num(current.get("rmse")) <= _num(v2.get("rmse"))
+        ),
+        "current_rank_corr_not_worse_vs_v2": (
+            int(current.get("sample_count") or 0) > 0
+            and _num(current.get("spearman")) >= _num(v2.get("spearman"))
+        ),
+        "current_display_matches_qt": (
+            int(current.get("sample_count") or 0) > 0
+            and _num(current.get("mae")) <= 0.5
+            and _num(current.get("rmse")) <= 0.5
         ),
     }
     return result

@@ -105,7 +105,7 @@ def build_selected_project_index_context(
         materials_empty_display = "block"
 
     try:
-        submissions_all = main.load_submissions()
+        submissions_all = main._load_submissions_safe()
         selected_submissions = [
             item
             for item in submissions_all

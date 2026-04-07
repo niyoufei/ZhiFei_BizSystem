@@ -44,6 +44,8 @@ OPS_AGENT_NAMES = (
 )
 OPS_AGENT_DEFAULT_INTERVAL_SECONDS = 60.0
 OPS_AGENT_STALE_GRACE_SECONDS = 90.0
+OPS_LOCAL_READ_RETRY_ATTEMPTS = 2
+OPS_LOCAL_READ_RETRY_DELAY_SECONDS = 0.2
 
 
 def _now_iso() -> str:
@@ -243,6 +245,49 @@ def _request_json(
             "json": {},
             "error": f"{type(exc).__name__}: {exc}",
         }
+
+
+def _is_transient_local_read_failure(response: Dict[str, Any], *, url: str, method: str) -> bool:
+    if str(method or "").strip().upper() != "GET":
+        return False
+    if not _is_local_url(url):
+        return False
+    if int(response.get("status_code") or 0) != 0:
+        return False
+    error_text = str(response.get("error") or "").strip().lower()
+    return "connection refused" in error_text or "connection reset" in error_text
+
+
+def _request_with_local_read_retry(
+    *,
+    requester: Callable[..., Dict[str, Any]],
+    method: str,
+    url: str,
+    api_key: Optional[str] = None,
+    timeout: float = 8.0,
+    payload: Optional[Dict[str, Any]] = None,
+    form_fields: Optional[Dict[str, Any]] = None,
+    files: Optional[List[Dict[str, Any]]] = None,
+    retry_attempts: int = OPS_LOCAL_READ_RETRY_ATTEMPTS,
+    retry_delay_seconds: float = OPS_LOCAL_READ_RETRY_DELAY_SECONDS,
+) -> Dict[str, Any]:
+    attempts = max(1, int(retry_attempts))
+    last_response: Dict[str, Any] = {}
+    for attempt in range(1, attempts + 1):
+        last_response = requester(
+            method=method,
+            url=url,
+            api_key=api_key,
+            timeout=timeout,
+            payload=payload,
+            form_fields=form_fields,
+            files=files,
+        )
+        if not _is_transient_local_read_failure(last_response, url=url, method=method):
+            return last_response
+        if attempt < attempts:
+            time.sleep(max(0.0, float(retry_delay_seconds)))
+    return last_response
 
 
 def _status(pass_flag: bool, warn_flag: bool = False) -> str:
@@ -1045,6 +1090,7 @@ def _run_project_flow_agent(
     created_ok = bool(project_id) and int(create_resp.get("status_code") or 0) == 200
     listed_after_create = False
     removed_after_delete = False
+    projects_after_delete_ok = False
 
     if created_ok:
         projects_after_create = requester(
@@ -1073,21 +1119,30 @@ def _run_project_flow_agent(
             "status_code": int(delete_resp.get("status_code") or 0),
         }
         if delete_ok:
-            projects_after_delete = requester(
+            projects_after_delete = _request_with_local_read_retry(
+                requester=requester,
                 method="GET",
                 url=f"{base_url}/api/v1/projects",
                 api_key=api_key,
                 timeout=timeout,
             )
             checks["projects_after_delete"] = projects_after_delete
-            projects_rows = _normalize_projects(projects_after_delete.get("json"))
-            removed_after_delete = not any(
-                str(row.get("id") or "").strip() == project_id for row in projects_rows
-            )
+            projects_after_delete_ok = int(projects_after_delete.get("status_code") or 0) == 200
+            if projects_after_delete_ok:
+                projects_rows = _normalize_projects(projects_after_delete.get("json"))
+                removed_after_delete = not any(
+                    str(row.get("id") or "").strip() == project_id for row in projects_rows
+                )
     else:
         delete_ok = False
 
-    pass_flag = created_ok and listed_after_create and delete_ok and removed_after_delete
+    pass_flag = (
+        created_ok
+        and listed_after_create
+        and delete_ok
+        and projects_after_delete_ok
+        and removed_after_delete
+    )
     recommendations: List[str] = []
     if not pass_flag:
         create_status = int(create_resp.get("status_code") or 0)
@@ -1097,6 +1152,8 @@ def _run_project_flow_agent(
             recommendations.append("项目创建主链 smoke 失败，说明创建项目链路未通过自动巡检。")
         elif created_ok and not listed_after_create:
             recommendations.append("项目创建后未能在列表中回显，项目选择链路存在异常。")
+        elif created_ok and delete_ok and not projects_after_delete_ok:
+            recommendations.append("项目 smoke 删除后项目列表不可达，服务在清理后未稳定返回。")
         elif created_ok and delete_ok and not removed_after_delete:
             recommendations.append("项目 smoke 删除后仍残留在列表中，项目清理链路存在异常。")
         else:
@@ -1114,6 +1171,7 @@ def _run_project_flow_agent(
             "created_ok": int(created_ok),
             "listed_after_create": int(listed_after_create),
             "delete_ok": int(delete_ok),
+            "projects_after_delete_ok": int(projects_after_delete_ok),
             "removed_after_delete": int(removed_after_delete),
         },
         "recommendations": recommendations,
@@ -1165,6 +1223,7 @@ def _run_tender_project_flow_agent(
 
     listed_after_create = False
     removed_after_delete = False
+    projects_after_delete_ok = False
     delete_ok = False
     if created_ok:
         projects_after_create = requester(
@@ -1192,23 +1251,27 @@ def _run_tender_project_flow_agent(
             "status_code": int(delete_resp.get("status_code") or 0),
         }
         if delete_ok:
-            projects_after_delete = requester(
+            projects_after_delete = _request_with_local_read_retry(
+                requester=requester,
                 method="GET",
                 url=f"{base_url}/api/v1/projects",
                 api_key=api_key,
                 timeout=timeout,
             )
             checks["projects_after_delete"] = projects_after_delete
-            projects_rows = _normalize_projects(projects_after_delete.get("json"))
-            removed_after_delete = not any(
-                str(row.get("id") or "").strip() == project_id for row in projects_rows
-            )
+            projects_after_delete_ok = int(projects_after_delete.get("status_code") or 0) == 200
+            if projects_after_delete_ok:
+                projects_rows = _normalize_projects(projects_after_delete.get("json"))
+                removed_after_delete = not any(
+                    str(row.get("id") or "").strip() == project_id for row in projects_rows
+                )
 
     pass_flag = (
         created_ok
         and inferred_ok
         and listed_after_create
         and delete_ok
+        and projects_after_delete_ok
         and removed_after_delete
         and elapsed_ok
     )
@@ -1227,6 +1290,8 @@ def _run_tender_project_flow_agent(
             recommendations.append("招标文件自动创建接口耗时过长，已超过 smoke 阈值。")
         elif not inferred_ok:
             recommendations.append("招标文件自动创建未正确识别项目名称，项目名推断链路存在异常。")
+        elif created_ok and delete_ok and not projects_after_delete_ok:
+            recommendations.append("招标文件主链 smoke 清理后项目列表不可达，服务未稳定返回。")
         else:
             recommendations.append(
                 "招标文件自动创建主链 smoke 失败，请检查 create_from_tender、项目回显和项目删除链路。"
@@ -1246,6 +1311,7 @@ def _run_tender_project_flow_agent(
             "elapsed_ok": int(elapsed_ok),
             "listed_after_create": int(listed_after_create),
             "delete_ok": int(delete_ok),
+            "projects_after_delete_ok": int(projects_after_delete_ok),
             "removed_after_delete": int(removed_after_delete),
             "elapsed_ms": int(create_resp.get("elapsed_ms") or 0),
         },
@@ -1292,6 +1358,7 @@ def _run_upload_flow_agent(
     submission_listed = False
     delete_ok = False
     removed_after_delete = False
+    projects_after_delete_ok = False
     if created_ok:
         material_resp = requester(
             method="POST",
@@ -1378,17 +1445,20 @@ def _run_upload_flow_agent(
             "status_code": int(delete_resp.get("status_code") or 0),
         }
         if delete_ok:
-            projects_after_delete = requester(
+            projects_after_delete = _request_with_local_read_retry(
+                requester=requester,
                 method="GET",
                 url=f"{base_url}/api/v1/projects",
                 api_key=api_key,
                 timeout=timeout,
             )
             checks["projects_after_delete"] = projects_after_delete
-            projects_rows = _normalize_projects(projects_after_delete.get("json"))
-            removed_after_delete = not any(
-                str(row.get("id") or "").strip() == project_id for row in projects_rows
-            )
+            projects_after_delete_ok = int(projects_after_delete.get("status_code") or 0) == 200
+            if projects_after_delete_ok:
+                projects_rows = _normalize_projects(projects_after_delete.get("json"))
+                removed_after_delete = not any(
+                    str(row.get("id") or "").strip() == project_id for row in projects_rows
+                )
 
     pass_flag = (
         created_ok
@@ -1397,6 +1467,7 @@ def _run_upload_flow_agent(
         and shigong_upload_ok
         and submission_listed
         and delete_ok
+        and projects_after_delete_ok
         and removed_after_delete
     )
     recommendations: List[str] = []
@@ -1411,6 +1482,10 @@ def _run_upload_flow_agent(
             recommendations.append("上传链 smoke 失败：施组上传接口异常。")
         elif not submission_listed:
             recommendations.append("上传链 smoke 失败：施组上传后未在列表回显。")
+        elif delete_ok and not projects_after_delete_ok:
+            recommendations.append(
+                "上传链 smoke 失败：清理测试项目后项目列表不可达，服务未稳定返回。"
+            )
         elif not removed_after_delete:
             recommendations.append("上传链 smoke 失败：清理测试项目后仍残留。")
         else:
@@ -1431,6 +1506,7 @@ def _run_upload_flow_agent(
             "shigong_upload_ok": int(shigong_upload_ok),
             "submission_listed": int(submission_listed),
             "delete_ok": int(delete_ok),
+            "projects_after_delete_ok": int(projects_after_delete_ok),
             "removed_after_delete": int(removed_after_delete),
         },
         "recommendations": recommendations,
@@ -1818,6 +1894,9 @@ def _run_learning_calibration_agent(
                 "bootstrap_active_count": 0,
                 "bootstrap_monitoring_count": 0,
                 "bootstrap_review_failed_count": 0,
+                "calibrator_degraded_before_count": 0,
+                "calibrator_degraded_after_count": 0,
+                "calibrator_rollback_candidate_count": 0,
                 "llm_status_unavailable_count": 0,
                 "llm_provider_degraded_count": 0,
                 "llm_fallback_unavailable_count": 0,
@@ -1916,10 +1995,10 @@ def _run_learning_calibration_agent(
             if total_accounts > 1 and healthy_accounts <= 1:
                 llm_provider_thin_pool_count += 1
         for quality in (openai_pool_quality, gemini_pool_quality):
-            rated_accounts = _to_int(quality.get("rated_accounts"))
+            sufficiently_rated_accounts = _to_int(quality.get("sufficiently_rated_accounts"))
             average_quality_score = float(quality.get("average_quality_score") or 0.0)
             llm_deprioritized_account_count += _to_int(quality.get("low_quality_accounts"))
-            if rated_accounts >= 2 and average_quality_score < 45.0:
+            if sufficiently_rated_accounts >= 2 and average_quality_score < 45.0:
                 llm_account_low_quality_pool_count += 1
 
     evolve_actions: List[Dict[str, Any]] = []
@@ -1939,6 +2018,7 @@ def _run_learning_calibration_agent(
     reflection_attempted_count = 0
     reflection_success_count = 0
     manual_confirmation_required_count = 0
+    manual_confirmation_rows: List[Dict[str, Any]] = []
     few_shot_pending_review_count = 0
     few_shot_pending_project_count = 0
     drift_alert_before_count = 0
@@ -1949,6 +2029,13 @@ def _run_learning_calibration_agent(
     bootstrap_active_count = 0
     bootstrap_monitoring_count = 0
     bootstrap_review_failed_count = 0
+    calibrator_degraded_before_count = 0
+    calibrator_degraded_after_count = 0
+    calibrator_rollback_candidate_count = 0
+    calibrator_runtime_rollback_count = 0
+    calibrator_runtime_rollback_success_count = 0
+    calibrator_runtime_rollback_recovered_count = 0
+    calibrator_runtime_rollback_unrecovered_count = 0
     enhancement_review_diverged_count = 0
     enhancement_governed_count = 0
     patch_deployed_count = 0
@@ -1960,9 +2047,10 @@ def _run_learning_calibration_agent(
         pid = str(project.get("id") or "").strip()
         if not pid:
             continue
+        project_name = str(project.get("name") or pid).strip() or pid
         project_status = _normalize_project_status(project.get("status"))
         project_manual_confirmation_required = False
-        project_checks: Dict[str, Any] = {"project_id": pid}
+        project_checks: Dict[str, Any] = {"project_id": pid, "project_name": project_name}
         checks.append(project_checks)
 
         health_resp = requester(
@@ -1990,6 +2078,11 @@ def _run_learning_calibration_agent(
             health_summary.get("has_evolved_multipliers")
             or health_summary.get("evolution_weights_usable")
         )
+        calibrator_degraded_before = bool(health_summary.get("current_calibrator_degraded"))
+        if calibrator_degraded_before:
+            calibrator_degraded_before_count += 1
+            if bool(health_summary.get("current_calibrator_has_rollback_candidate")):
+                calibrator_rollback_candidate_count += 1
         drift_level = str(health_drift.get("level") or "").strip().lower()
         drift_alert_before = drift_level in OPS_LEARNING_CALIBRATION_DRIFT_ALERT_LEVELS
         if drift_alert_before:
@@ -2041,7 +2134,9 @@ def _run_learning_calibration_agent(
             few_shot_pending_project_count += 1
 
         needs_evolve = not has_evolved_multipliers
-        needs_reflection = reflection_ready and (not has_project_calibrator or drift_alert_before)
+        needs_reflection = reflection_ready and (
+            not has_project_calibrator or drift_alert_before or calibrator_degraded_before
+        )
         if needs_evolve:
             pending_evolve_before += 1
         if reflection_ready and not has_project_calibrator:
@@ -2101,6 +2196,19 @@ def _run_learning_calibration_agent(
                     reflection_success_count += 1
                     if bool(reflection_payload.get("calibrator_deployed")):
                         calibrator_deployed_count += 1
+                    runtime_governance = _json_object(
+                        reflection_payload.get("calibrator_runtime_governance")
+                    )
+                    if str(runtime_governance.get("action") or "").strip().lower() == "rollback":
+                        calibrator_runtime_rollback_count += 1
+                        if _to_int(runtime_governance.get("updated_reports")) > 0:
+                            calibrator_runtime_rollback_success_count += 1
+                        recovered_after = runtime_governance.get("recovered_after")
+                        degraded_after = runtime_governance.get("degraded_after")
+                        if recovered_after is True:
+                            calibrator_runtime_rollback_recovered_count += 1
+                        elif recovered_after is False or degraded_after is True:
+                            calibrator_runtime_rollback_unrecovered_count += 1
                     if bool(reflection_payload.get("patch_deployed")):
                         patch_deployed_count += 1
                     patch_auto_govern = _json_object(reflection_payload.get("patch_auto_govern"))
@@ -2154,6 +2262,8 @@ def _run_learning_calibration_agent(
             OPS_LEARNING_CALIBRATION_DRIFT_ALERT_LEVELS
         ):
             drift_alert_after_count += 1
+        if bool(verify_health_summary.get("current_calibrator_degraded")):
+            calibrator_degraded_after_count += 1
         if not has_evolved_after:
             pending_evolve_after += 1
 
@@ -2234,6 +2344,74 @@ def _run_learning_calibration_agent(
             project_manual_confirmation_required = True
         if project_manual_confirmation_required:
             manual_confirmation_required_count += 1
+            pending_extreme_ground_truth_count = _to_int(
+                verify_governance_summary.get("pending_extreme_ground_truth_count")
+                or governance_summary.get("pending_extreme_ground_truth_count")
+            )
+            blocked_ground_truth_count = _to_int(
+                verify_governance_summary.get("blocked_ground_truth_count")
+                or governance_summary.get("blocked_ground_truth_count")
+            )
+            manual_override_hint = str(
+                verify_governance_summary.get("manual_override_hint")
+                or governance_summary.get("manual_override_hint")
+                or ""
+            ).strip()
+            matched_submission_count = _to_int(
+                verify_governance_score_preview.get("matched_submission_count")
+                or governance_score_preview.get("matched_submission_count")
+            )
+            current_calibrator_deployment_mode = str(
+                verify_governance_summary.get("current_calibrator_deployment_mode")
+                or governance_summary.get("current_calibrator_deployment_mode")
+                or ""
+            ).strip()
+            verify_governance_recommendations = verify_governance_payload.get("recommendations")
+            governance_recommendations = governance_payload.get("recommendations")
+            project_recommendations = [
+                str(item or "").strip()
+                for item in (
+                    verify_governance_recommendations
+                    if isinstance(verify_governance_recommendations, list)
+                    else []
+                )
+                if str(item or "").strip()
+            ]
+            if not project_recommendations:
+                project_recommendations = [
+                    str(item or "").strip()
+                    for item in (
+                        governance_recommendations
+                        if isinstance(governance_recommendations, list)
+                        else []
+                    )
+                    if str(item or "").strip()
+                ]
+            detail_parts: List[str] = []
+            if pending_extreme_ground_truth_count > 0:
+                detail_parts.append(f"待人工确认极端样本 {pending_extreme_ground_truth_count} 条")
+            elif blocked_ground_truth_count > 0:
+                detail_parts.append(f"当前被 guardrail 阻断样本 {blocked_ground_truth_count} 条")
+            if matched_submission_count <= 0:
+                detail_parts.append("当前暂无可关联预测样本")
+            if current_calibrator_deployment_mode:
+                detail_parts.append(f"当前校准部署模式：{current_calibrator_deployment_mode}")
+            manual_confirmation_rows.append(
+                {
+                    "project_id": pid,
+                    "project_name": project_name,
+                    "pending_extreme_ground_truth_count": pending_extreme_ground_truth_count,
+                    "blocked_ground_truth_count": blocked_ground_truth_count,
+                    "matched_submission_count": matched_submission_count,
+                    "manual_override_hint": manual_override_hint,
+                    "current_calibrator_deployment_mode": current_calibrator_deployment_mode,
+                    "entrypoint_key": "ground_truth",
+                    "entrypoint_label": "前往「5) 自我学习与进化」录入真实评标",
+                    "action_label": "录入真实评标并人工确认极端样本",
+                    "recommendation": project_recommendations[0] if project_recommendations else "",
+                    "detail": "；".join(detail_parts),
+                }
+            )
 
     total_failure_count = failed_count + post_verify_failed_count
     pass_flag = (
@@ -2246,6 +2424,7 @@ def _run_learning_calibration_agent(
         and evolve_cooldown_skipped_count == 0
         and reflection_cooldown_skipped_count == 0
         and enhancement_review_diverged_count == 0
+        and calibrator_degraded_after_count == 0
         and llm_status_unavailable_count == 0
         and llm_provider_degraded_count == 0
         and llm_provider_quality_degraded_count == 0
@@ -2256,6 +2435,7 @@ def _run_learning_calibration_agent(
         and llm_provider_thin_pool_count == 0
         and llm_account_low_quality_pool_count == 0
         and llm_deprioritized_account_count == 0
+        and calibrator_runtime_rollback_unrecovered_count == 0
     )
     warn_flag = total_failure_count == 0 and not pass_flag
 
@@ -2322,6 +2502,26 @@ def _run_learning_calibration_agent(
         recommendations.append(
             f"有 {bootstrap_review_failed_count} 个项目的小样本 bootstrap 校准在只读偏差复核中变差，系统已自动阻止部署。"
         )
+    if calibrator_degraded_after_count > 0:
+        recommendations.append(
+            f"有 {calibrator_degraded_after_count} 个项目当前项目级校准器近期误差已劣于规则基线，系统已触发重新校准但仍需继续观察。"
+        )
+    if calibrator_rollback_candidate_count > 0:
+        recommendations.append(
+            f"其中有 {calibrator_rollback_candidate_count} 个项目已找到更稳的历史校准器候选，可作为保守回退目标。"
+        )
+    if calibrator_runtime_rollback_count > 0:
+        recommendations.append(
+            f"本轮已有 {calibrator_runtime_rollback_count} 个项目触发运行时校准回退治理，其中 {calibrator_runtime_rollback_success_count} 个项目已自动切回历史更稳版本并完成回填。"
+        )
+    if calibrator_runtime_rollback_recovered_count > 0:
+        recommendations.append(
+            f"其中有 {calibrator_runtime_rollback_recovered_count} 个项目在运行时回退后已恢复稳定。"
+        )
+    if calibrator_runtime_rollback_unrecovered_count > 0:
+        recommendations.append(
+            f"仍有 {calibrator_runtime_rollback_unrecovered_count} 个项目在运行时回退后依旧显示退化，建议立即人工复核该项目的校准器与真实评分样本。"
+        )
     if reflection_not_ready_count > 0:
         recommendations.append(
             f"有 {reflection_not_ready_count} 个项目真实样本已达学习门槛，但可关联预测样本不足，建议优先用步骤4施组下拉录入真实评标。"
@@ -2362,6 +2562,7 @@ def _run_learning_calibration_agent(
             "evolve": evolve_actions[:20],
             "reflection_auto_run": reflection_actions[:20],
         },
+        "manual_confirmation_rows": manual_confirmation_rows[:8],
         "metrics": {
             "project_count": len(projects),
             "monitored_project_count": len(monitored_projects),
@@ -2390,6 +2591,17 @@ def _run_learning_calibration_agent(
             "bootstrap_active_count": bootstrap_active_count,
             "bootstrap_monitoring_count": bootstrap_monitoring_count,
             "bootstrap_review_failed_count": bootstrap_review_failed_count,
+            "calibrator_degraded_before_count": calibrator_degraded_before_count,
+            "calibrator_degraded_after_count": calibrator_degraded_after_count,
+            "calibrator_rollback_candidate_count": calibrator_rollback_candidate_count,
+            "calibrator_runtime_rollback_count": calibrator_runtime_rollback_count,
+            "calibrator_runtime_rollback_success_count": calibrator_runtime_rollback_success_count,
+            "calibrator_runtime_rollback_recovered_count": (
+                calibrator_runtime_rollback_recovered_count
+            ),
+            "calibrator_runtime_rollback_unrecovered_count": (
+                calibrator_runtime_rollback_unrecovered_count
+            ),
             "llm_status_unavailable_count": llm_status_unavailable_count,
             "llm_provider_degraded_count": llm_provider_degraded_count,
             "llm_provider_quality_degraded_count": llm_provider_quality_degraded_count,
