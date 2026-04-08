@@ -11,6 +11,9 @@ API_KEY="${API_KEY:-}"
 PID_FILE="build/server.pid"
 LOG_FILE="build/server.log"
 LOCK_DIR="build/.restart.lock"
+LOCK_OWNER_FILE="$LOCK_DIR/owner.pid"
+LOCK_META_FILE="$LOCK_DIR/meta.env"
+LOCK_STALE_SECONDS="${RESTART_LOCK_STALE_SECONDS:-180}"
 SCREEN_SESSION="zhifei_server_${PORT}"
 LOG_KEEP="${LOG_KEEP:-12}"
 
@@ -58,13 +61,83 @@ PY
   return 1
 }
 
+cleanup_lock() {
+  rm -f "$LOCK_OWNER_FILE" "$LOCK_META_FILE"
+  rmdir "$LOCK_DIR" >/dev/null 2>&1 || rm -rf "$LOCK_DIR" >/dev/null 2>&1 || true
+}
+
+record_lock_owner() {
+  printf '%s\n' "$$" >"$LOCK_OWNER_FILE"
+  cat >"$LOCK_META_FILE" <<EOF
+pid=$$
+started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+host=$(hostname 2>/dev/null || echo unknown)
+port=$PORT
+EOF
+}
+
+lock_owner_pid() {
+  if [[ -f "$LOCK_OWNER_FILE" ]]; then
+    tr -cd '0-9' <"$LOCK_OWNER_FILE" || true
+  fi
+}
+
+lock_age_seconds() {
+  "$PYTHON_BIN" - "$LOCK_DIR" <<'PY'
+import os
+import sys
+import time
+
+path = sys.argv[1]
+try:
+    age = max(0, int(time.time() - os.stat(path).st_mtime))
+except FileNotFoundError:
+    age = 0
+print(age)
+PY
+}
+
+lock_looks_stale() {
+  if [[ ! -e "$LOCK_DIR" ]]; then
+    return 1
+  fi
+
+  local owner_pid age_seconds
+  owner_pid="$(lock_owner_pid)"
+  if [[ -n "$owner_pid" ]] && kill -0 "$owner_pid" 2>/dev/null; then
+    return 1
+  fi
+
+  age_seconds="$(lock_age_seconds)"
+  if [[ -n "$owner_pid" ]]; then
+    echo "Detected stale restart lock owned by inactive pid: $owner_pid"
+    return 0
+  fi
+
+  if [[ "${age_seconds:-0}" -ge "$LOCK_STALE_SECONDS" ]]; then
+    echo "Detected stale legacy restart lock older than ${LOCK_STALE_SECONDS}s: $LOCK_DIR"
+    return 0
+  fi
+
+  return 1
+}
+
+clear_stale_lock() {
+  rm -rf "$LOCK_DIR" >/dev/null 2>&1 || true
+}
+
 acquire_lock() {
   local attempts=120
   local i
   for i in $(seq 1 "$attempts"); do
     if mkdir "$LOCK_DIR" 2>/dev/null; then
-      trap 'rmdir "$LOCK_DIR" >/dev/null 2>&1 || true' EXIT
+      record_lock_owner
+      trap cleanup_lock EXIT INT TERM
       return 0
+    fi
+    if lock_looks_stale; then
+      clear_stale_lock
+      continue
     fi
     sleep 0.1
   done
@@ -225,42 +298,50 @@ check_endpoint_coverage() {
   return 0
 }
 
-echo "Restarting server on http://127.0.0.1:${PORT}"
-acquire_lock
-stop_by_pid_file
-stop_by_port
-preflight_python_runtime
+main() {
+  local new_pid=""
 
-START_MODE="unknown"
-if ! "$PYTHON_BIN" "$ROOT_DIR/scripts/rotate_runtime_logs.py" --keep "$LOG_KEEP" "$ROOT_DIR/$LOG_FILE" >/dev/null 2>&1; then
-  echo "Warning: runtime log rotation failed; continuing with existing files."
+  echo "Restarting server on http://127.0.0.1:${PORT}"
+  acquire_lock
+  stop_by_pid_file
+  stop_by_port
+  preflight_python_runtime
+
+  START_MODE="unknown"
+  if ! "$PYTHON_BIN" "$ROOT_DIR/scripts/rotate_runtime_logs.py" --keep "$LOG_KEEP" "$ROOT_DIR/$LOG_FILE" >/dev/null 2>&1; then
+    echo "Warning: runtime log rotation failed; continuing with existing files."
+  fi
+  start_server_process
+
+  if wait_until_ready; then
+    new_pid="$(listener_pid)"
+    write_pid_from_listener || true
+    echo "Server started successfully. pid=$new_pid"
+    echo "Start mode: $START_MODE"
+    echo "URL: http://127.0.0.1:${PORT}/"
+    echo "Log: $ROOT_DIR/$LOG_FILE"
+    post_start_data_hygiene_repair
+    check_endpoint_coverage
+    return 0
+  fi
+
+  if confirm_ready_after_timeout; then
+    new_pid="$(listener_pid)"
+    write_pid_from_listener || true
+    echo "Server started successfully after extended startup. pid=$new_pid"
+    echo "Start mode: $START_MODE"
+    echo "URL: http://127.0.0.1:${PORT}/"
+    echo "Log: $ROOT_DIR/$LOG_FILE"
+    post_start_data_hygiene_repair
+    check_endpoint_coverage
+    return 0
+  fi
+
+  echo "Server failed to become ready. Recent logs:"
+  tail -n 80 "$LOG_FILE" || true
+  return 1
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
 fi
-start_server_process
-
-if wait_until_ready; then
-  new_pid="$(listener_pid)"
-  write_pid_from_listener || true
-  echo "Server started successfully. pid=$new_pid"
-  echo "Start mode: $START_MODE"
-  echo "URL: http://127.0.0.1:${PORT}/"
-  echo "Log: $ROOT_DIR/$LOG_FILE"
-  post_start_data_hygiene_repair
-  check_endpoint_coverage
-  exit 0
-fi
-
-if confirm_ready_after_timeout; then
-  new_pid="$(listener_pid)"
-  write_pid_from_listener || true
-  echo "Server started successfully after extended startup. pid=$new_pid"
-  echo "Start mode: $START_MODE"
-  echo "URL: http://127.0.0.1:${PORT}/"
-  echo "Log: $ROOT_DIR/$LOG_FILE"
-  post_start_data_hygiene_repair
-  check_endpoint_coverage
-  exit 0
-fi
-
-echo "Server failed to become ready. Recent logs:"
-tail -n 80 "$LOG_FILE" || true
-exit 1
