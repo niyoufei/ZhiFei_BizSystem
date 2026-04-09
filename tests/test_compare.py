@@ -532,9 +532,17 @@ def test_compare_optimization_card_exposes_replace_and_insert_payloads():
     replace_row = next((r for r in recs if r.get("write_mode") == "replace"), {})
     assert "补充以下完整内容" in str(insert_row.get("insertion_guidance") or "")
     assert str(insert_row.get("replacement_text") or "").strip()
+    assert (
+        str(insert_row.get("direct_apply_text") or "").strip()
+        == str(insert_row.get("insertion_content") or "").strip()
+    )
     assert str(insert_row.get("original_text") or "").strip()
     assert replace_row.get("write_mode_label") == "原句替换"
     assert str(replace_row.get("replacement_text") or "").strip()
+    assert (
+        str(replace_row.get("direct_apply_text") or "").strip()
+        == str(replace_row.get("replacement_text") or "").strip()
+    )
     assert not str(replace_row.get("layout_constraint") or "").strip()
 
 

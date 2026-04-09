@@ -1000,6 +1000,17 @@ def _build_penalty_replacement_text(code: str, *, evidence: str, reason: str) ->
     return _shrink_generated_copy(content, evidence)
 
 
+def _resolve_direct_apply_text(
+    *,
+    write_mode: str,
+    replacement_text: str = "",
+    insertion_content: str = "",
+) -> str:
+    if _safe_str(write_mode) == "insert":
+        return _safe_str(insertion_content)
+    return _safe_str(replacement_text)
+
+
 def _recommendation_requires_insertion(evidence_row: Dict[str, Any], evidence: str) -> bool:
     if bool(evidence_row.get("synthetic")):
         return True
@@ -1371,6 +1382,11 @@ def _build_submission_optimization_cards(
                         if write_mode == "insert"
                         else replace_text
                     ),
+                    "direct_apply_text": _resolve_direct_apply_text(
+                        write_mode=write_mode,
+                        replacement_text=replace_text,
+                        insertion_content=insertion_bundle["insertion_content"],
+                    ),
                     "insertion_guidance": (
                         insertion_bundle["insertion_guidance"] if write_mode == "insert" else ""
                     ),
@@ -1452,6 +1468,11 @@ def _build_submission_optimization_cards(
                         evidence=original_text or evidence_snippet,
                         reason=reason,
                     ),
+                    "direct_apply_text": _build_penalty_replacement_text(
+                        code,
+                        evidence=original_text or evidence_snippet,
+                        reason=reason,
+                    ),
                     "insertion_guidance": "",
                     "insertion_content": "",
                     "before_after_example": _build_penalty_before_after_example(
@@ -1496,6 +1517,7 @@ def _build_submission_optimization_cards(
                     "write_mode_label": "原句替换",
                     "original_text": "建议做术语一致性与阈值口径复核。",
                     "replacement_text": "统一术语、关键参数和验收动作的口径，并在目录与对应章节同步标注复核结果。",
+                    "direct_apply_text": "统一术语、关键参数和验收动作的口径，并在目录与对应章节同步标注复核结果。",
                     "insertion_guidance": "",
                     "insertion_content": "",
                     "before_after_example": "\n".join(

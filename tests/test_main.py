@@ -6340,9 +6340,11 @@ class TestIndexEndpoint:
             "data-submission-id=\"' + esc(String(submission && submission.id || '')) + '\"" in page
         )
         assert "renderOptimizationRecommendationTable" in page
+        assert "r.direct_apply_text || r.replacement_text || r.insertion_content || ''" in page
         assert "当前仅分析你点击的这一份施组，不混入其它文件的优化建议。" in page
         assert "直接替换文本 / 原位补充内容" in page
         assert "排版约束：" not in page
+        assert "r.issue || ''" not in page
         assert "function describeSelectedFiles(files, emptyText = '未选择任何文件')" in page
         assert (
             "function updateFilePickerText(inputId, textId, emptyText = '未选择任何文件')" in page

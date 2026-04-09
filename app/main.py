@@ -36240,10 +36240,9 @@ def index(
                   + (recs.length
                     ? recs.map((r) => {
                         const pageLabel = String((r && r.page_hint) || '页码未知') + (r && r.chapter_hint ? (' / ' + String(r.chapter_hint)) : '');
-                        const direct = String((r && r.write_mode) || '') === 'insert'
-                          ? (fallbackEscapeHtml(String((r && r.insertion_guidance) || '')) + ((r && r.insertion_content) ? ('<br/><span style="color:#475569;font-size:12px">' + fallbackEscapeHtml(String(r.insertion_content || '')) + '</span>') : ''))
-                          : fallbackEscapeHtml(String((r && r.replacement_text) || ''));
-                        return '<tr><td>' + fallbackEscapeHtml(String((r && r.write_mode_label) || '')) + '</td><td>' + fallbackEscapeHtml(pageLabel) + '</td><td>' + fallbackEscapeHtml(String((r && r.original_text) || (r && r.evidence) || '')) + '</td><td>' + direct + '</td></tr>';
+                        const original = String((r && r.original_text) || '').trim();
+                        const direct = fallbackEscapeHtml(String((r && r.direct_apply_text) || (r && r.replacement_text) || (r && r.insertion_content) || ''));
+                        return '<tr><td>' + fallbackEscapeHtml(String((r && r.write_mode_label) || '')) + '</td><td>' + fallbackEscapeHtml(pageLabel) + '</td><td>' + fallbackEscapeHtml(original || '（未提取到原文）') + '</td><td>' + direct + '</td></tr>';
                       }).join('')
                     : '<tr><td colspan="4">暂无可执行清单。</td></tr>')
                   + '</table>';
@@ -47405,13 +47404,12 @@ def index(
               return '<table><tr><th>写入方式</th><th>页码定位</th><th>原文内容</th><th>直接替换文本 / 原位补充内容</th></tr>'
                 + (recRows.length ? recRows.map((r) => {
                   const pageLabel = (r.page_hint || '页码未知') + ((r.chapter_hint && String(r.chapter_hint).trim()) ? (' / ' + r.chapter_hint) : '');
-                  const directText = r.write_mode === 'insert'
-                    ? (escMultiline(r.insertion_guidance || '') + ((r.insertion_content || '') ? ('<br/><span style="color:#475569;font-size:12px">' + escMultiline(r.insertion_content || '') + '</span>') : ''))
-                    : escMultiline(r.replacement_text || '');
+                  const originalText = String(r.original_text || '').trim();
+                  const directText = escMultiline(r.direct_apply_text || r.replacement_text || r.insertion_content || '');
                   return '<tr>'
                     + '<td>' + esc((r.priority || '') + ' ' + (r.write_mode_label || '')) + '</td>'
                     + '<td>' + esc(pageLabel) + '</td>'
-                    + '<td>' + escMultiline(r.original_text || r.evidence || '') + '<br/><span style="color:#64748b;font-size:12px">' + escMultiline(r.issue || '') + '</span></td>'
+                    + '<td>' + escMultiline(originalText || '（未提取到原文）') + '</td>'
                     + '<td>' + directText + '</td>'
                     + '</tr>';
                 }).join('') : '<tr><td colspan="4">暂无可执行清单。</td></tr>')
