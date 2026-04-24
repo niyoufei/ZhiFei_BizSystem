@@ -234,6 +234,13 @@ def _match_requirements(
         dim_units = units_by_dim.get(dim_id, [])
         dim_text = _joined_unit_text(dim_units)
         scope_text = dim_text if dim_text else text
+        semantic_scope_text = scope_text
+        if (
+            str(req.get("source_pack_id") or "").strip() == "runtime_material_rag"
+            and str(patterns.get("material_type") or req.get("material_type") or "").strip().lower()
+            == "boq"
+        ):
+            semantic_scope_text = text
         scope_lower = scope_text.lower()
         hit = True
         reason = ""
@@ -258,7 +265,7 @@ def _match_requirements(
             if hints:
                 minimum_hint_hits = int(patterns.get("minimum_hint_hits", 1) or 1)
                 hint_hits = _count_hit_terms(
-                    scope_text, [str(h) for h in hints if isinstance(h, str)]
+                    semantic_scope_text, [str(h) for h in hints if isinstance(h, str)]
                 )
                 hit = hint_hits >= max(1, minimum_hint_hits)
                 reason = f"semantic_hints:{hint_hits}/{max(1, minimum_hint_hits)}"
@@ -733,7 +740,29 @@ def _consistency_bonus(
         elif key == "key_milestones":
             dim9 = " ".join(u.get("text", "") for u in units_by_dim.get("09", []))
             dim15 = " ".join(u.get("text", "") for u in units_by_dim.get("15", []))
-            if dim9 and dim15:
+            milestone_scope = " ".join(part for part in [dim9, dim15] if part).strip()
+            raw_anchor_value = a.get("anchor_value")
+            anchor_texts: List[str] = []
+            if isinstance(raw_anchor_value, str) and raw_anchor_value.strip():
+                anchor_texts = [raw_anchor_value.strip()]
+            elif isinstance(raw_anchor_value, list):
+                anchor_texts = [
+                    str(item).strip() for item in raw_anchor_value if str(item or "").strip()
+                ]
+            milestone_terms = [
+                "里程碑",
+                "关键线路",
+                "总控计划",
+                "关键节点",
+                "关键节点攻坚",
+                "进度计划",
+                "分段验收移交",
+            ]
+            anchor_phrase_hit = any(
+                phrase and len(phrase) >= 4 and phrase in milestone_scope for phrase in anchor_texts
+            )
+            milestone_hit_count = _count_hit_terms(milestone_scope, milestone_terms)
+            if milestone_scope and (anchor_phrase_hit or milestone_hit_count >= 2):
                 bonus += 2.5
                 checks.append({"check": "milestone_consistency", "ok": True, "anchor": key})
             else:
@@ -789,11 +818,56 @@ def _action_penalties(text: str, lexicon: Dict[str, Any]) -> List[Dict[str, Any]
     ]
     penalties: List[Dict[str, Any]] = []
     total = 0.0
+    deduct_per_hit = 0.8
+    max_deduct = 4.0
+    seen_windows: Dict[str, List[Tuple[int, int, str]]] = {}
     for kw in triggers:
         if not kw:
             continue
         for m in re.finditer(re.escape(str(kw)), text):
             snippet = _snippet(text, m.start(), m.end(), window=60)
+            line_start = text.rfind("\n", 0, m.start()) + 1
+            line_end = text.find("\n", m.end())
+            if line_end < 0:
+                line_end = len(text)
+            current_line = text[line_start:line_end].strip()
+            normalized_line = " ".join(current_line.split())
+            is_toc_line = bool(re.search(r"(?:\.{4,}|…{2,}|_{4,})\s*\d+\s*$", normalized_line))
+            is_heading_line = (
+                bool(
+                    re.match(
+                        r"^(?:第[一二三四五六七八九十百千万〇零0-9]+[章节条]|[0-9]+(?:\.[0-9]+){0,3})",
+                        normalized_line,
+                    )
+                )
+                and len(normalized_line) <= 40
+                and not re.search(r"[。；;:：]", normalized_line)
+            )
+            is_stage_task_list_line = (
+                normalized_line
+                and not re.search(r"[：:]", normalized_line)
+                and len(re.findall(r"[;；]", snippet)) >= 2
+                and bool(
+                    re.search(
+                        r"(?:阶段主控工作内容|主控工作内容|阶段名称工期|施工准备|先导抢通阶段|工程阶段)",
+                        snippet,
+                    )
+                )
+            )
+            is_policy_coverage_line = (
+                normalized_line
+                and not re.search(r"[：:;；]", normalized_line)
+                and "交底" in normalized_line
+                and bool(
+                    re.search(
+                        r"(?:100%覆盖|全覆盖|覆盖至一线作业终端|覆盖到一线作业终端|覆盖至终端|覆盖到终端)",
+                        normalized_line,
+                    )
+                )
+                and bool(re.search(r"(?:必须|应当|确保|做到)", normalized_line))
+            )
+            if is_toc_line or is_heading_line or is_stage_task_list_line or is_policy_coverage_line:
+                continue
             has_accept = bool(
                 re.search(r"(?:报验|签认|验收|旁站|自检|互检|交接检|隐蔽验收|销项)", snippet)
             )
@@ -807,18 +881,35 @@ def _action_penalties(text: str, lexicon: Dict[str, Any]) -> List[Dict[str, Any]
                 miss.append("role")
             if not has_accept:
                 miss.append("accept")
+            kw_key = str(kw)
+            snippet_start = max(0, m.start() - 60)
+            snippet_end = min(len(text), m.end() + 60)
+            snippet_norm = " ".join(snippet.split())
+            duplicate_hit = False
+            for prev_start, prev_end, prev_norm in seen_windows.get(kw_key, []):
+                overlap = max(0, min(snippet_end, prev_end) - max(snippet_start, prev_start))
+                min_window_len = min(snippet_end - snippet_start, prev_end - prev_start)
+                overlap_ratio = overlap / min_window_len if min_window_len > 0 else 0.0
+                if snippet_norm == prev_norm or overlap_ratio >= 0.5:
+                    duplicate_hit = True
+                    break
+            if duplicate_hit:
+                continue
+            if total + deduct_per_hit > max_deduct:
+                return penalties
             penalties.append(
                 {
                     "code": "P-ACTION-002",
-                    "points": 0.8,
+                    "points": deduct_per_hit,
                     "reason": "措施缺少硬要素：" + ",".join(miss),
                     "evidence_refs": [
                         {"locator": f"char:{m.start()}-{m.end()}", "text_snippet": snippet}
                     ],
                 }
             )
-            total += 0.8
-            if total >= 6.0:
+            seen_windows.setdefault(kw_key, []).append((snippet_start, snippet_end, snippet_norm))
+            total += deduct_per_hit
+            if total >= max_deduct:
                 return penalties
     return penalties
 
@@ -1161,6 +1252,7 @@ def _build_suggestions(
     weights_norm: Dict[str, float],
     *,
     probe_dimensions: List[Dict[str, Any]] | None = None,
+    project_id: str | None = None,
 ) -> List[Dict[str, Any]]:
     suggestions: List[Dict[str, Any]] = []
     for dim_id, score_item in dim_scores.items():
@@ -1191,7 +1283,11 @@ def _build_suggestions(
         )
     )
     if probe_dimensions:
-        rag_suggestions = build_probe_template_suggestions(probe_dimensions, threshold=0.8)
+        rag_suggestions = build_probe_template_suggestions(
+            probe_dimensions,
+            threshold=0.8,
+            project_id=project_id,
+        )
         suggestions = rag_suggestions + suggestions
     return suggestions
 
@@ -1201,6 +1297,7 @@ def score_text_v2(
     submission_id: str,
     text: str,
     lexicon: Dict[str, Any],
+    project_id: str | None = None,
     weights_norm: Dict[str, float] | None = None,
     anchors: List[Dict[str, Any]] | None = None,
     requirements: List[Dict[str, Any]] | None = None,
@@ -1287,6 +1384,7 @@ def score_text_v2(
         dim_scores,
         weights_norm,
         probe_dimensions=probe_dimensions,
+        project_id=project_id,
     )
 
     mandatory_total = sum(1 for r in req_hits if r.get("mandatory"))
