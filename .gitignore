@@ -105,3 +105,6 @@ sample_report*.json
 qingtian_report_word.txt
 *.bak
 *.bak_*
+
+# Local virtualenv backups
+.venv.bak-*/
