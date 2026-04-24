@@ -29,6 +29,185 @@
       }
     },
     {
+      "id": "REQ-ALL-RISK-001-05",
+      "dimension_id": "05",
+      "req_label": "四新技术应用需体现工艺风险识别及对应控制措施",
+      "req_type": "semantic",
+      "mandatory": true,
+      "weight": 2.0,
+      "patterns": {
+        "risk_terms": [
+          "压实漏项",
+          "人为压实漏项",
+          "传统工艺缺陷",
+          "粗放翻拌",
+          "传统翻拌",
+          "扬尘污染",
+          "场外消解",
+          "工艺风险",
+          "控制偏差",
+          "摊铺偏差",
+          "压实偏差",
+          "剂量偏差"
+        ],
+        "measure_terms": [
+          "无人驾驶",
+          "智能摊铺",
+          "毫米级自动控制",
+          "精准撒布",
+          "就地冷再生",
+          "设定剂量",
+          "均匀布灰",
+          "碾压遍数",
+          "搭接宽度",
+          "行驶轨迹",
+          "应用成效",
+          "核心技术",
+          "核心工艺",
+          "工艺控制",
+          "精准控制"
+        ],
+        "linkage_rule": {
+          "same_dimension_scope": true,
+          "within_same_heading_or_neighbor_units": 2
+        }
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "high",
+        "why_it_matters": "四新技术应用如果没有把传统工艺缺陷、控制偏差和对应的精准控制措施形成联动，创新价值难以落到可执行工艺控制。",
+        "fix_template": "按“传统工艺缺陷/压实漏项/扬尘污染/剂量偏差→无人驾驶或智能摊铺/精准撒布/就地冷再生/毫米级自动控制→设定剂量/碾压遍数/搭接宽度/行驶轨迹”等表达补齐四新工艺风险与控制措施。"
+      }
+    },
+    {
+      "id": "REQ-ALL-RISK-001-10",
+      "dimension_id": "10",
+      "req_label": "成本资金控制需体现定额预警、专户托管及刚性保供措施",
+      "req_type": "semantic",
+      "mandatory": true,
+      "weight": 2.0,
+      "patterns": {
+        "risk_terms": [
+          "定额底线",
+          "定额预警",
+          "动态预警",
+          "资金风险",
+          "资金缺口",
+          "支付风险",
+          "拨付风险",
+          "工资支付风险",
+          "农民工工资风险",
+          "资金滞后",
+          "资金延误",
+          "刚性保供",
+          "保供压力",
+          "台账预警"
+        ],
+        "measure_terms": [
+          "资金托管",
+          "专款专户",
+          "专款专 户",
+          "农民工工资专户",
+          "资金计划",
+          "支付节点",
+          "资金拨付",
+          "拨付记录",
+          "对账",
+          "复核",
+          "台账",
+          "动态预警",
+          "定额预警",
+          "刚性保供",
+          "执行",
+          "托管",
+          "支付",
+          "拨付"
+        ],
+        "linkage_rule": {
+          "same_dimension_scope": true,
+          "within_same_heading_or_neighbor_units": 2
+        }
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "high",
+        "why_it_matters": "成本资金章节若未把定额预警、专户托管和刚性保供形成风险与控制措施联动，难以形成可执行、可核验的资金保障证据。",
+        "fix_template": "按“定额底线/动态预警/资金风险/保供压力→专款专户或资金托管/工资专户/支付拨付/对账复核/台账/刚性保供”补齐成本资金风险与控制措施。"
+      }
+    },
+    {
+      "id": "REQ-ALL-RISK-001-14",
+      "dimension_id": "14",
+      "req_label": "设计协调与深化需体现碰撞风险识别及避让迁改措施",
+      "req_type": "semantic",
+      "mandatory": true,
+      "weight": 2.0,
+      "patterns": {
+        "risk_terms": ["冲突点", "碰撞", "碰撞风险", "防碰撞", "高危敏感区域", "保护节点", "图纸节点", "管线冲突", "标高冲突", "预留预埋冲突", "专业碰撞", "硬碰撞", "软碰撞"],
+        "measure_terms": ["排查", "会审", "联合会审", "图纸会审", "专项论证", "专家论证", "深化设计", "深化优化", "避让", "迁改", "标高走向优化", "预留预埋优化", "碰撞检测", "碰撞检查"],
+        "linkage_rule": {
+          "same_dimension_scope": true,
+          "within_same_heading_or_neighbor_units": 2
+        }
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "high",
+        "why_it_matters": "设计协调与深化缺少碰撞风险识别、会审论证、避让迁改和优化措施时，图纸问题难以形成可执行闭环。",
+        "fix_template": "按“冲突点/碰撞风险/保护节点→BIM排查或会审论证→避让迁改/标高走向优化/预留预埋优化”补齐设计协调风险措施。"
+      }
+    },
+    {
+      "id": "REQ-ALL-RISK-001-12",
+      "dimension_id": "12",
+      "req_label": "流程穿插与移交组织需体现交叉作业风险及衔接措施",
+      "req_type": "semantic",
+      "mandatory": true,
+      "weight": 2.0,
+      "patterns": {
+        "risk_terms": [
+          "狭窄空间作业",
+          "工序衔接断层",
+          "循环效率受阻",
+          "交叉作业",
+          "交叉冲突",
+          "作业面受限",
+          "工序冲突",
+          "穿插冲突",
+          "移交不清",
+          "前置条件不满足",
+          "节点封闭不到位"
+        ],
+        "measure_terms": [
+          "分段开挖",
+          "快速封底",
+          "快速移交",
+          "作业面移交",
+          "路床移交",
+          "节点封闭",
+          "方可推进",
+          "立体穿插",
+          "多工作面",
+          "平移转场",
+          "动态优化",
+          "流程衔接",
+          "前置条件",
+          "硬性前置条件",
+          "闭环移交"
+        ],
+        "linkage_rule": {
+          "same_dimension_scope": true,
+          "within_same_heading_or_neighbor_units": 2
+        }
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "high",
+        "why_it_matters": "流程穿插与移交组织若缺少交叉作业风险识别及衔接措施，现场易出现作业面受限、工序断层和节点推进失序。",
+        "fix_template": "按“狭窄空间作业/工序衔接断层/交叉作业风险→分段开挖或快速封底→作业面或路床快速移交→节点封闭后方可推进/多工作面立体穿插/动态优化”补齐流程组织风险措施。"
+      }
+    },
+    {
       "id": "REQ-ALL-CLOSURE-001",
       "dimension_ids": ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16"],
       "req_label": "措施类内容必须形成“参数+频次+责任+验收+记录”闭环",
@@ -53,6 +232,78 @@
       }
     },
     {
+      "id": "REQ-ALL-CLOSURE-001-12",
+      "dimension_id": "12",
+      "req_label": "流程穿插与移交措施必须形成前置条件/移交交接/影像资料闭环",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.8,
+      "patterns": {
+        "must_include_measure_and_acceptance": {
+          "measure_terms": ["执行", "实施", "移交", "交接", "闭环移交", "节点封闭", "方可", "动态优化"],
+          "acceptance_terms": ["验收", "隐蔽验收", "检查", "复核", "交接", "移交", "路床交接"]
+        },
+        "should_have_terms_any2": {
+          "terms": ["影像", "隐蔽验收", "检测影像报告", "数字档案", "抽检数据", "路床交接", "硬性前置条件", "闭环移交", "移交", "交接", "节点封闭", "方可", "记录"],
+          "minimum": 3
+        }
+      },
+      "lint": {
+        "issue_code": "ClosureGap",
+        "severity": "high",
+        "why_it_matters": "流程穿插与移交缺少前置条件、移交交接和影像资料闭环时，工序衔接条件难以形成可核验证据。",
+        "fix_template": "按“执行/实施→移交或交接→路床交接或硬性前置条件→检测影像报告/数字档案/抽检数据/记录”补齐流程组织闭环。"
+      }
+    },
+    {
+      "id": "REQ-ALL-CLOSURE-001-14",
+      "dimension_id": "14",
+      "req_label": "设计协调与深化措施必须形成会审论证/碰撞检查/避让迁改/优化复核闭环",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.8,
+      "patterns": {
+        "must_include_measure_and_acceptance": {
+          "measure_terms": ["会审", "联合会审", "图纸会审", "专项论证", "专家论证", "深化设计", "碰撞检测", "碰撞检查", "避让", "迁改", "优化", "标高走向优化", "预留预埋优化"],
+          "acceptance_terms": ["检查", "复核", "签认", "会审", "论证", "确认", "优化"]
+        },
+        "should_have_terms_any2": {
+          "terms": ["参数", "会审", "联合会审", "专项论证", "专家论证", "碰撞检测", "碰撞检查", "避让", "迁改", "标高走向优化", "预留预埋优化", "复核", "签认", "记录", "台账"],
+          "minimum": 3
+        }
+      },
+      "lint": {
+        "issue_code": "ClosureGap",
+        "severity": "high",
+        "why_it_matters": "设计协调与深化缺少会审论证、碰撞检查、避让迁改和优化复核闭环时，图纸问题难以形成可执行证据。",
+        "fix_template": "按“会审/专项论证→碰撞检测或检查→避让迁改/标高走向优化/预留预埋优化→复核签认/记录台账”补齐设计协调闭环。"
+      }
+    },
+    {
+      "id": "REQ-ALL-CLOSURE-001-10",
+      "dimension_id": "10",
+      "req_label": "成本资金控制措施必须形成资金计划/专户/支付/预警/台账闭环",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.8,
+      "patterns": {
+        "must_include_measure_and_acceptance": {
+          "measure_terms": ["措施", "执行", "实施", "控制", "托管", "支付", "拨付", "预警", "对账", "复核"],
+          "acceptance_terms": ["检查", "复核", "对账", "签认", "台账", "记录", "拨付记录", "支付台账", "工资专户台账"]
+        },
+        "should_have_terms_any2": {
+          "terms": ["资金托管", "专款专户", "专款专 户", "农民工工资专户", "定额预警", "动态预警", "资金计划", "支付节点", "资金拨付", "拨付记录", "对账", "复核", "台账"],
+          "minimum": 3
+        }
+      },
+      "lint": {
+        "issue_code": "ClosureGap",
+        "severity": "high",
+        "why_it_matters": "成本资金控制闭环缺少资金计划、专户托管、支付拨付、预警和台账记录时，难以形成可核验的资金管理证据。",
+        "fix_template": "按“资金计划/专款专户/资金托管/工资专户/定额预警/支付节点/拨付记录/对账复核/台账”补齐成本资金控制闭环。"
+      }
+    },
+    {
       "id": "REQ-ALL-BANNED-001",
       "dimension_ids": ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16"],
       "req_label": "禁语控制：禁止空泛口号化表达",
@@ -61,6 +312,85 @@
       "weight": 1.4,
       "patterns": {
         "must_not_have_terms": ["按照", "符合", "确保", "保障", "严格落实", "加强管理", "有效措施", "合理安排", "现场实际情况", "相关规范", "有关规定"]
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "medium",
+        "why_it_matters": "命中禁语会降低可执行性与可验收性，影响青天抽取稳定度。",
+        "fix_template": "删除空泛术语，改写为“量化参数+检查频次+责任岗位+验收动作+记录载体”。"
+      }
+    },
+    {
+      "id": "REQ-ALL-BANNED-001-10",
+      "dimension_id": "10",
+      "req_label": "禁语控制：禁止空泛口号化表达",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.4,
+      "patterns": {
+        "must_not_have_terms": [
+          "按照",
+          "符合",
+          "确保",
+          "严格落实",
+          "加强管理",
+          "有效措施",
+          "合理安排",
+          "现场实际情况",
+          "相关规范",
+          "有关规定"
+        ]
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "medium",
+        "why_it_matters": "命中禁语会降低可执行性与可验收性，影响青天抽取稳定度。",
+        "fix_template": "删除空泛术语，改写为“量化参数+检查频次+责任岗位+验收动作+记录载体”。"
+      }
+    },
+    {
+      "id": "REQ-ALL-BANNED-001-05",
+      "dimension_id": "05",
+      "req_label": "禁语控制：禁止空泛口号化表达",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.4,
+      "patterns": {
+        "must_not_have_terms": ["按照", "符合", "确保", "保障", "加强管理", "有效措施", "合理安排", "现场实际情况", "相关规范", "有关规定"]
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "medium",
+        "why_it_matters": "命中禁语会降低可执行性与可验收性，影响青天抽取稳定度。",
+        "fix_template": "删除空泛术语，改写为“量化参数+检查频次+责任岗位+验收动作+记录载体”。"
+      }
+    },
+    {
+      "id": "REQ-ALL-BANNED-001-12",
+      "dimension_id": "12",
+      "req_label": "禁语控制：禁止空泛口号化表达",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.4,
+      "patterns": {
+        "must_not_have_terms": ["按照", "符合", "严格落实", "加强管理", "有效措施", "合理安排", "现场实际情况", "相关规范", "有关规定"]
+      },
+      "lint": {
+        "issue_code": "MissingRequirement",
+        "severity": "medium",
+        "why_it_matters": "命中禁语会降低可执行性与可验收性，影响青天抽取稳定度。",
+        "fix_template": "删除空泛术语，改写为“量化参数+检查频次+责任岗位+验收动作+记录载体”。"
+      }
+    },
+    {
+      "id": "REQ-ALL-BANNED-001-14",
+      "dimension_id": "14",
+      "req_label": "禁语控制：禁止空泛口号化表达",
+      "req_type": "presence",
+      "mandatory": true,
+      "weight": 1.4,
+      "patterns": {
+        "must_not_have_terms": ["按照", "符合", "保障", "严格落实", "加强管理", "有效措施", "合理安排", "现场实际情况", "相关规范", "有关规定"]
       },
       "lint": {
         "issue_code": "MissingRequirement",
@@ -167,7 +497,20 @@
       "weight": 1.6,
       "patterns": {
         "should_have_terms_any2": {
-          "terms": ["类别", "采用内容", "适用部位", "实施参数", "预期效果", "验证方式", "管控要点"],
+          "terms": [
+            "新技术",
+            "新工艺",
+            "新材料",
+            "新设备",
+            "应用部位",
+            "核心技术",
+            "核心工艺",
+            "应用成效",
+            "预期效果",
+            "实施参数",
+            "验证方式",
+            "管控要点"
+          ],
           "minimum": 4
         }
       },
@@ -175,7 +518,7 @@
         "issue_code": "MissingRequirement",
         "severity": "medium",
         "why_it_matters": "四新章节未落到可验证清单，无法形成可评分证据。",
-        "fix_template": "每项四新需写：类别/采用内容/适用部位/实施参数/预期效果/验证方式/管控要点。"
+        "fix_template": "每项四新需写：新技术/新工艺/新材料/新设备类型、应用部位、核心技术或核心工艺、应用成效或预期效果、实施参数、验证方式、管控要点。"
       }
     },
     {
@@ -266,21 +609,21 @@
     {
       "id": "REQ-10-SPECIAL-CHAIN-001",
       "dimension_id": "10",
-      "req_label": "维度10需覆盖专项方案全链条节点",
+      "req_label": "维度10需覆盖成本管理与资金控制关键闭环",
       "req_type": "presence",
       "mandatory": true,
       "weight": 1.4,
       "patterns": {
         "should_have_terms_any2": {
-          "terms": ["编制时点", "审批节点", "交底时点", "验收时点", "销项资料"],
+          "terms": ["成本", "资金", "专款专户", "资金托管", "农民工工资专户", "定额预警", "计量支付", "资金计划", "支付节点", "资金拨付"],
           "minimum": 4
         }
       },
       "lint": {
         "issue_code": "MissingRequirement",
         "severity": "medium",
-        "why_it_matters": "专项方案节点缺失，审批与验收链路不完整。",
-        "fix_template": "按“专项名称/编制时点/审批节点/交底对象/验收节点/形成资料”补齐。"
+        "why_it_matters": "成本与资金控制闭环缺失，支付计划、专户保障和预警机制不完整。",
+        "fix_template": "按“资金计划/支付节点/专款专户/资金托管/工资专户/定额预警”补齐成本与资金控制闭环。"
       }
     },
     {
@@ -312,7 +655,22 @@
       "weight": 1.4,
       "patterns": {
         "should_have_terms_any2": {
-          "terms": ["前置条件", "可穿插工序", "禁止交叉情形", "移交条件", "记录表"],
+          "terms": [
+            "前置条件",
+            "硬性前置条件",
+            "可穿插工序",
+            "移交条件",
+            "路床移交",
+            "路床交接",
+            "作业面移交",
+            "快速移交",
+            "立体穿插",
+            "多工作面",
+            "平移转场",
+            "节点封闭",
+            "方可",
+            "交接"
+          ],
           "minimum": 4
         }
       },
@@ -320,7 +678,7 @@
         "issue_code": "MissingRequirement",
         "severity": "medium",
         "why_it_matters": "流程衔接条件不清晰会引发交叉作业冲突。",
-        "fix_template": "按“区域系统/前置条件/可穿插工序/禁止交叉情形/移交条件/记录表”补齐。"
+        "fix_template": "按“前置条件/路床或作业面移交/节点封闭后方可/立体穿插或多工作面/交接记录”补齐流程穿插与移交条件。"
       }
     },
     {
@@ -352,7 +710,28 @@
       "weight": 1.6,
       "patterns": {
         "should_have_terms_any2": {
-          "terms": ["问题发现", "会审提出", "责任分配", "深化处理", "变更确认", "关闭条件", "复核签认"],
+          "terms": [
+            "问题发现",
+            "会审提出",
+            "责任分配",
+            "深化处理",
+            "变更确认",
+            "关闭条件",
+            "复核签认",
+            "冲突点",
+            "碰撞排查",
+            "碰撞检测",
+            "防碰撞",
+            "联合图纸会审",
+            "联合会审",
+            "深化设计方案会审",
+            "避让",
+            "迁改",
+            "管线综合",
+            "标高",
+            "走向",
+            "预留预埋"
+          ],
           "minimum": 5
         }
       },
@@ -360,7 +739,7 @@
         "issue_code": "MissingRequirement",
         "severity": "medium",
         "why_it_matters": "图纸会审与变更缺少闭环会削弱可追溯性。",
-        "fix_template": "按“问题来源/问题类型/提出时限/责任专业/关闭条件/复核人/台账”补齐。"
+        "fix_template": "按“图纸问题发现/BIM碰撞排查/会审与深化处理/避让迁改/关闭条件/复核签认/台账”补齐。"
       }
     },
     {
@@ -371,9 +750,9 @@
       "mandatory": true,
       "weight": 1.6,
       "patterns": {
-        "must_have_terms": ["触发条件", "调配动作"],
+        "must_have_terms": ["低于预警线", "调配增援"],
         "should_have_terms_any2": {
-          "terms": ["人员缺口触发", "材料延误触发", "设备故障触发", "夜间施工触发", "高峰抢工触发", "完成时限", "批准人"],
+          "terms": ["人员缺口触发", "材料延误触发", "设备故障触发", "夜间施工触发", "高峰抢工触发", "完成时限", "批准人", "低于预警线", "报警", "预警线", "跨区调配", "调配增援", "增援", "资源蓄水池", "后备资源", "生产要素", "生产要素配置", "多点同步", "人员倒班", "高峰期", "饱和投入", "设备台账", "每日盘点"],
           "minimum": 3
         }
       },
