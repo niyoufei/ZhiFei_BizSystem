@@ -1,5 +1,6 @@
 fastapi
 httpx
+mypy
 python-dotenv
 python-multipart
 uvicorn

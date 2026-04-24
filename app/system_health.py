@@ -11,8 +11,12 @@ def build_readiness_status(
     load_config: Callable[[], Any],
     ensure_data_dirs: Callable[[], None],
     validate_runtime_security_settings: Optional[Callable[[], None]] = None,
+    probe_config_completeness: Optional[Callable[[], Dict[str, object]]] = None,
+    probe_storage_lock_status: Optional[Callable[[], Dict[str, object]]] = None,
+    probe_event_log_appendability: Optional[Callable[[], Dict[str, object]]] = None,
 ) -> Dict[str, object]:
     checks: Dict[str, bool] = {}
+    details: Dict[str, object] = {}
 
     try:
         load_config()
@@ -26,6 +30,33 @@ def build_readiness_status(
     except Exception:
         checks["data_dirs"] = False
 
+    if probe_config_completeness is not None:
+        try:
+            completeness = probe_config_completeness()
+            checks["config_completeness"] = bool(completeness.get("ok"))
+            details["config_completeness"] = completeness
+        except Exception as exc:
+            checks["config_completeness"] = False
+            details["config_completeness"] = {"ok": False, "detail": str(exc)}
+
+    if probe_storage_lock_status is not None:
+        try:
+            lock_status = probe_storage_lock_status()
+            checks["storage_lock"] = bool(lock_status.get("ok"))
+            details["storage_lock"] = lock_status
+        except Exception as exc:
+            checks["storage_lock"] = False
+            details["storage_lock"] = {"ok": False, "detail": str(exc)}
+
+    if probe_event_log_appendability is not None:
+        try:
+            appendability = probe_event_log_appendability()
+            checks["event_log_appendable"] = bool(appendability.get("ok"))
+            details["event_log_appendable"] = appendability
+        except Exception as exc:
+            checks["event_log_appendable"] = False
+            details["event_log_appendable"] = {"ok": False, "detail": str(exc)}
+
     if validate_runtime_security_settings is not None:
         try:
             validate_runtime_security_settings()
@@ -36,6 +67,7 @@ def build_readiness_status(
     return {
         "status": "ready" if checks and all(checks.values()) else "not_ready",
         "checks": checks,
+        "details": details,
     }
 
 
@@ -45,6 +77,14 @@ class SystemSelfCheckContext:
     load_config: Callable[[], Any]
     ensure_data_dirs: Callable[[], None]
     storage_probe_dir: str
+    build_storage_backend_status: Callable[[], Dict[str, Any]]
+    probe_config_completeness: Callable[[], Dict[str, Any]]
+    probe_storage_lock_status: Callable[[], Dict[str, Any]]
+    probe_event_log_appendability: Callable[[], Dict[str, Any]]
+    probe_projection_consistency: Callable[[], Dict[str, Any]]
+    probe_learning_artifact_versions: Callable[[], Dict[str, Any]]
+    probe_agent_dependency_health: Callable[[], Dict[str, Any]]
+    probe_scoring_replay_consistency: Callable[[Optional[str]], Dict[str, Any]]
     get_auth_status: Callable[[], Dict[str, Any]]
     get_rate_limit_status: Callable[[], Dict[str, Any]]
     get_runtime_security_status: Callable[[], Dict[str, Any]]
@@ -130,6 +170,18 @@ def run_system_self_check(
         add("config", False, str(exc), category="config")
 
     try:
+        config_completeness = context.probe_config_completeness()
+        add(
+            "config_completeness",
+            bool(config_completeness.get("ok")),
+            str(config_completeness.get("detail") or ""),
+            category="config",
+            required=False,
+        )
+    except Exception as exc:
+        add("config_completeness", False, str(exc), category="config", required=False)
+
+    try:
         context.ensure_data_dirs()
         with tempfile.NamedTemporaryFile(
             prefix="selfcheck_",
@@ -141,6 +193,94 @@ def run_system_self_check(
         add("data_dirs_writable", True, "data directory writable", category="storage")
     except Exception as exc:
         add("data_dirs_writable", False, str(exc), category="storage")
+
+    try:
+        backend_status = context.build_storage_backend_status()
+        add(
+            "storage_backend_status",
+            True,
+            (
+                f"primary={backend_status.get('primary_backend')}, "
+                f"event_log={backend_status.get('event_log_enabled')}, "
+                f"sqlite_mirror={backend_status.get('sqlite_mirror_enabled')}"
+            ),
+            category="storage",
+            required=False,
+        )
+    except Exception as exc:
+        add("storage_backend_status", False, str(exc), category="storage", required=False)
+
+    try:
+        storage_lock_status = context.probe_storage_lock_status()
+        add(
+            "storage_lock_status",
+            bool(storage_lock_status.get("ok")),
+            str(storage_lock_status.get("detail") or ""),
+            category="storage",
+            required=False,
+        )
+    except Exception as exc:
+        add("storage_lock_status", False, str(exc), category="storage", required=False)
+
+    try:
+        event_log_status = context.probe_event_log_appendability()
+        add(
+            "event_log_appendability",
+            bool(event_log_status.get("ok")),
+            str(event_log_status.get("detail") or ""),
+            category="event_log",
+            required=False,
+        )
+    except Exception as exc:
+        add("event_log_appendability", False, str(exc), category="event_log", required=False)
+
+    try:
+        projection_status = context.probe_projection_consistency()
+        add(
+            "projection_consistency",
+            bool(projection_status.get("ok")),
+            str(projection_status.get("detail") or ""),
+            category="projection",
+            required=False,
+        )
+    except Exception as exc:
+        add("projection_consistency", False, str(exc), category="projection", required=False)
+
+    try:
+        learning_versions = context.probe_learning_artifact_versions()
+        add(
+            "learning_artifact_versions",
+            bool(learning_versions.get("ok")),
+            str(learning_versions.get("detail") or ""),
+            category="learning",
+            required=False,
+        )
+    except Exception as exc:
+        add("learning_artifact_versions", False, str(exc), category="learning", required=False)
+
+    try:
+        agent_health = context.probe_agent_dependency_health()
+        add(
+            "agent_dependency_health",
+            bool(agent_health.get("ok")),
+            str(agent_health.get("detail") or ""),
+            category="agent",
+            required=False,
+        )
+    except Exception as exc:
+        add("agent_dependency_health", False, str(exc), category="agent", required=False)
+
+    try:
+        replay_status = context.probe_scoring_replay_consistency(project_id)
+        add(
+            "scoring_replay_consistency",
+            bool(replay_status.get("ok")),
+            str(replay_status.get("detail") or ""),
+            category="scoring",
+            required=False,
+        )
+    except Exception as exc:
+        add("scoring_replay_consistency", False, str(exc), category="scoring", required=False)
 
     try:
         auth_status = context.get_auth_status()
@@ -308,13 +448,16 @@ def run_system_self_check(
 
     try:
         hygiene = context.build_data_hygiene_report(apply=False)
+        datasets = hygiene.get("datasets")
+        dataset_rows = datasets if isinstance(datasets, list) else []
         data_hygiene_orphan_count = int(
             context.to_float_or_none(hygiene.get("orphan_records_total")) or 0
         )
         data_hygiene_impacted = sum(
             1
-            for row in (hygiene.get("datasets") or [])
-            if int(context.to_float_or_none((row or {}).get("orphan_count")) or 0) > 0
+            for row in dataset_rows
+            if isinstance(row, dict)
+            and int(context.to_float_or_none(row.get("orphan_count")) or 0) > 0
         )
         add(
             "data_hygiene",
@@ -379,24 +522,22 @@ def run_system_self_check(
                     readiness = context.build_scoring_readiness(str(project_id), target)
                     project_ready = bool(readiness.get("ready"))
                     project_gate_passed = bool(readiness.get("gate_passed"))
-                    issues = (
-                        readiness.get("issues") if isinstance(readiness.get("issues"), list) else []
-                    )
-                    warnings = (
-                        readiness.get("warnings")
-                        if isinstance(readiness.get("warnings"), list)
-                        else []
-                    )
-                    material_gate = (
-                        readiness.get("material_gate")
-                        if isinstance(readiness.get("material_gate"), dict)
-                        else {}
-                    )
+                    issues_raw = readiness.get("issues")
+                    issues = issues_raw if isinstance(issues_raw, list) else []
+                    warnings_raw = readiness.get("warnings")
+                    warnings = warnings_raw if isinstance(warnings_raw, list) else []
+                    material_gate_raw = readiness.get("material_gate")
+                    material_gate = material_gate_raw if isinstance(material_gate_raw, dict) else {}
+                    missing_required_types = material_gate.get("missing_required_types")
                     project_issue_count = len(issues)
                     project_warning_count = len(warnings)
                     project_missing_required_types = [
                         str(item)
-                        for item in (material_gate.get("missing_required_types") or [])
+                        for item in (
+                            missing_required_types
+                            if isinstance(missing_required_types, list)
+                            else []
+                        )
                         if str(item).strip()
                     ]
                     project_issues_preview = (
@@ -466,6 +607,18 @@ def run_system_self_check(
         "structured_summary_schema_ok": structured_summary_schema_ok,
         "data_hygiene_orphan_records": data_hygiene_orphan_count,
         "data_hygiene_impacted_datasets": data_hygiene_impacted,
+        "storage_probe_items": {
+            name: checks.get(name)
+            for name in (
+                "storage_backend_status",
+                "storage_lock_status",
+                "event_log_appendability",
+                "projection_consistency",
+                "learning_artifact_versions",
+                "agent_dependency_health",
+                "scoring_replay_consistency",
+            )
+        },
         "project_id": project_id,
         "project_name": project_name,
         "project_material_count": project_material_count,
