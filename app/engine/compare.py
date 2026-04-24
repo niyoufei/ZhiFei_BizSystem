@@ -14,7 +14,8 @@ DEFAULT_DIMENSION_MAX_SCORE = 10.0
 EVIDENCE_CONTEXT_RADIUS = 90
 MIN_MEANINGFUL_ORIGINAL_TEXT_CHARS = 15
 SEMANTIC_EXCERPT_TARGET_CHARS = 60
-SEMANTIC_EXCERPT_MAX_CHARS = 220
+SEMANTIC_EXCERPT_MAX_CHARS = 360
+SEMANTIC_EXCERPT_COMPLETION_MAX_CHARS = 520
 SEMANTIC_NEIGHBOR_SCAN_STEPS = 4
 
 _OCR_NOISE_RE = re.compile(
@@ -23,6 +24,23 @@ _OCR_NOISE_RE = re.compile(
 )
 _DOT_LEADER_RE = re.compile(r"[\.。．·•…]{4,}")
 _EMPTY_TEXT_RE = re.compile(r"^[\s\-—_=·•|]+$")
+_SENTENCE_PUNCT_RE = re.compile(r"[，。；：:！？!?]")
+_SENTENCE_END_RE = re.compile(r"[。！？!?；;]$")
+_COMPANY_NAME_SPAN_RE = re.compile(
+    r"(?:(?<=^)|(?<=[\s，。；：:、()（）【】/\-]))"
+    r"([\u4e00-\u9fffA-Za-z0-9·（）()]{2,48}"
+    r"(?:有限责任公司|股份有限公司|集团有限公司|有限公司|集团公司))"
+    r"(?=$|[\s，。；：:、()（）【】/\-])"
+)
+_BODY_ACTION_HINT_RE = re.compile(
+    r"(?:负责|执行|验收|控制|检查|设置|落实|编制|实施|明确|组织|采用|进行|确保|同步|完成|开展|布置|检验|交底|巡检|报验|签认|调配|闭环|推进|整改|归档|移交|穿插|复验)"
+)
+_PROJECT_TITLE_MARKER_RE = re.compile(
+    r"(?:项目|工程|标段|厂房|楼|区改造|提升改造|前厅接待区|专项|施工组织设计|投标文件)"
+)
+_PROJECT_TITLE_CODE_RE = re.compile(
+    r"(?:[A-Z]-?\d+#|\d+#|\d{4}\s*年|\d+\s*月|C\s*\d+|[(（][A-Z0-9#\-]+[)）])"
+)
 _ANTI_BOILERPLATE_PREFIX_RE = re.compile(
     r"^(?:由(?:项目经理|技术负责人|施工员|专业工程师|安全员|项目总工|生产经理)[^，。；]{0,24}[，,；;]\s*)"
 )
@@ -88,12 +106,31 @@ def _clean_snippet(text: str, limit: int = 90) -> str:
     return s[:limit] + ("..." if len(s) > limit else "")
 
 
-def _strip_extraction_noise(text: str) -> str:
+def _strip_extraction_noise_core(text: str) -> str:
     if not text:
         return ""
     clean = re.sub(r"\[[^\]]+\]", " ", str(text))
     clean = _OCR_NOISE_RE.sub(" ", clean)
     clean = re.sub(r"\s+", " ", clean).strip()
+    clean = _strip_suspicious_english_span(clean)
+    clean = _strip_suspicious_english_tail(clean)
+    return clean
+
+
+def _strip_company_name_spans(text: str) -> str:
+    clean = str(text or "").strip()
+    if not clean:
+        return ""
+    clean = _COMPANY_NAME_SPAN_RE.sub("", clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    clean = re.sub(r"\s*([，。；：:])\s*", r"\1", clean)
+    clean = re.sub(r"[，；：:]{2,}", "，", clean)
+    return clean.strip(" ，；：:")
+
+
+def _strip_extraction_noise(text: str) -> str:
+    clean = _strip_extraction_noise_core(text)
+    clean = _strip_company_name_spans(clean)
     return clean
 
 
@@ -103,6 +140,112 @@ def _clean_original_excerpt(text: str, limit: int = SEMANTIC_EXCERPT_MAX_CHARS) 
         return ""
     clean = clean[:limit].rstrip()
     return clean
+
+
+def _strip_suspicious_english_tail(text: str) -> str:
+    clean = str(text or "").strip()
+    if not clean:
+        return ""
+    match = re.search(r"((?:\s+[A-Za-z]{1,16}){2,}\s*[A-Za-z]{1,16}:?)\s*$", clean)
+    if not match:
+        return clean
+    tail = match.group(1).strip()
+    has_colon = tail.endswith(":")
+    tokens = [token.rstrip(":") for token in tail.split() if token.rstrip(":")]
+    if _looks_like_suspicious_english_tokens(tokens, has_colon=has_colon):
+        return clean[: match.start()].rstrip()
+    return clean
+
+
+def _find_suspicious_english_span(text: str) -> Optional[re.Match[str]]:
+    clean = str(text or "").strip()
+    if not clean:
+        return None
+    pattern = r"(?:^|[\s，。；：:()（）-])((?:[A-Za-z]{1,16}\s+){2,}[A-Za-z]{1,16}:?)(?=$|[\s，。；：:()（）-])"
+    for match in re.finditer(pattern, clean):
+        span = match.group(1).strip()
+        has_colon = span.endswith(":")
+        tokens = [token.rstrip(":") for token in span.split() if token.rstrip(":")]
+        if _looks_like_suspicious_english_tokens(tokens, has_colon=has_colon):
+            return match
+    return None
+
+
+def _strip_suspicious_english_span(text: str) -> str:
+    clean = str(text or "").strip()
+    if not clean:
+        return ""
+    while True:
+        match = _find_suspicious_english_span(clean)
+        if not match:
+            break
+        start = match.start(1)
+        end = match.end(1)
+        if end < len(clean) and clean[end] in ":：":
+            end += 1
+        clean = (clean[:start] + clean[end:]).strip()
+        clean = re.sub(r"\s+", " ", clean).strip(" ，；")
+    return clean
+
+
+def _looks_like_suspicious_english_tokens(tokens: List[str], *, has_colon: bool = False) -> bool:
+    if not tokens:
+        return False
+    lower_tokens = sum(any(ch.islower() for ch in token) for token in tokens)
+    short_tokens = sum(len(token) <= 2 for token in tokens)
+    all_upper_tokens = sum(token.isupper() for token in tokens)
+    if len(tokens) >= 5:
+        return True
+    if lower_tokens >= 2 or short_tokens >= 2:
+        return True
+    if len(tokens) >= 3 and lower_tokens >= 1 and all_upper_tokens >= 1:
+        return True
+    if len(tokens) >= 3 and has_colon and lower_tokens >= 1:
+        return True
+    return False
+
+
+def _looks_like_running_title(text: str) -> bool:
+    raw_clean = _strip_extraction_noise_core(text)
+    if not raw_clean:
+        return False
+    clean = _strip_company_name_spans(raw_clean)
+    dense = re.sub(r"\s+", "", clean)
+    suspicious_english = _find_suspicious_english_span(raw_clean) is not None
+    first_clause = re.split(r"[，。；：:！？!?]", raw_clean, maxsplit=1)[0].strip()
+    if "施工组织设计" in raw_clean and not _SENTENCE_PUNCT_RE.search(raw_clean):
+        return True
+    if first_clause.endswith("施工组织设计"):
+        return True
+    if "施工组织设计" in raw_clean and suspicious_english:
+        return True
+    if re.search(r"(?:有限责任公司|股份有限公司|集团有限公司|有限公司|集团公司)\s*$", first_clause):
+        return True
+    if (
+        not _SENTENCE_PUNCT_RE.search(raw_clean)
+        and _PROJECT_TITLE_MARKER_RE.search(raw_clean)
+        and _PROJECT_TITLE_CODE_RE.search(raw_clean)
+        and not _BODY_ACTION_HINT_RE.search(raw_clean)
+    ):
+        return True
+    if clean.endswith(("投标文件", "施工方案", "专项方案")) and not _SENTENCE_PUNCT_RE.search(
+        raw_clean
+    ):
+        return len(dense) <= 40
+    return False
+
+
+def _looks_like_synthetic_evidence_excerpt(text: str) -> bool:
+    clean = _clean_original_excerpt(text, limit=320)
+    if not clean:
+        return False
+    if re.match(r"^P-[A-Z0-9-]+\s+扣分\s+\d+(?:\.\d+)?", clean):
+        return True
+    if re.search(r"得分\s+\d+(?:\.\d+)?/\d+(?:\.\d+)?；", clean) and (
+        "命中词:" in clean or "子项:" in clean or "建议补充可验证证据" in clean
+    ):
+        return True
+    return False
 
 
 def _looks_like_directory_entry(text: str) -> bool:
@@ -131,6 +274,15 @@ def _is_meaningful_original_text(text: str) -> bool:
         return False
     alnum = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", clean)
     return len(alnum) >= max(8, MIN_MEANINGFUL_ORIGINAL_TEXT_CHARS // 2)
+
+
+def _is_body_like_original_text(text: str) -> bool:
+    clean = _clean_original_excerpt(text, limit=320)
+    if not _is_meaningful_original_text(clean):
+        return False
+    if _looks_like_synthetic_evidence_excerpt(clean):
+        return False
+    return not _looks_like_running_title(clean)
 
 
 def _build_text_line_rows(text: str) -> List[Dict[str, Any]]:
@@ -169,6 +321,19 @@ def _line_is_table_like(row: Dict[str, Any]) -> bool:
     return ("|" in text) or ("\t" in text) or bool(re.search(r"\S\s{2,}\S", text))
 
 
+def _find_first_meaningful_body_index(rows: List[Dict[str, Any]]) -> int:
+    fallback_idx = -1
+    for idx, row in enumerate(rows):
+        clean = _clean_original_excerpt(row.get("text") or "", limit=320)
+        if not _is_meaningful_original_text(clean):
+            continue
+        if fallback_idx < 0:
+            fallback_idx = idx
+        if _is_body_like_original_text(clean):
+            return idx
+    return fallback_idx
+
+
 def _find_line_index_for_pos(rows: List[Dict[str, Any]], pos: int) -> int:
     if pos < 0:
         return -1
@@ -181,12 +346,33 @@ def _find_line_index_for_pos(rows: List[Dict[str, Any]], pos: int) -> int:
 
 
 def _excerpt_from_line_range(rows: List[Dict[str, Any]], start_idx: int, end_idx: int) -> str:
-    pieces = [
-        _clean_original_excerpt(rows[idx].get("text") or "", limit=SEMANTIC_EXCERPT_MAX_CHARS)
-        for idx in range(start_idx, end_idx + 1)
-        if not _line_is_blank(rows[idx])
-    ]
-    return _clean_original_excerpt(" ".join(piece for piece in pieces if piece))
+    body_pieces: List[str] = []
+    all_pieces: List[str] = []
+    for idx in range(start_idx, end_idx + 1):
+        if _line_is_blank(rows[idx]):
+            continue
+        clean = _clean_original_excerpt(
+            rows[idx].get("text") or "", limit=SEMANTIC_EXCERPT_MAX_CHARS
+        )
+        if not clean:
+            continue
+        all_pieces.append(clean)
+        if not _looks_like_running_title(clean):
+            body_pieces.append(clean)
+    return _clean_original_excerpt(" ".join(body_pieces or all_pieces))
+
+
+def _excerpt_ends_mid_clause(text: str) -> bool:
+    clean = _clean_original_excerpt(text, limit=SEMANTIC_EXCERPT_COMPLETION_MAX_CHARS).rstrip()
+    if not clean:
+        return False
+    if _SENTENCE_END_RE.search(clean):
+        return False
+    if clean.endswith(
+        ("，", "、", "：", ":", "与", "及", "并", "和", "或", "且", "/", "-", "（", "(")
+    ):
+        return True
+    return len(clean) < SEMANTIC_EXCERPT_MAX_CHARS
 
 
 def _coalesce_excerpt_around_index(rows: List[Dict[str, Any]], idx: int) -> str:
@@ -231,6 +417,16 @@ def _coalesce_excerpt_around_index(rows: List[Dict[str, Any]], idx: int) -> str:
         end_idx += 1
         if len(_excerpt_from_line_range(rows, start_idx, end_idx)) >= SEMANTIC_EXCERPT_TARGET_CHARS:
             break
+    while end_idx + 1 < len(rows):
+        excerpt = _excerpt_from_line_range(rows, start_idx, end_idx)
+        if len(
+            _clean_original_excerpt(excerpt, limit=SEMANTIC_EXCERPT_COMPLETION_MAX_CHARS)
+        ) >= SEMANTIC_EXCERPT_COMPLETION_MAX_CHARS or not _excerpt_ends_mid_clause(excerpt):
+            break
+        nxt = rows[end_idx + 1]
+        if int(nxt.get("page_no") or 0) != page_no or _line_is_blank(nxt):
+            break
+        end_idx += 1
     return _excerpt_from_line_range(rows, start_idx, end_idx)
 
 
@@ -264,20 +460,37 @@ def _resolve_semantic_excerpt(
         candidate_indexes.extend([idx + step, idx - step])
     excerpt = ""
     chosen_idx = idx
+    fallback_excerpt = ""
+    fallback_candidate_idx = idx
     for candidate in candidate_indexes:
         if candidate < 0 or candidate >= len(rows):
             continue
         candidate_excerpt = _coalesce_excerpt_around_index(rows, candidate)
-        if _is_meaningful_original_text(candidate_excerpt):
+        if not fallback_excerpt and _is_meaningful_original_text(candidate_excerpt):
+            fallback_excerpt = candidate_excerpt
+            fallback_candidate_idx = candidate
+        if _is_body_like_original_text(candidate_excerpt):
             excerpt = candidate_excerpt
             chosen_idx = candidate
             break
+    if not excerpt and fallback_excerpt:
+        excerpt = fallback_excerpt
+        chosen_idx = fallback_candidate_idx
     if not excerpt:
         clean_snippet = _clean_original_excerpt(snippet)
-        if _is_meaningful_original_text(clean_snippet):
+        if _is_body_like_original_text(clean_snippet) or _is_meaningful_original_text(
+            clean_snippet
+        ):
             excerpt = clean_snippet
         else:
             excerpt = clean_snippet
+    if not _is_meaningful_original_text(excerpt):
+        fallback_idx = _find_first_meaningful_body_index(rows)
+        if fallback_idx >= 0:
+            fallback_excerpt = _coalesce_excerpt_around_index(rows, fallback_idx)
+            if _is_meaningful_original_text(fallback_excerpt):
+                excerpt = fallback_excerpt
+                chosen_idx = fallback_idx
 
     page_no = int(rows[chosen_idx].get("page_no") or 0)
     page_hint = (
@@ -296,14 +509,14 @@ def _resolve_semantic_excerpt(
         if _line_is_blank(rows[prev_idx]):
             break
         prev_text = _clean_original_excerpt(rows[prev_idx].get("text") or "", limit=140)
-        if _is_meaningful_original_text(prev_text):
+        if _is_body_like_original_text(prev_text):
             before = prev_text
             break
     for next_idx in range(chosen_idx + 1, len(rows)):
         if _line_is_blank(rows[next_idx]):
             break
         next_text = _clean_original_excerpt(rows[next_idx].get("text") or "", limit=140)
-        if _is_meaningful_original_text(next_text):
+        if _is_body_like_original_text(next_text):
             after = next_text
             break
 
@@ -910,10 +1123,13 @@ def _shrink_generated_copy(
 
 
 def _normalize_original_text(snippet: str, *, synthetic: bool = False) -> str:
+    raw_clean = _strip_extraction_noise_core(snippet)
+    if raw_clean and _looks_like_running_title(raw_clean):
+        return ""
     clean = _clean_original_excerpt(snippet, limit=220)
-    if clean and not synthetic and _is_meaningful_original_text(clean):
+    if clean and not synthetic and _is_body_like_original_text(clean):
         return clean
-    return "当前正文未检出与该要求直接对应的有效原句，需在定位章节补设完整条款。"
+    return ""
 
 
 def _write_location(page_hint: str, chapter_hint: str) -> str:
@@ -958,7 +1174,7 @@ def _build_dimension_replacement_text(
         _materialize_template(
             _REWRITE_TEMPLATES.get(
                 dim_id,
-                "该段应明确责任岗位、执行频次、控制参数和验收动作，形成可复核的闭环表达。",
+                "责任岗位、执行频次、控制参数和验收动作明确，形成可复核的闭环表达。",
             )
         )
     ]
@@ -977,7 +1193,7 @@ def _build_dimension_insertion_guidance(
 ) -> Dict[str, str]:
     content = _DIMENSION_INSERTION_OVERRIDES.get(
         dim_id,
-        "补充一段紧凑条款，明确责任岗位、执行频次、控制参数、验收动作和记录表单，避免长篇扩写。",
+        "责任岗位、执行频次、控制参数、验收动作和记录表单明确，形成可追踪的闭环表达。",
     )
     compact = _shrink_generated_copy(content, original_text or evidence, insert_mode=True)
     location = _write_location(page_hint, chapter_hint)
@@ -990,25 +1206,12 @@ def _build_dimension_insertion_guidance(
 def _build_penalty_replacement_text(code: str, *, evidence: str, reason: str) -> str:
     content = _PENALTY_REWRITE_EXAMPLES.get(
         code,
-        "本段应明确责任岗位、执行频次、阈值参数和验收动作，形成台账留痕并闭环复验。",
+        "责任岗位、执行频次、阈值参数和验收动作明确，形成台账留痕并完成闭环复验。",
     )
     source = _normalize_original_text(evidence)
     if _is_meaningful_original_text(source):
         content = _append_targeted_fix_clause(source, content)
-    if reason and reason not in content:
-        content = content + " 同时消除触发原因中的抽象承诺或缺失字段。"
     return _shrink_generated_copy(content, evidence)
-
-
-def _resolve_direct_apply_text(
-    *,
-    write_mode: str,
-    replacement_text: str = "",
-    insertion_content: str = "",
-) -> str:
-    if _safe_str(write_mode) == "insert":
-        return _safe_str(insertion_content)
-    return _safe_str(replacement_text)
 
 
 def _recommendation_requires_insertion(evidence_row: Dict[str, Any], evidence: str) -> bool:
@@ -1017,9 +1220,7 @@ def _recommendation_requires_insertion(evidence_row: Dict[str, Any], evidence: s
     clean = _safe_str(evidence_row.get("original_text") or evidence)
     if not clean:
         return True
-    if clean.startswith("当前正文未检出"):
-        return True
-    if not _is_meaningful_original_text(clean):
+    if not _is_body_like_original_text(clean):
         return True
     return "建议补充可验证证据" in clean
 
@@ -1039,7 +1240,7 @@ _DIM_PAGE_KEYWORDS = {
     "12": ["总体施工", "施工工艺"],
     "13": ["物资", "设备配置"],
     "14": ["设计协调", "深化设计"],
-    "15": ["总体配置", "实施计划"],
+    "15": ["总体配置", "实施计划", "资源风险", "资源调配", "资源风险与调配"],
     "16": ["技术措施", "可行性", "落地"],
 }
 
@@ -1148,14 +1349,9 @@ def _fallback_dimension_evidence(
             text=text,
             markers=markers,
         )
-    if text:
-        idx = 0
-        return _build_evidence_row(
-            snippet=_snippet_by_pos(text, idx),
-            locator="char:0-1",
-            text=text,
-            markers=markers,
-        )
+    single_page_body = _fallback_single_page_body_evidence(text, markers)
+    if single_page_body:
+        return single_page_body
     synthetic = _synthesize_dimension_snippet(dim_id, dim_row or {})
     return {
         "snippet": synthetic,
@@ -1183,6 +1379,29 @@ def _reason_tokens(reason: str) -> List[str]:
     return dedup[:8]
 
 
+def _fallback_single_page_body_evidence(
+    text: str, markers: List[Tuple[int, int]]
+) -> Dict[str, str]:
+    rows = _build_text_line_rows(text)
+    if not rows:
+        return {}
+    page_nos = {int(row.get("page_no") or 0) for row in rows if not _line_is_blank(row)}
+    if len(page_nos) > 1:
+        return {}
+    body_idx = _find_first_meaningful_body_index(rows)
+    if body_idx < 0:
+        return {}
+    row = rows[body_idx]
+    start = int(row.get("start") or 0)
+    end = int(row.get("end") or max(start + 1, 1))
+    return _build_evidence_row(
+        snippet=_safe_str(row.get("text")),
+        locator=f"char:{start}-{max(start + 1, end)}",
+        text=text,
+        markers=markers,
+    )
+
+
 def _fallback_penalty_evidence(
     penalty: Dict[str, Any], text: str, markers: List[Tuple[int, int]]
 ) -> Dict[str, str]:
@@ -1199,14 +1418,9 @@ def _fallback_penalty_evidence(
             text=text,
             markers=markers,
         )
-    if text:
-        idx = 0
-        return _build_evidence_row(
-            snippet=_snippet_by_pos(text, idx),
-            locator="char:0-1",
-            text=text,
-            markers=markers,
-        )
+    single_page_body = _fallback_single_page_body_evidence(text, markers)
+    if single_page_body:
+        return single_page_body
     synthetic = _synthesize_penalty_snippet(penalty)
     return {
         "snippet": synthetic,
@@ -1238,9 +1452,22 @@ def _guess_dimension_page_hint(
         idx = text.find(kw)
         if idx >= 0:
             return _position_to_page(idx, text, markers)
-    if text:
-        return _position_to_page(0, text, markers)
     return "页码未知"
+
+
+def _page_hint_sort_key(page_hint: str) -> Tuple[int, int]:
+    hint = _safe_str(page_hint)
+    if not hint:
+        return (2, 10**9)
+    if hint == "全篇复核":
+        return (1, 10**9 - 1)
+    match = re.search(r"第\s*(\d+)\s*页", hint)
+    if match:
+        return (0, int(match.group(1)))
+    match = re.search(r"约第\s*(\d+)\s*页", hint)
+    if match:
+        return (0, int(match.group(1)))
+    return (2, 10**9)
 
 
 def _build_submission_optimization_cards(
@@ -1382,11 +1609,6 @@ def _build_submission_optimization_cards(
                         if write_mode == "insert"
                         else replace_text
                     ),
-                    "direct_apply_text": _resolve_direct_apply_text(
-                        write_mode=write_mode,
-                        replacement_text=replace_text,
-                        insertion_content=insertion_bundle["insertion_content"],
-                    ),
                     "insertion_guidance": (
                         insertion_bundle["insertion_guidance"] if write_mode == "insert" else ""
                     ),
@@ -1468,11 +1690,6 @@ def _build_submission_optimization_cards(
                         evidence=original_text or evidence_snippet,
                         reason=reason,
                     ),
-                    "direct_apply_text": _build_penalty_replacement_text(
-                        code,
-                        evidence=original_text or evidence_snippet,
-                        reason=reason,
-                    ),
                     "insertion_guidance": "",
                     "insertion_content": "",
                     "before_after_example": _build_penalty_before_after_example(
@@ -1517,7 +1734,6 @@ def _build_submission_optimization_cards(
                     "write_mode_label": "原句替换",
                     "original_text": "建议做术语一致性与阈值口径复核。",
                     "replacement_text": "统一术语、关键参数和验收动作的口径，并在目录与对应章节同步标注复核结果。",
-                    "direct_apply_text": "统一术语、关键参数和验收动作的口径，并在目录与对应章节同步标注复核结果。",
                     "insertion_guidance": "",
                     "insertion_content": "",
                     "before_after_example": "\n".join(
@@ -1575,6 +1791,16 @@ def _build_submission_optimization_cards(
             else:
                 level = "P3"
             r["priority"] = level
+            r["_priority_rank"] = idx
+
+        recommendations.sort(
+            key=lambda x: (
+                _page_hint_sort_key(_safe_str(x.get("page_hint"))),
+                _safe_float(x.get("_priority_rank"), 10**9),
+            )
+        )
+        for r in recommendations:
+            r.pop("_priority_rank", None)
 
         cards.append(
             {

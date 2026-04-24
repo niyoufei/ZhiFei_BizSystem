@@ -532,17 +532,9 @@ def test_compare_optimization_card_exposes_replace_and_insert_payloads():
     replace_row = next((r for r in recs if r.get("write_mode") == "replace"), {})
     assert "补充以下完整内容" in str(insert_row.get("insertion_guidance") or "")
     assert str(insert_row.get("replacement_text") or "").strip()
-    assert (
-        str(insert_row.get("direct_apply_text") or "").strip()
-        == str(insert_row.get("insertion_content") or "").strip()
-    )
-    assert str(insert_row.get("original_text") or "").strip()
+    assert not str(insert_row.get("original_text") or "").strip()
     assert replace_row.get("write_mode_label") == "原句替换"
     assert str(replace_row.get("replacement_text") or "").strip()
-    assert (
-        str(replace_row.get("direct_apply_text") or "").strip()
-        == str(replace_row.get("replacement_text") or "").strip()
-    )
     assert not str(replace_row.get("layout_constraint") or "").strip()
 
 
@@ -580,12 +572,21 @@ def test_compare_replacement_text_keeps_original_semantic_anchor():
 def test_compare_optimization_original_text_strips_extraction_markers():
     cleaned = _normalize_original_text(
         "[PDF_BACKEND:pymupdf] [PAGE_OCR_MODE:1] gray_2x:psm11 score=6.9921 "
-        "[PAGE_OCR:1] 塘岗中心老旧小区改造工程施工组织设计"
+        "[PAGE_OCR:1] 质量控制点按检查频次、责任人和验收记录闭环执行。"
     )
 
     assert "[PDF_BACKEND" not in cleaned
     assert "gray_2x:psm11" not in cleaned
-    assert "塘岗中心老旧小区改造工程施工组织设计" in cleaned
+    assert "质量控制点按检查频次、责任人和验收记录闭环执行。" in cleaned
+
+
+def test_compare_optimization_original_text_rejects_title_line_even_with_appended_clause():
+    cleaned = _normalize_original_text(
+        "合肥高新区集成电路标准化厂房二期 C-7#、C-8#厂房提升改造项目 施工组织设计 "
+        "ead OARS SRM Secreted y My，并补充应用场景、实施步骤、控制参数。"
+    )
+
+    assert cleaned == ""
 
 
 def test_build_evidence_row_expands_short_keyword_to_semantic_excerpt():
@@ -629,6 +630,92 @@ def test_build_evidence_row_rejects_directory_like_snippet():
     assert "........" not in original
     assert len(original) >= 15
     assert "分区推进" in original
+
+
+def test_build_evidence_row_skips_running_title_and_english_artifact_tail():
+    text = (
+        "[PAGE:1]\n"
+        "合肥高新区集成电路标准化厂房二期 C-7#、C-8#厂房提升改造项目 施工组织设计 ead OARS "
+        "SRM Secreted y My\n"
+        "质量控制点、检查频次、责任人和验收记录闭环执行，隐蔽工程完成后立即报验签认。\n"
+    )
+    pos = text.find("质量控制点")
+
+    row = _build_evidence_row(
+        snippet="质量控制点",
+        locator=f"char:{pos}-{pos + 5}",
+        text=text,
+        markers=_build_page_markers(text),
+    )
+
+    original = str(row.get("original_text") or "")
+    assert "ead OARS SRM Secreted y My" not in original
+    assert "施工组织设计" not in original
+    assert "质量控制点" in original
+    assert "隐蔽工程完成后立即报验签认" in original
+
+
+def test_build_evidence_row_prefers_body_text_over_project_title_line():
+    text = (
+        "[PAGE:1]\n"
+        "合肥高新区集成电路标准化厂房二期 C-7#、(C-8#厂)房提升改造项目 C 8前厅接待区改造将来 2026 年4月\n"
+        "施工流程穿插与移交明确前置条件、可穿插工序、禁止交叉情形、移交条件和对应记录表单。\n"
+    )
+    pos = text.find("合肥高新区")
+
+    row = _build_evidence_row(
+        snippet="合肥高新区",
+        locator=f"char:{pos}-{pos + 5}",
+        text=text,
+        markers=_build_page_markers(text),
+    )
+
+    original = str(row.get("original_text") or "")
+    assert "合肥高新区集成电路标准化厂房二期" not in original
+    assert "施工流程穿插与移交明确前置条件" in original
+    assert "移交条件和对应记录表单" in original
+
+
+def test_compare_optimization_original_text_strips_three_token_ocr_english_noise():
+    cleaned = _normalize_original_text(
+        "合肥高新区集成电路标准化厂房二期 C-7#、C-8#厂房提升改造项目 "
+        "ead OARS RGA: C 8#厂房接待区改造将来。"
+    )
+
+    assert "ead OARS RGA" not in cleaned
+    assert "C 8#厂房接待区改造将来" in cleaned
+
+
+def test_compare_optimization_original_text_rejects_bidder_company_title_line():
+    sample = (
+        "合肥高新区集成电路标准化厂房二期 C-7#、C-8#厂房提升改造项目 "
+        "C 8前厅接待区改造将来 中明建投建设集团有限责任公司"
+    )
+
+    cleaned = _normalize_original_text(sample)
+
+    assert cleaned == ""
+
+
+def test_build_evidence_row_extends_incomplete_clause_to_next_line():
+    text = (
+        "[PAGE:9]\n"
+        "竣工验收交付阶段 第121天—第130天(历时) 1.专项验收闭环:全力推进消防验收与整改闭环"
+        "(此为交付核心前置条件)。 2.工程资料归档:同步开展竣工图绘制与\n"
+        "并施工流程穿插与移交明确前置条件、可穿插工序、禁止交叉情形、移交条件和对应记录表单。\n"
+    )
+    pos = text.find("工程资料归档")
+
+    row = _build_evidence_row(
+        snippet="工程资料归档",
+        locator=f"char:{pos}-{pos + 6}",
+        text=text,
+        markers=_build_page_markers(text),
+    )
+
+    original = str(row.get("original_text") or "")
+    assert "同步开展竣工图绘制与" in original
+    assert "移交条件和对应记录表单" in original
 
 
 def test_compare_optimization_card_carries_material_gate_summary():
@@ -723,3 +810,89 @@ def test_compare_still_generates_synthetic_evidence_without_text():
     recs = low_card.get("recommendations") or []
     assert recs
     assert all("未提取到证据片段" not in str(r.get("evidence") or "") for r in recs[:3])
+
+
+def test_compare_submission_card_recommendations_are_sorted_by_page_hint():
+    text_low = (
+        "[PAGE:1]\n"
+        "四新技术应用应明确应用场景、实施步骤和验收标准。\n"
+        "[PAGE:6]\n"
+        "资源风险与调配明确触发阈值、责任岗位和补充时限。\n"
+        "[PAGE:17]\n"
+        "人力资源配置设置项目经理、技术负责人和专业施工班组。\n"
+    )
+    submissions = [
+        {
+            "id": "s-low",
+            "filename": "低分稿.pdf",
+            "total_score": 60.0,
+            "text": text_low,
+            "report": {
+                "dimension_scores": {
+                    "05": {"score": 2.0},
+                    "11": {"score": 1.5},
+                    "15": {"score": 1.0},
+                },
+                "penalties": [],
+            },
+        },
+        {
+            "id": "s-high",
+            "filename": "高分稿.pdf",
+            "total_score": 88.0,
+            "text": "[PAGE:1]\n高分稿正文。\n",
+            "report": {
+                "dimension_scores": {
+                    "05": {"score": 8.5},
+                    "11": {"score": 8.0},
+                    "15": {"score": 8.5},
+                },
+                "penalties": [],
+            },
+        },
+    ]
+
+    result = build_compare_narrative(submissions)
+    cards = result.get("submission_optimization_cards") or []
+    low_card = next((c for c in cards if c.get("submission_id") == "s-low"), {})
+    recs = low_card.get("recommendations") or []
+
+    page_hints = [str(r.get("page_hint") or "") for r in recs[:3]]
+    assert page_hints == ["第1页", "第6页", "第17页"]
+
+
+def test_compare_submission_card_without_reliable_anchor_does_not_fallback_to_first_page():
+    text_low = (
+        "[PAGE:1]\n"
+        "合肥高新区集成电路标准化厂房二期 C-7#、(C-8#厂)房提升改造项目 C 8前厅接待区改造将来 2026 年4月\n"
+        "[PAGE:6]\n"
+        "真正正文：该条款明确触发阈值、责任岗位和补充时限。\n"
+    )
+    submissions = [
+        {
+            "id": "s-low",
+            "filename": "低分稿.pdf",
+            "total_score": 60.0,
+            "text": text_low,
+            "report": {
+                "dimension_scores": {"15": {"score": 2.0}},
+                "penalties": [],
+            },
+        },
+        {
+            "id": "s-high",
+            "filename": "高分稿.pdf",
+            "total_score": 88.0,
+            "text": "[PAGE:1]\n高分稿正文。\n",
+            "report": {"dimension_scores": {"15": {"score": 8.5}}, "penalties": []},
+        },
+    ]
+
+    result = build_compare_narrative(submissions)
+    cards = result.get("submission_optimization_cards") or []
+    low_card = next((c for c in cards if c.get("submission_id") == "s-low"), {})
+    recs = low_card.get("recommendations") or []
+    dim15 = next((r for r in recs if r.get("dimension") == "15"), {})
+
+    assert dim15.get("page_hint") == "页码未知"
+    assert not str(dim15.get("original_text") or "").strip()
