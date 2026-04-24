@@ -145,6 +145,424 @@ def _score_dim_candidates(text: str, seeds: Dict[str, List[str]]) -> List[Dict[s
                 score += 1.0
         if score > 0:
             hit_scores.append((dim_id, score))
+    info_primary_signals = [
+        "智慧工地",
+        "信息化管理",
+        "数字化管理",
+        "数字化信息化管理",
+    ]
+    info_operational_signals = [
+        "在线监测",
+        "远程监管",
+        "远程查阅",
+        "数字化闭环",
+        "轨迹监控",
+        "轨迹",
+        "人脸识别",
+        "联网",
+        "北斗",
+        "gps",
+        "cctv",
+        "数字影像档案",
+        "实时监控",
+    ]
+    has_info_primary = any(signal.lower() in lower for signal in info_primary_signals)
+    info_operational_hits = sum(1 for signal in info_operational_signals if signal.lower() in lower)
+    if has_info_primary and info_operational_hits >= 2:
+        score_map = {dim_id: score for dim_id, score in hit_scores}
+        score_map["16"] = max(
+            float(score_map.get("16", 0.0)),
+            2.0 + min(1.5, 0.25 * info_operational_hits),
+        )
+        hit_scores = list(score_map.items())
+    civil_primary_signals = [
+        "文明施工",
+        "绿色工地",
+        "绿色环保",
+        "环保标准",
+        "扬尘治理",
+        "黄土不见天",
+        "黄土 不见天",
+        "裸土覆盖",
+        "裸土网格化覆盖",
+        "专职环保员",
+    ]
+    civil_operational_signals = [
+        "喷淋",
+        "微雾喷淋",
+        "冲洗",
+        "洗车台",
+        "雾炮",
+        "pm2.5",
+        "pm10",
+        "环境监测",
+        "防尘网",
+        "密闭清运",
+        "三级沉淀池",
+        "环保巡查",
+        "裸土覆盖",
+    ]
+    civil_primary_hits = sum(1 for signal in civil_primary_signals if signal.lower() in lower)
+    civil_operational_hits = sum(
+        1 for signal in civil_operational_signals if signal.lower() in lower
+    )
+    if (
+        civil_primary_hits >= 1
+        and civil_operational_hits >= 2
+        and not (has_info_primary and info_operational_hits >= 3)
+    ):
+        score_map = {dim_id: score for dim_id, score in hit_scores}
+        score_map["03"] = max(
+            float(score_map.get("03", 0.0)),
+            3.0
+            + min(
+                1.5,
+                0.25 * civil_primary_hits + 0.2 * civil_operational_hits,
+            ),
+        )
+        hit_scores = list(score_map.items())
+    newtech_primary_signals = [
+        "四新",
+        "新技术",
+        "新工艺",
+        "新材料",
+        "新设备",
+    ]
+    newtech_structural_signals = [
+        "应用部位",
+        "核心技术",
+        "应用成效",
+        "实施参数",
+        "验证方式",
+        "管控要点",
+    ]
+    has_newtech_primary = any(signal.lower() in lower for signal in newtech_primary_signals)
+    newtech_structural_hits = sum(
+        1 for signal in newtech_structural_signals if signal.lower() in lower
+    )
+    if has_newtech_primary and newtech_structural_hits >= 2:
+        score_map = {dim_id: score for dim_id, score in hit_scores}
+        score_map["05"] = max(
+            float(score_map.get("05", 0.0)),
+            2.0 + min(1.5, 0.25 * newtech_structural_hits),
+        )
+        hit_scores = list(score_map.items())
+    material_subject_signals = [
+        "管材",
+        "材料",
+        "部品",
+        "厂家",
+        "供应商",
+    ]
+    material_process_signals = [
+        "驻厂监造",
+        "监造",
+        "封样",
+        "源头封样",
+        "进场",
+        "抽检",
+        "破坏抽检",
+        "第三方送检",
+        "送检",
+        "第三方检测",
+        "复验",
+        "批次",
+        "追溯",
+    ]
+    has_material_subject = any(signal.lower() in lower for signal in material_subject_signals)
+    material_process_hits = sum(1 for signal in material_process_signals if signal.lower() in lower)
+    if has_material_subject and material_process_hits >= 3:
+        score_map = {dim_id: score for dim_id, score in hit_scores}
+        score_map["04"] = max(
+            float(score_map.get("04", 0.0)),
+            2.0 + min(1.5, 0.2 * material_process_hits),
+        )
+        hit_scores = list(score_map.items())
+    safety_cert_primary_signals = [
+        "特殊工种",
+        "特种作业",
+        "持证上岗",
+    ]
+    safety_disclosure_signals = [
+        "技术交底",
+        "工艺交底",
+        "技术与工艺交底",
+    ]
+    frontline_coverage_signals = [
+        "覆盖至一线",
+        "覆盖到一线",
+        "一线作业",
+        "一线作业终端",
+    ]
+    has_safety_cert_primary = any(signal.lower() in lower for signal in safety_cert_primary_signals)
+    has_safety_disclosure = any(signal.lower() in lower for signal in safety_disclosure_signals)
+    has_frontline_coverage = any(signal.lower() in lower for signal in frontline_coverage_signals)
+    if has_safety_cert_primary and has_safety_disclosure and has_frontline_coverage:
+        score_map = {dim_id: score for dim_id, score in hit_scores}
+        score_map["02"] = max(float(score_map.get("02", 0.0)), 3.2)
+        hit_scores = list(score_map.items())
+    risk_primary_signals = [
+        "危大工程",
+        "专项方案",
+        "专家论证",
+        "监测预警",
+    ]
+    risk_operational_signals = [
+        "高危节点",
+        "风险极大",
+        "前置审批",
+        "预警阈值",
+        "暂停施工作业",
+        "停工",
+        "复工",
+        "排查",
+        "方案未批复",
+        "严禁施工",
+        "自动化监测",
+    ]
+    has_risk_primary = any(signal.lower() in lower for signal in risk_primary_signals)
+    risk_operational_hits = sum(1 for signal in risk_operational_signals if signal.lower() in lower)
+    if has_risk_primary and risk_operational_hits >= 2:
+        score_map = {dim_id: score for dim_id, score in hit_scores}
+        score_map["07"] = max(
+            float(score_map.get("07", 0.0)),
+            2.0 + min(1.5, 0.25 * risk_operational_hits),
+        )
+        hit_scores = list(score_map.items())
+    quality_primary_signals = [
+        "质量保障体系",
+        "质量管理体系",
+        "质量总监",
+        "质检部",
+    ]
+    quality_control_signals = [
+        "一票否决",
+        "停工整改",
+        "整改闭环",
+        "闭环整改",
+        "质量闭环",
+        "质量终身责任制",
+    ]
+    has_quality_primary = any(signal.lower() in lower for signal in quality_primary_signals)
+    quality_control_hits = sum(1 for signal in quality_control_signals if signal.lower() in lower)
+    if has_quality_primary and quality_control_hits >= 2:
+        score_map = {dim_id: score for dim_id, score in hit_scores}
+        score_map["08"] = max(
+            float(score_map.get("08", 0.0)),
+            2.0 + min(1.5, 0.25 * quality_control_hits),
+        )
+        hit_scores = list(score_map.items())
+    quality_sample_primary_signals = [
+        "样板首件制",
+        "首件制",
+    ]
+    quality_sample_operational_signals = [
+        "核心工序",
+        "交验",
+    ]
+    has_quality_sample_primary = any(
+        signal.lower() in lower for signal in quality_sample_primary_signals
+    )
+    quality_sample_operational_hits = sum(
+        1 for signal in quality_sample_operational_signals if signal.lower() in lower
+    )
+    if has_quality_sample_primary and quality_sample_operational_hits >= 1:
+        score_map = {dim_id: score for dim_id, score in hit_scores}
+        score_map["08"] = max(
+            float(score_map.get("08", 0.0)),
+            3.0 + min(1.0, 0.5 * quality_sample_operational_hits),
+        )
+        hit_scores = list(score_map.items())
+    resource_primary_signals = [
+        "资源配置",
+        "资源保障",
+        "生产要素",
+        "资源调配",
+        "高峰保障",
+        "后备资源",
+        "资源蓄水池",
+        "资源池",
+    ]
+    resource_operational_signals = [
+        "触发",
+        "预警",
+        "报警",
+        "调配",
+        "增援",
+        "完成时限",
+        "批准",
+        "高峰",
+        "缺口",
+        "故障",
+        "延误",
+        "抢工",
+        "倒班",
+    ]
+    has_resource_primary = any(signal.lower() in lower for signal in resource_primary_signals)
+    resource_operational_hits = sum(
+        1 for signal in resource_operational_signals if signal.lower() in lower
+    )
+    if has_resource_primary and resource_operational_hits >= 2:
+        score_map = {dim_id: score for dim_id, score in hit_scores}
+        score_map["15"] = max(
+            float(score_map.get("15", 0.0)),
+            2.0 + min(1.5, 0.25 * resource_operational_hits),
+        )
+        hit_scores = list(score_map.items())
+    schedule_primary_signals = [
+        "总进度计划",
+        "施工进度计划",
+        "工期目标",
+        "工期保障体系",
+        "关键线路",
+        "里程碑",
+        "节点工期",
+    ]
+    schedule_operational_signals = [
+        "动态纠偏",
+        "三级预警",
+        "前锋线",
+        "倒排",
+        "赶工",
+        "分段验收移交",
+        "节点攻坚",
+        "月度滚动计划",
+        "周作业计划",
+        "日排班计划",
+        "四级计划",
+    ]
+    schedule_primary_hits = sum(1 for signal in schedule_primary_signals if signal.lower() in lower)
+    schedule_operational_hits = sum(
+        1 for signal in schedule_operational_signals if signal.lower() in lower
+    )
+    if schedule_primary_hits >= 2 or (
+        schedule_primary_hits >= 1 and schedule_operational_hits >= 2
+    ):
+        score_map = {dim_id: score for dim_id, score in hit_scores}
+        score_map["09"] = max(
+            float(score_map.get("09", 0.0)),
+            2.0
+            + min(
+                1.5,
+                0.35 * schedule_primary_hits + 0.2 * schedule_operational_hits,
+            ),
+        )
+        hit_scores = list(score_map.items())
+    design_primary_signals = [
+        "图纸会审",
+        "联合会审",
+        "深化设计",
+        "设计协调",
+        "bim",
+    ]
+    design_operational_signals = [
+        "碰撞",
+        "碰撞检测",
+        "防碰撞",
+        "冲突点",
+        "避让",
+        "迁改",
+        "标高",
+        "走向",
+        "预留预埋",
+        "关闭条件",
+        "复核签认",
+        "问题关闭",
+        "会审",
+    ]
+    has_design_primary = any(signal.lower() in lower for signal in design_primary_signals)
+    design_operational_hits = sum(
+        1 for signal in design_operational_signals if signal.lower() in lower
+    )
+    if has_design_primary and design_operational_hits >= 2:
+        score_map = {dim_id: score for dim_id, score in hit_scores}
+        score_map["14"] = max(
+            float(score_map.get("14", 0.0)),
+            2.0 + min(1.5, 0.25 * design_operational_hits),
+        )
+        hit_scores = list(score_map.items())
+    process_primary_signals = [
+        "施工顺序",
+        "流水段",
+        "流水步距",
+        "工序衔接",
+        "流程衔接",
+        "作业面移交",
+        "立体穿插",
+    ]
+    process_operational_signals = [
+        "前置",
+        "方可",
+        "移交",
+        "转场",
+        "分段",
+        "作业面",
+        "封闭后",
+        "多工作面",
+        "穿插",
+        "优先",
+        "交接",
+        "并行",
+        "平移转场",
+    ]
+    has_process_primary = any(signal.lower() in lower for signal in process_primary_signals)
+    process_operational_hits = sum(
+        1 for signal in process_operational_signals if signal.lower() in lower
+    )
+    if has_process_primary and process_operational_hits >= 2:
+        score_map = {dim_id: score for dim_id, score in hit_scores}
+        score_map["12"] = max(
+            float(score_map.get("12", 0.0)),
+            2.0 + min(1.5, 0.25 * process_operational_hits),
+        )
+        hit_scores = list(score_map.items())
+    equipment_primary_signals = [
+        "机柜",
+        "起重机械",
+        "设备运行状态",
+        "防护等级",
+        "法兰盘",
+        "预埋件",
+        "检验合格报告",
+        "维保",
+    ]
+    equipment_operational_signals = [
+        "进场",
+        "检验合格",
+        "吊装前",
+        "钢丝绳",
+        "吊钩",
+        "制动器",
+        "巡检",
+        "故障",
+        "响应",
+        "替补",
+        "停机",
+        "ip55",
+        "镀锌钢板",
+        "法兰盘",
+        "预埋件",
+    ]
+    personnel_cert_signals = [
+        "司机",
+        "司索",
+        "信号工",
+        "持证上岗",
+        "无证",
+        "特种作业",
+    ]
+    has_equipment_primary = any(signal.lower() in lower for signal in equipment_primary_signals)
+    equipment_operational_hits = sum(
+        1 for signal in equipment_operational_signals if signal.lower() in lower
+    )
+    has_personnel_cert_signal = any(signal.lower() in lower for signal in personnel_cert_signals)
+    if has_equipment_primary and equipment_operational_hits >= 2 and not has_personnel_cert_signal:
+        score_map = {dim_id: score for dim_id, score in hit_scores}
+        score_map["13"] = max(
+            float(score_map.get("13", 0.0)),
+            2.0 + min(1.5, 0.25 * equipment_operational_hits),
+        )
+        hit_scores = list(score_map.items())
     if not hit_scores:
         return [
             {"dimension_id": "01", "confidence": 0.34},
