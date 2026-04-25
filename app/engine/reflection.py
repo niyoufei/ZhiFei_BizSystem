@@ -148,6 +148,7 @@ def build_calibration_samples(
     latest_reports_by_submission: Dict[str, Dict[str, Any]],
     latest_qingtian_by_submission: Dict[str, Dict[str, Any]],
     submissions_by_id: Dict[str, Dict[str, Any]],
+    project: Dict[str, Any] | None = None,
 ) -> List[Dict[str, Any]]:
     samples: List[Dict[str, Any]] = []
     for submission_id, report in latest_reports_by_submission.items():
@@ -156,7 +157,11 @@ def build_calibration_samples(
         if not qtr or not sub:
             continue
         row = build_feature_row(
-            report, submission=sub, qingtian_result=qtr, feature_schema_version="v2"
+            report,
+            submission=sub,
+            project=project,
+            qingtian_result=qtr,
+            feature_schema_version="v2",
         )
         if row.get("y_label") is None:
             continue

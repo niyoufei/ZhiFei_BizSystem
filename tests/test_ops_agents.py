@@ -195,6 +195,7 @@ def test_run_ops_agents_cycle_short_circuit_on_sre_fail(monkeypatch):
     assert result["agents"]["scoring_quality"]["status"] == "fail"
     assert result["agents"]["evolution"]["status"] == "fail"
     assert result["agents"]["learning_calibration"]["status"] == "fail"
+    assert "triage" in result
 
 
 def test_run_ops_agents_cycle_warn_from_sub_agents(monkeypatch):
@@ -656,13 +657,15 @@ def test_run_ops_agents_cycle_retries_smoke_after_restart(monkeypatch, tmp_path:
     monkeypatch.setattr(
         oa,
         "_run_restart_command",
-        lambda restart_cmd: restart_calls.__setitem__("count", restart_calls["count"] + 1)
-        or {
-            "attempted": True,
-            "ok": True,
-            "returncode": 0,
-            "error": None,
-        },
+        lambda restart_cmd: (
+            restart_calls.__setitem__("count", restart_calls["count"] + 1)
+            or {
+                "attempted": True,
+                "ok": True,
+                "returncode": 0,
+                "error": None,
+            }
+        ),
     )
 
     result = oa.run_ops_agents_cycle(base_url="http://127.0.0.1:8000", max_workers=2)
@@ -817,13 +820,15 @@ def test_run_ops_agents_cycle_skips_smoke_restart_during_cooldown(
     monkeypatch.setattr(
         oa,
         "_run_restart_command",
-        lambda restart_cmd: restart_calls.__setitem__("count", restart_calls["count"] + 1)
-        or {
-            "attempted": True,
-            "ok": True,
-            "returncode": 0,
-            "error": None,
-        },
+        lambda restart_cmd: (
+            restart_calls.__setitem__("count", restart_calls["count"] + 1)
+            or {
+                "attempted": True,
+                "ok": True,
+                "returncode": 0,
+                "error": None,
+            }
+        ),
     )
 
     result = oa.run_ops_agents_cycle(base_url="http://127.0.0.1:8000", max_workers=2)
@@ -1731,7 +1736,7 @@ def test_learning_calibration_agent_warns_when_llm_pool_is_degraded():
     assert result["status"] == "warn"
     assert result["metrics"]["llm_provider_degraded_count"] == 1
     assert result["metrics"]["llm_fallback_unavailable_count"] == 0
-    assert any("provider 当前处于 cooldown" in row for row in result["recommendations"])
+    assert any("服务提供方当前处于冷却期" in row for row in result["recommendations"])
 
 
 def test_learning_calibration_agent_warns_when_llm_account_pool_is_thin():
@@ -1817,7 +1822,7 @@ def test_learning_calibration_agent_warns_when_llm_account_pool_is_thin():
     assert result["status"] == "warn"
     assert result["metrics"]["llm_account_cooldown_count"] == 3
     assert result["metrics"]["llm_provider_thin_pool_count"] == 1
-    assert any("当前共有 3 个 LLM 账号处于 cooldown" in row for row in result["recommendations"])
+    assert any("当前共有 3 个 LLM 账号处于冷却期" in row for row in result["recommendations"])
     assert any("仅剩 1 个健康账号" in row for row in result["recommendations"])
 
 
@@ -3315,7 +3320,7 @@ def test_ops_agents_history_entry_prefers_manual_confirmation_recommendation():
             }
         ],
         learning_recommendations=[
-            "有 2 个 provider 的账号池历史质量分偏低，系统会优先避开弱 key，但建议继续补强冗余账号。",
+            "有 2 个服务提供方的账号池历史质量分偏低，系统会优先避开弱账号，但建议继续补强冗余账号。",
             "有 1 个项目的自动学习结论仍需人工确认，建议优先处理待审核项。",
         ],
         recommendations=[
@@ -3345,7 +3350,7 @@ def test_ops_agents_history_entry_prefers_low_quality_pool_recommendation():
         },
         learning_recommendations=[
             "建议继续处理待审核项。",
-            "有 2 个 provider 的账号池历史质量分偏低，系统会优先避开弱 key，但建议继续补强冗余账号。",
+            "有 2 个服务提供方的账号池历史质量分偏低，系统会优先避开弱账号，但建议继续补强冗余账号。",
         ],
         recommendations=[
             "建议继续观察巡检趋势。",
@@ -3358,7 +3363,7 @@ def test_ops_agents_history_entry_prefers_low_quality_pool_recommendation():
     assert result["quality_reason_label"] == "LLM 账号池质量偏低"
     assert (
         result["top_recommendation"]
-        == "有 2 个 provider 的账号池历史质量分偏低，系统会优先避开弱 key，但建议继续补强冗余账号。"
+        == "有 2 个服务提供方的账号池历史质量分偏低，系统会优先避开弱账号，但建议继续补强冗余账号。"
     )
 
 

@@ -10,7 +10,8 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib import error, request
 from urllib.parse import urlparse
 
-from app.storage import load_json, save_json
+from app.application.storage_access import StorageAccess
+from app.bootstrap.storage import get_storage_access
 
 OPS_AUDIT_PREPARATION_STATUSES = {"scoring_preparation", "draft", "created"}
 OPS_AUDIT_SYNTHETIC_PREFIXES = ("ops_", "ops招标项目_", "e2e_")
@@ -46,6 +47,14 @@ OPS_AGENT_DEFAULT_INTERVAL_SECONDS = 60.0
 OPS_AGENT_STALE_GRACE_SECONDS = 90.0
 OPS_LOCAL_READ_RETRY_ATTEMPTS = 2
 OPS_LOCAL_READ_RETRY_DELAY_SECONDS = 0.2
+
+
+def load_json(path: Path | str, default: Any) -> Any:
+    return get_storage_access().load_json(path, default)
+
+
+def save_json(path: Path | str, payload: Any) -> None:
+    get_storage_access().save_json(path, payload)
 
 
 def _now_iso() -> str:
@@ -524,10 +533,16 @@ def _run_restart_command(restart_cmd: List[str]) -> Dict[str, Any]:
     return result
 
 
-def _load_smoke_runtime_retry_state(path: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
+def _load_smoke_runtime_retry_state(
+    path: Optional[Path] = None,
+    *,
+    storage: StorageAccess | None = None,
+) -> Dict[str, Dict[str, Any]]:
     retry_path = path or OPS_SMOKE_RUNTIME_RETRY_STATE_PATH
     try:
-        payload = load_json(retry_path, {})
+        payload = (
+            storage.load_json(retry_path, {}) if storage is not None else load_json(retry_path, {})
+        )
     except Exception:
         return {}
     if not isinstance(payload, dict):
@@ -542,8 +557,13 @@ def _load_smoke_runtime_retry_state(path: Optional[Path] = None) -> Dict[str, Di
 def _save_smoke_runtime_retry_state(
     state: Dict[str, Dict[str, Any]],
     path: Optional[Path] = None,
+    *,
+    storage: StorageAccess | None = None,
 ) -> None:
     retry_path = path or OPS_SMOKE_RUNTIME_RETRY_STATE_PATH
+    if storage is not None:
+        storage.save_json(retry_path, state)
+        return
     save_json(retry_path, state)
 
 
@@ -553,8 +573,9 @@ def _smoke_runtime_retry_cooldown_remaining(
     cooldown_seconds: float,
     path: Optional[Path] = None,
     now: Optional[datetime] = None,
+    storage: StorageAccess | None = None,
 ) -> float:
-    state = _load_smoke_runtime_retry_state(path)
+    state = _load_smoke_runtime_retry_state(path, storage=storage)
     item = state.get(str(name or "").strip()) or {}
     attempted_at = _parse_iso_datetime(item.get("attempted_at"))
     if attempted_at is None:
@@ -569,16 +590,17 @@ def _record_smoke_runtime_retry_attempt(
     *,
     outcome: str,
     path: Optional[Path] = None,
+    storage: StorageAccess | None = None,
 ) -> None:
     key = str(name or "").strip()
     if not key:
         return
-    state = _load_smoke_runtime_retry_state(path)
+    state = _load_smoke_runtime_retry_state(path, storage=storage)
     state[key] = {
         "attempted_at": _now_iso(),
         "outcome": str(outcome or "").strip() or "attempted",
     }
-    _save_smoke_runtime_retry_state(state, path)
+    _save_smoke_runtime_retry_state(state, path, storage=storage)
 
 
 def _run_smoke_agent_with_runtime_retry(
@@ -971,7 +993,7 @@ def _run_runtime_repair_agent(
     recommendations: List[str] = []
     if required_failed_after:
         recommendations.append(
-            "运行态仍存在必需项失败，说明服务主链异常，建议优先检查 health/ready/self_check 依赖。"
+            "运行态仍存在必需项失败，说明服务主链异常，建议优先检查健康检查与系统自检接口依赖。"
         )
     elif repairable_after and not restartable_after and async_parse_busy_after:
         recommendations.append(
@@ -2441,42 +2463,42 @@ def _run_learning_calibration_agent(
 
     recommendations: List[str] = []
     if llm_status_unavailable_count > 0:
-        recommendations.append("无法读取 LLM 池状态，学习进化链的 provider 退化风险当前不可见。")
+        recommendations.append("无法读取 LLM 池状态，学习进化链的服务提供方退化风险当前不可见。")
     if llm_provider_degraded_count > 0:
         recommendations.append(
-            f"有 {llm_provider_degraded_count} 个 LLM provider 当前处于 cooldown，系统虽可自动切换，但建议继续观察账号池稳定性。"
+            f"有 {llm_provider_degraded_count} 个 LLM 服务提供方当前处于冷却期，系统虽可自动切换，但建议继续观察账号池稳定性。"
         )
     if llm_provider_quality_degraded_count > 0:
         recommendations.append(
-            f"有 {llm_provider_quality_degraded_count} 个 LLM provider 最近复核分歧偏高，系统已自动降权其主位优先级。"
+            f"有 {llm_provider_quality_degraded_count} 个 LLM 服务提供方最近复核分歧偏高，系统已自动降低其主位优先级。"
         )
     if llm_provider_review_regression_count > 0:
         recommendations.append(
-            f"有 {llm_provider_review_regression_count} 个 LLM provider 的累计复核分歧已超过确认次数，建议重点观察其长期输出质量。"
+            f"有 {llm_provider_review_regression_count} 个 LLM 服务提供方的累计复核分歧已超过确认次数，建议重点观察其长期输出质量。"
         )
     if llm_provider_low_quality_score_count > 0:
         recommendations.append(
-            f"有 {llm_provider_low_quality_score_count} 个 LLM provider 的历史质量分偏低，系统虽可继续运行，但建议优先观察其主位输出。"
+            f"有 {llm_provider_low_quality_score_count} 个 LLM 服务提供方的历史质量分偏低，系统虽可继续运行，但建议优先观察其主位输出。"
         )
     if llm_fallback_unavailable_count > 0:
         recommendations.append(
-            "当前学习进化仅剩单 provider 可用，跨 provider fallback 与双模型复核暂时不可用。"
+            "当前学习进化仅剩单一服务提供方可用，跨服务提供方切换与双模型复核暂时不可用。"
         )
     if llm_account_cooldown_count > 0:
         recommendations.append(
-            f"当前共有 {llm_account_cooldown_count} 个 LLM 账号处于 cooldown，系统仍可运行，但建议继续补强账号池冗余。"
+            f"当前共有 {llm_account_cooldown_count} 个 LLM 账号处于冷却期，系统仍可运行，但建议继续补强账号池冗余。"
         )
     if llm_provider_thin_pool_count > 0:
         recommendations.append(
-            f"有 {llm_provider_thin_pool_count} 个 provider 当前仅剩 1 个健康账号，抗抖动余量偏薄。"
+            f"有 {llm_provider_thin_pool_count} 个服务提供方当前仅剩 1 个健康账号，抗抖动余量偏薄。"
         )
     if llm_account_low_quality_pool_count > 0:
         recommendations.append(
-            f"有 {llm_account_low_quality_pool_count} 个 provider 的账号池历史质量分偏低，系统会优先避开弱 key，但建议继续补强冗余账号。"
+            f"有 {llm_account_low_quality_pool_count} 个服务提供方的账号池历史质量分偏低，系统会优先避开弱账号，但建议继续补强冗余账号。"
         )
     if llm_deprioritized_account_count > 0:
         recommendations.append(
-            f"当前共有 {llm_deprioritized_account_count} 个 LLM 账号已被系统自动降优先级，主链会优先选择历史表现更稳的 key。"
+            f"当前共有 {llm_deprioritized_account_count} 个 LLM 账号已被系统自动降优先级，主链会优先选择历史表现更稳的账号。"
         )
     if total_failure_count > 0:
         recommendations.append(
@@ -2492,15 +2514,15 @@ def _run_learning_calibration_agent(
         )
     if pending_calibration_after > 0:
         recommendations.append(
-            f"仍有 {pending_calibration_after} 个项目未形成项目级校准器，当前可能仍在使用 prior 兜底逼近。"
+            f"仍有 {pending_calibration_after} 个项目未形成项目级校准器，当前可能仍在使用先验兜底逼近。"
         )
     if bootstrap_monitoring_count > 0:
         recommendations.append(
-            f"有 {bootstrap_monitoring_count} 个项目当前使用小样本 bootstrap 校准，已自动部署但仍需继续补录真实评分样本。"
+            f"有 {bootstrap_monitoring_count} 个项目当前使用小样本自举校准，已自动部署但仍需继续补录真实评分样本。"
         )
     if bootstrap_review_failed_count > 0:
         recommendations.append(
-            f"有 {bootstrap_review_failed_count} 个项目的小样本 bootstrap 校准在只读偏差复核中变差，系统已自动阻止部署。"
+            f"有 {bootstrap_review_failed_count} 个项目的小样本自举校准在只读偏差复核中变差，系统已自动阻止部署。"
         )
     if calibrator_degraded_after_count > 0:
         recommendations.append(
@@ -2528,7 +2550,7 @@ def _run_learning_calibration_agent(
         )
     if few_shot_pending_project_count > 0:
         recommendations.append(
-            f"有 {few_shot_pending_project_count} 个项目存在 few-shot 待审核样本，建议人工确认后再观察编制指导收敛。"
+            f"有 {few_shot_pending_project_count} 个项目存在待审核高分特征样本，建议人工确认后再观察编制指导收敛。"
         )
     if drift_alert_after_count > 0:
         recommendations.append(
@@ -2793,7 +2815,7 @@ def run_ops_agents_cycle(
             if msg and msg not in recommendations:
                 recommendations.append(msg)
 
-    return {
+    payload = {
         "generated_at": _now_iso(),
         "base_url": base_url,
         "agent_count": len(OPS_AGENT_NAMES),
@@ -2815,4 +2837,44 @@ def run_ops_agents_cycle(
         },
         "agents": ordered_agents,
         "recommendations": recommendations[:20],
+    }
+    payload["triage"] = _build_controlled_ops_triage(payload)
+    return payload
+
+
+def _build_controlled_ops_triage(payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        from app.bootstrap.dependencies import get_application_services
+
+        result = get_application_services().agents.dry_run(
+            agent_name="ops-triage",
+            payload={
+                "trigger_event": "ops_agents_cycle",
+                "actor_type": "system",
+                "actor_id": "ops_agents",
+                "ops_agents_payload": payload,
+            },
+        )
+        if isinstance(result.output, dict):
+            return dict(result.output)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "overall_status": "unknown",
+            "severity": "medium",
+            "diagnostics": [
+                {
+                    "source": "ops_triage",
+                    "status": "unknown",
+                    "severity": "medium",
+                    "summary": "受控 ops triage 未生成结果。",
+                    "recommendation": f"ops_triage_unavailable: {type(exc).__name__}: {exc}",
+                }
+            ],
+            "recommended_actions": ["检查 agent runtime 注册与受控审计链路。"],
+        }
+    return {
+        "overall_status": "unknown",
+        "severity": "medium",
+        "diagnostics": [],
+        "recommended_actions": ["受控 ops triage 返回空结果。"],
     }
