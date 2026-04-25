@@ -75,8 +75,8 @@ class TestRecordScore:
         for i in range(3):
             record_score(
                 project_id="proj-001",
-                submission_id=f"sub-00{i+1}",
-                filename=f"test_{i+1}.txt",
+                submission_id=f"sub-00{i + 1}",
+                filename=f"test_{i + 1}.txt",
                 total_score=70.0 + i * 5,
                 dimension_scores={"D01": 15.0 + i},
                 penalty_count=3 - i,
@@ -138,6 +138,29 @@ class TestGetHistory:
         assert result1["entries"][0]["filename"] == "test1.txt"
         assert result2["entries"][0]["filename"] == "test2.txt"
 
+    def test_get_history_recovers_legacy_entry_missing_required_fields(self):
+        """旧历史记录缺字段时仍能稳定返回"""
+        save_score_history(
+            [
+                {
+                    "project_id": "proj-001",
+                }
+            ]
+        )
+
+        result = get_history("proj-001")
+
+        assert result["project_id"] == "proj-001"
+        assert result["total_count"] == 1
+        assert result["entries"][0]["project_id"] == "proj-001"
+        assert result["entries"][0]["id"] == ""
+        assert result["entries"][0]["submission_id"] == ""
+        assert result["entries"][0]["filename"] == ""
+        assert result["entries"][0]["total_score"] == 0.0
+        assert result["entries"][0]["dimension_scores"] == {}
+        assert result["entries"][0]["penalty_count"] == 0
+        assert result["entries"][0]["created_at"]
+
 
 class TestCalculateTrend:
     """测试趋势计算功能"""
@@ -185,8 +208,8 @@ class TestAnalyzeTrend:
         for i in range(5):
             record_score(
                 project_id="proj-001",
-                submission_id=f"sub-00{i+1}",
-                filename=f"v{i+1}.txt",
+                submission_id=f"sub-00{i + 1}",
+                filename=f"v{i + 1}.txt",
                 total_score=70.0 + i * 5,  # 70, 75, 80, 85, 90
                 dimension_scores={"D01": 15.0 + i, "D02": 10.0 + i},
                 penalty_count=5 - i,
@@ -222,6 +245,34 @@ class TestAnalyzeTrend:
         dim_trend_names = {d["dimension_name"] for d in result["dimension_trends"]}
         assert "工程概况" in dim_trend_names
         assert "施工部署" in dim_trend_names
+
+    def test_analyze_trend_recovers_legacy_entry_missing_required_fields(self):
+        """旧历史记录缺字段时趋势分析仍能稳定输出"""
+        save_score_history(
+            [
+                {
+                    "project_id": "proj-001",
+                },
+                {
+                    "project_id": "proj-001",
+                    "submission_id": "sub-002",
+                    "filename": "v2.txt",
+                    "total_score": "80.0",
+                    "dimension_scores": {"D01": "16.5"},
+                    "penalty_count": "2",
+                    "created_at": "2026-02-02T10:00:00+00:00",
+                },
+            ]
+        )
+
+        result = analyze_trend("proj-001")
+
+        assert result["project_id"] == "proj-001"
+        assert result["total_submissions"] == 2
+        assert len(result["score_history"]) == 2
+        assert result["score_history"][0]["total_score"] == 0.0
+        assert result["score_history"][1]["total_score"] == 80.0
+        assert result["penalty_trend"] == [0, 2]
 
 
 class TestGenerateRecommendations:

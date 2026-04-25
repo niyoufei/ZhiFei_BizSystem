@@ -36,9 +36,52 @@ def record_score(
     return entry
 
 
+def _normalize_history_entry(
+    entry: Dict[str, Any] | object,
+    *,
+    project_id_fallback: str,
+) -> Dict[str, Any]:
+    normalized = dict(entry) if isinstance(entry, dict) else {}
+    normalized["id"] = str(normalized.get("id") or "").strip()
+    normalized["project_id"] = str(
+        normalized.get("project_id") or project_id_fallback or ""
+    ).strip()
+    normalized["submission_id"] = str(normalized.get("submission_id") or "").strip()
+    normalized["filename"] = str(normalized.get("filename") or "").strip()
+    try:
+        normalized["total_score"] = float(normalized.get("total_score") or 0.0)
+    except (TypeError, ValueError):
+        normalized["total_score"] = 0.0
+    raw_dimension_scores = normalized.get("dimension_scores")
+    if isinstance(raw_dimension_scores, dict):
+        normalized_dimension_scores: Dict[str, float] = {}
+        for key, value in raw_dimension_scores.items():
+            clean_key = str(key or "").strip()
+            if not clean_key:
+                continue
+            try:
+                normalized_dimension_scores[clean_key] = float(value or 0.0)
+            except (TypeError, ValueError):
+                normalized_dimension_scores[clean_key] = 0.0
+        normalized["dimension_scores"] = normalized_dimension_scores
+    else:
+        normalized["dimension_scores"] = {}
+    try:
+        normalized["penalty_count"] = int(float(normalized.get("penalty_count") or 0))
+    except (TypeError, ValueError):
+        normalized["penalty_count"] = 0
+    normalized["created_at"] = (
+        str(normalized.get("created_at") or "").strip() or datetime.now(timezone.utc).isoformat()
+    )
+    return normalized
+
+
 def get_history(project_id: str) -> Dict[str, Any]:
     """获取项目的评分历史"""
-    entries = get_project_score_history(project_id)
+    entries = [
+        _normalize_history_entry(entry, project_id_fallback=project_id)
+        for entry in get_project_score_history(project_id)
+    ]
     return {
         "project_id": project_id,
         "entries": entries,
@@ -73,7 +116,10 @@ def analyze_trend(
     project_id: str, dimension_names: Optional[Dict[str, str]] = None
 ) -> Dict[str, Any]:
     """分析项目评分趋势"""
-    entries = get_project_score_history(project_id)
+    entries = [
+        _normalize_history_entry(entry, project_id_fallback=project_id)
+        for entry in get_project_score_history(project_id)
+    ]
 
     if not entries:
         return {
