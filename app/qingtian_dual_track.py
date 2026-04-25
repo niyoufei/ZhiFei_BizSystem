@@ -145,7 +145,7 @@ def build_submission_dual_track_summary(
     elif qingtian_score_100 is not None and raw_pred_total is not None:
         if abs_delta_improvement_100 is not None and abs_delta_improvement_100 > 0:
             alignment_status = "approximation_better"
-            governance_hint = "当前分层当前更接近青天，可继续沉淀校准样本和 few-shot。"
+            governance_hint = "当前分层当前更接近青天，可继续沉淀校准样本和高分特征样本。"
         elif abs_delta_improvement_100 is not None and abs_delta_improvement_100 < 0:
             alignment_status = "independent_better"
             governance_hint = "独立层当前更接近青天，建议优先查看评分治理面板。"
@@ -542,16 +542,18 @@ def ingest_qingtian_result(submission_id: str, payload: object):
         project["updated_at"] = main._now_iso()
         main.save_projects(projects)
 
-    return main.QingTianResultRecord(**record)
+    return main.QingTianResultRecord(**main._normalize_qingtian_result_record(record)[0])
 
 
 def get_latest_qingtian_result(submission_id: str):
     main = _main()
     main.ensure_data_dirs()
     results = [
-        r for r in main.load_qingtian_results() if str(r.get("submission_id")) == submission_id
+        r
+        for r in main._load_qingtian_results_safe()
+        if str(r.get("submission_id")) == submission_id
     ]
     if not results:
         raise main.HTTPException(status_code=404, detail="暂无青天评标结果")
     latest = sorted(results, key=lambda x: str(x.get("created_at", "")), reverse=True)[0]
-    return main.QingTianResultRecord(**latest)
+    return main.QingTianResultRecord(**main._normalize_qingtian_result_record(latest)[0])

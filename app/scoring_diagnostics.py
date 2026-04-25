@@ -25,6 +25,15 @@ class MaterialCardContext:
     to_float_or_none: Callable[[Any], Optional[float]]
 
 
+def _is_benign_parse_fallback_error(error_text: object) -> bool:
+    text = str(error_text or "").strip().lower()
+    if not text:
+        return False
+    if "gpt_parse_failed" in text:
+        return True
+    return "http error 400" in text and "bad request" in text
+
+
 def prepare_latest_submission_context(
     *,
     project_id: str,
@@ -458,7 +467,7 @@ def build_material_type_cards(
         ]
         parse_status_counts: Dict[str, int] = {}
         parse_backend_counts: Dict[str, int] = {}
-        parse_error_preview: List[str] = []
+        raw_parse_error_preview: List[str] = []
         parse_confidence_values: List[float] = []
         queued_count = 0
         processing_count = 0
@@ -484,8 +493,14 @@ def build_material_type_cards(
             error_text = str(
                 parse_row.get("parse_error_message") or parse_row.get("parse_error_class") or ""
             ).strip()
-            if error_text and error_text not in parse_error_preview:
-                parse_error_preview.append(error_text[:120])
+            if error_text and error_text not in raw_parse_error_preview:
+                raw_parse_error_preview.append(error_text[:120])
+
+        parse_error_preview = list(raw_parse_error_preview)
+        if parsed_count > 0 and parse_error_preview:
+            parse_error_preview = [
+                item for item in parse_error_preview if not _is_benign_parse_fallback_error(item)
+            ]
 
         depth_row = (
             depth_by_type.get(mat_type) if isinstance(depth_by_type.get(mat_type), dict) else {}

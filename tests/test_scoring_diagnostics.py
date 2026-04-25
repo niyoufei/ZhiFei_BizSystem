@@ -269,6 +269,7 @@ def test_build_material_type_cards_summarizes_material_signals_and_missing_requi
     assert tender["parse_status_counts"] == {"parsed": 1, "failed": 1}
     assert tender["parse_backend_summary"] == ["GPT-5.4×1"]
     assert tender["parse_confidence_avg"] == 0.9
+    assert tender["parse_error_preview"] == ["ocr fail"]
     assert tender["hit_requirement_labels"] == ["工期节点"]
     assert tender["miss_requirement_labels"] == ["危大工程清单"]
     assert tender["project_numeric_terms"] == ["90", "48"]
@@ -279,6 +280,94 @@ def test_build_material_type_cards_summarizes_material_signals_and_missing_requi
     assert boq["required"] is True
     assert boq["status"] == "missing"
     assert "缺少工程量清单" in boq["guidance"][0]
+
+
+def test_build_material_type_cards_hides_benign_gpt_fallback_errors_when_local_parse_succeeds():
+    cards = build_material_type_cards(
+        material_rows=[
+            {
+                "material_type": "site_photo",
+                "filename": "现场1.JPG",
+                "parse_status": "parsed",
+                "parse_backend": "local",
+                "parse_confidence": 0.71,
+                "parse_error_message": "HTTP Error 400: Bad Request",
+            },
+            {
+                "material_type": "site_photo",
+                "filename": "现场2.JPG",
+                "parse_status": "parsed",
+                "parse_backend": "local",
+                "parse_confidence": 0.68,
+                "parse_error_class": "gpt_parse_failed",
+            },
+        ],
+        material_depth={
+            "depth_gate": {"enforce": True},
+            "by_type": [
+                {
+                    "material_type": "site_photo",
+                    "files": 2,
+                    "parsed_chars": 2600,
+                    "parsed_chunks": 3,
+                    "numeric_terms": 0,
+                    "meets_chars": True,
+                    "meets_chunks": True,
+                    "meets_numeric_terms": True,
+                }
+            ],
+        },
+        material_knowledge={
+            "by_type": [
+                {
+                    "material_type": "site_photo",
+                    "top_numeric_terms": [],
+                    "top_terms": ["现场", "照片"],
+                    "top_dimensions": [{"dimension_id": "07"}],
+                    "structured_quality_score": 0.42,
+                    "structured_quality_max": 0.59,
+                    "structured_quality_signal_coverage": 0.31,
+                }
+            ]
+        },
+        readiness={"material_gate": {"required_types": ["site_photo"]}},
+        latest_submission={
+            "exists": True,
+            "is_scored": True,
+            "scoring_status": "scored",
+        },
+        basis_util={
+            "available_types": ["site_photo"],
+            "by_type": {
+                "site_photo": {
+                    "retrieval_total": 0,
+                    "retrieval_hit": 0,
+                    "consistency_total": 0,
+                    "consistency_hit": 0,
+                    "fallback_total": 0,
+                    "fallback_hit": 0,
+                }
+            },
+        },
+        basis_retrieval={"preview": [], "consistency_preview": []},
+        conflict_summary={"conflicts": []},
+        requirement_hits=[],
+        context=MaterialCardContext(
+            normalize_material_type=_normalize_material_type,
+            normalize_numeric_token=_normalize_numeric_token,
+            classify_numeric_anchor_category=_classify_numeric_anchor_category,
+            append_numeric_anchor_bucket=_append_numeric_anchor_bucket,
+            build_numeric_anchor_category_summary=_build_numeric_anchor_category_summary,
+            material_type_label=_material_type_label,
+            to_float_or_none=_to_float_or_none,
+        ),
+    )
+
+    site_photo = next(item for item in cards if item["material_type"] == "site_photo")
+
+    assert site_photo["status"] == "parsed_not_used"
+    assert site_photo["parse_backend_summary"] == ["local×2"]
+    assert site_photo["parse_error_preview"] == []
 
 
 def test_build_material_type_cards_marks_parsed_materials_waiting_for_score():

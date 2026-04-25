@@ -26,7 +26,7 @@ def _load_latest_qingtian_by_submission(
     return main._latest_records_by_submission(
         [
             row
-            for row in main.load_qingtian_results()
+            for row in main._load_qingtian_results_safe()
             if str(row.get("submission_id") or "").strip() in submission_ids
         ]
     )
@@ -150,7 +150,7 @@ def build_project_submission_views(
     resolved_material_snapshot = (
         material_knowledge_snapshot
         if isinstance(material_knowledge_snapshot, dict)
-        else main._build_material_knowledge_profile(project_id)
+        else main._build_material_knowledge_profile_safe(project_id)
     )
     resolved_project = dict(project or {})
     resolved_project.setdefault("id", project_id)
@@ -397,7 +397,7 @@ def build_project_pre_score_rows(
 ) -> List[Dict[str, object]]:
     main = _main()
     latest_reports = main._latest_records_by_submission(
-        [row for row in main.load_score_reports() if str(row.get("project_id")) == project_id]
+        [row for row in main._load_score_reports_safe() if str(row.get("project_id")) == project_id]
     )
     rows: List[Dict[str, object]] = []
     for submission in submissions_view:

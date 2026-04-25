@@ -4,6 +4,11 @@ import html
 from typing import Dict, List
 
 from app import submission_dual_track_views as submission_dual_track_views_module
+from app.domain.material_parse_state import (
+    material_parse_status_label as domain_material_parse_status_label,
+)
+from app.domain.material_parse_state import normalize_material_row_for_parse
+from app.domain.material_types import material_type_label as domain_material_type_label
 
 
 def _main():
@@ -14,24 +19,28 @@ def _main():
 
 def build_selected_project_material_rows_html(project_id: str) -> str:
     main = _main()
-    materials_all = main.load_materials()
+    materials_all = main._load_materials_safe()
     selected_materials = [
         item for item in materials_all if str(item.get("project_id", "")) == project_id
     ]
     selected_materials.sort(key=lambda item: str(item.get("created_at", "")), reverse=True)
     rows: List[str] = []
     for item in selected_materials:
-        normalized_item, _ = main._normalize_material_row_for_parse(dict(item))
+        normalized_item, _ = normalize_material_row_for_parse(
+            dict(item),
+            parse_version=main.DEFAULT_MATERIAL_PARSE_VERSION,
+            now_iso=main._now_iso(),
+        )
         material_id = html.escape(str(item.get("id", "")))
         filename_raw = str(normalized_item.get("filename", ""))
         material_type_label = html.escape(
-            main._material_type_label(
+            domain_material_type_label(
                 normalized_item.get("material_type"),
                 filename=normalized_item.get("filename"),
             )
         )
         parse_status_label = html.escape(
-            main._material_parse_status_label(
+            domain_material_parse_status_label(
                 normalized_item.get("parse_status"),
                 parse_backend=normalized_item.get("parse_backend"),
                 parse_error_message=normalized_item.get("parse_error_message"),

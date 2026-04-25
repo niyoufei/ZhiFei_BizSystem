@@ -5,22 +5,139 @@ from typing import Dict, List, Tuple
 
 from fastapi import HTTPException
 
+from app.application.storage_access import StorageAccess
+from app.bootstrap.storage import get_storage_access
+from app.domain.documents.parse_errors import coerce_document_parse_error
+from app.domain.learning.ground_truth_records import (
+    assert_valid_final_score,
+    new_ground_truth_record,
+    parse_judge_scores_form,
+    resolve_project_score_scale_max,
+)
+from app.domain.learning.ground_truth_rule_resolution import (
+    resolve_project_ground_truth_score_rule as resolve_domain_ground_truth_score_rule,
+)
+from app.domain.learning.ground_truth_scoring import (
+    auto_compute_ground_truth_final_score_if_needed,
+)
+from app.i18n import t
+from app.infrastructure.documents.runtime_adapters import (
+    get_default_uploaded_content_reader_dependencies,
+)
+from app.infrastructure.documents.uploaded_content import (
+    read_uploaded_file_content_with_dependencies,
+)
+
+
+def _storage(storage: StorageAccess | None = None) -> StorageAccess:
+    return storage or get_storage_access()
+
 
 def _main():
-    import app.main as main_mod
+    from app.application import runtime as main_mod
 
     return main_mod
 
 
+def _resolve_project_ground_truth_score_rule(
+    project_id: str,
+    *,
+    project: Dict[str, object] | None = None,
+    storage: StorageAccess | None = None,
+) -> Dict[str, object]:
+    runtime_attr = getattr(_main(), "_resolve_project_ground_truth_score_rule", None)
+    runtime_module_name = getattr(runtime_attr, "__module__", None)
+    if runtime_attr is not None and runtime_module_name not in {"app.application.runtime", None}:
+        return runtime_attr(project_id, project=project)
+
+    project_row = project
+    if project_row is None:
+        project_row = next(
+            (
+                item
+                for item in _load_projects(storage)
+                if str(item.get("id") or "") == str(project_id)
+            ),
+            None,
+        )
+    if not isinstance(project_row, dict):
+        raise HTTPException(status_code=404, detail="项目不存在")
+    return resolve_domain_ground_truth_score_rule(
+        project_id,
+        project=project_row,
+        materials=_storage(storage).load_materials(),
+        extract_rule_from_text=lambda text, filename: (
+            _main()._extract_ground_truth_score_rule_from_text(
+                text,
+                filename=filename,
+            )
+        ),
+        extract_rule_from_material=_main()._extract_ground_truth_score_rule_from_material,
+        extract_scale_from_material=_main()._extract_ground_truth_score_scale_from_material,
+    )
+
+
+def _auto_compute_ground_truth_final_score_if_needed(
+    project_id: str,
+    *,
+    judge_scores: List[float],
+    final_score: float,
+    project: Dict[str, object],
+) -> float:
+    return auto_compute_ground_truth_final_score_if_needed(
+        project_id,
+        judge_scores=judge_scores,
+        final_score=final_score,
+        project=project,
+        resolve_scoring_rule=lambda pid, project_row: _resolve_project_ground_truth_score_rule(
+            pid,
+            project=project_row,
+        ),
+    )
+
+
+def _read_uploaded_file_content(
+    content: bytes | None,
+    filename: str,
+    *,
+    file_path: Path | None = None,
+) -> str:
+    runtime_attr = getattr(_main(), "_read_uploaded_file_content", None)
+    runtime_module_name = getattr(runtime_attr, "__module__", None)
+    if runtime_attr is not None and runtime_module_name not in {"app.application.runtime", None}:
+        return runtime_attr(content, filename, file_path=file_path)
+    return read_uploaded_file_content_with_dependencies(
+        content,
+        filename,
+        file_path=file_path,
+        dependencies=get_default_uploaded_content_reader_dependencies(),
+    )
+
+
+def _load_projects(storage: StorageAccess | None = None) -> List[Dict[str, object]]:
+    runtime_attr = getattr(_main(), "load_projects", None)
+    runtime_module_name = getattr(runtime_attr, "__module__", None)
+    if runtime_attr is not None and runtime_module_name not in {"app.storage", None}:
+        return runtime_attr()
+    return _storage(storage).load_projects()
+
+
+def _load_submissions(storage: StorageAccess | None = None) -> List[Dict[str, object]]:
+    runtime_attr = getattr(_main(), "load_submissions", None)
+    runtime_module_name = getattr(runtime_attr, "__module__", None)
+    if runtime_attr is not None and runtime_module_name not in {"app.storage", None}:
+        return runtime_attr()
+    return _storage(storage).load_submissions()
+
+
 def _resolve_project_score_context(
-    project_id: str, *, locale: str
+    project_id: str, *, locale: str, storage: StorageAccess | None = None
 ) -> Tuple[Dict[str, object], int]:
-    main = _main()
-    projects = main.load_projects()
-    project = next((p for p in projects if p["id"] == project_id), None)
+    projects = _load_projects(storage)
+    project = next((p for p in projects if str(p.get("id") or "") == project_id), None)
     if project is None:
-        raise HTTPException(status_code=404, detail=main.t("api.project_not_found", locale=locale))
-    score_scale_max = main._resolve_project_score_scale_max(project)
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    score_scale_max = resolve_project_score_scale_max(project)
     return project, score_scale_max
 
 
@@ -34,18 +151,23 @@ def build_ground_truth_record(
     locale: str,
     judge_weights: List[float] | None = None,
     qualitative_tags_by_judge: List[List[str]] | None = None,
+    storage: StorageAccess | None = None,
 ) -> Dict[str, object]:
-    project, score_scale_max = _resolve_project_score_context(project_id, locale=locale)
+    project, score_scale_max = _resolve_project_score_context(
+        project_id,
+        locale=locale,
+        storage=storage,
+    )
     if len((shigong_text or "").strip()) < 50:
         raise HTTPException(status_code=422, detail="施组全文过短，至少 50 字以便学习分析。")
-    final_score = _main()._auto_compute_ground_truth_final_score_if_needed(
+    final_score = _auto_compute_ground_truth_final_score_if_needed(
         project_id,
         judge_scores=judge_scores,
         final_score=final_score,
         project=project,
     )
-    _main()._assert_valid_final_score(final_score, score_scale_max=score_scale_max)
-    return _main()._new_ground_truth_record(
+    assert_valid_final_score(final_score, score_scale_max=score_scale_max)
+    return new_ground_truth_record(
         project_id=project_id,
         shigong_text=shigong_text,
         judge_scores=judge_scores,
@@ -66,12 +188,16 @@ def build_ground_truth_record_from_submission(
     source: str,
     qualitative_tags_by_judge: List[List[str]] | None,
     locale: str,
+    storage: StorageAccess | None = None,
 ) -> Dict[str, object]:
-    main = _main()
-    project, score_scale_max = _resolve_project_score_context(project_id, locale=locale)
+    project, score_scale_max = _resolve_project_score_context(
+        project_id,
+        locale=locale,
+        storage=storage,
+    )
 
     submission_id = str(submission_id or "").strip()
-    submissions = main.load_submissions()
+    submissions = _load_submissions(storage)
     submission = next(
         (
             s
@@ -86,15 +212,15 @@ def build_ground_truth_record_from_submission(
     shigong_text = str(submission.get("text") or "").strip()
     if len(shigong_text) < 50:
         raise HTTPException(status_code=422, detail="该施组文本过短，暂不支持录入真实评标。")
-    final_score = main._auto_compute_ground_truth_final_score_if_needed(
+    final_score = _auto_compute_ground_truth_final_score_if_needed(
         project_id,
         judge_scores=judge_scores,
         final_score=final_score,
         project=project,
     )
-    main._assert_valid_final_score(final_score, score_scale_max=score_scale_max)
+    assert_valid_final_score(final_score, score_scale_max=score_scale_max)
 
-    record = main._new_ground_truth_record(
+    record = new_ground_truth_record(
         project_id=project_id,
         shigong_text=shigong_text,
         judge_scores=[float(x) for x in judge_scores],
@@ -119,10 +245,10 @@ def build_ground_truth_record_from_uploaded_file(
     final_score: float,
     source: str,
     locale: str,
+    storage: StorageAccess | None = None,
 ) -> Dict[str, object]:
-    main = _main()
-    judge_scores_list = main._parse_judge_scores_form(judge_scores_form)
-    shigong_text = main._read_uploaded_file_content(content, filename or "")
+    judge_scores_list = parse_judge_scores_form(judge_scores_form)
+    shigong_text = _read_uploaded_file_content(content, filename or "")
     record = build_ground_truth_record(
         project_id,
         shigong_text=shigong_text,
@@ -130,6 +256,7 @@ def build_ground_truth_record_from_uploaded_file(
         final_score=final_score,
         source=source,
         locale=locale,
+        storage=storage,
     )
     record["source_submission_filename"] = filename or None
     return record
@@ -144,17 +271,17 @@ def build_ground_truth_record_from_uploaded_path(
     final_score: float,
     source: str,
     locale: str,
+    storage: StorageAccess | None = None,
 ) -> Dict[str, object]:
-    main = _main()
-    judge_scores_list = main._parse_judge_scores_form(judge_scores_form)
+    judge_scores_list = parse_judge_scores_form(judge_scores_form)
     try:
-        shigong_text = main._read_uploaded_file_content(
+        shigong_text = _read_uploaded_file_content(
             None,
             filename or "",
             file_path=Path(file_path),
         )
     except Exception as exc:
-        raise main._coerce_document_parse_error(exc, filename=filename or "") from exc
+        raise coerce_document_parse_error(exc, filename=filename or "") from exc
     record = build_ground_truth_record(
         project_id,
         shigong_text=shigong_text,
@@ -162,6 +289,7 @@ def build_ground_truth_record_from_uploaded_path(
         final_score=final_score,
         source=source,
         locale=locale,
+        storage=storage,
     )
     record["source_submission_filename"] = filename or None
     return record
@@ -175,27 +303,31 @@ def build_ground_truth_batch_items_from_uploaded_files(
     final_score: float,
     source: str,
     locale: str,
+    storage: StorageAccess | None = None,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
-    main = _main()
-    project, score_scale_max = _resolve_project_score_context(project_id, locale=locale)
-    judge_scores_list = main._parse_judge_scores_form(judge_scores_form)
-    final_score = main._auto_compute_ground_truth_final_score_if_needed(
+    project, score_scale_max = _resolve_project_score_context(
+        project_id,
+        locale=locale,
+        storage=storage,
+    )
+    judge_scores_list = parse_judge_scores_form(judge_scores_form)
+    final_score = _auto_compute_ground_truth_final_score_if_needed(
         project_id,
         judge_scores=judge_scores_list,
         final_score=final_score,
         project=project,
     )
-    main._assert_valid_final_score(final_score, score_scale_max=score_scale_max)
+    assert_valid_final_score(final_score, score_scale_max=score_scale_max)
 
     items: List[Dict[str, object]] = []
     success_records: List[Dict[str, object]] = []
     for filename, content in uploads:
         clean_filename = filename or "unknown"
         try:
-            shigong_text = main._read_uploaded_file_content(content, clean_filename)
+            shigong_text = _read_uploaded_file_content(content, clean_filename)
             if len(shigong_text.strip()) < 50:
                 raise ValueError("施组全文过短，至少 50 字以便学习分析。")
-            record = main._new_ground_truth_record(
+            record = new_ground_truth_record(
                 project_id=project_id,
                 shigong_text=shigong_text,
                 judge_scores=judge_scores_list,
@@ -235,31 +367,35 @@ def build_ground_truth_batch_items_from_uploaded_paths(
     final_score: float,
     source: str,
     locale: str,
+    storage: StorageAccess | None = None,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
-    main = _main()
-    project, score_scale_max = _resolve_project_score_context(project_id, locale=locale)
-    judge_scores_list = main._parse_judge_scores_form(judge_scores_form)
-    final_score = main._auto_compute_ground_truth_final_score_if_needed(
+    project, score_scale_max = _resolve_project_score_context(
+        project_id,
+        locale=locale,
+        storage=storage,
+    )
+    judge_scores_list = parse_judge_scores_form(judge_scores_form)
+    final_score = _auto_compute_ground_truth_final_score_if_needed(
         project_id,
         judge_scores=judge_scores_list,
         final_score=final_score,
         project=project,
     )
-    main._assert_valid_final_score(final_score, score_scale_max=score_scale_max)
+    assert_valid_final_score(final_score, score_scale_max=score_scale_max)
 
     items: List[Dict[str, object]] = []
     success_records: List[Dict[str, object]] = []
     for filename, file_path in uploads:
         clean_filename = filename or "unknown"
         try:
-            shigong_text = main._read_uploaded_file_content(
+            shigong_text = _read_uploaded_file_content(
                 None,
                 clean_filename,
                 file_path=Path(file_path),
             )
             if len(shigong_text.strip()) < 50:
                 raise ValueError("施组全文过短，至少 50 字以便学习分析。")
-            record = main._new_ground_truth_record(
+            record = new_ground_truth_record(
                 project_id=project_id,
                 shigong_text=shigong_text,
                 judge_scores=judge_scores_list,
@@ -280,7 +416,7 @@ def build_ground_truth_batch_items_from_uploaded_paths(
                 }
             )
         except Exception as exc:
-            normalized_exc = main._coerce_document_parse_error(exc, filename=clean_filename)
+            normalized_exc = coerce_document_parse_error(exc, filename=clean_filename)
             items.append(
                 {
                     "filename": clean_filename,
