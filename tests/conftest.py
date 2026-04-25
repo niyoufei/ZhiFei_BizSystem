@@ -109,3 +109,13 @@ def isolate_auth_env(monkeypatch: pytest.MonkeyPatch):
     """避免本机 .env 中的 API_KEYS/ZHIFEI_REQUIRE_API_KEYS 污染测试默认行为。"""
     monkeypatch.delenv("API_KEYS", raising=False)
     monkeypatch.delenv("ZHIFEI_REQUIRE_API_KEYS", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def reset_score_cache_between_tests():
+    """避免持久化评分缓存导致测试跨用例污染。"""
+    from app.cache import reset_score_cache
+
+    reset_score_cache()
+    yield
+    reset_score_cache()

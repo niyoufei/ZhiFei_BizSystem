@@ -8,6 +8,7 @@
 - 线程安全
 - 缓存统计（命中率等）
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -349,6 +350,11 @@ def reset_score_cache() -> None:
     global _score_cache
     with _cache_lock:
         _score_cache = None
+    try:
+        if CACHE_PATH.exists():
+            CACHE_PATH.unlink()
+    except OSError:
+        pass
 
 
 def cache_score_result(
