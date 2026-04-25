@@ -8,6 +8,7 @@ from uuid import uuid4
 from fastapi import FastAPI, Request
 from starlette.routing import BaseRoute
 
+from app.application.task_runtime import log_structured, runtime_context
 from app.metrics import record_request
 
 REQUEST_ID_HEADER = "X-Request-ID"
@@ -45,42 +46,46 @@ def configure_observability(app: FastAPI, logger: logging.Logger) -> None:
         request_id = str(request.headers.get(REQUEST_ID_HEADER) or uuid4().hex)
         request.state.request_id = request_id
         started = time.perf_counter()
-        try:
-            response = await call_next(request)
-        except Exception:
+        with runtime_context(correlation_id=request_id, run_id=request_id):
+            try:
+                response = await call_next(request)
+            except Exception:
+                duration_ms = (time.perf_counter() - started) * 1000.0
+                record_request(
+                    request.method,
+                    _get_endpoint_label(request),
+                    500,
+                    duration_ms / 1000.0,
+                )
+                if duration_ms >= slow_request_warn_ms:
+                    log_structured(
+                        logger,
+                        level=logging.WARNING,
+                        event="http_request_slow_failed",
+                        path=request.url.path,
+                        method=request.method,
+                        duration_ms=round(duration_ms, 1),
+                        status_code=500,
+                    )
+                raise
+
             duration_ms = (time.perf_counter() - started) * 1000.0
             record_request(
                 request.method,
                 _get_endpoint_label(request),
-                500,
+                int(response.status_code),
                 duration_ms / 1000.0,
             )
+            if REQUEST_ID_HEADER not in response.headers:
+                response.headers[REQUEST_ID_HEADER] = request_id
             if duration_ms >= slow_request_warn_ms:
-                logger.warning(
-                    "slow_request_failed path=%s method=%s duration_ms=%.1f request_id=%s",
-                    request.url.path,
-                    request.method,
-                    duration_ms,
-                    request_id,
+                log_structured(
+                    logger,
+                    level=logging.WARNING,
+                    event="http_request_slow",
+                    path=request.url.path,
+                    method=request.method,
+                    status_code=int(response.status_code),
+                    duration_ms=round(duration_ms, 1),
                 )
-            raise
-
-        duration_ms = (time.perf_counter() - started) * 1000.0
-        record_request(
-            request.method,
-            _get_endpoint_label(request),
-            int(response.status_code),
-            duration_ms / 1000.0,
-        )
-        if REQUEST_ID_HEADER not in response.headers:
-            response.headers[REQUEST_ID_HEADER] = request_id
-        if duration_ms >= slow_request_warn_ms:
-            logger.warning(
-                "slow_request path=%s method=%s status_code=%s duration_ms=%.1f request_id=%s",
-                request.url.path,
-                request.method,
-                response.status_code,
-                duration_ms,
-                request_id,
-            )
-        return response
+            return response

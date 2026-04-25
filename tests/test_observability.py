@@ -60,7 +60,9 @@ def test_configure_observability_logs_slow_requests(monkeypatch):
 
     assert response.status_code == 200
     logger.warning.assert_called_once()
-    assert "slow_request" in logger.warning.call_args[0][0]
+    payload = logger.warning.call_args[0][0]
+    assert "http_request_slow" in payload
+    assert "correlation_id" in payload
 
 
 def test_configure_observability_records_metrics_with_route_template(monkeypatch):
