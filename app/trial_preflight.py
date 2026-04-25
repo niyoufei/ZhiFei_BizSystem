@@ -47,9 +47,9 @@ def _system_improvement_closure_gate_label(gate_id: object, minimum_ready_projec
     if raw == "minimum_evaluated_projects":
         return f"具备真实样本的项目数达到 {minimum_ready_projects} 个"
     if raw == "minimum_ready_projects":
-        return f"达到第一阶段 ready 的项目数达到 {minimum_ready_projects} 个"
+        return f"达到第一阶段就绪的项目数达到 {minimum_ready_projects} 个"
     if raw == "all_evaluated_projects_phase1_ready":
-        return "所有具备真实样本的项目均已达到第一阶段 ready"
+        return "所有具备真实样本的项目均已达到第一阶段就绪"
     if raw == "all_evaluated_projects_current_display_match_qt":
         return "所有具备真实样本的项目当前分均已对齐青天结果"
     if raw == "all_evaluated_projects_calibrator_stable":
@@ -99,13 +99,13 @@ def _build_system_improvement_closure_gate_details(
             detail = next_step_detail or "需先推进候选项目进入真实评标与跨项目评估范围。"
         elif raw_gate_id == "minimum_ready_projects":
             summary = (
-                f"当前仅有 {ready_project_count} 个项目达到第一阶段 ready，"
+                f"当前仅有 {ready_project_count} 个项目达到第一阶段就绪，"
                 f"至少需要 {minimum_ready_projects} 个。"
             )
-            detail = next_step_detail or "需继续推进候选项目或优先收口未 ready 项目。"
+            detail = next_step_detail or "需继续推进候选项目或优先收口未就绪项目。"
         elif raw_gate_id == "all_evaluated_projects_phase1_ready":
-            summary = f"当前仍有 {not_ready_project_count} 个已评估项目未达到第一阶段 ready。"
-            detail = next_step_detail or "建议优先收口当前最优先未 ready 项目。"
+            summary = f"当前仍有 {not_ready_project_count} 个已评估项目未达到第一阶段就绪。"
+            detail = next_step_detail or "建议优先收口当前最优先未就绪项目。"
         elif raw_gate_id == "all_evaluated_projects_current_display_match_qt":
             mismatch_count = max(0, evaluated_project_count - current_display_matches_qt_pass_count)
             summary = f"当前仍有 {mismatch_count} 个已评估项目的当前展示分未完全对齐青天结果。"
@@ -177,11 +177,11 @@ def _build_system_improvement_project_gap_details(
             {
                 "id": f"phase1_ready_gap:{project_id}",
                 "kind": "phase1_ready_gap",
-                "kind_label": "第一阶段 ready 缺口",
+                "kind_label": "第一阶段就绪缺口",
                 "project_id": project_id,
                 "project_name": project_name,
                 "summary": (
-                    f"当前项目仍未达到第一阶段 ready（未通过门 {int(row.get('failed_gate_count') or 0)} 个）。"
+                    f"当前项目仍未达到第一阶段就绪（未通过门 {int(row.get('failed_gate_count') or 0)} 个）。"
                 ),
                 "detail": detail or "建议优先收口该项目未通过门。",
                 "entrypoint_key": str(row.get("entrypoint_key") or "").strip(),
@@ -1048,12 +1048,12 @@ def _build_system_improvement_ops_agent_quality_summary(
     if bootstrap_monitoring_count > 0:
         _append_unique(
             warnings,
-            f"当前仍有 {bootstrap_monitoring_count} 个项目处于 bootstrap 监控期，自动优化仍需继续观察。",
+            f"当前仍有 {bootstrap_monitoring_count} 个项目处于小样本自举监控期，自动优化仍需继续观察。",
         )
     if llm_account_low_quality_pool_count > 0:
         _append_unique(
             warnings,
-            f"当前有 {llm_account_low_quality_pool_count} 个 provider 账号池历史质量分偏低，系统虽会自动降优先级，但智能体质量仍需继续观察。",
+            f"当前有 {llm_account_low_quality_pool_count} 个服务提供方账号池历史质量分偏低，系统虽会自动降优先级，但智能体质量仍需继续观察。",
         )
     if post_verify_failed_count > 0:
         _append_unique(
@@ -1968,7 +1968,7 @@ def build_system_improvement_overview_report(
         )
 
     if ready_project_count > 0:
-        _append_unique(strengths, f"当前已有 {ready_project_count} 个项目达到第一阶段 ready。")
+        _append_unique(strengths, f"当前已有 {ready_project_count} 个项目达到第一阶段就绪。")
     if not_ready_project_count > 0:
         detail = (
             f"；当前最优先收口项目为“{next_priority_project_name}”。"
@@ -1977,7 +1977,7 @@ def build_system_improvement_overview_report(
         )
         _append_unique(
             warnings,
-            f"当前仍有 {not_ready_project_count} 个项目未达到第一阶段 ready{detail}",
+            f"当前仍有 {not_ready_project_count} 个项目未达到第一阶段就绪{detail}",
         )
     if candidate_project_count > 0:
         detail = (
@@ -2444,7 +2444,7 @@ def render_trial_preflight_markdown(report: Mapping[str, object]) -> str:
             f"- 漂移等级：`{metrics.get('drift_level') or '-'}`",
             f"- 最新评分置信度：`{metrics.get('latest_score_confidence_level') or '-'}`",
             f"- 高严重度资料冲突：`{metrics.get('material_conflict_high_severity_count') or 0}`",
-            f"- 系统总封关 ready：`{bool(metrics.get('system_closure_ready'))}`",
+            f"- 系统总封关就绪：`{bool(metrics.get('system_closure_ready'))}`",
             "",
             "## 优势项",
             "",
@@ -2628,7 +2628,7 @@ def render_trial_preflight_docx(report: Mapping[str, object]) -> bytes:
         ("漂移等级", metrics.get("drift_level") or "-"),
         ("最新评分置信度", metrics.get("latest_score_confidence_level") or "-"),
         ("高严重度资料冲突", metrics.get("material_conflict_high_severity_count") or 0),
-        ("系统总封关 ready", bool(metrics.get("system_closure_ready"))),
+        ("系统总封关就绪", bool(metrics.get("system_closure_ready"))),
     ]
     table = doc.add_table(rows=1, cols=2)
     table.style = "Table Grid"

@@ -651,7 +651,7 @@ def test_build_system_improvement_overview_report_highlights_global_gaps():
     assert report["ops_agent_quality_summary"]["agent_rows"][0]["name"] == "learning_calibration"
     assert any(item["id"] == "system_closure" for item in report["focus_workstreams"])
     assert report["closure_gate_details"][0]["id"] == "minimum_ready_projects"
-    assert report["closure_gate_details"][0]["label"] == "达到第一阶段 ready 的项目数达到 2 个"
+    assert report["closure_gate_details"][0]["label"] == "达到第一阶段就绪的项目数达到 2 个"
     assert (
         report["closure_gate_details"][0]["entrypoint_label"]
         == "前往「5) 自我学习与进化」执行“跨项目汇总评估”"
