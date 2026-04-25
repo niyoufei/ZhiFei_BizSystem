@@ -5,7 +5,24 @@ import math
 import random
 from typing import Any, Dict, List, Sequence, Tuple
 
+from app.project_taxonomy import normalize_bid_method, normalize_project_type
+
 DIMENSION_IDS = [f"{i:02d}" for i in range(1, 17)]
+
+PROJECT_TYPE_FEATURE_KEYS = {
+    "装修及景观": "project_type_decoration_landscape",
+    "高标准农田": "project_type_high_standard_farmland",
+    "生态环境": "project_type_ecological_environment",
+    "服务方案": "project_type_service_solution",
+    "其他项目": "project_type_other",
+}
+
+BID_METHOD_FEATURE_KEYS = {
+    "AI合理价格法": "bid_method_ai_reasonable_price",
+    "AI综合评估法（三阶段）": "bid_method_ai_comprehensive_three_stage",
+    "综合评估法（三阶段）": "bid_method_comprehensive_three_stage",
+    "评定分离": "bid_method_bid_evaluation_separation",
+}
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -17,6 +34,10 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 def _clip(value: float, low: float = 0.0, high: float = 100.0) -> float:
     return max(low, min(high, value))
+
+
+def _safe_dict(value: Any) -> Dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
 
 def _dot(a: Sequence[float], b: Sequence[float]) -> float:
@@ -62,12 +83,15 @@ def build_feature_row(
     report: Dict[str, Any],
     *,
     submission: Dict[str, Any] | None = None,
+    project: Dict[str, Any] | None = None,
     qingtian_result: Dict[str, Any] | None = None,
     feature_schema_version: str = "v2",
 ) -> Dict[str, Any]:
     submission = submission or {}
+    project = project or {}
     qingtian_result = qingtian_result or {}
     text = str(submission.get("text") or "")
+    meta = _safe_dict(report.get("meta"))
 
     rule_total = _safe_float(report.get("rule_total_score", report.get("total_score", 0.0)))
     consistency_bonus = _safe_float(report.get("consistency_bonus", 0.0))
@@ -108,6 +132,90 @@ def build_feature_row(
         "has_table": 1.0 if ("\t" in text or "|" in text) else 0.0,
         "has_images": 1.0 if _safe_float(submission.get("image_count", 0.0)) > 0 else 0.0,
     }
+
+    project_type = normalize_project_type(
+        project.get("project_type") or submission.get("project_type")
+    )
+    bid_method = normalize_bid_method(project.get("bid_method") or submission.get("bid_method"))
+    x_features["project_type_known"] = 1.0 if project_type else 0.0
+    x_features["bid_method_known"] = 1.0 if bid_method else 0.0
+    for option, feature_key in PROJECT_TYPE_FEATURE_KEYS.items():
+        x_features[feature_key] = 1.0 if project_type == option else 0.0
+    for option, feature_key in BID_METHOD_FEATURE_KEYS.items():
+        x_features[feature_key] = 1.0 if bid_method == option else 0.0
+
+    material_utilization = _safe_dict(meta.get("material_utilization"))
+    material_quality = _safe_dict(meta.get("material_quality"))
+    material_gate = _safe_dict(meta.get("material_utilization_gate")) or _safe_dict(
+        meta.get("material_gate")
+    )
+    evidence_trace = _safe_dict(meta.get("evidence_trace"))
+    material_retrieval = _safe_dict(meta.get("material_retrieval"))
+    uncovered_types = (
+        material_utilization.get("uncovered_types")
+        if isinstance(material_utilization.get("uncovered_types"), list)
+        else []
+    )
+    available_types = (
+        material_utilization.get("available_types")
+        if isinstance(material_utilization.get("available_types"), list)
+        else []
+    )
+    available_type_count = float(len(available_types))
+    uncovered_type_count = float(len(uncovered_types))
+    coverage_ratio = (
+        max(0.0, (available_type_count - uncovered_type_count) / available_type_count)
+        if available_type_count > 0
+        else 0.0
+    )
+    x_features.update(
+        {
+            "material_retrieval_hit_rate": _safe_float(
+                material_utilization.get("retrieval_hit_rate", 0.0)
+            ),
+            "material_retrieval_file_coverage_rate": _safe_float(
+                material_utilization.get("retrieval_file_coverage_rate", 0.0)
+            ),
+            "material_consistency_hit_rate": _safe_float(
+                material_utilization.get("consistency_hit_rate", 0.0)
+            ),
+            "material_dimension_hit_rate": _safe_float(
+                material_utilization.get("material_dimension_hit_rate", 0.0)
+            ),
+            "material_available_type_count": available_type_count,
+            "material_uncovered_type_count": uncovered_type_count,
+            "material_type_coverage_ratio": coverage_ratio,
+            "material_total_files": _safe_float(material_quality.get("total_files", 0.0)),
+            "material_total_parsed_chars": _safe_float(
+                material_quality.get("total_parsed_chars", 0.0)
+            ),
+            "material_parse_fail_ratio": _safe_float(material_quality.get("parse_fail_ratio", 0.0)),
+            "material_gate_passed": 1.0
+            if bool(material_gate.get("passed", not bool(material_gate.get("blocked"))))
+            else 0.0,
+            "material_gate_blocked": 1.0 if bool(material_gate.get("blocked")) else 0.0,
+            "material_gate_warned": 1.0 if bool(material_gate.get("warned")) else 0.0,
+            "evidence_mandatory_hit_rate": _safe_float(
+                evidence_trace.get("mandatory_hit_rate", 0.0)
+            ),
+            "evidence_source_files_hit_count": _safe_float(
+                evidence_trace.get("source_files_hit_count", 0.0)
+            ),
+            "evidence_total_requirements": _safe_float(
+                evidence_trace.get("total_requirements", 0.0)
+            ),
+            "evidence_total_hits": _safe_float(evidence_trace.get("total_hits", 0.0)),
+            "material_dimension_requirements": _safe_float(
+                material_retrieval.get("material_dimension_requirements", 0.0)
+            ),
+            "feature_confidence_requirements": _safe_float(
+                material_retrieval.get("feature_confidence_requirements", 0.0)
+            ),
+            "feedback_evolution_requirements": _safe_float(
+                material_retrieval.get("feedback_evolution_requirements", 0.0)
+            ),
+        }
+    )
 
     weights_norm = ((report.get("meta") or {}).get("expert_profile_snapshot") or {}).get(
         "weights_norm"
