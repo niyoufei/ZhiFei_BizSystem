@@ -1,7 +1,47 @@
 from __future__ import annotations
 
-from statistics import pstdev
 from typing import Dict, List, Optional
+
+from fastapi import HTTPException
+
+from app.application.runtime_facade import RuntimeModuleFacade
+from app.application.storage_access import StorageAccess
+from app.bootstrap.storage import get_storage_access
+from app.domain.learning.feedback_analysis import (
+    build_high_consensus_auto_approval as evaluate_high_consensus_auto_approval,
+)
+from app.domain.learning.feedback_analysis import (
+    build_learning_quality_gate_payload,
+)
+from app.domain.learning.feedback_analysis import (
+    resolve_report_predicted_score_100 as resolve_predicted_score_100,
+)
+from app.domain.learning.feedback_guardrails import (
+    build_feedback_guardrail_delta_text,
+    extract_feedback_guardrail,
+    extract_learning_quality_gate,
+    feedback_guardrail_blocks_training,
+    normalize_feedback_guardrail_state,
+)
+from app.domain.learning.feedback_state import (
+    normalize_few_shot_distillation_state,
+    normalize_learning_quality_gate_state,
+)
+from app.domain.learning.few_shot_support import (
+    collect_dimension_evidence_texts,
+    collect_dimension_guidance_texts,
+    flatten_ground_truth_qualitative_tags,
+    select_ground_truth_few_shot_dimensions,
+)
+from app.domain.learning.ground_truth_records import (
+    DEFAULT_SCORE_SCALE_MAX,
+    convert_score_from_100,
+    ground_truth_record_for_learning,
+    normalize_score_scale_max,
+    resolve_project_score_scale_max,
+    to_float_or_none,
+)
+from app.domain.learning.project_feedback_views import summarize_project_feedback_guardrail
 
 CONSENSUS_AUTO_APPROVE_MIN_JUDGES = 7
 CONSENSUS_AUTO_APPROVE_MAX_SCORE_SPAN = 0.4
@@ -9,10 +49,37 @@ CONSENSUS_AUTO_APPROVE_MAX_SCORE_STDDEV = 0.12
 CONSENSUS_AUTO_APPROVE_MAX_FINAL_DELTA = 0.15
 
 
-def _main():
-    import app.main as main_mod
+def _main(storage: StorageAccess | None = None):
+    from app.application import runtime as main_mod
 
-    return main_mod
+    return RuntimeModuleFacade(main_mod, storage=storage or get_storage_access())
+
+
+def _persist_ground_truth_record_fields(
+    main: RuntimeModuleFacade,
+    project_id: str,
+    record_id: str,
+    *,
+    updates: Dict[str, object],
+    updated_at: str,
+) -> Dict[str, object]:
+    records = main.load_ground_truth()
+    updated_row = None
+    for idx, row in enumerate(records):
+        if str(row.get("project_id") or "") != str(project_id):
+            continue
+        if str(row.get("id") or "") != str(record_id):
+            continue
+        merged = dict(row)
+        merged.update(updates)
+        merged["updated_at"] = updated_at
+        records[idx] = merged
+        updated_row = merged
+        break
+    if updated_row is None:
+        raise HTTPException(status_code=404, detail="真实评标记录不存在")
+    main.save_ground_truth(records)
+    return updated_row
 
 
 def auto_update_feature_confidence_on_ground_truth(
@@ -22,15 +89,18 @@ def auto_update_feature_confidence_on_ground_truth(
     project_score_scale_max: int,
 ) -> Dict[str, object]:
     main = _main()
-    applied_feature_ids = main._collect_applied_feature_ids_from_report(report)
+    applied_feature_ids = main._collect_applied_feature_ids_from_report(
+        report,
+        project_id=str(gt_record.get("project_id") or "").strip(),
+    )
     if not applied_feature_ids:
         return {"updated": 0, "retired": 0, "reason": "no_applied_feature_ids"}
 
-    gt_for_learning = main._ground_truth_record_for_learning(
+    gt_for_learning = ground_truth_record_for_learning(
         gt_record,
         default_score_scale_max=project_score_scale_max,
     )
-    actual_score_100 = main._to_float_or_none(gt_for_learning.get("final_score"))
+    actual_score_100 = to_float_or_none(gt_for_learning.get("final_score"))
     if actual_score_100 is None:
         return {"updated": 0, "retired": 0, "reason": "missing_actual_score"}
 
@@ -79,53 +149,23 @@ def resolve_report_predicted_score_100(
     *,
     project_score_scale_max: int,
 ) -> Optional[float]:
-    main = _main()
-    pred_score_100 = main._to_float_or_none(report.get("pred_total_score"))
-    if pred_score_100 is None:
-        pred_score_100 = main._to_float_or_none(report.get("total_score"))
-    if pred_score_100 is None:
-        pred_score_100 = main._to_float_or_none(report.get("rule_total_score"))
-    if pred_score_100 is None:
-        return None
-    if int(project_score_scale_max) == 5 and pred_score_100 <= 5.0:
-        pred_score_100 = float(main._convert_score_to_100(pred_score_100, 5) or 0.0)
-    return float(pred_score_100)
+    return resolve_predicted_score_100(
+        report,
+        project_score_scale_max=project_score_scale_max,
+    )
 
 
 def _build_high_consensus_auto_approval(
     *,
     gt_for_learning: Dict[str, object],
 ) -> Dict[str, object]:
-    main = _main()
-    judge_scores_raw = gt_for_learning.get("judge_scores")
-    if not isinstance(judge_scores_raw, list):
-        return {"eligible": False}
-    judge_scores: List[float] = []
-    for value in judge_scores_raw:
-        normalized = main._to_float_or_none(value)
-        if normalized is None:
-            return {"eligible": False}
-        judge_scores.append(float(normalized))
-    if len(judge_scores) < CONSENSUS_AUTO_APPROVE_MIN_JUDGES:
-        return {"eligible": False}
-    avg_score = sum(judge_scores) / float(len(judge_scores))
-    score_span = max(judge_scores) - min(judge_scores)
-    score_stddev = pstdev(judge_scores) if len(judge_scores) > 1 else 0.0
-    final_score = float(main._to_float_or_none(gt_for_learning.get("final_score")) or 0.0)
-    final_vs_avg_abs_delta = abs(final_score - avg_score)
-    eligible = (
-        score_span <= CONSENSUS_AUTO_APPROVE_MAX_SCORE_SPAN
-        and score_stddev <= CONSENSUS_AUTO_APPROVE_MAX_SCORE_STDDEV
-        and final_vs_avg_abs_delta <= CONSENSUS_AUTO_APPROVE_MAX_FINAL_DELTA
+    return evaluate_high_consensus_auto_approval(
+        gt_for_learning=gt_for_learning,
+        min_judges=CONSENSUS_AUTO_APPROVE_MIN_JUDGES,
+        max_score_span=CONSENSUS_AUTO_APPROVE_MAX_SCORE_SPAN,
+        max_score_stddev=CONSENSUS_AUTO_APPROVE_MAX_SCORE_STDDEV,
+        max_final_delta=CONSENSUS_AUTO_APPROVE_MAX_FINAL_DELTA,
     )
-    return {
-        "eligible": bool(eligible),
-        "judge_count": len(judge_scores),
-        "avg_score": round(avg_score, 2),
-        "score_span": round(score_span, 2),
-        "score_stddev": round(score_stddev, 4),
-        "final_vs_avg_abs_delta": round(final_vs_avg_abs_delta, 2),
-    }
 
 
 def build_ground_truth_feedback_guardrail(
@@ -135,21 +175,21 @@ def build_ground_truth_feedback_guardrail(
     project_score_scale_max: int,
 ) -> Dict[str, object]:
     main = _main()
-    project_score_scale = main._normalize_score_scale_max(
+    project_score_scale = normalize_score_scale_max(
         project_score_scale_max,
-        default=main.DEFAULT_SCORE_SCALE_MAX,
+        default=DEFAULT_SCORE_SCALE_MAX,
     )
-    gt_for_learning = main._ground_truth_record_for_learning(
+    gt_for_learning = ground_truth_record_for_learning(
         gt_record,
         default_score_scale_max=project_score_scale_max,
     )
-    actual_score_100 = main._to_float_or_none(gt_for_learning.get("final_score"))
+    actual_score_100 = to_float_or_none(gt_for_learning.get("final_score"))
     predicted_score_100 = resolve_report_predicted_score_100(
         report,
         project_score_scale_max=project_score_scale_max,
     )
     if actual_score_100 is None or predicted_score_100 is None:
-        return main._normalize_feedback_guardrail_state(
+        return normalize_feedback_guardrail_state(
             {
                 "blocked": False,
                 "status": "insufficient_score_context",
@@ -168,35 +208,36 @@ def build_ground_truth_feedback_guardrail(
                 "score_scale_max": project_score_scale,
                 "actual_score_raw": gt_for_learning.get("final_score_raw"),
                 "predicted_score_raw": (
-                    main._convert_score_from_100(predicted_score_100, project_score_scale)
+                    convert_score_from_100(predicted_score_100, project_score_scale)
                     if predicted_score_100 is not None
                     else None
                 ),
                 "current_score_raw": (
-                    main._convert_score_from_100(predicted_score_100, project_score_scale)
+                    convert_score_from_100(predicted_score_100, project_score_scale)
                     if predicted_score_100 is not None
                     else None
                 ),
-                "threshold_ratio": round(float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO), 4),
-            }
+            },
+            default_score_scale_max=project_score_scale,
+            default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
         )
 
-    actual_score_raw = main._to_float_or_none(gt_for_learning.get("final_score_raw"))
+    actual_score_raw = to_float_or_none(gt_for_learning.get("final_score_raw"))
     if actual_score_raw is None:
-        actual_score_raw = main._convert_score_from_100(actual_score_100, project_score_scale)
-    predicted_score_raw = main._convert_score_from_100(predicted_score_100, project_score_scale)
+        actual_score_raw = convert_score_from_100(actual_score_100, project_score_scale)
+    predicted_score_raw = convert_score_from_100(predicted_score_100, project_score_scale)
     abs_delta_100 = abs(float(actual_score_100) - float(predicted_score_100))
     abs_delta_raw = (
         abs(float(actual_score_raw) - float(predicted_score_raw))
         if actual_score_raw is not None and predicted_score_raw is not None
-        else main._convert_score_from_100(abs_delta_100, project_score_scale)
+        else convert_score_from_100(abs_delta_100, project_score_scale)
     )
     relative_delta_ratio = abs_delta_100 / 100.0
     blocked = relative_delta_ratio > float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO)
     consensus_auto_approval = _build_high_consensus_auto_approval(gt_for_learning=gt_for_learning)
     warning_message = ""
     if blocked and bool(consensus_auto_approval.get("eligible")):
-        delta_text = main._build_feedback_guardrail_delta_text(
+        delta_text = build_feedback_guardrail_delta_text(
             {
                 "score_scale_max": project_score_scale,
                 "abs_delta_raw": abs_delta_raw,
@@ -204,7 +245,7 @@ def build_ground_truth_feedback_guardrail(
             },
             default_score_scale_max=project_score_scale,
         )
-        return main._normalize_feedback_guardrail_state(
+        return normalize_feedback_guardrail_state(
             {
                 "blocked": False,
                 "threshold_blocked": True,
@@ -220,7 +261,6 @@ def build_ground_truth_feedback_guardrail(
                 "abs_delta_raw": abs_delta_raw,
                 "score_scale_max": project_score_scale,
                 "relative_delta_ratio": round(float(relative_delta_ratio), 4),
-                "threshold_ratio": round(float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO), 4),
                 "auto_approved_consensus": True,
                 "judge_score_avg": consensus_auto_approval.get("avg_score"),
                 "judge_score_span": consensus_auto_approval.get("score_span"),
@@ -241,10 +281,12 @@ def build_ground_truth_feedback_guardrail(
                     "已自动放行进入学习闭环。"
                 ),
                 "manual_override_hint": None,
-            }
+            },
+            default_score_scale_max=project_score_scale,
+            default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
         )
     if blocked:
-        delta_text = main._build_feedback_guardrail_delta_text(
+        delta_text = build_feedback_guardrail_delta_text(
             {
                 "score_scale_max": project_score_scale,
                 "abs_delta_raw": abs_delta_raw,
@@ -256,7 +298,7 @@ def build_ground_truth_feedback_guardrail(
             f"预测与真实总分偏差 {delta_text or '未提供'}，"
             "已暂停自动调权/自动校准，请人工确认后再执行「学习进化」或「一键闭环执行」。"
         )
-    return main._normalize_feedback_guardrail_state(
+    return normalize_feedback_guardrail_state(
         {
             "blocked": blocked,
             "threshold_blocked": blocked,
@@ -272,10 +314,11 @@ def build_ground_truth_feedback_guardrail(
             "abs_delta_raw": abs_delta_raw,
             "score_scale_max": project_score_scale,
             "relative_delta_ratio": round(float(relative_delta_ratio), 4),
-            "threshold_ratio": round(float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO), 4),
             "warning_message": warning_message or None,
             "manual_override_hint": "confirm_extreme_sample=1" if blocked else None,
-        }
+        },
+        default_score_scale_max=project_score_scale,
+        default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
     )
 
 
@@ -287,76 +330,14 @@ def build_ground_truth_learning_quality_gate(
 ) -> Dict[str, object]:
     del gt_record, project_score_scale_max
     main = _main()
-    report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
-    material_gate = (
-        report_meta.get("material_utilization_gate")
-        if isinstance(report_meta.get("material_utilization_gate"), dict)
-        else {}
-    )
-    evidence_trace = (
-        report_meta.get("evidence_trace")
-        if isinstance(report_meta.get("evidence_trace"), dict)
-        else {}
-    )
-    score_self_awareness = (
-        report_meta.get("score_self_awareness")
-        if isinstance(report_meta.get("score_self_awareness"), dict)
-        else {}
-    )
-    material_quality = (
-        report_meta.get("material_quality")
-        if isinstance(report_meta.get("material_quality"), dict)
-        else {}
-    )
-    awareness_score = main._to_float_or_none(score_self_awareness.get("score_0_100"))
-    awareness_level = str(score_self_awareness.get("level") or "").strip()
-    evidence_hits = int(main._to_float_or_none(evidence_trace.get("total_hits")) or 0)
-    material_gate_blocked = bool(material_gate.get("blocked"))
-    total_parsed_chars = int(
-        main._to_float_or_none(material_quality.get("total_parsed_chars")) or 0
-    )
-
-    reasons: List[str] = []
-    reason_labels: List[str] = []
-    if material_gate_blocked:
-        reasons.append("material_gate_blocked")
-        reason_labels.append("资料利用门禁未通过")
-    if awareness_score is not None and awareness_score < float(
-        main.DEFAULT_LEARNING_MIN_AWARENESS_SCORE
-    ):
-        reasons.append("low_score_self_awareness")
-        reason_labels.append(
-            f"评分自感知过低（{awareness_score:.1f} < {float(main.DEFAULT_LEARNING_MIN_AWARENESS_SCORE):.1f}）"
-        )
-    if evidence_hits < int(main.DEFAULT_LEARNING_MIN_EVIDENCE_HITS):
-        reasons.append("missing_evidence_hits")
-        reason_labels.append(
-            f"证据命中不足（{evidence_hits} < {int(main.DEFAULT_LEARNING_MIN_EVIDENCE_HITS)}）"
-        )
-    blocked = bool(reasons)
-    warning_message = None
-    if blocked and reason_labels:
-        warning_message = (
-            "当前真实评分样本未纳入自动学习："
-            + "；".join(reason_labels)
-            + "。建议先补齐资料、重评分或修复证据链后再学习。"
-        )
-    return main._normalize_learning_quality_gate_state(
-        {
-            "blocked": blocked,
-            "status": "blocked" if blocked else "accepted",
-            "reasons": reasons,
-            "score_self_awareness_score": (
-                round(float(awareness_score), 2) if awareness_score is not None else None
-            ),
-            "score_self_awareness_level": awareness_level or None,
-            "evidence_hits": evidence_hits,
-            "material_gate_blocked": material_gate_blocked,
-            "total_parsed_chars": total_parsed_chars,
-            "min_awareness_score": round(float(main.DEFAULT_LEARNING_MIN_AWARENESS_SCORE), 2),
-            "min_evidence_hits": int(main.DEFAULT_LEARNING_MIN_EVIDENCE_HITS),
-            "warning_message": warning_message,
-        }
+    return normalize_learning_quality_gate_state(
+        build_learning_quality_gate_payload(
+            report,
+            min_awareness_score=float(main.DEFAULT_LEARNING_MIN_AWARENESS_SCORE),
+            min_evidence_hits=int(main.DEFAULT_LEARNING_MIN_EVIDENCE_HITS),
+        ),
+        default_min_awareness_score=float(main.DEFAULT_LEARNING_MIN_AWARENESS_SCORE),
+        default_min_evidence_hits=int(main.DEFAULT_LEARNING_MIN_EVIDENCE_HITS),
     )
 
 
@@ -370,7 +351,11 @@ def capture_ground_truth_few_shot_features(
     feature_confidence_update: Dict[str, object],
 ) -> Dict[str, object]:
     main = _main()
-    normalized_guardrail = main._normalize_feedback_guardrail_state(feedback_guardrail)
+    normalized_guardrail = normalize_feedback_guardrail_state(
+        feedback_guardrail,
+        default_score_scale_max=DEFAULT_SCORE_SCALE_MAX,
+        default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
+    )
     if (
         bool(normalized_guardrail.get("threshold_blocked"))
         and str(normalized_guardrail.get("manual_review_status") or "").strip().lower()
@@ -381,16 +366,18 @@ def capture_ground_truth_few_shot_features(
         return {
             "captured": 0,
             "reason": "learning_quality_blocked",
-            "learning_quality_gate": main._normalize_learning_quality_gate_state(
-                learning_quality_gate
+            "learning_quality_gate": normalize_learning_quality_gate_state(
+                learning_quality_gate,
+                default_min_awareness_score=float(main.DEFAULT_LEARNING_MIN_AWARENESS_SCORE),
+                default_min_evidence_hits=int(main.DEFAULT_LEARNING_MIN_EVIDENCE_HITS),
             ),
         }
 
-    gt_for_learning = main._ground_truth_record_for_learning(
+    gt_for_learning = ground_truth_record_for_learning(
         gt_record,
         default_score_scale_max=project_score_scale_max,
     )
-    actual_score_100 = float(main._to_float_or_none(gt_for_learning.get("final_score")) or 0.0)
+    actual_score_100 = float(to_float_or_none(gt_for_learning.get("final_score")) or 0.0)
     if actual_score_100 < float(main.DEFAULT_FEW_SHOT_MIN_HIGH_SCORE_100):
         return {
             "captured": 0,
@@ -401,15 +388,15 @@ def capture_ground_truth_few_shot_features(
             ),
         }
 
-    candidate_dimensions = main._select_ground_truth_few_shot_dimensions(
+    candidate_dimensions = select_ground_truth_few_shot_dimensions(
         report=report,
         feature_confidence_update=feature_confidence_update,
     )
     if not candidate_dimensions:
         return {"captured": 0, "reason": "no_candidate_dimensions"}
 
-    tags = main._flatten_ground_truth_qualitative_tags(gt_record)
-    existing_distillation = main._normalize_few_shot_distillation_state(
+    tags = flatten_ground_truth_qualitative_tags(gt_record)
+    existing_distillation = normalize_few_shot_distillation_state(
         gt_record.get("few_shot_distillation")
     )
     existing_review_status = (
@@ -425,8 +412,8 @@ def capture_ground_truth_few_shot_features(
     feature_ids: List[str] = []
     for dim_id in candidate_dimensions:
         dim_name = ((main.DIMENSIONS.get(dim_id) or {}).get("name") or dim_id).strip()
-        evidence_texts = main._collect_dimension_evidence_texts(report, dimension_id=dim_id)
-        guidance_texts = main._collect_dimension_guidance_texts(report, dimension_id=dim_id)
+        evidence_texts = collect_dimension_evidence_texts(report, dimension_id=dim_id)
+        guidance_texts = collect_dimension_guidance_texts(report, dimension_id=dim_id)
         source_highlights = [*tags[:3], *evidence_texts[:3], *guidance_texts[:2]]
         source_parts: List[str] = [f"维度：{dim_name}"]
         if tags:
@@ -442,6 +429,7 @@ def capture_ground_truth_few_shot_features(
             confidence_score=0.7,
             governance_status=feature_governance_status,
             source_record_ids=[str(gt_record.get("id") or "").strip()],
+            source_project_ids=[str(gt_record.get("project_id") or "").strip()],
             source_highlights=source_highlights,
         )
         if feature is None:
@@ -453,6 +441,13 @@ def capture_ground_truth_few_shot_features(
         return {"captured": 0, "reason": "feature_distillation_empty"}
 
     upsert_result = main.upsert_distilled_features(distilled_features)
+    resolved_feature_ids = [
+        str(item or "").strip()
+        for item in (upsert_result.get("resolved_feature_ids") or [])
+        if str(item or "").strip()
+    ]
+    if len(resolved_feature_ids) == len(feature_ids):
+        feature_ids = resolved_feature_ids
     response: Dict[str, object] = {
         "captured": len(distilled_features),
         "reason": "captured",
@@ -483,8 +478,10 @@ def capture_ground_truth_few_shot_features(
 def sync_ground_truth_record_to_qingtian(
     project_id: str,
     gt_record: Dict[str, object],
+    *,
+    storage: StorageAccess | None = None,
 ) -> Dict[str, object]:
-    main = _main()
+    main = _main(storage)
     projects = main.load_projects()
     project = main._find_project(project_id, projects)
     config = main.load_config()
@@ -614,8 +611,8 @@ def sync_ground_truth_record_to_qingtian(
         ),
         None,
     )
-    project_score_scale = main._resolve_project_score_scale_max(project)
-    gt_for_learning = main._ground_truth_record_for_learning(
+    project_score_scale = resolve_project_score_scale_max(project)
+    gt_for_learning = ground_truth_record_for_learning(
         gt_record,
         default_score_scale_max=project_score_scale,
     )
@@ -632,8 +629,10 @@ def sync_ground_truth_record_to_qingtian(
                 gt_record=gt_record,
                 project_score_scale_max=project_score_scale,
             )
-            existing_guardrail = main._normalize_feedback_guardrail_state(
-                gt_record.get("feedback_guardrail")
+            existing_guardrail = normalize_feedback_guardrail_state(
+                gt_record.get("feedback_guardrail"),
+                default_score_scale_max=project_score_scale,
+                default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
             )
             if bool(feedback_guardrail.get("threshold_blocked")) and str(
                 existing_guardrail.get("manual_review_status") or ""
@@ -667,7 +666,13 @@ def sync_ground_truth_record_to_qingtian(
         "retired": 0,
         "reason": "not_executed",
     }
-    if bool(main._feedback_guardrail_blocks_training(feedback_guardrail)):
+    if bool(
+        feedback_guardrail_blocks_training(
+            feedback_guardrail,
+            default_score_scale_max=project_score_scale,
+            default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
+        )
+    ):
         feature_confidence_update = {
             "updated": 0,
             "retired": 0,
@@ -681,8 +686,10 @@ def sync_ground_truth_record_to_qingtian(
             "updated": 0,
             "retired": 0,
             "reason": "learning_quality_blocked",
-            "learning_quality_gate": main._normalize_learning_quality_gate_state(
-                learning_quality_gate
+            "learning_quality_gate": normalize_learning_quality_gate_state(
+                learning_quality_gate,
+                default_min_awareness_score=float(main.DEFAULT_LEARNING_MIN_AWARENESS_SCORE),
+                default_min_evidence_hits=int(main.DEFAULT_LEARNING_MIN_EVIDENCE_HITS),
             ),
         }
     elif isinstance(report_for_feedback, dict):
@@ -709,8 +716,10 @@ def sync_ground_truth_record_to_qingtian(
         few_shot_distillation = {
             "captured": 0,
             "reason": "learning_quality_blocked",
-            "learning_quality_gate": main._normalize_learning_quality_gate_state(
-                learning_quality_gate
+            "learning_quality_gate": normalize_learning_quality_gate_state(
+                learning_quality_gate,
+                default_min_awareness_score=float(main.DEFAULT_LEARNING_MIN_AWARENESS_SCORE),
+                default_min_evidence_hits=int(main.DEFAULT_LEARNING_MIN_EVIDENCE_HITS),
             ),
         }
     elif isinstance(report_for_feedback, dict):
@@ -736,12 +745,18 @@ def sync_ground_truth_record_to_qingtian(
         for row in all_gt_records:
             if str(row.get("id") or "") != source_gt_id:
                 continue
-            row["feedback_guardrail"] = main._normalize_feedback_guardrail_state(feedback_guardrail)
-            row["learning_quality_gate"] = main._normalize_learning_quality_gate_state(
-                learning_quality_gate
+            row["feedback_guardrail"] = normalize_feedback_guardrail_state(
+                feedback_guardrail,
+                default_score_scale_max=project_score_scale,
+                default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
+            )
+            row["learning_quality_gate"] = normalize_learning_quality_gate_state(
+                learning_quality_gate,
+                default_min_awareness_score=float(main.DEFAULT_LEARNING_MIN_AWARENESS_SCORE),
+                default_min_evidence_hits=int(main.DEFAULT_LEARNING_MIN_EVIDENCE_HITS),
             )
             row["feature_confidence_update"] = feature_confidence_update
-            row["few_shot_distillation"] = main._normalize_few_shot_distillation_state(
+            row["few_shot_distillation"] = normalize_few_shot_distillation_state(
                 few_shot_distillation
             )
             row["updated_at"] = main._now_iso()
@@ -768,6 +783,7 @@ def sync_ground_truth_record_to_qingtian(
                 ],
                 "raw_payload": {
                     "ground_truth_record_id": source_gt_id,
+                    "project_id": project_id,
                     "source": gt_record.get("source"),
                     "judge_scores": gt_record.get("judge_scores"),
                     "final_score": gt_record.get("final_score"),
@@ -799,6 +815,7 @@ def sync_ground_truth_record_to_qingtian(
             }
         ]
         raw_payload["ground_truth_record_id"] = source_gt_id
+        raw_payload["project_id"] = project_id
         raw_payload["source"] = gt_record.get("source")
         raw_payload["judge_scores"] = gt_record.get("judge_scores")
         raw_payload["final_score"] = gt_record.get("final_score")
@@ -837,8 +854,9 @@ def run_feedback_closed_loop(
     locale: str,
     trigger: str,
     ground_truth_record_ids: Optional[List[str]] = None,
+    storage: StorageAccess | None = None,
 ) -> Dict[str, object]:
-    main = _main()
+    main = _main(storage)
     result: Dict[str, object] = {
         "ok": True,
         "project_id": project_id,
@@ -849,9 +867,12 @@ def run_feedback_closed_loop(
         "auto_run": None,
         "evolution_refresh": {"refreshed": False},
     }
-    feedback_guardrail = main._summarize_project_feedback_guardrail(
+    feedback_guardrail = summarize_project_feedback_guardrail(
         project_id,
         record_ids=ground_truth_record_ids,
+        rows=main.load_ground_truth(),
+        default_score_scale_max=DEFAULT_SCORE_SCALE_MAX,
+        default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
     )
     result["feedback_guardrail"] = feedback_guardrail
     selected_rows = [
@@ -865,7 +886,13 @@ def run_feedback_closed_loop(
         )
     ]
     training_blocked_rows = [
-        row for row in selected_rows if main._feedback_guardrail_blocks_training(row)
+        row
+        for row in selected_rows
+        if feedback_guardrail_blocks_training(
+            row,
+            default_score_scale_max=DEFAULT_SCORE_SCALE_MAX,
+            default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
+        )
     ]
     try:
         main._refresh_project_reflection_objects(project_id)
@@ -905,7 +932,13 @@ def run_feedback_closed_loop(
         blocked_record_ids = [str(row.get("id") or "").strip() for row in training_blocked_rows]
         deltas = [
             float(
-                main._to_float_or_none(main._extract_feedback_guardrail(row).get("abs_delta_100"))
+                to_float_or_none(
+                    extract_feedback_guardrail(
+                        row,
+                        default_score_scale_max=DEFAULT_SCORE_SCALE_MAX,
+                        default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
+                    ).get("abs_delta_100")
+                )
                 or 0.0
             )
             for row in training_blocked_rows
@@ -977,7 +1010,7 @@ def run_feedback_closed_loop(
                         (project or {}).get("scoring_engine_version_locked") or "v2"
                     ),
                     scope="project",
-                    score_scale_max=main._resolve_project_score_scale_max(project or {}),
+                    score_scale_max=resolve_project_score_scale_max(project or {}),
                     force_unlock=True,
                 ),
                 locale=locale,
@@ -1030,8 +1063,9 @@ def run_feedback_closed_loop_safe(
     locale: str,
     trigger: str,
     ground_truth_record_ids: Optional[List[str]] = None,
+    storage: StorageAccess | None = None,
 ) -> Dict[str, object]:
-    main = _main()
+    main = _main(storage)
     try:
         if ground_truth_record_ids:
             raw_result = main._run_feedback_closed_loop(
@@ -1095,47 +1129,68 @@ def finalize_ground_truth_learning_record(
     *,
     locale: str,
     trigger: str,
+    storage: StorageAccess | None = None,
 ) -> Dict[str, object]:
-    main = _main()
+    main = _main(storage)
     sync_result = main._sync_ground_truth_record_to_qingtian(project_id, record)
     sync_payload = sync_result if isinstance(sync_result, dict) else {}
     feedback_guardrail = sync_payload.get("feedback_guardrail")
     learning_quality_gate = sync_payload.get("learning_quality_gate")
     few_shot_distillation = sync_payload.get("few_shot_distillation")
-    record["feedback_guardrail"] = main._normalize_feedback_guardrail_state(feedback_guardrail)
-    record["learning_quality_gate"] = main._normalize_learning_quality_gate_state(
-        learning_quality_gate
+    record["feedback_guardrail"] = normalize_feedback_guardrail_state(
+        feedback_guardrail,
+        default_score_scale_max=DEFAULT_SCORE_SCALE_MAX,
+        default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
     )
-    record["few_shot_distillation"] = main._normalize_few_shot_distillation_state(
-        few_shot_distillation
+    record["learning_quality_gate"] = normalize_learning_quality_gate_state(
+        learning_quality_gate,
+        default_min_awareness_score=float(main.DEFAULT_LEARNING_MIN_AWARENESS_SCORE),
+        default_min_evidence_hits=int(main.DEFAULT_LEARNING_MIN_EVIDENCE_HITS),
     )
+    record["few_shot_distillation"] = normalize_few_shot_distillation_state(few_shot_distillation)
     record["feedback_closed_loop"] = main._run_feedback_closed_loop_safe(
         project_id,
         locale=locale,
         trigger=trigger,
         ground_truth_record_ids=[str(record.get("id") or "")],
     )
-    return main._persist_ground_truth_record_fields(
+    return _persist_ground_truth_record_fields(
+        main,
         project_id,
         str(record.get("id") or ""),
         updates={
-            "feedback_guardrail": main._extract_feedback_guardrail(record),
-            "learning_quality_gate": main._extract_learning_quality_gate(record),
-            "few_shot_distillation": main._normalize_few_shot_distillation_state(
+            "feedback_guardrail": extract_feedback_guardrail(
+                record,
+                default_score_scale_max=DEFAULT_SCORE_SCALE_MAX,
+                default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
+            ),
+            "learning_quality_gate": extract_learning_quality_gate(
+                record,
+                default_min_awareness_score=float(main.DEFAULT_LEARNING_MIN_AWARENESS_SCORE),
+                default_min_evidence_hits=int(main.DEFAULT_LEARNING_MIN_EVIDENCE_HITS),
+            ),
+            "few_shot_distillation": normalize_few_shot_distillation_state(
                 record.get("few_shot_distillation")
             ),
             "feedback_closed_loop": record.get("feedback_closed_loop") or {},
         },
+        updated_at=main._now_iso(),
     )
 
 
 def refresh_project_ground_truth_learning_records(
     project_id: str,
+    *,
+    storage: StorageAccess | None = None,
 ) -> Dict[str, object]:
-    main = _main()
+    main = _main(storage)
 
     def _needs_refresh(row: Dict[str, object]) -> bool:
-        guardrail = main._normalize_feedback_guardrail_state(row.get("feedback_guardrail"))
+        guardrail = normalize_feedback_guardrail_state(
+            row.get("feedback_guardrail"),
+            default_score_scale_max=DEFAULT_SCORE_SCALE_MAX,
+            default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
+        )
         guardrail_review_status = str(guardrail.get("manual_review_status") or "").strip().lower()
         if bool(guardrail.get("threshold_blocked")) or guardrail_review_status in {
             "pending",
@@ -1143,8 +1198,8 @@ def refresh_project_ground_truth_learning_records(
             "rejected",
         }:
             return True
-        distillation = main._normalize_few_shot_distillation_state(row.get("few_shot_distillation"))
-        if int(main._to_float_or_none(distillation.get("captured")) or 0) <= 0:
+        distillation = normalize_few_shot_distillation_state(row.get("few_shot_distillation"))
+        if int(to_float_or_none(distillation.get("captured")) or 0) <= 0:
             return False
         few_shot_review_status = str(distillation.get("manual_review_status") or "").strip().lower()
         return few_shot_review_status == "pending"
@@ -1161,8 +1216,10 @@ def refresh_project_ground_truth_learning_records(
     for row in rows:
         try:
             sync_result = main._sync_ground_truth_record_to_qingtian(project_id, row)
-            guardrail = main._normalize_feedback_guardrail_state(
-                (sync_result or {}).get("feedback_guardrail")
+            guardrail = normalize_feedback_guardrail_state(
+                (sync_result or {}).get("feedback_guardrail"),
+                default_score_scale_max=DEFAULT_SCORE_SCALE_MAX,
+                default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
             )
             refreshed += 1
             if bool(guardrail.get("blocked")):
@@ -1190,8 +1247,9 @@ def finalize_ground_truth_batch_learning_records(
     *,
     locale: str,
     trigger: str,
+    storage: StorageAccess | None = None,
 ) -> List[Dict[str, object]]:
-    main = _main()
+    main = _main(storage)
     success_record_ids: List[str] = []
     for item in items:
         record = item.get("record")
@@ -1203,13 +1261,17 @@ def finalize_ground_truth_batch_learning_records(
             feedback_guardrail = sync_payload.get("feedback_guardrail")
             learning_quality_gate = sync_payload.get("learning_quality_gate")
             few_shot_distillation = sync_payload.get("few_shot_distillation")
-            record["feedback_guardrail"] = main._normalize_feedback_guardrail_state(
-                feedback_guardrail
+            record["feedback_guardrail"] = normalize_feedback_guardrail_state(
+                feedback_guardrail,
+                default_score_scale_max=DEFAULT_SCORE_SCALE_MAX,
+                default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
             )
-            record["learning_quality_gate"] = main._normalize_learning_quality_gate_state(
-                learning_quality_gate
+            record["learning_quality_gate"] = normalize_learning_quality_gate_state(
+                learning_quality_gate,
+                default_min_awareness_score=float(main.DEFAULT_LEARNING_MIN_AWARENESS_SCORE),
+                default_min_evidence_hits=int(main.DEFAULT_LEARNING_MIN_EVIDENCE_HITS),
             )
-            record["few_shot_distillation"] = main._normalize_few_shot_distillation_state(
+            record["few_shot_distillation"] = normalize_few_shot_distillation_state(
                 few_shot_distillation
             )
             success_record_ids.append(str(record.get("id") or ""))
@@ -1236,9 +1298,17 @@ def finalize_ground_truth_batch_learning_records(
             if str(stored_row.get("id") or "") != record_id:
                 continue
             merged = dict(stored_row)
-            merged["feedback_guardrail"] = main._extract_feedback_guardrail(record)
-            merged["learning_quality_gate"] = main._extract_learning_quality_gate(record)
-            merged["few_shot_distillation"] = main._normalize_few_shot_distillation_state(
+            merged["feedback_guardrail"] = extract_feedback_guardrail(
+                record,
+                default_score_scale_max=DEFAULT_SCORE_SCALE_MAX,
+                default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
+            )
+            merged["learning_quality_gate"] = extract_learning_quality_gate(
+                record,
+                default_min_awareness_score=float(main.DEFAULT_LEARNING_MIN_AWARENESS_SCORE),
+                default_min_evidence_hits=int(main.DEFAULT_LEARNING_MIN_EVIDENCE_HITS),
+            )
+            merged["few_shot_distillation"] = normalize_few_shot_distillation_state(
                 record.get("few_shot_distillation")
             )
             merged["feedback_closed_loop"] = closed_loop_result

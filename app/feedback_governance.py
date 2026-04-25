@@ -1,15 +1,148 @@
 from __future__ import annotations
 
 import copy
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from fastapi import HTTPException
 
+from app.application.runtime_facade import RuntimeModuleFacade
+from app.application.storage_access import StorageAccess
+from app.bootstrap.storage import get_storage_access
+from app.domain.governance.artifact_versions import (
+    artifact_payload_fingerprint,
+    artifact_summary_delta,
+    build_artifact_version_history,
+    summarize_versioned_artifact_payload,
+)
+from app.domain.governance.review_state import (
+    apply_feedback_guardrail_review_state,
+    apply_few_shot_review_state,
+)
+from app.domain.learning.feedback_guardrails import (
+    extract_feedback_guardrail,
+    normalize_feedback_guardrail_state,
+)
+from app.domain.learning.feedback_state import normalize_few_shot_distillation_state
+from app.domain.learning.few_shot_support import (
+    normalize_dimension_id,
+    resolve_distillation_feature_ids_for_record,
+)
+from app.domain.learning.ground_truth_records import (
+    DEFAULT_SCORE_SCALE_MAX,
+    ground_truth_record_for_learning,
+    resolve_project_score_scale_max,
+    score_scale_label,
+    to_float_or_none,
+)
+from app.domain.learning.project_feedback_views import (
+    collect_blocked_ground_truth_guardrails,
+    list_project_ground_truth_records,
+    summarize_project_feedback_guardrail,
+)
 
-def _main():
-    import app.main as main_mod
 
-    return main_mod
+def _main(storage: StorageAccess | None = None):
+    from app.application import runtime as main_mod
+
+    return RuntimeModuleFacade(main_mod, storage=storage or get_storage_access())
+
+
+def _persist_ground_truth_record_fields(
+    main: RuntimeModuleFacade,
+    project_id: str,
+    record_id: str,
+    *,
+    updates: Dict[str, object],
+    updated_at: str,
+) -> Dict[str, object]:
+    records = main.load_ground_truth()
+    updated_row = None
+    for idx, row in enumerate(records):
+        if str(row.get("project_id") or "") != str(project_id):
+            continue
+        if str(row.get("id") or "") != str(record_id):
+            continue
+        merged = dict(row)
+        merged.update(updates)
+        merged["updated_at"] = updated_at
+        records[idx] = merged
+        updated_row = merged
+        break
+    if updated_row is None:
+        raise HTTPException(status_code=404, detail="真实评标记录不存在")
+    main.save_ground_truth(records)
+    return updated_row
+
+
+def _governance_artifact_spec(main: RuntimeModuleFacade, artifact: str) -> Dict[str, object]:
+    specs = {
+        "high_score_features": {
+            "path": main.HIGH_SCORE_FEATURES_PATH,
+            "default_payload": [],
+        },
+        "evolution_reports": {
+            "path": main.EVOLUTION_REPORTS_PATH,
+            "default_payload": {},
+        },
+        "calibration_models": {
+            "path": main.CALIBRATION_MODELS_PATH,
+            "default_payload": [],
+        },
+        "expert_profiles": {
+            "path": main.EXPERT_PROFILES_PATH,
+            "default_payload": [],
+        },
+    }
+    spec = specs.get(str(artifact or "").strip())
+    if not isinstance(spec, dict):
+        raise HTTPException(status_code=404, detail="历史版本配置不存在")
+    return spec
+
+
+def _summarize_governance_artifact_payload(
+    main: RuntimeModuleFacade,
+    artifact: str,
+    payload: object,
+    *,
+    project_id: str,
+) -> Dict[str, object]:
+    return summarize_versioned_artifact_payload(
+        artifact,
+        payload,
+        project_id=project_id,
+        normalize_dimension_id=normalize_dimension_id,
+        calibrator_auto_review_state=main._calibrator_auto_review_state,
+        calibrator_bootstrap_small_sample=main._calibrator_bootstrap_small_sample,
+        calibrator_deployment_mode=main._calibrator_deployment_mode,
+    )
+
+
+def _governance_version_targets(main: RuntimeModuleFacade) -> list[tuple[str, Path]]:
+    return [
+        ("high_score_features", main.HIGH_SCORE_FEATURES_PATH),
+        ("evolution_reports", main.EVOLUTION_REPORTS_PATH),
+        ("calibration_models", main.CALIBRATION_MODELS_PATH),
+        ("expert_profiles", main.EXPERT_PROFILES_PATH),
+    ]
+
+
+def _resolve_record_distillation_feature_ids(
+    main: RuntimeModuleFacade,
+    record: Dict[str, object],
+    distillation: Dict[str, object],
+    *,
+    ground_truth_rows: Optional[List[Dict[str, object]]] = None,
+    features: Optional[List[object]] = None,
+) -> List[str]:
+    return resolve_distillation_feature_ids_for_record(
+        record,
+        distillation,
+        features=features if features is not None else main.load_feature_kb(),
+        ground_truth_rows=ground_truth_rows
+        if ground_truth_rows is not None
+        else main.load_ground_truth(),
+    )
 
 
 def build_feedback_governance_report(
@@ -18,25 +151,39 @@ def build_feedback_governance_report(
     *,
     artifact_payload_overrides: Optional[Dict[str, object]] = None,
     ground_truth_rows_override: Optional[List[Dict[str, object]]] = None,
+    storage: StorageAccess | None = None,
 ) -> Dict[str, object]:
-    main = _main()
-    project_score_scale = main._resolve_project_score_scale_max(project)
-    all_rows = main._list_project_ground_truth_records(
+    main = _main(storage)
+    source_rows = (
+        ground_truth_rows_override
+        if isinstance(ground_truth_rows_override, list)
+        else main.load_ground_truth()
+    )
+    project_score_scale = resolve_project_score_scale_max(project)
+    all_rows = list_project_ground_truth_records(
         project_id,
+        rows=source_rows,
         include_guardrail_blocked=True,
-        rows_override=ground_truth_rows_override,
+        default_score_scale_max=DEFAULT_SCORE_SCALE_MAX,
+        default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
     )
-    active_rows = main._list_project_ground_truth_records(
+    active_rows = list_project_ground_truth_records(
         project_id,
-        rows_override=ground_truth_rows_override,
+        rows=source_rows,
+        default_score_scale_max=DEFAULT_SCORE_SCALE_MAX,
+        default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
     )
-    blocked_rows = main._collect_blocked_ground_truth_guardrails(
+    blocked_rows = collect_blocked_ground_truth_guardrails(
         project_id,
-        rows_override=ground_truth_rows_override,
+        rows=source_rows,
+        default_score_scale_max=DEFAULT_SCORE_SCALE_MAX,
+        default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
     )
-    summary_guardrail = main._summarize_project_feedback_guardrail(
+    summary_guardrail = summarize_project_feedback_guardrail(
         project_id,
-        rows_override=ground_truth_rows_override,
+        rows=source_rows,
+        default_score_scale_max=DEFAULT_SCORE_SCALE_MAX,
+        default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
     )
     approved_extreme_count = 0
     rejected_extreme_count = 0
@@ -49,7 +196,11 @@ def build_feedback_governance_report(
 
     blocked_samples: List[Dict[str, object]] = []
     for item in blocked_rows[:12]:
-        guardrail = main._normalize_feedback_guardrail_state(item.get("feedback_guardrail"))
+        guardrail = normalize_feedback_guardrail_state(
+            item.get("feedback_guardrail"),
+            default_score_scale_max=project_score_scale,
+            default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
+        )
         record_id = str(item.get("record_id") or "")
         row = next(
             (candidate for candidate in all_rows if str(candidate.get("id") or "") == record_id), {}
@@ -61,23 +212,20 @@ def build_feedback_governance_report(
                 "source_submission_filename": str(row.get("source_submission_filename") or ""),
                 "source": str(row.get("source") or ""),
                 "score_scale_max": int(
-                    main._to_float_or_none(guardrail.get("score_scale_max")) or project_score_scale
+                    to_float_or_none(guardrail.get("score_scale_max")) or project_score_scale
                 ),
                 "score_scale_label": str(
-                    guardrail.get("score_scale_label")
-                    or main._score_scale_label(project_score_scale)
+                    guardrail.get("score_scale_label") or score_scale_label(project_score_scale)
                 ),
-                "actual_score": main._to_float_or_none(guardrail.get("actual_score_raw")),
-                "predicted_score": main._to_float_or_none(guardrail.get("predicted_score_raw")),
-                "current_score": main._to_float_or_none(guardrail.get("current_score_raw")),
-                "abs_delta": main._to_float_or_none(guardrail.get("abs_delta_raw")),
-                "actual_score_100": main._to_float_or_none(guardrail.get("actual_score_100")),
-                "predicted_score_100": main._to_float_or_none(guardrail.get("predicted_score_100")),
-                "current_score_100": main._to_float_or_none(guardrail.get("current_score_100")),
-                "abs_delta_100": main._to_float_or_none(guardrail.get("abs_delta_100")),
-                "relative_delta_ratio": main._to_float_or_none(
-                    guardrail.get("relative_delta_ratio")
-                ),
+                "actual_score": to_float_or_none(guardrail.get("actual_score_raw")),
+                "predicted_score": to_float_or_none(guardrail.get("predicted_score_raw")),
+                "current_score": to_float_or_none(guardrail.get("current_score_raw")),
+                "abs_delta": to_float_or_none(guardrail.get("abs_delta_raw")),
+                "actual_score_100": to_float_or_none(guardrail.get("actual_score_100")),
+                "predicted_score_100": to_float_or_none(guardrail.get("predicted_score_100")),
+                "current_score_100": to_float_or_none(guardrail.get("current_score_100")),
+                "abs_delta_100": to_float_or_none(guardrail.get("abs_delta_100")),
+                "relative_delta_ratio": to_float_or_none(guardrail.get("relative_delta_ratio")),
                 "warning_message": str(guardrail.get("warning_message") or ""),
                 "manual_review_status": str(guardrail.get("manual_review_status") or ""),
                 "manual_review_note": str(guardrail.get("manual_review_note") or ""),
@@ -88,7 +236,11 @@ def build_feedback_governance_report(
     few_shot_recent: List[Dict[str, object]] = []
     captured_recent_count = 0
     for row in all_rows:
-        guardrail = main._extract_feedback_guardrail(row)
+        guardrail = extract_feedback_guardrail(
+            row,
+            default_score_scale_max=project_score_scale,
+            default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
+        )
         if bool(guardrail.get("threshold_blocked")):
             review_status = str(guardrail.get("manual_review_status") or "pending")
             if review_status == "approved":
@@ -123,45 +275,38 @@ def build_feedback_governance_report(
                             "reviewed_at": str(guardrail.get("manual_reviewed_at") or ""),
                             "review_note": str(guardrail.get("manual_review_note") or ""),
                             "score_scale_max": int(
-                                main._to_float_or_none(guardrail.get("score_scale_max"))
+                                to_float_or_none(guardrail.get("score_scale_max"))
                                 or project_score_scale
                             ),
                             "score_scale_label": str(
                                 guardrail.get("score_scale_label")
-                                or main._score_scale_label(project_score_scale)
+                                or score_scale_label(project_score_scale)
                             ),
-                            "actual_score": main._to_float_or_none(
-                                guardrail.get("actual_score_raw")
-                            ),
-                            "predicted_score": main._to_float_or_none(
+                            "actual_score": to_float_or_none(guardrail.get("actual_score_raw")),
+                            "predicted_score": to_float_or_none(
                                 guardrail.get("predicted_score_raw")
                             ),
-                            "current_score": main._to_float_or_none(
-                                guardrail.get("current_score_raw")
-                            ),
-                            "abs_delta": main._to_float_or_none(guardrail.get("abs_delta_raw")),
-                            "actual_score_100": main._to_float_or_none(
-                                guardrail.get("actual_score_100")
-                            ),
-                            "predicted_score_100": main._to_float_or_none(
+                            "current_score": to_float_or_none(guardrail.get("current_score_raw")),
+                            "abs_delta": to_float_or_none(guardrail.get("abs_delta_raw")),
+                            "actual_score_100": to_float_or_none(guardrail.get("actual_score_100")),
+                            "predicted_score_100": to_float_or_none(
                                 guardrail.get("predicted_score_100")
                             ),
-                            "current_score_100": main._to_float_or_none(
+                            "current_score_100": to_float_or_none(
                                 guardrail.get("current_score_100")
                             ),
-                            "abs_delta_100": main._to_float_or_none(guardrail.get("abs_delta_100")),
+                            "abs_delta_100": to_float_or_none(guardrail.get("abs_delta_100")),
                             "closed_loop_effect": {
                                 "weight_updated": bool(weight_update.get("updated")),
                                 "delta_case_count": int(
-                                    main._to_float_or_none(auto_run.get("delta_cases")) or 0
+                                    to_float_or_none(auto_run.get("delta_cases")) or 0
                                 ),
                                 "calibration_sample_count": int(
-                                    main._to_float_or_none(auto_run.get("calibration_samples")) or 0
+                                    to_float_or_none(auto_run.get("calibration_samples")) or 0
                                 ),
                                 "calibrator_version": str(auto_run.get("calibrator_version") or ""),
                                 "evolution_refresh_sample_count": int(
-                                    main._to_float_or_none(evolution_refresh.get("sample_count"))
-                                    or 0
+                                    to_float_or_none(evolution_refresh.get("sample_count")) or 0
                                 ),
                             },
                         }
@@ -175,8 +320,8 @@ def build_feedback_governance_report(
         key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""),
         reverse=True,
     ):
-        distill = main._normalize_few_shot_distillation_state(row.get("few_shot_distillation"))
-        captured = int(main._to_float_or_none(distill.get("captured")) or 0)
+        distill = normalize_few_shot_distillation_state(row.get("few_shot_distillation"))
+        captured = int(to_float_or_none(distill.get("captured")) or 0)
         reason_text = str(distill.get("reason") or "").strip()
         if captured > 0:
             captured_recent_count += 1
@@ -191,9 +336,9 @@ def build_feedback_governance_report(
                             "review_note": str(distill.get("manual_review_note") or ""),
                             "captured": captured,
                             "dimension_ids": [
-                                main._normalize_dimension_id(item)
+                                normalize_dimension_id(item)
                                 for item in (distill.get("dimension_ids") or [])
-                                if main._normalize_dimension_id(item)
+                                if normalize_dimension_id(item)
                             ],
                             "feature_ids": [
                                 str(item or "").strip()
@@ -210,7 +355,7 @@ def build_feedback_governance_report(
             continue
         if captured <= 0 and not reason_text:
             continue
-        normalized_row = main._ground_truth_record_for_learning(
+        normalized_row = ground_truth_record_for_learning(
             row if isinstance(row, dict) else {},
             default_score_scale_max=project_score_scale,
         )
@@ -219,25 +364,24 @@ def build_feedback_governance_report(
                 "record_id": str(row.get("id") or ""),
                 "created_at": str(row.get("updated_at") or row.get("created_at") or ""),
                 "score_scale_max": int(
-                    main._to_float_or_none(normalized_row.get("score_scale_max"))
-                    or project_score_scale
+                    to_float_or_none(normalized_row.get("score_scale_max")) or project_score_scale
                 ),
                 "score_scale_label": str(
-                    main._score_scale_label(
+                    score_scale_label(
                         int(
-                            main._to_float_or_none(normalized_row.get("score_scale_max"))
+                            to_float_or_none(normalized_row.get("score_scale_max"))
                             or project_score_scale
                         )
                     )
                 ),
-                "actual_score": main._to_float_or_none(normalized_row.get("final_score_raw")),
-                "actual_score_100": main._to_float_or_none(normalized_row.get("final_score")),
+                "actual_score": to_float_or_none(normalized_row.get("final_score_raw")),
+                "actual_score_100": to_float_or_none(normalized_row.get("final_score")),
                 "captured": captured,
                 "reason": reason_text,
                 "dimension_ids": [
-                    main._normalize_dimension_id(item)
+                    normalize_dimension_id(item)
                     for item in (distill.get("dimension_ids") or [])
-                    if main._normalize_dimension_id(item)
+                    if normalize_dimension_id(item)
                 ],
                 "feature_ids": [
                     str(item or "").strip()
@@ -250,31 +394,40 @@ def build_feedback_governance_report(
             }
         )
 
-    version_targets = [
-        ("high_score_features", main.HIGH_SCORE_FEATURES_PATH),
-        ("evolution_reports", main.EVOLUTION_REPORTS_PATH),
-        ("calibration_models", main.CALIBRATION_MODELS_PATH),
-        ("expert_profiles", main.EXPERT_PROFILES_PATH),
-    ]
-    version_history: List[Dict[str, object]] = []
-    for artifact, path in version_targets:
-        versions = main.list_json_versions(path)
-        latest = versions[0] if versions else {}
-        version_history.append(
-            {
-                "artifact": artifact,
-                "version_count": len(versions),
-                "latest_version_id": str(latest.get("version_id") or ""),
-                "latest_created_at": str(latest.get("created_at") or ""),
-                "recent_versions": [
-                    {
-                        "version_id": str(item.get("version_id") or ""),
-                        "created_at": str(item.get("created_at") or ""),
-                    }
-                    for item in versions[:6]
-                ],
-            }
-        )
+    version_history = build_artifact_version_history(
+        _governance_version_targets(main),
+        list_versions=main.list_json_versions,
+    )
+    feature_kb_rows = list(main.load_feature_kb())
+    few_shot_project_feature_ids: set[str] = set()
+    for row in all_rows:
+        if str(row.get("project_id") or "") != str(project_id):
+            continue
+        distill = normalize_few_shot_distillation_state(row.get("few_shot_distillation"))
+        if str(distill.get("manual_review_status") or "").strip().lower() != "adopted":
+            continue
+        for feature_id in _resolve_record_distillation_feature_ids(
+            main,
+            row,
+            distill,
+            ground_truth_rows=all_rows,
+            features=feature_kb_rows,
+        ):
+            fid = str(feature_id or "").strip()
+            if fid:
+                few_shot_project_feature_ids.add(fid)
+    few_shot_project_feature_count = 0
+    if few_shot_project_feature_ids:
+        for feature in feature_kb_rows:
+            feature_id = str(getattr(feature, "feature_id", "") or "").strip()
+            if feature_id not in few_shot_project_feature_ids:
+                continue
+            if not bool(getattr(feature, "active", False)):
+                continue
+            governance_status = str(getattr(feature, "governance_status", "") or "").strip().lower()
+            if governance_status not in {"adopted", "auto_adopted"}:
+                continue
+            few_shot_project_feature_count += 1
     artifact_impacts = main._build_governance_artifact_impacts(
         project_id,
         artifact_payload_overrides=artifact_payload_overrides,
@@ -315,7 +468,7 @@ def build_feedback_governance_report(
         )
     if captured_recent_count <= 0:
         recommendations.append(
-            "近期尚未形成新的 few-shot 蒸馏样本，建议优先补录高分且证据充分的真实评标。"
+            "近期尚未形成新的高分特征蒸馏样本，建议优先补录高分且证据充分的真实评标。"
         )
     if any(int(item.get("version_count") or 0) <= 0 for item in version_history):
         recommendations.append(
@@ -323,15 +476,15 @@ def build_feedback_governance_report(
         )
     if blocked_count <= 0 and captured_recent_count > 0:
         recommendations.append(
-            "当前闭环处于可进化状态，可继续观察 few-shot 蒸馏是否带来评分贴近真实结果。"
+            "当前闭环处于可进化状态，可继续观察高分特征蒸馏是否带来评分贴近真实结果。"
         )
     if any(bool(item.get("changed_since_latest_snapshot")) for item in artifact_impacts):
         recommendations.append(
             "检测到部分闭环产物与最近一次快照不一致；若刚执行过回滚，请结合“治理影响体检”确认差异是否符合预期。"
         )
     preview_match_count = int(score_preview.get("matched_submission_count") or 0)
-    avg_abs_delta_stored = main._to_float_or_none(score_preview.get("avg_abs_delta_stored"))
-    avg_abs_delta_preview = main._to_float_or_none(score_preview.get("avg_abs_delta_preview"))
+    avg_abs_delta_stored = to_float_or_none(score_preview.get("avg_abs_delta_stored"))
+    avg_abs_delta_preview = to_float_or_none(score_preview.get("avg_abs_delta_preview"))
     if preview_match_count <= 0:
         recommendations.append(
             "当前暂无可同时关联最新评分报告与青天结果的样本，治理面板暂不能执行评分偏差试算。"
@@ -350,10 +503,8 @@ def build_feedback_governance_report(
             "评分偏差试算当前仅覆盖校准总分层；由于权重、画像或进化逻辑已变化，维度分与完整总分仍需重评分后确认。"
         )
     sandbox_executed_count = int(sandbox_preview.get("executed_row_count") or 0)
-    sandbox_avg_abs_delta_stored = main._to_float_or_none(
-        sandbox_preview.get("avg_abs_delta_stored")
-    )
-    sandbox_avg_abs_delta = main._to_float_or_none(sandbox_preview.get("avg_abs_delta_sandbox"))
+    sandbox_avg_abs_delta_stored = to_float_or_none(sandbox_preview.get("avg_abs_delta_stored"))
+    sandbox_avg_abs_delta = to_float_or_none(sandbox_preview.get("avg_abs_delta_sandbox"))
     sandbox_warning = str(sandbox_preview.get("constraints_warning") or "").strip()
     if sandbox_warning:
         recommendations.append(sandbox_warning)
@@ -390,16 +541,16 @@ def build_feedback_governance_report(
     if latest_project_calibrator_version:
         if latest_project_calibrator_mode == "bootstrap_auto_deploy":
             recommendations.append(
-                "当前项目级校准器处于小样本 bootstrap 监控态，已可参与校准评分；建议继续补录真实评标样本，尽快升级为完整 CV 校准。"
+                "当前项目级校准器处于小样本自举监控态，已可参与校准评分；建议继续补录真实评标样本，尽快升级为完整交叉验证校准。"
             )
         elif latest_project_calibrator_mode == "bootstrap_candidate_only":
             if str(latest_project_auto_review.get("action") or "") == "rollback":
                 recommendations.append(
-                    "最新小样本 bootstrap 校准器在只读偏差复核中表现变差，系统已自动保留为候选未部署，当前仍沿用旧校准器或 prior。"
+                    "最新小样本自举校准器在只读偏差复核中表现变差，系统已自动保留为候选未部署，当前仍沿用旧校准器或先验兜底。"
                 )
             else:
                 recommendations.append(
-                    "最新小样本 bootstrap 校准器尚未正式部署，建议继续补录真实评标样本后再自动复核。"
+                    "最新小样本自举校准器尚未正式部署，建议继续补录真实评标样本后再自动复核。"
                 )
     if current_calibrator_degraded:
         recommendations.append(
@@ -425,6 +576,7 @@ def build_feedback_governance_report(
             "few_shot_adopted_count": few_shot_adopted_count,
             "few_shot_ignored_count": few_shot_ignored_count,
             "few_shot_pending_review_count": few_shot_pending_review_count,
+            "few_shot_project_feature_count": few_shot_project_feature_count,
             "few_shot_feature_version_count": int(
                 next(
                     (
@@ -436,7 +588,29 @@ def build_feedback_governance_report(
                 )
                 or 0
             ),
+            "few_shot_global_snapshot_count": int(
+                next(
+                    (
+                        item.get("version_count")
+                        for item in version_history
+                        if str(item.get("artifact") or "") == "high_score_features"
+                    ),
+                    0,
+                )
+                or 0
+            ),
             "latest_few_shot_version_id": str(
+                next(
+                    (
+                        item.get("latest_version_id")
+                        for item in version_history
+                        if str(item.get("artifact") or "") == "high_score_features"
+                    ),
+                    "",
+                )
+                or ""
+            ),
+            "latest_few_shot_global_snapshot_id": str(
                 next(
                     (
                         item.get("latest_version_id")
@@ -523,19 +697,22 @@ def build_feedback_governance_version_preview(
     *,
     artifact: str,
     version_id: str,
+    storage: StorageAccess | None = None,
 ) -> Dict[str, object]:
-    main = _main()
-    spec = main._resolve_governance_artifact_spec(artifact)
+    main = _main(storage)
+    spec = _governance_artifact_spec(main, artifact)
     path = spec.get("path")
     default_payload = copy.deepcopy(spec.get("default_payload"))
     current_payload = main._load_governance_artifact_payload(artifact)
     preview_payload = main.load_json_version(path, version_id, default_payload)
-    current_summary = main._summarize_versioned_artifact_payload(
+    current_summary = _summarize_governance_artifact_payload(
+        main,
         artifact,
         current_payload,
         project_id=project_id,
     )
-    preview_summary = main._summarize_versioned_artifact_payload(
+    preview_summary = _summarize_governance_artifact_payload(
+        main,
         artifact,
         preview_payload,
         project_id=project_id,
@@ -550,10 +727,10 @@ def build_feedback_governance_version_preview(
         project,
         artifact_payload_overrides={artifact: preview_payload},
     )
-    delta_vs_current = main._artifact_summary_delta(preview_summary, current_summary)
-    matches_current = main._artifact_payload_fingerprint(
-        current_payload
-    ) == main._artifact_payload_fingerprint(preview_payload)
+    delta_vs_current = artifact_summary_delta(preview_summary, current_summary)
+    matches_current = artifact_payload_fingerprint(current_payload) == artifact_payload_fingerprint(
+        preview_payload
+    )
     recommendations: List[str] = []
     if matches_current:
         recommendations.append("所选历史版本与当前在线产物一致，本次只读预演不会引入变化。")
@@ -566,7 +743,7 @@ def build_feedback_governance_version_preview(
         if isinstance(governance_payload.get("sandbox_preview"), dict)
         else {}
     )
-    if int(main._to_float_or_none(sandbox_preview.get("executed_row_count")) or 0) <= 0:
+    if int(to_float_or_none(sandbox_preview.get("executed_row_count")) or 0) <= 0:
         recommendations.append(
             "本次预演未形成有效沙箱重评分样本，请结合当前版本快照和治理影响体检一起判断。"
         )
@@ -597,8 +774,9 @@ def build_feedback_governance_action_preview(
     action: str,
     note: str,
     rerun_closed_loop: bool = False,
+    storage: StorageAccess | None = None,
 ) -> Dict[str, object]:
-    main = _main()
+    main = _main(storage)
     records = copy.deepcopy(main.load_ground_truth())
     target_record = next(
         (
@@ -615,22 +793,36 @@ def build_feedback_governance_action_preview(
     action_text = str(action or "").strip().lower()
     note_text = str(note or "").strip()
     if preview_type == "guardrail":
-        current_state = main._extract_feedback_guardrail(target_record)
-        preview_state = main._apply_feedback_guardrail_review(
+        project_score_scale = resolve_project_score_scale_max(project)
+        current_state = extract_feedback_guardrail(
+            target_record,
+            default_score_scale_max=project_score_scale,
+            default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
+        )
+        preview_state = apply_feedback_guardrail_review_state(
             target_record,
             action=action_text,
             note=note_text,
+            reviewed_at=main._now_iso(),
+            default_score_scale_max=project_score_scale,
+            default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
         )
         target_record["feedback_guardrail"] = preview_state
         preview_kind = "guardrail"
     elif preview_type == "few_shot":
-        current_state = main._normalize_few_shot_distillation_state(
+        current_state = normalize_few_shot_distillation_state(
             target_record.get("few_shot_distillation")
         )
-        preview_state = main._apply_few_shot_review(
-            target_record,
+        preview_state = apply_few_shot_review_state(
+            target_record.get("few_shot_distillation"),
             action=action_text,
             note=note_text,
+            reviewed_at=main._now_iso(),
+            resolved_feature_ids=_resolve_record_distillation_feature_ids(
+                main,
+                target_record,
+                current_state,
+            ),
         )
         target_record["few_shot_distillation"] = preview_state
         preview_kind = "few_shot"
@@ -646,7 +838,7 @@ def build_feedback_governance_action_preview(
     if preview_kind == "guardrail":
         if action_text == "approve":
             recommendations.append(
-                "本次仅为只读预演：正式提交前不会执行真实闭环，也不会写入权重、校准器或 few-shot 特征。"
+                "本次仅为只读预演：正式提交前不会执行真实闭环，也不会写入权重、校准器或高分特征。"
             )
             if bool(rerun_closed_loop):
                 recommendations.append(
@@ -656,7 +848,7 @@ def build_feedback_governance_action_preview(
             recommendations.append("极端偏差审核预演只会改变治理状态，不会直接改写当前评分产物。")
     else:
         recommendations.append(
-            "few-shot 采纳预演只改变治理登记状态，不会直接改写当前 high_score_features；如需评分变化，仍需正式闭环刷新。"
+            "高分特征采纳预演只改变治理登记状态，不会直接改写当前高分特征库；如需评分变化，仍需正式闭环刷新。"
         )
     score_preview = governance.get("score_preview") if isinstance(governance, dict) else {}
     sandbox_preview = governance.get("sandbox_preview") if isinstance(governance, dict) else {}
@@ -694,8 +886,9 @@ def execute_feedback_guardrail_review(
     note: str,
     rerun_closed_loop: bool,
     locale: str,
+    storage: StorageAccess | None = None,
 ) -> Dict[str, object]:
-    main = _main()
+    main = _main(storage)
     records = main.load_ground_truth()
     record = next(
         (
@@ -709,15 +902,23 @@ def execute_feedback_guardrail_review(
     if record is None:
         raise HTTPException(status_code=404, detail="真实评标记录不存在")
 
-    updated_guardrail = main._apply_feedback_guardrail_review(
+    updated_at = main._now_iso()
+    updated_guardrail = apply_feedback_guardrail_review_state(
         record,
         action=str(action or "").strip().lower(),
         note=str(note or "").strip(),
+        reviewed_at=updated_at,
+        default_score_scale_max=int(
+            to_float_or_none(record.get("score_scale_max")) or DEFAULT_SCORE_SCALE_MAX
+        ),
+        default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
     )
-    updated_record = main._persist_ground_truth_record_fields(
+    updated_record = _persist_ground_truth_record_fields(
+        main,
         project_id,
         record_id,
         updates={"feedback_guardrail": updated_guardrail},
+        updated_at=updated_at,
     )
     closed_loop: Dict[str, object] = {}
     if str(updated_guardrail.get("manual_review_status") or "") == "approved" and bool(
@@ -729,10 +930,12 @@ def execute_feedback_guardrail_review(
             trigger="ground_truth_manual_review",
             ground_truth_record_ids=[record_id],
         )
-        updated_record = main._persist_ground_truth_record_fields(
+        updated_record = _persist_ground_truth_record_fields(
+            main,
             project_id,
             record_id,
             updates={"feedback_closed_loop": closed_loop},
+            updated_at=main._now_iso(),
         )
     else:
         existing_closed_loop = updated_record.get("feedback_closed_loop")
@@ -741,7 +944,11 @@ def execute_feedback_guardrail_review(
         "ok": True,
         "project_id": project_id,
         "record_id": record_id,
-        "feedback_guardrail": main._extract_feedback_guardrail(updated_record),
+        "feedback_guardrail": extract_feedback_guardrail(
+            updated_record,
+            default_score_scale_max=DEFAULT_SCORE_SCALE_MAX,
+            default_threshold_ratio=float(main.DEFAULT_FEEDBACK_EXTREME_DELTA_RATIO),
+        ),
         "feedback_closed_loop": closed_loop,
         "updated_at": str(updated_record.get("updated_at") or main._now_iso()),
     }
@@ -753,8 +960,9 @@ def execute_feedback_few_shot_review(
     *,
     action: str,
     note: str,
+    storage: StorageAccess | None = None,
 ) -> Dict[str, object]:
-    main = _main()
+    main = _main(storage)
     records = main.load_ground_truth()
     record = next(
         (
@@ -767,15 +975,27 @@ def execute_feedback_few_shot_review(
     )
     if record is None:
         raise HTTPException(status_code=404, detail="真实评标记录不存在")
-    updated_distillation = main._apply_few_shot_review(
-        record,
+    current_distillation = normalize_few_shot_distillation_state(
+        record.get("few_shot_distillation")
+    )
+    updated_at = main._now_iso()
+    updated_distillation = apply_few_shot_review_state(
+        record.get("few_shot_distillation"),
         action=str(action or "").strip().lower(),
         note=str(note or "").strip(),
+        reviewed_at=updated_at,
+        resolved_feature_ids=_resolve_record_distillation_feature_ids(
+            main,
+            record,
+            current_distillation,
+        ),
     )
-    updated_record = main._persist_ground_truth_record_fields(
+    updated_record = _persist_ground_truth_record_fields(
+        main,
         project_id,
         record_id,
         updates={"few_shot_distillation": updated_distillation},
+        updated_at=updated_at,
     )
     main._sync_feature_governance_review(
         feature_ids=[
@@ -790,7 +1010,7 @@ def execute_feedback_few_shot_review(
         "ok": True,
         "project_id": project_id,
         "record_id": record_id,
-        "few_shot_distillation": main._normalize_few_shot_distillation_state(
+        "few_shot_distillation": normalize_few_shot_distillation_state(
             updated_record.get("few_shot_distillation")
         ),
         "updated_at": str(updated_record.get("updated_at") or main._now_iso()),

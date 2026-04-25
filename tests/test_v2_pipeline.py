@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -89,6 +90,53 @@ class TestQingTianEndpoint:
         assert data["qingtian_model_version"] == "qingtian-2026.02"
         mock_save_results.assert_called_once()
         mock_save_projects.assert_called_once()
+
+    @patch("app.main.load_qingtian_results")
+    @patch("app.main.ensure_data_dirs")
+    def test_latest_qingtian_result_recovers_legacy_row_missing_required_fields(
+        self,
+        mock_ensure,
+        mock_load_results,
+    ):
+        mock_load_results.return_value = [
+            {
+                "submission_id": "sub1",
+                "qt_total_score": "88.5",
+                "qt_reasons": ["工期控制不足"],
+            }
+        ]
+
+        resp = _client().get("/api/v1/submissions/sub1/qingtian-results/latest")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["id"] == ""
+        assert data["submission_id"] == "sub1"
+        assert data["qingtian_model_version"] == "qingtian-2026.02"
+        assert data["qt_total_score"] == 88.5
+        assert data["qt_reasons"][0]["text"] == "工期控制不足"
+        assert data["raw_payload"] == {}
+        assert data["created_at"]
+
+    @patch("app.main.load_qingtian_results")
+    @patch("app.main.ensure_data_dirs")
+    def test_latest_qingtian_result_returns_404_when_storage_corrupted(
+        self,
+        mock_ensure,
+        mock_load_results,
+    ):
+        from app.storage import StorageDataError
+
+        mock_load_results.side_effect = StorageDataError(
+            Path("/tmp/qingtian_results.json"),
+            "json_parse_failed",
+            "数据文件 JSON 格式损坏：qingtian_results.json（第 1 行，第 1 列），请使用历史版本回滚。",
+        )
+
+        resp = _client().get("/api/v1/submissions/sub1/qingtian-results/latest")
+
+        assert resp.status_code == 404
+        assert "暂无青天评标结果" in resp.json()["detail"]
 
 
 class TestCalibratorEndpoints:
@@ -218,6 +266,54 @@ class TestCalibratorEndpoints:
         saved_models = mock_save_models.call_args[0][0]
         current = next(row for row in saved_models if row["calibrator_version"] == "calib_best")
         assert current["deployed"] is True
+
+    @patch("app.main.load_calibration_models")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_calibration_models_recovers_legacy_row_missing_required_fields(
+        self,
+        mock_ensure,
+        mock_load_models,
+    ):
+        mock_load_models.return_value = [
+            {
+                "calibrator_version": "c1",
+                "metrics": None,
+                "calibrator_summary": None,
+            }
+        ]
+
+        resp = _client().get("/api/v1/calibration/models")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["calibrator_version"] == "c1"
+        assert data[0]["model_type"] == "ridge"
+        assert data[0]["feature_schema_version"] == "v2"
+        assert data[0]["train_filter"] == {}
+        assert data[0]["metrics"] == {}
+        assert data[0]["artifact_uri"] == ""
+        assert data[0]["created_at"]
+
+    @patch("app.main.load_calibration_models")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_calibration_models_recovers_when_storage_corrupted(
+        self,
+        mock_ensure,
+        mock_load_models,
+    ):
+        from app.storage import StorageDataError
+
+        mock_load_models.side_effect = StorageDataError(
+            Path("/tmp/calibration_models.json"),
+            "json_parse_failed",
+            "数据文件 JSON 格式损坏：calibration_models.json（第 1 行，第 1 列），请使用历史版本回滚。",
+        )
+
+        resp = _client().get("/api/v1/calibration/models")
+
+        assert resp.status_code == 200
+        assert resp.json() == []
 
     @patch("app.main._build_governance_score_preview")
     @patch("app.main._build_governance_artifact_impacts")
@@ -785,8 +881,12 @@ class TestDeltaAndSamplesEndpoints:
         mock_load_samples,
         mock_save_samples,
     ):
-        mock_load_projects.return_value = [{"id": "p1"}]
-        mock_load_submissions.return_value = [{"id": "s1", "project_id": "p1", "text": "工期365天"}]
+        mock_load_projects.return_value = [
+            {"id": "p1", "project_type": "装修及景观项目", "bid_method": "AI评标"}
+        ]
+        mock_load_submissions.return_value = [
+            {"id": "s1", "project_id": "p1", "text": "工期365天|横道图", "image_count": 2}
+        ]
         mock_load_reports.return_value = [
             {
                 "id": "r1",
@@ -795,6 +895,23 @@ class TestDeltaAndSamplesEndpoints:
                 "rule_total_score": 80,
                 "rule_dim_scores": {},
                 "penalties": [],
+                "meta": {
+                    "material_utilization": {
+                        "retrieval_hit_rate": 0.7,
+                        "retrieval_file_coverage_rate": 0.5,
+                        "consistency_hit_rate": 0.6,
+                        "material_dimension_hit_rate": 0.4,
+                        "available_types": ["drawing", "boq"],
+                        "uncovered_types": ["drawing"],
+                    },
+                    "material_quality": {
+                        "total_files": 5,
+                        "total_parsed_chars": 9000,
+                        "parse_fail_ratio": 0.2,
+                    },
+                    "material_utilization_gate": {"passed": True, "blocked": False},
+                    "evidence_trace": {"mandatory_hit_rate": 0.8, "source_files_hit_count": 2},
+                },
                 "created_at": "2026-02-06T10:00:00Z",
             }
         ]
@@ -812,7 +929,118 @@ class TestDeltaAndSamplesEndpoints:
         data = resp.json()
         assert len(data) == 1
         assert data[0]["submission_id"] == "s1"
+        assert data[0]["x_features"]["project_type_decoration_landscape"] == 1.0
+        assert data[0]["x_features"]["bid_method_ai_comprehensive_three_stage"] == 1.0
+        assert data[0]["x_features"]["material_retrieval_hit_rate"] == 0.7
+        assert data[0]["x_features"]["material_total_parsed_chars"] == 9000.0
+        assert data[0]["x_features"]["material_gate_passed"] == 1.0
+        assert data[0]["x_features"]["evidence_mandatory_hit_rate"] == 0.8
         mock_save_samples.assert_called_once()
+
+    @patch("app.main.load_delta_cases")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_delta_cases_recovers_legacy_row_missing_required_fields(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_delta,
+    ):
+        mock_load_projects.return_value = [{"id": "p1"}]
+        mock_load_delta.return_value = [
+            {
+                "project_id": "p1",
+                "total_error": "5.5",
+                "reason_alignment": ["工期控制不足"],
+            }
+        ]
+
+        resp = _client().get("/api/v1/projects/p1/delta_cases")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["id"] == ""
+        assert data[0]["project_id"] == "p1"
+        assert data[0]["submission_id"] == ""
+        assert data[0]["total_error"] == 5.5
+        assert data[0]["reason_alignment"][0]["text"] == "工期控制不足"
+        assert data[0]["created_at"]
+
+    @patch("app.main.load_delta_cases")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_delta_cases_recovers_when_storage_corrupted(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_delta,
+    ):
+        from app.storage import StorageDataError
+
+        mock_load_projects.return_value = [{"id": "p1"}]
+        mock_load_delta.side_effect = StorageDataError(
+            Path("/tmp/delta_cases.json"),
+            "json_parse_failed",
+            "数据文件 JSON 格式损坏：delta_cases.json（第 1 行，第 1 列），请使用历史版本回滚。",
+        )
+
+        resp = _client().get("/api/v1/projects/p1/delta_cases")
+
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    @patch("app.main.load_calibration_samples")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_calibration_samples_recovers_legacy_row_missing_required_fields(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_samples,
+    ):
+        mock_load_projects.return_value = [{"id": "p1"}]
+        mock_load_samples.return_value = [
+            {
+                "project_id": "p1",
+                "submission_id": "s1",
+                "x_features": {"a": "1.5"},
+            }
+        ]
+
+        resp = _client().get("/api/v1/projects/p1/calibration_samples")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["id"] == ""
+        assert data[0]["project_id"] == "p1"
+        assert data[0]["submission_id"] == "s1"
+        assert data[0]["feature_schema_version"] == "v2"
+        assert data[0]["x_features"]["a"] == 1.5
+
+    @patch("app.main.load_calibration_samples")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_calibration_samples_recovers_when_storage_corrupted(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_samples,
+    ):
+        from app.storage import StorageDataError
+
+        mock_load_projects.return_value = [{"id": "p1"}]
+        mock_load_samples.side_effect = StorageDataError(
+            Path("/tmp/calibration_samples.json"),
+            "json_parse_failed",
+            "数据文件 JSON 格式损坏：calibration_samples.json（第 1 行，第 1 列），请使用历史版本回滚。",
+        )
+
+        resp = _client().get("/api/v1/projects/p1/calibration_samples")
+
+        assert resp.status_code == 200
+        assert resp.json() == []
 
 
 class TestPatchPackageEndpoints:
@@ -916,6 +1144,39 @@ class TestPatchPackageEndpoints:
         assert data["deployed"] is True
         mock_save_packages.assert_called_once()
         mock_save_deploys.assert_called_once()
+
+    @patch("app.main.load_patch_packages")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_patches_recovers_legacy_row_missing_required_fields(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_packages,
+    ):
+        mock_load_projects.return_value = [{"id": "p1"}]
+        mock_load_packages.return_value = [
+            {
+                "project_id": "p1",
+                "status": "",
+                "shadow_metrics": [],
+            }
+        ]
+
+        resp = _client().get("/api/v1/projects/p1/patches")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["id"] == ""
+        assert data[0]["project_id"] == "p1"
+        assert data[0]["patch_type"] == "threshold"
+        assert data[0]["patch_payload"] == {}
+        assert data[0]["target_symptom"] == {}
+        assert data[0]["status"] == "candidate"
+        assert data[0]["shadow_metrics"] is None
+        assert data[0]["created_at"]
+        assert data[0]["updated_at"]
 
 
 class TestGroundTruthAutoSync:
@@ -2464,7 +2725,7 @@ class TestScoringFactorsEndpoint:
         assert data["project_id"] == "p1"
         assert "项目分析包" in data["markdown"]
         assert "评分体系总览" in data["markdown"]
-        assert "第一阶段封关 readiness" in data["markdown"]
+        assert "第一阶段封关就绪度" in data["markdown"]
         assert "可封第一阶段" in data["markdown"]
 
     @patch("app.main.project_analysis_bundle")
@@ -3098,7 +3359,7 @@ class TestEvaluationEndpoint:
         assert "补录真实评标" in data["total_closure_readiness"]["next_step_entrypoint_detail"]
         assert (
             data["total_closure_readiness"]["system_closure_path"][-1]
-            == "重新执行跨项目汇总评估，确认系统总封关 readiness。"
+            == "重新执行跨项目汇总评估，确认系统总封关就绪度。"
         )
 
     @patch("app.main.load_ground_truth")
@@ -3466,8 +3727,7 @@ class TestEvaluationEndpoint:
         assert "候选项目" in closure["recommendation"]
         assert closure["system_closure_path"][0] == "在项目“候选项目”上传至少 1 份施组文件。"
         assert (
-            closure["system_closure_path"][-1]
-            == "重新执行跨项目汇总评估，确认系统总封关 readiness。"
+            closure["system_closure_path"][-1] == "重新执行跨项目汇总评估，确认系统总封关就绪度。"
         )
 
     @patch("app.main.load_ground_truth")
@@ -3862,6 +4122,7 @@ class TestScoringMeceInjection:
     @patch("app.main._apply_prediction_to_report")
     @patch("app.main._apply_deployed_patch_to_report")
     @patch("app.main.score_text_v2")
+    @patch("app.main.build_scoring_evidence_package")
     @patch("app.main._build_runtime_custom_requirements")
     @patch("app.main._constraints_need_rebuild")
     @patch("app.main._rebuild_project_anchors_and_requirements")
@@ -3882,6 +4143,7 @@ class TestScoringMeceInjection:
         mock_rebuild_constraints,
         mock_constraints_need_rebuild,
         mock_build_runtime_custom_requirements,
+        mock_build_scoring_evidence_package,
         mock_score_text_v2,
         mock_apply_patch,
         mock_apply_predict,
@@ -3935,6 +4197,49 @@ class TestScoringMeceInjection:
             ],
             {"runtime_custom_requirements": 1},
         )
+        mock_build_scoring_evidence_package.return_value = {
+            "base_units": [{"id": "base-1"}],
+            "candidate_evidence": [
+                {
+                    "candidate_id": "cand-1",
+                    "source_ref": "submission:s1",
+                    "page_locator": "page:2",
+                    "confidence": 0.84,
+                    "model_version": "gpt-5.4",
+                    "prompt_or_policy_version": "policy-v1",
+                    "extraction_time": "2026-02-19T00:00:02+00:00",
+                    "validator_status": "pending_validation",
+                }
+            ],
+            "accepted_candidates": [
+                {
+                    "candidate_id": "cand-1",
+                    "source_ref": "submission:s1",
+                    "page_locator": "page:2",
+                    "confidence": 0.84,
+                    "model_version": "gpt-5.4",
+                    "prompt_or_policy_version": "policy-v1",
+                    "extraction_time": "2026-02-19T00:00:02+00:00",
+                    "validator_status": "accepted",
+                }
+            ],
+            "rejected_candidates": [],
+            "accepted_units": [{"id": "accepted-1"}],
+            "scoring_units": [{"id": "base-1"}, {"id": "accepted-1"}],
+            "summary": {
+                "mode": "openai",
+                "provider": "openai",
+                "available": True,
+                "model_version": "gpt-5.4",
+                "prompt_or_policy_version": "policy-v1",
+                "fallback_reason": None,
+                "base_unit_count": 1,
+                "candidate_count": 1,
+                "accepted_count": 1,
+                "rejected_count": 0,
+                "validator_breakdown": {"accepted": 1},
+            },
+        }
         mock_score_text_v2.return_value = {
             "engine_version": "v2",
             "rule_total_score": 81.2,
@@ -3981,6 +4286,14 @@ class TestScoringMeceInjection:
         # base requirements + runtime custom requirements 都应传入评分引擎
         assert mock_score_text_v2.call_args.kwargs["requirements"]
         assert len(mock_score_text_v2.call_args.kwargs["requirements"]) == 2
+        assert mock_score_text_v2.call_args.kwargs["evidence_units"] == [
+            {"id": "base-1"},
+            {"id": "accepted-1"},
+        ]
+        model_boundary = (report.get("meta") or {}).get("model_boundary") or {}
+        assert model_boundary["summary"]["accepted_count"] == 1
+        assert model_boundary["scoring_gate"]["accepted_evidence_only"] is True
+        assert model_boundary["scoring_gate"]["final_score_authority"] == "rules_only"
         mock_apply_patch.assert_called_once()
         mock_apply_predict.assert_called_once()
 
