@@ -210,10 +210,28 @@ def _sanitize_scoring_text(text: Any, *, fallback: str) -> str:
     return normalized or fallback
 
 
-def _build_few_shot_prompt_context(top_k: int = 4) -> str:
+def _resolve_few_shot_project_id(
+    *,
+    rules_report: ScoreReport,
+    project_id: str | None = None,
+) -> str | None:
+    explicit_project_id = str(project_id or "").strip()
+    if explicit_project_id:
+        return explicit_project_id
+    meta = rules_report.meta if isinstance(rules_report.meta, dict) else {}
+    inferred_project_id = str(meta.get("project_id") or "").strip()
+    return inferred_project_id or None
+
+
+def _build_few_shot_prompt_context(
+    top_k: int = 4,
+    *,
+    project_id: str | None = None,
+) -> str:
     rows = select_top_few_shot_prompt_examples(
         dimension_ids=list(DIMENSIONS.keys()),
         top_k=max(1, int(top_k or 4)),
+        project_id=project_id,
     )
     if not rows:
         return ""
@@ -573,6 +591,7 @@ def run_spark_judge(
     rubric: Dict[str, Any],
     prompt_name: str,
     rules_report: ScoreReport,
+    project_id: str | None = None,
 ) -> Dict[str, Any]:
     """
     历史兼容入口：现已改为调用 OpenAI GPT-5.4。
@@ -598,7 +617,12 @@ def run_spark_judge(
 
     prompt_template = load_prompt(prompt_name)
     prompt_parts = [prompt_template]
-    few_shot_context = _build_few_shot_prompt_context()
+    few_shot_context = _build_few_shot_prompt_context(
+        project_id=_resolve_few_shot_project_id(
+            rules_report=rules_report,
+            project_id=project_id,
+        )
+    )
     if few_shot_context:
         prompt_parts.extend(["\n---\n", few_shot_context])
     prompt_parts.extend(["\n\n---\n输入文本：\n", text[:12000]])

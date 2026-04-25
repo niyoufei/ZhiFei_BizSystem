@@ -52,9 +52,33 @@ def test_collect_applied_feature_ids_uses_probe_dimensions_when_suggestions_miss
     assert out == ["F-p01", "F-p03"]
 
 
+def test_collect_applied_feature_ids_filters_probe_fallback_by_project() -> None:
+    report = {
+        "suggestions": [],
+        "probe_dimensions": [{"id": "P03", "score_rate": 0.4}],
+    }
+
+    with patch("app.main.select_top_logic_skeletons") as mock_select:
+        mock_select.return_value = [
+            SimpleNamespace(feature_id="F-p1"),
+        ]
+        out = _collect_applied_feature_ids_from_report(
+            report,
+            project_id="p1",
+            top_k_per_probe=1,
+        )
+        kwargs = mock_select.call_args.kwargs
+
+    assert kwargs["dimension_ids"] == ["P03"]
+    assert kwargs["project_id"] == "p1"
+    assert kwargs["top_k"] == 1
+    assert out == ["F-p1"]
+
+
 def test_auto_update_feature_confidence_normalizes_five_scale_scores() -> None:
     gt_record = {
         "id": "gt-1",
+        "project_id": "p1",
         "final_score": 4.2,
         "score_scale_max": 5,
         "judge_scores": [4.0, 4.1, 4.2, 4.3, 4.4],
@@ -84,6 +108,8 @@ def test_auto_update_feature_confidence_normalizes_five_scale_scores() -> None:
     assert abs(out["delta_score_100"] - 4.0) < 1e-6
     assert 0.0 < out["time_decay_weight"] <= 1.0
     assert out["positive_or_negative_feedback"] == "positive"
+    collect_kwargs = mock_collect.call_args.kwargs
+    assert collect_kwargs["project_id"] == "p1"
     kwargs = mock_update.call_args.kwargs
     assert kwargs["applied_feature_ids"] == ["F-1", "F-2"]
     assert abs(kwargs["actual_score"] - 84.0) < 1e-6
@@ -202,6 +228,7 @@ def test_capture_ground_truth_few_shot_features_distills_evidence(monkeypatch) -
     }
     gt_record = {
         "id": "gt-logic",
+        "project_id": "p1",
         "final_score": 86,
         "score_scale_max": 100,
         "judge_scores": [84, 85, 86, 87, 88],
@@ -231,7 +258,51 @@ def test_capture_ground_truth_few_shot_features_distills_evidence(monkeypatch) -
     assert captured["count"] == 1
     assert captured["features"][0].governance_status == "pending"
     assert captured["features"][0].source_record_ids == ["gt-logic"]
+    assert captured["features"][0].source_project_ids == ["p1"]
     assert captured["features"][0].source_highlights
+
+
+def test_capture_ground_truth_few_shot_features_uses_resolved_upsert_feature_ids(
+    monkeypatch,
+) -> None:
+    report = {
+        "dimension_scores": {
+            "09": {
+                "score": 9.5,
+                "evidence": [{"anchor_label": "进度计划网", "quote": "关键线路周纠偏闭环。"}],
+            }
+        },
+        "suggestions": [{"dimension_id": "09", "text": "补强关键节点纠偏闭环。"}],
+    }
+    gt_record = {
+        "id": "gt-logic",
+        "project_id": "p1",
+        "final_score": 86,
+        "score_scale_max": 100,
+        "judge_scores": [84, 85, 86, 87, 88],
+    }
+
+    def _fake_upsert(features):
+        return {
+            "added": 0,
+            "updated": len(features),
+            "total": 1,
+            "resolved_feature_ids": ["F-stored-09"],
+            "feature_id_map": {str(features[0].feature_id): "F-stored-09"},
+        }
+
+    monkeypatch.setattr("app.main.upsert_distilled_features", _fake_upsert)
+
+    out = _capture_ground_truth_few_shot_features(
+        report=report,
+        gt_record=gt_record,
+        project_score_scale_max=100,
+        feedback_guardrail={"blocked": False},
+        learning_quality_gate={"blocked": False},
+        feature_confidence_update={"applied_dimension_ids": ["09"]},
+    )
+
+    assert out["feature_ids"] == ["F-stored-09"]
 
 
 def test_capture_ground_truth_few_shot_features_skips_learning_quality_blocked() -> None:

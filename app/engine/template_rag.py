@@ -67,9 +67,16 @@ def compute_probe_dimensions(
 
 
 def _feature_refs_for_probe(
-    probe_id: str, top_k: int = 2
+    probe_id: str,
+    *,
+    top_k: int = 2,
+    project_id: str | None = None,
 ) -> tuple[List[List[str]], List[str], List[str]]:
-    features = select_top_logic_skeletons(dimension_ids=[probe_id], top_k=top_k)
+    features = select_top_logic_skeletons(
+        dimension_ids=[probe_id],
+        top_k=top_k,
+        project_id=project_id,
+    )
     logic_skeletons: List[List[str]] = []
     flat_refs: List[str] = []
     feature_ids: List[str] = []
@@ -89,6 +96,7 @@ def build_probe_template_suggestions(
     probe_dimensions: Sequence[Dict[str, Any]],
     *,
     threshold: float = 0.8,
+    project_id: str | None = None,
 ) -> List[Dict[str, Any]]:
     suggestions: List[Dict[str, Any]] = []
     for probe in probe_dimensions or []:
@@ -97,7 +105,11 @@ def build_probe_template_suggestions(
             continue
 
         probe_id = str(probe.get("id") or "")
-        logic_skeletons, refs, feature_ids = _feature_refs_for_probe(probe_id, top_k=2)
+        logic_skeletons, refs, feature_ids = _feature_refs_for_probe(
+            probe_id,
+            top_k=2,
+            project_id=project_id,
+        )
         if not logic_skeletons:
             refs = [
                 "[前置条件] 识别风险边界 + [技术/动作] 形成执行动作链 + [量化指标类型] 阈值频次与闭环证据"

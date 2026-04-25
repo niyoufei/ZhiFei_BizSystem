@@ -84,9 +84,11 @@ def test_distill_feature_from_text_returns_sanitized_feature() -> None:
         dimension_id="09",
         source_text="关键线路明确；每周2次纠偏会；节点验收闭环。",
         confidence_score=0.72,
+        source_project_ids=["p1"],
     )
     assert feature is not None
     assert feature.dimension_id == "09"
+    assert feature.source_project_ids == ["p1"]
     assert feature.logic_skeleton
     assert all("[前置条件]" in item for item in feature.logic_skeleton)
     assert all(not any(ch.isdigit() for ch in item) for item in feature.logic_skeleton)
@@ -100,6 +102,7 @@ def test_upsert_distilled_features_adds_and_updates_existing(monkeypatch) -> Non
         confidence_score=0.45,
         usage_count=2,
         active=True,
+        source_project_ids=["p1"],
     )
     new_feature = ExtractedFeature(
         feature_id="F-new",
@@ -108,6 +111,7 @@ def test_upsert_distilled_features_adds_and_updates_existing(monkeypatch) -> Non
         confidence_score=0.67,
         usage_count=0,
         active=True,
+        source_project_ids=["p1"],
     )
     stronger_existing = ExtractedFeature(
         feature_id="F-override",
@@ -116,6 +120,7 @@ def test_upsert_distilled_features_adds_and_updates_existing(monkeypatch) -> Non
         confidence_score=0.8,
         usage_count=0,
         active=True,
+        source_project_ids=["p2"],
     )
     saved = {}
 
@@ -129,7 +134,13 @@ def test_upsert_distilled_features_adds_and_updates_existing(monkeypatch) -> Non
     assert out["added"] == 1
     assert out["updated"] == 1
     assert out["total"] == 2
+    assert out["resolved_feature_ids"] == ["F-new", "F-existing"]
+    assert out["feature_id_map"] == {
+        "F-new": "F-new",
+        "F-override": "F-existing",
+    }
     assert existing.confidence_score == 0.8
+    assert existing.source_project_ids == ["p1", "p2"]
     assert saved["count"] == 2
 
 
@@ -213,6 +224,55 @@ def test_select_top_logic_skeletons_excludes_pending_and_ignored(monkeypatch) ->
     assert [item.feature_id for item in out] == ["F-adopted"]
 
 
+def test_select_top_logic_skeletons_filters_by_project(monkeypatch) -> None:
+    project_feature = ExtractedFeature(
+        feature_id="F-p1",
+        dimension_id="P02",
+        logic_skeleton=["[前置条件] 场景明确 + [技术/动作] 协同审查 + [量化指标类型] 闭环完成率"],
+        confidence_score=0.8,
+        usage_count=2,
+        active=True,
+        governance_status="adopted",
+        source_project_ids=["p1"],
+    )
+    other_project_feature = ExtractedFeature(
+        feature_id="F-p2",
+        dimension_id="P02",
+        logic_skeleton=["[前置条件] 风险识别 + [技术/动作] 智能巡检 + [量化指标类型] 纠偏时效"],
+        confidence_score=0.95,
+        usage_count=8,
+        active=True,
+        governance_status="adopted",
+        source_record_ids=["gt-p2"],
+    )
+    unsourced_feature = ExtractedFeature(
+        feature_id="F-unsourced",
+        dimension_id="P02",
+        logic_skeleton=["[前置条件] 条件约束 + [技术/动作] 资源联动 + [量化指标类型] 达成率"],
+        confidence_score=0.99,
+        usage_count=9,
+        active=True,
+        governance_status="adopted",
+    )
+    monkeypatch.setattr(
+        fd,
+        "load_feature_kb",
+        lambda: [project_feature, other_project_feature, unsourced_feature],
+    )
+    monkeypatch.setattr(
+        fd,
+        "load_ground_truth",
+        lambda: [
+            {"id": "gt-p1", "project_id": "p1"},
+            {"id": "gt-p2", "project_id": "p2"},
+        ],
+    )
+
+    out = fd.select_top_logic_skeletons(dimension_ids=["P02"], top_k=3, project_id="p1")
+
+    assert [item.feature_id for item in out] == ["F-p1"]
+
+
 def test_select_top_few_shot_prompt_examples_only_uses_adopted_features(monkeypatch) -> None:
     adopted = ExtractedFeature(
         feature_id="F-adopted",
@@ -238,5 +298,41 @@ def test_select_top_few_shot_prompt_examples_only_uses_adopted_features(monkeypa
 
     assert len(out) == 1
     assert out[0]["feature_id"] == "F-adopted"
+    assert out[0]["governance_status"] == "auto_adopted"
     assert out[0]["dimension_name"]
     assert out[0]["source_highlights"] == ["评委表扬关键线路纠偏闭环", "节点验收责任明确"]
+
+
+def test_select_top_few_shot_prompt_examples_filters_by_project(monkeypatch) -> None:
+    project_feature = ExtractedFeature(
+        feature_id="F-p1",
+        dimension_id="09",
+        logic_skeleton=["[前置条件] 风险识别 + [技术/动作] 计划纠偏 + [量化指标类型] 节点达成率"],
+        confidence_score=0.82,
+        usage_count=3,
+        active=True,
+        governance_status="adopted",
+        source_project_ids=["p1"],
+        source_highlights=["项目内高分样本"],
+    )
+    other_project_feature = ExtractedFeature(
+        feature_id="F-p2",
+        dimension_id="09",
+        logic_skeleton=["[前置条件] 场景明确 + [技术/动作] 资源统筹 + [量化指标类型] 达成率"],
+        confidence_score=0.99,
+        usage_count=10,
+        active=True,
+        governance_status="adopted",
+        source_record_ids=["gt-p2"],
+        source_highlights=["异项目高分样本"],
+    )
+    monkeypatch.setattr(fd, "load_feature_kb", lambda: [project_feature, other_project_feature])
+    monkeypatch.setattr(fd, "load_ground_truth", lambda: [{"id": "gt-p2", "project_id": "p2"}])
+
+    out = fd.select_top_few_shot_prompt_examples(
+        dimension_ids=["09"],
+        top_k=3,
+        project_id="p1",
+    )
+
+    assert [item["feature_id"] for item in out] == ["F-p1"]

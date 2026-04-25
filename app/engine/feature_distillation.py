@@ -13,7 +13,12 @@ from pydantic import ValidationError
 from app.config import RESOURCES_DIR
 from app.engine.dimensions import DIMENSIONS
 from app.schemas import ExtractedFeature
-from app.storage import StorageDataError, load_high_score_features, save_high_score_features
+from app.storage import (
+    StorageDataError,
+    load_ground_truth,
+    load_high_score_features,
+    save_high_score_features,
+)
 
 FEATURE_BOOTSTRAP_PATH = RESOURCES_DIR / "high_score_templates.json"
 logger = logging.getLogger(__name__)
@@ -103,6 +108,38 @@ def _feature_runtime_allowed(feature: ExtractedFeature) -> bool:
     return governance_status not in {"pending", "ignored"}
 
 
+def _build_ground_truth_project_by_record_id() -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    for row in load_ground_truth():
+        if not isinstance(row, dict):
+            continue
+        record_id = str(row.get("id") or "").strip()
+        project_id = str(row.get("project_id") or "").strip()
+        if record_id and project_id:
+            mapping[record_id] = project_id
+    return mapping
+
+
+def _extract_feature_project_ids(
+    feature: ExtractedFeature,
+    *,
+    ground_truth_project_by_record_id: Dict[str, str],
+) -> set[str]:
+    project_ids = {
+        str(item or "").strip()
+        for item in (feature.source_project_ids or [])
+        if str(item or "").strip()
+    }
+    if project_ids:
+        return project_ids
+    for record_id in feature.source_record_ids or []:
+        normalized_record_id = str(record_id or "").strip()
+        mapped_project_id = ground_truth_project_by_record_id.get(normalized_record_id)
+        if mapped_project_id:
+            project_ids.add(mapped_project_id)
+    return project_ids
+
+
 def _load_bootstrap_features() -> List[ExtractedFeature]:
     if not FEATURE_BOOTSTRAP_PATH.exists():
         return []
@@ -153,6 +190,7 @@ def distill_feature_from_text(
     confidence_score: float = 0.62,
     governance_status: str | None = None,
     source_record_ids: Sequence[str] | None = None,
+    source_project_ids: Sequence[str] | None = None,
     source_highlights: Sequence[str] | None = None,
 ) -> ExtractedFeature | None:
     clean_text = str(source_text or "").strip()
@@ -174,16 +212,23 @@ def distill_feature_from_text(
         active=True,
         governance_status=_normalize_governance_status(governance_status),
         source_record_ids=_merge_unique_strings(source_record_ids or []),
+        source_project_ids=_merge_unique_strings(source_project_ids or []),
         source_highlights=_merge_unique_strings(source_highlights or []),
         created_at=now,
         updated_at=now,
     )
 
 
-def upsert_distilled_features(features: Sequence[ExtractedFeature]) -> Dict[str, int]:
+def upsert_distilled_features(features: Sequence[ExtractedFeature]) -> Dict[str, Any]:
     clean_features = [feature for feature in features if isinstance(feature, ExtractedFeature)]
     if not clean_features:
-        return {"added": 0, "updated": 0, "total": len(load_feature_kb())}
+        return {
+            "added": 0,
+            "updated": 0,
+            "total": len(load_feature_kb()),
+            "resolved_feature_ids": [],
+            "feature_id_map": {},
+        }
 
     existing = load_feature_kb()
     index = {
@@ -193,6 +238,8 @@ def upsert_distilled_features(features: Sequence[ExtractedFeature]) -> Dict[str,
     }
     added = 0
     updated = 0
+    resolved_feature_ids: List[str] = []
+    feature_id_map: Dict[str, str] = {}
     for feature in clean_features:
         key = (feature.dimension_id, tuple(feature.logic_skeleton))
         current = index.get(key)
@@ -200,6 +247,10 @@ def upsert_distilled_features(features: Sequence[ExtractedFeature]) -> Dict[str,
             existing.append(feature)
             index[key] = feature
             added += 1
+            resolved_feature_ids.append(str(feature.feature_id or "").strip())
+            feature_id_map[str(feature.feature_id or "").strip()] = str(
+                feature.feature_id or ""
+            ).strip()
             continue
         current.confidence_score = _clip(
             max(_safe_float(current.confidence_score), _safe_float(feature.confidence_score)),
@@ -215,6 +266,10 @@ def upsert_distilled_features(features: Sequence[ExtractedFeature]) -> Dict[str,
             current.source_record_ids or [],
             feature.source_record_ids or [],
         )
+        current.source_project_ids = _merge_unique_strings(
+            current.source_project_ids or [],
+            feature.source_project_ids or [],
+        )
         current.source_highlights = _merge_unique_strings(
             current.source_highlights or [],
             feature.source_highlights or [],
@@ -222,9 +277,20 @@ def upsert_distilled_features(features: Sequence[ExtractedFeature]) -> Dict[str,
         current.retired_at = None
         current.updated_at = _now_iso()
         updated += 1
+        resolved_id = str(current.feature_id or "").strip()
+        incoming_id = str(feature.feature_id or "").strip()
+        resolved_feature_ids.append(resolved_id)
+        if incoming_id:
+            feature_id_map[incoming_id] = resolved_id
     if added or updated:
         save_feature_kb(existing)
-    return {"added": added, "updated": updated, "total": len(existing)}
+    return {
+        "added": added,
+        "updated": updated,
+        "total": len(existing),
+        "resolved_feature_ids": resolved_feature_ids,
+        "feature_id_map": feature_id_map,
+    }
 
 
 def _skeleton_lines_from_text(raw_text: str) -> List[str]:
@@ -244,7 +310,7 @@ def _normalize_formula_line(line: str) -> str:
 
     parts = [p.strip() for p in re.split(r"\s*\+\s*|\s*[|｜;；]\s*", text) if p.strip()]
     if len(parts) >= 3:
-        return f"[前置条件] {parts[0]} + " f"[技术/动作] {parts[1]} + " f"[量化指标类型] {parts[2]}"
+        return f"[前置条件] {parts[0]} + [技术/动作] {parts[1]} + [量化指标类型] {parts[2]}"
     return (
         "[前置条件] 适用场景与约束条件明确 + "
         f"[技术/动作] {text} + "
@@ -353,10 +419,24 @@ def select_top_logic_skeletons(
     *,
     dimension_ids: Sequence[str],
     top_k: int = 3,
+    project_id: str | None = None,
 ) -> List[ExtractedFeature]:
     features = load_feature_kb()
     dim_set = {str(x) for x in dimension_ids}
-    candidates = [f for f in features if _feature_runtime_allowed(f) and f.dimension_id in dim_set]
+    normalized_project_id = str(project_id or "").strip()
+    ground_truth_project_by_record_id = (
+        _build_ground_truth_project_by_record_id() if normalized_project_id else {}
+    )
+    candidates = []
+    for feature in features:
+        if not _feature_runtime_allowed(feature) or feature.dimension_id not in dim_set:
+            continue
+        if normalized_project_id and normalized_project_id not in _extract_feature_project_ids(
+            feature,
+            ground_truth_project_by_record_id=ground_truth_project_by_record_id,
+        ):
+            continue
+        candidates.append(feature)
     candidates.sort(key=lambda f: (f.confidence_score, -f.usage_count), reverse=True)
     return candidates[: max(1, top_k)]
 
@@ -365,10 +445,15 @@ def select_top_few_shot_prompt_examples(
     *,
     dimension_ids: Sequence[str] | None = None,
     top_k: int = 4,
+    project_id: str | None = None,
 ) -> List[Dict[str, Any]]:
     dim_set = {
         str(item or "").strip().upper() for item in (dimension_ids or []) if str(item or "").strip()
     }
+    normalized_project_id = str(project_id or "").strip()
+    ground_truth_project_by_record_id = (
+        _build_ground_truth_project_by_record_id() if normalized_project_id else {}
+    )
     candidates: List[ExtractedFeature] = []
     for feature in load_feature_kb():
         governance_status = _normalize_governance_status(feature.governance_status)
@@ -379,12 +464,18 @@ def select_top_few_shot_prompt_examples(
         feature_dim_id = str(feature.dimension_id or "").strip().upper()
         if dim_set and feature_dim_id not in dim_set:
             continue
+        if normalized_project_id and normalized_project_id not in _extract_feature_project_ids(
+            feature,
+            ground_truth_project_by_record_id=ground_truth_project_by_record_id,
+        ):
+            continue
         candidates.append(feature)
     candidates.sort(key=lambda f: (f.confidence_score, -f.usage_count), reverse=True)
     out: List[Dict[str, Any]] = []
     for feature in candidates[: max(1, top_k)]:
         dim_id = str(feature.dimension_id or "").strip().upper()
         dim_name = str((DIMENSIONS.get(dim_id) or {}).get("name") or dim_id).strip()
+        governance_status = _normalize_governance_status(feature.governance_status)
         out.append(
             {
                 "feature_id": str(feature.feature_id or "").strip(),
