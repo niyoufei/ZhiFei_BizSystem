@@ -121,7 +121,7 @@ dimensions:
     weight: 5
     suggestion_threshold: 6
     suggested_gain: 1.2
-    suggestion: 专项方案管理按时间节点写清：编制、审批、交底、验收、销项资料。
+    suggestion: 成本与资金控制应写清资金计划、支付节点、专款专户、资金托管、工资专户和定额预警闭环。
   "11":
     max_score: 10
     per_hit: 2.5
