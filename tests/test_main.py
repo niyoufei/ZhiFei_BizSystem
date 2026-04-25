@@ -111,6 +111,127 @@ class TestStorageErrorHandling:
 
         assert _load_calibration_models_safe() == []
 
+    @patch("app.main.load_delta_cases")
+    def test_load_delta_cases_safe_falls_back_on_corrupted_storage(
+        self,
+        mock_load_delta_cases,
+    ):
+        from app.main import _load_delta_cases_safe
+        from app.storage import StorageDataError
+
+        mock_load_delta_cases.side_effect = StorageDataError(
+            Path("/tmp/delta_cases.json"),
+            "json_parse_failed",
+            "数据文件 JSON 格式损坏：delta_cases.json（第 1 行，第 1 列），请使用历史版本回滚。",
+        )
+
+        assert _load_delta_cases_safe() == []
+
+    @patch("app.main.load_calibration_samples")
+    def test_load_calibration_samples_safe_falls_back_on_corrupted_storage(
+        self,
+        mock_load_calibration_samples,
+    ):
+        from app.main import _load_calibration_samples_safe
+        from app.storage import StorageDataError
+
+        mock_load_calibration_samples.side_effect = StorageDataError(
+            Path("/tmp/calibration_samples.json"),
+            "json_parse_failed",
+            "数据文件 JSON 格式损坏：calibration_samples.json（第 1 行，第 1 列），请使用历史版本回滚。",
+        )
+
+        assert _load_calibration_samples_safe() == []
+
+    @patch("app.main.load_score_reports")
+    def test_load_score_reports_safe_falls_back_on_corrupted_storage(
+        self,
+        mock_load_score_reports,
+    ):
+        from app.main import _load_score_reports_safe
+        from app.storage import StorageDataError
+
+        mock_load_score_reports.side_effect = StorageDataError(
+            Path("/tmp/score_reports.json"),
+            "json_parse_failed",
+            "数据文件 JSON 格式损坏：score_reports.json（第 1 行，第 1 列），请使用历史版本回滚。",
+        )
+
+        assert _load_score_reports_safe() == []
+
+    @patch("app.main.load_score_reports")
+    def test_load_score_reports_safe_prefers_pred_total_for_missing_display_score(
+        self,
+        mock_load_score_reports,
+    ):
+        from app.main import _load_score_reports_safe
+
+        mock_load_score_reports.return_value = [
+            {
+                "id": "r1",
+                "submission_id": "s1",
+                "project_id": "p1",
+                "scoring_engine_version": "v2",
+                "rule_total_score": 78,
+                "pred_total_score": 80,
+                "created_at": "2026-02-06T10:01:00Z",
+            }
+        ]
+
+        rows = _load_score_reports_safe()
+
+        assert rows[0]["total_score"] == 80.0
+        assert rows[0]["rule_total_score"] == 78
+        assert rows[0]["pred_total_score"] == 80
+
+    @patch("app.main.load_qingtian_results")
+    def test_load_qingtian_results_safe_falls_back_on_corrupted_storage(
+        self,
+        mock_load_qingtian_results,
+    ):
+        from app.main import _load_qingtian_results_safe
+        from app.storage import StorageDataError
+
+        mock_load_qingtian_results.side_effect = StorageDataError(
+            Path("/tmp/qingtian_results.json"),
+            "json_parse_failed",
+            "数据文件 JSON 格式损坏：qingtian_results.json（第 1 行，第 1 列），请使用历史版本回滚。",
+        )
+
+        assert _load_qingtian_results_safe() == []
+
+    @patch("app.main.load_materials")
+    def test_load_materials_safe_falls_back_on_corrupted_storage(
+        self,
+        mock_load_materials,
+    ):
+        from app.main import _load_materials_safe
+        from app.storage import StorageDataError
+
+        mock_load_materials.side_effect = StorageDataError(
+            Path("/tmp/materials.json"),
+            "json_parse_failed",
+            "数据文件 JSON 格式损坏：materials.json（第 1 行，第 1 列），请使用历史版本回滚。",
+        )
+
+        assert _load_materials_safe() == []
+
+    @patch("app.main.load_material_parse_jobs")
+    def test_load_material_parse_jobs_safe_falls_back_on_corrupted_storage(
+        self,
+        mock_load_material_parse_jobs,
+    ):
+        from app.main import _load_material_parse_jobs_safe
+        from app.storage import StorageDataError
+
+        mock_load_material_parse_jobs.side_effect = StorageDataError(
+            Path("/tmp/material_parse_jobs.json"),
+            "json_parse_failed",
+            "数据文件 JSON 格式损坏：material_parse_jobs.json（第 1 行，第 1 列），请使用历史版本回滚。",
+        )
+
+        assert _load_material_parse_jobs_safe() == []
+
 
 class TestVersionedJsonHistoryRoutes:
     @patch("app.main.list_json_versions")
@@ -137,6 +258,30 @@ class TestVersionedJsonHistoryRoutes:
         assert data["artifact"] == "expert_profiles"
         assert data["versions"][0]["version_id"] == "20260314T010203000000Z"
 
+    @patch("app.main.list_json_versions")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_versioned_json_history_recovers_legacy_row_missing_required_fields(
+        self,
+        mock_ensure,
+        mock_list_versions,
+        client,
+    ):
+        mock_list_versions.return_value = [
+            {
+                "version_id": "20260314T010203000000Z",
+            }
+        ]
+
+        response = client.get("/api/v1/ops/versioned-json/expert_profiles")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["artifact"] == "expert_profiles"
+        assert data["versions"][0]["version_id"] == "20260314T010203000000Z"
+        assert data["versions"][0]["filename"] == "expert_profiles_v20260314T010203000000Z.json"
+        assert data["versions"][0]["size_bytes"] == 0
+        assert data["versions"][0]["created_at"]
+
     @patch("app.main.restore_json_version")
     @patch("app.main.ensure_data_dirs")
     def test_rollback_versioned_json_history(
@@ -162,6 +307,185 @@ class TestVersionedJsonHistoryRoutes:
         assert data["artifact"] == "calibration_models"
         assert data["restored_version_id"] == "20260314T010203000000Z"
         assert data["backup_version_id"] == "20260314T020304999999Z"
+
+
+class TestHistoryAndTrendRoutes:
+    @patch("app.main.get_history")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_project_history_ignores_legacy_project_missing_id(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_get_history,
+        client,
+    ):
+        mock_load_projects.return_value = [
+            {"name": "legacy-without-id"},
+            {"id": "p1", "name": "正式项目"},
+        ]
+        mock_get_history.return_value = {
+            "project_id": "p1",
+            "entries": [],
+            "total_count": 0,
+        }
+
+        response = client.get("/api/v1/projects/p1/history")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["entries"] == []
+        assert data["total_count"] == 0
+
+    @patch("app.main.load_config")
+    @patch("app.main.analyze_trend")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_project_trend_ignores_legacy_project_missing_id(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_analyze_trend,
+        mock_load_config,
+        client,
+    ):
+        mock_load_projects.return_value = [
+            {"meta": {}},
+            {"id": "p1", "name": "正式项目"},
+        ]
+        mock_load_config.return_value = MagicMock(
+            rubric={"dimensions": {"D01": {"name": "工程概况"}}}
+        )
+        mock_analyze_trend.return_value = {
+            "project_id": "p1",
+            "total_submissions": 1,
+            "score_history": [
+                {
+                    "submission_id": "sub-001",
+                    "filename": "v1.txt",
+                    "total_score": 80.0,
+                    "created_at": "2026-02-01T10:00:00+00:00",
+                }
+            ],
+            "overall_trend": "stable",
+            "avg_score": 80.0,
+            "best_score": 80.0,
+            "worst_score": 80.0,
+            "latest_score": 80.0,
+            "score_improvement": 0.0,
+            "dimension_trends": [],
+            "penalty_trend": [0],
+            "recommendations": ["继续保持"],
+        }
+
+        response = client.get("/api/v1/projects/p1/trend")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["total_submissions"] == 1
+        assert data["score_history"][0]["submission_id"] == "sub-001"
+
+
+class TestProjectContextRoutes:
+    @patch("app.main.load_project_context")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_project_context_recovers_legacy_plaintext_payload(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_project_context,
+        client,
+    ):
+        mock_load_projects.return_value = [
+            {"name": "legacy-without-id"},
+            {"id": "p1", "name": "正式项目"},
+        ]
+        mock_load_project_context.return_value = {
+            "p1": "旧项目上下文文本",
+        }
+
+        response = client.get("/api/v1/projects/p1/context")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["text"] == "旧项目上下文文本"
+        assert data["filename"] is None
+        assert data["updated_at"] is None
+
+    @patch("app.main.load_project_context")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_project_context_recovers_legacy_non_mapping_store(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_project_context,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "正式项目"}]
+        mock_load_project_context.return_value = ["legacy-invalid-store"]
+
+        response = client.get("/api/v1/projects/p1/context")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["text"] == ""
+        assert data["filename"] is None
+        assert data["updated_at"] is None
+
+    @patch("app.main.save_project_context")
+    @patch("app.main.load_project_context")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_set_project_context_recovers_legacy_non_mapping_store(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_project_context,
+        mock_save_project_context,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "正式项目"}]
+        mock_load_project_context.return_value = ["legacy-invalid-store"]
+
+        response = client.put(
+            "/api/v1/projects/p1/context",
+            json={"text": "新的上下文", "filename": "ctx.txt"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["text"] == "新的上下文"
+        assert data["filename"] == "ctx.txt"
+        saved_payload = mock_save_project_context.call_args[0][0]
+        assert saved_payload["p1"]["text"] == "新的上下文"
+
+    @patch("app.main.load_project_context")
+    @patch("app.main.load_materials")
+    def test_constraints_need_rebuild_tolerates_legacy_plaintext_project_context(
+        self,
+        mock_load_materials,
+        mock_load_project_context,
+    ):
+        from app.main import _constraints_need_rebuild
+
+        mock_load_materials.return_value = []
+        mock_load_project_context.return_value = {"p1": "旧项目上下文文本"}
+
+        assert (
+            _constraints_need_rebuild(
+                "p1",
+                anchors=[{"created_at": "2026-03-24T10:16:57+00:00"}],
+                requirements=[{"created_at": "2026-03-24T10:16:57+00:00"}],
+            )
+            is False
+        )
 
 
 class TestMaterialParseWorkerLifecycle:
@@ -3879,6 +4203,86 @@ class TestMaterialParsePerformanceGuards:
         assert merged["evidence_confidence"] == 0.78
         mock_call_gpt.assert_not_called()
 
+    @patch("app.main._call_gpt_material_parser")
+    def test_augment_site_photo_summary_reencodes_large_payload_before_gpt(
+        self,
+        mock_call_gpt,
+    ):
+        if app_main.Image is None:
+            pytest.skip("Pillow not available")
+
+        image = app_main.Image.new("RGB", (1200, 1200), color=(128, 160, 196))
+        payload = BytesIO()
+        image.save(payload, format="BMP")
+        image_bytes = payload.getvalue()
+        local_summary = {
+            "structured_quality_score": 0.52,
+            "ocr_quality_score": 0.28,
+            "visual_capability": "ocr_multistage",
+            "structured_terms": ["现场", "照片", "围挡"],
+            "safety_scene_tags": [],
+            "civilization_scene_tags": [],
+            "quality_scene_tags": [],
+            "progress_scene_tags": [],
+            "top_numeric_terms": [],
+        }
+        mock_call_gpt.return_value = (False, {}, "gpt_parse_failed")
+
+        with patch.object(app_main, "DEFAULT_SITE_PHOTO_GPT_MAX_IMAGE_BYTES", 90_000):
+            _merged, backend, confidence, error = app_main._augment_site_photo_summary_with_gpt(
+                image_bytes,
+                "现场照片.bmp",
+                "围挡 道路 现场照片",
+                local_summary,
+            )
+
+        assert backend == "local"
+        assert confidence == 0.52
+        assert error == "gpt_parse_failed"
+        mock_call_gpt.assert_called_once()
+        kwargs = mock_call_gpt.call_args.kwargs
+        assert kwargs["image_mime"] == "image/jpeg"
+        assert len(kwargs["image_bytes"]) <= 90_000
+
+    @patch("app.main._prepare_site_photo_gpt_image_payload")
+    @patch("app.main._call_gpt_material_parser")
+    def test_augment_site_photo_summary_skips_gpt_when_payload_cannot_be_prepared(
+        self,
+        mock_call_gpt,
+        mock_prepare_payload,
+    ):
+        local_summary = {
+            "structured_quality_score": 0.49,
+            "ocr_quality_score": 0.22,
+            "visual_capability": "ocr_text",
+            "structured_terms": ["现场", "照片"],
+            "safety_scene_tags": [],
+            "civilization_scene_tags": [],
+            "quality_scene_tags": [],
+            "progress_scene_tags": [],
+            "top_numeric_terms": [],
+        }
+        mock_prepare_payload.return_value = (
+            None,
+            "",
+            "image_payload_too_large",
+            {"gpt_image_bytes_before": 14_200_000, "gpt_image_bytes_after": 14_200_000},
+        )
+
+        merged, backend, confidence, error = app_main._augment_site_photo_summary_with_gpt(
+            b"x" * 32,
+            "现场照片.jpg",
+            "现场 围挡",
+            local_summary,
+        )
+
+        assert backend == "local"
+        assert confidence == 0.49
+        assert error == ""
+        assert merged["gpt_skip_reason"] == "image_payload_too_large"
+        assert merged["evidence_confidence"] == 0.49
+        mock_call_gpt.assert_not_called()
+
     @patch("app.main._notify_material_parse_workers")
     @patch("app.main._rebuild_project_anchors_and_requirements")
     def test_material_parse_rebuilds_are_debounced_per_project(
@@ -4285,6 +4689,11 @@ class TestIndexEndpoint:
         assert 'id="uploadZoneFilesBoq"' in response.text
         assert 'id="uploadZoneFilesDrawing"' in response.text
         assert 'id="uploadZoneFilesSitePhoto"' in response.text
+        assert response.text.count('class="upload-zone-list-shell"') == 4
+        assert response.text.count('class="upload-zone-list-scroll"') == 4
+        assert response.text.count('class="upload-zone-col-file"') == 4
+        assert response.text.count('class="upload-zone-col-status"') == 4
+        assert response.text.count('class="upload-zone-col-actions"') == 4
         assert 'id="uploadZoneEmptyTenderQa"' in response.text
         assert 'id="uploadZoneEmptyBoq"' in response.text
         assert 'id="uploadZoneEmptyDrawing"' in response.text
@@ -4316,6 +4725,7 @@ class TestIndexEndpoint:
         assert 'id="deleteSelectedProjects"' in response.text
         assert 'id="scoreScaleSelect"' in response.text
         assert 'name="score_scale_max"' in response.text
+        assert 'id="scoreScaleSourceHint"' in response.text
         assert 'id="btnMaterialKnowledgeProfile"' in response.text
         assert 'id="btnMaterialKnowledgeProfileDownload"' in response.text
         assert 'id="evolutionCoreActions"' in response.text
@@ -4551,7 +4961,9 @@ class TestIndexEndpoint:
         assert "折算100分口径" not in page
         assert "（100分口径）" not in page
 
-    def test_index_renders_selected_project_material_rows(self, client):
+    def test_index_renders_selected_project_material_rows_via_client_upload_zone_refresh(
+        self, client
+    ):
         materials = [
             {
                 "id": "m1",
@@ -4573,10 +4985,15 @@ class TestIndexEndpoint:
 
         assert response.status_code == 200
         page = response.text
-        assert "招标文件.docx" in page
+        assert "文件上传区" in page
         assert "招标文件和答疑" in page
-        assert "已解析（GPT-5.4）" in page
-        assert 'data-material-id="m1"' in page
+        assert 'id="uploadZoneTenderQa"' in page
+        assert 'id="uploadZoneFilesTenderQa"' in page
+        assert "function renderMaterialUploadZones" in page
+        assert "function buildMaterialUploadZoneFileRowHtml" in page
+        assert "/materials/parse_status?t=' + Date.now()" in page
+        assert "招标文件.docx" not in page
+        assert 'data-material-id="m1"' not in page
 
     def test_index_project_selector_shows_plain_names_and_search_controls(self, client):
         with (
@@ -4991,16 +5408,11 @@ class TestIndexEndpoint:
             in page
         )
         assert (
-            "replaceTableRowsIfChanged(\n            'materialsTable',\n            rowHtml,"
-            in page
-        )
-        assert (
             "replaceTableRowsIfChanged(\n            'groundTruthTable',\n            rowHtml,"
             in page
         )
         assert "function buildGroundTruthTableRowHtml(record, index, isCurrent) {" in page
         assert "clearTableRenderSignature('submissionsTable');" in page
-        assert "clearTableRenderSignature('materialsTable');" in page
         assert "clearTableRenderSignature('groundTruthTable');" in page
 
     def test_index_frontend_skips_noop_panel_rerenders_for_project_diagnostics(self, client):
@@ -5263,7 +5675,11 @@ class TestIndexEndpoint:
         assert 'id="btnRenameProject"' not in response.text
         assert 'action="/web/upload_materials"' in response.text
         assert 'action="/web/upload_shigong"' in response.text
-        assert 'id="scoreScaleSelect" class="compact-select"' in response.text
+        assert (
+            'id="scoreScaleSelect" class="compact-select" name="score_scale_max" style="margin-left:4px" disabled'
+            in response.text
+        )
+        assert 'id="scoreScaleSourceHint"' in response.text
         assert 'id="groundTruthSubmissionSelect" class="wide-select"' in response.text
         assert 'id="gtJudgeCount" class="compact-select"' in response.text
         assert 'id="gtFinal" class="score-number-input"' in response.text
@@ -5275,6 +5691,7 @@ class TestIndexEndpoint:
         assert "施组文件" in page
         assert 'id="gtFinalRuleHint"' in page
         assert "function refreshGroundTruthScoringRule" in page
+        assert "function renderConfirmedScoreScale" in page
         assert "function applyGroundTruthFinalScoreAutoFill" in page
         assert "function submitGroundTruthDraft" in page
         assert "function clearGroundTruthDraftForm()" in page
@@ -5285,6 +5702,7 @@ class TestIndexEndpoint:
             in page
         )
         assert "/ground_truth/scoring_rule" in page
+        assert "score_scale_detected" in page
         assert "学习进化前需先完成真实评标录入" in page
         assert "本次已先自动录入当前表单中的真实评标，再执行学习进化。" in page
         assert "已评分（资料预警）" in page
@@ -5293,21 +5711,27 @@ class TestIndexEndpoint:
         assert "await refreshGroundTruthSubmissionOptions(id, switchSeq, subs);" in page
         assert "isWarned: hasGate ? (!!utilGate.warned && !utilGate.blocked) : false," in page
         assert "const consistencyHitRate = toFiniteNumber(summary.consistency_hit_rate);" in page
-        assert "当前缺口资料类型：" in page
+        assert "资料利用情况（本次评分）" in page
+        assert "可继续补齐资料类型：" in page
         assert "阻断施组：" in page
-        assert "建议动作：" in page
+        assert "可继续优化：" in page
         assert "补充提示" in page
         assert "关键资料覆盖" in page
         assert "已上传类型覆盖" in page
         assert "提示：已有 " in page
         assert "const highlightColorForLevel = (level) =>" in page
+        assert "if (gatePassed) return '#475569';" in page
+        assert "资料利用审计（本次评分）" not in page
+        assert "解析异常：' + (parseErrorPreview.length" not in page
+        assert "? '<div>解析异常：' + escapeHtmlText(parseErrorPreview[0]) + '</div>'" in page
         assert "return '#475569';" in page
-        assert "小样本 bootstrap（已部署）" in page
-        assert "小样本 bootstrap（候选未部署）" in page
+        assert "小样本自举（已部署）" in page
+        assert "score_scale_max: selectedScoreScaleMax()," not in page
+        assert "小样本自举（候选未部署）" in page
         assert "当前校准形态" in page
         assert "最新项目级自动复核" in page
         assert "<b>自动复核</b>" in page
-        assert "当前属于小样本 bootstrap 校准" in page
+        assert "当前属于小样本自举校准" in page
         assert (
             "await refreshGroundTruthSubmissionOptions(null, null, undefined, { forceFetch: true });"
             in page
@@ -5392,6 +5816,18 @@ class TestIndexEndpoint:
         assert "最近运行时校准治理" in page
         assert "回退后已恢复稳定" in page
         assert "当前校准器状态" in page
+        assert "少样本已关联特征数" in page
+        assert "少样本全局快照数" in page
+        assert "最新少样本全局快照" in page
+        assert "function formatWeightsSourceLabel(value)" in page
+        assert "const summarizeGovernancePreviewState = (previewType, state) => {" in page
+        assert "学习画像（已存储未生效）" in page
+        assert "进化权重（已存储未生效）" in page
+        assert "先验兜底" in page
+        assert "完整交叉验证校准" in page
+        assert "prior 兜底" not in page
+        assert "few-shot 版本数" not in page
+        assert "最新 few-shot 版本" not in page
         assert "校准器训练已完成" in page
         assert "校准分回填已完成" in page
         assert "一键闭环执行已完成" in page
@@ -5399,11 +5835,51 @@ class TestIndexEndpoint:
         assert "当前分已与青天结果对齐" in page
         assert "当前分 MAE/RMSE 不劣于 V2" in page
         assert "当前分排序相关性不劣于 V2" in page
-        assert "第一阶段封关 readiness" in page
+        assert "第一阶段封关就绪度" in page
         assert "通过门数：" in page
         assert "未通过门数：" in page
-        assert "系统总封关 readiness" in page
-        assert "系统封关推进摘要" in page
+        assert "系统总封关就绪度" in page
+        assert "全局闭环状态与下一步" in page
+        assert "function presentClosureGateLabel(gateId)" in page
+        assert "function presentSystemClosureStatusLabel(label)" in page
+        assert "function presentSystemClosureNeedProjectHint(closure)" in page
+        assert "function presentSystemClosureEntrypointLabel(entrypointKey, rawLabel='')" in page
+        assert (
+            "function presentSystemClosureActionDetail(entrypointKey, rawDetail='', closure=null)"
+            in page
+        )
+        assert "function presentSystemClosurePathSteps(pathSteps)" in page
+        assert "function buildProjectSelectionClosureHintModel(closure, projectId)" in page
+        assert "function isCurrentProjectClosureGuidanceRelevant(closure, projectId)" in page
+        assert (
+            "function buildProjectScopedActionFollowUpMessage(baseMessage, closure, projectId, options=null)"
+            in page
+        )
+        assert (
+            "function renderProjectScopedActionHint(anchorId, closure, projectId, options=null)"
+            in page
+        )
+        assert "本项目下一步" in page
+        assert "下一步" in page
+        assert "当前系统卡点" in page
+        assert "建议先做" in page
+        assert "处理入口" in page
+        assert "点击动作" in page
+        assert "查看系统指标与建议步骤" in page
+        assert "建议操作步骤" in page
+        assert "const finalStatus = buildProjectScopedActionFollowUpMessage(" in page
+        assert "renderProjectScopedActionHint(cfg.statusId, closureSummary, projectId, {" in page
+        assert (
+            "renderProjectScopedActionHint('shigongActionStatus', closureSummary, projectId, {"
+            in page
+        )
+        assert "先创建首个真实样本项目" in page
+        assert "存在待审核样本" in page
+        assert "先处理异常样本和待审核样本，再继续闭环。" in page
+        assert "前往：" not in page
+        assert "刷新来源=" not in page
+        assert "系统封关推进摘要" not in page
+        assert "最短闭环路径" not in page
         assert "候选项目数：" in page
         assert "候选首选项目：" in page
         assert "候选推进阶段：" in page
@@ -5413,8 +5889,6 @@ class TestIndexEndpoint:
         assert "下一步详情" in page
         assert "推荐入口" in page
         assert "入口动作" in page
-        assert "前往：" not in page
-        assert "最短闭环路径" in page
         assert "function ensureProjectSelectionClosureHintContainer()" in page
         assert "function clearProjectSelectionClosureHint()" in page
         assert "function renderProjectSelectionClosureHint(closure, projectId)" in page
@@ -5450,6 +5924,11 @@ class TestIndexEndpoint:
             "function buildSystemClosureActionFollowUpMessage(baseMessage, closure, projectId, options=null)"
             in page
         )
+        assert "function isCurrentProjectClosureGuidanceRelevant(closure, projectId)" in page
+        assert (
+            "function buildProjectScopedActionFollowUpMessage(baseMessage, closure, projectId, options=null)"
+            in page
+        )
         assert "function ensureSystemClosureActionHintContainer(anchorId)" in page
         assert "function clearSystemClosureActionHint(anchorId)" in page
         assert "function clearProjectScopedSystemClosureActionHints()" in page
@@ -5461,6 +5940,10 @@ class TestIndexEndpoint:
         assert "const gateSummary = String(card.material_gate_summary || '').trim();" in page
         assert (
             "function renderSystemClosureActionHint(anchorId, closure, projectId, options=null)"
+            in page
+        )
+        assert (
+            "function renderProjectScopedActionHint(anchorId, closure, projectId, options=null)"
             in page
         )
         assert (
@@ -5482,6 +5965,13 @@ class TestIndexEndpoint:
         assert "reason: 'upload_shigong'" in page
         assert "reason: 'score_shigong'" in page
         assert "reason: 'ground_truth_add'" in page
+        assert "const finalStatus = buildProjectScopedActionFollowUpMessage(" in page
+        assert "const finalDoneMsg = buildProjectScopedActionFollowUpMessage(" in page
+        assert "renderProjectScopedActionHint(cfg.statusId, closureSummary, projectId, {" in page
+        assert (
+            "renderProjectScopedActionHint('shigongActionStatus', closureSummary, projectId, {"
+            in page
+        )
 
     def test_index_frontend_blocks_evolution_until_scoring_ready(self, client):
         response = client.get("/")
@@ -5509,8 +5999,8 @@ class TestIndexEndpoint:
         assert "clearActionScopedClosureZoneHint(id);" in page
         assert "clearProjectClosureZoneHint('materialsClosureHint');" in page
         assert "clearProjectClosureZoneHint('shigongClosureHint');" in page
-        assert "已达第一阶段 ready 项目数：" in page
-        assert "未 ready 项目数：" in page
+        assert "已达第一阶段就绪项目数：" in page
+        assert "未就绪项目数：" in page
         assert "下一优先项目：" in page
         assert "下一优先未通过门：" in page
         assert "项目级建议：" in page
@@ -5955,6 +6445,12 @@ class TestIndexEndpoint:
         assert "materialsDebugPanel" in page
         assert "materialsDebugInfo" in page
         assert "uploadZoneFilesTenderQa" in page
+        assert "upload-zone-list-shell" in page
+        assert "upload-zone-list-scroll" in page
+        assert "table-layout:fixed" in page
+        assert "upload-zone-col-status" in page
+        assert "upload-zone-col-actions" in page
+        assert "emptyEl.style.display = bucket.total > 0 ? 'none' : 'flex';" in page
         assert "uploadZoneDebugTenderQa" in page
         assert "uploadZoneDebugInfoTenderQa" in page
         assert "function setMaterialParseSummary" in page
@@ -5962,8 +6458,10 @@ class TestIndexEndpoint:
         assert "function renderMaterialParseDebugInfo" in page
         assert "底层运行监控（Debug Info）" in page
         assert "解析引擎快照" in page
-        assert "<th>资料名称</th>" in page
-        assert "<th>解析完成时间</th>" in page
+        assert "资料概览与工具" in page
+        assert "已上传文件请在下方“文件上传区”中按类型查看和删除。" in page
+        assert "<th>资料名称</th>" not in page
+        assert "<th>解析完成时间</th>" not in page
         assert "<th>文件名称</th>" in page
         assert "js-view-material" not in page
         assert "latest_finished_at" in page
@@ -5994,6 +6492,13 @@ class TestIndexEndpoint:
         assert "缺口证据：" in page
         assert "命中类别：" in page
         assert "待补类别：" in page
+        assert (
+            "const hasScoringEvidence = statusRaw === 'scored' || statusRaw === 'blocked';" in page
+        )
+        assert "资料准备诊断（项目级）" in page
+        assert (
+            "当前施组尚未评分，“支撑较强维度”“证据薄弱维度”和维度支撑明细将在评分后显示。" in page
+        )
         assert "资料支撑维度总览" in page
         assert "支撑较强维度" in page
         assert "证据薄弱维度" in page
@@ -6340,11 +6845,9 @@ class TestIndexEndpoint:
             "data-submission-id=\"' + esc(String(submission && submission.id || '')) + '\"" in page
         )
         assert "renderOptimizationRecommendationTable" in page
-        assert "r.direct_apply_text || r.replacement_text || r.insertion_content || ''" in page
         assert "当前仅分析你点击的这一份施组，不混入其它文件的优化建议。" in page
         assert "直接替换文本 / 原位补充内容" in page
         assert "排版约束：" not in page
-        assert "r.issue || ''" not in page
         assert "function describeSelectedFiles(files, emptyText = '未选择任何文件')" in page
         assert (
             "function updateFilePickerText(inputId, textId, emptyText = '未选择任何文件')" in page
@@ -6685,13 +7188,19 @@ class TestWebFallbackOps:
         assert "%E4%B8%8A%E4%BC%A0%E6%96%BD%E7%BB%84" in location
 
     @patch("app.main.rescore_project_submissions")
-    def test_web_score_shigong_success_uses_reports_generated(self, mock_rescore, client):
+    @patch("app.main._resolve_project_confirmed_score_scale_max", return_value=5)
+    def test_web_score_shigong_success_uses_reports_generated(
+        self,
+        mock_score_scale,
+        mock_rescore,
+        client,
+    ):
         from types import SimpleNamespace
 
         mock_rescore.return_value = SimpleNamespace(reports_generated=3)
         response = client.post(
             "/web/score_shigong",
-            data={"project_id": "p1"},
+            data={"project_id": "p1", "score_scale_max": 100},
             follow_redirects=False,
         )
         assert response.status_code == 303
@@ -6699,6 +7208,8 @@ class TestWebFallbackOps:
         assert "msg_type=success" in location
         assert "%E5%B7%B2%E9%87%8D%E7%AE%97+3+%E4%BB%BD" in location
         assert "#section-shigong" in location
+        assert mock_rescore.call_args.kwargs["payload"].score_scale_max == 5
+        mock_score_scale.assert_called_once_with("p1")
 
     def test_web_score_shigong_redirects_readable_error_when_auth_enabled_without_key(self, client):
         with patch.dict(os.environ, {"API_KEYS": "admin:test-admin-key"}, clear=False):
@@ -6826,14 +7337,26 @@ class TestHealthEndpoints:
         assert "status" in data
         assert "version" in data
 
+    @patch("app.main._probe_config_completeness")
+    @patch("app.main.probe_storage_lock_status")
+    @patch("app.main.probe_event_log_appendability")
     @patch("app.main.load_config")
     @patch("app.main.ensure_data_dirs")
     def test_ready_returns_ready_when_all_checks_pass(
-        self, mock_ensure_dirs, mock_load_config, client
+        self,
+        mock_ensure_dirs,
+        mock_load_config,
+        mock_event_log_appendability,
+        mock_storage_lock_status,
+        mock_config_completeness,
+        client,
     ):
         """GET /ready should return ready when all checks pass."""
         mock_load_config.return_value = MagicMock()
         mock_ensure_dirs.return_value = None
+        mock_config_completeness.return_value = {"ok": True, "detail": "complete"}
+        mock_storage_lock_status.return_value = {"ok": True, "detail": "lock healthy"}
+        mock_event_log_appendability.return_value = {"ok": True, "detail": "appendable"}
 
         response = client.get("/ready")
         assert response.status_code == 200
@@ -6841,6 +7364,9 @@ class TestHealthEndpoints:
         assert data["status"] == "ready"
         assert data["checks"]["config"] is True
         assert data["checks"]["data_dirs"] is True
+        assert data["checks"]["config_completeness"] is True
+        assert data["checks"]["storage_lock"] is True
+        assert data["checks"]["event_log_appendable"] is True
 
     @patch("app.main.load_config")
     @patch("app.main.ensure_data_dirs")
@@ -6880,6 +7406,7 @@ class TestHealthEndpoints:
         data = response.json()
         assert "status" in data
         assert "checks" in data
+        assert "details" in data
         assert isinstance(data["checks"], dict)
 
 
@@ -6947,6 +7474,45 @@ class TestProjectsEndpoints:
         assert data["meta"]["key"] == "value"
         assert data["meta"]["enforce_material_gate"] is True
         assert "required_material_types" in data["meta"]
+
+    @patch("app.main.save_projects")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_create_project_with_project_classification(
+        self, mock_ensure, mock_load, mock_save, client
+    ):
+        mock_load.return_value = []
+        response = client.post(
+            "/api/v1/projects",
+            json={
+                "name": "测试项目",
+                "project_type": "装修及景观项目",
+                "bid_method": "AI评标",
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_type"] == "装修及景观"
+        assert data["bid_method"] == "AI综合评估法（三阶段）"
+        mock_save.assert_called_once()
+
+    @patch("app.main.save_projects")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_create_project_rejects_removed_legacy_bid_method(
+        self, mock_ensure, mock_load, mock_save, client
+    ):
+        mock_load.return_value = []
+        response = client.post(
+            "/api/v1/projects",
+            json={
+                "name": "测试项目",
+                "bid_method": "技术评分最低标价法",
+            },
+        )
+        assert response.status_code == 422
+        assert "已停用" in response.json()["detail"]
+        mock_save.assert_not_called()
 
     @patch("app.main.save_projects")
     @patch("app.main.load_projects")
@@ -7194,6 +7760,60 @@ class TestProjectsEndpoints:
         mock_save.assert_called_once()
         mock_preview_reader.assert_called_once()
         mock_full_reader.assert_not_called()
+
+    @patch("app.main._store_uploaded_material_from_local_path", new_callable=AsyncMock)
+    @patch("app.main.save_projects")
+    @patch("app.main.load_projects")
+    @patch("app.main._read_uploaded_file_content")
+    @patch("app.main._read_uploaded_file_preview_for_project_name")
+    @patch("app.main.ensure_data_dirs")
+    def test_create_project_from_tender_recovers_material_missing_path(
+        self,
+        mock_ensure,
+        mock_preview_reader,
+        mock_full_reader,
+        mock_load,
+        mock_save,
+        mock_store_material,
+        client,
+    ):
+        mock_load.return_value = []
+        mock_preview_reader.return_value = "项目名称：春晖路道路工程"
+        mock_full_reader.side_effect = AssertionError(
+            "full parser should not run during auto-create"
+        )
+
+        def _fake_store_material(
+            *, project_id, source_path, normalized_name, normalized_material_type, locale
+        ):
+            return {
+                "material": {
+                    "id": "m1",
+                    "project_id": project_id,
+                    "material_type": normalized_material_type,
+                    "filename": normalized_name,
+                    "created_at": "2026-03-19T00:00:00+00:00",
+                }
+            }
+
+        mock_store_material.side_effect = _fake_store_material
+
+        response = client.post(
+            "/api/v1/projects/create_from_tender",
+            files={
+                "file": (
+                    "招标文件.txt",
+                    "项目名称：春晖路道路工程".encode("utf-8"),
+                    "text/plain",
+                )
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["material"]["path"] == ""
+        assert data["material"]["parse_status"] == "failed"
+        assert data["material"]["parse_error_class"] == "missing_path"
 
     @patch("app.main._read_uploaded_file_preview_for_project_name")
     @patch("app.main.ensure_data_dirs")
@@ -8157,6 +8777,31 @@ class TestProjectsEndpoints:
         assert data[0]["created_at"]
         mock_save.assert_called_once()
 
+    @patch("app.main.save_projects")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_projects_sanitizes_legacy_project_taxonomy_fields(
+        self, mock_ensure, mock_load, mock_save, client
+    ):
+        mock_load.return_value = [
+            {
+                "id": "p1",
+                "name": "项目1",
+                "project_type": "未知工程类型",
+                "bid_method": "技术评分最低标价法",
+                "meta": {},
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+
+        response = client.get("/api/v1/projects")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data[0]["project_type"] is None
+        assert data[0]["bid_method"] is None
+        mock_save.assert_called_once()
+
 
 class TestExpertProfileEndpoints:
     """Tests for /projects/{project_id}/expert-profile and rescore endpoints."""
@@ -8188,6 +8833,51 @@ class TestExpertProfileEndpoints:
         assert data["expert_profile"]["weights_raw"]["01"] == 5
         assert data["expert_profile"]["weights_raw"]["16"] == 5
         assert data["expert_profile"]["norm_rule_version"] == "v1_m=0.5+a/10_norm=sum"
+        mock_save_profiles.assert_called_once()
+        mock_save_projects.assert_called_once()
+
+    @patch("app.main.save_expert_profiles")
+    @patch("app.main.save_projects")
+    @patch("app.main.load_expert_profiles")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_project_expert_profile_recovers_legacy_profile_missing_norm_fields(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_profiles,
+        mock_save_projects,
+        mock_save_profiles,
+        client,
+    ):
+        mock_load_projects.return_value = [
+            {
+                "id": "p1",
+                "name": "项目1",
+                "expert_profile_id": "ep1",
+                "meta": {},
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+        mock_load_profiles.return_value = [
+            {
+                "id": "ep1",
+                "name": "项目1 默认配置",
+                "weights_raw": {"01": 10},
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+
+        response = client.get("/api/v1/projects/p1/expert-profile")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["expert_profile"]["id"] == "ep1"
+        assert data["expert_profile"]["norm_rule_version"] == "v1_m=0.5+a/10_norm=sum"
+        assert data["expert_profile"]["updated_at"]
+        assert abs(sum(data["expert_profile"]["weights_norm"].values()) - 1.0) < 1e-6
+        assert data["expert_profile"]["weights_raw"]["01"] == 10
+        assert data["expert_profile"]["weights_raw"]["16"] == 5
         mock_save_profiles.assert_called_once()
         mock_save_projects.assert_called_once()
 
@@ -8371,7 +9061,7 @@ class TestExpertProfileEndpoints:
             {
                 "id": "p1",
                 "name": "项目1",
-                "meta": {},
+                "meta": {"score_scale_max": 5},
                 "created_at": "2026-01-01T00:00:00Z",
                 "expert_profile_id": "ep1",
             }
@@ -8422,7 +9112,7 @@ class TestExpertProfileEndpoints:
 
         response = client.post(
             "/api/v1/projects/p1/rescore",
-            json={"scoring_engine_version": "v2", "scope": "project", "score_scale_max": 5},
+            json={"scoring_engine_version": "v2", "scope": "project", "score_scale_max": 100},
         )
         assert response.status_code == 200
         data = response.json()
@@ -8434,6 +9124,8 @@ class TestExpertProfileEndpoints:
         assert "material_utilization" in data
         assert "material_utilization_alerts" in data
         assert "material_utilization_gate" in data
+        saved_projects = mock_save_projects.call_args.args[0]
+        assert saved_projects[0]["meta"]["score_scale_max"] == 5
         mock_save_submissions.assert_called_once()
         mock_save_score_reports.assert_called_once()
         mock_record_history.assert_called_once()
@@ -8791,6 +9483,63 @@ class TestMaterialsEndpoint:
         assert response.status_code == 404
         assert "项目不存在" in response.json()["detail"]
 
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_materials_ignores_legacy_project_missing_id(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        client,
+    ):
+        mock_load_projects.return_value = [
+            {"name": "legacy-without-id"},
+            {"id": "p1", "name": "正式项目"},
+        ]
+        mock_load_materials.return_value = [
+            {
+                "id": "m1",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件.pdf",
+                "path": "/tmp/tender.pdf",
+                "created_at": "2026-03-24T10:16:57+00:00",
+                "parse_status": "parsed",
+            }
+        ]
+
+        response = client.get("/api/v1/projects/p1/materials")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["id"] == "m1"
+
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_materials_recovers_when_materials_storage_corrupted(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        client,
+    ):
+        from app.storage import StorageDataError
+
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1"}]
+        mock_load_materials.side_effect = StorageDataError(
+            Path("/tmp/materials.json"),
+            "json_parse_failed",
+            "数据文件 JSON 格式损坏：materials.json（第 1 行，第 1 列），请使用历史版本回滚。",
+        )
+
+        response = client.get("/api/v1/projects/p1/materials")
+
+        assert response.status_code == 200
+        assert response.json() == []
+
     @patch("app.main._store_uploaded_material_from_local_path", new_callable=AsyncMock)
     def test_upload_material_returns_standardized_parse_error(
         self,
@@ -9023,7 +9772,7 @@ class TestMaterialsEndpoint:
         assert data["summary"]["scheduler_project_recent_consecutive_steady_round_count"] == 0
         assert (
             data["summary"]["scheduler_project_recent_stable_hot_threshold"]
-            == main_module._MATERIAL_PARSE_PROJECT_CACHE_STEADY_THRESHOLD
+            == app_main._MATERIAL_PARSE_PROJECT_CACHE_STEADY_THRESHOLD
         )
         assert data["summary"]["scheduler_project_recent_stable_hot"] is False
         assert data["summary"]["scheduler_project_recent_stable_hot_remaining_rounds"] == 3
@@ -9044,7 +9793,7 @@ class TestMaterialsEndpoint:
         assert data["summary"]["scheduler_project_recent_stable_hot_badge_label"] == "冷启动"
         assert (
             data["summary"]["scheduler_project_recent_stable_hot_rule_label"]
-            == main_module._material_parse_project_cache_stable_hot_rule_label()
+            == app_main._material_parse_project_cache_stable_hot_rule_label()
         )
         assert data["summary"]["scheduler_project_recent_window_state"] == "cold"
         assert data["summary"]["scheduler_project_recent_avoided_rebuild_work_units_avg"] == 0.0
@@ -9059,6 +9808,158 @@ class TestMaterialsEndpoint:
         assert data["materials"][0]["parse_effective_status"] == "processing"
         assert "解析中" in str(data["materials"][0]["parse_stage_label"])
         assert data["materials"][0]["parse_route_label"] == "本地预解析，必要时 GPT 深解析"
+
+    @patch("app.main._load_material_parse_status_core_payload")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_material_parse_status_recovers_material_row_missing_path(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_core_payload,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1"}]
+        mock_load_core_payload.return_value = {
+            "jobs": [],
+            "materials": [
+                {
+                    "id": "m1",
+                    "project_id": "p1",
+                    "material_type": "site_photo",
+                    "filename": "现场照片.JPG",
+                    "created_at": "2026-03-09T00:00:00+00:00",
+                }
+            ],
+            "summary": {
+                "materials_total": 1,
+                "parsed_materials": 0,
+                "failed_materials": 1,
+                "processing_materials": 0,
+                "queued_materials": 0,
+                "previewed_materials": 0,
+            },
+        }
+
+        response = client.get("/api/v1/projects/p1/materials/parse_status")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["materials"][0]["path"] == ""
+        assert data["materials"][0]["parse_status"] == "failed"
+        assert data["materials"][0]["parse_error_class"] == "missing_path"
+
+    @patch("app.main._load_material_parse_status_core_payload")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_material_parse_status_recovers_job_row_missing_required_fields(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_core_payload,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1"}]
+        mock_load_core_payload.return_value = {
+            "jobs": [
+                {
+                    "status": "queued",
+                }
+            ],
+            "materials": [],
+            "summary": {
+                "materials_total": 0,
+                "parsed_materials": 0,
+                "failed_materials": 0,
+                "processing_materials": 0,
+                "queued_materials": 0,
+                "previewed_materials": 0,
+            },
+        }
+
+        response = client.get("/api/v1/projects/p1/materials/parse_status")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["jobs"][0]["id"] == ""
+        assert data["jobs"][0]["material_id"] == ""
+        assert data["jobs"][0]["project_id"] == ""
+        assert data["jobs"][0]["material_type"] == "tender_qa"
+        assert data["jobs"][0]["filename"] == ""
+        assert data["jobs"][0]["status"] == "queued"
+
+    @patch("app.main.load_material_parse_jobs", return_value=[])
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_material_parse_status_recovers_when_materials_storage_corrupted(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        mock_load_jobs,
+        client,
+    ):
+        from app.storage import StorageDataError
+
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1"}]
+        mock_load_materials.side_effect = StorageDataError(
+            Path("/tmp/materials.json"),
+            "json_parse_failed",
+            "数据文件 JSON 格式损坏：materials.json（第 1 行，第 1 列），请使用历史版本回滚。",
+        )
+
+        response = client.get("/api/v1/projects/p1/materials/parse_status")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["materials"] == []
+        assert data["jobs"] == []
+        assert data["overview"]["materials_total"] == 0
+        assert data["summary"]["materials_total"] == 0
+
+    @patch("app.main.load_material_parse_jobs")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_material_parse_status_recovers_when_jobs_storage_corrupted(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        mock_load_jobs,
+        client,
+    ):
+        from app.storage import StorageDataError
+
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1"}]
+        mock_load_materials.return_value = [
+            {
+                "id": "m1",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件.pdf",
+                "path": "/tmp/招标文件.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "queued",
+                "parse_backend": "queued",
+            }
+        ]
+        mock_load_jobs.side_effect = StorageDataError(
+            Path("/tmp/material_parse_jobs.json"),
+            "json_parse_failed",
+            "数据文件 JSON 格式损坏：material_parse_jobs.json（第 1 行，第 1 列），请使用历史版本回滚。",
+        )
+
+        response = client.get("/api/v1/projects/p1/materials/parse_status")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["jobs"] == []
+        assert data["materials"][0]["id"] == "m1"
+        assert data["overview"]["materials_total"] == 1
 
     @patch("app.main.load_material_parse_jobs")
     @patch("app.main.load_materials")
@@ -9101,6 +10002,50 @@ class TestMaterialsEndpoint:
         assert data["parse_status"] == "parsed"
         assert data["parse_finished_at"] == "2026-03-09T00:05:00+00:00"
         assert data["parsed_chars"] == 1280
+        assert "第一页文本" in data["parsed_text_preview"]
+
+    @patch("app.main.load_material_parse_jobs")
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_material_detail_recovers_when_jobs_storage_corrupted(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        mock_load_jobs,
+        client,
+    ):
+        from app.storage import StorageDataError
+
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1"}]
+        mock_load_materials.return_value = [
+            {
+                "id": "m1",
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件正文.pdf",
+                "path": "/tmp/招标文件正文.pdf",
+                "created_at": "2026-03-09T00:00:00+00:00",
+                "parse_status": "parsed",
+                "parse_backend": "local",
+                "parse_finished_at": "2026-03-09T00:05:00+00:00",
+                "parsed_chars": 120,
+                "parsed_text": "第一页文本",
+            }
+        ]
+        mock_load_jobs.side_effect = StorageDataError(
+            Path("/tmp/material_parse_jobs.json"),
+            "json_parse_failed",
+            "数据文件 JSON 格式损坏：material_parse_jobs.json（第 1 行，第 1 列），请使用历史版本回滚。",
+        )
+
+        response = client.get("/api/v1/projects/p1/materials/m1/detail")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["id"] == "m1"
+        assert data["parse_status"] == "parsed"
         assert "第一页文本" in data["parsed_text_preview"]
 
     @patch("app.main.load_material_parse_jobs")
@@ -10923,9 +11868,9 @@ class TestMaterialsEndpoint:
             "closure_gate_details": [
                 {
                     "id": "minimum_ready_projects",
-                    "label": "达到第一阶段 ready 的项目数达到 2 个",
-                    "summary": "当前仅有 1 个项目达到第一阶段 ready，至少需要 2 个。",
-                    "detail": "先推进未 ready 项目进入第一阶段 ready。",
+                    "label": "达到第一阶段就绪的项目数达到 2 个",
+                    "summary": "当前仅有 1 个项目达到第一阶段就绪，至少需要 2 个。",
+                    "detail": "先推进未就绪项目进入第一阶段就绪。",
                     "project_id": "p1",
                     "project_name": "项目A",
                     "entrypoint_key": "ground_truth",
@@ -10937,10 +11882,10 @@ class TestMaterialsEndpoint:
                 {
                     "id": "phase1_ready_gap:p1",
                     "kind": "phase1_ready_gap",
-                    "kind_label": "第一阶段 ready 缺口",
+                    "kind_label": "第一阶段就绪缺口",
                     "project_id": "p1",
                     "project_name": "项目A",
-                    "summary": "当前项目仍未达到第一阶段 ready（未通过门 2 个）。",
+                    "summary": "当前项目仍未达到第一阶段就绪（未通过门 2 个）。",
                     "detail": "未通过门：current_display_matches_qt、drift_low；当前项目尚未满足第一阶段封关条件，优先收口未通过门。",
                     "entrypoint_key": "auto_run_reflection",
                     "entrypoint_label": "前往「5) 自我学习与进化」执行“一键闭环执行”",
@@ -12012,6 +12957,59 @@ class TestMaterialsEndpoint:
         assert "## 解析能力" in markdown
         assert "DWG 转换器可用" in markdown
 
+    @patch("app.main.load_materials")
+    @patch("app.main._build_scoring_readiness")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_material_depth_report_recovers_when_materials_storage_corrupted(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_build_readiness,
+        mock_load_materials,
+        client,
+    ):
+        from app.storage import StorageDataError
+
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_build_readiness.return_value = {
+            "project_id": "p1",
+            "ready": True,
+            "material_quality": {
+                "total_files": 0,
+                "parsed_ok_files": 0,
+                "parsed_failed_files": 0,
+                "total_parsed_chars": 0,
+                "total_parsed_chunks": 0,
+                "total_numeric_terms": 0,
+                "parse_fail_ratio": 0.0,
+                "counts_by_type": {},
+                "chars_by_type": {},
+                "chunks_by_type": {},
+                "numeric_terms_by_type": {},
+                "parsed_ok_by_type": {},
+                "parsed_fail_by_type": {},
+                "parsed_fail_details": [],
+            },
+            "material_gate": {"required_types": [], "passed": True},
+            "material_depth_gate": {"passed": True},
+            "issues": [],
+            "warnings": [],
+        }
+        mock_load_materials.side_effect = StorageDataError(
+            Path("/tmp/materials.json"),
+            "json_parse_failed",
+            "数据文件 JSON 格式损坏：materials.json（第 1 行，第 1 列），请使用历史版本回滚。",
+        )
+
+        response = client.get("/api/v1/projects/p1/materials/depth_report")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["capabilities"]["pdf_file_count"] == 0
+        assert data["capabilities"]["dwg_file_count"] == 0
+        assert data["capabilities"]["site_photo_file_count"] == 0
+
     @patch("app.main._build_material_knowledge_profile")
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
@@ -12117,6 +13115,62 @@ class TestMaterialsEndpoint:
         assert "## 按评分维度" in markdown
         assert "## 建议动作" in markdown
         assert "数值约束簇" in markdown
+
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_material_knowledge_profile_recovers_when_materials_storage_corrupted(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        client,
+    ):
+        from app.storage import StorageDataError
+
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_load_materials.side_effect = StorageDataError(
+            Path("/tmp/materials.json"),
+            "json_parse_failed",
+            "数据文件 JSON 格式损坏：materials.json（第 1 行，第 1 列），请使用历史版本回滚。",
+        )
+
+        response = client.get("/api/v1/projects/p1/materials/knowledge_profile")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["summary"]["total_files"] == 0
+        assert data["by_type"] == []
+        assert data["by_dimension"] == []
+        assert data["recommendations"] == []
+
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_material_knowledge_profile_markdown_recovers_when_materials_storage_corrupted(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        client,
+    ):
+        from app.storage import StorageDataError
+
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_load_materials.side_effect = StorageDataError(
+            Path("/tmp/materials.json"),
+            "json_parse_failed",
+            "数据文件 JSON 格式损坏：materials.json（第 1 行，第 1 列），请使用历史版本回滚。",
+        )
+
+        response = client.get("/api/v1/projects/p1/materials/knowledge_profile/markdown")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert "# 项目资料知识画像报告" in data["markdown"]
+        assert "资料总数：`0`" in data["markdown"]
 
     @patch("app.main._resolve_dwg_converter_binaries", return_value=["/usr/local/bin/dwg2dxf"])
     @patch("app.main._now_iso", return_value="2026-02-27T00:00:00+00:00")
@@ -12827,7 +13881,7 @@ class TestMaterialAdvancedParsing:
         assert "关键节点" in " ".join(duration_patterns.get("must_hit_terms") or [])
         assert float(duration_patterns.get("consensus_score") or 0.0) >= 0.6
 
-    @patch("app.main.select_top_logic_skeletons")
+    @patch("app.main._select_project_top_logic_skeletons")
     def test_build_runtime_feature_requirements_uses_high_confidence_skeletons(
         self,
         mock_select_top_logic_skeletons,
@@ -12835,7 +13889,7 @@ class TestMaterialAdvancedParsing:
         from app.main import _build_runtime_feature_requirements
         from app.schemas import ExtractedFeature
 
-        mock_select_top_logic_skeletons.side_effect = lambda dimension_ids, top_k=2: (
+        mock_select_top_logic_skeletons.side_effect = lambda dimension_ids, project_id, top_k=2: (
             [
                 ExtractedFeature(
                     feature_id=f"feat-{dimension_ids[0]}",
@@ -12876,6 +13930,55 @@ class TestMaterialAdvancedParsing:
         assert "feat-14" in (patterns.get("feature_ids") or [])
         assert "动作链与责任分工" in " ".join(patterns.get("hints") or [])
         assert float(dim14.get("weight") or 0.0) > 1.0
+
+    @patch("app.main._select_project_top_logic_skeletons")
+    def test_build_runtime_feature_requirements_filters_cross_project_skeletons(
+        self,
+        mock_select_project_top_logic_skeletons,
+    ):
+        from app.main import _build_runtime_feature_requirements
+        from app.schemas import ExtractedFeature
+
+        mock_select_project_top_logic_skeletons.return_value = [
+            ExtractedFeature(
+                feature_id="feat-p1",
+                dimension_id="14",
+                logic_skeleton=[
+                    "[前置条件] 图纸接口明确 + [技术/动作] 深化碰撞复核 + [量化指标类型] 节点闭环"
+                ],
+                confidence_score=0.88,
+                usage_count=6,
+                active=True,
+                governance_status="adopted",
+                source_project_ids=["p1"],
+            ),
+        ]
+
+        reqs = _build_runtime_feature_requirements(
+            "p1",
+            material_knowledge_profile={
+                "by_dimension": [
+                    {
+                        "dimension_id": "14",
+                        "coverage_score": 0.76,
+                        "source_file_count": 2,
+                        "source_types": ["drawing"],
+                    }
+                ]
+            },
+            weights_norm={"14": 0.2},
+        )
+
+        dim14 = next(row for row in reqs if str(row.get("dimension_id")) == "14")
+        patterns = dim14.get("patterns") or {}
+        assert any(
+            call.kwargs.get("dimension_ids") == ["14"]
+            and call.kwargs.get("project_id") == "p1"
+            and call.kwargs.get("top_k") == 2
+            for call in mock_select_project_top_logic_skeletons.call_args_list
+        )
+        assert patterns.get("feature_ids") == ["feat-p1"]
+        assert "深化碰撞复核" in " ".join(patterns.get("hints") or [])
 
     @patch("app.main.load_evolution_reports")
     def test_build_runtime_feedback_requirements_uses_evolution_multipliers(
@@ -12983,6 +14086,7 @@ class TestMaterialAdvancedParsing:
                 confidence_score=0.83,
                 usage_count=6,
                 active=True,
+                source_project_ids=["p1"],
             ),
             ExtractedFeature(
                 feature_id="f-14",
@@ -12993,6 +14097,7 @@ class TestMaterialAdvancedParsing:
                 confidence_score=0.72,
                 usage_count=4,
                 active=True,
+                source_project_ids=["p1"],
             ),
             ExtractedFeature(
                 feature_id="f-03-old",
@@ -13003,6 +14108,7 @@ class TestMaterialAdvancedParsing:
                 confidence_score=0.18,
                 usage_count=5,
                 active=False,
+                source_project_ids=["p1"],
             ),
         ]
         summary = _build_feature_confidence_summary(
@@ -13020,6 +14126,149 @@ class TestMaterialAdvancedParsing:
         assert summary["focus_dimensions"] == ["14", "09"]
         top_dim_ids = [row["dimension_id"] for row in summary["top_dimensions"]]
         assert top_dim_ids[:2] == ["09", "14"] or top_dim_ids[:2] == ["14", "09"]
+
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_feature_kb")
+    def test_build_feature_confidence_summary_filters_cross_project_features(
+        self,
+        mock_load_feature_kb,
+        mock_load_ground_truth,
+    ):
+        from app.main import _build_feature_confidence_summary
+        from app.schemas import ExtractedFeature
+
+        mock_load_feature_kb.return_value = [
+            ExtractedFeature(
+                feature_id="f-p1",
+                dimension_id="09",
+                logic_skeleton=[
+                    "[前置条件] 节点明确 + [技术/动作] 周纠偏闭环 + [量化指标类型] 达成率"
+                ],
+                confidence_score=0.88,
+                usage_count=5,
+                active=True,
+                source_record_ids=["gt-p1"],
+            ),
+            ExtractedFeature(
+                feature_id="f-p2",
+                dimension_id="14",
+                logic_skeleton=[
+                    "[前置条件] 图纸接口明确 + [技术/动作] 深化复核 + [量化指标类型] 节点闭环"
+                ],
+                confidence_score=0.91,
+                usage_count=8,
+                active=True,
+                source_project_ids=["p2"],
+            ),
+            ExtractedFeature(
+                feature_id="f-unscoped",
+                dimension_id="03",
+                logic_skeleton=[
+                    "[前置条件] 文明施工场景明确 + [技术/动作] 扬尘联动 + [量化指标类型] 巡检频次"
+                ],
+                confidence_score=0.77,
+                usage_count=3,
+                active=True,
+            ),
+        ]
+        mock_load_ground_truth.return_value = [
+            {"id": "gt-p1", "project_id": "p1"},
+            {"id": "gt-p2", "project_id": "p2"},
+        ]
+
+        summary = _build_feature_confidence_summary("p1")
+
+        assert summary["active_count"] == 1
+        assert summary["high_confidence_count"] == 1
+        assert [row["dimension_id"] for row in summary["top_dimensions"]] == ["09"]
+
+    @patch("app.main.load_feature_kb")
+    def test_build_project_few_shot_prompt_examples_recovers_stale_feature_ids_via_record_link(
+        self,
+        mock_load_feature_kb,
+    ):
+        from app.main import _build_project_few_shot_prompt_examples
+        from app.schemas import ExtractedFeature
+
+        mock_load_feature_kb.return_value = [
+            ExtractedFeature(
+                feature_id="F-real",
+                dimension_id="09",
+                logic_skeleton=[
+                    "[前置条件] 节点明确 + [技术/动作] 周纠偏闭环 + [量化指标类型] 达成率"
+                ],
+                confidence_score=0.86,
+                usage_count=4,
+                active=True,
+                governance_status="adopted",
+                source_record_ids=["gt-1"],
+                source_project_ids=["p1"],
+                source_highlights=["评委表扬关键节点周纠偏"],
+            )
+        ]
+
+        with patch(
+            "app.main.load_ground_truth",
+            return_value=[
+                {
+                    "id": "gt-1",
+                    "project_id": "p1",
+                    "few_shot_distillation": {
+                        "captured": 1,
+                        "feature_ids": ["F-stale"],
+                        "dimension_ids": ["09"],
+                        "manual_review_status": "adopted",
+                    },
+                }
+            ],
+        ):
+            rows = _build_project_few_shot_prompt_examples("p1")
+
+        assert len(rows) == 1
+        assert rows[0]["feature_id"] == "F-real"
+
+    @patch("app.main.load_feature_kb")
+    def test_build_project_few_shot_prompt_examples_ignores_cross_project_explicit_feature_ids(
+        self,
+        mock_load_feature_kb,
+    ):
+        from app.main import _build_project_few_shot_prompt_examples
+        from app.schemas import ExtractedFeature
+
+        mock_load_feature_kb.return_value = [
+            ExtractedFeature(
+                feature_id="F-p2",
+                dimension_id="09",
+                logic_skeleton=[
+                    "[前置条件] 异项目场景 + [技术/动作] 外部纠偏闭环 + [量化指标类型] 达成率"
+                ],
+                confidence_score=0.91,
+                usage_count=5,
+                active=True,
+                governance_status="adopted",
+                source_project_ids=["p2"],
+                source_highlights=["异项目显式残留"],
+            )
+        ]
+
+        with patch(
+            "app.main.load_ground_truth",
+            return_value=[
+                {
+                    "id": "gt-1",
+                    "project_id": "p1",
+                    "few_shot_distillation": {
+                        "captured": 1,
+                        "feature_ids": ["F-p2"],
+                        "dimension_ids": ["09"],
+                        "manual_review_status": "adopted",
+                    },
+                }
+            ],
+        ):
+            rows = _build_project_few_shot_prompt_examples("p1")
+
+        assert rows == []
 
     def test_build_material_utilization_summary_tracks_dimension_requirements(self):
         from app.main import _build_material_utilization_summary
@@ -15106,6 +16355,38 @@ class TestSubmissionsEndpoint:
         assert len(data) == 1
         assert data[0]["id"] == "s1"
 
+    def test_list_submissions_recovers_legacy_submission_missing_required_fields(self, client):
+        legacy_submission = {
+            "project_id": "p1",
+            "report": {"meta": None},
+            "text": 123,
+        }
+
+        with (
+            patch("app.main.ensure_data_dirs"),
+            patch("app.main.load_projects", return_value=[{"id": "p1"}]),
+            patch("app.main.load_submissions", return_value=[legacy_submission]),
+            patch("app.main.load_qingtian_results", return_value=[]),
+            patch("app.main._select_calibrator_model", return_value=None),
+            patch("app.main._build_material_knowledge_profile", return_value={}),
+            patch("app.main._ensure_report_score_self_awareness"),
+        ):
+            response = client.get("/api/v1/projects/p1/submissions")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["id"] == ""
+        assert data[0]["project_id"] == "p1"
+        assert data[0]["filename"] == ""
+        assert data[0]["total_score"] == 0.0
+        assert data[0]["text"] == "123"
+        assert data[0]["created_at"]
+        assert data[0]["report"]["scoring_status"] == "pending"
+        assert data[0]["report"]["dimension_scores"] == {}
+        assert data[0]["report"]["penalties"] == []
+        assert data[0]["report"]["suggestions"] == []
+
     @patch("app.main.load_projects")
     @patch("app.main.load_submissions")
     @patch("app.main.ensure_data_dirs")
@@ -15270,131 +16551,6 @@ class TestSubmissionsEndpoint:
         assert data[0]["report"]["raw_rule_total_score_100"] == 20.01
         assert data[0]["report"]["dual_track_summary"]["display_score_label"] == "当前分"
         assert data[0]["report"]["dual_track_summary"]["display_total_score"] == 4.86
-
-    @patch("app.main.load_qingtian_results")
-    @patch("app.main.load_projects")
-    @patch("app.main.load_submissions")
-    @patch("app.main.ensure_data_dirs")
-    def test_list_submissions_uses_five_scale_global_prior_within_soft_buffer(
-        self,
-        mock_ensure,
-        mock_load_submissions,
-        mock_load_projects,
-        mock_load_qingtian_results,
-        client,
-    ):
-        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 5}}]
-        mock_load_submissions.return_value = [
-            {
-                "id": "s1",
-                "project_id": "p1",
-                "filename": "current.pdf",
-                "total_score": 20.91,
-                "report": {
-                    "scoring_status": "scored",
-                    "total_score": 20.91,
-                    "rule_total_score": 20.91,
-                    "meta": {},
-                },
-                "text": "current text",
-                "created_at": "2026-01-02T00:00:00Z",
-            },
-            {
-                "id": "hist1",
-                "project_id": "hist",
-                "filename": "hist.txt",
-                "total_score": 6.81,
-                "report": {
-                    "scoring_status": "scored",
-                    "total_score": 6.81,
-                    "rule_total_score": 6.81,
-                    "meta": {},
-                },
-                "text": "historical text",
-                "created_at": "2026-01-01T00:00:00Z",
-            },
-        ]
-        mock_load_qingtian_results.return_value = [
-            {
-                "id": "qt1",
-                "submission_id": "hist1",
-                "qt_total_score": 84.0,
-                "created_at": "2026-01-03T00:00:00Z",
-            }
-        ]
-
-        response = client.get("/api/v1/projects/p1/submissions")
-
-        assert response.status_code == 200
-        data = response.json()
-        assert len(data) == 1
-        assert data[0]["report"]["rule_total_score"] == 1.0455
-        assert data[0]["report"]["raw_rule_total_score_100"] == 20.91
-        assert data[0]["report"]["pred_total_score"] is not None
-        assert data[0]["total_score"] > data[0]["report"]["rule_total_score"]
-        assert data[0]["report"]["dual_track_summary"]["display_score_label"] == "当前分"
-
-    @patch("app.main.load_qingtian_results")
-    @patch("app.main.load_projects")
-    @patch("app.main.load_submissions")
-    @patch("app.main.ensure_data_dirs")
-    def test_list_submissions_skips_five_scale_global_prior_outside_soft_buffer(
-        self,
-        mock_ensure,
-        mock_load_submissions,
-        mock_load_projects,
-        mock_load_qingtian_results,
-        client,
-    ):
-        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 5}}]
-        mock_load_submissions.return_value = [
-            {
-                "id": "s1",
-                "project_id": "p1",
-                "filename": "current.pdf",
-                "total_score": 21.04,
-                "report": {
-                    "scoring_status": "scored",
-                    "total_score": 21.04,
-                    "rule_total_score": 21.04,
-                    "meta": {},
-                },
-                "text": "current text",
-                "created_at": "2026-01-02T00:00:00Z",
-            },
-            {
-                "id": "hist1",
-                "project_id": "hist",
-                "filename": "hist.txt",
-                "total_score": 6.81,
-                "report": {
-                    "scoring_status": "scored",
-                    "total_score": 6.81,
-                    "rule_total_score": 6.81,
-                    "meta": {},
-                },
-                "text": "historical text",
-                "created_at": "2026-01-01T00:00:00Z",
-            },
-        ]
-        mock_load_qingtian_results.return_value = [
-            {
-                "id": "qt1",
-                "submission_id": "hist1",
-                "qt_total_score": 84.0,
-                "created_at": "2026-01-03T00:00:00Z",
-            }
-        ]
-
-        response = client.get("/api/v1/projects/p1/submissions")
-
-        assert response.status_code == 200
-        data = response.json()
-        assert len(data) == 1
-        assert data[0]["total_score"] == 1.052
-        assert data[0]["report"]["pred_total_score"] is None
-        assert data[0]["report"]["rule_total_score"] == 1.052
-        assert data[0]["report"]["dual_track_summary"]["display_score_label"] == "独立分"
 
     @patch("app.main.load_qingtian_results")
     @patch("app.main.load_projects")
@@ -15665,6 +16821,94 @@ class TestSubmissionsEndpoint:
         assert summary["alignment_status"] == "ground_truth_exact"
         assert "真实评标结果" in summary["governance_hint"]
 
+    def test_list_submissions_recovers_when_qingtian_storage_corrupted(self, client):
+        from app.storage import StorageDataError
+
+        submission = {
+            "id": "s1",
+            "project_id": "p1",
+            "filename": "f1.txt",
+            "total_score": 82.0,
+            "report": {
+                "scoring_status": "scored",
+                "total_score": 82.0,
+                "rule_total_score": 78.0,
+                "pred_total_score": 82.0,
+                "meta": {},
+            },
+            "text": "t1",
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+        with (
+            patch("app.main.ensure_data_dirs"),
+            patch("app.main.load_projects", return_value=[{"id": "p1"}]),
+            patch("app.main.load_submissions", return_value=[submission]),
+            patch(
+                "app.main.load_qingtian_results",
+                side_effect=StorageDataError(
+                    Path("/tmp/qingtian_results.json"),
+                    "json_parse_failed",
+                    "数据文件 JSON 格式损坏：qingtian_results.json（第 1 行，第 1 列），请使用历史版本回滚。",
+                ),
+            ),
+            patch(
+                "app.main._select_calibrator_model",
+                return_value={"calibrator_version": "calib_v1"},
+            ),
+            patch("app.main._build_material_knowledge_profile_safe", return_value={}),
+            patch("app.main._ensure_report_score_self_awareness"),
+        ):
+            response = client.get("/api/v1/projects/p1/submissions")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["report"]["dual_track_summary"]["qingtian_score"] is None
+
+    def test_list_submissions_recovers_when_materials_storage_corrupted(self, client):
+        from app.storage import StorageDataError
+
+        submission = {
+            "id": "s1",
+            "project_id": "p1",
+            "filename": "f1.txt",
+            "total_score": 82.0,
+            "report": {
+                "scoring_status": "scored",
+                "total_score": 82.0,
+                "rule_total_score": 78.0,
+                "pred_total_score": 82.0,
+                "meta": {},
+            },
+            "text": "t1",
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+        with (
+            patch("app.main.ensure_data_dirs"),
+            patch("app.main.load_projects", return_value=[{"id": "p1"}]),
+            patch("app.main.load_submissions", return_value=[submission]),
+            patch("app.main.load_qingtian_results", return_value=[]),
+            patch(
+                "app.main.load_materials",
+                side_effect=StorageDataError(
+                    Path("/tmp/materials.json"),
+                    "json_parse_failed",
+                    "数据文件 JSON 格式损坏：materials.json（第 1 行，第 1 列），请使用历史版本回滚。",
+                ),
+            ),
+            patch(
+                "app.main._select_calibrator_model",
+                return_value={"calibrator_version": "calib_v1"},
+            ),
+            patch("app.main._ensure_report_score_self_awareness"),
+        ):
+            response = client.get("/api/v1/projects/p1/submissions")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["report"]["dual_track_summary"]["display_score_label"] == "当前分"
+
     def test_build_submission_dual_track_overview_prefers_real_score_headline(self):
         from app.qingtian_dual_track import build_submission_dual_track_overview
 
@@ -15761,6 +17005,368 @@ class TestSubmissionsEndpoint:
         assert second["latest_report"]["rank_by_rule"] == 1
         assert first["latest_report"]["top_expected_gain"] == 3.0
 
+    def test_list_submissions_with_latest_report_recovers_when_score_reports_storage_corrupted(
+        self,
+        client,
+    ):
+        from app.storage import StorageDataError
+
+        submissions = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "A.docx",
+                "total_score": 82.0,
+                "report": {"scoring_status": "scored", "total_score": 82.0, "meta": {}},
+                "text": "t1",
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+
+        with (
+            patch("app.main.ensure_data_dirs"),
+            patch("app.main.load_projects", return_value=[{"id": "p1"}]),
+            patch("app.main.load_submissions", return_value=submissions),
+            patch(
+                "app.main.load_score_reports",
+                side_effect=StorageDataError(
+                    Path("/tmp/score_reports.json"),
+                    "json_parse_failed",
+                    "数据文件 JSON 格式损坏：score_reports.json（第 1 行，第 1 列），请使用历史版本回滚。",
+                ),
+            ),
+            patch("app.main.load_qingtian_results", return_value=[]),
+            patch(
+                "app.main._select_calibrator_model",
+                return_value={"calibrator_version": "calib_v1"},
+            ),
+            patch("app.main._build_material_knowledge_profile_safe", return_value={}),
+            patch("app.main._ensure_report_score_self_awareness"),
+        ):
+            response = client.get("/api/v1/projects/p1/submissions?with=latest_report")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert len(data["submissions"]) == 1
+        latest = data["submissions"][0]["latest_report"]
+        assert latest["report_id"] is None
+        assert latest["rank_by_pred"] is None
+        assert latest["rank_by_rule"] == 1
+        assert latest["top_expected_gain"] == 0.0
+
+    def test_get_latest_submission_report_recovers_when_score_reports_storage_corrupted(
+        self,
+        client,
+    ):
+        from app.storage import StorageDataError
+
+        submission = {
+            "id": "s1",
+            "project_id": "p1",
+            "filename": "A.docx",
+            "total_score": 82.0,
+            "report": {
+                "scoring_status": "scored",
+                "total_score": 82.0,
+                "rule_total_score": 80.0,
+                "pred_total_score": 82.0,
+                "rule_dim_scores": {},
+                "penalties": [],
+                "lint_findings": [],
+                "suggestions": [],
+                "meta": {},
+            },
+            "text": "t1",
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+
+        with (
+            patch("app.main.ensure_data_dirs"),
+            patch(
+                "app.main.load_score_reports",
+                side_effect=StorageDataError(
+                    Path("/tmp/score_reports.json"),
+                    "json_parse_failed",
+                    "数据文件 JSON 格式损坏：score_reports.json（第 1 行，第 1 列），请使用历史版本回滚。",
+                ),
+            ),
+            patch("app.main.load_submissions", return_value=[submission]),
+        ):
+            response = client.get("/api/v1/submissions/s1/reports/latest")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["report"]["submission_id"] == "s1"
+        assert data["report"]["rule_total_score"] == 80.0
+        assert data["ui_summary"]["top_conflicts"] == []
+        assert data["ui_summary"]["top10_suggestions"] == []
+
+    def test_get_project_evaluation_recovers_when_score_reports_storage_corrupted(self, client):
+        from app.storage import StorageDataError
+
+        evaluation_payload = {
+            "project_id": "p1",
+            "sample_count_qt": 0,
+            "variants": {},
+            "acceptance": {},
+            "computed_at": "2026-01-01T00:00:00Z",
+        }
+
+        with (
+            patch("app.main.ensure_data_dirs"),
+            patch("app.main.load_projects", return_value=[{"id": "p1"}]),
+            patch("app.main.load_submissions", return_value=[]),
+            patch(
+                "app.main.load_score_reports",
+                side_effect=StorageDataError(
+                    Path("/tmp/score_reports.json"),
+                    "json_parse_failed",
+                    "数据文件 JSON 格式损坏：score_reports.json（第 1 行，第 1 列），请使用历史版本回滚。",
+                ),
+            ),
+            patch("app.main.load_qingtian_results", return_value=[]),
+            patch("app.main.evaluate_project_variants", return_value=evaluation_payload),
+            patch("app.main._build_evolution_health_report", return_value={}),
+            patch("app.main._build_feedback_governance_report", return_value={}),
+            patch("app.main._build_phase1_closure_readiness", return_value={}),
+        ):
+            response = client.get("/api/v1/projects/p1/evaluation")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["sample_count_qt"] == 0
+
+    def test_get_evaluation_summary_recovers_when_score_reports_storage_corrupted(self, client):
+        from app.storage import StorageDataError
+
+        evaluation_payload = {
+            "project_id": "p1",
+            "sample_count_qt": 0,
+            "variants": {},
+            "acceptance": {},
+            "computed_at": "2026-01-01T00:00:00Z",
+        }
+
+        with (
+            patch("app.main.ensure_data_dirs"),
+            patch("app.main.load_projects", return_value=[{"id": "p1"}]),
+            patch("app.main.load_materials", return_value=[]),
+            patch("app.main.load_submissions", return_value=[]),
+            patch(
+                "app.main.load_score_reports",
+                side_effect=StorageDataError(
+                    Path("/tmp/score_reports.json"),
+                    "json_parse_failed",
+                    "数据文件 JSON 格式损坏：score_reports.json（第 1 行，第 1 列），请使用历史版本回滚。",
+                ),
+            ),
+            patch("app.main.load_qingtian_results", return_value=[]),
+            patch("app.main.load_calibration_models", return_value=[]),
+            patch("app.main.load_ground_truth", return_value=[]),
+            patch("app.main.evaluate_project_variants", return_value=evaluation_payload),
+            patch("app.main._build_total_closure_readiness", return_value={}),
+        ):
+            response = client.get("/api/v1/evaluation/summary")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_count"] == 1
+        assert data["project_ids"] == ["p1"]
+
+    def test_get_evaluation_summary_recovers_when_qingtian_storage_corrupted(self, client):
+        from app.storage import StorageDataError
+
+        evaluation_payload = {
+            "project_id": "p1",
+            "sample_count_qt": 0,
+            "variants": {},
+            "acceptance": {},
+            "computed_at": "2026-01-01T00:00:00Z",
+        }
+
+        with (
+            patch("app.main.ensure_data_dirs"),
+            patch("app.main.load_projects", return_value=[{"id": "p1"}]),
+            patch("app.main.load_materials", return_value=[]),
+            patch("app.main.load_submissions", return_value=[]),
+            patch("app.main.load_score_reports", return_value=[]),
+            patch(
+                "app.main.load_qingtian_results",
+                side_effect=StorageDataError(
+                    Path("/tmp/qingtian_results.json"),
+                    "json_parse_failed",
+                    "数据文件 JSON 格式损坏：qingtian_results.json（第 1 行，第 1 列），请使用历史版本回滚。",
+                ),
+            ),
+            patch("app.main.load_calibration_models", return_value=[]),
+            patch("app.main.load_ground_truth", return_value=[]),
+            patch("app.main.evaluate_project_variants", return_value=evaluation_payload),
+            patch("app.main._build_total_closure_readiness", return_value={}),
+        ):
+            response = client.get("/api/v1/evaluation/summary")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_count"] == 1
+        assert data["project_ids"] == ["p1"]
+
+    def test_list_governance_comparable_submission_snapshots_recovers_when_score_reports_storage_corrupted(
+        self,
+    ):
+        from app.storage import StorageDataError
+
+        with (
+            patch(
+                "app.main.load_score_reports",
+                side_effect=StorageDataError(
+                    Path("/tmp/score_reports.json"),
+                    "json_parse_failed",
+                    "数据文件 JSON 格式损坏：score_reports.json（第 1 行，第 1 列），请使用历史版本回滚。",
+                ),
+            ),
+            patch(
+                "app.main.load_submissions",
+                return_value=[
+                    {
+                        "id": "s1",
+                        "project_id": "p1",
+                        "filename": "A.docx",
+                    }
+                ],
+            ),
+            patch("app.main.load_qingtian_results", return_value=[]),
+        ):
+            rows = app_main._list_governance_comparable_submission_snapshots(
+                "p1",
+                {"id": "p1", "score_scale_max": 100},
+            )
+
+        assert rows == []
+
+    def test_list_governance_comparable_submission_snapshots_recovers_when_qingtian_storage_corrupted(
+        self,
+    ):
+        from app.storage import StorageDataError
+
+        with (
+            patch(
+                "app.main.load_score_reports",
+                return_value=[
+                    {
+                        "id": "r1",
+                        "project_id": "p1",
+                        "submission_id": "s1",
+                        "created_at": "2026-01-02T00:00:00Z",
+                        "rule_total_score": 80.0,
+                    }
+                ],
+            ),
+            patch(
+                "app.main.load_submissions",
+                return_value=[
+                    {
+                        "id": "s1",
+                        "project_id": "p1",
+                        "filename": "A.docx",
+                    }
+                ],
+            ),
+            patch(
+                "app.main.load_qingtian_results",
+                side_effect=StorageDataError(
+                    Path("/tmp/qingtian_results.json"),
+                    "json_parse_failed",
+                    "数据文件 JSON 格式损坏：qingtian_results.json（第 1 行，第 1 列），请使用历史版本回滚。",
+                ),
+            ),
+        ):
+            rows = app_main._list_governance_comparable_submission_snapshots(
+                "p1",
+                {"id": "p1", "score_scale_max": 100},
+            )
+
+        assert rows == []
+
+    def test_project_analysis_bundle_recovers_when_score_reports_storage_corrupted(self, client):
+        from app.storage import StorageDataError
+
+        evaluation_payload = {
+            "project_id": "p1",
+            "sample_count_qt": 0,
+            "variants": {},
+            "acceptance": {},
+            "computed_at": "2026-01-01T00:00:00Z",
+        }
+
+        with (
+            patch("app.main.ensure_data_dirs"),
+            patch(
+                "app.runtime_security.is_secure_desktop_mode_enabled",
+                return_value=False,
+            ),
+            patch("app.main.load_projects", return_value=[{"id": "p1", "name": "项目A"}]),
+            patch("app.main.load_submissions", return_value=[]),
+            patch(
+                "app.main.load_score_reports",
+                side_effect=StorageDataError(
+                    Path("/tmp/score_reports.json"),
+                    "json_parse_failed",
+                    "数据文件 JSON 格式损坏：score_reports.json（第 1 行，第 1 列），请使用历史版本回滚。",
+                ),
+            ),
+            patch("app.main.load_qingtian_results", return_value=[]),
+            patch("app.main._build_scoring_factors_overview", return_value={}),
+            patch("app.main.evaluate_project_variants", return_value=evaluation_payload),
+            patch("app.main._render_project_analysis_bundle_markdown", return_value="bundle"),
+        ):
+            response = client.get("/api/v1/projects/p1/analysis_bundle")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["markdown"] == "bundle"
+
+    def test_project_analysis_bundle_recovers_when_qingtian_storage_corrupted(self, client):
+        from app.storage import StorageDataError
+
+        evaluation_payload = {
+            "project_id": "p1",
+            "sample_count_qt": 0,
+            "variants": {},
+            "acceptance": {},
+            "computed_at": "2026-01-01T00:00:00Z",
+        }
+
+        with (
+            patch("app.main.ensure_data_dirs"),
+            patch(
+                "app.runtime_security.is_secure_desktop_mode_enabled",
+                return_value=False,
+            ),
+            patch("app.main.load_projects", return_value=[{"id": "p1", "name": "项目A"}]),
+            patch("app.main.load_submissions", return_value=[]),
+            patch("app.main.load_score_reports", return_value=[]),
+            patch(
+                "app.main.load_qingtian_results",
+                side_effect=StorageDataError(
+                    Path("/tmp/qingtian_results.json"),
+                    "json_parse_failed",
+                    "数据文件 JSON 格式损坏：qingtian_results.json（第 1 行，第 1 列），请使用历史版本回滚。",
+                ),
+            ),
+            patch("app.main._build_scoring_factors_overview", return_value={}),
+            patch("app.main.evaluate_project_variants", return_value=evaluation_payload),
+            patch("app.main._render_project_analysis_bundle_markdown", return_value="bundle"),
+        ):
+            response = client.get("/api/v1/projects/p1/analysis_bundle")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["markdown"] == "bundle"
+
     def test_score_scale_round_trip_preserves_precision_for_5_scale(self):
         from app.main import _convert_score_from_100, _convert_score_to_100
 
@@ -15787,6 +17393,12 @@ class TestCompareEndpoints:
     def test_compare_with_submissions(self, mock_ensure, mock_load, client):
         """Compare should return rankings and stats."""
         mock_load.return_value = [
+            {
+                "id": "legacy-bad",
+                "filename": "legacy.txt",
+                "total_score": 99.0,
+                "report": {"dimension_scores": {}, "penalties": []},
+            },
             {
                 "id": "s1",
                 "project_id": "p1",
@@ -15821,6 +17433,30 @@ class TestCompareEndpoints:
             data["rankings"][0]["ranking_sort_score"] >= data["rankings"][1]["ranking_sort_score"]
         )
         assert "ranking_evidence_bonus" in data["rankings"][0]
+
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_compare_ignores_legacy_submission_missing_project_id(
+        self, mock_ensure, mock_load, client
+    ):
+        mock_load.return_value = [
+            {"id": "legacy", "filename": "legacy.txt", "total_score": 99.0, "report": {}},
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "f1.txt",
+                "total_score": 80.0,
+                "report": {"dimension_scores": {}, "penalties": []},
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+        ]
+
+        response = client.get("/api/v1/projects/p1/compare")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["rankings"]) == 1
+        assert data["rankings"][0]["submission_id"] == "s1"
 
     @patch("app.main.load_submissions")
     @patch("app.main.ensure_data_dirs")
@@ -17312,11 +18948,16 @@ class TestLearningEndpoints:
         """Update learning profile should save and return profile."""
         mock_load_sub.return_value = [
             {
+                "id": "legacy-bad",
+                "total_score": 91.0,
+                "report": {"total_score": 91.0, "scoring_status": "scored"},
+            },
+            {
                 "id": "s1",
                 "project_id": "p1",
                 "total_score": 90.0,
                 "report": {"total_score": 90.0, "scoring_status": "scored"},
-            }
+            },
         ]
         mock_build.return_value = {
             "dimension_multipliers": {"D01": 1.1},
@@ -17327,7 +18968,39 @@ class TestLearningEndpoints:
         assert response.status_code == 200
         data = response.json()
         assert data["project_id"] == "p1"
+        assert data["sample_count"] == 1
         mock_save.assert_called_once()
+
+    @patch("app.main.save_learning_profiles")
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.build_learning_profile")
+    @patch("app.main.load_submissions")
+    @patch("app.main.ensure_data_dirs")
+    def test_update_learning_profile_ignores_legacy_submission_missing_project_id(
+        self, mock_ensure, mock_load_sub, mock_build, mock_load_prof, mock_save, client
+    ):
+        mock_load_sub.return_value = [
+            {"id": "legacy", "report": {"scoring_status": "scored"}},
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "total_score": 90.0,
+                "report": {"total_score": 90.0, "scoring_status": "scored"},
+            },
+        ]
+        mock_build.return_value = {
+            "dimension_multipliers": {"D01": 1.1},
+            "rationale": {"D01": "test rationale"},
+        }
+        mock_load_prof.return_value = []
+
+        response = client.post("/api/v1/projects/p1/learning")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        saved_profiles = mock_save.call_args[0][0]
+        assert any(p.get("project_id") == "p1" for p in saved_profiles)
 
     @patch("app.main.save_learning_profiles")
     @patch("app.main.load_learning_profiles")
@@ -17357,6 +19030,7 @@ class TestLearningEndpoints:
         call_args = mock_save.call_args[0][0]
         p1_profiles = [p for p in call_args if p.get("project_id") == "p1"]
         assert len(p1_profiles) == 1
+        assert p1_profiles[0]["sample_count"] == 1
 
     @patch("app.main.load_submissions")
     @patch("app.main.ensure_data_dirs")
@@ -17400,6 +19074,28 @@ class TestLearningEndpoints:
         assert response.status_code == 200
         data = response.json()
         assert data["project_id"] == "p1"
+        assert data["sample_count"] is None
+
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_learning_profile_recovers_legacy_row_missing_required_fields(
+        self, mock_ensure, mock_load, client
+    ):
+        mock_load.return_value = [
+            {
+                "project_id": "p1",
+                "dimension_multipliers": {"D01": "1.1", "D02": 0.95},
+            }
+        ]
+
+        response = client.get("/api/v1/projects/p1/learning")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["dimension_multipliers"] == {"D01": 1.1, "D02": 0.95}
+        assert data["rationale"] == {}
+        assert data["updated_at"]
 
     @patch("app.main.load_learning_profiles")
     @patch("app.main.ensure_data_dirs")
@@ -17409,6 +19105,175 @@ class TestLearningEndpoints:
         response = client.get("/api/v1/projects/p1/learning")
         assert response.status_code == 404
         assert "暂无学习画像" in response.json()["detail"]
+
+
+class TestLegacyLearningProfileMaturity:
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.load_expert_profiles")
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.load_projects")
+    def test_resolve_project_scoring_context_skips_thin_learning_profile(
+        self,
+        mock_load_projects,
+        mock_load_evolution_reports,
+        mock_load_expert_profiles,
+        mock_load_learning_profiles,
+    ):
+        from app.main import _resolve_project_scoring_context
+
+        mock_load_projects.return_value = [{"id": "p1", "meta": {}}]
+        mock_load_evolution_reports.return_value = {}
+        mock_load_expert_profiles.return_value = []
+        mock_load_learning_profiles.return_value = [
+            {"project_id": "p1", "dimension_multipliers": {"D01": 1.2}, "sample_count": 1}
+        ]
+
+        multipliers, profile, project = _resolve_project_scoring_context("p1")
+
+        assert multipliers == {}
+        assert profile is None
+        assert project["id"] == "p1"
+
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.load_expert_profiles")
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.load_projects")
+    def test_resolve_project_scoring_context_keeps_legacy_profile_without_sample_count(
+        self,
+        mock_load_projects,
+        mock_load_evolution_reports,
+        mock_load_expert_profiles,
+        mock_load_learning_profiles,
+    ):
+        from app.main import _resolve_project_scoring_context
+
+        mock_load_projects.return_value = [{"id": "p1", "meta": {}}]
+        mock_load_evolution_reports.return_value = {}
+        mock_load_expert_profiles.return_value = []
+        mock_load_learning_profiles.return_value = [
+            {"project_id": "p1", "dimension_multipliers": {"D01": 1.2}}
+        ]
+
+        multipliers, profile, project = _resolve_project_scoring_context("p1")
+
+        assert multipliers == {"D01": 1.2}
+        assert profile is None
+        assert project["id"] == "p1"
+
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.load_projects")
+    def test_infer_weights_source_marks_thin_legacy_learning_profile_inactive(
+        self,
+        mock_load_projects,
+        mock_load_evolution_reports,
+        mock_load_learning_profiles,
+    ):
+        from app.main import _infer_weights_source
+
+        mock_load_projects.return_value = [{"id": "p1", "meta": {}}]
+        mock_load_evolution_reports.return_value = {}
+        mock_load_learning_profiles.return_value = [
+            {"project_id": "p1", "dimension_multipliers": {"D01": 1.2}, "sample_count": 1}
+        ]
+
+        source = _infer_weights_source("p1", None)
+
+        assert source == "learning_profile_stored_inactive"
+
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main._evaluate_evolution_weight_status")
+    @patch("app.main._load_governance_artifact_payload")
+    def test_resolve_project_scoring_context_for_governance_marks_thin_legacy_learning_profile_inactive(
+        self,
+        mock_load_governance_artifact_payload,
+        mock_evaluate_evolution_weight_status,
+        mock_load_learning_profiles,
+    ):
+        from app.main import _resolve_project_scoring_context_for_governance
+
+        mock_load_governance_artifact_payload.side_effect = (
+            lambda artifact, artifact_payload_overrides=None: (
+                [] if artifact == "expert_profiles" else {}
+            )
+        )
+        mock_evaluate_evolution_weight_status.return_value = {"usable": False, "stored": False}
+        mock_load_learning_profiles.return_value = [
+            {"project_id": "p1", "dimension_multipliers": {"D01": 1.2}, "sample_count": 1}
+        ]
+
+        multipliers, profile_snapshot, source = _resolve_project_scoring_context_for_governance(
+            "p1",
+            {"id": "p1", "meta": {}},
+        )
+
+        assert multipliers == {}
+        assert profile_snapshot is None
+        assert source == "learning_profile_stored_inactive"
+
+
+class TestProjectConstraintEndpoints:
+    @patch("app.main.load_project_anchors")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_project_anchors_recovers_legacy_row_missing_required_fields(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_anchors,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_load_anchors.return_value = [
+            {
+                "project_id": "p1",
+                "anchor_key": "contract_duration_days",
+                "anchor_value": "120",
+            }
+        ]
+
+        response = client.get("/api/v1/projects/p1/anchors")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data[0]["id"] == ""
+        assert data[0]["project_id"] == "p1"
+        assert data[0]["anchor_key"] == "contract_duration_days"
+        assert data[0]["source_locator"] == ""
+        assert data[0]["confidence"] == 0.0
+        assert data[0]["created_at"]
+
+    @patch("app.main.load_project_requirements")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_list_project_requirements_recovers_legacy_row_missing_required_fields(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_requirements,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_load_requirements.return_value = [
+            {
+                "project_id": "p1",
+                "dimension_id": "05",
+                "req_label": "四新技术应用",
+            }
+        ]
+
+        response = client.get("/api/v1/projects/p1/requirements")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data[0]["id"] == ""
+        assert data[0]["project_id"] == "p1"
+        assert data[0]["dimension_id"] == "05"
+        assert data[0]["req_label"] == "四新技术应用"
+        assert data[0]["patterns"] == {}
+        assert data[0]["mandatory"] is False
+        assert data[0]["weight"] == 0.0
+        assert data[0]["created_at"]
 
 
 class TestAdaptiveApplyEndpoint:
@@ -17863,6 +19728,36 @@ class TestCacheEndpoints:
         # 验证 score_text 没有被调用（使用了缓存）
         mock_score.assert_not_called()
 
+    @patch("app.main.get_cached_score")
+    @patch("app.main.load_config")
+    @patch("app.main.score_text")
+    def test_score_endpoint_recovers_legacy_cached_result_missing_required_fields(
+        self, mock_score, mock_config, mock_cache_get, client
+    ):
+        mock_cache_get.return_value = {
+            "total_score": "90.0",
+            "dimension_scores": {
+                "D01": {
+                    "score": "15.5",
+                    "hits": ["工程概况"],
+                }
+            },
+            "penalties": [{"code": "P1", "message": "缺少措施"}],
+        }
+
+        response = client.post("/api/v1/score", json={"text": "缓存测试"})
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_score"] == 90.0
+        assert data["logic_lock"]["definition_score"] == 0.0
+        assert data["dimension_scores"]["D01"]["id"] == "D01"
+        assert data["dimension_scores"]["D01"]["score"] == 15.5
+        assert data["dimension_scores"]["D01"]["max_score"] == 0.0
+        assert data["penalties_logic_lock"] == []
+        assert data["suggestions"] == []
+        mock_score.assert_not_called()
+
 
 class TestProjectLevelCacheIntegration:
     """Tests for project-level endpoint cache integration."""
@@ -18139,6 +20034,49 @@ class TestProjectLevelCacheIntegration:
         assert data["total_score"] == 88.0
         assert data["report"]["total_score"] == 88.0
         assert data["report"]["rule_total_score"] == 88.0
+        mock_score.assert_not_called()
+
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.get_cached_score")
+    @patch("app.main.save_submissions")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.load_config")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main.score_text")
+    def test_score_for_project_recovers_legacy_cached_result_missing_required_fields(
+        self,
+        mock_score,
+        mock_ensure,
+        mock_load_proj,
+        mock_config,
+        mock_profiles,
+        mock_load_sub,
+        mock_save_sub,
+        mock_cache_get,
+        mock_load_evolution_reports,
+        client,
+    ):
+        mock_load_evolution_reports.return_value = {}
+        mock_cache_get.return_value = {
+            "total_score": "84.0",
+            "dimension_scores": {"D01": {"score": "11.5"}},
+            "penalties": [],
+        }
+        mock_load_proj.return_value = [{"id": "p1"}]
+        mock_config.return_value = MagicMock(rubric={}, lexicon={})
+        mock_profiles.return_value = []
+        mock_load_sub.return_value = []
+
+        response = client.post("/api/v1/projects/p1/score", json={"text": "缓存修复测试"})
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_score"] == 84.0
+        assert data["report"]["logic_lock"]["analysis_score"] == 0.0
+        assert data["report"]["dimension_scores"]["D01"]["id"] == "D01"
+        assert data["report"]["dimension_scores"]["D01"]["score"] == 11.5
         mock_score.assert_not_called()
 
     @patch("app.main.get_cached_score")
@@ -18457,6 +20395,98 @@ def test_build_data_hygiene_report_repairs_legacy_project_schema(monkeypatch):
     assert any("项目记录结构异常" in str(text) for text in payload["recommendations"])
 
 
+def test_build_data_hygiene_report_recovers_when_score_reports_storage_corrupted(monkeypatch):
+    import app.main as main_mod
+    from app.storage import StorageDataError
+
+    monkeypatch.setattr(main_mod, "ensure_data_dirs", lambda: None)
+    monkeypatch.setattr(main_mod, "load_projects", lambda: [{"id": "p1"}])
+
+    for loader_name in (
+        "load_submissions",
+        "load_materials",
+        "load_learning_profiles",
+        "load_score_history",
+        "load_ground_truth",
+        "load_project_anchors",
+        "load_project_requirements",
+        "load_delta_cases",
+        "load_calibration_samples",
+        "load_patch_packages",
+        "load_patch_deployments",
+        "load_evidence_units",
+        "load_qingtian_results",
+    ):
+        monkeypatch.setattr(main_mod, loader_name, lambda: [])
+
+    monkeypatch.setattr(
+        main_mod,
+        "load_score_reports",
+        lambda: (_ for _ in ()).throw(
+            StorageDataError(
+                Path("/tmp/score_reports.json"),
+                "json_parse_failed",
+                "数据文件 JSON 格式损坏：score_reports.json（第 1 行，第 1 列），请使用历史版本回滚。",
+            )
+        ),
+    )
+
+    for loader_name in ("load_project_context", "load_evolution_reports"):
+        monkeypatch.setattr(main_mod, loader_name, lambda: {})
+
+    payload = main_mod._build_data_hygiene_report(apply=False)
+
+    dataset = next(row for row in payload["datasets"] if row["name"] == "score_reports")
+    assert dataset["total"] == 0
+    assert dataset["orphan_count"] == 0
+
+
+def test_build_data_hygiene_report_recovers_when_qingtian_storage_corrupted(monkeypatch):
+    import app.main as main_mod
+    from app.storage import StorageDataError
+
+    monkeypatch.setattr(main_mod, "ensure_data_dirs", lambda: None)
+    monkeypatch.setattr(main_mod, "load_projects", lambda: [{"id": "p1"}])
+
+    for loader_name in (
+        "load_submissions",
+        "load_materials",
+        "load_learning_profiles",
+        "load_score_history",
+        "load_ground_truth",
+        "load_project_anchors",
+        "load_project_requirements",
+        "load_delta_cases",
+        "load_calibration_samples",
+        "load_patch_packages",
+        "load_patch_deployments",
+        "load_score_reports",
+        "load_evidence_units",
+    ):
+        monkeypatch.setattr(main_mod, loader_name, lambda: [])
+
+    monkeypatch.setattr(
+        main_mod,
+        "load_qingtian_results",
+        lambda: (_ for _ in ()).throw(
+            StorageDataError(
+                Path("/tmp/qingtian_results.json"),
+                "json_parse_failed",
+                "数据文件 JSON 格式损坏：qingtian_results.json（第 1 行，第 1 列），请使用历史版本回滚。",
+            )
+        ),
+    )
+
+    for loader_name in ("load_project_context", "load_evolution_reports"):
+        monkeypatch.setattr(main_mod, loader_name, lambda: {})
+
+    payload = main_mod._build_data_hygiene_report(apply=False)
+
+    dataset = next(row for row in payload["datasets"] if row["name"] == "qingtian_results")
+    assert dataset["total"] == 0
+    assert dataset["orphan_count"] == 0
+
+
 class TestComputeMultipliersHash:
     """Tests for _compute_multipliers_hash helper function."""
 
@@ -18616,6 +20646,7 @@ class TestProjectCalibratorDirectApply:
         )
 
         assert mock_build_row.called
+        assert mock_build_row.call_args.kwargs["project"] is project
         assert mock_predict.called
         assert version == "calib-1"
         assert report["pred_total_score"] == 80.74
@@ -18949,6 +20980,74 @@ class TestExactGroundTruthOverride:
         assert mock_persist.call_args.kwargs["updates"]["final_score_100"] == 88.8
         assert mock_finalize.call_args.args[1]["final_score"] == 4.44
 
+    def test_repair_ground_truth_record_final_score_if_needed_ignores_cross_project_qingtian_row(
+        self,
+    ):
+        from app.main import _repair_ground_truth_record_final_score_if_needed
+
+        record = {
+            "id": "gt-1",
+            "project_id": "p1",
+            "judge_scores": [4.33, 4.36, 4.35, 4.36, 4.8],
+            "score_scale_max": 5,
+            "final_score": 0.0,
+            "final_score_raw": 0.0,
+            "final_score_100": 0.0,
+        }
+        persisted_row = {
+            **record,
+            "final_score": 4.44,
+            "final_score_raw": 4.44,
+            "final_score_100": 88.8,
+        }
+        finalized_row = {**persisted_row, "feedback_guardrail": {"blocked": False}}
+
+        with (
+            patch(
+                "app.main._resolve_project_ground_truth_score_rule",
+                return_value={
+                    "formula": "simple_mean",
+                    "auto_compute": True,
+                    "rounding_digits": 2,
+                },
+            ),
+            patch(
+                "app.main.load_submissions",
+                return_value=[{"id": "sub-other", "project_id": "other-project"}],
+            ),
+            patch(
+                "app.main.load_qingtian_results",
+                return_value=[
+                    {
+                        "id": "qt-1",
+                        "submission_id": "sub-other",
+                        "qt_total_score": 0.0,
+                        "raw_payload": {
+                            "ground_truth_record_id": "gt-1",
+                        },
+                    }
+                ],
+            ),
+            patch(
+                "app.main._persist_ground_truth_record_fields",
+                return_value=persisted_row,
+            ),
+            patch(
+                "app.main._finalize_ground_truth_learning_record",
+                return_value=finalized_row,
+            ),
+            patch("app.main._sync_ground_truth_record_to_qingtian") as mock_sync,
+        ):
+            repaired = _repair_ground_truth_record_final_score_if_needed(
+                "p1",
+                record,
+                project={"id": "p1", "meta": {"score_scale_max": 5}},
+            )
+
+        assert repaired["final_score"] == 4.44
+        assert repaired["final_score_100"] == 88.8
+        mock_sync.assert_not_called()
+
     def test_repair_ground_truth_record_final_score_if_needed_resyncs_stale_qingtian_snapshot(self):
         from app.main import _repair_ground_truth_record_final_score_if_needed
 
@@ -18968,6 +21067,7 @@ class TestExactGroundTruthOverride:
                 "qt_total_score": 0.0,
                 "raw_payload": {
                     "ground_truth_record_id": "gt-1",
+                    "project_id": "p1",
                     "final_score": 0.0,
                     "final_score_raw": 0.0,
                     "final_score_100": 0.0,
@@ -19565,15 +21665,21 @@ class TestFeedbackClosedLoopSafety:
             "new_profile_id": "ep-1",
         }
         mock_sync_weights.return_value = {"synced": True, "candidate_profile_id": "ep-1"}
-        mock_auto_rescore.side_effect = lambda *args, **kwargs: events.append("rescore") or {
-            "ok": True,
-            "reports_generated": 1,
-            "submission_count": 1,
-        }
-        mock_auto_run.side_effect = lambda *args, **kwargs: events.append("auto_run") or {
-            "ok": True,
-            "calibrator_deployed": False,
-        }
+        mock_auto_rescore.side_effect = lambda *args, **kwargs: (
+            events.append("rescore")
+            or {
+                "ok": True,
+                "reports_generated": 1,
+                "submission_count": 1,
+            }
+        )
+        mock_auto_run.side_effect = lambda *args, **kwargs: (
+            events.append("auto_run")
+            or {
+                "ok": True,
+                "calibrator_deployed": False,
+            }
+        )
         mock_refresh_evo.return_value = {"refreshed": True, "sample_count": 1}
 
         payload = _run_feedback_closed_loop("p1", locale="zh", trigger="ground_truth_add")
@@ -19782,6 +21888,53 @@ class TestFeedbackClosedLoopSafety:
         )
         assert saved_reports["p1"]["calibrator_runtime_governance"]["recovered_after"] is True
 
+    @patch("app.main.save_evolution_reports")
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main._build_feature_confidence_summary")
+    @patch("app.main._build_material_knowledge_profile")
+    @patch("app.main.build_evolution_report")
+    @patch("app.main._merge_materials_text")
+    @patch("app.main.load_project_context")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_projects")
+    def test_refresh_evolution_report_recovers_legacy_non_mapping_store(
+        self,
+        mock_load_projects,
+        mock_load_ground_truth,
+        mock_load_project_context,
+        mock_merge_materials_text,
+        mock_build_evolution_report,
+        mock_build_material_knowledge_profile,
+        mock_build_feature_confidence_summary,
+        mock_load_evolution_reports,
+        mock_save_evolution_reports,
+    ):
+        from app.main import _refresh_evolution_report_from_ground_truth
+
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 100}}]
+        mock_load_ground_truth.return_value = []
+        mock_load_project_context.return_value = {}
+        mock_merge_materials_text.return_value = ""
+        mock_build_material_knowledge_profile.return_value = {}
+        mock_build_feature_confidence_summary.return_value = {}
+        mock_build_evolution_report.return_value = {
+            "project_id": "p1",
+            "high_score_logic": ["逻辑A"],
+            "writing_guidance": ["建议A"],
+            "sample_count": 0,
+            "updated_at": "2026-04-11T00:00:00+08:00",
+            "scoring_evolution": {},
+            "compilation_instructions": {},
+        }
+        mock_load_evolution_reports.return_value = "legacy-string-store"
+
+        payload = _refresh_evolution_report_from_ground_truth("p1")
+
+        assert payload["refreshed"] is True
+        saved_reports = mock_save_evolution_reports.call_args.args[0]
+        assert isinstance(saved_reports, dict)
+        assert saved_reports["p1"]["writing_guidance"] == ["建议A"]
+
 
 class TestGroundTruthGuardrailRoutes:
     @patch("app.main.load_ground_truth")
@@ -19812,6 +21965,54 @@ class TestGroundTruthGuardrailRoutes:
         assert "5分制" in detail
         assert "100分口径" not in detail
         assert "confirm_extreme_sample=1" in detail
+
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    @patch("app.main._enrich_ground_truth_submission_metadata")
+    @patch("app.main._repair_ground_truth_record_final_score_if_needed")
+    def test_list_ground_truth_recovers_legacy_row_missing_required_fields(
+        self,
+        mock_repair_ground_truth,
+        mock_enrich_ground_truth,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_ground_truth,
+        mock_load_submissions,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 5}}]
+        mock_load_ground_truth.return_value = [
+            {
+                "project_id": "p1",
+                "judge_scores": ["4.1", "4.2", "4.3", "4.4", "4.5"],
+                "final_score_raw": 4.3,
+                "feedback_guardrail": None,
+                "few_shot_distillation": None,
+            }
+        ]
+        mock_load_submissions.return_value = []
+        mock_repair_ground_truth.side_effect = lambda project_id, row, project, locale: row
+        mock_enrich_ground_truth.side_effect = lambda project_id, rows: rows
+
+        response = client.get("/api/v1/projects/p1/ground_truth")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["id"] == ""
+        assert data[0]["project_id"] == "p1"
+        assert data[0]["shigong_text"] == ""
+        assert data[0]["source"] == "青天大模型"
+        assert data[0]["judge_count"] == 5
+        assert data[0]["score_scale_max"] == 5
+        assert data[0]["final_score"] == 4.3
+        assert data[0]["final_score_raw"] == 4.3
+        assert data[0]["final_score_100"] == 86.0
+        assert data[0]["feedback_guardrail"] == {}
+        assert data[0]["few_shot_distillation"] == {}
+        assert data[0]["created_at"]
 
     @patch("app.main.load_submissions")
     @patch("app.main.load_ground_truth")
@@ -20146,10 +22347,10 @@ class TestGroundTruthGuardrailRoutes:
 
     @patch("app.main.upsert_distilled_features", return_value={"upserted": 1})
     @patch("app.main.distill_feature_from_text")
-    @patch("app.main._collect_dimension_guidance_texts", return_value=["编制提示"])
-    @patch("app.main._collect_dimension_evidence_texts", return_value=["高分证据"])
-    @patch("app.main._flatten_ground_truth_qualitative_tags", return_value=["评委反馈"])
-    @patch("app.main._select_ground_truth_few_shot_dimensions", return_value=["01"])
+    @patch("app.feedback_learning.collect_dimension_guidance_texts", return_value=["编制提示"])
+    @patch("app.feedback_learning.collect_dimension_evidence_texts", return_value=["高分证据"])
+    @patch("app.feedback_learning.flatten_ground_truth_qualitative_tags", return_value=["评委反馈"])
+    @patch("app.feedback_learning.select_ground_truth_few_shot_dimensions", return_value=["01"])
     def test_capture_ground_truth_few_shot_features_auto_adopts_high_consensus_sample(
         self,
         mock_select_dims,
@@ -20276,14 +22477,11 @@ class TestGroundTruthGuardrailRoutes:
             },
             "recommendations": ["当前链路未命中人工确认阻塞。"],
         }
-        mock_refresh_ground_truth.side_effect = lambda project_id: events.append(
-            ("refresh", project_id)
-        ) or {"refreshed": 0}
-        mock_collect_blocked.side_effect = (
-            lambda *args, **kwargs: events.append(
-                ("collect", args[0] if args else kwargs.get("project_id"))
-            )
-            or []
+        mock_refresh_ground_truth.side_effect = lambda project_id: (
+            events.append(("refresh", project_id)) or {"refreshed": 0}
+        )
+        mock_collect_blocked.side_effect = lambda *args, **kwargs: (
+            events.append(("collect", args[0] if args else kwargs.get("project_id"))) or []
         )
         mock_refresh_reflection.side_effect = lambda *args, **kwargs: events.append(
             ("reflection", args[0] if args else kwargs.get("project_id"))
@@ -20309,6 +22507,7 @@ class TestFeedbackGovernanceRoutes:
     @patch("app.main.load_calibration_models")
     @patch("app.main.load_evolution_reports")
     @patch("app.main.load_high_score_features")
+    @patch("app.main.load_feature_kb")
     @patch("app.main.load_json_version")
     @patch("app.main.list_json_versions")
     @patch("app.main.load_ground_truth")
@@ -20321,20 +22520,39 @@ class TestFeedbackGovernanceRoutes:
         mock_load_ground_truth,
         mock_list_versions,
         mock_load_json_version,
+        mock_load_feature_kb,
         mock_load_high_score_features,
         mock_load_evolution_reports,
         mock_load_calibration_models,
         mock_load_expert_profiles,
         client,
     ):
+        from app.schemas import ExtractedFeature
+
         mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 100}}]
         mock_load_high_score_features.return_value = [
             {
-                "feature_id": "f-current-1",
+                "feature_id": "F-1",
                 "dimension_id": "09",
                 "confidence_score": 0.88,
                 "active": True,
+                "governance_status": "adopted",
+                "source_project_ids": ["p1"],
             }
+        ]
+        mock_load_feature_kb.return_value = [
+            ExtractedFeature(
+                feature_id="F-1",
+                dimension_id="09",
+                logic_skeleton=[
+                    "[前置条件] 节点明确 + [技术/动作] 周纠偏闭环 + [量化指标类型] 达成率"
+                ],
+                confidence_score=0.88,
+                usage_count=4,
+                active=True,
+                governance_status="adopted",
+                source_project_ids=["p1"],
+            )
         ]
         mock_load_evolution_reports.return_value = {"p1": {"high_score_logic": ["逻辑A"]}}
         mock_load_calibration_models.return_value = [
@@ -20490,6 +22708,9 @@ class TestFeedbackGovernanceRoutes:
         assert data["summary"]["few_shot_adopted_count"] == 1
         assert data["summary"]["pending_extreme_ground_truth_count"] == 1
         assert data["summary"]["few_shot_pending_review_count"] == 0
+        assert data["summary"]["few_shot_project_feature_count"] == 1
+        assert data["summary"]["few_shot_global_snapshot_count"] == 1
+        assert data["summary"]["latest_few_shot_global_snapshot_id"] == "20260314T010203000000Z"
         assert data["summary"]["current_calibrator_degraded"] is False
         assert data["summary"]["current_calibrator_rollback_candidate_version"] is None
         assert data["blocked_samples"][0]["record_id"] == "gt-blocked"
@@ -21168,9 +23389,7 @@ class TestFeedbackGovernanceRoutes:
         assert data["current_state"]["manual_review_status"] == "pending"
         assert data["preview_state"]["manual_review_status"] == "adopted"
         assert data["governance"]["summary"]["few_shot_adopted_count"] == 1
-        assert any(
-            "不会直接改写当前 high_score_features" in item for item in data["recommendations"]
-        )
+        assert any("不会直接改写当前高分特征库" in item for item in data["recommendations"])
         assert store[0]["few_shot_distillation"].get("manual_review_status") is None
         mock_save_ground_truth.assert_not_called()
 
@@ -21252,7 +23471,8 @@ class TestFeedbackGovernanceRoutes:
                 "few_shot_distillation": {
                     "captured": 2,
                     "reason": "captured",
-                    "feature_ids": ["F-1"],
+                    "feature_ids": ["F-stale"],
+                    "dimension_ids": ["09"],
                 },
             }
         ]
@@ -21267,6 +23487,8 @@ class TestFeedbackGovernanceRoutes:
                 usage_count=2,
                 active=True,
                 governance_status="pending",
+                source_record_ids=["gt-2"],
+                source_project_ids=["p1"],
             )
         ]
         mock_load_projects.return_value = [{"id": "p1"}]
@@ -21288,6 +23510,7 @@ class TestFeedbackGovernanceRoutes:
         data = response.json()
         assert data["few_shot_distillation"]["manual_review_status"] == "adopted"
         assert store[0]["few_shot_distillation"]["manual_review_status"] == "adopted"
+        assert store[0]["few_shot_distillation"]["feature_ids"] == ["F-1"]
         assert feature_store[0].governance_status == "adopted"
         assert feature_store[0].active is True
 
@@ -21366,6 +23589,122 @@ class TestGroundTruthScoreRuleRoutes:
         assert data["source_filename"] == "招标文件正文.pdf"
         assert data["source_page_hint"] == "第80页"
         assert "打分平均值" in data["label"]
+
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_ground_truth_scoring_rule_endpoint_detects_score_scale_from_tender_text(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 100}}]
+        mock_load_materials.return_value = [
+            {
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件正文.pdf",
+                "parsed_text": "本项目技术标采用5分制进行评委打分。[PAGE:12]",
+            }
+        ]
+
+        response = client.get("/api/v1/projects/p1/ground_truth/scoring_rule")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["formula"] == "manual"
+        assert data["score_scale_max"] == 5
+        assert data["score_scale_label"] == "5分制"
+        assert data["score_scale_detected"] is True
+        assert data["score_scale_source_filename"] == "招标文件正文.pdf"
+        assert data["score_scale_source_page_hint"] == "第12页"
+
+    @patch("app.main.load_materials")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_ground_truth_scoring_rule_endpoint_ignores_legacy_project_missing_id(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_materials,
+        client,
+    ):
+        mock_load_projects.return_value = [
+            {"meta": {"score_scale_max": 100}},
+            {"id": "p1", "meta": {"score_scale_max": 5}},
+        ]
+        mock_load_materials.return_value = [
+            {
+                "project_id": "p1",
+                "material_type": "tender_qa",
+                "filename": "招标文件正文.pdf",
+                "parsed_text": "本项目技术标采用5分制进行评委打分。[PAGE:12]",
+            }
+        ]
+
+        response = client.get("/api/v1/projects/p1/ground_truth/scoring_rule")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["score_scale_max"] == 5
+
+    @patch("app.main._run_feedback_closed_loop_safe")
+    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main.save_ground_truth")
+    @patch("app.main.load_ground_truth")
+    @patch("app.main.load_submissions")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_add_ground_truth_from_submission_ignores_legacy_project_missing_id(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_submissions,
+        mock_load_ground_truth,
+        mock_save_ground_truth,
+        mock_sync_gt,
+        mock_run_closed_loop,
+        client,
+    ):
+        mock_load_projects.return_value = [
+            {"meta": {"score_scale_max": 100}},
+            {"id": "p1", "meta": {"score_scale_max": 100}},
+        ]
+        mock_load_submissions.return_value = [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "filename": "施组一.docx",
+                "created_at": "2026-03-24T10:16:57+00:00",
+                "text": "示例施组文本" * 20,
+            }
+        ]
+        mock_load_ground_truth.return_value = []
+        mock_sync_gt.return_value = {
+            "feedback_guardrail": {"blocked": False},
+            "learning_quality_gate": {"blocked": False},
+            "few_shot_distillation": {"captured": 0, "reason": "not_executed"},
+        }
+        mock_run_closed_loop.return_value = {"ok": True}
+
+        response = client.post(
+            "/api/v1/projects/p1/ground_truth/from_submission",
+            json={
+                "submission_id": "s1",
+                "judge_scores": [80, 81, 82, 83, 84],
+                "final_score": 80,
+                "source": "青天大模型",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["source_submission_id"] == "s1"
 
     @patch("app.main.pymupdf", None)
     @patch("app.main.PdfReader")
@@ -21747,6 +24086,29 @@ class TestGroundTruthScoreRuleRoutes:
         assert data["pending_feedback_summary"]["pending_sample_count"] == 1
         assert data["pending_feedback_patch_bundle"]["section_count"] == 1
 
+    @patch("app.main._build_pending_feedback_scoring_points")
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_writing_guidance_recovers_legacy_non_mapping_evolution_store(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_evolution_reports,
+        mock_build_pending_feedback,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "name": "项目1", "meta": {}}]
+        mock_load_evolution_reports.return_value = "legacy-string-store"
+        mock_build_pending_feedback.return_value = {"summary": {}, "patch_bundle": {}}
+
+        response = client.get("/api/v1/projects/p1/writing_guidance")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["sample_count"] == 0
+        assert "请先录入" in data["guidance"][0]
+
     @patch("app.main.get_writing_guidance")
     def test_get_project_writing_guidance_markdown_and_download(
         self,
@@ -21827,6 +24189,62 @@ class TestGroundTruthScoreRuleRoutes:
             assert "项目级补丁正文" in doc_text
             assert "05 四新技术的应用与实施方案" in doc_text
             assert "写入方式：" in doc_text
+
+    @patch("app.main.load_learning_profiles", return_value=[])
+    @patch("app.main._resolve_project_scoring_context")
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_scoring_context_recovers_legacy_non_mapping_evolution_store(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_evolution_reports,
+        mock_resolve_project_scoring_context,
+        _mock_load_learning_profiles,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 100}}]
+        mock_load_evolution_reports.return_value = "legacy-string-store"
+        mock_resolve_project_scoring_context.return_value = (
+            {"01": 1.0},
+            None,
+            {"id": "p1", "meta": {"score_scale_max": 100}},
+        )
+
+        response = client.get("/api/v1/projects/p1/scoring_context")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["source"] == "none"
+        assert data["dimension_multipliers"]["01"] == 1.0
+
+    @patch("app.main.load_learning_profiles")
+    @patch("app.main.load_evolution_reports")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_get_scoring_context_marks_thin_legacy_learning_profile_inactive(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_load_evolution_reports,
+        mock_load_learning_profiles,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1", "meta": {"score_scale_max": 100}}]
+        mock_load_evolution_reports.return_value = {}
+        mock_load_learning_profiles.return_value = [
+            {"project_id": "p1", "dimension_multipliers": {"D01": 1.2}, "sample_count": 1}
+        ]
+
+        response = client.get("/api/v1/projects/p1/scoring_context")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == "p1"
+        assert data["source"] == "learning_profile_stored_inactive"
+        assert data["dimension_multipliers"] == {}
 
 
 class TestDynamicBlendAdjustment:
