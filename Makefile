@@ -1,7 +1,7 @@
 # 施工组织设计评标评分系统 Makefile
 # 提供一键操作命令
 
-.PHONY: install test smoke score docx batch clean help coverage lint-fix pre-commit web run api restart stop status daemon-start daemon-stop daemon-status analysis-bundle analysis-bundle-all doctor soak trial-preflight e2e-flow mece-audit data-hygiene ops-agents-run ops-agents-start ops-agents-stop ops-agents-status spec-coverage acceptance acceptance-fast
+.PHONY: install test smoke score docx batch clean help coverage lint lint-fix typecheck quality-gate replay-regression pre-commit web run api restart stop status daemon-start daemon-stop daemon-status analysis-bundle analysis-bundle-all doctor soak trial-preflight e2e-flow mece-audit data-hygiene ops-agents-run ops-agents-start ops-agents-stop ops-agents-status spec-coverage acceptance acceptance-fast
 
 PYTHON ?= $(shell if [ -x .venv/bin/python ]; then echo .venv/bin/python; else echo python3; fi)
 SOAK_DURATION ?= 600
@@ -45,6 +45,9 @@ help:
 	@echo "  make all      - 运行完整端到端（JSON + DOCX）"
 	@echo "  make clean    - 清理产物"
 	@echo "  make lint     - 运行代码检查"
+	@echo "  make typecheck - 运行受控范围类型检查"
+	@echo "  make quality-gate - 运行本地质量门（ruff + mypy + pytest + replay）"
+	@echo "  make replay-regression - 运行评分重放回归"
 	@echo "  make lint-fix - 运行代码检查并自动修复"
 	@echo "  make coverage - 查看测试覆盖率"
 	@echo "  make web      - 启动 Streamlit Web UI"
@@ -58,7 +61,13 @@ install:
 
 # 运行单元测试
 test:
-	$(PYTHON) -m pytest tests/ -v
+	@if [ -x .venv/bin/pytest ] && .venv/bin/pytest --version >/dev/null 2>&1; then \
+		.venv/bin/pytest tests/ -v; \
+	elif python3 -m pytest --version >/dev/null 2>&1; then \
+		python3 -m pytest tests/ -v; \
+	else \
+		$(PYTHON) -m pytest tests/ -v; \
+	fi
 
 # 运行端到端 smoke test
 smoke:
@@ -97,11 +106,41 @@ clean:
 
 # 代码检查
 lint:
-	$(PYTHON) -m ruff check app/ tests/ scripts/
+	@if [ -x .venv/bin/ruff ]; then \
+		.venv/bin/ruff check app/ tests/ scripts/; \
+	elif python3 -m ruff --version >/dev/null 2>&1; then \
+		python3 -m ruff check app/ tests/ scripts/; \
+	else \
+		$(PYTHON) -m ruff check app/ tests/ scripts/; \
+	fi
+
+typecheck:
+	@if [ -x .venv/bin/mypy ]; then \
+		.venv/bin/mypy app/application/task_runtime.py app/application/services/workflows.py app/application/agents/runtime.py app/observability.py app/storage.py app/system_health.py; \
+	elif python3 -m mypy --version >/dev/null 2>&1; then \
+		python3 -m mypy app/application/task_runtime.py app/application/services/workflows.py app/application/agents/runtime.py app/observability.py app/storage.py app/system_health.py; \
+	else \
+		$(PYTHON) -m mypy app/application/task_runtime.py app/application/services/workflows.py app/application/agents/runtime.py app/observability.py app/storage.py app/system_health.py; \
+	fi
+
+quality-gate: lint typecheck test replay-regression
+
+replay-regression:
+	@if [ -x .venv/bin/pytest ] && .venv/bin/pytest --version >/dev/null 2>&1; then \
+		.venv/bin/pytest tests/test_replay_regression.py -q; \
+	elif python3 -m pytest --version >/dev/null 2>&1; then \
+		python3 -m pytest tests/test_replay_regression.py -q; \
+	else \
+		$(PYTHON) -m pytest tests/test_replay_regression.py -q; \
+	fi
 
 # 测试覆盖率
 coverage:
-	$(PYTHON) -m pytest --cov=app --cov-report=term-missing
+	@if [ -x .venv/bin/pytest ]; then \
+		.venv/bin/pytest --cov=app --cov-report=term-missing; \
+	else \
+		$(PYTHON) -m pytest --cov=app --cov-report=term-missing; \
+	fi
 
 # 一键启动（推荐）：启动后浏览器打开 http://localhost:8000/ 即可使用
 run:

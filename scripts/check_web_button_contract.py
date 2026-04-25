@@ -76,6 +76,7 @@ CRITICAL_VISIBLE_BUTTON_IDS = [
 SMOKE_REQUIRED_BUTTON_IDS = [
     "btnSaveApiKey",
     "btnClearApiKey",
+    "btnReloadPage",
     "btnStartNewProject",
     "btnCreateProjectFromTender",
     "deleteSelectedProjects",

@@ -722,6 +722,38 @@ BUTTON_SMOKE_MATRIX: List[Dict[str, Any]] = [
         "timeout_ms": 30000,
     },
     {
+        "id": "btnReloadPage",
+        "label": "刷新页面",
+        "selector": "#btnReloadPage",
+        "kind": "js_check",
+        "prepare_js": """(() => {
+          const state = window.__codexSmokeState || {};
+          window.__codexRevealForSmoke('#btnReloadPage');
+          state.pageReloadRequested = false;
+          state.pageReloadRestored = false;
+          state.pageReloadOriginal = window.__zhifeiReloadPage;
+          window.__zhifeiReloadPage = function () {
+            state.pageReloadRequested = true;
+          };
+          return true;
+        })()""",
+        "verify_js": """() => {
+          const state = window.__codexSmokeState || {};
+          const original = state.pageReloadOriginal;
+          if (!state.pageReloadRestored && typeof original === 'function') {
+            window.__zhifeiReloadPage = original;
+            state.pageReloadRestored = true;
+          }
+          return !!state.pageReloadRequested;
+        }""",
+        "observed_js": """() => {
+          const state = window.__codexSmokeState || {};
+          return JSON.stringify({
+            requested: !!state.pageReloadRequested,
+          });
+        }""",
+    },
+    {
         "id": "refreshProjects",
         "label": "刷新项目列表",
         "selector": "#refreshProjects",

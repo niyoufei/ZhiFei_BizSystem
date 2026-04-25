@@ -26,6 +26,7 @@ step_browser_smoke=0
 step_mece=0
 step_hygiene=0
 step_coverage=0
+step_typecheck=0
 step_tests=0
 tests_skipped=0
 browser_smoke_skipped=0
@@ -57,7 +58,7 @@ write_summary() {
   else
     status="FAIL"
   fi
-  python3 - "$SUMMARY_FILE" "$status" "$rc" "$started_at" "$ended_at" "$step_doctor" "$step_e2e" "$step_browser_smoke" "$step_mece" "$step_hygiene" "$step_coverage" "$step_tests" "$RUN_TESTS" "$tests_skipped" "$browser_smoke_skipped" "$git_is_repo" "$git_ref" "$git_head" "$git_has_commit" "$workspace_dirty" <<'PY'
+  python3 - "$SUMMARY_FILE" "$status" "$rc" "$started_at" "$ended_at" "$step_doctor" "$step_e2e" "$step_browser_smoke" "$step_mece" "$step_hygiene" "$step_coverage" "$step_typecheck" "$step_tests" "$RUN_TESTS" "$tests_skipped" "$browser_smoke_skipped" "$git_is_repo" "$git_ref" "$git_head" "$git_has_commit" "$workspace_dirty" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -71,21 +72,22 @@ summary = {
     "steps": {
         "doctor_strict_ok": bool(int(sys.argv[6])),
         "e2e_strict_ok": bool(int(sys.argv[7])),
-        "browser_button_smoke_ok": (None if bool(int(sys.argv[15])) else bool(int(sys.argv[8]))),
+        "browser_button_smoke_ok": (None if bool(int(sys.argv[16])) else bool(int(sys.argv[8]))),
         "mece_audit_ok": bool(int(sys.argv[9])),
         "data_hygiene_ok": bool(int(sys.argv[10])),
         "spec_coverage_ok": bool(int(sys.argv[11])),
-        "tests_ok": (None if bool(int(sys.argv[14])) else bool(int(sys.argv[12]))),
+        "typecheck_ok": bool(int(sys.argv[12])),
+        "tests_ok": (None if bool(int(sys.argv[15])) else bool(int(sys.argv[13]))),
     },
-    "tests_skipped": bool(int(sys.argv[14])),
-    "browser_smoke_skipped": bool(int(sys.argv[15])),
-    "run_tests": bool(int(sys.argv[13])),
+    "tests_skipped": bool(int(sys.argv[15])),
+    "browser_smoke_skipped": bool(int(sys.argv[16])),
+    "run_tests": bool(int(sys.argv[14])),
     "git": {
-        "is_repo": bool(int(sys.argv[16])),
-        "ref": sys.argv[17],
-        "head": (None if sys.argv[18] == "null" else sys.argv[18]),
-        "has_commit": bool(int(sys.argv[19])),
-        "workspace_dirty": bool(int(sys.argv[20])),
+        "is_repo": bool(int(sys.argv[17])),
+        "ref": sys.argv[18],
+        "head": (None if sys.argv[19] == "null" else sys.argv[19]),
+        "has_commit": bool(int(sys.argv[20])),
+        "workspace_dirty": bool(int(sys.argv[21])),
     },
     "artifacts": {
         "e2e_summary": "/Users/youfeini/Desktop/ZhiFei_BizSystem/build/e2e_flow/summary.json",
@@ -176,11 +178,11 @@ PY
 
 trap 'rc=$?; cleanup_retained_e2e_project; write_summary "$rc"' EXIT
 
-echo "[acceptance] step 1/7: strict doctor"
+echo "[acceptance] step 1/8: strict doctor"
 STRICT=1 API_KEY="$API_KEY" PORT="$PORT" ./scripts/doctor.sh
 step_doctor=1
 
-echo "[acceptance] step 2/7: strict e2e flow"
+echo "[acceptance] step 2/8: strict e2e flow"
 if [[ "$RUN_BROWSER_SMOKE" == "0" ]]; then
   run_strict_e2e_flow 0
 else
@@ -189,7 +191,7 @@ else
 fi
 step_e2e=1
 
-echo "[acceptance] step 3/7: browser button smoke"
+echo "[acceptance] step 3/8: browser button smoke"
 if [[ "$RUN_BROWSER_SMOKE" == "0" ]]; then
   echo "[acceptance] browser smoke disabled (RUN_BROWSER_SMOKE=$RUN_BROWSER_SMOKE)"
   browser_smoke_skipped=1
@@ -213,15 +215,15 @@ else
   fi
 fi
 
-echo "[acceptance] step 4/7: mece audit"
+echo "[acceptance] step 4/8: mece audit"
 STRICT=1 API_KEY="$API_KEY" BASE_URL="http://127.0.0.1:${PORT}" ./scripts/mece_audit.sh
 step_mece=1
 
-echo "[acceptance] step 5/7: data hygiene (auto-repair)"
+echo "[acceptance] step 5/8: data hygiene (auto-repair)"
 APPLY=1 STRICT=1 FAIL_ON_ORPHAN=0 API_KEY="$API_KEY" BASE_URL="http://127.0.0.1:${PORT}" ./scripts/data_hygiene.sh
 step_hygiene=1
 
-echo "[acceptance] step 6/7: v2 spec coverage"
+echo "[acceptance] step 6/8: v2 spec coverage"
 if [[ -x ".venv/bin/python" ]]; then
   .venv/bin/python scripts/check_v2_spec_coverage.py --strict
 else
@@ -229,8 +231,16 @@ else
 fi
 step_coverage=1
 
+echo "[acceptance] step 7/8: mypy typecheck"
+if [[ -x ".venv/bin/python" ]]; then
+  .venv/bin/python -m mypy app/application/task_runtime.py app/application/services/workflows.py app/application/agents/runtime.py app/observability.py app/storage.py app/system_health.py
+else
+  python3 -m mypy app/application/task_runtime.py app/application/services/workflows.py app/application/agents/runtime.py app/observability.py app/storage.py app/system_health.py
+fi
+step_typecheck=1
+
 if [[ "$RUN_TESTS" == "1" ]]; then
-  echo "[acceptance] step 7/7: pytest"
+  echo "[acceptance] step 8/8: pytest"
   if [[ -x ".venv/bin/pytest" ]]; then
     .venv/bin/pytest -q
   else
@@ -238,7 +248,7 @@ if [[ "$RUN_TESTS" == "1" ]]; then
   fi
   step_tests=1
 else
-  echo "[acceptance] step 7/7: skipped tests (RUN_TESTS=$RUN_TESTS)"
+  echo "[acceptance] step 8/8: skipped tests (RUN_TESTS=$RUN_TESTS)"
   tests_skipped=1
 fi
 
