@@ -72,6 +72,7 @@ def _call_ollama_http(
                 "model": model,
                 "messages": [{"role": "user", "content": user_message}],
                 "stream": False,
+                "think": False,
                 "options": {
                     "temperature": 0.3,
                     "num_predict": max_tokens,
@@ -91,11 +92,15 @@ def _call_ollama_http(
         return False, None, str(e)
     message = data.get("message") if isinstance(data, dict) else {}
     content = ""
+    thinking = ""
     if isinstance(message, dict):
         content = str(message.get("content") or "").strip()
+        thinking = str(message.get("thinking") or "").strip()
     if not content and isinstance(data, dict):
         content = str(data.get("response") or "").strip()
     if not content:
+        if thinking:
+            return False, None, "empty_content_thinking_only"
         return False, None, "empty_content"
     parsed = _extract_json_from_content(content)
     if parsed is None:

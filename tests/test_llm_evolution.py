@@ -298,7 +298,47 @@ class TestLlmEvolutionOllamaModule:
         assert captured["body"]["model"] == "qwen2.5"
         assert captured["body"]["messages"] == [{"role": "user", "content": "prompt"}]
         assert captured["body"]["stream"] is False
+        assert captured["body"]["think"] is False
         assert captured["body"]["options"]["num_predict"] == 128
+
+    def test_call_ollama_http_reports_thinking_only_response(self):
+        from app.engine.llm_evolution_ollama import _call_ollama_http
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "message": {
+                            "content": "",
+                            "thinking": json.dumps(
+                                {
+                                    "high_score_logic": ["h1"],
+                                    "writing_guidance": ["w1"],
+                                },
+                                ensure_ascii=False,
+                            ),
+                        }
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
+
+        with patch("urllib.request.urlopen", return_value=FakeResponse()):
+            ok, parsed, err = _call_ollama_http(
+                "prompt",
+                model="qwen3:0.6b",
+                max_tokens=128,
+                timeout=3,
+            )
+
+        assert ok is False
+        assert parsed is None
+        assert err == "empty_content_thinking_only"
 
     def test_enhance_ollama_returns_existing_report_shape_with_mock_call(self):
         from app.engine.llm_evolution_ollama import (
