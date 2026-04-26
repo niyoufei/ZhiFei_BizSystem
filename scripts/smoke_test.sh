@@ -7,13 +7,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$PROJECT_ROOT/build"
+CLI_LOG="$BUILD_DIR/smoke_test_cli.log"
 
 echo "=========================================="
 echo "文档生成系统 Smoke Test"
 echo "=========================================="
 
-# 清理旧产物
-rm -f "$BUILD_DIR/smoke_test_output.json" "$BUILD_DIR/smoke_test_output.docx"
+# 准备输出目录并清理旧产物
+mkdir -p "$BUILD_DIR"
+rm -f "$BUILD_DIR/smoke_test_output.json" "$BUILD_DIR/smoke_test_output.docx" "$CLI_LOG"
 
 # 测试 1: 单元测试
 echo ""
@@ -29,16 +31,20 @@ fi
 # 测试 2: CLI JSON 输出
 echo ""
 echo "[2/4] 测试 CLI JSON 输出..."
-if python3 -m app.cli score --input sample_shigong.txt --out "$BUILD_DIR/smoke_test_output.json" > /dev/null 2>&1; then
+if python3 -m app.cli score --input sample_shigong.txt --out "$BUILD_DIR/smoke_test_output.json" > "$CLI_LOG" 2>&1; then
     if [ -f "$BUILD_DIR/smoke_test_output.json" ]; then
         SIZE=$(wc -c < "$BUILD_DIR/smoke_test_output.json")
         echo "✅ JSON 输出成功 ($SIZE bytes)"
     else
         echo "❌ JSON 文件未生成"
+        echo "--- CLI log ($CLI_LOG) ---"
+        cat "$CLI_LOG"
         exit 1
     fi
 else
     echo "❌ CLI JSON 输出失败"
+    echo "--- CLI log ($CLI_LOG) ---"
+    cat "$CLI_LOG"
     exit 1
 fi
 
