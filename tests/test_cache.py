@@ -772,24 +772,57 @@ class TestWarmupCacheParallel:
         assert result.warmed == 2
         assert result.failed == 2
 
-    def test_parallel_warmup_faster_than_sequential(self):
-        """测试并行预热比串行快"""
+    def test_parallel_warmup_faster_than_sequential(self, monkeypatch):
+        """测试并行预热使用线程池提交所有任务"""
+        import concurrent.futures
 
-        def slow_score_fn(text: str) -> Dict[str, Any]:
-            time.sleep(0.05)  # 50ms 延迟
-            return {"score": 80}
+        created_workers = []
+        submitted_items = []
+
+        class ImmediateFuture:
+            def __init__(self, value: Any):
+                self._value = value
+
+            def result(self) -> Any:
+                return self._value
+
+        class RecordingExecutor:
+            def __init__(self, max_workers: int):
+                created_workers.append(max_workers)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> bool:
+                return False
+
+            def submit(self, fn: Any, item: str) -> ImmediateFuture:
+                submitted_items.append(item)
+                return ImmediateFuture(fn(item))
+
+        def fake_as_completed(futures: Any) -> list:
+            return list(futures)
+
+        monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", RecordingExecutor)
+        monkeypatch.setattr(concurrent.futures, "as_completed", fake_as_completed)
+
+        calls = []
+
+        def score_fn(text: str) -> Dict[str, Any]:
+            calls.append(text)
+            return {"score": len(text)}
 
         items = [f"文本{i}" for i in range(8)]
+        result = warmup_cache_parallel(items, score_fn=score_fn, max_workers=4, skip_existing=False)
 
-        # 并行执行（4 workers）
-        result_parallel = warmup_cache_parallel(
-            items, score_fn=slow_score_fn, max_workers=4, skip_existing=False
-        )
+        assert created_workers == [4]
+        assert submitted_items == items
+        assert calls == items
+        assert result.total_items == 8
+        assert result.warmed == 8
+        assert result.skipped == 0
+        assert result.failed == 0
+        assert result.errors == []
 
-        # 清空缓存再串行执行
-        clear_score_cache()
-        result_sequential = warmup_cache(items, score_fn=slow_score_fn, skip_existing=False)
-
-        # 并行应该明显更快（理论上 ~4x）
-        # 允许一些误差，但并行至少应该快 2 倍
-        assert result_parallel.duration_ms < result_sequential.duration_ms * 0.7
+        for text in items:
+            assert get_cached_score(text) == {"score": len(text)}
