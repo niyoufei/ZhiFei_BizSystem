@@ -49,3 +49,35 @@ OLLAMA_TIMEOUT=120
 - 失败模型回退：设置 `OLLAMA_MODEL=not-exist-model` 时返回 `None`，不崩溃，可由 rules 逻辑安全兜底。
 
 下一阶段仍应保持人工可控开关，不接核心评分主链；如需扩展到页面或评标增强入口，应单独小范围设计、验证和回滚。
+
+## 七、手动 Ollama 预览 API 真实验证记录
+
+已完成一次手动 Ollama evolution preview API 的本机真实验证，验证对象为：
+
+```text
+POST /api/v1/projects/{project_id}/evolve/ollama_preview
+```
+
+验证环境与结果：
+
+- 当前验证 commit：`6776dbc feat: add manual Ollama evolution preview API`。
+- Ollama 服务可访问。
+- 验证模型 `qwen3:0.6b` 存在。
+- 使用环境变量：
+  - `EVOLUTION_LLM_BACKEND=ollama`
+  - `OLLAMA_MODEL=qwen3:0.6b`
+  - `OLLAMA_BASE_URL=http://localhost:11434`
+  - `OLLAMA_TIMEOUT=120`
+- 真实调用预览 API 成功：`status_code=200`。
+- 成功场景返回：`enhanced_by=ollama`，`fallback=false`，返回内容非空。
+- 失败模型 `not-exist-model` 返回：`fallback=true`，`error_summary="Ollama enhancement returned no result"`。
+- 失败模型场景不崩溃。
+- 未写入 `evolution_reports`。
+- 未调用 `save_evolution_reports`。
+- 未调用 `load_evolution_reports`。
+- 未调用 `scorer` / `v2_scorer`。
+- 未启动 Web 服务，未写 `.env`，未连接数据库。
+
+该接口仅用于人工触发的 Ollama 增强预览，不写入正式 `evolution_reports`，不改变核心评分主链，也不修改正式评分分数、扣分逻辑或评分规则。
+
+如下一阶段需要在页面中增加“手动 Ollama 预览”按钮，应单独创建小 PR，只接前端按钮与该预览 API，不接核心评分主链。
