@@ -14774,12 +14774,20 @@ def index(
               const preview = (data && typeof data.preview === 'object') ? data.preview : {};
               const logic = Array.isArray(preview.high_score_logic) ? preview.high_score_logic : [];
               const guidance = Array.isArray(preview.writing_guidance) ? preview.writing_guidance : [];
+              const enhancedBy = (data && data.enhanced_by) || 'rules';
+              const fallback = !!(data && data.fallback);
+              const errorSummary = (data && data.error_summary) || '-';
+              const updatedAt = String((preview && preview.updated_at) || (data && data.updated_at) || '-');
               const html = ''
                 + '<strong>Ollama 增强预览</strong>'
                 + '<p style="margin:6px 0">状态：'
-                + (data && data.fallback ? '<span class="error">已回退</span>' : '<span class="success">增强成功</span>')
-                + '；增强后端：' + esc((data && data.enhanced_by) || 'rules')
+                + (fallback ? '<span class="error">已回退</span>' : '<span class="success">增强成功</span>')
                 + '</p>'
+                + '<table><tr><th>enhanced_by</th><th>fallback</th><th>error_summary</th><th>更新时间</th></tr>'
+                + '<tr><td>' + esc(enhancedBy) + '</td>'
+                + '<td>' + esc(String(fallback)) + '</td>'
+                + '<td>' + esc(errorSummary) + '</td>'
+                + '<td>' + esc(updatedAt) + '</td></tr></table>'
                 + (data && data.error_summary ? '<p class="error">' + esc(data.error_summary) + '</p>' : '')
                 + (logic.length ? '<strong>高分逻辑预览</strong><ul>' + logic.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>' : '')
                 + (guidance.length ? '<strong>编制指导预览</strong><ul>' + guidance.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>' : '')
@@ -15064,6 +15072,9 @@ def index(
         <div class="action-row" style="margin-bottom:10px">
           <button type="button" id="btnEvolve" onclick="return window.__zhifeiFallbackClick(event, 'btnEvolve')">学习进化（根据已录入真实评标生成高分逻辑与编制指导）</button>
           <button type="button" id="btnOllamaPreview" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnOllamaPreview')">Ollama 增强预览</button>
+          <button type="button" id="btnOllamaPreviewCopy" class="secondary" disabled>复制预览结果</button>
+          <button type="button" id="btnOllamaPreviewExport" class="secondary" disabled>导出 JSON</button>
+          <span id="ollamaPreviewActionStatus" class="note">生成预览后可复制或导出。</span>
           <button type="button" id="btnEvolutionHealth" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnEvolutionHealth')">进化健康度</button>
           <button type="button" id="btnWritingGuidance" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnWritingGuidance')">查看编制指导</button>
           <button type="button" id="btnCompilationInstructions" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnCompilationInstructions')">编制系统指令（可导出为编制约束）</button>
@@ -16292,6 +16303,8 @@ def index(
         let expertProfileLocked = false;
         let projectMetaById = {};
         let scoringReadinessState = { project_id: '', ready: false, gate_passed: false, issues: [] };
+        let latestOllamaPreviewPayload = null;
+        let latestOllamaPreviewProjectId = '';
         const PROJECT_REQUIRED_BUTTON_IDS = [
           'deleteCurrentProject', 'btnWeightsReset', 'btnWeightsSave', 'btnWeightsApply',
           'btnMaterialDepthReport', 'btnMaterialDepthReportDownload', 'btnMaterialKnowledgeProfile', 'btnMaterialKnowledgeProfileDownload',
@@ -16459,6 +16472,7 @@ def index(
             const scaleSel = document.getElementById('scoreScaleSelect');
             if (scaleSel) scaleSel.value = '100';
           }
+          resetOllamaPreviewActions();
           const gtSubmissionSel = document.getElementById('groundTruthSubmissionSelect');
           if (gtSubmissionSel) {
             gtSubmissionSel.innerHTML = '';
@@ -18147,15 +18161,111 @@ def index(
             .replace(/\"/g, '&quot;')
             .replace(/'/g, '&#39;');
         }
+        function ollamaPreviewUpdatedAt(data) {
+          const preview = (data && typeof data.preview === 'object') ? data.preview : {};
+          return String((preview && preview.updated_at) || (data && data.updated_at) || '-');
+        }
+        function ollamaPreviewStatusText(data) {
+          return data && data.fallback ? '已回退' : '增强成功';
+        }
+        function setOllamaPreviewActionStatus(text, isError=false) {
+          const el = document.getElementById('ollamaPreviewActionStatus');
+          if (!el) return;
+          el.textContent = text || '';
+          el.style.color = isError ? '#b91c1c' : '#64748b';
+        }
+        function setOllamaPreviewActionButtons(enabled) {
+          ['btnOllamaPreviewCopy', 'btnOllamaPreviewExport'].forEach((id) => {
+            const btn = document.getElementById(id);
+            if (!btn) return;
+            btn.disabled = !enabled;
+            btn.title = enabled ? '' : '请先生成 Ollama 增强预览';
+          });
+        }
+        function resetOllamaPreviewActions() {
+          latestOllamaPreviewPayload = null;
+          latestOllamaPreviewProjectId = '';
+          setOllamaPreviewActionButtons(false);
+          setOllamaPreviewActionStatus('生成预览后可复制或导出。', false);
+        }
+        function storeOllamaPreviewPayload(projectId, data) {
+          latestOllamaPreviewProjectId = String(projectId || '');
+          latestOllamaPreviewPayload = (data && typeof data === 'object') ? data : null;
+          setOllamaPreviewActionButtons(!!latestOllamaPreviewPayload);
+          setOllamaPreviewActionStatus(
+            latestOllamaPreviewPayload ? '预览已生成，可复制或导出 JSON。' : '生成预览后可复制或导出。',
+            false
+          );
+        }
+        function formatOllamaPreviewPlainText(data) {
+          const preview = (data && typeof data.preview === 'object') ? data.preview : {};
+          const logic = Array.isArray(preview.high_score_logic) ? preview.high_score_logic : [];
+          const guidance = Array.isArray(preview.writing_guidance) ? preview.writing_guidance : [];
+          const lines = [
+            'Ollama 增强预览',
+            '状态：' + ollamaPreviewStatusText(data),
+            'enhanced_by：' + String((data && data.enhanced_by) || 'rules'),
+            'fallback：' + String(!!(data && data.fallback)),
+            'error_summary：' + String((data && data.error_summary) || '-'),
+            '更新时间：' + ollamaPreviewUpdatedAt(data),
+            '',
+            '高分逻辑预览',
+          ];
+          if (logic.length) logic.forEach((x, idx) => lines.push(String(idx + 1) + '. ' + String(x)));
+          else lines.push('暂无');
+          lines.push('', '编制指导预览');
+          if (guidance.length) guidance.forEach((x, idx) => lines.push(String(idx + 1) + '. ' + String(x)));
+          else lines.push('暂无');
+          lines.push('', '仅预览，不写入正式学习进化结果。');
+          return lines.join(NL);
+        }
+        async function copyTextToClipboard(text) {
+          if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+            await navigator.clipboard.writeText(text);
+            return;
+          }
+          const area = document.createElement('textarea');
+          area.value = text;
+          area.setAttribute('readonly', 'readonly');
+          area.style.position = 'fixed';
+          area.style.left = '-9999px';
+          document.body.appendChild(area);
+          area.select();
+          document.execCommand('copy');
+          area.remove();
+        }
+        function downloadOllamaPreviewJson(projectId, data) {
+          const safeProjectId = String(projectId || 'project').replace(/[^a-zA-Z0-9_-]+/g, '_');
+          const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+          const blob = new Blob([JSON.stringify(data || {}, null, 2)], {
+            type: 'application/json;charset=utf-8',
+          });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'ollama_preview_' + safeProjectId + '_' + stamp + '.json';
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+        }
         function renderOllamaPreviewHtml(data) {
           const preview = (data && typeof data.preview === 'object') ? data.preview : {};
           const logic = Array.isArray(preview.high_score_logic) ? preview.high_score_logic : [];
           const guidance = Array.isArray(preview.writing_guidance) ? preview.writing_guidance : [];
+          const enhancedBy = (data && data.enhanced_by) || 'rules';
+          const fallback = !!(data && data.fallback);
+          const errorSummary = (data && data.error_summary) || '-';
+          const updatedAt = ollamaPreviewUpdatedAt(data);
           let html = '<strong>Ollama 增强预览</strong>';
           html += '<p style="margin:6px 0">状态：'
-            + (data && data.fallback ? '<span class="error">已回退</span>' : '<span class="success">增强成功</span>')
-            + '；增强后端：' + escapeHtmlText((data && data.enhanced_by) || 'rules')
+            + (fallback ? '<span class="error">已回退</span>' : '<span class="success">增强成功</span>')
             + '</p>';
+          html += '<table><tr><th>enhanced_by</th><th>fallback</th><th>error_summary</th><th>更新时间</th></tr>'
+            + '<tr><td>' + escapeHtmlText(enhancedBy) + '</td>'
+            + '<td>' + escapeHtmlText(String(fallback)) + '</td>'
+            + '<td>' + escapeHtmlText(errorSummary) + '</td>'
+            + '<td>' + escapeHtmlText(updatedAt) + '</td></tr></table>';
           if (data && data.error_summary) {
             html += '<p class="error">' + escapeHtmlText(data.error_summary) + '</p>';
           }
@@ -19286,6 +19396,7 @@ def index(
         safeClick('btnOllamaPreview', async () => {
           if (!ensureProjectForAction('ollamaPreviewResult')) return;
           const projectId = actionProjectId();
+          resetOllamaPreviewActions();
           setResultLoading('ollamaPreviewResult', 'Ollama 增强预览生成中...');
           let res;
           let data = {};
@@ -19304,10 +19415,28 @@ def index(
           if (!el) return;
           el.style.display = 'block';
           if (res.ok) {
+            storeOllamaPreviewPayload(projectId, data);
             el.innerHTML = renderOllamaPreviewHtml(data);
           } else {
+            resetOllamaPreviewActions();
             el.innerHTML = '<span class="error">' + escapeHtmlText(data.detail || 'Ollama 增强预览失败') + '</span>';
           }
+        });
+        safeClick('btnOllamaPreviewCopy', async () => {
+          if (!latestOllamaPreviewPayload) {
+            setOllamaPreviewActionStatus('请先生成 Ollama 增强预览。', true);
+            return;
+          }
+          await copyTextToClipboard(formatOllamaPreviewPlainText(latestOllamaPreviewPayload));
+          setOllamaPreviewActionStatus('预览结果已复制。', false);
+        });
+        safeClick('btnOllamaPreviewExport', async () => {
+          if (!latestOllamaPreviewPayload) {
+            setOllamaPreviewActionStatus('请先生成 Ollama 增强预览。', true);
+            return;
+          }
+          downloadOllamaPreviewJson(latestOllamaPreviewProjectId, latestOllamaPreviewPayload);
+          setOllamaPreviewActionStatus('JSON 导出已触发。', false);
         });
         safeClick('btnEvolutionHealth', async () => {
           if (!ensureProjectForAction('evolutionHealthResult')) return;
