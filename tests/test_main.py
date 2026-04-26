@@ -191,6 +191,19 @@ class TestIndexEndpoint:
         assert "更新时间" in page
         assert "仅预览，不写入正式学习进化结果。" in page
 
+    def test_index_compare_report_cards_use_structured_direct_apply_fields(self, client):
+        """Compare report optimization cards should not use issue/guidance as copyable text."""
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert "原文内容" in page
+        assert "直接替换文本 / 原位补充内容" in page
+        assert "r.original_text || r.evidence || ''" in page
+        assert "r.direct_apply_text || r.replacement_text || r.insertion_content || ''" in page
+        assert "r.original_text || r.issue" not in page
+        assert "r.direct_apply_text || r.insertion_guidance" not in page
+        assert "r.direct_apply_text || r.rewrite_instruction" not in page
+
     def test_index_frontend_section_5_6_7_actions_have_explicit_project_guard(self, client):
         """Section 5/6/7 action handlers should proactively show project-selection errors instead of silent failure."""
         response = client.get("/")
