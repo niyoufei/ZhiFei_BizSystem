@@ -4820,6 +4820,11 @@ class TestOllamaEvolutionPreviewEndpoint:
             ) as preview_ollama,
             patch("app.main.load_evolution_reports") as load_reports,
             patch("app.main.save_evolution_reports") as save_reports,
+            patch("app.main.save_score_reports") as save_score_reports,
+            patch("app.main.save_evidence_units") as save_evidence_units,
+            patch("app.main.score_text") as score_text,
+            patch("app.main.score_text_v2") as score_text_v2,
+            patch("app.main.compute_v2_rule_total") as compute_v2_rule_total,
         ):
             response = client.post("/api/v1/projects/p1/evolve/ollama_preview")
 
@@ -4834,6 +4839,11 @@ class TestOllamaEvolutionPreviewEndpoint:
         assert preview_ollama.call_args.args[3] == "项目上下文\n\n资料文本"
         load_reports.assert_not_called()
         save_reports.assert_not_called()
+        save_score_reports.assert_not_called()
+        save_evidence_units.assert_not_called()
+        score_text.assert_not_called()
+        score_text_v2.assert_not_called()
+        compute_v2_rule_total.assert_not_called()
 
     def test_ollama_preview_failure_returns_fallback_without_saving(self, client):
         rule_report = self._rule_report()
@@ -4860,6 +4870,11 @@ class TestOllamaEvolutionPreviewEndpoint:
             ),
             patch("app.main.load_evolution_reports") as load_reports,
             patch("app.main.save_evolution_reports") as save_reports,
+            patch("app.main.save_score_reports") as save_score_reports,
+            patch("app.main.save_evidence_units") as save_evidence_units,
+            patch("app.main.score_text") as score_text,
+            patch("app.main.score_text_v2") as score_text_v2,
+            patch("app.main.compute_v2_rule_total") as compute_v2_rule_total,
         ):
             response = client.post("/api/v1/projects/p1/evolve/ollama_preview")
 
@@ -4872,6 +4887,11 @@ class TestOllamaEvolutionPreviewEndpoint:
         assert data["preview"]["high_score_logic"] == ["规则高分逻辑"]
         load_reports.assert_not_called()
         save_reports.assert_not_called()
+        save_score_reports.assert_not_called()
+        save_evidence_units.assert_not_called()
+        score_text.assert_not_called()
+        score_text_v2.assert_not_called()
+        compute_v2_rule_total.assert_not_called()
 
     def test_default_evolve_still_saves_rules_report_without_preview(self, client):
         rule_report = self._rule_report()
