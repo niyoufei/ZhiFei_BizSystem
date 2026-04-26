@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -77,6 +78,11 @@ class TestCliStructure:
         command_names = [cmd.name for cmd in app.registered_groups]
         assert "warmup" in command_names
 
+    def test_app_has_agents_command(self):
+        """Test that agents command is registered."""
+        command_names = [cmd.name for cmd in app.registered_groups]
+        assert "agents" in command_names
+
     def test_help_option(self):
         """Test --help option shows usage."""
         result = runner.invoke(app, ["--help"])
@@ -129,6 +135,39 @@ class TestWarmupCommand:
         assert "预热完成" in result.stdout
         assert "共 2 条" in result.stdout or "2" in result.stdout
         assert mock_score_text.call_count == 2
+
+
+class TestAgentsCommand:
+    def test_agents_list_outputs_registered_specs(self):
+        services = SimpleNamespace(
+            agents=SimpleNamespace(
+                list_agents=MagicMock(return_value=[{"agent_name": "ops-triage"}])
+            )
+        )
+        with patch("app.cli.get_application_services", return_value=services):
+            result = runner.invoke(app, ["agents", "list"])
+
+        assert result.exit_code == 0
+        payload = json.loads(result.stdout)
+        assert payload[0]["agent_name"] == "ops-triage"
+
+    def test_agents_dry_run_prints_result_payload(self):
+        run_result = SimpleNamespace(
+            model_dump=lambda mode="json": {
+                "audit": {"status": "success"},
+                "output": {"overall_status": "warn"},
+            }
+        )
+        services = SimpleNamespace(
+            agents=SimpleNamespace(dry_run=MagicMock(return_value=run_result))
+        )
+        with patch("app.cli.get_application_services", return_value=services):
+            result = runner.invoke(app, ["agents", "dry-run", "--agent", "ops-triage"])
+
+        assert result.exit_code == 0
+        payload = json.loads(result.stdout)
+        assert payload["audit"]["status"] == "success"
+        assert payload["output"]["overall_status"] == "warn"
 
 
 # ============================================================================
@@ -538,7 +577,7 @@ class TestBatchParallel:
         input_dir.mkdir()
         for i in range(3):
             (input_dir / f"test_{i}.txt").write_text(
-                f"测试文档 {i}\n工期：{i*10+10}天", encoding="utf-8"
+                f"测试文档 {i}\n工期：{i * 10 + 10}天", encoding="utf-8"
             )
         output_dir = Path(temp_dir) / "outputs"
         result = runner.invoke(

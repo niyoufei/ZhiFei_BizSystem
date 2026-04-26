@@ -26,6 +26,7 @@ def test_browser_button_smoke_matrix_covers_high_value_buttons() -> None:
     by_id = {item["id"]: item for item in BUTTON_SMOKE_MATRIX}
     assert "btnSaveApiKey" in ids
     assert "btnClearApiKey" in ids
+    assert "btnReloadPage" in ids
     assert "btnStartNewProject" in ids
     assert "btnWeightsReset" in ids
     assert "btnOptimizationReport" in ids
@@ -74,6 +75,9 @@ def test_browser_button_smoke_matrix_covers_high_value_buttons() -> None:
     )
     assert "project_intake_mode" in by_id["btnStartNewProject"]["verify_js"]
     assert "window.__codexForceProjectContextForSmoke" in by_id["btnStartNewProject"]["verify_js"]
+    assert by_id["btnReloadPage"]["kind"] == "js_check"
+    assert "window.__zhifeiReloadPage = function ()" in by_id["btnReloadPage"]["prepare_js"]
+    assert "pageReloadRequested" in by_id["btnReloadPage"]["verify_js"]
     assert by_id["btnWeightsReset"]["kind"] == "js_check"
     assert (
         "window.__codexSetWeightSliderForSmoke('09', 7)" in by_id["btnWeightsReset"]["prepare_js"]

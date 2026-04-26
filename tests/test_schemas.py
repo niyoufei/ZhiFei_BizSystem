@@ -56,11 +56,22 @@ class TestProjectCreate:
     def test_create_with_name_only(self):
         proj = ProjectCreate(name="项目名")
         assert proj.name == "项目名"
+        assert proj.project_type is None
+        assert proj.bid_method is None
         assert proj.meta is None
 
     def test_create_with_meta(self):
         proj = ProjectCreate(name="项目", meta={"key": "value"})
         assert proj.meta == {"key": "value"}
+
+    def test_create_with_project_type_and_bid_method(self):
+        proj = ProjectCreate(
+            name="项目",
+            project_type="装修及景观",
+            bid_method="AI综合评估法（三阶段）",
+        )
+        assert proj.project_type == "装修及景观"
+        assert proj.bid_method == "AI综合评估法（三阶段）"
 
     def test_name_required(self):
         with pytest.raises(ValidationError):
@@ -74,11 +85,15 @@ class TestProjectRecord:
         rec = ProjectRecord(
             id="proj-001",
             name="测试项目",
+            project_type="装修及景观",
+            bid_method="AI综合评估法（三阶段）",
             meta={"location": "北京"},
             created_at="2026-01-01T00:00:00",
         )
         assert rec.id == "proj-001"
         assert rec.name == "测试项目"
+        assert rec.project_type == "装修及景观"
+        assert rec.bid_method == "AI综合评估法（三阶段）"
         assert rec.meta == {"location": "北京"}
         assert rec.created_at == "2026-01-01T00:00:00"
 

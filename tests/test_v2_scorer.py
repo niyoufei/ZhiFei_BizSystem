@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from app.engine.v2_scorer import score_text_v2
 
 
@@ -192,6 +194,26 @@ def test_evidence_gate_caps_dim_score_when_evidence_and_mandatory_missing() -> N
     gate = dim01.get("evidence_gate") or {}
     assert gate.get("applied") is True
     assert float(dim01.get("dim_score", 0.0)) <= 6.2
+
+
+def test_score_text_v2_passes_project_id_to_probe_suggestions() -> None:
+    with patch("app.engine.v2_scorer.compute_probe_dimensions") as mock_probe:
+        with patch("app.engine.v2_scorer.build_probe_template_suggestions") as mock_build:
+            mock_probe.return_value = [{"id": "P02", "name": "BIM应用", "score_rate": 0.45}]
+            mock_build.return_value = []
+
+            score_text_v2(
+                submission_id="s-project-probe",
+                project_id="p1",
+                text="BIM 应用较弱，未体现智慧工地。",
+                lexicon=_minimal_lexicon(),
+                anchors=[],
+                requirements=[],
+            )
+
+    kwargs = mock_build.call_args.kwargs
+    assert kwargs["project_id"] == "p1"
+    assert kwargs["threshold"] == 0.8
 
 
 def test_material_consistency_can_require_numeric_constraints() -> None:

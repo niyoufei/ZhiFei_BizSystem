@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from app.engine.preflight import PreFlightFatalError, pre_flight_check
 from app.engine.surrogate_learning import calibrate_weights, compute_time_decay_weight
 from app.engine.template_rag import build_probe_template_suggestions, compute_probe_dimensions
+from app.schemas import ExtractedFeature
 
 
 def _uniform_weights() -> dict:
@@ -101,3 +102,38 @@ def test_probe_template_suggestions_trigger_under_80_percent() -> None:
     assert isinstance(p02.get("logic_skeletons"), list)
     assert p02.get("references")
     assert isinstance(p02.get("applied_feature_ids"), list)
+
+
+def test_probe_template_suggestions_filter_feature_refs_by_project(monkeypatch) -> None:
+    probes = [{"id": "P02", "name": "BIM应用", "score_rate": 0.45}]
+    captured: dict = {}
+
+    def _fake_select(*, dimension_ids, top_k, project_id=None):
+        captured["dimension_ids"] = list(dimension_ids)
+        captured["top_k"] = top_k
+        captured["project_id"] = project_id
+        return [
+            ExtractedFeature(
+                feature_id="F-p1",
+                dimension_id="P02",
+                logic_skeleton=[
+                    "[前置条件] BIM场景明确 + [技术/动作] 协同审查 + [量化指标类型] 闭环完成率"
+                ],
+                confidence_score=0.8,
+                usage_count=1,
+                active=True,
+                governance_status="adopted",
+                source_project_ids=["p1"],
+            )
+        ]
+
+    monkeypatch.setattr("app.engine.template_rag.select_top_logic_skeletons", _fake_select)
+
+    suggestions = build_probe_template_suggestions(probes, threshold=0.8, project_id="p1")
+
+    assert suggestions[0]["applied_feature_ids"] == ["F-p1"]
+    assert captured == {
+        "dimension_ids": ["P02"],
+        "top_k": 2,
+        "project_id": "p1",
+    }
