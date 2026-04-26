@@ -34,6 +34,8 @@
 
 如需“只用单步命令”的最简操作方式，请看 **[零代码操作手册](docs/零代码操作手册.md)**。
 
+如需评估本地 Ollama 大模型的低风险可选接入，请看 **[Ollama 接入最小改动清单](docs/ollama-minimal-integration-plan.md)**。
+
 ---
 
 ## 环境准备（可选阅读）
