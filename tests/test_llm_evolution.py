@@ -10,6 +10,7 @@ from app.engine.llm_evolution import (
     EVOLUTION_LLM_BACKEND_ENV,
     enhance_evolution_report_with_llm,
     get_evolution_llm_backend,
+    get_llm_backend_status,
 )
 
 
@@ -29,6 +30,29 @@ class TestGetEvolutionLlmBackend:
             assert get_evolution_llm_backend() == "openai"
         with patch.dict(os.environ, {EVOLUTION_LLM_BACKEND_ENV: "gemini"}):
             assert get_evolution_llm_backend() == "gemini"
+
+    def test_env_ollama(self):
+        with patch.dict(os.environ, {EVOLUTION_LLM_BACKEND_ENV: "ollama"}):
+            assert get_evolution_llm_backend() == "ollama"
+
+
+class TestGetLlmBackendStatus:
+    def test_ollama_status_uses_model_only(self):
+        with patch.dict(
+            os.environ,
+            {
+                EVOLUTION_LLM_BACKEND_ENV: "ollama",
+                "OLLAMA_MODEL": "qwen2.5",
+            },
+            clear=True,
+        ):
+            status = get_llm_backend_status()
+
+        assert status["evolution_backend"] == "ollama"
+        assert status["ollama_configured"] is True
+        assert status["spark_configured"] is False
+        assert status["openai_configured"] is False
+        assert status["gemini_configured"] is False
 
 
 class TestEnhanceEvolutionReportWithLlm:
@@ -94,6 +118,80 @@ class TestEnhanceEvolutionReportWithLlm:
             finally:
                 if save is not None:
                     os.environ["GEMINI_API_KEY"] = save
+
+    def test_ollama_backend_without_model_returns_none(self):
+        with patch.dict(os.environ, {EVOLUTION_LLM_BACKEND_ENV: "ollama"}, clear=False):
+            save = os.environ.pop("OLLAMA_MODEL", None)
+            try:
+                report = {
+                    "project_id": "p1",
+                    "high_score_logic": ["a"],
+                    "writing_guidance": ["b"],
+                    "sample_count": 0,
+                    "updated_at": "2020-01-01T00:00:00Z",
+                }
+                out = enhance_evolution_report_with_llm("p1", report, [], "")
+                assert out is None
+            finally:
+                if save is not None:
+                    os.environ["OLLAMA_MODEL"] = save
+
+    def test_ollama_backend_uses_mocked_client(self):
+        report = {
+            "project_id": "p1",
+            "high_score_logic": ["a"],
+            "writing_guidance": ["b"],
+            "sample_count": 1,
+            "updated_at": "2020-01-01T00:00:00Z",
+        }
+        expected = {
+            "project_id": "p1",
+            "high_score_logic": ["h1"],
+            "writing_guidance": ["w1"],
+            "sample_count": 1,
+            "updated_at": "2020-01-02T00:00:00Z",
+            "enhanced_by": "ollama",
+        }
+        with (
+            patch.dict(os.environ, {EVOLUTION_LLM_BACKEND_ENV: "ollama"}, clear=False),
+            patch(
+                "app.engine.llm_evolution_ollama.enhance_evolution_report_ollama",
+                return_value=expected,
+            ) as enhance,
+        ):
+            out = enhance_evolution_report_with_llm("p1", report, [], "ctx")
+
+        assert out == expected
+        assert enhance.call_count == 1
+        enhance.assert_called_with("p1", report, [], "ctx")
+
+    def test_ollama_backend_retries_once_on_none(self):
+        report = {
+            "project_id": "p1",
+            "high_score_logic": ["a"],
+            "writing_guidance": ["b"],
+            "sample_count": 1,
+            "updated_at": "2020-01-01T00:00:00Z",
+        }
+        expected = {
+            "project_id": "p1",
+            "high_score_logic": ["h1"],
+            "writing_guidance": ["w1"],
+            "sample_count": 1,
+            "updated_at": "2020-01-02T00:00:00Z",
+            "enhanced_by": "ollama",
+        }
+        with (
+            patch.dict(os.environ, {EVOLUTION_LLM_BACKEND_ENV: "ollama"}, clear=False),
+            patch(
+                "app.engine.llm_evolution_ollama.enhance_evolution_report_ollama",
+                side_effect=[None, expected],
+            ) as enhance,
+        ):
+            out = enhance_evolution_report_with_llm("p1", report, [], "ctx")
+
+        assert out == expected
+        assert enhance.call_count == 2
 
 
 class TestLlmEvolutionSparkModule:

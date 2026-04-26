@@ -20,7 +20,7 @@
 ## 当前基线
 
 - CLI 评分当前支持规则模式，以及基于 Spark 的 `spark` / `hybrid` 模式。
-- 学习进化后端当前通过 `EVOLUTION_LLM_BACKEND` 在 `rules`、`spark`、`openai`、`gemini` 之间选择。
+- 学习进化后端当前通过 `EVOLUTION_LLM_BACKEND` 在 `rules`、`spark`、`openai`、`gemini`、`ollama` 之间选择。
 - 未配置外部模型密钥或调用失败时，现有逻辑会回退到规则结果。
 - 项目已经有 smoke test、Python 版本矩阵测试和 lint 检查，后续实现必须保持这些检查稳定。
 
@@ -28,7 +28,7 @@
 
 ### 1. 后端边界
 
-后续实现时，建议先只把 Ollama 接入学习进化增强链路，不直接参与核心评分总分计算。
+当前实现先只把 Ollama 接入学习进化增强链路，不直接参与核心评分总分计算。
 
 建议新增后端语义：
 
@@ -37,10 +37,11 @@
 - `OLLAMA_MODEL=<local-model-name>`
 
 默认仍保持 `EVOLUTION_LLM_BACKEND=rules`，只有用户显式配置 `ollama` 时才尝试本地调用。
+未设置 `OLLAMA_MODEL` 时，即使选择 `EVOLUTION_LLM_BACKEND=ollama`，也会返回规则版结果。
 
 ### 2. 调用适配层
 
-后续代码 PR 可新增独立适配文件，复用现有进化 LLM 的 prompt 构造和 JSON 解析规则：
+已新增独立适配文件，复用现有进化 LLM 的 prompt 构造和 JSON 解析规则：
 
 - 输入：规则版进化报告与真实评标数据摘要。
 - 输出：与现有 LLM 增强路径一致的 `high_score_logic`、`writing_guidance` 等文本字段。
@@ -65,8 +66,8 @@
 
 ## 建议拆分 PR
 
-1. **适配层 PR**：新增 Ollama 进化后端适配器和单元测试，不接入 CLI/API 默认路径。
-2. **配置接入 PR**：将 `EVOLUTION_LLM_BACKEND=ollama` 接入现有后端选择逻辑，补充状态展示。
+1. **适配层 PR**：已新增 Ollama 进化后端适配器和单元测试，不接入 CLI/API 默认路径。
+2. **配置接入 PR**：已将 `EVOLUTION_LLM_BACKEND=ollama` 接入现有后端选择逻辑，补充状态展示。
 3. **文档 PR**：补充 `.env.example`、README、产品说明和故障排查。
 4. **可选体验 PR**：在 Web/UI 中展示本地模型增强状态，但不改变现有评分入口。
 
