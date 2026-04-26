@@ -179,12 +179,24 @@ class TestIndexEndpoint:
         response = client.get("/")
         assert response.status_code == 200
         page = response.text
+        assert "let latestOllamaPreviewPayload = null" in page
+        assert "let latestOllamaPreviewProjectId = ''" in page
         assert "safeClick('btnOllamaPreviewCopy'" in page
         assert "safeClick('btnOllamaPreviewExport'" in page
+        assert "function resetOllamaPreviewActions" in page
+        assert page.count("latestOllamaPreviewPayload = null") >= 2
+        assert page.count("latestOllamaPreviewProjectId = ''") >= 2
+        assert "resetOllamaPreviewActions();" in page
+        assert "storeOllamaPreviewPayload(projectId, data)" in page
         assert "function formatOllamaPreviewPlainText" in page
         assert "function downloadOllamaPreviewJson" in page
+        assert "formatOllamaPreviewPlainText(latestOllamaPreviewPayload)" in page
+        assert (
+            "downloadOllamaPreviewJson(latestOllamaPreviewProjectId, " "latestOllamaPreviewPayload)"
+        ) in page
         assert "navigator.clipboard.writeText" in page
         assert "new Blob([JSON.stringify(data || {}, null, 2)]" in page
+        assert "请先生成 Ollama 增强预览。" in page
         assert "enhanced_by" in page
         assert "fallback" in page
         assert "error_summary" in page
