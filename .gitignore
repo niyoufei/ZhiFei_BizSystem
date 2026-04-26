@@ -93,6 +93,9 @@ data/*.json
 data/*.lock
 data/*.json.lock
 
+# Local agent audit logs
+/data/agent_audit_log.jsonl
+
 # Generated report outputs (keep code, ignore generated artifacts)
 report_*.json
 sample_report*.json
