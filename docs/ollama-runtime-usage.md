@@ -81,3 +81,30 @@ POST /api/v1/projects/{project_id}/evolve/ollama_preview
 该接口仅用于人工触发的 Ollama 增强预览，不写入正式 `evolution_reports`，不改变核心评分主链，也不修改正式评分分数、扣分逻辑或评分规则。
 
 页面中的“自我学习与进化”区域可单独提供“手动 Ollama 预览”按钮，只调用该预览 API 并展示临时结果；该按钮仍不接核心评分主链，也不保存正式进化报告。
+
+## 八、前端 Ollama 增强预览按钮真实验收记录
+
+已完成一次前端“Ollama 增强预览”按钮的本机真实运行验收，验证对象为“自我学习与进化”区域中的人工预览按钮。
+
+验收环境与结果：
+
+- 当前验证 commit：`69817e4 feat: add Ollama preview UI button`。
+- 按钮存在，位于“自我学习与进化”区域，按钮文本为“Ollama 增强预览”。
+- 点击按钮后成功调用：
+
+  ```text
+  POST /api/v1/projects/{project_id}/evolve/ollama_preview
+  ```
+
+- 成功模型 `qwen3:0.6b` 返回：`status_code=200`，`enhanced_by=ollama`，`fallback=false`，返回内容非空。
+- 失败模型 `not-exist-model` 返回：`status_code=200`，`fallback=true`，不崩溃。
+- 未写入 `evolution_reports`。
+- 未触发 `save_evolution_reports`。
+- 未触发 `score_text` / `score_text_v2` / `compute_v2_rule_total`。
+- 未修改评分分数。
+- 未写 `.env`。
+- 未连接数据库写入。
+
+该按钮只用于人工触发 Ollama 增强预览，只展示临时预览结果，不写入正式 `evolution_reports`，不修改评分分数，不接核心评分主链。
+
+下一阶段仍暂不接核心评分主链；如需继续扩展，应优先保持人工可控、小范围验证和可回退。
