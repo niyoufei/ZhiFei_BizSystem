@@ -625,7 +625,7 @@ README.md
 
 ## 下一步扩展为 LLM/RAG（接口预留说明）
 
-如需评估本地模型后端，先参考 **[Ollama 最小接入计划](docs/ollama-minimal-integration-plan.md)**；该计划只描述后续接入边界，不代表当前版本已接入 Ollama。
+如需评估本地模型后端，先参考 **[Ollama 最小接入计划](docs/ollama-minimal-integration-plan.md)** 与 **[Ollama 可选 backend 使用说明](docs/ollama-runtime-usage.md)**。
 
 本 MVP 的评分入口集中在 `app/engine/scorer.py` 的 `score_text()`。
 后续可新增 `llm_scorer.py` 或 `rag_scorer.py`，保持与 `score_text()` 相同的输出结构：
