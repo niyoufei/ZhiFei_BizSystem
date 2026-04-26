@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -18,6 +19,7 @@ except Exception:  # noqa: BLE001 - environment-dependent optional dependency
     pymupdf = None
 
 runner = CliRunner()
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 # ============================================================================
@@ -845,10 +847,11 @@ class TestProcessPoolExecutor:
     def test_batch_executor_help_shows_option(self):
         """Test that --executor option is shown in help."""
         result = runner.invoke(app, ["batch", "--help"])
+        output = ANSI_ESCAPE_RE.sub("", result.output)
         assert result.exit_code == 0
-        assert "--executor" in result.output
-        assert "thread" in result.output
-        assert "process" in result.output
+        assert "--executor" in output
+        assert "thread" in output
+        assert "process" in output
 
     def test_batch_process_executor_two_files(self, temp_dir):
         """Test batch with ProcessPoolExecutor on two files (need 2+ for parallel)."""
