@@ -122,3 +122,12 @@ POST /api/v1/projects/{project_id}/evolve/ollama_preview
 - 两个按钮不写数据库。
 
 该能力仍属于人工预览辅助，不接核心评分主链，不让模型直接影响最终评分。
+
+## 十、预览触发条件与边界
+
+- 只有真实调用 Ollama 增强预览时，才需要本机先运行 `ollama serve`，并确保 `OLLAMA_MODEL` 指向本机已拉取的模型。
+- 如果只是文档检查、静态源码测试或 mock 测试，不需要运行 `ollama serve`，也不需要连接本机 Ollama 服务。
+- 如果尚未生成 Ollama 增强预览，点击“复制预览结果”或“导出 JSON”时，页面会提示：`请先生成 Ollama 增强预览。`
+- 复制和导出只使用浏览器内存中的最近一次预览结果，不重新触发预览、不重新触发评分。
+- Ollama 增强预览不写 `data/` 下的正式运行数据，不写正式 `evolution_reports`，不写正式评分报告。
+- Ollama 增强预览不影响评分分数，不进入核心评分主链，不调用 `scorer.py` / `v2_scorer.py`。
