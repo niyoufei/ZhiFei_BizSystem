@@ -14791,7 +14791,7 @@ def index(
                 + (data && data.error_summary ? '<p class="error">' + esc(data.error_summary) + '</p>' : '')
                 + (logic.length ? '<strong>高分逻辑预览</strong><ul>' + logic.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>' : '')
                 + (guidance.length ? '<strong>编制指导预览</strong><ul>' + guidance.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>' : '')
-                + '<p style="font-size:12px;color:#64748b;margin-top:8px">仅预览，不写入正式学习进化结果。</p>';
+                + '<p style="font-size:12px;color:#64748b;margin-top:8px">仅预览，不写入正式学习进化结果；不影响评分，不进入核心评分主链。</p>';
               setResultHtml(cfg.resultId, html || '<pre>' + esc(text || '{}') + '</pre>');
               return true;
             }
@@ -18216,7 +18216,7 @@ def index(
           lines.push('', '编制指导预览');
           if (guidance.length) guidance.forEach((x, idx) => lines.push(String(idx + 1) + '. ' + String(x)));
           else lines.push('暂无');
-          lines.push('', '仅预览，不写入正式学习进化结果。');
+          lines.push('', '仅预览，不写入正式学习进化结果；不影响评分，不进入核心评分主链。');
           return lines.join(NL);
         }
         async function copyTextToClipboard(text) {
@@ -18282,7 +18282,7 @@ def index(
           if (!logic.length && !guidance.length) {
             html += '<p style="color:#64748b">暂无可展示的预览内容。</p>';
           }
-          html += '<p style="font-size:12px;color:#64748b;margin-top:8px">仅预览，不写入正式学习进化结果。</p>';
+          html += '<p style="font-size:12px;color:#64748b;margin-top:8px">仅预览，不写入正式学习进化结果；不影响评分，不进入核心评分主链。</p>';
           return html;
         }
         function materialTypeDisplayName(materialType) {

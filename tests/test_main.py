@@ -189,7 +189,9 @@ class TestIndexEndpoint:
         assert "fallback" in page
         assert "error_summary" in page
         assert "更新时间" in page
-        assert "仅预览，不写入正式学习进化结果。" in page
+        assert "仅预览，不写入正式学习进化结果" in page
+        assert "不影响评分" in page
+        assert "不进入核心评分主链" in page
 
     def test_index_compare_report_cards_use_structured_direct_apply_fields(self, client):
         """Compare report optimization cards should not use issue/guidance as copyable text."""
