@@ -39,3 +39,13 @@ OLLAMA_TIMEOUT=120
 - 去掉 `EVOLUTION_LLM_BACKEND=ollama`。
 - 或将 backend 保持为 `rules`。
 - Ollama 服务关闭时不应影响现有 `rules` 逻辑。
+
+## 六、人工可控开关验证记录
+
+已完成一次人工可控的 Ollama backend 开关验证，验证范围只覆盖学习进化增强后端，不接入核心评分主链。
+
+- rules 默认模式：不设置 `EVOLUTION_LLM_BACKEND` 时，`backend=rules`，`ollama_called=false`。
+- ollama 可选模式：设置 `EVOLUTION_LLM_BACKEND=ollama`、`OLLAMA_MODEL=qwen3:0.6b`、`OLLAMA_BASE_URL=http://localhost:11434`、`OLLAMA_TIMEOUT=120` 后，返回 `enhanced_by=ollama`，且 `content_non_empty=true`。
+- 失败模型回退：设置 `OLLAMA_MODEL=not-exist-model` 时返回 `None`，不崩溃，可由 rules 逻辑安全兜底。
+
+下一阶段仍应保持人工可控开关，不接核心评分主链；如需扩展到页面或评标增强入口，应单独小范围设计、验证和回滚。
