@@ -108,3 +108,6 @@ qingtian_report_word.txt
 
 # Local virtualenv backups
 .venv.bak-*/
+
+# Local agent audit logs
+/data/agent_audit_log.jsonl
