@@ -60,8 +60,12 @@ class TestIndexEndpoint:
         assert 'id="btnMaterialKnowledgeProfileDownload"' in response.text
         assert 'id="btnEvolutionHealth"' in response.text
         assert 'id="btnOllamaPreview"' in response.text
+        assert 'id="btnOllamaPreviewCopy"' in response.text
+        assert 'id="btnOllamaPreviewExport"' in response.text
         assert 'id="ollamaPreviewResult"' in response.text
         assert "Ollama 增强预览" in response.text
+        assert "复制预览结果" in response.text
+        assert "导出 JSON" in response.text
         assert "/evolve/ollama_preview" in response.text
         assert 'id="btnEvidenceTrace"' in response.text
         assert 'id="btnScoringBasis"' in response.text
@@ -169,6 +173,23 @@ class TestIndexEndpoint:
             "btnRefreshGroundTruthSubmissionOptions",
         ):
             assert f"safeClick('{button_id}'" in page
+
+    def test_index_frontend_has_ollama_preview_export_actions(self, client):
+        """Ollama preview result actions should be client-side and preview-only."""
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert "safeClick('btnOllamaPreviewCopy'" in page
+        assert "safeClick('btnOllamaPreviewExport'" in page
+        assert "function formatOllamaPreviewPlainText" in page
+        assert "function downloadOllamaPreviewJson" in page
+        assert "navigator.clipboard.writeText" in page
+        assert "new Blob([JSON.stringify(data || {}, null, 2)]" in page
+        assert "enhanced_by" in page
+        assert "fallback" in page
+        assert "error_summary" in page
+        assert "更新时间" in page
+        assert "仅预览，不写入正式学习进化结果。" in page
 
     def test_index_frontend_section_5_6_7_actions_have_explicit_project_guard(self, client):
         """Section 5/6/7 action handlers should proactively show project-selection errors instead of silent failure."""
