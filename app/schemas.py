@@ -66,10 +66,14 @@ class ConfigStatusResponse(BaseModel):
 class LLMBackendStatus(BaseModel):
     """进化 LLM 后端配置状态（不暴露密钥）"""
 
-    evolution_backend: str = Field(..., description="当前进化后端：rules | spark | openai | gemini")
+    evolution_backend: str = Field(
+        ...,
+        description="当前进化后端：rules | spark | openai | gemini | ollama",
+    )
     spark_configured: bool = Field(..., description="是否已配置 SPARK_APIPASSWORD")
     openai_configured: bool = Field(..., description="是否已配置 OPENAI_API_KEY")
     gemini_configured: bool = Field(..., description="是否已配置 GEMINI_API_KEY")
+    ollama_configured: bool = Field(..., description="是否已配置 OLLAMA_MODEL")
 
 
 class ConfigReloadResponse(BaseModel):
@@ -1020,8 +1024,22 @@ class EvolutionReport(BaseModel):
     )
     enhanced_by: Optional[str] = Field(
         None,
-        description="若由 LLM 增强则标识后端：spark | openai | gemini；仅规则时为 None",
+        description="若由 LLM 增强则标识后端：spark | openai | gemini | ollama；仅规则时为 None",
     )
+
+
+class OllamaEvolutionPreviewResponse(BaseModel):
+    """手动 Ollama 增强预览响应；仅用于人工复核，不持久化为正式进化报告。"""
+
+    project_id: str
+    enhanced_by: Optional[str] = Field(
+        None,
+        description="成功增强时为 ollama；fallback 时为 None",
+    )
+    fallback: bool = Field(..., description="是否已回退到规则版报告预览")
+    fallback_reason: Optional[str] = Field(None, description="回退原因")
+    error_summary: Optional[str] = Field(None, description="Ollama 调用失败摘要")
+    preview: Dict[str, Any] = Field(..., description="不会持久化的进化报告预览内容")
 
 
 class CompilationInstructions(BaseModel):
