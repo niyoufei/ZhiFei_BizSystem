@@ -494,6 +494,34 @@ def _build_penalty_before_after_example(
     )
 
 
+def _extract_before_after_text(before_after_example: str) -> Tuple[str, str]:
+    original_text = ""
+    replacement_text = ""
+    for raw_line in _safe_str(before_after_example).splitlines():
+        line = raw_line.strip()
+        if line.startswith("改写前（摘录）："):
+            original_text = line.split("：", 1)[1].strip()
+        elif line.startswith("改写后（示例）："):
+            replacement_text = line.split("：", 1)[1].strip()
+    return original_text, replacement_text
+
+
+def _attach_direct_apply_fields(recommendation: Dict[str, Any]) -> None:
+    extracted_original, replacement_text = _extract_before_after_text(
+        _safe_str(recommendation.get("before_after_example"))
+    )
+    original_text = extracted_original or _safe_str(recommendation.get("evidence"))
+    insertion_content = ""
+    insertion_guidance = _safe_str(recommendation.get("rewrite_instruction"))
+    direct_apply_text = replacement_text or insertion_content
+
+    recommendation["original_text"] = original_text
+    recommendation["replacement_text"] = replacement_text
+    recommendation["insertion_content"] = insertion_content
+    recommendation["insertion_guidance"] = insertion_guidance
+    recommendation["direct_apply_text"] = direct_apply_text
+
+
 _DIM_PAGE_KEYWORDS = {
     "01": ["工程概况", "项目整体", "实施路径"],
     "02": ["安全生产", "安全管理", "隐患排查"],
@@ -956,6 +984,7 @@ def _build_submission_optimization_cards(
             reverse=True,
         )
         for idx, r in enumerate(recommendations, start=1):
+            _attach_direct_apply_fields(r)
             if idx <= 4:
                 level = "P1"
             elif idx <= 8:

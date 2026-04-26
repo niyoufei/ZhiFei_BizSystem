@@ -320,6 +320,18 @@ def test_compare_optimization_card_contains_executable_steps():
     assert any("前文" in str(r.get("evidence_context") or "") for r in recs)
     assert any("执行清单" in str(r.get("execution_checklist") or "") for r in recs)
     assert any(str(r.get("priority_reason") or "").strip() for r in recs)
+    for rec in recs:
+        assert "original_text" in rec
+        assert "replacement_text" in rec
+        assert "insertion_content" in rec
+        assert "insertion_guidance" in rec
+        assert "direct_apply_text" in rec
+        assert rec.get("original_text") != rec.get("issue")
+        assert rec.get("direct_apply_text") != rec.get("issue")
+        assert rec.get("direct_apply_text") != rec.get("insertion_guidance")
+    replacement_recs = [r for r in recs if str(r.get("replacement_text") or "").strip()]
+    assert replacement_recs
+    assert any(r.get("direct_apply_text") == r.get("replacement_text") for r in replacement_recs)
 
 
 def test_compare_dimension_diagnostics_contains_weak_filenames():

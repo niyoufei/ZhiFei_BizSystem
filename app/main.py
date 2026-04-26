@@ -18932,7 +18932,7 @@ def index(
               html += '<strong>逐文件优化清单（你要的直接执行版）</strong>' +
                 data.submission_optimization_cards.map(card => {
                   const rows = Array.isArray(card.recommendations) ? card.recommendations : [];
-                  const table = '<table><tr><th>优先级</th><th>类别</th><th>建议章节</th><th>定位页码</th><th>预计提分</th><th>优先理由</th><th>问题</th><th>证据片段</th><th>证据窗口（前后文）</th><th>改写前后示例</th><th>建议改写（直接执行）</th><th>验收标准</th><th>执行检查表</th></tr>' +
+                  const table = '<table><tr><th>优先级</th><th>类别</th><th>建议章节</th><th>定位页码</th><th>预计提分</th><th>优先理由</th><th>问题</th><th>原文内容</th><th>直接替换文本 / 原位补充内容</th><th>证据片段</th><th>证据窗口（前后文）</th><th>改写前后示例</th><th>改写指导</th><th>验收标准</th><th>执行检查表</th></tr>' +
                     rows.map(r => '<tr>' +
                       '<td>' + esc(r.priority || '') + '</td>' +
                       '<td>' + esc(r.category || '') + '</td>' +
@@ -18941,10 +18941,12 @@ def index(
                       '<td>' + esc(r.target_delta_reduction == null ? '' : r.target_delta_reduction) + '</td>' +
                       '<td>' + escMultiline(r.priority_reason || '') + '</td>' +
                       '<td>' + escMultiline(r.issue || '') + '</td>' +
+                      '<td>' + escMultiline(r.original_text || r.evidence || '') + '</td>' +
+                      '<td>' + escMultiline(r.direct_apply_text || r.replacement_text || r.insertion_content || '') + '</td>' +
                       '<td>' + escMultiline(r.evidence || '') + '</td>' +
                       '<td><span style="font-size:12px;color:#334155">' + escMultiline(r.evidence_context || '') + '</span></td>' +
                       '<td><details><summary>展开</summary><span style="font-size:12px;color:#0f172a">' + escMultiline(r.before_after_example || '') + '</span></details></td>' +
-                      '<td><details open><summary>执行步骤</summary>' + escMultiline(r.rewrite_instruction || '') + '</details></td>' +
+                      '<td><details open><summary>怎么改</summary>' + escMultiline(r.insertion_guidance || r.rewrite_instruction || '') + '</details></td>' +
                       '<td><details><summary>验收标准</summary>' + escMultiline(r.acceptance_check || '') + '</details></td>' +
                       '<td><details><summary>检查表</summary>' + escMultiline(r.execution_checklist || '') + '</details></td>' +
                     '</tr>').join('') + '</table>';
