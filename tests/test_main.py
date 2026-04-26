@@ -4713,6 +4713,141 @@ class TestEvolutionTotalScale:
         assert len(hash_value) == 16  # 截断为 16 字符
 
 
+class TestOllamaEvolutionPreviewEndpoint:
+    """Tests for manual Ollama evolution preview API."""
+
+    def _rule_report(self):
+        return {
+            "project_id": "p1",
+            "high_score_logic": ["规则高分逻辑"],
+            "writing_guidance": ["规则编制建议"],
+            "sample_count": 1,
+            "updated_at": "2026-04-26T00:00:00Z",
+            "scoring_evolution": {"dimension_multipliers": {"01": 1.1}},
+        }
+
+    def _ground_truth_records(self):
+        return [
+            {
+                "id": "gt1",
+                "project_id": "p1",
+                "shigong_text": "施工组织设计文本",
+                "judge_scores": [90, 91, 92, 93, 94],
+                "final_score": 92.0,
+                "score_scale_max": 100,
+            }
+        ]
+
+    def test_ollama_preview_success_returns_preview_without_saving(self, client):
+        rule_report = self._rule_report()
+        preview_result = {
+            "project_id": "p1",
+            "enhanced_by": "ollama",
+            "fallback": False,
+            "fallback_reason": None,
+            "error_summary": None,
+            "preview": {
+                **rule_report,
+                "high_score_logic": ["Ollama 高分逻辑"],
+                "writing_guidance": ["Ollama 编制建议"],
+                "enhanced_by": "ollama",
+            },
+        }
+
+        with (
+            patch.dict(os.environ, {"API_KEYS": ""}, clear=False),
+            patch("app.main.ensure_data_dirs"),
+            patch("app.main.load_projects", return_value=[{"id": "p1", "meta": {}}]),
+            patch("app.main.load_ground_truth", return_value=self._ground_truth_records()),
+            patch("app.main.load_project_context", return_value={"p1": {"text": "项目上下文"}}),
+            patch("app.main._merge_materials_text", return_value="资料文本"),
+            patch("app.main.build_evolution_report", return_value=rule_report) as build_report,
+            patch(
+                "app.main.preview_evolution_report_with_ollama",
+                return_value=preview_result,
+            ) as preview_ollama,
+            patch("app.main.load_evolution_reports") as load_reports,
+            patch("app.main.save_evolution_reports") as save_reports,
+        ):
+            response = client.post("/api/v1/projects/p1/evolve/ollama_preview")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["enhanced_by"] == "ollama"
+        assert data["fallback"] is False
+        assert data["preview"]["high_score_logic"] == ["Ollama 高分逻辑"]
+        assert data["preview"]["enhanced_by"] == "ollama"
+        build_report.assert_called_once()
+        preview_ollama.assert_called_once()
+        assert preview_ollama.call_args.args[3] == "项目上下文\n\n资料文本"
+        load_reports.assert_not_called()
+        save_reports.assert_not_called()
+
+    def test_ollama_preview_failure_returns_fallback_without_saving(self, client):
+        rule_report = self._rule_report()
+        preview_result = {
+            "project_id": "p1",
+            "enhanced_by": None,
+            "fallback": True,
+            "fallback_reason": "ollama_unavailable_or_failed",
+            "error_summary": "Ollama enhancement returned no result",
+            "preview": rule_report,
+        }
+
+        with (
+            patch.dict(os.environ, {"API_KEYS": ""}, clear=False),
+            patch("app.main.ensure_data_dirs"),
+            patch("app.main.load_projects", return_value=[{"id": "p1", "meta": {}}]),
+            patch("app.main.load_ground_truth", return_value=self._ground_truth_records()),
+            patch("app.main.load_project_context", return_value={"p1": {"text": ""}}),
+            patch("app.main._merge_materials_text", return_value=""),
+            patch("app.main.build_evolution_report", return_value=rule_report),
+            patch(
+                "app.main.preview_evolution_report_with_ollama",
+                return_value=preview_result,
+            ),
+            patch("app.main.load_evolution_reports") as load_reports,
+            patch("app.main.save_evolution_reports") as save_reports,
+        ):
+            response = client.post("/api/v1/projects/p1/evolve/ollama_preview")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["enhanced_by"] is None
+        assert data["fallback"] is True
+        assert data["fallback_reason"] == "ollama_unavailable_or_failed"
+        assert data["error_summary"] == "Ollama enhancement returned no result"
+        assert data["preview"]["high_score_logic"] == ["规则高分逻辑"]
+        load_reports.assert_not_called()
+        save_reports.assert_not_called()
+
+    def test_default_evolve_still_saves_rules_report_without_preview(self, client):
+        rule_report = self._rule_report()
+
+        with (
+            patch.dict(os.environ, {"API_KEYS": ""}, clear=False),
+            patch("app.main.ensure_data_dirs"),
+            patch("app.main.load_projects", return_value=[{"id": "p1", "meta": {}}]),
+            patch("app.main.load_ground_truth", return_value=self._ground_truth_records()),
+            patch("app.main.load_project_context", return_value={"p1": {"text": ""}}),
+            patch("app.main._merge_materials_text", return_value=""),
+            patch("app.main.build_evolution_report", return_value=rule_report),
+            patch("app.main.enhance_evolution_report_with_llm", return_value=None),
+            patch("app.main.preview_evolution_report_with_ollama") as preview_ollama,
+            patch("app.main.load_evolution_reports", return_value={}) as load_reports,
+            patch("app.main.save_evolution_reports") as save_reports,
+        ):
+            response = client.post("/api/v1/projects/p1/evolve")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["enhanced_by"] is None
+        assert data["high_score_logic"] == ["规则高分逻辑"]
+        preview_ollama.assert_not_called()
+        load_reports.assert_called_once()
+        save_reports.assert_called_once_with({"p1": rule_report})
+
+
 class TestPdfFallbackParser:
     @patch("app.main.pymupdf", None)
     @patch("app.main.PdfReader")

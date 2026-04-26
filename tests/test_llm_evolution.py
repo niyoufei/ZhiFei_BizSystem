@@ -11,6 +11,7 @@ from app.engine.llm_evolution import (
     enhance_evolution_report_with_llm,
     get_evolution_llm_backend,
     get_llm_backend_status,
+    preview_evolution_report_with_ollama,
 )
 
 
@@ -192,6 +193,77 @@ class TestEnhanceEvolutionReportWithLlm:
 
         assert out == expected
         assert enhance.call_count == 2
+
+
+class TestPreviewEvolutionReportWithOllama:
+    def test_preview_ollama_success_keeps_rules_only_fields(self):
+        report = {
+            "project_id": "p1",
+            "high_score_logic": ["rule high"],
+            "writing_guidance": ["rule guide"],
+            "sample_count": 1,
+            "updated_at": "2020-01-01T00:00:00Z",
+            "scoring_evolution": {"dimension_multipliers": {"01": 1.1}},
+            "compilation_instructions": {"required_sections": ["施工部署"]},
+        }
+        enhanced = {
+            "project_id": "p1",
+            "high_score_logic": ["ollama high"],
+            "writing_guidance": ["ollama guide"],
+            "sample_count": 1,
+            "updated_at": "2020-01-02T00:00:00Z",
+            "enhanced_by": "ollama",
+        }
+
+        with patch("app.engine.llm_evolution._enhance_with_ollama", return_value=enhanced):
+            out = preview_evolution_report_with_ollama("p1", report, [], "ctx")
+
+        assert out["project_id"] == "p1"
+        assert out["enhanced_by"] == "ollama"
+        assert out["fallback"] is False
+        assert out["error_summary"] is None
+        assert out["preview"]["high_score_logic"] == ["ollama high"]
+        assert out["preview"]["writing_guidance"] == ["ollama guide"]
+        assert out["preview"]["scoring_evolution"] == {"dimension_multipliers": {"01": 1.1}}
+        assert out["preview"]["compilation_instructions"] == {"required_sections": ["施工部署"]}
+
+    def test_preview_ollama_failure_returns_rules_preview(self):
+        report = {
+            "project_id": "p1",
+            "high_score_logic": ["rule high"],
+            "writing_guidance": ["rule guide"],
+            "sample_count": 1,
+            "updated_at": "2020-01-01T00:00:00Z",
+        }
+
+        with patch("app.engine.llm_evolution._enhance_with_ollama", return_value=None):
+            out = preview_evolution_report_with_ollama("p1", report, [], "ctx")
+
+        assert out["project_id"] == "p1"
+        assert out["enhanced_by"] is None
+        assert out["fallback"] is True
+        assert out["fallback_reason"] == "ollama_unavailable_or_failed"
+        assert out["error_summary"]
+        assert out["preview"] == report
+
+    def test_preview_ollama_exception_returns_error_summary(self):
+        report = {
+            "project_id": "p1",
+            "high_score_logic": ["rule high"],
+            "writing_guidance": ["rule guide"],
+            "sample_count": 1,
+            "updated_at": "2020-01-01T00:00:00Z",
+        }
+
+        with patch(
+            "app.engine.llm_evolution._enhance_with_ollama",
+            side_effect=RuntimeError("boom"),
+        ):
+            out = preview_evolution_report_with_ollama("p1", report, [], "ctx")
+
+        assert out["fallback"] is True
+        assert out["error_summary"] == "RuntimeError: boom"
+        assert out["preview"] == report
 
 
 class TestLlmEvolutionSparkModule:

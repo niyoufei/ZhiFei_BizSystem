@@ -67,6 +67,54 @@ def enhance_evolution_report_with_llm(
     return result
 
 
+def preview_evolution_report_with_ollama(
+    project_id: str,
+    report: Dict[str, Any],
+    ground_truth_records: List[Dict[str, Any]],
+    project_context: str = "",
+) -> Dict[str, Any]:
+    """
+    手动触发 Ollama 增强预览，不依赖 EVOLUTION_LLM_BACKEND，也不持久化结果。
+    调用失败时返回规则版报告预览与 fallback 信息，调用方可安全展示给人工复核。
+    """
+    error_summary = ""
+    try:
+        enhanced = _enhance_with_ollama(project_id, report, ground_truth_records, project_context)
+    except Exception as exc:
+        enhanced = None
+        error_summary = f"{type(exc).__name__}: {exc}"
+
+    preview = dict(report)
+    preview.setdefault("project_id", project_id)
+    if enhanced is None:
+        return {
+            "project_id": project_id,
+            "enhanced_by": None,
+            "fallback": True,
+            "fallback_reason": "ollama_unavailable_or_failed",
+            "error_summary": error_summary or "Ollama enhancement returned no result",
+            "preview": preview,
+        }
+
+    preview["high_score_logic"] = enhanced.get(
+        "high_score_logic", preview.get("high_score_logic", [])
+    )
+    preview["writing_guidance"] = enhanced.get(
+        "writing_guidance", preview.get("writing_guidance", [])
+    )
+    preview["sample_count"] = enhanced.get("sample_count", preview.get("sample_count", 0))
+    preview["updated_at"] = enhanced.get("updated_at", preview.get("updated_at"))
+    preview["enhanced_by"] = enhanced.get("enhanced_by") or "ollama"
+    return {
+        "project_id": project_id,
+        "enhanced_by": preview["enhanced_by"],
+        "fallback": False,
+        "fallback_reason": None,
+        "error_summary": None,
+        "preview": preview,
+    }
+
+
 def _enhance_with_spark(
     project_id: str,
     report: Dict[str, Any],

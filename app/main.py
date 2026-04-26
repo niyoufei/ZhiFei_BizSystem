@@ -112,7 +112,11 @@ from app.engine.history import (
 )
 from app.engine.insights import build_project_insights
 from app.engine.learning import build_learning_profile
-from app.engine.llm_evolution import enhance_evolution_report_with_llm, get_llm_backend_status
+from app.engine.llm_evolution import (
+    enhance_evolution_report_with_llm,
+    get_llm_backend_status,
+    preview_evolution_report_with_ollama,
+)
 from app.engine.reflection import (
     build_calibration_samples,
     build_delta_cases,
@@ -173,6 +177,7 @@ from app.schemas import (
     MaterialKnowledgeProfileMarkdownResponse,
     MaterialKnowledgeProfileResponse,
     MaterialRecord,
+    OllamaEvolutionPreviewResponse,
     PatchDeploymentRecord,
     PatchDeployRequest,
     PatchMineRequest,
@@ -6453,6 +6458,7 @@ def llm_status() -> LLMBackendStatus:
         spark_configured=s["spark_configured"],
         openai_configured=s["openai_configured"],
         gemini_configured=s["gemini_configured"],
+        ollama_configured=s["ollama_configured"],
     )
 
 
@@ -13200,6 +13206,47 @@ def evolve_project(
     reports[project_id] = report
     save_evolution_reports(reports)
     return EvolutionReport(**report)
+
+
+@router.post(
+    "/projects/{project_id}/evolve/ollama_preview",
+    response_model=OllamaEvolutionPreviewResponse,
+    tags=["自我学习与进化"],
+    responses={**RESPONSES_401, **RESPONSES_404},
+)
+def preview_project_evolution_with_ollama(
+    project_id: str,
+    api_key: Optional[str] = Depends(verify_api_key),
+    locale: str = Depends(get_locale),
+) -> OllamaEvolutionPreviewResponse:
+    """
+    手动触发 Ollama 增强预览，仅返回临时结果，不写入正式 evolution_reports。
+    规则版报告仍由 build_evolution_report 生成，Ollama 失败时返回 fallback 信息。
+    """
+    ensure_data_dirs()
+    projects = load_projects()
+    project = next((p for p in projects if p["id"] == project_id), None)
+    if project is None:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    project_score_scale = _resolve_project_score_scale_max(project)
+    records_raw = [r for r in load_ground_truth() if r.get("project_id") == project_id]
+    records = [
+        _ground_truth_record_for_learning(
+            r if isinstance(r, dict) else {},
+            default_score_scale_max=project_score_scale,
+        )
+        for r in records_raw
+    ]
+    ctx_data = load_project_context().get(project_id) or {}
+    project_context = (ctx_data.get("text") or "").strip()
+    materials_text = _merge_materials_text(project_id)
+    if materials_text:
+        project_context = (
+            (project_context + "\n\n" + materials_text) if project_context else materials_text
+        )
+    report = build_evolution_report(project_id, records, project_context)
+    preview = preview_evolution_report_with_ollama(project_id, report, records, project_context)
+    return OllamaEvolutionPreviewResponse(**preview)
 
 
 @router.get(
