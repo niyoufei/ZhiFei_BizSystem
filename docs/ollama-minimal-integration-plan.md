@@ -72,6 +72,16 @@
 3. **文档 PR**：补充 `.env.example`、README、产品说明和故障排查。
 4. **可选体验 PR**：在 Web/UI 中展示本地模型增强状态，但不改变现有评分入口。
 
+## 真实 Ollama 验证记录
+
+已在本机 Ollama 服务上完成轻量模型验证：
+
+- 验证模型：`qwen3:0.6b`
+- 客户端调用结果：`client_ok=True`，返回内容非空
+- 进化后端结果：`backend_enhanced_by=ollama`
+- 失败模型验证：`OLLAMA_MODEL=not-exist-model` 时不会崩溃，可返回失败状态并安全回退到规则版结果
+- 验证范围：未修改评分主流程、未写数据库、未写 `.env`
+
 ## 验收标准
 
 后续实现完成前，至少满足：
