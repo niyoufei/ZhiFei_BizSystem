@@ -14514,6 +14514,7 @@ def index(
             btnRefreshGroundTruth: { resultId: 'evolveResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/ground_truth', loading: '真实评标列表刷新中...' },
             btnRefreshGroundTruthSubmissionOptions: { resultId: 'evolveResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/submissions', loading: '施组选项刷新中...' },
             btnEvolve: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/evolve', loading: '学习进化执行中...' },
+            btnOllamaPreview: { resultId: 'ollamaPreviewResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/evolve/ollama_preview', loading: 'Ollama 增强预览生成中...' },
             btnEvolutionHealth: { resultId: 'evolutionHealthResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/evolution/health', loading: '进化健康度分析中...' },
             btnWritingGuidance: { resultId: 'guidanceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/writing_guidance', loading: '正在生成编制指导...' },
             btnCompilationInstructions: { resultId: 'compilationInstructionsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compilation_instructions', loading: '正在生成编制系统指令...' },
@@ -14767,6 +14768,23 @@ def index(
                   ? '<ul style="margin:6px 0 0 18px;color:#92400e">' + recs.slice(0, 6).map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>'
                   : '');
               setResultHtml(cfg.resultId, html);
+              return true;
+            }
+            if (actionId === 'btnOllamaPreview') {
+              const preview = (data && typeof data.preview === 'object') ? data.preview : {};
+              const logic = Array.isArray(preview.high_score_logic) ? preview.high_score_logic : [];
+              const guidance = Array.isArray(preview.writing_guidance) ? preview.writing_guidance : [];
+              const html = ''
+                + '<strong>Ollama 增强预览</strong>'
+                + '<p style="margin:6px 0">状态：'
+                + (data && data.fallback ? '<span class="error">已回退</span>' : '<span class="success">增强成功</span>')
+                + '；增强后端：' + esc((data && data.enhanced_by) || 'rules')
+                + '</p>'
+                + (data && data.error_summary ? '<p class="error">' + esc(data.error_summary) + '</p>' : '')
+                + (logic.length ? '<strong>高分逻辑预览</strong><ul>' + logic.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>' : '')
+                + (guidance.length ? '<strong>编制指导预览</strong><ul>' + guidance.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>' : '')
+                + '<p style="font-size:12px;color:#64748b;margin-top:8px">仅预览，不写入正式学习进化结果。</p>';
+              setResultHtml(cfg.resultId, html || '<pre>' + esc(text || '{}') + '</pre>');
               return true;
             }
             setResultHtml(cfg.resultId, '<pre>' + esc(text || '{}') + '</pre>');
@@ -15045,6 +15063,7 @@ def index(
         </div>
         <div class="action-row" style="margin-bottom:10px">
           <button type="button" id="btnEvolve" onclick="return window.__zhifeiFallbackClick(event, 'btnEvolve')">学习进化（根据已录入真实评标生成高分逻辑与编制指导）</button>
+          <button type="button" id="btnOllamaPreview" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnOllamaPreview')">Ollama 增强预览</button>
           <button type="button" id="btnEvolutionHealth" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnEvolutionHealth')">进化健康度</button>
           <button type="button" id="btnWritingGuidance" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnWritingGuidance')">查看编制指导</button>
           <button type="button" id="btnCompilationInstructions" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnCompilationInstructions')">编制系统指令（可导出为编制约束）</button>
@@ -15079,6 +15098,7 @@ def index(
           </div>
         </details>
         <div id="evolveResult" class="result-block" style="display:none"></div>
+        <div id="ollamaPreviewResult" class="result-block" style="display:none"></div>
         <div id="evolutionHealthResult" class="result-block" style="display:none"></div>
         <div id="compilationInstructionsResult" class="result-block" style="display:none"></div>
         <div id="guidanceResult" class="result-block" style="display:none"></div>
@@ -15132,6 +15152,7 @@ def index(
             btnUploadFeed: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/materials', loading: '投喂包上传中...' },
             btnAddGroundTruth: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/ground_truth/from_submission', loading: '真实评标录入中...' },
             btnEvolve: { resultId: 'evolveResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/evolve', loading: '学习进化执行中...' },
+            btnOllamaPreview: { resultId: 'ollamaPreviewResult', method: 'POST', path: (pid) => '/api/v1/projects/' + pid + '/evolve/ollama_preview', loading: 'Ollama 增强预览生成中...' },
             btnEvolutionHealth: { resultId: 'evolutionHealthResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/evolution/health', loading: '进化健康度分析中...' },
             btnWritingGuidance: { resultId: 'guidanceResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/writing_guidance', loading: '正在生成编制指导...' },
             btnCompilationInstructions: { resultId: 'compilationInstructionsResult', method: 'GET', path: (pid) => '/api/v1/projects/' + pid + '/compilation_instructions', loading: '正在生成编制系统指令...' },
@@ -16275,7 +16296,7 @@ def index(
           'deleteCurrentProject', 'btnWeightsReset', 'btnWeightsSave', 'btnWeightsApply',
           'btnMaterialDepthReport', 'btnMaterialDepthReportDownload', 'btnMaterialKnowledgeProfile', 'btnMaterialKnowledgeProfileDownload',
           'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
-          'btnEvolve', 'btnEvolutionHealth', 'btnWritingGuidance', 'btnCompilationInstructions',
+          'btnEvolve', 'btnOllamaPreview', 'btnEvolutionHealth', 'btnWritingGuidance', 'btnCompilationInstructions',
           'btnRebuildDelta', 'btnRebuildSamples', 'btnTrainCalibratorV2', 'btnApplyCalibPredict',
           'btnAutoRunReflection', 'btnEvalMetricsV2', 'btnEvalSummaryV2',
           'btnMinePatchV2', 'btnShadowPatchV2', 'btnDeployPatchV2', 'btnRollbackPatchV2',
@@ -16286,7 +16307,7 @@ def index(
           'btnEvidenceTrace', 'btnScoringBasis',
           'btnAdaptive', 'btnAdaptivePatch', 'btnAdaptiveValidate', 'btnAdaptiveApply',
           'btnRefreshGroundTruth', 'btnRefreshGroundTruthSubmissionOptions', 'btnUploadFeed', 'btnRefreshFeedMaterials', 'btnAddGroundTruth',
-          'btnEvolve', 'btnEvolutionHealth', 'btnWritingGuidance', 'btnCompilationInstructions',
+          'btnEvolve', 'btnOllamaPreview', 'btnEvolutionHealth', 'btnWritingGuidance', 'btnCompilationInstructions',
           'btnRebuildDelta', 'btnRebuildSamples', 'btnTrainCalibratorV2', 'btnApplyCalibPredict',
           'btnAutoRunReflection', 'btnEvalMetricsV2', 'btnEvalSummaryV2',
           'btnMinePatchV2', 'btnShadowPatchV2', 'btnDeployPatchV2', 'btnRollbackPatchV2',
@@ -16416,7 +16437,7 @@ def index(
             'compareResult', 'compareReportResult', 'insightsResult', 'learningResult',
             'evidenceTraceResult', 'scoringBasisResult',
             'adaptiveResult', 'adaptivePatchResult', 'adaptiveValidateResult', 'adaptiveApplyResult',
-            'evolveResult', 'guidanceResult', 'compilationInstructionsResult',
+            'evolveResult', 'ollamaPreviewResult', 'guidanceResult', 'compilationInstructionsResult',
             'deltaResult', 'sampleResult', 'calibTrainResult', 'patchResult',
             'patchShadowResult', 'patchDeployResult', 'evalResult'
           ].forEach(clearResultBlock);
@@ -18126,6 +18147,34 @@ def index(
             .replace(/\"/g, '&quot;')
             .replace(/'/g, '&#39;');
         }
+        function renderOllamaPreviewHtml(data) {
+          const preview = (data && typeof data.preview === 'object') ? data.preview : {};
+          const logic = Array.isArray(preview.high_score_logic) ? preview.high_score_logic : [];
+          const guidance = Array.isArray(preview.writing_guidance) ? preview.writing_guidance : [];
+          let html = '<strong>Ollama 增强预览</strong>';
+          html += '<p style="margin:6px 0">状态：'
+            + (data && data.fallback ? '<span class="error">已回退</span>' : '<span class="success">增强成功</span>')
+            + '；增强后端：' + escapeHtmlText((data && data.enhanced_by) || 'rules')
+            + '</p>';
+          if (data && data.error_summary) {
+            html += '<p class="error">' + escapeHtmlText(data.error_summary) + '</p>';
+          }
+          if (logic.length) {
+            html += '<strong>高分逻辑预览</strong><ul>'
+              + logic.map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('')
+              + '</ul>';
+          }
+          if (guidance.length) {
+            html += '<strong>编制指导预览</strong><ul>'
+              + guidance.map((x) => '<li>' + escapeHtmlText(x) + '</li>').join('')
+              + '</ul>';
+          }
+          if (!logic.length && !guidance.length) {
+            html += '<p style="color:#64748b">暂无可展示的预览内容。</p>';
+          }
+          html += '<p style="font-size:12px;color:#64748b;margin-top:8px">仅预览，不写入正式学习进化结果。</p>';
+          return html;
+        }
         function materialTypeDisplayName(materialType) {
           const t = String(materialType || '').trim();
           if (t === 'tender_qa') return '招标文件和答疑';
@@ -19233,6 +19282,32 @@ def index(
             html += '<p style="font-size:12px;margin-top:8px">点击「编制系统指令」可查看/导出编制约束（必备章节、图表、禁止表述等）。</p>';
             el.innerHTML = html;
           } else { el.innerHTML = '<span class="error">' + (data.detail || '请求失败，若需认证请设置 API Key') + '</span>'; }
+        });
+        safeClick('btnOllamaPreview', async () => {
+          if (!ensureProjectForAction('ollamaPreviewResult')) return;
+          const projectId = actionProjectId();
+          setResultLoading('ollamaPreviewResult', 'Ollama 增强预览生成中...');
+          let res;
+          let data = {};
+          try {
+            res = await fetch('/api/v1/projects/' + encodeURIComponent(projectId) + '/evolve/ollama_preview', {
+              method: 'POST',
+              headers: apiHeaders(false),
+            });
+            data = await res.json().catch(() => ({}));
+          } catch (err) {
+            setResultError('ollamaPreviewResult', 'Ollama 增强预览失败：' + String((err && err.message) || err || '网络异常'));
+            return;
+          }
+          showJson('output', formatApiOutput(res, data, 'Ollama 增强预览失败'));
+          const el = document.getElementById('ollamaPreviewResult');
+          if (!el) return;
+          el.style.display = 'block';
+          if (res.ok) {
+            el.innerHTML = renderOllamaPreviewHtml(data);
+          } else {
+            el.innerHTML = '<span class="error">' + escapeHtmlText(data.detail || 'Ollama 增强预览失败') + '</span>';
+          }
         });
         safeClick('btnEvolutionHealth', async () => {
           if (!ensureProjectForAction('evolutionHealthResult')) return;

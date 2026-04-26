@@ -80,4 +80,4 @@ POST /api/v1/projects/{project_id}/evolve/ollama_preview
 
 该接口仅用于人工触发的 Ollama 增强预览，不写入正式 `evolution_reports`，不改变核心评分主链，也不修改正式评分分数、扣分逻辑或评分规则。
 
-如下一阶段需要在页面中增加“手动 Ollama 预览”按钮，应单独创建小 PR，只接前端按钮与该预览 API，不接核心评分主链。
+页面中的“自我学习与进化”区域可单独提供“手动 Ollama 预览”按钮，只调用该预览 API 并展示临时结果；该按钮仍不接核心评分主链，也不保存正式进化报告。

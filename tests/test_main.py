@@ -59,6 +59,10 @@ class TestIndexEndpoint:
         assert 'id="btnMaterialKnowledgeProfile"' in response.text
         assert 'id="btnMaterialKnowledgeProfileDownload"' in response.text
         assert 'id="btnEvolutionHealth"' in response.text
+        assert 'id="btnOllamaPreview"' in response.text
+        assert 'id="ollamaPreviewResult"' in response.text
+        assert "Ollama 增强预览" in response.text
+        assert "/evolve/ollama_preview" in response.text
         assert 'id="btnEvidenceTrace"' in response.text
         assert 'id="btnScoringBasis"' in response.text
         assert 'id="scoringBasisResult"' in response.text
