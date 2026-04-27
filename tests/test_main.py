@@ -210,10 +210,34 @@ class TestIndexEndpoint:
         response = client.get("/")
         assert response.status_code == 200
         page = response.text
+        assert "复制优化清单" in page
+        assert "导出优化清单 JSON" in page
+        assert "let latestCompareReportPayload = null" in page
+        assert "let latestCompareReportProjectId = ''" in page
+        assert "safeClick('btnCompareReportCopy'" in page
+        assert "safeClick('btnCompareReportExport'" in page
+        assert "function resetCompareReportActions" in page
+        assert "function storeCompareReportPayload" in page
+        assert "storeCompareReportPayload(projectId, data)" in page
+        assert "function formatCompareReportOptimizationPlainText" in page
+        assert "function downloadCompareReportJson" in page
+        assert "请先生成对比报告。" in page
         assert "原文内容" in page
         assert "直接替换文本 / 原位补充内容" in page
+        assert "original_text" in page
+        assert "direct_apply_text" in page
+        assert "replacement_text" in page
+        assert "insertion_content" in page
+        assert "insertion_guidance" in page
+        assert "acceptance_check" in page
+        assert "execution_checklist" in page
         assert "r.original_text || r.evidence || ''" in page
         assert "r.direct_apply_text || r.replacement_text || r.insertion_content || ''" in page
+        assert "formatCompareReportOptimizationPlainText(latestCompareReportPayload)" in page
+        assert (
+            "downloadCompareReportJson(latestCompareReportProjectId, latestCompareReportPayload)"
+            in page
+        )
         assert "r.original_text || r.issue" not in page
         assert "r.direct_apply_text || r.insertion_guidance" not in page
         assert "r.direct_apply_text || r.rewrite_instruction" not in page

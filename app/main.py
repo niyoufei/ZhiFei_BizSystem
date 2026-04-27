@@ -14975,6 +14975,9 @@ def index(
         <div class="action-row">
           <button type="button" id="btnCompare" onclick="return window.__zhifeiFallbackClick(event, 'btnCompare')">对比排名</button>
           <button type="button" id="btnCompareReport" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnCompareReport')">对比报告（叙述）</button>
+          <button type="button" id="btnCompareReportCopy" class="secondary" disabled>复制优化清单</button>
+          <button type="button" id="btnCompareReportExport" class="secondary" disabled>导出优化清单 JSON</button>
+          <span id="compareReportActionStatus" class="note">生成对比报告后可复制或导出优化清单。</span>
           <button type="button" id="btnInsights" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnInsights')">洞察</button>
           <button type="button" id="btnLearning" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnLearning')">生成学习画像</button>
           <button type="button" id="btnEvidenceTrace" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnEvidenceTrace')">证据追溯（最新施组）</button>
@@ -16303,6 +16306,8 @@ def index(
         let expertProfileLocked = false;
         let projectMetaById = {};
         let scoringReadinessState = { project_id: '', ready: false, gate_passed: false, issues: [] };
+        let latestCompareReportPayload = null;
+        let latestCompareReportProjectId = '';
         let latestOllamaPreviewPayload = null;
         let latestOllamaPreviewProjectId = '';
         const PROJECT_REQUIRED_BUTTON_IDS = [
@@ -18161,6 +18166,100 @@ def index(
             .replace(/\"/g, '&quot;')
             .replace(/'/g, '&#39;');
         }
+        function setCompareReportActionStatus(text, isError=false) {
+          const el = document.getElementById('compareReportActionStatus');
+          if (!el) return;
+          el.textContent = text || '';
+          el.style.color = isError ? '#b91c1c' : '#64748b';
+        }
+        function setCompareReportActionButtons(enabled) {
+          ['btnCompareReportCopy', 'btnCompareReportExport'].forEach((id) => {
+            const btn = document.getElementById(id);
+            if (!btn) return;
+            btn.disabled = !enabled;
+            btn.title = enabled ? '' : '请先生成对比报告';
+          });
+        }
+        function resetCompareReportActions() {
+          latestCompareReportPayload = null;
+          latestCompareReportProjectId = '';
+          setCompareReportActionButtons(false);
+          setCompareReportActionStatus('生成对比报告后可复制或导出优化清单。', false);
+        }
+        function storeCompareReportPayload(projectId, data) {
+          latestCompareReportProjectId = String(projectId || '');
+          latestCompareReportPayload = (data && typeof data === 'object') ? data : null;
+          setCompareReportActionButtons(!!latestCompareReportPayload);
+          setCompareReportActionStatus(
+            latestCompareReportPayload ? '对比报告已生成，可复制或导出优化清单。' : '生成对比报告后可复制或导出优化清单。',
+            false
+          );
+        }
+        function compareReportPlainValue(v) {
+          return String(v == null ? '' : v).trim();
+        }
+        function formatCompareReportOptimizationPlainText(payload) {
+          const data = (payload && typeof payload === 'object') ? payload : {};
+          const cards = Array.isArray(data.submission_optimization_cards) ? data.submission_optimization_cards : [];
+          const lines = ['对比报告优化清单'];
+          if (data.project_id) lines.push('项目ID：' + compareReportPlainValue(data.project_id));
+          if (data.summary) lines.push('摘要：' + compareReportPlainValue(data.summary));
+          lines.push('');
+          if (!cards.length) {
+            lines.push('暂无优化清单。');
+            return lines.join(NL);
+          }
+          cards.forEach((card, cardIndex) => {
+            const filename = compareReportPlainValue(card.filename || ('文件' + String(cardIndex + 1)));
+            const rows = Array.isArray(card.recommendations) ? card.recommendations : [];
+            lines.push('## ' + String(cardIndex + 1) + '. ' + filename);
+            lines.push(
+              '当前分：' + compareReportPlainValue(card.total_score)
+              + '；目标分：' + compareReportPlainValue(card.target_score)
+              + '；差距：' + compareReportPlainValue(card.target_gap)
+            );
+            if (!rows.length) {
+              lines.push('暂无建议。', '');
+              return;
+            }
+            rows.forEach((r, idx) => {
+              const originalText = compareReportPlainValue(r.original_text || r.evidence);
+              const directApplyText = compareReportPlainValue(
+                r.direct_apply_text || r.replacement_text || r.insertion_content
+              );
+              lines.push('');
+              lines.push('### 建议 ' + String(idx + 1));
+              lines.push('建议章节：' + compareReportPlainValue(r.chapter_hint));
+              lines.push('定位页码：' + compareReportPlainValue(r.page_hint || '页码未知'));
+              lines.push('预计提分：' + compareReportPlainValue(r.target_delta_reduction));
+              lines.push('问题：' + compareReportPlainValue(r.issue));
+              lines.push('原文内容：' + originalText);
+              lines.push('直接替换文本 / 原位补充内容：' + directApplyText);
+              lines.push('怎么改：' + compareReportPlainValue(r.insertion_guidance));
+              lines.push('证据片段：' + compareReportPlainValue(r.evidence));
+              lines.push('证据窗口：' + compareReportPlainValue(r.evidence_context));
+              lines.push('验收标准：' + compareReportPlainValue(r.acceptance_check));
+              lines.push('执行检查表：' + compareReportPlainValue(r.execution_checklist));
+            });
+            lines.push('');
+          });
+          return lines.join(NL);
+        }
+        function downloadCompareReportJson(projectId, payload) {
+          const safeProjectId = String(projectId || 'project').replace(/[^a-zA-Z0-9_-]+/g, '_');
+          const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+          const blob = new Blob([JSON.stringify(payload || {}, null, 2)], {
+            type: 'application/json;charset=utf-8',
+          });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'compare-report-' + safeProjectId + '-' + stamp + '.json';
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+        }
         function ollamaPreviewUpdatedAt(data) {
           const preview = (data && typeof data.preview === 'object') ? data.preview : {};
           return String((preview && preview.updated_at) || (data && data.updated_at) || '-');
@@ -18843,6 +18942,8 @@ def index(
 
         safeClick('btnCompareReport', async () => {
           if (!ensureProjectForAction('compareReportResult')) return;
+          resetCompareReportActions();
+          setCompareReportActionStatus('对比报告生成中...', false);
           setResultLoading('compareReportResult', '对比报告生成中...');
           const projectId = actionProjectId();
           const res = await fetch('/api/v1/projects/' + projectId + '/compare_report');
@@ -18853,6 +18954,7 @@ def index(
           document.getElementById('insightsResult').style.display = 'none';
           document.getElementById('learningResult').style.display = 'none';
           if (res.ok) {
+            storeCompareReportPayload(projectId, data);
             const esc = (v) => String(v == null ? '' : v)
               .replace(/&/g, '&amp;')
               .replace(/</g, '&lt;')
@@ -19041,8 +19143,27 @@ def index(
             }
             el.innerHTML = html;
           } else {
+            resetCompareReportActions();
+            setCompareReportActionStatus('请先生成对比报告。', true);
             el.innerHTML = '<span class="error">' + (data.detail || '请求失败') + '</span>';
           }
+        });
+
+        safeClick('btnCompareReportCopy', async () => {
+          if (!latestCompareReportPayload) {
+            setCompareReportActionStatus('请先生成对比报告。', true);
+            return;
+          }
+          await copyTextToClipboard(formatCompareReportOptimizationPlainText(latestCompareReportPayload));
+          setCompareReportActionStatus('优化清单已复制。', false);
+        });
+        safeClick('btnCompareReportExport', async () => {
+          if (!latestCompareReportPayload) {
+            setCompareReportActionStatus('请先生成对比报告。', true);
+            return;
+          }
+          downloadCompareReportJson(latestCompareReportProjectId, latestCompareReportPayload);
+          setCompareReportActionStatus('优化清单 JSON 导出已触发。', false);
         });
 
         safeClick('btnInsights', async () => {
