@@ -222,6 +222,12 @@ class TestIndexEndpoint:
         assert "function formatCompareReportOptimizationPlainText" in page
         assert "function downloadCompareReportJson" in page
         assert "请先生成对比报告。" in page
+        assert "const lines = ['对比报告优化清单'];" in page
+        assert "const appendField = (label, value) =>" in page
+        assert "if (!text) return;" in page
+        assert "appendField('生成时间', new Date().toISOString())" in page
+        assert "appendField('项目ID', data.project_id)" in page
+        assert "appendField('摘要', data.summary)" in page
         assert "原文内容" in page
         assert "直接替换文本 / 原位补充内容" in page
         assert "original_text" in page
@@ -233,11 +239,21 @@ class TestIndexEndpoint:
         assert "execution_checklist" in page
         assert "r.original_text || r.evidence || ''" in page
         assert "r.direct_apply_text || r.replacement_text || r.insertion_content || ''" in page
+        assert "r.direct_apply_text || r.replacement_text || r.insertion_content" in page
+        assert "appendField('建议章节', r.chapter_hint)" in page
+        assert "appendField('预计提分', r.target_delta_reduction)" in page
+        assert "appendField('原文内容', originalText)" in page
+        assert "appendField('直接替换文本 / 原位补充内容', directApplyText)" in page
+        assert "appendField('怎么改', r.insertion_guidance)" in page
+        assert "appendField('验收标准', r.acceptance_check)" in page
+        assert "appendField('执行检查表', r.execution_checklist)" in page
         assert "formatCompareReportOptimizationPlainText(latestCompareReportPayload)" in page
         assert (
             "downloadCompareReportJson(latestCompareReportProjectId, latestCompareReportPayload)"
             in page
         )
+        assert "lines.push('建议章节：'" not in page
+        assert "lines.push('预计提分：'" not in page
         assert "r.original_text || r.issue" not in page
         assert "r.direct_apply_text || r.insertion_guidance" not in page
         assert "r.direct_apply_text || r.rewrite_instruction" not in page
