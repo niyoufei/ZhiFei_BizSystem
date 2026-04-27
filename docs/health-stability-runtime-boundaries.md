@@ -18,7 +18,25 @@
 | ops_agents / watchdog | `scripts/start_ops_agents.sh`、`scripts/stop_ops_agents.sh`、`scripts/ops_agents_status.sh`、`scripts/ops_agents.py`、`app/engine/ops_agents.py` | `start_ops_agents.sh` 会启动守护 | 否 | 可能写 `build/ops_agents_status.json`、`build/ops_agents_status.md`、日志、pid | 运维巡检、守护、状态聚合 | `start_ops_agents.sh` 默认涉及 auto-repair / auto-evolve 风险，需单独授权 |
 | Ollama 真实调用 | Ollama 增强预览、`OLLAMA_BASE_URL`、`OLLAMA_MODEL` | 否 | 是 | 不应写正式报告；真实调用会访问本机 Ollama | 手动预览增强结果 | 真实调用前必须提醒用户先在 2 号窗口运行 `ollama serve`；文档检查、静态检查、mock 测试不需要 `ollama serve` |
 
-## 三、推荐的最小健康回归
+## 三、health / ready / self_check 边界说明
+
+### `/health`
+
+当前实现适合作为最轻量 liveness 检查，只返回服务存活状态。它不触达 `data/`，不写文件，不调用评分主链，不连接 Ollama。
+
+### `/ready`
+
+当前实现属于运行态 readiness 检查，会读取配置，并调用 `ensure_data_dirs`。因此它可能触达或创建 `data/`、`data/materials/` 目录，不应称为纯只读检查，也不用于静态审计。
+
+### `/api/v1/system/self_check` 与 `/api/system/self_check`
+
+两个路径复用同一 self_check 逻辑，属于运行态诊断。当前实现会检查 config、auth、rate limit、PDF/DOCX/OCR/DWG 能力、data hygiene、项目读取能力，会触达 `data/`，并会创建后删除 `selfcheck_*.tmp` 临时文件用于 data 可写性测试。它不应称为纯只读检查，默认不连接 Ollama，也不作为核心评分主链入口。
+
+### 使用边界
+
+文档检查、`git grep`、静态测试不需要启动服务；TestClient / mock 测试不需要启动服务。真实访问 `/ready` 或 self_check 前，应按运行态诊断处理。只有真实 Ollama 调用才需要提醒用户在 2 号窗口运行 `ollama serve`。
+
+## 四、推荐的最小健康回归
 
 以下组合不需要启动服务，不需要 Ollama，但 pytest 可能写 `.pytest_cache/` 或 `__pycache__/`，应放在验证轮执行：
 
@@ -30,7 +48,7 @@ python3 -m pytest -q \
   tests/test_ops_agents.py
 ```
 
-## 四、禁止边界
+## 五、禁止边界
 
 - 不把 health / self_check / ops_agents 接入核心评分主链。
 - 不修改 `scorer.py`。
@@ -42,7 +60,7 @@ python3 -m pytest -q \
 - 不运行 `git clean`。
 - 不把真实 Ollama 调用作为默认回归。
 
-## 五、后续任务建议
+## 六、后续任务建议
 
 - 为 ops_agents 启动脚本补充安全提示或静态断言。
 - 为 health / self_check 增加更清晰的只读 / 运行态说明。

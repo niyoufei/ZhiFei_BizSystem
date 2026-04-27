@@ -24,6 +24,41 @@ def client():
     return TestClient(app)
 
 
+def test_health_ready_self_check_runtime_boundaries_are_visible():
+    """Static guard for health/readiness/self_check runtime boundary wording."""
+    repo_root = Path(__file__).resolve().parents[1]
+    main_text = (repo_root / "app/main.py").read_text(encoding="utf-8")
+    boundary_doc = (repo_root / "docs/health-stability-runtime-boundaries.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert '@app.get("/health"' in main_text
+    assert '@app.get("/ready"' in main_text
+    assert 'router = APIRouter(prefix="/api/v1")' in main_text
+    assert '@router.get(\n    "/system/self_check"' in main_text
+    assert 'compat_router = APIRouter(prefix="/api")' in main_text
+    assert '@compat_router.get("/system/self_check"' in main_text
+    assert "/api/v1/system/self_check" in main_text
+    assert "ensure_data_dirs()" in main_text
+    assert 'prefix="selfcheck_"' in main_text
+    assert 'suffix=".tmp"' in main_text
+    assert "NamedTemporaryFile" in main_text
+    assert "ollama serve" not in main_text
+
+    assert "/health" in boundary_doc
+    assert "/ready" in boundary_doc
+    assert "/api/v1/system/self_check" in boundary_doc
+    assert "/api/system/self_check" in boundary_doc
+    assert "liveness" in boundary_doc
+    assert "readiness" in boundary_doc
+    assert "ensure_data_dirs" in boundary_doc
+    assert "selfcheck_*.tmp" in boundary_doc
+    assert "不应称为纯只读检查" in boundary_doc
+    assert "不作为核心评分主链入口" in boundary_doc
+    assert "不连接 Ollama" in boundary_doc
+    assert "ollama serve" in boundary_doc
+
+
 class TestCreateApp:
     """Tests for create_app factory function."""
 
