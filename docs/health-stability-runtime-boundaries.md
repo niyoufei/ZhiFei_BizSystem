@@ -36,7 +36,29 @@
 
 文档检查、`git grep`、静态测试不需要启动服务；TestClient / mock 测试不需要启动服务。真实访问 `/ready` 或 self_check 前，应按运行态诊断处理。只有真实 Ollama 调用才需要提醒用户在 2 号窗口运行 `ollama serve`。
 
-## 四、推荐的最小健康回归
+## 四、diagnostic scripts 副作用边界说明
+
+本小节只固定当前边界说明，不改变任何脚本行为。以下脚本不应与 `git grep`、静态测试等纯只读检查混同。
+
+| 脚本 | 边界归类 | 主要副作用 | 是否适合作为只读检查 | 执行前置条件 |
+|------|----------|------------|----------------------|--------------|
+| `scripts/doctor.sh` | 需单独授权 | 当前实现会发起运行态 HTTP 请求，调用 `/health`、self_check、openapi 相关检查；`/health` 失败时可能调用 `scripts/restart_server.sh`，间接触发服务重启 | 否，脚本不是纯只读检查 | 已明确允许运行态诊断和可能的服务重启 |
+| `scripts/restart_server.sh` | 服务控制脚本 | 当前实现会停止旧进程并启动服务，可能使用 `kill` / `kill -9`，并写 `build/server.pid`、`build/server.log`、restart lock | 否，不得在只读审计中执行 | 已明确允许停止 / 启动服务和写 build pid/log |
+| `scripts/data_hygiene.sh` | 运行态写入诊断 | 当前实现默认 audit 会发起 HTTP 请求并写 `build/data_hygiene_latest.*`；`APPLY=1` repair 会发起 POST repair，可能通过服务端写 `data/` | 默认 audit 也不是纯只读；repair 更需要单独授权 | 已启动服务；repair 必须额外确认 `APPLY=1` |
+| `scripts/e2e_api_flow.sh` | 端到端写入验证 | 当前实现可能启动或重启本地服务，会发起多个 API 请求，触达项目创建、上传、评分、对比、导出、学习或进化链路，并写 `data/` 和 `build/e2e_flow/*` | 否，不适合作为默认回归，不应在只读阶段执行 | 已明确允许端到端写入验证和服务控制 |
+| `scripts/server_status.sh` | 运行态状态脚本 | 当前实现可能请求 `/health`；如发现 stale pid，可能修正或删除 `build/server.pid` | 否，不是纯只读静态检查 | 已明确允许运行态状态检查和 pid 文件修正 |
+
+`scripts/doctor.sh` 当前实现不是纯只读检查。它会发起运行态 HTTP 请求，调用 `/health`、`/api/v1/system/self_check`、`/api/system/self_check` 和 `openapi.json` 相关检查；当 health 失败时，可能调用 `scripts/restart_server.sh`，从而间接触发服务重启。执行前需要单独授权。
+
+`scripts/restart_server.sh` 当前实现属于服务控制脚本。它会停止旧进程并启动服务，可能使用 `kill` / `kill -9`，会写 `build/server.pid`、`build/server.log` 和 restart lock，不得在只读审计中执行。执行前需要单独授权。
+
+`scripts/data_hygiene.sh` 当前实现属于运行态诊断脚本。默认 audit 和 `APPLY=1` repair 必须区分：audit 会发起 HTTP 请求并写 `build/data_hygiene_latest.*`；`APPLY=1` repair 会发起 POST repair，可能通过服务端写 `data/`。repair 必须单独授权，不作为默认只读检查。
+
+`scripts/e2e_api_flow.sh` 当前实现属于端到端写入验证。它可能启动或重启本地服务，会发起多个 API 请求，触达项目创建、上传、评分、对比、导出、学习或进化链路，并写 `data/` 和 `build/e2e_flow/*`。它不适合作为默认回归，不应在只读阶段执行。
+
+`scripts/server_status.sh` 当前实现属于运行态状态脚本，可能请求 `/health`。如发现 stale pid 或 pid 文件与监听进程不一致，可能修正或删除 `build/server.pid`，因此不应与 `git grep`、静态测试等纯只读检查混同。
+
+## 五、推荐的最小健康回归
 
 以下组合不需要启动服务，不需要 Ollama，但 pytest 可能写 `.pytest_cache/` 或 `__pycache__/`，应放在验证轮执行：
 
@@ -48,7 +70,7 @@ python3 -m pytest -q \
   tests/test_ops_agents.py
 ```
 
-## 五、禁止边界
+## 六、禁止边界
 
 - 不把 health / self_check / ops_agents 接入核心评分主链。
 - 不修改 `scorer.py`。
@@ -60,7 +82,7 @@ python3 -m pytest -q \
 - 不运行 `git clean`。
 - 不把真实 Ollama 调用作为默认回归。
 
-## 六、后续任务建议
+## 七、后续任务建议
 
 - 为 ops_agents 启动脚本补充安全提示或静态断言。
 - 为 health / self_check 增加更清晰的只读 / 运行态说明。
