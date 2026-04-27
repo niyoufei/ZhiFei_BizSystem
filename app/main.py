@@ -18202,8 +18202,14 @@ def index(
           const data = (payload && typeof payload === 'object') ? payload : {};
           const cards = Array.isArray(data.submission_optimization_cards) ? data.submission_optimization_cards : [];
           const lines = ['对比报告优化清单'];
-          if (data.project_id) lines.push('项目ID：' + compareReportPlainValue(data.project_id));
-          if (data.summary) lines.push('摘要：' + compareReportPlainValue(data.summary));
+          const appendField = (label, value) => {
+            const text = compareReportPlainValue(value);
+            if (!text) return;
+            lines.push(label + '：' + text);
+          };
+          appendField('生成时间', new Date().toISOString());
+          appendField('项目ID', data.project_id);
+          appendField('摘要', data.summary);
           lines.push('');
           if (!cards.length) {
             lines.push('暂无优化清单。');
@@ -18213,11 +18219,17 @@ def index(
             const filename = compareReportPlainValue(card.filename || ('文件' + String(cardIndex + 1)));
             const rows = Array.isArray(card.recommendations) ? card.recommendations : [];
             lines.push('## ' + String(cardIndex + 1) + '. ' + filename);
-            lines.push(
-              '当前分：' + compareReportPlainValue(card.total_score)
-              + '；目标分：' + compareReportPlainValue(card.target_score)
-              + '；差距：' + compareReportPlainValue(card.target_gap)
-            );
+            const scoreParts = [
+              ['当前分', card.total_score],
+              ['目标分', card.target_score],
+              ['差距', card.target_gap],
+            ]
+              .map(([label, value]) => {
+                const text = compareReportPlainValue(value);
+                return text ? (label + '：' + text) : '';
+              })
+              .filter(Boolean);
+            if (scoreParts.length) lines.push(scoreParts.join('；'));
             if (!rows.length) {
               lines.push('暂无建议。', '');
               return;
@@ -18229,17 +18241,17 @@ def index(
               );
               lines.push('');
               lines.push('### 建议 ' + String(idx + 1));
-              lines.push('建议章节：' + compareReportPlainValue(r.chapter_hint));
-              lines.push('定位页码：' + compareReportPlainValue(r.page_hint || '页码未知'));
-              lines.push('预计提分：' + compareReportPlainValue(r.target_delta_reduction));
-              lines.push('问题：' + compareReportPlainValue(r.issue));
-              lines.push('原文内容：' + originalText);
-              lines.push('直接替换文本 / 原位补充内容：' + directApplyText);
-              lines.push('怎么改：' + compareReportPlainValue(r.insertion_guidance));
-              lines.push('证据片段：' + compareReportPlainValue(r.evidence));
-              lines.push('证据窗口：' + compareReportPlainValue(r.evidence_context));
-              lines.push('验收标准：' + compareReportPlainValue(r.acceptance_check));
-              lines.push('执行检查表：' + compareReportPlainValue(r.execution_checklist));
+              appendField('建议章节', r.chapter_hint);
+              appendField('定位页码', r.page_hint || '页码未知');
+              appendField('预计提分', r.target_delta_reduction);
+              appendField('问题', r.issue);
+              appendField('原文内容', originalText);
+              appendField('直接替换文本 / 原位补充内容', directApplyText);
+              appendField('怎么改', r.insertion_guidance);
+              appendField('证据片段', r.evidence);
+              appendField('证据窗口', r.evidence_context);
+              appendField('验收标准', r.acceptance_check);
+              appendField('执行检查表', r.execution_checklist);
             });
             lines.push('');
           });
