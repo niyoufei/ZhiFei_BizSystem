@@ -27,6 +27,10 @@ def test_start_ops_agents_script_runtime_boundaries_are_visible():
     assert "build/ops_agents.pid" in start_script
     assert 'mkdir -p "$ROOT_DIR/build"' in start_script
     assert "screen" in start_script or "nohup" in start_script
+    assert "非只读运行入口" in start_script
+    assert "启动 ops_agents 守护进程" in start_script
+    assert "单独授权" in start_script
+    assert "文档检查、静态检查、mock 测试不需要运行本脚本" in start_script
 
     assert "--auto-repair" in ops_cli
     assert "--auto-evolve" in ops_cli

@@ -12,6 +12,16 @@ LOG_FILE="${LOG_FILE:-$ROOT_DIR/build/ops_agents.log}"
 PID_FILE="${PID_FILE:-$ROOT_DIR/build/ops_agents.pid}"
 SCREEN_SESSION="${SCREEN_SESSION:-zhifei_ops_agents}"
 
+cat <<'EOF'
+[ops-agents] 安全提示：
+- 这是非只读运行入口。
+- 本脚本会启动 ops_agents 守护进程。
+- 默认参数包含 --auto-repair 1 和 --auto-evolve 1。
+- 本脚本会写 build/ops_agents.log 和 build/ops_agents.pid。
+- 运行本脚本需要单独授权。
+- 文档检查、静态检查、mock 测试不需要运行本脚本。
+EOF
+
 mkdir -p "$ROOT_DIR/build"
 
 if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
