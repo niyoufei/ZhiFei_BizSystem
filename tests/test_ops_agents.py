@@ -1,6 +1,46 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from app.engine import ops_agents as oa
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _read_repo_text(path: str) -> str:
+    return (REPO_ROOT / path).read_text(encoding="utf-8")
+
+
+def _contains_path_fragment(text: str, path_fragment: str) -> bool:
+    path_style = path_fragment.replace("/", '" / "')
+    return path_fragment in text or path_style in text
+
+
+def test_start_ops_agents_script_runtime_boundaries_are_visible():
+    start_script = _read_repo_text("scripts/start_ops_agents.sh")
+    ops_cli = _read_repo_text("scripts/ops_agents.py")
+    boundary_doc = _read_repo_text("docs/health-stability-runtime-boundaries.md")
+
+    assert "--auto-repair 1" in start_script
+    assert "--auto-evolve 1" in start_script
+    assert "build/ops_agents.log" in start_script
+    assert "build/ops_agents.pid" in start_script
+    assert 'mkdir -p "$ROOT_DIR/build"' in start_script
+    assert "screen" in start_script or "nohup" in start_script
+
+    assert "--auto-repair" in ops_cli
+    assert "--auto-evolve" in ops_cli
+    assert _contains_path_fragment(ops_cli, "build/ops_agents_status.json")
+    assert _contains_path_fragment(ops_cli, "build/ops_agents_status.md")
+    assert "--max-cycles" in ops_cli or "--interval-seconds" in ops_cli
+
+    assert "start_ops_agents.sh" in boundary_doc
+    assert "auto-repair" in boundary_doc
+    assert "auto-evolve" in boundary_doc
+    assert "build/ops_agents_status.json" in boundary_doc
+    assert "build/ops_agents_status.md" in boundary_doc
+    assert "单独授权" in boundary_doc
+    assert "不接核心评分主链" in boundary_doc
 
 
 def test_run_ops_agents_cycle_short_circuit_on_sre_fail(monkeypatch):
