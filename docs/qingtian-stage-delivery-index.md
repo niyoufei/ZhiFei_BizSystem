@@ -105,7 +105,7 @@
 - `v0.1.8-qingtian-health-stability` 可作为健康稳定运行命令边界稳定点。
 - `v0.1.9-qingtian-health-selfcheck-boundaries` 可作为 health / self_check 边界稳定点。
 - `v0.1.10-qingtian-diagnostic-scripts-boundaries` 可作为 diagnostic scripts 副作用边界稳定点。
-- 本文只提供标签定位，不提供 reset、force push、clean 等破坏性命令。
+- 本文只提供标签定位，不提供 reset、force push、git clean 等破坏性命令。
 
 ## 8. 后续专项建议
 
