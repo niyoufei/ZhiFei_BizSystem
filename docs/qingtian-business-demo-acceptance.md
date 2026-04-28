@@ -18,6 +18,12 @@
 - 不替代接口测试、CI 和 PR 记录；
 - 文档检查、静态检查、mock 测试不需要启动服务，也不需要 `ollama serve`。
 
+## 评分报告与证据链交付说明
+
+评分报告 JSON、DOCX、latest report、evidence trace、scoring basis、analysis bundle、compare_report、优化清单复制/JSON 导出等交付物说明见：[青天评分报告与证据链交付说明](qingtian-report-evidence-delivery.md)。
+
+该文档用于交付物核对、验收、归档和交接；不改变运行逻辑，不接核心评分主链；真实服务访问或真实 Ollama 调用前需单独授权。
+
 ## 2. 演示前置条件
 
 - 后续开发与验证应使用新 clean worktree。
