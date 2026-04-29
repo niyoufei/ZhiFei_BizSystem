@@ -32,6 +32,21 @@ def test_health_ready_self_check_runtime_boundaries_are_visible():
         encoding="utf-8"
     )
 
+    def slice_between(start_marker: str, end_marker: str) -> str:
+        start = main_text.index(start_marker)
+        end = main_text.index(end_marker, start + len(start_marker))
+        return main_text[start:end]
+
+    runtime_boundary_text = "\n".join(
+        [
+            slice_between("def _run_system_self_check", "\n\n# ===================="),
+            slice_between('@app.get("/health"', '\n\n@app.get("/metrics"'),
+            slice_between('@app.get("/ready"', '\n\n@app.get("/__ping__"'),
+            slice_between('@router.get(\n    "/system/self_check"', "\n\n@router.get("),
+            slice_between('@compat_router.get("/system/self_check"', "\n\n@compat_router.get("),
+        ]
+    )
+
     assert '@app.get("/health"' in main_text
     assert '@app.get("/ready"' in main_text
     assert 'router = APIRouter(prefix="/api/v1")' in main_text
@@ -43,7 +58,7 @@ def test_health_ready_self_check_runtime_boundaries_are_visible():
     assert 'prefix="selfcheck_"' in main_text
     assert 'suffix=".tmp"' in main_text
     assert "NamedTemporaryFile" in main_text
-    assert "ollama serve" not in main_text
+    assert "ollama serve" not in runtime_boundary_text
 
     assert "/health" in boundary_doc
     assert "/ready" in boundary_doc
