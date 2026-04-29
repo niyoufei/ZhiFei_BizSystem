@@ -14859,6 +14859,19 @@ def index(
         <p class="muted">下方所有操作将使用选中的项目。选择项目后建议先上传项目资料（招标、清单等），再上传施组进行评分。删除项目会同时删除该项目全部资料与记录。</p>
       </div>
 
+      <div class="section card">
+        <h2>评分报告 / 证据链交付入口</h2>
+        <p class="muted">本区集中提示已有交付路径，便于验收人员核对评分报告、证据链、评分依据、分析包和对比报告等交付物；页面仅提示交付路径，不新增后端接口，不改变运行逻辑，不接核心评分主链。</p>
+        <ul style="margin:8px 0 0 18px;color:#334155;font-size:13px;line-height:1.7">
+          <li><strong>评分报告 JSON / latest report</strong>：用于接口验收、归档和最近一次评分结果核对；API 入口包含 <code>reports/latest</code>。</li>
+          <li><strong>评分报告 DOCX</strong>：用于线下审阅、交接和归档，页面仅提示交付路径，不改变导出逻辑。</li>
+          <li><strong>evidence trace / evidence_trace</strong>、<strong>scoring basis / scoring_basis</strong>、<strong>analysis bundle / analysis_bundle</strong>：用于证据追溯、评分依据核对和项目级归档。</li>
+          <li><strong>compare_report</strong>、<strong>复制优化清单</strong>、<strong>导出优化清单 JSON</strong>：用于优化建议交付、人工复核和二次分析。</li>
+          <li><strong>Ollama 增强预览</strong>：仅作为增强预览；真实 Ollama 调用前运行 <code>ollama serve</code>。</li>
+          <li>安全边界：不改 <code>scorer.py</code> / <code>v2_scorer.py</code> / <code>storage.py</code>；真实服务访问需单独授权。</li>
+        </ul>
+      </div>
+
       <div class="section card" id="section-materials">
         <h2>3) 项目资料</h2>
         <p style="font-size:13px;color:#64748b;margin:-8px 0 8px 0">评分会读取本区资料并注入到锚点/要求矩阵中，作为后续施组打分依据。请按资料类型上传，避免混投。</p>

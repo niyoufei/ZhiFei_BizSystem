@@ -105,3 +105,35 @@ def test_delivery_page_entries_match_delivery_docs():
             "git clean",
         ],
     )
+
+
+def test_report_evidence_delivery_entry_is_visible_on_home_page():
+    main_text = _read_repo_file("app/main.py")
+
+    _assert_keywords_visible(
+        main_text,
+        [
+            "评分报告 / 证据链交付入口",
+            "评分报告 JSON",
+            "latest report",
+            "reports/latest",
+            "评分报告 DOCX",
+            "evidence trace",
+            "evidence_trace",
+            "scoring basis",
+            "scoring_basis",
+            "analysis bundle",
+            "analysis_bundle",
+            "compare_report",
+            "复制优化清单",
+            "导出优化清单 JSON",
+            "Ollama 增强预览",
+            "不改变运行逻辑",
+            "不接核心评分主链",
+            "scorer.py",
+            "v2_scorer.py",
+            "storage.py",
+            "单独授权",
+            "ollama serve",
+        ],
+    )
