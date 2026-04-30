@@ -37,15 +37,28 @@ def test_health_ready_self_check_runtime_boundaries_are_visible():
         end = main_text.index(end_marker, start + len(start_marker))
         return main_text[start:end]
 
-    runtime_boundary_text = "\n".join(
-        [
-            slice_between("def _run_system_self_check", "\n\n# ===================="),
-            slice_between('@app.get("/health"', '\n\n@app.get("/metrics"'),
-            slice_between('@app.get("/ready"', '\n\n@app.get("/__ping__"'),
-            slice_between('@router.get(\n    "/system/self_check"', "\n\n@router.get("),
-            slice_between('@compat_router.get("/system/self_check"', "\n\n@compat_router.get("),
-        ]
-    )
+    runtime_boundary_snippets = {
+        "_run_system_self_check": slice_between(
+            "def _run_system_self_check", "\n\n# ===================="
+        ),
+        "health_check": slice_between('@app.get("/health"', '\n\n@app.get("/metrics"'),
+        "readiness_check": slice_between('@app.get("/ready"', '\n\n@app.get("/__ping__"'),
+        "system_self_check": slice_between(
+            '@router.get(\n    "/system/self_check"', "\n\n@router.get("
+        ),
+        "compat_system_self_check": slice_between(
+            '@compat_router.get("/system/self_check"', "\n\n@compat_router.get("
+        ),
+    }
+    boundary_labels = [
+        "_run_system_self_check",
+        "health_check",
+        "readiness_check",
+        "system_self_check",
+    ]
+    for label in boundary_labels:
+        assert label in runtime_boundary_snippets
+    runtime_boundary_text = "\n".join(runtime_boundary_snippets.values())
 
     assert '@app.get("/health"' in main_text
     assert '@app.get("/ready"' in main_text
