@@ -14870,6 +14870,11 @@ def index(
           <li><strong>Ollama 增强预览</strong>：仅作为增强预览；真实 Ollama 调用前运行 <code>ollama serve</code>。</li>
           <li>安全边界：不改 <code>scorer.py</code> / <code>v2_scorer.py</code> / <code>storage.py</code>；真实服务访问需单独授权。</li>
         </ul>
+        <div class="action-row" style="margin-top:10px">
+          <button type="button" id="btnLatestReportJsonCopy" class="secondary">复制 latest report JSON</button>
+          <button type="button" id="btnLatestReportJsonExport" class="secondary">导出 latest report JSON</button>
+          <span id="latestReportJsonActionStatus" class="note">复用 reports/latest；不重新评分，不触发 rescore，不写 data，不接 Ollama，不接核心评分主链。</span>
+        </div>
       </div>
 
       <div class="section card" id="section-materials">
@@ -16297,6 +16302,7 @@ def index(
           return h;
         }
         const NL = String.fromCharCode(10);
+        let latestReportJsonSubmissionId = '';
         const DIMENSION_LABELS = {
           "01": "01 工程项目整体理解与实施路径",
           "02": "02 安全生产管理体系与控制措施",
@@ -18179,6 +18185,107 @@ def index(
             .replace(/\"/g, '&quot;')
             .replace(/'/g, '&#39;');
         }
+        function setLatestReportJsonActionStatus(text, isError=false) {
+          const el = document.getElementById('latestReportJsonActionStatus');
+          if (!el) return;
+          el.textContent = text || '';
+          el.style.color = isError ? '#b91c1c' : '#64748b';
+        }
+        function latestReportSortValue(row) {
+          const latest = (row && row.latest_report && typeof row.latest_report === 'object') ? row.latest_report : {};
+          return String(latest.updated_at || row.updated_at || row.created_at || '');
+        }
+        function hasLatestReportSummary(row) {
+          const latest = (row && row.latest_report && typeof row.latest_report === 'object') ? row.latest_report : {};
+          const report = (row && row.report && typeof row.report === 'object') ? row.report : {};
+          return !!(
+            String((row && row.submission_id) || (row && row.id) || '').trim()
+            && (
+              latest.report_id
+              || latest.rule_total_score != null
+              || latest.pred_total_score != null
+              || latest.updated_at
+              || String(report.scoring_status || '').toLowerCase() === 'scored'
+            )
+          );
+        }
+        function hasSubmissionReportPayload(row) {
+          const report = (row && row.report && typeof row.report === 'object') ? row.report : {};
+          const status = String(report.scoring_status || '').toLowerCase();
+          return !!(
+            String((row && row.id) || '').trim()
+            && (
+              status === 'scored'
+              || report.rule_total_score != null
+              || report.pred_total_score != null
+              || report.total_score != null
+            )
+          );
+        }
+        async function resolveLatestReportSubmissionId(projectId) {
+          const scopedProjectId = encodeURIComponent(projectId);
+          const preScoreRes = await fetch(
+            '/api/v1/projects/' + scopedProjectId + '/submissions?with=latest_report&t=' + Date.now(),
+            { cache: 'no-store' }
+          );
+          if (preScoreRes.ok) {
+            const preScoreData = await preScoreRes.json().catch(() => ({}));
+            const rows = Array.isArray(preScoreData.submissions) ? preScoreData.submissions : [];
+            const candidates = rows
+              .filter(hasLatestReportSummary)
+              .sort((a, b) => latestReportSortValue(b).localeCompare(latestReportSortValue(a)));
+            if (candidates.length) return String(candidates[0].submission_id || '').trim();
+          }
+
+          const listRes = await fetch(
+            '/api/v1/projects/' + scopedProjectId + '/submissions?t=' + Date.now(),
+            { cache: 'no-store' }
+          );
+          if (!listRes.ok) {
+            throw new Error('施组列表加载失败（HTTP ' + String(listRes.status || 0) + '）');
+          }
+          const submissions = await listRes.json().catch(() => []);
+          const fallbackCandidates = (Array.isArray(submissions) ? submissions : [])
+            .filter(hasSubmissionReportPayload)
+            .sort((a, b) => String(b.updated_at || b.created_at || '').localeCompare(String(a.updated_at || a.created_at || '')));
+          return fallbackCandidates.length ? String(fallbackCandidates[0].id || '').trim() : '';
+        }
+        async function fetchLatestReportJsonForCurrentProject(actionLabel) {
+          const currentId = pid();
+          if (!currentId) {
+            throw new Error('请先选择项目后再' + actionLabel + ' latest report JSON。');
+          }
+          const submissionId = await resolveLatestReportSubmissionId(currentId);
+          if (!submissionId) {
+            throw new Error('请先选择或生成评分报告后再' + actionLabel + ' latest report JSON。');
+          }
+          latestReportJsonSubmissionId = submissionId;
+          const url = '/api/v1/submissions/' + encodeURIComponent(submissionId) + '/reports/latest';
+          const reportRes = await fetch(url, { cache: 'no-store' });
+          const data = await reportRes.json().catch(() => ({}));
+          if (!reportRes.ok) {
+            const detail = data && data.detail ? String(data.detail) : ('HTTP ' + String(reportRes.status || 0));
+            throw new Error(detail);
+          }
+          showJson('output', data);
+          return { projectId: currentId, submissionId, data };
+        }
+        function downloadLatestReportJson(projectId, submissionId, payload) {
+          const safeProjectId = String(projectId || 'project').replace(/[^a-zA-Z0-9_-]+/g, '_');
+          const safeSubmissionId = String(submissionId || latestReportJsonSubmissionId || 'submission').replace(/[^a-zA-Z0-9_-]+/g, '_');
+          const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+          const blob = new Blob([JSON.stringify(payload || {}, null, 2)], {
+            type: 'application/json;charset=utf-8',
+          });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'latest-report-' + safeProjectId + '-' + safeSubmissionId + '-' + stamp + '.json';
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+        }
         function setCompareReportActionStatus(text, isError=false) {
           const el = document.getElementById('compareReportActionStatus');
           if (!el) return;
@@ -19189,6 +19296,27 @@ def index(
           }
           downloadCompareReportJson(latestCompareReportProjectId, latestCompareReportPayload);
           setCompareReportActionStatus('优化清单 JSON 导出已触发。', false);
+        });
+
+        safeClick('btnLatestReportJsonCopy', async () => {
+          setLatestReportJsonActionStatus('正在读取 reports/latest，不重新评分、不触发 rescore、不写 data、不接 Ollama。', false);
+          try {
+            const latest = await fetchLatestReportJsonForCurrentProject('复制');
+            await copyTextToClipboard(JSON.stringify(latest.data || {}, null, 2));
+            setLatestReportJsonActionStatus('latest report JSON 已复制；不重新评分、不触发 rescore、不写 data、不接 Ollama、不接核心评分主链。', false);
+          } catch (err) {
+            setLatestReportJsonActionStatus(String((err && err.message) || err || 'latest report JSON 复制失败'), true);
+          }
+        });
+        safeClick('btnLatestReportJsonExport', async () => {
+          setLatestReportJsonActionStatus('正在读取 reports/latest，不重新评分、不触发 rescore、不写 data、不接 Ollama。', false);
+          try {
+            const latest = await fetchLatestReportJsonForCurrentProject('导出');
+            downloadLatestReportJson(latest.projectId, latest.submissionId, latest.data);
+            setLatestReportJsonActionStatus('latest report JSON 导出已触发；不重新评分、不触发 rescore、不写 data、不接 Ollama、不接核心评分主链。', false);
+          } catch (err) {
+            setLatestReportJsonActionStatus(String((err && err.message) || err || 'latest report JSON 导出失败'), true);
+          }
         });
 
         safeClick('btnInsights', async () => {
