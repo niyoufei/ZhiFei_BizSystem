@@ -14875,6 +14875,11 @@ def index(
           <button type="button" id="btnLatestReportJsonExport" class="secondary">导出 latest report JSON</button>
           <span id="latestReportJsonActionStatus" class="note">复用 reports/latest；不重新评分，不触发 rescore，不写 data，不接 Ollama，不接核心评分主链。</span>
         </div>
+        <div class="action-row" style="margin-top:8px">
+          <button type="button" id="btnScoringBasisJsonCopy" class="secondary">复制 scoring basis JSON</button>
+          <button type="button" id="btnScoringBasisJsonExport" class="secondary">导出 scoring basis JSON</button>
+          <span id="scoringBasisJsonActionStatus" class="note">复用 scoring_basis/latest；评分依据 JSON 仅用于交付核对，不重新评分，不触发 rescore，不写 data，不接 Ollama，不接核心评分主链。</span>
+        </div>
       </div>
 
       <div class="section card" id="section-materials">
@@ -16303,6 +16308,8 @@ def index(
         }
         const NL = String.fromCharCode(10);
         let latestReportJsonSubmissionId = '';
+        let latestScoringBasisPayload = null;
+        let latestScoringBasisProjectId = '';
         const DIMENSION_LABELS = {
           "01": "01 工程项目整体理解与实施路径",
           "02": "02 安全生产管理体系与控制措施",
@@ -18286,6 +18293,58 @@ def index(
           a.remove();
           URL.revokeObjectURL(url);
         }
+        function setScoringBasisJsonActionStatus(text, isError=false) {
+          const el = document.getElementById('scoringBasisJsonActionStatus');
+          if (!el) return;
+          el.textContent = text || '';
+          el.style.color = isError ? '#b91c1c' : '#64748b';
+        }
+        function storeScoringBasisJsonPayload(projectId, data) {
+          latestScoringBasisProjectId = String(projectId || '');
+          latestScoringBasisPayload = (data && typeof data === 'object') ? data : null;
+          if (latestScoringBasisPayload) {
+            setScoringBasisJsonActionStatus(
+              '评分依据 JSON 已就绪，可复制或导出 scoring basis JSON；不重新评分、不触发 rescore、不写 data、不接 Ollama、不接核心评分主链。',
+              false
+            );
+          }
+        }
+        async function fetchScoringBasisJsonForCurrentProject(actionLabel) {
+          const currentId = pid();
+          if (!currentId) {
+            throw new Error('请先选择项目后再' + actionLabel + ' scoring basis JSON。');
+          }
+          if (latestScoringBasisPayload && latestScoringBasisProjectId === currentId) {
+            showJson('output', latestScoringBasisPayload);
+            return { projectId: currentId, data: latestScoringBasisPayload };
+          }
+          const url = '/api/v1/projects/' + encodeURIComponent(currentId) + '/scoring_basis/latest';
+          const res = await fetch(url, { cache: 'no-store' });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            const fallback = '请先生成评分依据后再' + actionLabel + ' scoring basis JSON。';
+            const detail = data && data.detail ? String(data.detail) : fallback;
+            throw new Error(detail || fallback);
+          }
+          storeScoringBasisJsonPayload(currentId, data);
+          showJson('output', data);
+          return { projectId: currentId, data };
+        }
+        function downloadScoringBasisJson(projectId, payload) {
+          const safeProjectId = String(projectId || 'project').replace(/[^a-zA-Z0-9_-]+/g, '_');
+          const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+          const blob = new Blob([JSON.stringify(payload || {}, null, 2)], {
+            type: 'application/json;charset=utf-8',
+          });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'scoring-basis-' + safeProjectId + '-' + stamp + '.json';
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+        }
         function setCompareReportActionStatus(text, isError=false) {
           const el = document.getElementById('compareReportActionStatus');
           if (!el) return;
@@ -19319,6 +19378,27 @@ def index(
           }
         });
 
+        safeClick('btnScoringBasisJsonCopy', async () => {
+          setScoringBasisJsonActionStatus('正在读取 scoring_basis/latest，不重新评分、不触发 rescore、不写 data、不接 Ollama。', false);
+          try {
+            const latest = await fetchScoringBasisJsonForCurrentProject('复制');
+            await copyTextToClipboard(JSON.stringify(latest.data || {}, null, 2));
+            setScoringBasisJsonActionStatus('scoring basis JSON 已复制；不重新评分、不触发 rescore、不写 data、不接 Ollama、不接核心评分主链。', false);
+          } catch (err) {
+            setScoringBasisJsonActionStatus(String((err && err.message) || err || 'scoring basis JSON 复制失败'), true);
+          }
+        });
+        safeClick('btnScoringBasisJsonExport', async () => {
+          setScoringBasisJsonActionStatus('正在读取 scoring_basis/latest，不重新评分、不触发 rescore、不写 data、不接 Ollama。', false);
+          try {
+            const latest = await fetchScoringBasisJsonForCurrentProject('导出');
+            downloadScoringBasisJson(latest.projectId, latest.data);
+            setScoringBasisJsonActionStatus('scoring basis JSON 导出已触发；不重新评分、不触发 rescore、不写 data、不接 Ollama、不接核心评分主链。', false);
+          } catch (err) {
+            setScoringBasisJsonActionStatus(String((err && err.message) || err || 'scoring basis JSON 导出失败'), true);
+          }
+        });
+
         safeClick('btnInsights', async () => {
           if (!ensureProjectForAction('insightsResult')) return;
           setResultLoading('insightsResult', '洞察分析中...');
@@ -19424,9 +19504,12 @@ def index(
           const el = document.getElementById('scoringBasisResult');
           el.style.display = 'block';
           if (!res.ok) {
+            latestScoringBasisPayload = null;
+            latestScoringBasisProjectId = '';
             el.innerHTML = '<span class="error">' + (data.detail || '请求失败') + '</span>';
             return;
           }
+          storeScoringBasisJsonPayload(projectId, data);
           const mece = (data.mece_inputs && typeof data.mece_inputs === 'object') ? data.mece_inputs : {};
           const util = (data.material_utilization && typeof data.material_utilization === 'object') ? data.material_utilization : {};
           const gate = (data.material_utilization_gate && typeof data.material_utilization_gate === 'object') ? data.material_utilization_gate : {};

@@ -160,3 +160,28 @@ def test_latest_report_json_actions_are_visible_on_home_page():
             "不接核心评分主链",
         ],
     )
+
+
+def test_scoring_basis_json_actions_are_visible_on_home_page():
+    main_text = _read_repo_file("app/main.py")
+
+    _assert_keywords_visible(
+        main_text,
+        [
+            "复制 scoring basis JSON",
+            "导出 scoring basis JSON",
+            "scoring_basis/latest",
+            "scoring basis",
+            "评分依据",
+            "navigator.clipboard",
+            "Blob",
+            "createObjectURL",
+            "download",
+            "不重新评分",
+            "不触发 rescore",
+            "不写 data",
+            "不接 Ollama",
+            "不接核心评分主链",
+            "scoring-basis",
+        ],
+    )
