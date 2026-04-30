@@ -137,3 +137,26 @@ def test_report_evidence_delivery_entry_is_visible_on_home_page():
             "ollama serve",
         ],
     )
+
+
+def test_latest_report_json_actions_are_visible_on_home_page():
+    main_text = _read_repo_file("app/main.py")
+
+    _assert_keywords_visible(
+        main_text,
+        [
+            "复制 latest report JSON",
+            "导出 latest report JSON",
+            "reports/latest",
+            "latest report",
+            "navigator.clipboard",
+            "Blob",
+            "createObjectURL",
+            "download",
+            "不重新评分",
+            "不触发 rescore",
+            "不写 data",
+            "不接 Ollama",
+            "不接核心评分主链",
+        ],
+    )
