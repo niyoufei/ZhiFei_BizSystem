@@ -14880,6 +14880,10 @@ def index(
           <button type="button" id="btnScoringBasisJsonExport" class="secondary">导出 scoring basis JSON</button>
           <span id="scoringBasisJsonActionStatus" class="note">复用 scoring_basis/latest；评分依据 JSON 仅用于交付核对，不重新评分，不触发 rescore，不写 data，不接 Ollama，不接核心评分主链。</span>
         </div>
+        <div class="action-row" style="margin-top:8px">
+          <button type="button" id="btnAnalysisBundleMarkdownCopy" class="secondary">复制 analysis bundle Markdown</button>
+          <span id="analysisBundleMarkdownCopyStatus" class="note">复用 analysis_bundle / 项目分析包 Markdown；不重新评分，不触发 rescore，不写 data，不接 Ollama，不接核心评分主链。</span>
+        </div>
       </div>
 
       <div class="section card" id="section-materials">
@@ -16310,6 +16314,8 @@ def index(
         let latestReportJsonSubmissionId = '';
         let latestScoringBasisPayload = null;
         let latestScoringBasisProjectId = '';
+        let latestAnalysisBundleMarkdown = '';
+        let latestAnalysisBundleProjectId = '';
         const DIMENSION_LABELS = {
           "01": "01 工程项目整体理解与实施路径",
           "02": "02 安全生产管理体系与控制措施",
@@ -16502,6 +16508,14 @@ def index(
           if (!hasProject) {
             const scaleSel = document.getElementById('scoreScaleSelect');
             if (scaleSel) scaleSel.value = '100';
+          }
+          latestAnalysisBundleMarkdown = '';
+          latestAnalysisBundleProjectId = '';
+          if (typeof setAnalysisBundleMarkdownCopyStatus === 'function') {
+            setAnalysisBundleMarkdownCopyStatus(
+              '复用 analysis_bundle / 项目分析包 Markdown；不重新评分，不触发 rescore，不写 data，不接 Ollama，不接核心评分主链。',
+              false
+            );
           }
           resetOllamaPreviewActions();
           const gtSubmissionSel = document.getElementById('groundTruthSubmissionSelect');
@@ -16964,6 +16978,7 @@ def index(
             return;
           }
           const markdown = String((r.data && r.data.markdown) || '');
+          storeAnalysisBundleMarkdown(currentId, markdown);
           setScoringFactorsResult('项目分析包已生成（可直接复制给 ChatGPT）', markdown.slice(0, 600) + (markdown.length > 600 ? '\\n...（已截断预览）' : ''), false);
           const out = document.getElementById('output');
           if (out) out.textContent = markdown;
@@ -18345,6 +18360,52 @@ def index(
           a.remove();
           URL.revokeObjectURL(url);
         }
+        function setAnalysisBundleMarkdownCopyStatus(text, isError=false) {
+          const el = document.getElementById('analysisBundleMarkdownCopyStatus');
+          if (!el) return;
+          el.textContent = text || '';
+          el.style.color = isError ? '#b91c1c' : '#64748b';
+        }
+        function storeAnalysisBundleMarkdown(projectId, markdown) {
+          latestAnalysisBundleProjectId = String(projectId || '');
+          latestAnalysisBundleMarkdown = String(markdown || '');
+          if (latestAnalysisBundleMarkdown.trim()) {
+            setAnalysisBundleMarkdownCopyStatus(
+              '项目分析包 Markdown 已就绪，可复制 analysis bundle Markdown；不重新评分、不触发 rescore、不写 data、不接 Ollama、不接核心评分主链。',
+              false
+            );
+          }
+        }
+        async function fetchAnalysisBundleMarkdownForCurrentProject(actionLabel) {
+          const currentId = pid();
+          if (!currentId) {
+            throw new Error('请先选择项目后再' + actionLabel + ' analysis bundle Markdown。');
+          }
+          if (latestAnalysisBundleMarkdown && latestAnalysisBundleProjectId === currentId) {
+            const out = document.getElementById('output');
+            if (out) out.textContent = latestAnalysisBundleMarkdown;
+            return { projectId: currentId, markdown: latestAnalysisBundleMarkdown };
+          }
+          const url = '/api/v1/projects/' + encodeURIComponent(currentId) + '/analysis_bundle';
+          const fallback = '请先生成项目分析包后再' + actionLabel + ' analysis bundle Markdown。';
+          const r = await probeEndpoint(url);
+          if (r.error) {
+            throw new Error(r.error || fallback);
+          }
+          if (!r.ok) {
+            const detail = (r.data && r.data.detail) ? String(r.data.detail) : String(r.text || '').slice(0, 200);
+            throw new Error(detail || fallback);
+          }
+          const markdown = String((r.data && r.data.markdown) || '');
+          if (!markdown.trim()) {
+            throw new Error(fallback);
+          }
+          storeAnalysisBundleMarkdown(currentId, markdown);
+          setScoringFactorsResult('项目分析包已生成（可直接复制给 ChatGPT）', markdown.slice(0, 600) + (markdown.length > 600 ? '\\n...（已截断预览）' : ''), false);
+          const out = document.getElementById('output');
+          if (out) out.textContent = markdown;
+          return { projectId: currentId, markdown };
+        }
         function setCompareReportActionStatus(text, isError=false) {
           const el = document.getElementById('compareReportActionStatus');
           if (!el) return;
@@ -19396,6 +19457,17 @@ def index(
             setScoringBasisJsonActionStatus('scoring basis JSON 导出已触发；不重新评分、不触发 rescore、不写 data、不接 Ollama、不接核心评分主链。', false);
           } catch (err) {
             setScoringBasisJsonActionStatus(String((err && err.message) || err || 'scoring basis JSON 导出失败'), true);
+          }
+        });
+
+        safeClick('btnAnalysisBundleMarkdownCopy', async () => {
+          setAnalysisBundleMarkdownCopyStatus('正在读取 analysis_bundle Markdown，不重新评分、不触发 rescore、不写 data、不接 Ollama。', false);
+          try {
+            const bundle = await fetchAnalysisBundleMarkdownForCurrentProject('复制');
+            await copyTextToClipboard(bundle.markdown);
+            setAnalysisBundleMarkdownCopyStatus('analysis bundle Markdown 已复制；不重新评分、不触发 rescore、不写 data、不接 Ollama、不接核心评分主链。', false);
+          } catch (err) {
+            setAnalysisBundleMarkdownCopyStatus(String((err && err.message) || err || 'analysis bundle Markdown 复制失败'), true);
           }
         });
 
