@@ -185,3 +185,24 @@ def test_scoring_basis_json_actions_are_visible_on_home_page():
             "scoring-basis",
         ],
     )
+
+
+def test_analysis_bundle_markdown_copy_action_is_visible_on_home_page():
+    main_text = _read_repo_file("app/main.py")
+
+    _assert_keywords_visible(
+        main_text,
+        [
+            "复制 analysis bundle Markdown",
+            "analysis_bundle",
+            "analysis bundle",
+            "项目分析包",
+            "Markdown",
+            "navigator.clipboard",
+            "不重新评分",
+            "不触发 rescore",
+            "不写 data",
+            "不接 Ollama",
+            "不接核心评分主链",
+        ],
+    )
