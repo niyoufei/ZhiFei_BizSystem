@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import os
 import shlex
 import socket
@@ -96,6 +97,17 @@ class BrowserMarkdownCopyPolicy:
     click_delta_paths: tuple[str, ...]
 
 
+@dataclasses.dataclass(frozen=True)
+class DataPreflightResult:
+    project_id: str
+    data_dir: Path
+    ok: bool
+    reasons: tuple[str, ...]
+    selected_submission_id: str = ""
+    selected_submission_status: str = ""
+    submissions_for_project: int = 0
+
+
 def parse_paths(value: str | None) -> list[str]:
     if not value:
         return ["/"]
@@ -125,6 +137,150 @@ def parse_statuses(value: str | None) -> set[int]:
     if not statuses:
         raise SmokeGuardError("No valid expected status codes were provided.")
     return statuses
+
+
+def default_data_dir() -> Path:
+    return Path(__file__).resolve().parents[1] / "data"
+
+
+def load_json_file(path: Path) -> object:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SmokeGuardError(f"invalid json: {path}") from exc
+
+
+def _is_scored_submission(row: object) -> bool:
+    if not isinstance(row, dict):
+        return False
+    report = row.get("report")
+    if isinstance(report, dict):
+        status = str(report.get("scoring_status") or "").strip().lower()
+        if status == "scored":
+            return True
+        if status in {"pending", "blocked"}:
+            return False
+        for key in ("rule_total_score", "pred_total_score", "total_score"):
+            if report.get(key) is not None:
+                return True
+    return row.get("total_score") is not None
+
+
+def _submission_status(row: object) -> str:
+    if not isinstance(row, dict):
+        return "unknown"
+    report = row.get("report")
+    if isinstance(report, dict):
+        status = str(report.get("scoring_status") or "").strip()
+        if status:
+            return status
+    if _is_scored_submission(row):
+        return "scored"
+    return "latest"
+
+
+def run_data_preflight(project_id: str, data_dir: Path) -> DataPreflightResult:
+    project_id = (project_id or "").strip()
+    reasons: list[str] = []
+    if not project_id:
+        reasons.append("missing project_id")
+        return DataPreflightResult(
+            project_id=project_id, data_dir=data_dir, ok=False, reasons=tuple(reasons)
+        )
+
+    if not data_dir.exists() or not data_dir.is_dir():
+        reasons.append("missing data directory")
+        return DataPreflightResult(
+            project_id=project_id, data_dir=data_dir, ok=False, reasons=tuple(reasons)
+        )
+
+    projects_path = data_dir / "projects.json"
+    submissions_path = data_dir / "submissions.json"
+
+    if not projects_path.exists():
+        reasons.append("missing data/projects.json")
+        return DataPreflightResult(
+            project_id=project_id, data_dir=data_dir, ok=False, reasons=tuple(reasons)
+        )
+
+    try:
+        projects = load_json_file(projects_path)
+    except SmokeGuardError as exc:
+        reasons.append(str(exc))
+        return DataPreflightResult(
+            project_id=project_id, data_dir=data_dir, ok=False, reasons=tuple(reasons)
+        )
+    if not isinstance(projects, list):
+        reasons.append("invalid json: data/projects.json is not a list")
+        return DataPreflightResult(
+            project_id=project_id, data_dir=data_dir, ok=False, reasons=tuple(reasons)
+        )
+    if not any(
+        isinstance(row, dict) and str(row.get("id") or "") == project_id for row in projects
+    ):
+        reasons.append("missing project_id")
+        return DataPreflightResult(
+            project_id=project_id, data_dir=data_dir, ok=False, reasons=tuple(reasons)
+        )
+
+    if not submissions_path.exists():
+        reasons.append("missing data/submissions.json")
+        return DataPreflightResult(
+            project_id=project_id, data_dir=data_dir, ok=False, reasons=tuple(reasons)
+        )
+
+    try:
+        submissions = load_json_file(submissions_path)
+    except SmokeGuardError as exc:
+        reasons.append(str(exc))
+        return DataPreflightResult(
+            project_id=project_id, data_dir=data_dir, ok=False, reasons=tuple(reasons)
+        )
+    if not isinstance(submissions, list):
+        reasons.append("invalid json: data/submissions.json is not a list")
+        return DataPreflightResult(
+            project_id=project_id, data_dir=data_dir, ok=False, reasons=tuple(reasons)
+        )
+
+    project_rows = [
+        row
+        for row in submissions
+        if isinstance(row, dict) and str(row.get("project_id") or "") == project_id
+    ]
+    if not project_rows:
+        reasons.append("no submissions for project_id")
+        return DataPreflightResult(
+            project_id=project_id,
+            data_dir=data_dir,
+            ok=False,
+            reasons=tuple(reasons),
+            submissions_for_project=0,
+        )
+
+    selectable_rows = [row for row in project_rows if str(row.get("id") or "").strip()]
+    selectable_rows.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
+    selected = next((row for row in selectable_rows if _is_scored_submission(row)), None)
+    if selected is None and selectable_rows:
+        selected = selectable_rows[0]
+    if selected is None:
+        reasons.append("no selectable latest/scored submission")
+        return DataPreflightResult(
+            project_id=project_id,
+            data_dir=data_dir,
+            ok=False,
+            reasons=tuple(reasons),
+            submissions_for_project=len(project_rows),
+        )
+
+    return DataPreflightResult(
+        project_id=project_id,
+        data_dir=data_dir,
+        ok=True,
+        reasons=(),
+        selected_submission_id=str(selected.get("id") or ""),
+        selected_submission_status=_submission_status(selected),
+        submissions_for_project=len(project_rows),
+    )
 
 
 def build_url(base_url: str, path: str) -> str:
@@ -639,6 +795,32 @@ def render_browser_markdown_copy_report(
     return "\n".join(lines) + "\n"
 
 
+def render_data_preflight_report(result: DataPreflightResult) -> str:
+    reasons = result.reasons or ("-",)
+    affected = (
+        "/api/v1/projects/{project_id}/evidence_trace/latest, "
+        "/api/v1/projects/{project_id}/scoring_basis/latest"
+    ).format(project_id=result.project_id or "-")
+    lines = [
+        "# smoke_guard data-preflight report",
+        "",
+        "- mode: data-preflight",
+        f"- project_id: {result.project_id or '-'}",
+        f"- data_dir: {result.data_dir}",
+        f"- data_dir_exists: {str(result.data_dir.exists()).lower()}",
+        f"- projects_json_exists: {str((result.data_dir / 'projects.json').exists()).lower()}",
+        f"- submissions_json_exists: {str((result.data_dir / 'submissions.json').exists()).lower()}",
+        f"- submissions_for_project: {result.submissions_for_project}",
+        f"- selected_submission_id: {result.selected_submission_id or '-'}",
+        f"- selected_submission_status: {result.selected_submission_status or '-'}",
+        f"- affected_endpoints: {affected}",
+        "- latest_submission_required: evidence_trace/latest and scoring_basis/latest need latest submission precondition data",
+        f"- missing_reasons: {', '.join(reasons)}",
+        f"- final_result: {'PASS' if result.ok else 'FAIL'}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def _add_probe_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--paths", default="/")
@@ -682,6 +864,12 @@ def build_parser() -> argparse.ArgumentParser:
     scenario.add_argument("--submission-id", default="")
     scenario.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     scenario.add_argument("--allow-status", default=DEFAULT_SCENARIO_STATUS)
+
+    data_preflight = subparsers.add_parser(
+        "data-preflight", help="Check read-only data preconditions for latest delivery APIs."
+    )
+    data_preflight.add_argument("--project-id", default="p1")
+    data_preflight.add_argument("--data-dir", default=str(default_data_dir()))
 
     browser_copy = subparsers.add_parser(
         "browser-markdown-copy",
@@ -824,6 +1012,15 @@ def run_scenario_mode(args: argparse.Namespace) -> int:
         end="",
     )
     return 0 if all(result.ok for result in results) else 1
+
+
+def run_data_preflight_mode(args: argparse.Namespace) -> int:
+    result = run_data_preflight(
+        project_id=args.project_id,
+        data_dir=Path(args.data_dir),
+    )
+    print(render_data_preflight_report(result), end="")
+    return 0 if result.ok else 1
 
 
 def run_browser_markdown_copy_mode(args: argparse.Namespace) -> int:
@@ -1044,6 +1241,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return run_start_probe_mode(args)
         if args.mode == "scenario":
             return run_scenario_mode(args)
+        if args.mode == "data-preflight":
+            return run_data_preflight_mode(args)
         if args.mode == "browser-markdown-copy":
             return run_browser_markdown_copy_mode(args)
     except SmokeGuardError as exc:

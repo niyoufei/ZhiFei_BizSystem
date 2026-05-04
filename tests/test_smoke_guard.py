@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import http.server
+import json
 import socket
 import threading
 from typing import Iterator
@@ -203,6 +204,74 @@ def test_scenario_qingtian_runtime_skips_report_latest_without_submission_id() -
     assert "/api/v1/projects/p1/analysis_bundle" in plan.paths
     assert all("reports/latest" not in path for path in plan.paths)
     assert plan.report_latest_skipped is True
+
+
+def _write_json(path, payload) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_data_preflight_fails_when_submissions_json_missing(tmp_path, capsys) -> None:
+    data_dir = tmp_path / "data"
+    _write_json(data_dir / "projects.json", [{"id": "p1", "name": "项目1"}])
+
+    code = smoke_guard.main(["data-preflight", "--project-id", "p1", "--data-dir", str(data_dir)])
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "missing data/submissions.json" in output
+    assert "evidence_trace/latest and scoring_basis/latest need latest submission" in output
+    assert "- final_result: FAIL" in output
+
+
+def test_data_preflight_fails_when_project_has_no_submissions(tmp_path, capsys) -> None:
+    data_dir = tmp_path / "data"
+    _write_json(data_dir / "projects.json", [{"id": "p1", "name": "项目1"}])
+    _write_json(data_dir / "submissions.json", [{"id": "s2", "project_id": "p2"}])
+
+    code = smoke_guard.main(["data-preflight", "--project-id", "p1", "--data-dir", str(data_dir)])
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "no submissions for project_id" in output
+    assert "- final_result: FAIL" in output
+
+
+def test_data_preflight_passes_with_selectable_project_submission(tmp_path, capsys) -> None:
+    data_dir = tmp_path / "data"
+    _write_json(data_dir / "projects.json", [{"id": "p1", "name": "项目1"}])
+    _write_json(
+        data_dir / "submissions.json",
+        [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "created_at": "2026-05-05T00:00:00+00:00",
+                "report": {"scoring_status": "scored"},
+            }
+        ],
+    )
+
+    code = smoke_guard.main(["data-preflight", "--project-id", "p1", "--data-dir", str(data_dir)])
+
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "- selected_submission_id: s1" in output
+    assert "- final_result: PASS" in output
+
+
+def test_data_preflight_fails_on_invalid_json(tmp_path, capsys) -> None:
+    data_dir = tmp_path / "data"
+    _write_json(data_dir / "projects.json", [{"id": "p1", "name": "项目1"}])
+    (data_dir / "submissions.json").write_text("{not-json", encoding="utf-8")
+
+    code = smoke_guard.main(["data-preflight", "--project-id", "p1", "--data-dir", str(data_dir)])
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "invalid json" in output
+    assert "submissions.json" in output
+    assert "- final_result: FAIL" in output
 
 
 def test_scenario_denylist_allows_scoring_readiness() -> None:
