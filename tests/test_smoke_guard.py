@@ -225,6 +225,166 @@ def test_scenario_denylist_blocks_action_paths(path: str) -> None:
     assert smoke_guard.scenario_forbidden_fragments(path)
 
 
+def test_browser_markdown_copy_help_is_visible(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        smoke_guard.main(["browser-markdown-copy", "--help"])
+    output = capsys.readouterr().out
+    assert exc_info.value.code == 0
+    assert "browser-markdown-copy" in output
+    assert "--browser-executable" in output
+    assert "--button-selector" in output
+
+
+def test_browser_markdown_copy_lazy_import_does_not_affect_other_modes(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fail_if_called() -> object:
+        raise AssertionError("playwright should be lazy for non-browser modes")
+
+    monkeypatch.setattr(smoke_guard, "load_playwright_sync_api", fail_if_called)
+    with local_server() as base_url:
+        assert smoke_guard.main(["probe", "--base-url", base_url, "--paths", "/"]) == 0
+        assert smoke_guard.main(["report", "--base-url", base_url, "--paths", "/"]) == 0
+        assert (
+            smoke_guard.main(
+                [
+                    "scenario",
+                    "--scenario-name",
+                    "basic-runtime",
+                    "--base-url",
+                    base_url,
+                    "--allow-status",
+                    "200,204",
+                ]
+            )
+            == 0
+        )
+    capsys.readouterr()
+
+
+def test_browser_markdown_copy_missing_playwright_reports_clear_error(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    browser = tmp_path / "chrome"
+    browser.write_text("#!/bin/sh\n", encoding="utf-8")
+    browser.chmod(0o755)
+
+    def missing_playwright() -> object:
+        raise smoke_guard.SmokeGuardError("Playwright is required for browser-markdown-copy")
+
+    monkeypatch.setattr(smoke_guard, "load_playwright_sync_api", missing_playwright)
+    code = smoke_guard.main(["browser-markdown-copy", "--browser-executable", str(browser)])
+    output = capsys.readouterr().out
+    assert code == 2
+    assert "Playwright is required for browser-markdown-copy" in output
+    assert "- final_result: FAIL" in output
+
+
+def test_browser_markdown_copy_external_base_url_fail_closed(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = smoke_guard.main(
+        [
+            "browser-markdown-copy",
+            "--base-url",
+            "https://example.com",
+            "--browser-executable",
+            "/not/used",
+        ]
+    )
+    output = capsys.readouterr().out
+    assert code == 2
+    assert "- external_network_seen: true" in output
+    assert "- final_result: FAIL" in output
+
+
+def test_browser_markdown_copy_missing_browser_executable_fail_closed(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = smoke_guard.main(
+        ["browser-markdown-copy", "--browser-executable", "/tmp/no-such-browser"]
+    )
+    output = capsys.readouterr().out
+    assert code == 2
+    assert "browser executable not found or not executable" in output
+    assert "- final_result: FAIL" in output
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/projects/p1/rescore",
+        "/api/v1/projects/p1/evolve/ollama_preview",
+        "/api/v1/projects/p1/download",
+        "/api/v1/projects/p1/export",
+        "/api/v1/projects/p1/analysis_bundle.md",
+    ],
+)
+def test_browser_markdown_copy_denylist_blocks_action_paths(path: str) -> None:
+    assert smoke_guard.browser_markdown_copy_forbidden_fragments(path)
+
+
+def test_browser_markdown_copy_denylist_allows_scoring_readiness() -> None:
+    assert (
+        smoke_guard.browser_markdown_copy_forbidden_fragments(
+            "/api/v1/projects/p1/scoring_readiness"
+        )
+        == []
+    )
+
+
+def test_browser_markdown_copy_init_request_allowlist() -> None:
+    policy = smoke_guard.build_browser_markdown_copy_policy("p1")
+    expected = {
+        "/",
+        "/api/v1/projects",
+        "/api/v1/projects/p1/expert-profile",
+        "/api/v1/projects/p1/submissions",
+        "/api/v1/projects/p1/materials",
+        "/api/v1/projects/p1/scoring_readiness",
+        "/api/v1/projects/p1/ground_truth",
+    }
+    assert set(policy.init_readonly_paths) == expected
+    for path in expected:
+        category, normalized, fragments = smoke_guard.classify_browser_markdown_copy_request(
+            method="GET",
+            url=f"http://127.0.0.1:8013{path}",
+            base_url="http://127.0.0.1:8013",
+            phase="init",
+            policy=policy,
+        )
+        assert category == "init_readonly_requests"
+        assert normalized == path
+        assert fragments == ()
+
+
+def test_browser_markdown_copy_click_delta_allowlist() -> None:
+    policy = smoke_guard.build_browser_markdown_copy_policy("p1")
+    category, normalized, fragments = smoke_guard.classify_browser_markdown_copy_request(
+        method="GET",
+        url="http://127.0.0.1:8013/api/v1/projects/p1/analysis_bundle",
+        base_url="http://127.0.0.1:8013",
+        phase="click",
+        policy=policy,
+    )
+    assert category == "click_delta_requests"
+    assert normalized == "/api/v1/projects/p1/analysis_bundle"
+    assert fragments == ()
+
+    category, normalized, _ = smoke_guard.classify_browser_markdown_copy_request(
+        method="GET",
+        url="http://127.0.0.1:8013/api/v1/projects/p1/materials",
+        base_url="http://127.0.0.1:8013",
+        phase="click",
+        policy=policy,
+    )
+    assert category == "forbidden_path"
+    assert normalized == "/api/v1/projects/p1/materials"
+
+
 def test_cli_scenario_external_base_url_fail_closed(capsys: pytest.CaptureFixture[str]) -> None:
     code = smoke_guard.main(
         ["scenario", "--scenario-name", "basic-runtime", "--base-url", "https://example.com"]

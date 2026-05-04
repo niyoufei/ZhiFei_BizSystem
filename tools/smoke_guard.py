@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import os
 import shlex
 import socket
 import subprocess
@@ -15,6 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Iterable, Sequence
 
 DEFAULT_TIMEOUT = 5.0
@@ -38,6 +40,15 @@ SCENARIO_FORBIDDEN_FRAGMENTS = (
     "download",
     "export",
     ".md",
+)
+DEFAULT_BROWSER_COPY_BUTTON_SELECTOR = "#btnAnalysisBundleMarkdownCopy"
+BROWSER_COPY_STATUS_MARKERS = (
+    "analysis bundle Markdown 已复制",
+    "不重新评分",
+    "不触发 rescore",
+    "不写 data",
+    "不接 Ollama",
+    "不接核心评分主链",
 )
 
 
@@ -75,6 +86,14 @@ class ScenarioPlan:
     submission_id: str
     paths: tuple[str, ...]
     report_latest_skipped: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class BrowserMarkdownCopyPolicy:
+    project_id: str
+    init_readonly_paths: tuple[str, ...]
+    browser_optional_paths: tuple[str, ...]
+    click_delta_paths: tuple[str, ...]
 
 
 def parse_paths(value: str | None) -> list[str]:
@@ -230,6 +249,110 @@ def scenario_forbidden_fragments(path: str) -> list[str]:
 def is_allowed_scenario_base_url(base_url: str) -> bool:
     parsed = urllib.parse.urlparse(base_url)
     return parsed.scheme in {"http", "https"} and parsed.hostname in LOCAL_SCENARIO_HOSTS
+
+
+def normalize_request_path(url: str, base_url: str) -> tuple[str, bool]:
+    """Return the request path and whether the URL stays under the local base host."""
+    parsed_url = urllib.parse.urlparse(url)
+    parsed_base = urllib.parse.urlparse(base_url)
+    if not parsed_url.scheme:
+        path = parsed_url.path or "/"
+        return path, True
+    same_host = (
+        parsed_url.scheme in {"http", "https"}
+        and parsed_url.hostname in LOCAL_SCENARIO_HOSTS
+        and parsed_url.hostname == parsed_base.hostname
+        and (parsed_url.port or default_port(parsed_url.scheme))
+        == (parsed_base.port or default_port(parsed_base.scheme))
+    )
+    return parsed_url.path or "/", same_host
+
+
+def default_port(scheme: str) -> int:
+    return 443 if scheme == "https" else 80
+
+
+def build_browser_markdown_copy_policy(
+    project_id: str,
+    *,
+    allow_init_readonly: bool = True,
+) -> BrowserMarkdownCopyPolicy:
+    project_id = (project_id or "").strip()
+    if not project_id:
+        raise SmokeGuardError("project_id is required for browser-markdown-copy")
+    init_paths = ("/",)
+    if allow_init_readonly:
+        init_paths = (
+            "/",
+            "/api/v1/projects",
+            f"/api/v1/projects/{project_id}/expert-profile",
+            f"/api/v1/projects/{project_id}/submissions",
+            f"/api/v1/projects/{project_id}/materials",
+            f"/api/v1/projects/{project_id}/scoring_readiness",
+            f"/api/v1/projects/{project_id}/ground_truth",
+        )
+    return BrowserMarkdownCopyPolicy(
+        project_id=project_id,
+        init_readonly_paths=init_paths,
+        browser_optional_paths=("/favicon.ico",),
+        click_delta_paths=(f"/api/v1/projects/{project_id}/analysis_bundle",),
+    )
+
+
+def browser_markdown_copy_forbidden_fragments(path: str) -> list[str]:
+    return scenario_forbidden_fragments(path)
+
+
+def classify_browser_markdown_copy_request(
+    *,
+    method: str,
+    url: str,
+    base_url: str,
+    phase: str,
+    policy: BrowserMarkdownCopyPolicy,
+) -> tuple[str, str, tuple[str, ...]]:
+    path, local = normalize_request_path(url, base_url)
+    if not local:
+        return "external", path, ()
+    if method.upper() != "GET":
+        return "forbidden_method", path, ()
+    fragments = tuple(browser_markdown_copy_forbidden_fragments(path))
+    if fragments:
+        return "forbidden_path", path, fragments
+    if path in policy.browser_optional_paths:
+        return "browser_optional_get", path, ()
+    if phase == "init" and path in policy.init_readonly_paths:
+        return "init_readonly_requests", path, ()
+    if phase == "click" and path in policy.click_delta_paths:
+        return "click_delta_requests", path, ()
+    return "forbidden_path", path, ()
+
+
+def browser_copy_markers(project_id: str) -> tuple[str, ...]:
+    return ("# 项目分析包", "项目ID", project_id, "验收指标")
+
+
+def validate_browser_executable(browser_executable: str) -> str:
+    if not browser_executable:
+        raise SmokeGuardError("browser executable is required for browser-markdown-copy")
+    path = Path(browser_executable).expanduser()
+    if not path.exists() or not path.is_file() or not os.access(path, os.X_OK):
+        raise SmokeGuardError(
+            f"browser executable not found or not executable: {browser_executable}"
+        )
+    return str(path)
+
+
+def load_playwright_sync_api():
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise SmokeGuardError(
+            "Playwright is required for browser-markdown-copy; "
+            "install it separately or use an environment where it is already available."
+        ) from exc
+    return sync_playwright, PlaywrightTimeoutError
 
 
 def build_scenario_plan(
@@ -460,6 +583,62 @@ def render_scenario_report(
     return "\n".join(lines) + "\n"
 
 
+def _format_request_list(requests: Sequence[tuple[str, str]]) -> str:
+    if not requests:
+        return "[]"
+    return "[" + ", ".join(f"{method} {path}" for method, path in requests) + "]"
+
+
+def render_browser_markdown_copy_report(
+    *,
+    base_url: str,
+    project_id: str,
+    browser_executable: str,
+    clicked_target: str,
+    init_readonly_requests: Sequence[tuple[str, str]],
+    browser_optional_get: Sequence[tuple[str, str]],
+    click_delta_requests: Sequence[tuple[str, str]],
+    forbidden_method_seen: bool,
+    forbidden_path_seen: bool,
+    external_network_seen: bool,
+    ollama_seen: bool,
+    clipboard_write_count: int,
+    copied_text: str,
+    marker_hits: dict[str, bool],
+    status_text: str,
+    final_result: bool,
+    error: str = "",
+) -> str:
+    copied_text_preview = copied_text[:120].replace("\n", " ")
+    lines = [
+        "# smoke_guard browser-markdown-copy report",
+        "",
+        "- mode: browser-markdown-copy",
+        f"- base_url: {base_url}",
+        f"- project_id: {project_id}",
+        f"- browser_executable: {browser_executable}",
+        f"- clicked_target: {clicked_target}",
+        f"- init_readonly_requests: {_format_request_list(init_readonly_requests)}",
+        f"- browser_optional_get: {_format_request_list(browser_optional_get)}",
+        f"- click_delta_requests: {_format_request_list(click_delta_requests)}",
+        f"- forbidden_method_seen: {str(forbidden_method_seen).lower()}",
+        f"- forbidden_path_seen: {str(forbidden_path_seen).lower()}",
+        f"- external_network_seen: {str(external_network_seen).lower()}",
+        f"- ollama_seen: {str(ollama_seen).lower()}",
+        f"- clipboard_write_count: {clipboard_write_count}",
+        f"- copied_text_captured: {str(bool(copied_text)).lower()}",
+        f"- copied_text_length: {len(copied_text)}",
+        f"- copied_text_preview: {copied_text_preview}",
+        f"- marker_hits: {marker_hits}",
+        f"- status_text: {status_text[:240]}",
+        "- system_clipboard_written: false",
+        f"- final_result: {'PASS' if final_result else 'FAIL'}",
+    ]
+    if error:
+        lines.append(f"- error: {error}")
+    return "\n".join(lines) + "\n"
+
+
 def _add_probe_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--paths", default="/")
@@ -503,6 +682,22 @@ def build_parser() -> argparse.ArgumentParser:
     scenario.add_argument("--submission-id", default="")
     scenario.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     scenario.add_argument("--allow-status", default=DEFAULT_SCENARIO_STATUS)
+
+    browser_copy = subparsers.add_parser(
+        "browser-markdown-copy",
+        help="Optionally verify the analysis bundle Markdown copy UI with an existing browser.",
+    )
+    browser_copy.add_argument("--base-url", default=DEFAULT_SCENARIO_BASE_URL)
+    browser_copy.add_argument("--project-id", default="p1")
+    browser_copy.add_argument("--browser-executable", default="")
+    browser_copy.add_argument("--button-selector", default=DEFAULT_BROWSER_COPY_BUTTON_SELECTOR)
+    browser_copy.add_argument("--timeout", type=float, default=10.0)
+    browser_copy.add_argument(
+        "--allow-init-readonly",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow known read-only homepage initialization GET requests.",
+    )
     return parser
 
 
@@ -631,6 +826,210 @@ def run_scenario_mode(args: argparse.Namespace) -> int:
     return 0 if all(result.ok for result in results) else 1
 
 
+def run_browser_markdown_copy_mode(args: argparse.Namespace) -> int:
+    project_id = (args.project_id or "").strip()
+    base_url = args.base_url
+    clicked_target = args.button_selector
+    policy = build_browser_markdown_copy_policy(
+        project_id,
+        allow_init_readonly=bool(args.allow_init_readonly),
+    )
+    init_readonly_requests: list[tuple[str, str]] = []
+    browser_optional_get: list[tuple[str, str]] = []
+    click_delta_requests: list[tuple[str, str]] = []
+    forbidden_method_seen = False
+    forbidden_path_seen = False
+    external_network_seen = False
+    ollama_seen = False
+    clipboard_write_count = 0
+    copied_text = ""
+    status_text = ""
+    marker_hits: dict[str, bool] = {}
+    browser = None
+    final_result = False
+    error = ""
+
+    def emit() -> int:
+        print(
+            render_browser_markdown_copy_report(
+                base_url=base_url,
+                project_id=project_id,
+                browser_executable=args.browser_executable,
+                clicked_target=clicked_target,
+                init_readonly_requests=init_readonly_requests,
+                browser_optional_get=browser_optional_get,
+                click_delta_requests=click_delta_requests,
+                forbidden_method_seen=forbidden_method_seen,
+                forbidden_path_seen=forbidden_path_seen,
+                external_network_seen=external_network_seen,
+                ollama_seen=ollama_seen,
+                clipboard_write_count=clipboard_write_count,
+                copied_text=copied_text,
+                marker_hits=marker_hits,
+                status_text=status_text,
+                final_result=final_result,
+                error=error,
+            ),
+            end="",
+        )
+        return 0 if final_result else 2
+
+    if not is_allowed_scenario_base_url(base_url):
+        external_network_seen = True
+        error = "external base URL blocked"
+        return emit()
+
+    try:
+        browser_executable = validate_browser_executable(args.browser_executable)
+        sync_playwright, PlaywrightTimeoutError = load_playwright_sync_api()
+    except SmokeGuardError as exc:
+        error = str(exc)
+        return emit()
+
+    phase = "init"
+
+    def record_request(method: str, url: str) -> None:
+        nonlocal forbidden_method_seen
+        nonlocal forbidden_path_seen
+        nonlocal external_network_seen
+        nonlocal ollama_seen
+        category, path, fragments = classify_browser_markdown_copy_request(
+            method=method,
+            url=url,
+            base_url=base_url,
+            phase=phase,
+            policy=policy,
+        )
+        if "ollama" in path.lower() or "ollama" in fragments:
+            ollama_seen = True
+        if category == "external":
+            external_network_seen = True
+        elif category == "forbidden_method":
+            forbidden_method_seen = True
+        elif category == "forbidden_path":
+            forbidden_path_seen = True
+        elif category == "browser_optional_get":
+            browser_optional_get.append((method.upper(), path))
+        elif category == "init_readonly_requests":
+            init_readonly_requests.append((method.upper(), path))
+        elif category == "click_delta_requests":
+            click_delta_requests.append((method.upper(), path))
+
+    timeout_ms = int(args.timeout * 1000)
+
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                executable_path=browser_executable,
+                args=["--disable-gpu", "--no-first-run", "--no-default-browser-check"],
+            )
+            context = browser.new_context(base_url=base_url)
+            context.add_init_script(
+                """
+                (() => {
+                  window.__copiedText = null;
+                  window.__clipboardWriteCount = 0;
+                  Object.defineProperty(navigator, 'clipboard', {
+                    configurable: true,
+                    value: {
+                      writeText: async (text) => {
+                        window.__copiedText = String(text);
+                        window.__clipboardWriteCount += 1;
+                        return Promise.resolve();
+                      }
+                    }
+                  });
+                })();
+                """
+            )
+            page = context.new_page()
+            page.on("request", lambda request: record_request(request.method, request.url))
+            page.goto("/", wait_until="domcontentloaded", timeout=timeout_ms)
+            try:
+                page.wait_for_load_state("networkidle", timeout=timeout_ms)
+            except PlaywrightTimeoutError:
+                pass
+
+            for selector in (
+                "#projectId",
+                "#project_id",
+                "input[name='project_id']",
+                "input[name='projectId']",
+            ):
+                try:
+                    locator = page.locator(selector)
+                    if locator.count() > 0:
+                        locator.first.fill(project_id)
+                        break
+                except Exception:
+                    pass
+
+            phase = "click"
+            click_delta_requests.clear()
+            button = page.locator(args.button_selector)
+            if button.count() == 0:
+                button = page.get_by_text("复制 analysis bundle Markdown", exact=True)
+            button.first.click(timeout=timeout_ms)
+            page.wait_for_function(
+                "() => window.__clipboardWriteCount > 0 && typeof window.__copiedText === 'string'",
+                timeout=timeout_ms,
+            )
+
+            copied_text = str(page.evaluate("window.__copiedText") or "")
+            clipboard_write_count = int(page.evaluate("window.__clipboardWriteCount") or 0)
+
+            for selector in (
+                "#analysisBundleMarkdownCopyStatus",
+                "[data-testid='analysisBundleMarkdownCopyStatus']",
+            ):
+                try:
+                    locator = page.locator(selector)
+                    if locator.count() > 0:
+                        status_text = locator.first.inner_text(timeout=2000)
+                        break
+                except Exception:
+                    pass
+
+            marker_hits = {
+                marker: (marker in copied_text) for marker in browser_copy_markers(project_id)
+            }
+            status_hits = {
+                marker: (marker in status_text) for marker in BROWSER_COPY_STATUS_MARKERS
+            }
+            final_result = (
+                not forbidden_method_seen
+                and not forbidden_path_seen
+                and not external_network_seen
+                and not ollama_seen
+                and clipboard_write_count >= 1
+                and len(copied_text) > 1000
+                and all(marker_hits.values())
+                and all(status_hits.values())
+            )
+            if not final_result:
+                missing_markers = [marker for marker, hit in marker_hits.items() if not hit]
+                missing_status = [marker for marker, hit in status_hits.items() if not hit]
+                details = []
+                if missing_markers:
+                    details.append("missing copied text markers: " + ", ".join(missing_markers))
+                if missing_status:
+                    details.append("missing status text markers: " + ", ".join(missing_status))
+                if details:
+                    error = "; ".join(details)
+    except Exception as exc:
+        error = str(exc)
+        final_result = False
+    finally:
+        try:
+            if browser is not None:
+                browser.close()
+        except Exception:
+            pass
+
+    return emit()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -645,6 +1044,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return run_start_probe_mode(args)
         if args.mode == "scenario":
             return run_scenario_mode(args)
+        if args.mode == "browser-markdown-copy":
+            return run_browser_markdown_copy_mode(args)
     except SmokeGuardError as exc:
         print("# smoke_guard error report")
         print()
