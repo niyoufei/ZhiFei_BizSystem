@@ -11,16 +11,34 @@ import dataclasses
 import shlex
 import socket
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Iterable, Sequence
 
-
 DEFAULT_TIMEOUT = 5.0
 DEFAULT_EXPECTED_STATUSES = frozenset({200, 204, 301, 302})
+DEFAULT_SCENARIO_BASE_URL = "http://127.0.0.1:8013"
+DEFAULT_SCENARIO_STATUS = "200"
+LOCAL_SCENARIO_HOSTS = frozenset({"127.0.0.1", "localhost"})
+SCENARIO_NAMES = (
+    "basic-runtime",
+    "light-page",
+    "api-status",
+    "delivery-read",
+    "qingtian-runtime-v1",
+)
+SCENARIO_FORBIDDEN_FRAGMENTS = (
+    "/score",
+    "rescore",
+    "evolve",
+    "ollama",
+    "compare_report",
+    "download",
+    "export",
+    ".md",
+)
 
 
 class SmokeGuardError(RuntimeError):
@@ -48,6 +66,15 @@ class PortProbeResult:
     ok: bool
     latency_ms: float
     error: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
+class ScenarioPlan:
+    name: str
+    project_id: str
+    submission_id: str
+    paths: tuple[str, ...]
+    report_latest_skipped: bool
 
 
 def parse_paths(value: str | None) -> list[str]:
@@ -181,7 +208,9 @@ def check_port(host: str, port: int, *, timeout: float = DEFAULT_TIMEOUT) -> Por
             return PortProbeResult(host=host, port=port, ok=True, latency_ms=latency_ms)
     except OSError as exc:
         latency_ms = (time.monotonic() - started) * 1000
-        return PortProbeResult(host=host, port=port, ok=False, latency_ms=latency_ms, error=str(exc))
+        return PortProbeResult(
+            host=host, port=port, ok=False, latency_ms=latency_ms, error=str(exc)
+        )
 
 
 def prepare_start_command(start_cmd: str) -> list[str]:
@@ -191,6 +220,68 @@ def prepare_start_command(start_cmd: str) -> list[str]:
     if any(part.endswith(".sh") for part in parts):
         raise SmokeGuardError("start command must not invoke shell script files.")
     return parts
+
+
+def scenario_forbidden_fragments(path: str) -> list[str]:
+    path_lower = path.lower()
+    return [fragment for fragment in SCENARIO_FORBIDDEN_FRAGMENTS if fragment in path_lower]
+
+
+def is_allowed_scenario_base_url(base_url: str) -> bool:
+    parsed = urllib.parse.urlparse(base_url)
+    return parsed.scheme in {"http", "https"} and parsed.hostname in LOCAL_SCENARIO_HOSTS
+
+
+def build_scenario_plan(
+    scenario_name: str,
+    *,
+    project_id: str = "p1",
+    submission_id: str = "",
+) -> ScenarioPlan:
+    project_id = (project_id or "").strip()
+    submission_id = (submission_id or "").strip()
+    if not project_id:
+        raise SmokeGuardError("project_id is required for scenario")
+    if scenario_name not in SCENARIO_NAMES:
+        raise SmokeGuardError(f"Unsupported scenario name: {scenario_name}")
+
+    report_latest_skipped = False
+    if scenario_name == "basic-runtime":
+        paths = ["/health", "/ready", "/"]
+    elif scenario_name == "light-page":
+        paths = ["/", "/__ping__"]
+    elif scenario_name == "api-status":
+        paths = ["/api/v1/auth/status", "/api/v1/rate_limit/status", "/api/v1/config/status"]
+    elif scenario_name == "delivery-read":
+        if not submission_id:
+            raise SmokeGuardError("submission_id required for delivery-read")
+        paths = [
+            f"/api/v1/submissions/{submission_id}/reports/latest",
+            f"/api/v1/projects/{project_id}/analysis_bundle",
+        ]
+    else:
+        paths = [
+            "/health",
+            "/ready",
+            "/",
+            "/__ping__",
+            "/api/v1/auth/status",
+            "/api/v1/rate_limit/status",
+            "/api/v1/config/status",
+            f"/api/v1/projects/{project_id}/analysis_bundle",
+        ]
+        if submission_id:
+            paths.append(f"/api/v1/submissions/{submission_id}/reports/latest")
+        else:
+            report_latest_skipped = True
+
+    return ScenarioPlan(
+        name=scenario_name,
+        project_id=project_id,
+        submission_id=submission_id,
+        paths=tuple(paths),
+        report_latest_skipped=report_latest_skipped,
+    )
 
 
 def wait_until_ready(
@@ -285,7 +376,14 @@ def render_url_report(
             lines.append(f"- `{result.path}`: {result.error or 'probe failed'}")
     else:
         lines.append("- none")
-    lines.extend(["", "## summary", f"- checked: `{len(results)}`", f"- passed: `{len(results) - len(failures)}`"])
+    lines.extend(
+        [
+            "",
+            "## summary",
+            f"- checked: `{len(results)}`",
+            f"- passed: `{len(results) - len(failures)}`",
+        ]
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -306,6 +404,62 @@ def render_port_report(result: PortProbeResult) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_scenario_report(
+    *,
+    plan: ScenarioPlan,
+    base_url: str,
+    results: Sequence[UrlProbeResult],
+    forbidden_seen: bool,
+    external_base_url_blocked: bool,
+    error: str = "",
+) -> str:
+    passed = (
+        bool(results)
+        and all(result.ok for result in results)
+        and not forbidden_seen
+        and not external_base_url_blocked
+        and not error
+    )
+    if error:
+        passed = False
+    lines = [
+        "# smoke_guard scenario report",
+        "",
+        "- mode: scenario",
+        f"- scenario_name: {plan.name}",
+        f"- base_url: {base_url}",
+        f"- project_id: {plan.project_id}",
+        f"- submission_id_present: {str(bool(plan.submission_id)).lower()}",
+        f"- request_count: {len(results)}",
+        f"- forbidden_seen: {str(forbidden_seen).lower()}",
+        f"- external_base_url_blocked: {str(external_base_url_blocked).lower()}",
+        f"- report_latest_skipped: {str(plan.report_latest_skipped).lower()}",
+        f"- final_result: {'PASS' if passed else 'FAIL'}",
+    ]
+    if error:
+        lines.append(f"- error: {error}")
+    lines.extend(
+        [
+            "",
+            "## requests",
+            "| method | path | status | ok |",
+            "|---|---|---:|---|",
+        ]
+    )
+    if results:
+        for result in results:
+            lines.append(
+                "| GET | {path} | {status} | {ok} |".format(
+                    path=result.path,
+                    status=result.status_code if result.status_code is not None else "",
+                    ok=str(result.ok).lower(),
+                )
+            )
+    else:
+        lines.append("|  |  |  |  |")
+    return "\n".join(lines) + "\n"
+
+
 def _add_probe_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--paths", default="/")
@@ -315,13 +469,17 @@ def _add_probe_options(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Runtime smoke guard for externally managed services.")
+    parser = argparse.ArgumentParser(
+        description="Runtime smoke guard for externally managed services."
+    )
     subparsers = parser.add_subparsers(dest="mode", required=True)
 
     probe = subparsers.add_parser("probe", help="Probe one or more HTTP paths.")
     _add_probe_options(probe)
 
-    check_port_parser = subparsers.add_parser("check-port", help="Check whether a TCP port is open.")
+    check_port_parser = subparsers.add_parser(
+        "check-port", help="Check whether a TCP port is open."
+    )
     check_port_parser.add_argument("--host", default="127.0.0.1")
     check_port_parser.add_argument("--port", required=True, type=int)
     check_port_parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
@@ -329,10 +487,22 @@ def build_parser() -> argparse.ArgumentParser:
     report = subparsers.add_parser("report", help="Alias for a Markdown URL probe report.")
     _add_probe_options(report)
 
-    start_probe = subparsers.add_parser("start-probe", help="Start an explicit command, then probe URLs.")
+    start_probe = subparsers.add_parser(
+        "start-probe", help="Start an explicit command, then probe URLs."
+    )
     start_probe.add_argument("--start-cmd", required=True)
     start_probe.add_argument("--startup-timeout", type=float, default=10.0)
     _add_probe_options(start_probe)
+
+    scenario = subparsers.add_parser(
+        "scenario", help="Run a predefined optional runtime acceptance scenario."
+    )
+    scenario.add_argument("--scenario-name", required=True, choices=SCENARIO_NAMES)
+    scenario.add_argument("--base-url", default=DEFAULT_SCENARIO_BASE_URL)
+    scenario.add_argument("--project-id", default="p1")
+    scenario.add_argument("--submission-id", default="")
+    scenario.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    scenario.add_argument("--allow-status", default=DEFAULT_SCENARIO_STATUS)
     return parser
 
 
@@ -346,7 +516,9 @@ def run_probe_mode(args: argparse.Namespace, *, title: str = "probe") -> int:
         expected_statuses=statuses,
         expected_text=args.expect_text,
     )
-    print(render_url_report(title=title, base_url=args.base_url, paths=paths, results=results), end="")
+    print(
+        render_url_report(title=title, base_url=args.base_url, paths=paths, results=results), end=""
+    )
     return 0 if all(result.ok for result in results) else 1
 
 
@@ -367,7 +539,95 @@ def run_start_probe_mode(args: argparse.Namespace) -> int:
         timeout=args.timeout,
         expected_statuses=statuses,
     )
-    print(render_url_report(title="start-probe", base_url=args.base_url, paths=paths, results=results), end="")
+    print(
+        render_url_report(
+            title="start-probe", base_url=args.base_url, paths=paths, results=results
+        ),
+        end="",
+    )
+    return 0 if all(result.ok for result in results) else 1
+
+
+def run_scenario_mode(args: argparse.Namespace) -> int:
+    try:
+        plan = build_scenario_plan(
+            args.scenario_name,
+            project_id=args.project_id,
+            submission_id=args.submission_id,
+        )
+    except SmokeGuardError as exc:
+        fallback_plan = ScenarioPlan(
+            name=args.scenario_name,
+            project_id=(args.project_id or "").strip(),
+            submission_id=(args.submission_id or "").strip(),
+            paths=(),
+            report_latest_skipped=False,
+        )
+        print(
+            render_scenario_report(
+                plan=fallback_plan,
+                base_url=args.base_url,
+                results=[],
+                forbidden_seen=False,
+                external_base_url_blocked=False,
+                error=str(exc),
+            ),
+            end="",
+        )
+        return 2
+
+    external_base_url_blocked = not is_allowed_scenario_base_url(args.base_url)
+    if external_base_url_blocked:
+        print(
+            render_scenario_report(
+                plan=plan,
+                base_url=args.base_url,
+                results=[],
+                forbidden_seen=False,
+                external_base_url_blocked=True,
+                error="external base URL blocked",
+            ),
+            end="",
+        )
+        return 2
+
+    forbidden_paths = {
+        path: fragments for path in plan.paths if (fragments := scenario_forbidden_fragments(path))
+    }
+    if forbidden_paths:
+        detail = "; ".join(
+            f"{path}: {', '.join(fragments)}" for path, fragments in forbidden_paths.items()
+        )
+        print(
+            render_scenario_report(
+                plan=plan,
+                base_url=args.base_url,
+                results=[],
+                forbidden_seen=True,
+                external_base_url_blocked=False,
+                error=f"forbidden scenario path fragments: {detail}",
+            ),
+            end="",
+        )
+        return 2
+
+    statuses = parse_statuses(args.allow_status)
+    results = probe_urls(
+        args.base_url,
+        list(plan.paths),
+        timeout=args.timeout,
+        expected_statuses=statuses,
+    )
+    print(
+        render_scenario_report(
+            plan=plan,
+            base_url=args.base_url,
+            results=results,
+            forbidden_seen=False,
+            external_base_url_blocked=False,
+        ),
+        end="",
+    )
     return 0 if all(result.ok for result in results) else 1
 
 
@@ -383,6 +643,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return run_check_port_mode(args)
         if args.mode == "start-probe":
             return run_start_probe_mode(args)
+        if args.mode == "scenario":
+            return run_scenario_mode(args)
     except SmokeGuardError as exc:
         print("# smoke_guard error report")
         print()

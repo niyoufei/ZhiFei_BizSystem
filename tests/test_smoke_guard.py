@@ -63,7 +63,10 @@ def test_parse_paths_defaults_to_root() -> None:
 
 
 def test_build_url_joins_base_and_path() -> None:
-    assert smoke_guard.build_url("http://127.0.0.1:8000/base", "health") == "http://127.0.0.1:8000/base/health"
+    assert (
+        smoke_guard.build_url("http://127.0.0.1:8000/base", "health")
+        == "http://127.0.0.1:8000/base/health"
+    )
 
 
 def test_parse_statuses_defaults_and_custom_values() -> None:
@@ -110,22 +113,32 @@ def test_expect_text_miss_marks_result_failed() -> None:
 def test_multi_path_with_one_failure_is_overall_fail() -> None:
     with local_server() as base_url:
         results = smoke_guard.probe_urls(base_url, ["/", "/missing"], timeout=2)
-    report = smoke_guard.render_url_report(title="probe", base_url=base_url, paths=["/", "/missing"], results=results)
+    report = smoke_guard.render_url_report(
+        title="probe", base_url=base_url, paths=["/", "/missing"], results=results
+    )
     assert [result.ok for result in results] == [True, False]
     assert "- result: FAIL" in report
 
 
 def test_markdown_report_pass() -> None:
-    result = smoke_guard.UrlProbeResult("/", "http://example.local/", True, 200, 1.5, "text/plain", 5, (), ())
-    report = smoke_guard.render_url_report(title="probe", base_url="http://example.local", paths=["/"], results=[result])
+    result = smoke_guard.UrlProbeResult(
+        "/", "http://example.local/", True, 200, 1.5, "text/plain", 5, (), ()
+    )
+    report = smoke_guard.render_url_report(
+        title="probe", base_url="http://example.local", paths=["/"], results=[result]
+    )
     assert "# smoke_guard probe report" in report
     assert "- result: PASS" in report
     assert "- none" in report
 
 
 def test_markdown_report_fail() -> None:
-    result = smoke_guard.UrlProbeResult("/", "http://example.local/", False, 500, 1.5, "text/plain", 5, (), (), "bad")
-    report = smoke_guard.render_url_report(title="probe", base_url="http://example.local", paths=["/"], results=[result])
+    result = smoke_guard.UrlProbeResult(
+        "/", "http://example.local/", False, 500, 1.5, "text/plain", 5, (), (), "bad"
+    )
+    report = smoke_guard.render_url_report(
+        title="probe", base_url="http://example.local", paths=["/"], results=[result]
+    )
     assert "- result: FAIL" in report
     assert "`/`: bad" in report
 
@@ -137,12 +150,110 @@ def test_check_port_closed_reports_failure() -> None:
 
 
 def test_prepare_start_command_uses_argument_vector() -> None:
-    assert smoke_guard.prepare_start_command("python3 -m http.server 0") == ["python3", "-m", "http.server", "0"]
+    assert smoke_guard.prepare_start_command("python3 -m http.server 0") == [
+        "python3",
+        "-m",
+        "http.server",
+        "0",
+    ]
 
 
 def test_prepare_start_command_rejects_shell_script_files() -> None:
     with pytest.raises(smoke_guard.SmokeGuardError):
         smoke_guard.prepare_start_command("run.sh")
+
+
+def test_scenario_basic_runtime_paths() -> None:
+    plan = smoke_guard.build_scenario_plan("basic-runtime")
+    assert plan.paths == ("/health", "/ready", "/")
+    assert plan.report_latest_skipped is False
+
+
+def test_scenario_light_page_paths() -> None:
+    plan = smoke_guard.build_scenario_plan("light-page")
+    assert plan.paths == ("/", "/__ping__")
+
+
+def test_scenario_api_status_paths() -> None:
+    plan = smoke_guard.build_scenario_plan("api-status")
+    assert plan.paths == (
+        "/api/v1/auth/status",
+        "/api/v1/rate_limit/status",
+        "/api/v1/config/status",
+    )
+
+
+def test_scenario_delivery_read_requires_submission_id() -> None:
+    with pytest.raises(
+        smoke_guard.SmokeGuardError, match="submission_id required for delivery-read"
+    ):
+        smoke_guard.build_scenario_plan("delivery-read", project_id="p1")
+
+
+def test_scenario_delivery_read_paths_with_submission_id() -> None:
+    plan = smoke_guard.build_scenario_plan("delivery-read", project_id="p1", submission_id="s1")
+    assert plan.paths == (
+        "/api/v1/submissions/s1/reports/latest",
+        "/api/v1/projects/p1/analysis_bundle",
+    )
+
+
+def test_scenario_qingtian_runtime_skips_report_latest_without_submission_id() -> None:
+    plan = smoke_guard.build_scenario_plan("qingtian-runtime-v1", project_id="p1")
+    assert "/api/v1/projects/p1/analysis_bundle" in plan.paths
+    assert all("reports/latest" not in path for path in plan.paths)
+    assert plan.report_latest_skipped is True
+
+
+def test_scenario_denylist_allows_scoring_readiness() -> None:
+    assert smoke_guard.scenario_forbidden_fragments("/api/v1/projects/p1/scoring_readiness") == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/projects/p1/score",
+        "/api/v1/projects/p1/rescore",
+        "/api/v1/projects/p1/evolve",
+        "/api/v1/projects/p1/evolve/ollama_preview",
+        "/api/v1/projects/p1/download",
+        "/api/v1/projects/p1/export",
+        "/api/v1/projects/p1/analysis_bundle.md",
+    ],
+)
+def test_scenario_denylist_blocks_action_paths(path: str) -> None:
+    assert smoke_guard.scenario_forbidden_fragments(path)
+
+
+def test_cli_scenario_external_base_url_fail_closed(capsys: pytest.CaptureFixture[str]) -> None:
+    code = smoke_guard.main(
+        ["scenario", "--scenario-name", "basic-runtime", "--base-url", "https://example.com"]
+    )
+    output = capsys.readouterr().out
+    assert code == 2
+    assert "external_base_url_blocked: true" in output
+    assert "final_result: FAIL" in output
+
+
+def test_cli_scenario_basic_runtime_success(capsys: pytest.CaptureFixture[str]) -> None:
+    with local_server() as base_url:
+        code = smoke_guard.main(
+            [
+                "scenario",
+                "--scenario-name",
+                "basic-runtime",
+                "--base-url",
+                base_url,
+                "--allow-status",
+                "200,204",
+            ]
+        )
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "- mode: scenario" in output
+    assert "- scenario_name: basic-runtime" in output
+    assert "- request_count: 3" in output
+    assert "- final_result: PASS" in output
 
 
 def test_cli_probe_returns_zero_for_success(capsys: pytest.CaptureFixture[str]) -> None:
@@ -170,7 +281,9 @@ def test_cli_report_mode_outputs_markdown(capsys: pytest.CaptureFixture[str]) ->
 
 
 def test_cli_check_port_closed_returns_nonzero(capsys: pytest.CaptureFixture[str]) -> None:
-    code = smoke_guard.main(["check-port", "--host", "127.0.0.1", "--port", str(closed_port()), "--timeout", "0.2"])
+    code = smoke_guard.main(
+        ["check-port", "--host", "127.0.0.1", "--port", str(closed_port()), "--timeout", "0.2"]
+    )
     output = capsys.readouterr().out
     assert code == 1
     assert "port_status: `closed`" in output
