@@ -31,7 +31,9 @@ SCENARIO_NAMES = (
     "api-status",
     "delivery-read",
     "qingtian-runtime-v1",
+    "qingtian-data-preflight-v1",
 )
+SCENARIO_NAMES_HELP = ", ".join(SCENARIO_NAMES)
 SCENARIO_FORBIDDEN_FRAGMENTS = (
     "/score",
     "rescore",
@@ -538,6 +540,8 @@ def build_scenario_plan(
             f"/api/v1/submissions/{submission_id}/reports/latest",
             f"/api/v1/projects/{project_id}/analysis_bundle",
         ]
+    elif scenario_name == "qingtian-data-preflight-v1":
+        paths = []
     else:
         paths = [
             "/health",
@@ -821,6 +825,39 @@ def render_data_preflight_report(result: DataPreflightResult) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_data_preflight_scenario_report(
+    *,
+    scenario_name: str,
+    result: DataPreflightResult,
+) -> str:
+    reasons = result.reasons or ("-",)
+    affected = (
+        "/api/v1/projects/{project_id}/evidence_trace/latest, "
+        "/api/v1/projects/{project_id}/scoring_basis/latest"
+    ).format(project_id=result.project_id or "-")
+    lines = [
+        "# smoke_guard scenario report",
+        "",
+        "- mode: scenario",
+        f"- scenario_name: {scenario_name}",
+        "- scenario_kind: data-preflight",
+        f"- project_id: {result.project_id or '-'}",
+        f"- data_dir: {result.data_dir}",
+        "- http_access_used: false",
+        f"- data_dir_exists: {str(result.data_dir.exists()).lower()}",
+        f"- projects_json_exists: {str((result.data_dir / 'projects.json').exists()).lower()}",
+        f"- submissions_json_exists: {str((result.data_dir / 'submissions.json').exists()).lower()}",
+        f"- submissions_for_project: {result.submissions_for_project}",
+        f"- selected_submission_id: {result.selected_submission_id or '-'}",
+        f"- selected_submission_status: {result.selected_submission_status or '-'}",
+        f"- affected_endpoints: {affected}",
+        "- latest_submission_required: evidence_trace/latest and scoring_basis/latest need latest submission precondition data",
+        f"- missing_reasons: {', '.join(reasons)}",
+        f"- final_result: {'PASS' if result.ok else 'FAIL'}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def _add_probe_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--paths", default="/")
@@ -856,12 +893,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_probe_options(start_probe)
 
     scenario = subparsers.add_parser(
-        "scenario", help="Run a predefined optional runtime acceptance scenario."
+        "scenario",
+        help=f"Run a predefined optional runtime acceptance scenario: {SCENARIO_NAMES_HELP}.",
     )
-    scenario.add_argument("--scenario-name", required=True, choices=SCENARIO_NAMES)
+    scenario.add_argument("--scenario-name", dest="scenario_name", choices=SCENARIO_NAMES)
+    scenario.add_argument("--name", dest="scenario_name", choices=SCENARIO_NAMES)
     scenario.add_argument("--base-url", default=DEFAULT_SCENARIO_BASE_URL)
     scenario.add_argument("--project-id", default="p1")
     scenario.add_argument("--submission-id", default="")
+    scenario.add_argument("--data-dir", default=str(default_data_dir()))
     scenario.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     scenario.add_argument("--allow-status", default=DEFAULT_SCENARIO_STATUS)
 
@@ -932,15 +972,51 @@ def run_start_probe_mode(args: argparse.Namespace) -> int:
 
 
 def run_scenario_mode(args: argparse.Namespace) -> int:
+    scenario_name = (getattr(args, "scenario_name", "") or "").strip()
+    if not scenario_name:
+        fallback_plan = ScenarioPlan(
+            name="-",
+            project_id=(args.project_id or "").strip(),
+            submission_id=(args.submission_id or "").strip(),
+            paths=(),
+            report_latest_skipped=False,
+        )
+        print(
+            render_scenario_report(
+                plan=fallback_plan,
+                base_url=args.base_url,
+                results=[],
+                forbidden_seen=False,
+                external_base_url_blocked=False,
+                error="scenario name is required",
+            ),
+            end="",
+        )
+        return 2
+
+    if scenario_name == "qingtian-data-preflight-v1":
+        result = run_data_preflight(
+            project_id=args.project_id,
+            data_dir=Path(args.data_dir),
+        )
+        print(
+            render_data_preflight_scenario_report(
+                scenario_name=scenario_name,
+                result=result,
+            ),
+            end="",
+        )
+        return 0 if result.ok else 1
+
     try:
         plan = build_scenario_plan(
-            args.scenario_name,
+            scenario_name,
             project_id=args.project_id,
             submission_id=args.submission_id,
         )
     except SmokeGuardError as exc:
         fallback_plan = ScenarioPlan(
-            name=args.scenario_name,
+            name=scenario_name,
             project_id=(args.project_id or "").strip(),
             submission_id=(args.submission_id or "").strip(),
             paths=(),

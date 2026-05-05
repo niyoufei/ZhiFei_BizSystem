@@ -206,6 +206,15 @@ def test_scenario_qingtian_runtime_skips_report_latest_without_submission_id() -
     assert plan.report_latest_skipped is True
 
 
+def test_scenario_names_include_qingtian_data_preflight_v1() -> None:
+    assert "qingtian-data-preflight-v1" in smoke_guard.SCENARIO_NAMES
+
+
+def test_scenario_qingtian_data_preflight_has_no_http_paths() -> None:
+    plan = smoke_guard.build_scenario_plan("qingtian-data-preflight-v1", project_id="p1")
+    assert plan.paths == ()
+
+
 def _write_json(path, payload) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -272,6 +281,92 @@ def test_data_preflight_fails_on_invalid_json(tmp_path, capsys) -> None:
     assert "invalid json" in output
     assert "submissions.json" in output
     assert "- final_result: FAIL" in output
+
+
+def test_scenario_qingtian_data_preflight_fails_when_submissions_json_missing(
+    tmp_path, capsys
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_json(data_dir / "projects.json", [{"id": "p1", "name": "项目1"}])
+
+    code = smoke_guard.main(
+        [
+            "scenario",
+            "--name",
+            "qingtian-data-preflight-v1",
+            "--project-id",
+            "p1",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "- mode: scenario" in output
+    assert "- scenario_name: qingtian-data-preflight-v1" in output
+    assert "- http_access_used: false" in output
+    assert "missing data/submissions.json" in output
+    assert "- final_result: FAIL" in output
+
+
+def test_scenario_qingtian_data_preflight_passes_with_fixture(tmp_path, capsys) -> None:
+    data_dir = tmp_path / "data"
+    _write_json(data_dir / "projects.json", [{"id": "p1", "name": "项目1"}])
+    _write_json(
+        data_dir / "submissions.json",
+        [
+            {
+                "id": "s1",
+                "project_id": "p1",
+                "created_at": "2026-05-05T00:00:00+00:00",
+                "report": {"scoring_status": "scored"},
+            }
+        ],
+    )
+
+    code = smoke_guard.main(
+        [
+            "scenario",
+            "--name",
+            "qingtian-data-preflight-v1",
+            "--project-id",
+            "p1",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "- selected_submission_id: s1" in output
+    assert "- final_result: PASS" in output
+
+
+def test_scenario_qingtian_runtime_v1_does_not_require_submissions_json(tmp_path, capsys) -> None:
+    data_dir = tmp_path / "data"
+    _write_json(data_dir / "projects.json", [{"id": "p1", "name": "项目1"}])
+
+    with local_server() as base_url:
+        code = smoke_guard.main(
+            [
+                "scenario",
+                "--name",
+                "qingtian-runtime-v1",
+                "--base-url",
+                base_url,
+                "--allow-status",
+                "200,204",
+                "--data-dir",
+                str(data_dir),
+            ]
+        )
+
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "- scenario_name: qingtian-runtime-v1" in output
+    assert "missing data/submissions.json" not in output
+    assert "- final_result: PASS" in output
 
 
 def test_scenario_denylist_allows_scoring_readiness() -> None:
