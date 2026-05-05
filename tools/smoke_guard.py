@@ -13,6 +13,7 @@ import os
 import shlex
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -32,6 +33,7 @@ SCENARIO_NAMES = (
     "delivery-read",
     "qingtian-runtime-v1",
     "qingtian-data-preflight-v1",
+    "qingtian-external-data-runtime-v1",
 )
 SCENARIO_NAMES_HELP = ", ".join(SCENARIO_NAMES)
 SCENARIO_FORBIDDEN_FRAGMENTS = (
@@ -108,6 +110,23 @@ class DataPreflightResult:
     selected_submission_id: str = ""
     selected_submission_status: str = ""
     submissions_for_project: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
+class ExternalDataRuntimeResult:
+    project_id: str
+    data_dir: Path
+    ok: bool
+    returncode: int = 0
+    qingtian_data_dir: str = ""
+    storage_data_dir_match: bool = False
+    storage_submissions_path_match: bool = False
+    evidence_trace_status: str = ""
+    scoring_basis_status: str = ""
+    evidence_trace_submission_id: str = ""
+    scoring_basis_submission_id: str = ""
+    scoring_status: str = ""
+    error: str = ""
 
 
 def parse_paths(value: str | None) -> list[str]:
@@ -282,6 +301,134 @@ def run_data_preflight(project_id: str, data_dir: Path) -> DataPreflightResult:
         selected_submission_id=str(selected.get("id") or ""),
         selected_submission_status=_submission_status(selected),
         submissions_for_project=len(project_rows),
+    )
+
+
+def _parse_key_value_output(output: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in output.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key:
+            values[key] = value.strip()
+    return values
+
+
+def run_external_data_runtime(
+    project_id: str,
+    data_dir: Path,
+    *,
+    repo: Path | None = None,
+    timeout: float = 30.0,
+) -> ExternalDataRuntimeResult:
+    project_id = (project_id or "").strip()
+    resolved_data_dir = data_dir.expanduser().resolve()
+    if not project_id:
+        return ExternalDataRuntimeResult(
+            project_id=project_id,
+            data_dir=resolved_data_dir,
+            ok=False,
+            returncode=1,
+            error="missing project_id",
+        )
+
+    repo_root = (repo or Path(__file__).resolve().parents[1]).resolve()
+    env = os.environ.copy()
+    env["QINGTIAN_DATA_DIR"] = str(resolved_data_dir)
+    env["QINGTIAN_PROJECT_ID"] = project_id
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONPATH"] = (
+        str(repo_root)
+        if not env.get("PYTHONPATH")
+        else f"{repo_root}{os.pathsep}{env['PYTHONPATH']}"
+    )
+
+    script = r"""
+from pathlib import Path
+import os
+import urllib.parse
+
+from fastapi.testclient import TestClient
+
+from app import storage
+from app.main import app
+
+project_id = os.environ["QINGTIAN_PROJECT_ID"]
+expected_data_dir = Path(os.environ["QINGTIAN_DATA_DIR"]).expanduser().resolve()
+quoted_project_id = urllib.parse.quote(project_id, safe="")
+
+print(f"QINGTIAN_DATA_DIR={storage.DATA_DIR}")
+print(f"DATA_DIR_MATCH={storage.DATA_DIR == expected_data_dir}")
+print(f"SUBMISSIONS_PATH_MATCH={storage.SUBMISSIONS_PATH == expected_data_dir / 'submissions.json'}")
+
+client = TestClient(app)
+evidence = client.get(f"/api/v1/projects/{quoted_project_id}/evidence_trace/latest")
+scoring_basis = client.get(f"/api/v1/projects/{quoted_project_id}/scoring_basis/latest")
+print(f"EVIDENCE_TRACE_STATUS={evidence.status_code}")
+print(f"SCORING_BASIS_STATUS={scoring_basis.status_code}")
+
+evidence_payload = evidence.json() if evidence.status_code == 200 else {}
+scoring_basis_payload = scoring_basis.json() if scoring_basis.status_code == 200 else {}
+print(f"EVIDENCE_TRACE_SUBMISSION_ID={evidence_payload.get('submission_id', '')}")
+print(f"SCORING_BASIS_SUBMISSION_ID={scoring_basis_payload.get('submission_id', '')}")
+print(f"SCORING_STATUS={scoring_basis_payload.get('scoring_status', '')}")
+"""
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=repo_root,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return ExternalDataRuntimeResult(
+            project_id=project_id,
+            data_dir=resolved_data_dir,
+            ok=False,
+            returncode=1,
+            error=f"external data runtime subprocess timed out: {exc}",
+        )
+
+    values = _parse_key_value_output(proc.stdout)
+    evidence_status = values.get("EVIDENCE_TRACE_STATUS", "")
+    scoring_basis_status = values.get("SCORING_BASIS_STATUS", "")
+    evidence_submission_id = values.get("EVIDENCE_TRACE_SUBMISSION_ID", "")
+    scoring_basis_submission_id = values.get("SCORING_BASIS_SUBMISSION_ID", "")
+    data_dir_match = values.get("DATA_DIR_MATCH", "").lower() == "true"
+    submissions_path_match = values.get("SUBMISSIONS_PATH_MATCH", "").lower() == "true"
+    ok = (
+        proc.returncode == 0
+        and data_dir_match
+        and submissions_path_match
+        and evidence_status == "200"
+        and scoring_basis_status == "200"
+        and bool(evidence_submission_id)
+        and evidence_submission_id == scoring_basis_submission_id
+    )
+    error = ""
+    if not ok:
+        error = proc.stderr.strip() or "external data runtime validation failed"
+
+    return ExternalDataRuntimeResult(
+        project_id=project_id,
+        data_dir=resolved_data_dir,
+        ok=ok,
+        returncode=proc.returncode,
+        qingtian_data_dir=values.get("QINGTIAN_DATA_DIR", ""),
+        storage_data_dir_match=data_dir_match,
+        storage_submissions_path_match=submissions_path_match,
+        evidence_trace_status=evidence_status,
+        scoring_basis_status=scoring_basis_status,
+        evidence_trace_submission_id=evidence_submission_id,
+        scoring_basis_submission_id=scoring_basis_submission_id,
+        scoring_status=values.get("SCORING_STATUS", ""),
+        error=error,
     )
 
 
@@ -540,7 +687,10 @@ def build_scenario_plan(
             f"/api/v1/submissions/{submission_id}/reports/latest",
             f"/api/v1/projects/{project_id}/analysis_bundle",
         ]
-    elif scenario_name == "qingtian-data-preflight-v1":
+    elif scenario_name in {
+        "qingtian-data-preflight-v1",
+        "qingtian-external-data-runtime-v1",
+    }:
         paths = []
     else:
         paths = [
@@ -858,6 +1008,43 @@ def render_data_preflight_scenario_report(
     return "\n".join(lines) + "\n"
 
 
+def render_external_data_runtime_scenario_report(
+    *,
+    scenario_name: str,
+    result: ExternalDataRuntimeResult,
+) -> str:
+    lines = [
+        "# smoke_guard scenario report",
+        "",
+        "- mode: scenario",
+        f"- scenario_name: {scenario_name}",
+        "- scenario_kind: external-data-runtime",
+        f"- project_id: {result.project_id or '-'}",
+        f"- data_dir: {result.data_dir}",
+        "- uvicorn_started: false",
+        "- http_server_started: false",
+        "- browser_started: false",
+        "- external_network_used: false",
+        "- ollama_used: false",
+        f"- qingtian_data_dir: {result.qingtian_data_dir or '-'}",
+        f"- storage_data_dir_match: {str(result.storage_data_dir_match).lower()}",
+        (
+            "- storage_submissions_path_match: "
+            f"{str(result.storage_submissions_path_match).lower()}"
+        ),
+        f"- subprocess_exit_code: {result.returncode}",
+        f"- evidence_trace_status: {result.evidence_trace_status or '-'}",
+        f"- scoring_basis_status: {result.scoring_basis_status or '-'}",
+        f"- evidence_trace_submission_id: {result.evidence_trace_submission_id}",
+        f"- scoring_basis_submission_id: {result.scoring_basis_submission_id}",
+        f"- scoring_status: {result.scoring_status}",
+        f"- final_result: {'PASS' if result.ok else 'FAIL'}",
+    ]
+    if result.error:
+        lines.append(f"- error: {result.error}")
+    return "\n".join(lines) + "\n"
+
+
 def _add_probe_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--paths", default="/")
@@ -901,7 +1088,7 @@ def build_parser() -> argparse.ArgumentParser:
     scenario.add_argument("--base-url", default=DEFAULT_SCENARIO_BASE_URL)
     scenario.add_argument("--project-id", default="p1")
     scenario.add_argument("--submission-id", default="")
-    scenario.add_argument("--data-dir", default=str(default_data_dir()))
+    scenario.add_argument("--data-dir", default="")
     scenario.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     scenario.add_argument("--allow-status", default=DEFAULT_SCENARIO_STATUS)
 
@@ -997,10 +1184,43 @@ def run_scenario_mode(args: argparse.Namespace) -> int:
     if scenario_name == "qingtian-data-preflight-v1":
         result = run_data_preflight(
             project_id=args.project_id,
-            data_dir=Path(args.data_dir),
+            data_dir=Path(args.data_dir) if args.data_dir else default_data_dir(),
         )
         print(
             render_data_preflight_scenario_report(
+                scenario_name=scenario_name,
+                result=result,
+            ),
+            end="",
+        )
+        return 0 if result.ok else 1
+
+    if scenario_name == "qingtian-external-data-runtime-v1":
+        data_dir_arg = (args.data_dir or "").strip()
+        if not data_dir_arg:
+            result = ExternalDataRuntimeResult(
+                project_id=(args.project_id or "").strip(),
+                data_dir=Path("-"),
+                ok=False,
+                returncode=1,
+                error="missing --data-dir for qingtian-external-data-runtime-v1",
+            )
+            print(
+                render_external_data_runtime_scenario_report(
+                    scenario_name=scenario_name,
+                    result=result,
+                ),
+                end="",
+            )
+            return 1
+
+        result = run_external_data_runtime(
+            project_id=args.project_id,
+            data_dir=Path(data_dir_arg),
+            timeout=args.timeout,
+        )
+        print(
+            render_external_data_runtime_scenario_report(
                 scenario_name=scenario_name,
                 result=result,
             ),

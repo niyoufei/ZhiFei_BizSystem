@@ -210,14 +210,62 @@ def test_scenario_names_include_qingtian_data_preflight_v1() -> None:
     assert "qingtian-data-preflight-v1" in smoke_guard.SCENARIO_NAMES
 
 
+def test_scenario_names_include_qingtian_external_data_runtime_v1() -> None:
+    assert "qingtian-external-data-runtime-v1" in smoke_guard.SCENARIO_NAMES
+
+
 def test_scenario_qingtian_data_preflight_has_no_http_paths() -> None:
     plan = smoke_guard.build_scenario_plan("qingtian-data-preflight-v1", project_id="p1")
+    assert plan.paths == ()
+
+
+def test_scenario_qingtian_external_data_runtime_has_no_http_paths() -> None:
+    plan = smoke_guard.build_scenario_plan("qingtian-external-data-runtime-v1", project_id="p1")
     assert plan.paths == ()
 
 
 def _write_json(path, payload) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _write_runtime_external_data_root(data_dir) -> None:
+    _write_json(data_dir / "projects.json", [{"id": "p1", "name": "Synthetic Runtime Project"}])
+    _write_json(
+        data_dir / "submissions.json",
+        [
+            {
+                "id": "tmp-runtime-s1",
+                "project_id": "p1",
+                "filename": "tmp-runtime-submission.md",
+                "text": "Synthetic runtime submission with measurable item 100.",
+                "created_at": "2026-01-01T00:00:00Z",
+                "report": {
+                    "scoring_status": "scored",
+                    "rule_total_score": 88,
+                    "meta": {
+                        "evidence_trace": {
+                            "total_requirements": 1,
+                            "total_hits": 1,
+                        },
+                        "input_injection": {
+                            "mece_inputs": {
+                                "materials_quality_gate_passed": True,
+                            },
+                        },
+                        "material_quality": {"status": "ok"},
+                        "material_retrieval": {"used": False},
+                        "material_utilization": {"status": "not_applicable"},
+                        "material_utilization_gate": {
+                            "passed": True,
+                            "reasons": [],
+                        },
+                    },
+                    "requirement_hits": [],
+                },
+            }
+        ],
+    )
 
 
 def test_data_preflight_fails_when_submissions_json_missing(tmp_path, capsys) -> None:
@@ -340,6 +388,63 @@ def test_scenario_qingtian_data_preflight_passes_with_fixture(tmp_path, capsys) 
     output = capsys.readouterr().out
     assert code == 0
     assert "- selected_submission_id: s1" in output
+    assert "- final_result: PASS" in output
+
+
+def test_scenario_qingtian_external_data_runtime_requires_data_dir(capsys) -> None:
+    code = smoke_guard.main(
+        [
+            "scenario",
+            "--name",
+            "qingtian-external-data-runtime-v1",
+            "--project-id",
+            "p1",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "- scenario_name: qingtian-external-data-runtime-v1" in output
+    assert "- scenario_kind: external-data-runtime" in output
+    assert "missing --data-dir for qingtian-external-data-runtime-v1" in output
+    assert "- uvicorn_started: false" in output
+    assert "- http_server_started: false" in output
+    assert "- final_result: FAIL" in output
+
+
+def test_scenario_qingtian_external_data_runtime_passes_with_fixture(tmp_path, capsys) -> None:
+    data_dir = tmp_path / "external-data"
+    data_dir.mkdir()
+    _write_runtime_external_data_root(data_dir)
+
+    code = smoke_guard.main(
+        [
+            "scenario",
+            "--name",
+            "qingtian-external-data-runtime-v1",
+            "--project-id",
+            "p1",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "- scenario_name: qingtian-external-data-runtime-v1" in output
+    assert "- scenario_kind: external-data-runtime" in output
+    assert "- uvicorn_started: false" in output
+    assert "- http_server_started: false" in output
+    assert "- browser_started: false" in output
+    assert "- external_network_used: false" in output
+    assert "- ollama_used: false" in output
+    assert "- evidence_trace_status: 200" in output
+    assert "- scoring_basis_status: 200" in output
+    assert "- evidence_trace_submission_id: tmp-runtime-s1" in output
+    assert "- scoring_basis_submission_id: tmp-runtime-s1" in output
+    assert "- scoring_status: scored" in output
+    assert "- storage_data_dir_match: true" in output
+    assert "- storage_submissions_path_match: true" in output
     assert "- final_result: PASS" in output
 
 
