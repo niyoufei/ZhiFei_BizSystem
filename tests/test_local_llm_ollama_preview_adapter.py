@@ -15,9 +15,13 @@ from app.engine.local_llm_ollama_preview_adapter import (
     build_failure_response,
     build_real_ollama_preview_client,
     fetch_local_ollama_models,
+    get_ollama_num_predict,
+    get_ollama_timeout_seconds,
     is_ollama_preview_enabled,
     is_ollama_real_transport_enabled,
     normalize_ollama_response,
+    parse_ollama_num_predict,
+    parse_ollama_timeout_seconds,
     run_ollama_preview,
     select_local_ollama_model,
     validate_ollama_preview_boundary,
@@ -114,6 +118,64 @@ def test_is_ollama_real_transport_enabled_accepts_only_true_values() -> None:
     assert is_ollama_real_transport_enabled("on") is True
     assert is_ollama_real_transport_enabled("false") is False
     assert is_ollama_real_transport_enabled(None) is False
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, adapter.DEFAULT_TIMEOUT_SECONDS),
+        ("", adapter.DEFAULT_TIMEOUT_SECONDS),
+        ("not-a-number", adapter.DEFAULT_TIMEOUT_SECONDS),
+        ("-1", adapter.DEFAULT_TIMEOUT_SECONDS),
+        ("0", adapter.DEFAULT_TIMEOUT_SECONDS),
+        ("12.5", 12.5),
+        (str(adapter.MAX_TIMEOUT_SECONDS + 20), adapter.MAX_TIMEOUT_SECONDS),
+    ],
+)
+def test_parse_ollama_timeout_seconds_uses_safe_default_and_max(
+    value: str | None, expected: float
+) -> None:
+    assert parse_ollama_timeout_seconds(value) == expected
+
+
+def test_get_ollama_timeout_seconds_reads_expected_env_name() -> None:
+    requested: list[str] = []
+
+    def fake_getter(name: str) -> str | None:
+        requested.append(name)
+        return "7.25"
+
+    assert get_ollama_timeout_seconds(fake_getter) == 7.25
+    assert requested == [adapter.TIMEOUT_ENV_NAME]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, adapter.DEFAULT_GENERATE_NUM_PREDICT),
+        ("", adapter.DEFAULT_GENERATE_NUM_PREDICT),
+        ("not-a-number", adapter.DEFAULT_GENERATE_NUM_PREDICT),
+        ("-1", adapter.DEFAULT_GENERATE_NUM_PREDICT),
+        ("0", adapter.DEFAULT_GENERATE_NUM_PREDICT),
+        ("8", 8),
+        (str(adapter.MAX_GENERATE_NUM_PREDICT + 20), adapter.MAX_GENERATE_NUM_PREDICT),
+    ],
+)
+def test_parse_ollama_num_predict_uses_safe_default_and_max(
+    value: str | None, expected: int
+) -> None:
+    assert parse_ollama_num_predict(value) == expected
+
+
+def test_get_ollama_num_predict_reads_expected_env_name() -> None:
+    requested: list[str] = []
+
+    def fake_getter(name: str) -> str | None:
+        requested.append(name)
+        return "6"
+
+    assert get_ollama_num_predict(fake_getter) == 6
+    assert requested == [adapter.NUM_PREDICT_ENV_NAME]
 
 
 def test_validate_ollama_preview_boundary_rejects_invalid_input_before_client() -> None:
@@ -301,6 +363,38 @@ def test_real_ollama_preview_client_posts_generate_request_with_fake_transport()
     ]
 
 
+@pytest.mark.parametrize(
+    ("num_predict", "expected"),
+    [
+        ("", adapter.DEFAULT_GENERATE_NUM_PREDICT),
+        (0, adapter.DEFAULT_GENERATE_NUM_PREDICT),
+        (-1, adapter.DEFAULT_GENERATE_NUM_PREDICT),
+        (adapter.MAX_GENERATE_NUM_PREDICT + 5, adapter.MAX_GENERATE_NUM_PREDICT),
+    ],
+)
+def test_real_ollama_preview_client_bounds_num_predict_with_fake_transport(
+    num_predict: object, expected: int
+) -> None:
+    calls: list[dict] = []
+
+    def fake_transport(request, timeout: float) -> _FakeHttpResponse:
+        calls.append(json.loads(request.data.decode("utf-8")))
+        return _FakeHttpResponse(b'{"response":"OK","done":true}')
+
+    client = build_real_ollama_preview_client(
+        num_predict=num_predict,  # type: ignore[arg-type]
+        transport=fake_transport,
+    )
+    client(
+        {
+            "model": "local-a",
+            "messages": [{"role": "user", "content": "Return OK only."}],
+        }
+    )
+
+    assert calls[0]["options"] == {"num_predict": expected}
+
+
 def test_real_client_fake_unreachable_returns_ollama_unreachable() -> None:
     def fake_transport(*_: object, **__: object) -> _FakeHttpResponse:
         raise adapter.urllib_error.URLError(ConnectionRefusedError("refused"))
@@ -350,6 +444,30 @@ def test_real_client_fake_invalid_json_returns_invalid_response() -> None:
 
     assert response["status"] == "error"
     assert response["error_type"] == "invalid_response"
+    assert response["preview_only"] is True
+    assert response["no_write"] is True
+    assert response["affects_score"] is False
+
+
+def test_real_client_fake_model_404_returns_model_unavailable() -> None:
+    def fake_transport(*_: object, **__: object) -> _FakeHttpResponse:
+        raise adapter.urllib_error.HTTPError(
+            url=f"{OLLAMA_LOCAL_BASE_URL}/api/generate",
+            code=404,
+            msg="not found",
+            hdrs=None,
+            fp=None,
+        )
+
+    response = run_ollama_preview(
+        feature_flag_value="true",
+        prompt=_valid_prompt(),
+        model="missing-model",
+        client=build_real_ollama_preview_client(transport=fake_transport),
+    )
+
+    assert response["status"] == "error"
+    assert response["error_type"] == "model_unavailable"
     assert response["preview_only"] is True
     assert response["no_write"] is True
     assert response["affects_score"] is False

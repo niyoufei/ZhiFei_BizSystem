@@ -6406,6 +6406,8 @@ def _build_local_llm_ollama_preview_response(
     metadata = dict(payload) if isinstance(payload, dict) else {}
     client = None
     real_transport_enabled = _local_llm_ollama_real_transport_enabled()
+    timeout_seconds = local_llm_ollama_preview_adapter.get_ollama_timeout_seconds()
+    num_predict = local_llm_ollama_preview_adapter.get_ollama_num_predict()
     adapter_response: Optional[
         Dict[str, object]
     ] = local_llm_ollama_preview_adapter.validate_ollama_preview_boundary(
@@ -6418,12 +6420,13 @@ def _build_local_llm_ollama_preview_response(
         try:
             selected_model = local_llm_ollama_preview_adapter.select_local_ollama_model(
                 configured_model=os.getenv(local_llm_ollama_preview_adapter.MODEL_ENV_NAME),
-                timeout_seconds=local_llm_ollama_preview_adapter.DEFAULT_TIMEOUT_SECONDS,
+                timeout_seconds=timeout_seconds,
             )
             if selected_model:
                 model = selected_model
                 client = local_llm_ollama_preview_adapter.build_real_ollama_preview_client(
-                    timeout_seconds=local_llm_ollama_preview_adapter.DEFAULT_TIMEOUT_SECONDS
+                    timeout_seconds=timeout_seconds,
+                    num_predict=num_predict,
                 )
             else:
                 adapter_response = local_llm_ollama_preview_adapter.build_failure_response(
@@ -6473,7 +6476,7 @@ def _build_local_llm_ollama_preview_response(
             feature_flag_value=os.getenv(LOCAL_LLM_OLLAMA_PREVIEW_ADAPTER_FLAG),
             prompt=prompt,
             model=model,
-            timeout_seconds=local_llm_ollama_preview_adapter.DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds=timeout_seconds,
             client=client,
             metadata=metadata,
         )

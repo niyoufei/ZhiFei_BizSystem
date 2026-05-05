@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import socket
 from copy import deepcopy
 from typing import Any, Callable, Mapping
@@ -15,9 +17,13 @@ ADAPTER_SOURCE = "ollama_preview_adapter"
 FEATURE_FLAG_NAME = "LOCAL_LLM_OLLAMA_PREVIEW_ADAPTER_ENABLED"
 REAL_TRANSPORT_FEATURE_FLAG_NAME = "LOCAL_LLM_OLLAMA_REAL_TRANSPORT_ENABLED"
 MODEL_ENV_NAME = "LOCAL_LLM_OLLAMA_MODEL"
+TIMEOUT_ENV_NAME = "LOCAL_LLM_OLLAMA_TIMEOUT_SECONDS"
+NUM_PREDICT_ENV_NAME = "LOCAL_LLM_OLLAMA_NUM_PREDICT"
 TRUE_VALUES = {"true", "1", "yes", "on"}
 DEFAULT_TIMEOUT_SECONDS = 5.0
+MAX_TIMEOUT_SECONDS = 60.0
 DEFAULT_GENERATE_NUM_PREDICT = 128
+MAX_GENERATE_NUM_PREDICT = 128
 OLLAMA_LOCAL_BASE_URL = "http://127.0.0.1:11434"
 PROMPT_EXCERPT_LIMIT = 200
 RESPONSE_SUMMARY_LIMIT = 500
@@ -66,6 +72,48 @@ def is_ollama_real_transport_enabled(value: str | None) -> bool:
     """Return whether the explicit real transport flag permits localhost calls."""
     normalized = str(value or "").strip().lower()
     return normalized in TRUE_VALUES
+
+
+def parse_ollama_timeout_seconds(value: Any) -> float:
+    """Parse a bounded timeout value for preview-only Ollama transport."""
+    if value is None:
+        return DEFAULT_TIMEOUT_SECONDS
+    try:
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_TIMEOUT_SECONDS
+    if not math.isfinite(parsed) or parsed <= 0:
+        return DEFAULT_TIMEOUT_SECONDS
+    return min(MAX_TIMEOUT_SECONDS, parsed)
+
+
+def get_ollama_timeout_seconds(
+    environ_get: Callable[[str], str | None] | None = None,
+) -> float:
+    """Read the optional timeout environment setting with safe bounds."""
+    getter = environ_get or os.getenv
+    return parse_ollama_timeout_seconds(getter(TIMEOUT_ENV_NAME))
+
+
+def parse_ollama_num_predict(value: Any) -> int:
+    """Parse a bounded generation limit for preview-only Ollama transport."""
+    if value is None:
+        return DEFAULT_GENERATE_NUM_PREDICT
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_GENERATE_NUM_PREDICT
+    if parsed <= 0:
+        return DEFAULT_GENERATE_NUM_PREDICT
+    return min(MAX_GENERATE_NUM_PREDICT, parsed)
+
+
+def get_ollama_num_predict(
+    environ_get: Callable[[str], str | None] | None = None,
+) -> int:
+    """Read the optional num_predict environment setting with safe bounds."""
+    getter = environ_get or os.getenv
+    return parse_ollama_num_predict(getter(NUM_PREDICT_ENV_NAME))
 
 
 def validate_ollama_preview_boundary(
@@ -476,11 +524,7 @@ def _send_json_request(
 
 
 def _bounded_num_predict(value: int) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return DEFAULT_GENERATE_NUM_PREDICT
-    return min(128, max(1, parsed))
+    return parse_ollama_num_predict(value)
 
 
 def _build_mock_fallback(

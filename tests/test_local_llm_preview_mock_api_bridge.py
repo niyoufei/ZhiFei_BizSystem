@@ -12,6 +12,8 @@ FLAG = "LOCAL_LLM_PREVIEW_MOCK_API_ENABLED"
 ADAPTER_FLAG = "LOCAL_LLM_OLLAMA_PREVIEW_ADAPTER_ENABLED"
 REAL_TRANSPORT_FLAG = "LOCAL_LLM_OLLAMA_REAL_TRANSPORT_ENABLED"
 MODEL_FLAG = "LOCAL_LLM_OLLAMA_MODEL"
+TIMEOUT_FLAG = "LOCAL_LLM_OLLAMA_TIMEOUT_SECONDS"
+NUM_PREDICT_FLAG = "LOCAL_LLM_OLLAMA_NUM_PREDICT"
 
 
 def _client() -> TestClient:
@@ -40,6 +42,8 @@ def _clear_adapter_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(ADAPTER_FLAG, raising=False)
     monkeypatch.delenv(REAL_TRANSPORT_FLAG, raising=False)
     monkeypatch.delenv(MODEL_FLAG, raising=False)
+    monkeypatch.delenv(TIMEOUT_FLAG, raising=False)
+    monkeypatch.delenv(NUM_PREDICT_FLAG, raising=False)
 
 
 def _patch_helper_to_fail(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -406,8 +410,132 @@ def test_real_transport_enabled_with_fake_tags_uses_local_model(
     assert data["no_write"] is True
     assert data["affects_score"] is False
     assert build_calls == [
-        {"timeout_seconds": app_main.local_llm_ollama_preview_adapter.DEFAULT_TIMEOUT_SECONDS}
+        {
+            "timeout_seconds": app_main.local_llm_ollama_preview_adapter.DEFAULT_TIMEOUT_SECONDS,
+            "num_predict": app_main.local_llm_ollama_preview_adapter.DEFAULT_GENERATE_NUM_PREDICT,
+        }
     ]
+
+
+def test_real_transport_uses_timeout_and_num_predict_env_controls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    select_calls: list[dict] = []
+    build_calls: list[dict] = []
+
+    def fake_select_model(**kwargs) -> str:
+        select_calls.append(deepcopy(kwargs))
+        return "local-model-a"
+
+    def fake_build_client(**kwargs):
+        build_calls.append(deepcopy(kwargs))
+        return lambda _: {"response": "Config controlled preview."}
+
+    monkeypatch.setenv(FLAG, "true")
+    monkeypatch.setenv(ADAPTER_FLAG, "true")
+    monkeypatch.setenv(REAL_TRANSPORT_FLAG, "true")
+    monkeypatch.setenv(TIMEOUT_FLAG, "12.5")
+    monkeypatch.setenv(NUM_PREDICT_FLAG, "6")
+    monkeypatch.setattr(
+        app_main.local_llm_ollama_preview_adapter,
+        "select_local_ollama_model",
+        fake_select_model,
+    )
+    monkeypatch.setattr(
+        app_main.local_llm_ollama_preview_adapter,
+        "build_real_ollama_preview_client",
+        fake_build_client,
+    )
+    _patch_forbidden_runtime_paths(monkeypatch)
+
+    response = _client().post(PATH, json=_valid_payload())
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["model"] == "local-model-a"
+    assert data["preview_only"] is True
+    assert data["no_write"] is True
+    assert data["affects_score"] is False
+    assert select_calls == [{"configured_model": None, "timeout_seconds": 12.5}]
+    assert build_calls == [{"timeout_seconds": 12.5, "num_predict": 6}]
+
+
+def test_real_transport_invalid_timeout_and_num_predict_fall_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    build_calls: list[dict] = []
+
+    def fake_build_client(**kwargs):
+        build_calls.append(deepcopy(kwargs))
+        return lambda _: {"response": "Fallback config preview."}
+
+    monkeypatch.setenv(FLAG, "true")
+    monkeypatch.setenv(ADAPTER_FLAG, "true")
+    monkeypatch.setenv(REAL_TRANSPORT_FLAG, "true")
+    monkeypatch.setenv(TIMEOUT_FLAG, "not-a-number")
+    monkeypatch.setenv(NUM_PREDICT_FLAG, "-1")
+    monkeypatch.setattr(
+        app_main.local_llm_ollama_preview_adapter,
+        "select_local_ollama_model",
+        lambda **_: "local-model-a",
+    )
+    monkeypatch.setattr(
+        app_main.local_llm_ollama_preview_adapter,
+        "build_real_ollama_preview_client",
+        fake_build_client,
+    )
+
+    response = _client().post(PATH, json=_valid_payload())
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["preview_only"] is True
+    assert data["no_write"] is True
+    assert data["affects_score"] is False
+    assert build_calls == [
+        {
+            "timeout_seconds": app_main.local_llm_ollama_preview_adapter.DEFAULT_TIMEOUT_SECONDS,
+            "num_predict": app_main.local_llm_ollama_preview_adapter.DEFAULT_GENERATE_NUM_PREDICT,
+        }
+    ]
+
+
+def test_real_transport_env_model_unavailable_returns_stable_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected: list[str | None] = []
+
+    def fake_select_model(**kwargs) -> None:
+        selected.append(kwargs["configured_model"])
+        return None
+
+    monkeypatch.setenv(FLAG, "true")
+    monkeypatch.setenv(ADAPTER_FLAG, "true")
+    monkeypatch.setenv(REAL_TRANSPORT_FLAG, "true")
+    monkeypatch.setenv(MODEL_FLAG, "missing-local-model")
+    monkeypatch.setattr(
+        app_main.local_llm_ollama_preview_adapter,
+        "select_local_ollama_model",
+        fake_select_model,
+    )
+    monkeypatch.setattr(
+        app_main.local_llm_ollama_preview_adapter,
+        "build_real_ollama_preview_client",
+        _fail_call,
+    )
+
+    response = _client().post(PATH, json=_valid_payload())
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "error"
+    assert data["error_type"] == "model_unavailable"
+    assert data["preview_only"] is True
+    assert data["no_write"] is True
+    assert data["affects_score"] is False
+    assert selected == ["missing-local-model"]
 
 
 def test_real_transport_prefers_env_model_over_tags(
