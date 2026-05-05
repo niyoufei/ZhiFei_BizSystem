@@ -10,6 +10,8 @@ import app.main as app_main
 PATH = "/local-llm/preview-mock"
 FLAG = "LOCAL_LLM_PREVIEW_MOCK_API_ENABLED"
 ADAPTER_FLAG = "LOCAL_LLM_OLLAMA_PREVIEW_ADAPTER_ENABLED"
+REAL_TRANSPORT_FLAG = "LOCAL_LLM_OLLAMA_REAL_TRANSPORT_ENABLED"
+MODEL_FLAG = "LOCAL_LLM_OLLAMA_MODEL"
 
 
 def _client() -> TestClient:
@@ -36,6 +38,8 @@ def _fail_call(*args, **kwargs):
 @pytest.fixture(autouse=True)
 def _clear_adapter_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(ADAPTER_FLAG, raising=False)
+    monkeypatch.delenv(REAL_TRANSPORT_FLAG, raising=False)
+    monkeypatch.delenv(MODEL_FLAG, raising=False)
 
 
 def _patch_helper_to_fail(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -86,6 +90,13 @@ def _set_adapter_flag(monkeypatch: pytest.MonkeyPatch, value: str | None) -> Non
         monkeypatch.delenv(ADAPTER_FLAG, raising=False)
     else:
         monkeypatch.setenv(ADAPTER_FLAG, value)
+
+
+def _set_real_transport_flag(monkeypatch: pytest.MonkeyPatch, value: str | None) -> None:
+    if value is None:
+        monkeypatch.delenv(REAL_TRANSPORT_FLAG, raising=False)
+    else:
+        monkeypatch.setenv(REAL_TRANSPORT_FLAG, value)
 
 
 def _fake_adapter_success(*args, **kwargs) -> dict:
@@ -147,6 +158,7 @@ def test_disabled_state_does_not_check_or_call_ollama_adapter(
 ) -> None:
     monkeypatch.delenv(FLAG, raising=False)
     monkeypatch.setenv(ADAPTER_FLAG, "true")
+    monkeypatch.setenv(REAL_TRANSPORT_FLAG, "true")
     monkeypatch.setattr(
         app_main.local_llm_ollama_preview_adapter,
         "is_ollama_preview_enabled",
@@ -154,7 +166,17 @@ def test_disabled_state_does_not_check_or_call_ollama_adapter(
     )
     monkeypatch.setattr(
         app_main.local_llm_ollama_preview_adapter,
+        "is_ollama_real_transport_enabled",
+        _fail_call,
+    )
+    monkeypatch.setattr(
+        app_main.local_llm_ollama_preview_adapter,
         "run_ollama_preview",
+        _fail_call,
+    )
+    monkeypatch.setattr(
+        app_main.local_llm_ollama_preview_adapter,
+        "select_local_ollama_model",
         _fail_call,
     )
 
@@ -205,6 +227,12 @@ def test_endpoint_enabled_adapter_disabled_keeps_mock_only_helper(
 ) -> None:
     monkeypatch.setenv(FLAG, "true")
     _set_adapter_flag(monkeypatch, adapter_value)
+    monkeypatch.setenv(REAL_TRANSPORT_FLAG, "true")
+    monkeypatch.setattr(
+        app_main.local_llm_ollama_preview_adapter,
+        "is_ollama_real_transport_enabled",
+        _fail_call,
+    )
     monkeypatch.setattr(
         app_main.local_llm_ollama_preview_adapter,
         "run_ollama_preview",
@@ -254,6 +282,8 @@ def test_endpoint_enabled_adapter_enabled_enters_preview_adapter_branch(
             "feature_flag_value": "true",
             "prompt": "sample tender response excerpt",
             "model": "local-preview-no-real-model",
+            "timeout_seconds": app_main.local_llm_ollama_preview_adapter.DEFAULT_TIMEOUT_SECONDS,
+            "client": None,
             "metadata": _valid_payload(),
         }
     ]
@@ -272,6 +302,225 @@ def test_adapter_enabled_without_fake_client_returns_no_real_model_failure(
     data = response.json()
     assert data["status"] == "error"
     assert data["error_type"] == "model_unavailable"
+    assert data["preview_only"] is True
+    assert data["no_write"] is True
+    assert data["affects_score"] is False
+
+
+@pytest.mark.parametrize("real_value", [None, "", "false", "0", "no", "off"])
+def test_adapter_enabled_real_transport_disabled_does_not_construct_transport(
+    monkeypatch: pytest.MonkeyPatch, real_value: str | None
+) -> None:
+    monkeypatch.setenv(FLAG, "true")
+    monkeypatch.setenv(ADAPTER_FLAG, "true")
+    _set_real_transport_flag(monkeypatch, real_value)
+    monkeypatch.setattr(
+        app_main.local_llm_ollama_preview_adapter,
+        "select_local_ollama_model",
+        _fail_call,
+    )
+    monkeypatch.setattr(
+        app_main.local_llm_ollama_preview_adapter,
+        "build_real_ollama_preview_client",
+        _fail_call,
+    )
+
+    response = _client().post(PATH, json=_valid_payload())
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "error"
+    assert data["error_type"] == "model_unavailable"
+    assert data["real_transport_enabled"] is False
+    assert data["preview_only"] is True
+    assert data["no_write"] is True
+    assert data["affects_score"] is False
+
+
+def test_real_transport_enabled_with_fake_empty_tags_returns_model_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(FLAG, "true")
+    monkeypatch.setenv(ADAPTER_FLAG, "true")
+    monkeypatch.setenv(REAL_TRANSPORT_FLAG, "true")
+    monkeypatch.setattr(
+        app_main.local_llm_ollama_preview_adapter,
+        "select_local_ollama_model",
+        lambda **_: None,
+    )
+    monkeypatch.setattr(
+        app_main.local_llm_ollama_preview_adapter,
+        "build_real_ollama_preview_client",
+        _fail_call,
+    )
+
+    response = _client().post(PATH, json=_valid_payload())
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "error"
+    assert data["error_type"] == "model_unavailable"
+    assert data["real_transport_enabled"] is True
+    assert data["preview_only"] is True
+    assert data["no_write"] is True
+    assert data["affects_score"] is False
+
+
+def test_real_transport_enabled_with_fake_tags_uses_local_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    build_calls: list[dict] = []
+
+    def fake_build_client(**kwargs):
+        build_calls.append(deepcopy(kwargs))
+
+        def fake_client(_: dict) -> dict:
+            return {"response": "Real transport fake preview."}
+
+        return fake_client
+
+    monkeypatch.setenv(FLAG, "true")
+    monkeypatch.setenv(ADAPTER_FLAG, "true")
+    monkeypatch.setenv(REAL_TRANSPORT_FLAG, "true")
+    monkeypatch.setattr(
+        app_main.local_llm_ollama_preview_adapter,
+        "select_local_ollama_model",
+        lambda **_: "local-model-a",
+    )
+    monkeypatch.setattr(
+        app_main.local_llm_ollama_preview_adapter,
+        "build_real_ollama_preview_client",
+        fake_build_client,
+    )
+    _patch_forbidden_runtime_paths(monkeypatch)
+
+    response = _client().post(PATH, json=_valid_payload())
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["model"] == "local-model-a"
+    assert data["real_transport_enabled"] is True
+    assert data["advisory"]["summary"] == "Real transport fake preview."
+    assert data["preview_only"] is True
+    assert data["no_write"] is True
+    assert data["affects_score"] is False
+    assert build_calls == [
+        {"timeout_seconds": app_main.local_llm_ollama_preview_adapter.DEFAULT_TIMEOUT_SECONDS}
+    ]
+
+
+def test_real_transport_prefers_env_model_over_tags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected: list[str | None] = []
+
+    def fake_select_model(**kwargs) -> str:
+        selected.append(kwargs["configured_model"])
+        return str(kwargs["configured_model"])
+
+    def fake_build_client(**_: object):
+        return lambda _: {"response": "Env model preview."}
+
+    monkeypatch.setenv(FLAG, "true")
+    monkeypatch.setenv(ADAPTER_FLAG, "true")
+    monkeypatch.setenv(REAL_TRANSPORT_FLAG, "true")
+    monkeypatch.setenv(MODEL_FLAG, "env-model")
+    monkeypatch.setattr(
+        app_main.local_llm_ollama_preview_adapter,
+        "select_local_ollama_model",
+        fake_select_model,
+    )
+    monkeypatch.setattr(
+        app_main.local_llm_ollama_preview_adapter,
+        "build_real_ollama_preview_client",
+        fake_build_client,
+    )
+
+    response = _client().post(PATH, json=_valid_payload())
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["model"] == "env-model"
+    assert selected == ["env-model"]
+
+
+@pytest.mark.parametrize(
+    ("fake_client", "expected_error"),
+    [
+        (
+            lambda _: (_ for _ in ()).throw(
+                app_main.local_llm_ollama_preview_adapter.OllamaUnreachableError("down")
+            ),
+            "ollama_unreachable",
+        ),
+        (lambda _: (_ for _ in ()).throw(TimeoutError("slow")), "timeout"),
+        (
+            lambda _: (_ for _ in ()).throw(
+                app_main.local_llm_ollama_preview_adapter.OllamaModelUnavailableError("missing")
+            ),
+            "model_unavailable",
+        ),
+        (lambda _: {}, "invalid_response"),
+    ],
+)
+def test_real_transport_fake_failures_return_stable_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_client,
+    expected_error: str,
+) -> None:
+    monkeypatch.setenv(FLAG, "true")
+    monkeypatch.setenv(ADAPTER_FLAG, "true")
+    monkeypatch.setenv(REAL_TRANSPORT_FLAG, "true")
+    monkeypatch.setattr(
+        app_main.local_llm_ollama_preview_adapter,
+        "select_local_ollama_model",
+        lambda **_: "local-model-a",
+    )
+    monkeypatch.setattr(
+        app_main.local_llm_ollama_preview_adapter,
+        "build_real_ollama_preview_client",
+        lambda **_: fake_client,
+    )
+    _patch_forbidden_runtime_paths(monkeypatch)
+
+    response = _client().post(PATH, json=_valid_payload())
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "error"
+    assert data["error_type"] == expected_error
+    assert data["real_transport_enabled"] is True
+    assert data["preview_only"] is True
+    assert data["no_write"] is True
+    assert data["affects_score"] is False
+
+
+def test_real_transport_enabled_invalid_payload_does_not_construct_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(FLAG, "true")
+    monkeypatch.setenv(ADAPTER_FLAG, "true")
+    monkeypatch.setenv(REAL_TRANSPORT_FLAG, "true")
+    monkeypatch.setattr(
+        app_main.local_llm_ollama_preview_adapter,
+        "select_local_ollama_model",
+        _fail_call,
+    )
+    monkeypatch.setattr(
+        app_main.local_llm_ollama_preview_adapter,
+        "build_real_ollama_preview_client",
+        _fail_call,
+    )
+
+    response = _client().post(PATH, json={**_valid_payload(), "text_excerpt": ""})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "error"
+    assert data["error_type"] == "invalid_request"
+    assert data["real_transport_enabled"] is True
     assert data["preview_only"] is True
     assert data["no_write"] is True
     assert data["affects_score"] is False
