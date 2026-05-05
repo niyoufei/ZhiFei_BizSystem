@@ -228,6 +228,44 @@ def test_enabled_valid_fake_client_response_returns_ok() -> None:
     ]
 
 
+def test_canonical_ollama_generate_response_returns_ok() -> None:
+    response = run_ollama_preview(
+        feature_flag_value="true",
+        prompt=_valid_prompt(),
+        model=_valid_model(),
+        client=lambda _: {"response": "OK", "done": True},
+    )
+
+    assert response["status"] == "ok"
+    assert response["reason"] == "ok"
+    assert response["model"] == _valid_model()
+    assert response["advisory"]["summary"] == "OK"
+    assert response["preview_only"] is True
+    assert response["no_write"] is True
+    assert response["affects_score"] is False
+    assert _forbidden_keys(response) == set()
+
+
+def test_canonical_ollama_generate_response_with_extra_fields_returns_ok() -> None:
+    response = normalize_ollama_response(
+        {
+            "model": _valid_model(),
+            "created_at": "2026-05-05T00:00:00Z",
+            "response": "OK",
+            "done": True,
+            "total_duration": 123,
+        },
+        model=_valid_model(),
+    )
+
+    assert response["status"] == "ok"
+    assert response["advisory"]["summary"] == "OK"
+    assert response["preview_only"] is True
+    assert response["no_write"] is True
+    assert response["affects_score"] is False
+    assert _forbidden_keys(response) == set()
+
+
 def test_enabled_success_response_excludes_formal_score_fields() -> None:
     response = run_ollama_preview(
         feature_flag_value="on",
@@ -473,13 +511,39 @@ def test_real_client_fake_model_404_returns_model_unavailable() -> None:
     assert response["affects_score"] is False
 
 
-@pytest.mark.parametrize("raw_response", [None, {}, {"message": {}}, {"content": " "}])
-def test_invalid_response_returns_stable_failure(raw_response: dict | None) -> None:
-    response = normalize_ollama_response(raw_response, model=_valid_model())
+@pytest.mark.parametrize(
+    "raw_response",
+    [
+        None,
+        {},
+        {"message": {}},
+        {"content": " "},
+        {"response": ""},
+        {"response": "   "},
+        "not-a-mapping",
+        [{"response": "partial", "done": False}],
+    ],
+)
+def test_invalid_response_returns_stable_failure(raw_response: object) -> None:
+    response = normalize_ollama_response(raw_response, model=_valid_model())  # type: ignore[arg-type]
 
     assert response["status"] == "error"
     assert response["error_type"] == "invalid_response"
     assert response["message"] == "Ollama response did not contain non-empty content."
+    assert response["preview_only"] is True
+    assert response["no_write"] is True
+    assert response["affects_score"] is False
+
+
+def test_ollama_error_field_returns_stable_failure_not_ok() -> None:
+    response = normalize_ollama_response(
+        {"error": "model failed", "response": "OK", "done": True},
+        model=_valid_model(),
+    )
+
+    assert response["status"] == "error"
+    assert response["error_type"] == "invalid_response"
+    assert response["message"] == "Ollama response contained an error field."
     assert response["preview_only"] is True
     assert response["no_write"] is True
     assert response["affects_score"] is False

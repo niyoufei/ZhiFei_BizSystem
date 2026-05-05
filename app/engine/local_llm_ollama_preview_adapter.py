@@ -166,6 +166,20 @@ def normalize_ollama_response(
     model: str,
 ) -> dict[str, Any]:
     """Normalize a mocked Ollama response into a stable preview-only payload."""
+    if not isinstance(response, Mapping):
+        return build_failure_response(
+            "invalid_response",
+            "Ollama response did not contain non-empty content.",
+            model=model,
+        )
+
+    if _normalize_optional_text(response.get("error")) is not None:
+        return build_failure_response(
+            "invalid_response",
+            "Ollama response contained an error field.",
+            model=model,
+        )
+
     content = _extract_response_content(response)
     if content is None:
         return build_failure_response(
