@@ -66,6 +66,7 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import RedirectResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+import app.engine.local_llm_ollama_preview_adapter as local_llm_ollama_preview_adapter
 import app.engine.local_llm_preview_mock as local_llm_preview_mock
 from app.auth import get_auth_status, verify_api_key
 from app.cache import (
@@ -308,6 +309,8 @@ DEFAULT_SCORING_ENGINE_LOCKED = "v2.0.0"
 DEFAULT_CALIBRATOR_LOCKED = None
 LOCAL_LLM_PREVIEW_MOCK_API_FLAG = "LOCAL_LLM_PREVIEW_MOCK_API_ENABLED"
 LOCAL_LLM_PREVIEW_MOCK_API_TRUE_VALUES = {"true", "1", "yes", "on"}
+LOCAL_LLM_OLLAMA_PREVIEW_ADAPTER_FLAG = local_llm_ollama_preview_adapter.FEATURE_FLAG_NAME
+LOCAL_LLM_OLLAMA_PREVIEW_DEFAULT_MODEL = "local-preview-no-real-model"
 DEFAULT_RULE_SCORE_WEIGHT = 0.7
 DEFAULT_LLM_SCORE_WEIGHT = 0.3
 DEFAULT_LLM_DELTA_CAP = 35.0
@@ -6362,6 +6365,11 @@ def _local_llm_preview_mock_api_enabled() -> bool:
     return value in LOCAL_LLM_PREVIEW_MOCK_API_TRUE_VALUES
 
 
+def _local_llm_ollama_preview_adapter_enabled() -> bool:
+    value = os.getenv(LOCAL_LLM_OLLAMA_PREVIEW_ADAPTER_FLAG)
+    return local_llm_ollama_preview_adapter.is_ollama_preview_enabled(value)
+
+
 def _local_llm_preview_mock_disabled_response() -> Dict[str, object]:
     return {
         "status": "disabled",
@@ -6376,11 +6384,43 @@ def _local_llm_preview_mock_disabled_response() -> Dict[str, object]:
     }
 
 
+def _build_local_llm_ollama_preview_response(
+    payload: Optional[Dict[str, Any]],
+) -> Dict[str, object]:
+    prompt = payload.get("text_excerpt") if isinstance(payload, dict) else None
+    model = LOCAL_LLM_OLLAMA_PREVIEW_DEFAULT_MODEL
+    if isinstance(payload, dict):
+        model = (
+            payload.get("ollama_model")
+            or payload.get("model")
+            or LOCAL_LLM_OLLAMA_PREVIEW_DEFAULT_MODEL
+        )
+    metadata = dict(payload) if isinstance(payload, dict) else {}
+
+    adapter_response = local_llm_ollama_preview_adapter.run_ollama_preview(
+        feature_flag_value=os.getenv(LOCAL_LLM_OLLAMA_PREVIEW_ADAPTER_FLAG),
+        prompt=prompt,
+        model=model,
+        metadata=metadata,
+    )
+
+    return {
+        "enabled": True,
+        "feature_flag": LOCAL_LLM_PREVIEW_MOCK_API_FLAG,
+        "adapter_enabled": True,
+        "adapter_feature_flag": LOCAL_LLM_OLLAMA_PREVIEW_ADAPTER_FLAG,
+        **adapter_response,
+    }
+
+
 @app.post("/local-llm/preview-mock", tags=["系统状态"])
 def local_llm_preview_mock_api(payload: Optional[Dict[str, Any]] = None) -> Dict[str, object]:
     """Default-off local LLM preview/mock bridge with no storage or scoring side effects."""
     if not _local_llm_preview_mock_api_enabled():
         return _local_llm_preview_mock_disabled_response()
+
+    if _local_llm_ollama_preview_adapter_enabled():
+        return _build_local_llm_ollama_preview_response(payload)
 
     try:
         preview_input = local_llm_preview_mock.build_local_llm_preview_input(payload)
