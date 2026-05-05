@@ -66,6 +66,7 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import RedirectResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+import app.engine.local_llm_preview_mock as local_llm_preview_mock
 from app.auth import get_auth_status, verify_api_key
 from app.cache import (
     cache_score_result,
@@ -305,6 +306,8 @@ DEFAULT_REGION = "合肥"
 DEFAULT_QINGTIAN_MODEL_VERSION = "qingtian-2026.02"
 DEFAULT_SCORING_ENGINE_LOCKED = "v2.0.0"
 DEFAULT_CALIBRATOR_LOCKED = None
+LOCAL_LLM_PREVIEW_MOCK_API_FLAG = "LOCAL_LLM_PREVIEW_MOCK_API_ENABLED"
+LOCAL_LLM_PREVIEW_MOCK_API_TRUE_VALUES = {"true", "1", "yes", "on"}
 DEFAULT_RULE_SCORE_WEIGHT = 0.7
 DEFAULT_LLM_SCORE_WEIGHT = 0.3
 DEFAULT_LLM_DELTA_CAP = 35.0
@@ -6352,6 +6355,57 @@ def readiness_check() -> ReadyResponse:
 @app.get("/__ping__", include_in_schema=False)
 def ui_click_ping(btn: str = "") -> dict:
     return {"ok": True, "btn": btn}
+
+
+def _local_llm_preview_mock_api_enabled() -> bool:
+    value = str(os.getenv(LOCAL_LLM_PREVIEW_MOCK_API_FLAG, "") or "").strip().lower()
+    return value in LOCAL_LLM_PREVIEW_MOCK_API_TRUE_VALUES
+
+
+def _local_llm_preview_mock_disabled_response() -> Dict[str, object]:
+    return {
+        "status": "disabled",
+        "enabled": False,
+        "disabled": True,
+        "reason": "feature_flag_disabled",
+        "feature_flag": LOCAL_LLM_PREVIEW_MOCK_API_FLAG,
+        "preview_only": True,
+        "mock_only": True,
+        "no_write": True,
+        "affects_score": False,
+    }
+
+
+@app.post("/local-llm/preview-mock", tags=["系统状态"])
+def local_llm_preview_mock_api(payload: Optional[Dict[str, Any]] = None) -> Dict[str, object]:
+    """Default-off local LLM preview/mock bridge with no storage or scoring side effects."""
+    if not _local_llm_preview_mock_api_enabled():
+        return _local_llm_preview_mock_disabled_response()
+
+    try:
+        preview_input = local_llm_preview_mock.build_local_llm_preview_input(payload)
+        mock_response = local_llm_preview_mock.build_local_llm_mock_response(preview_input)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "status": "error",
+                "error": "invalid_preview_mock_payload",
+                "message": str(exc),
+                "preview_only": True,
+                "mock_only": True,
+                "no_write": True,
+                "affects_score": False,
+            },
+        )
+
+    return {
+        "status": "ok",
+        "enabled": True,
+        "feature_flag": LOCAL_LLM_PREVIEW_MOCK_API_FLAG,
+        "mock_only": True,
+        **mock_response,
+    }
 
 
 # API v1 路由
