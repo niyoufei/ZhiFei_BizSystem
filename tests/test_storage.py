@@ -2,9 +2,76 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 from pathlib import Path
 from unittest import mock
+
+
+class TestDataDirEnv:
+    """Tests for QINGTIAN_DATA_DIR startup-time data root override."""
+
+    def test_uses_repo_data_dir_when_env_unset(self, monkeypatch):
+        from app import storage
+
+        monkeypatch.delenv("QINGTIAN_DATA_DIR", raising=False)
+        try:
+            reloaded = importlib.reload(storage)
+
+            assert reloaded.DATA_DIR == reloaded.BASE_DIR / "data"
+            assert reloaded.SUBMISSIONS_PATH == reloaded.DATA_DIR / "submissions.json"
+        finally:
+            monkeypatch.delenv("QINGTIAN_DATA_DIR", raising=False)
+            importlib.reload(storage)
+
+    def test_uses_external_data_dir_when_env_set(self, monkeypatch, tmp_path: Path):
+        from app import storage
+
+        external_data = tmp_path / "external-data"
+        monkeypatch.setenv("QINGTIAN_DATA_DIR", str(external_data))
+        try:
+            reloaded = importlib.reload(storage)
+
+            assert reloaded.DATA_DIR == external_data.resolve()
+            assert reloaded.PROJECTS_PATH == external_data.resolve() / "projects.json"
+            assert reloaded.SUBMISSIONS_PATH == external_data.resolve() / "submissions.json"
+            assert reloaded.SCORE_REPORTS_PATH == external_data.resolve() / "score_reports.json"
+            assert reloaded.MATERIALS_DIR == external_data.resolve() / "materials"
+        finally:
+            monkeypatch.delenv("QINGTIAN_DATA_DIR", raising=False)
+            importlib.reload(storage)
+
+    def test_load_submissions_reads_external_data_root(self, monkeypatch, tmp_path: Path):
+        from app import storage
+
+        external_data = tmp_path / "external-data"
+        external_data.mkdir()
+        submissions = [{"id": "s1", "project_id": "p1"}]
+        (external_data / "submissions.json").write_text(json.dumps(submissions), encoding="utf-8")
+        monkeypatch.setenv("QINGTIAN_DATA_DIR", str(external_data))
+        try:
+            reloaded = importlib.reload(storage)
+
+            assert reloaded.load_submissions() == submissions
+        finally:
+            monkeypatch.delenv("QINGTIAN_DATA_DIR", raising=False)
+            importlib.reload(storage)
+
+    def test_load_submissions_missing_external_file_returns_empty(
+        self, monkeypatch, tmp_path: Path
+    ):
+        from app import storage
+
+        external_data = tmp_path / "external-data"
+        external_data.mkdir()
+        monkeypatch.setenv("QINGTIAN_DATA_DIR", str(external_data))
+        try:
+            reloaded = importlib.reload(storage)
+
+            assert reloaded.load_submissions() == []
+        finally:
+            monkeypatch.delenv("QINGTIAN_DATA_DIR", raising=False)
+            importlib.reload(storage)
 
 
 class TestLoadJson:

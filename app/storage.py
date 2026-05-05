@@ -9,7 +9,17 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 BASE_DIR = Path(__file__).resolve().parents[1]
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR_ENV_VAR = "QINGTIAN_DATA_DIR"
+
+
+def _resolve_data_dir() -> Path:
+    override = os.environ.get(DATA_DIR_ENV_VAR, "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return BASE_DIR / "data"
+
+
+DATA_DIR = _resolve_data_dir()
 MATERIALS_DIR = DATA_DIR / "materials"
 PROJECTS_PATH = DATA_DIR / "projects.json"
 SUBMISSIONS_PATH = DATA_DIR / "submissions.json"
