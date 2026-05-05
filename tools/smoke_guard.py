@@ -34,6 +34,7 @@ SCENARIO_NAMES = (
     "qingtian-runtime-v1",
     "qingtian-data-preflight-v1",
     "qingtian-external-data-runtime-v1",
+    "qingtian-real-sample-gate-v1",
 )
 SCENARIO_NAMES_HELP = ", ".join(SCENARIO_NAMES)
 SCENARIO_FORBIDDEN_FRAGMENTS = (
@@ -129,6 +130,26 @@ class ExternalDataRuntimeResult:
     error: str = ""
 
 
+@dataclasses.dataclass(frozen=True)
+class RealSampleGateResult:
+    project_id: str
+    data_dir: Path
+    ok: bool
+    repository_data_used: bool = False
+    repository_data_dir_rejected: bool = False
+    data_preflight_ok: bool = False
+    data_preflight_selected_submission_id: str = ""
+    data_preflight_failure_reason: str = ""
+    external_runtime_ok: bool = False
+    external_runtime_skipped: bool = False
+    evidence_trace_status: str = ""
+    scoring_basis_status: str = ""
+    runtime_submission_id: str = ""
+    scoring_status: str = ""
+    failure_stage: str = ""
+    failure_reason: str = ""
+
+
 def parse_paths(value: str | None) -> list[str]:
     if not value:
         return ["/"]
@@ -162,6 +183,18 @@ def parse_statuses(value: str | None) -> set[int]:
 
 def default_data_dir() -> Path:
     return Path(__file__).resolve().parents[1] / "data"
+
+
+def _path_is_same_or_child(path: Path, parent: Path) -> bool:
+    path = path.expanduser().resolve()
+    parent = parent.expanduser().resolve()
+    if path == parent:
+        return True
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
 
 
 def load_json_file(path: Path) -> object:
@@ -432,6 +465,101 @@ print(f"SCORING_STATUS={scoring_basis_payload.get('scoring_status', '')}")
     )
 
 
+def run_real_sample_gate(
+    project_id: str,
+    data_dir_arg: str,
+    *,
+    timeout: float = 30.0,
+) -> RealSampleGateResult:
+    project_id = (project_id or "").strip()
+    data_dir_arg = (data_dir_arg or "").strip()
+    if not data_dir_arg:
+        return RealSampleGateResult(
+            project_id=project_id,
+            data_dir=Path("-"),
+            ok=False,
+            external_runtime_skipped=True,
+            failure_stage="data-dir",
+            failure_reason="missing --data-dir for qingtian-real-sample-gate-v1",
+        )
+
+    resolved_data_dir = Path(data_dir_arg).expanduser().resolve()
+    if _path_is_same_or_child(resolved_data_dir, default_data_dir()):
+        return RealSampleGateResult(
+            project_id=project_id,
+            data_dir=resolved_data_dir,
+            ok=False,
+            repository_data_dir_rejected=True,
+            external_runtime_skipped=True,
+            failure_stage="data-dir",
+            failure_reason="data-dir must be external for qingtian-real-sample-gate-v1",
+        )
+
+    preflight = run_data_preflight(project_id=project_id, data_dir=resolved_data_dir)
+    if not preflight.ok:
+        failure_reason = ", ".join(preflight.reasons or ("data preflight failed",))
+        return RealSampleGateResult(
+            project_id=project_id,
+            data_dir=resolved_data_dir,
+            ok=False,
+            data_preflight_ok=False,
+            data_preflight_selected_submission_id=preflight.selected_submission_id,
+            data_preflight_failure_reason=failure_reason,
+            external_runtime_skipped=True,
+            failure_stage="data-preflight",
+            failure_reason=failure_reason,
+        )
+
+    runtime = run_external_data_runtime(
+        project_id=project_id,
+        data_dir=resolved_data_dir,
+        timeout=timeout,
+    )
+    evidence_submission_id = runtime.evidence_trace_submission_id
+    scoring_basis_submission_id = runtime.scoring_basis_submission_id
+    runtime_submission_id = (
+        evidence_submission_id
+        if evidence_submission_id and evidence_submission_id == scoring_basis_submission_id
+        else ""
+    )
+    runtime_ok = bool(runtime.ok and runtime_submission_id and runtime.scoring_status == "scored")
+    submission_ids_match = preflight.selected_submission_id == runtime_submission_id
+    ok = bool(runtime_ok and submission_ids_match)
+    failure_stage = ""
+    failure_reason = ""
+    if not runtime_ok:
+        failure_stage = "external-runtime"
+        if runtime.error:
+            failure_reason = runtime.error
+        elif runtime.evidence_trace_status != "200" or runtime.scoring_basis_status != "200":
+            failure_reason = "runtime latest endpoints did not return 200"
+        elif not runtime_submission_id:
+            failure_reason = "runtime submission ids do not match"
+        elif runtime.scoring_status != "scored":
+            failure_reason = "scoring_status is not scored"
+        else:
+            failure_reason = "external runtime validation failed"
+    elif not submission_ids_match:
+        failure_stage = "submission-match"
+        failure_reason = "data preflight selected submission does not match runtime submission"
+
+    return RealSampleGateResult(
+        project_id=project_id,
+        data_dir=resolved_data_dir,
+        ok=ok,
+        data_preflight_ok=True,
+        data_preflight_selected_submission_id=preflight.selected_submission_id,
+        external_runtime_ok=bool(runtime_ok),
+        external_runtime_skipped=False,
+        evidence_trace_status=runtime.evidence_trace_status,
+        scoring_basis_status=runtime.scoring_basis_status,
+        runtime_submission_id=runtime_submission_id,
+        scoring_status=runtime.scoring_status,
+        failure_stage=failure_stage,
+        failure_reason=failure_reason,
+    )
+
+
 def build_url(base_url: str, path: str) -> str:
     if not base_url:
         raise SmokeGuardError("--base-url is required.")
@@ -690,6 +818,7 @@ def build_scenario_plan(
     elif scenario_name in {
         "qingtian-data-preflight-v1",
         "qingtian-external-data-runtime-v1",
+        "qingtian-real-sample-gate-v1",
     }:
         paths = []
     else:
@@ -1045,6 +1174,45 @@ def render_external_data_runtime_scenario_report(
     return "\n".join(lines) + "\n"
 
 
+def render_real_sample_gate_scenario_report(
+    *,
+    scenario_name: str,
+    result: RealSampleGateResult,
+) -> str:
+    lines = [
+        "# smoke_guard scenario report",
+        "",
+        "- mode: scenario",
+        f"- scenario_name: {scenario_name}",
+        "- scenario_kind: real-sample-gate",
+        f"- project_id: {result.project_id or '-'}",
+        f"- data_dir: {result.data_dir}",
+        f"- repository_data_used: {str(result.repository_data_used).lower()}",
+        f"- repository_data_dir_rejected: {str(result.repository_data_dir_rejected).lower()}",
+        f"- data_preflight_result: {'PASS' if result.data_preflight_ok else 'FAIL'}",
+        (
+            "- data_preflight_selected_submission_id: "
+            f"{result.data_preflight_selected_submission_id}"
+        ),
+        f"- data_preflight_failure_reason: {result.data_preflight_failure_reason or '-'}",
+        f"- external_runtime_result: {'PASS' if result.external_runtime_ok else 'FAIL'}",
+        f"- external_runtime_skipped: {str(result.external_runtime_skipped).lower()}",
+        f"- evidence_trace_status: {result.evidence_trace_status}",
+        f"- scoring_basis_status: {result.scoring_basis_status}",
+        f"- runtime_submission_id: {result.runtime_submission_id}",
+        f"- scoring_status: {result.scoring_status}",
+        "- uvicorn_started: false",
+        "- http_server_started: false",
+        "- browser_started: false",
+        "- external_network_used: false",
+        "- ollama_used: false",
+        f"- failed_stage: {result.failure_stage or '-'}",
+        f"- failure_reason: {result.failure_reason or '-'}",
+        f"- final_result: {'PASS' if result.ok else 'FAIL'}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def _add_probe_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--paths", default="/")
@@ -1221,6 +1389,21 @@ def run_scenario_mode(args: argparse.Namespace) -> int:
         )
         print(
             render_external_data_runtime_scenario_report(
+                scenario_name=scenario_name,
+                result=result,
+            ),
+            end="",
+        )
+        return 0 if result.ok else 1
+
+    if scenario_name == "qingtian-real-sample-gate-v1":
+        result = run_real_sample_gate(
+            project_id=args.project_id,
+            data_dir_arg=args.data_dir,
+            timeout=args.timeout,
+        )
+        print(
+            render_real_sample_gate_scenario_report(
                 scenario_name=scenario_name,
                 result=result,
             ),

@@ -214,6 +214,10 @@ def test_scenario_names_include_qingtian_external_data_runtime_v1() -> None:
     assert "qingtian-external-data-runtime-v1" in smoke_guard.SCENARIO_NAMES
 
 
+def test_scenario_names_include_qingtian_real_sample_gate_v1() -> None:
+    assert "qingtian-real-sample-gate-v1" in smoke_guard.SCENARIO_NAMES
+
+
 def test_scenario_qingtian_data_preflight_has_no_http_paths() -> None:
     plan = smoke_guard.build_scenario_plan("qingtian-data-preflight-v1", project_id="p1")
     assert plan.paths == ()
@@ -221,6 +225,11 @@ def test_scenario_qingtian_data_preflight_has_no_http_paths() -> None:
 
 def test_scenario_qingtian_external_data_runtime_has_no_http_paths() -> None:
     plan = smoke_guard.build_scenario_plan("qingtian-external-data-runtime-v1", project_id="p1")
+    assert plan.paths == ()
+
+
+def test_scenario_qingtian_real_sample_gate_has_no_http_paths() -> None:
+    plan = smoke_guard.build_scenario_plan("qingtian-real-sample-gate-v1", project_id="p1")
     assert plan.paths == ()
 
 
@@ -446,6 +455,121 @@ def test_scenario_qingtian_external_data_runtime_passes_with_fixture(tmp_path, c
     assert "- storage_data_dir_match: true" in output
     assert "- storage_submissions_path_match: true" in output
     assert "- final_result: PASS" in output
+
+
+def test_scenario_qingtian_real_sample_gate_requires_data_dir(capsys) -> None:
+    code = smoke_guard.main(
+        [
+            "scenario",
+            "--name",
+            "qingtian-real-sample-gate-v1",
+            "--project-id",
+            "p1",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "- scenario_name: qingtian-real-sample-gate-v1" in output
+    assert "- scenario_kind: real-sample-gate" in output
+    assert "missing --data-dir for qingtian-real-sample-gate-v1" in output
+    assert "- data_preflight_result: FAIL" in output
+    assert "- external_runtime_result: FAIL" in output
+    assert "- external_runtime_skipped: true" in output
+    assert "- uvicorn_started: false" in output
+    assert "- http_server_started: false" in output
+    assert "- browser_started: false" in output
+    assert "- ollama_used: false" in output
+    assert "- final_result: FAIL" in output
+
+
+def test_scenario_qingtian_real_sample_gate_rejects_repository_data_dir(capsys) -> None:
+    code = smoke_guard.main(
+        [
+            "scenario",
+            "--name",
+            "qingtian-real-sample-gate-v1",
+            "--project-id",
+            "p1",
+            "--data-dir",
+            str(smoke_guard.default_data_dir()),
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "data-dir must be external for qingtian-real-sample-gate-v1" in output
+    assert "- repository_data_used: false" in output
+    assert "- repository_data_dir_rejected: true" in output
+    assert "- external_runtime_skipped: true" in output
+    assert "- final_result: FAIL" in output
+
+
+def test_scenario_qingtian_real_sample_gate_passes_with_external_fixture(tmp_path, capsys) -> None:
+    data_dir = tmp_path / "external-data"
+    data_dir.mkdir()
+    _write_runtime_external_data_root(data_dir)
+
+    code = smoke_guard.main(
+        [
+            "scenario",
+            "--name",
+            "qingtian-real-sample-gate-v1",
+            "--project-id",
+            "p1",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "- scenario_name: qingtian-real-sample-gate-v1" in output
+    assert "- scenario_kind: real-sample-gate" in output
+    assert "- repository_data_used: false" in output
+    assert "- data_preflight_result: PASS" in output
+    assert "- data_preflight_selected_submission_id: tmp-runtime-s1" in output
+    assert "- external_runtime_result: PASS" in output
+    assert "- external_runtime_skipped: false" in output
+    assert "- evidence_trace_status: 200" in output
+    assert "- scoring_basis_status: 200" in output
+    assert "- runtime_submission_id: tmp-runtime-s1" in output
+    assert "- scoring_status: scored" in output
+    assert "- uvicorn_started: false" in output
+    assert "- http_server_started: false" in output
+    assert "- browser_started: false" in output
+    assert "- ollama_used: false" in output
+    assert "- final_result: PASS" in output
+
+
+def test_scenario_qingtian_real_sample_gate_short_circuits_after_preflight_failure(
+    tmp_path, capsys
+) -> None:
+    data_dir = tmp_path / "external-data"
+    _write_json(data_dir / "projects.json", [{"id": "p1", "name": "项目1"}])
+
+    code = smoke_guard.main(
+        [
+            "scenario",
+            "--name",
+            "qingtian-real-sample-gate-v1",
+            "--project-id",
+            "p1",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "missing data/submissions.json" in output
+    assert "- failed_stage: data-preflight" in output
+    assert "- data_preflight_result: FAIL" in output
+    assert "- external_runtime_result: FAIL" in output
+    assert "- external_runtime_skipped: true" in output
+    assert "- evidence_trace_status: " in output
+    assert "- scoring_basis_status: " in output
+    assert "- final_result: FAIL" in output
 
 
 def test_scenario_qingtian_runtime_v1_does_not_require_submissions_json(tmp_path, capsys) -> None:
