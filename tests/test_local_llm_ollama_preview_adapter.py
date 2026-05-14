@@ -266,6 +266,81 @@ def test_canonical_ollama_generate_response_with_extra_fields_returns_ok() -> No
     assert _forbidden_keys(response) == set()
 
 
+def test_non_empty_response_takes_priority_over_thinking_preview() -> None:
+    response = normalize_ollama_response(
+        {
+            "content": "Content candidate should not win.",
+            "response": "Response candidate wins.",
+            "thinking": "Thinking candidate must stay secondary.",
+            "done": True,
+        },
+        model=_valid_model(),
+    )
+
+    assert response["status"] == "ok"
+    assert response["advisory"]["summary"] == "Response candidate wins."
+    assert response.get("content_source") is None
+    assert response.get("preview_mode") is None
+    assert response["preview_only"] is True
+    assert response["no_write"] is True
+    assert response["affects_score"] is False
+
+
+@pytest.mark.parametrize(
+    "raw_response",
+    [
+        {"response": "", "thinking": "Use only a bounded thinking preview.", "done": True},
+        {"response": "   ", "thinking": "Whitespace response uses thinking preview."},
+        {"thinking": "Missing response uses thinking preview."},
+    ],
+)
+def test_empty_response_non_empty_thinking_returns_controlled_preview(
+    raw_response: dict,
+) -> None:
+    thinking = str(raw_response["thinking"]).strip()
+
+    response = normalize_ollama_response(raw_response, model=_valid_model())
+
+    assert response["status"] == "ok"
+    assert response["reason"] == "ok"
+    assert response["content_source"] == "thinking"
+    assert response["preview_mode"] == "thinking_preview"
+    assert response["preview_text_length"] == len(thinking)
+    assert response["advisory"]["summary"] == thinking
+    assert response["advisory"]["content_source"] == "thinking"
+    assert response["advisory"]["preview_mode"] == "thinking_preview"
+    assert response["advisory"]["preview_text_length"] == len(thinking)
+    assert response["raw_response_included"] is False
+    assert response["preview_only"] is True
+    assert response["no_write"] is True
+    assert response["affects_score"] is False
+    assert response["advisory"]["boundary"] == {
+        "preview_only": True,
+        "no_write": True,
+        "affects_score": False,
+    }
+    assert _forbidden_keys(response) == set()
+
+
+def test_long_thinking_preview_keeps_only_length_and_bounded_summary() -> None:
+    thinking = "0123456789" * 20
+
+    response = normalize_ollama_response(
+        {"response": "", "thinking": thinking, "done": True},
+        model=_valid_model(),
+    )
+
+    summary = response["advisory"]["summary"]
+    assert response["status"] == "ok"
+    assert summary == thinking[: adapter.THINKING_PREVIEW_SUMMARY_LIMIT]
+    assert len(summary) == adapter.THINKING_PREVIEW_SUMMARY_LIMIT
+    assert response["preview_text_length"] == len(thinking)
+    assert thinking not in json.dumps(response, ensure_ascii=False)
+    assert response["preview_only"] is True
+    assert response["no_write"] is True
+    assert response["affects_score"] is False
+
+
 def test_enabled_success_response_excludes_formal_score_fields() -> None:
     response = run_ollama_preview(
         feature_flag_value="on",
@@ -520,6 +595,9 @@ def test_real_client_fake_model_404_returns_model_unavailable() -> None:
         {"content": " "},
         {"response": ""},
         {"response": "   "},
+        {"response": "", "thinking": ""},
+        {"thinking": ""},
+        {"response": "", "thinking": ["not", "a", "string"]},
         "not-a-mapping",
         [{"response": "partial", "done": False}],
     ],
@@ -537,16 +615,32 @@ def test_invalid_response_returns_stable_failure(raw_response: object) -> None:
 
 def test_ollama_error_field_returns_stable_failure_not_ok() -> None:
     response = normalize_ollama_response(
-        {"error": "model failed", "response": "OK", "done": True},
+        {"error": "model failed", "response": "", "thinking": "Should not become preview."},
         model=_valid_model(),
     )
 
     assert response["status"] == "error"
     assert response["error_type"] == "invalid_response"
     assert response["message"] == "Ollama response contained an error field."
+    assert "content_source" not in response
+    assert "preview_mode" not in response
     assert response["preview_only"] is True
     assert response["no_write"] is True
     assert response["affects_score"] is False
+
+
+def test_thinking_preview_output_is_deterministic() -> None:
+    raw_response = {
+        "model": _valid_model(),
+        "response": "",
+        "thinking": "Deterministic thinking preview.",
+        "done": True,
+    }
+
+    first = normalize_ollama_response(deepcopy(raw_response), model=_valid_model())
+    second = normalize_ollama_response(deepcopy(raw_response), model=_valid_model())
+
+    assert first == second
 
 
 def test_same_input_and_fake_response_are_deterministic() -> None:

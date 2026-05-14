@@ -27,6 +27,9 @@ MAX_GENERATE_NUM_PREDICT = 128
 OLLAMA_LOCAL_BASE_URL = "http://127.0.0.1:11434"
 PROMPT_EXCERPT_LIMIT = 200
 RESPONSE_SUMMARY_LIMIT = 500
+THINKING_PREVIEW_SUMMARY_LIMIT = 80
+THINKING_PREVIEW_MODE = "thinking_preview"
+THINKING_CONTENT_SOURCE = "thinking"
 
 FORBIDDEN_EXACT_KEYS = {
     "final_score",
@@ -181,7 +184,25 @@ def normalize_ollama_response(
         )
 
     content = _extract_response_content(response)
-    if content is None:
+    if content is not None:
+        return _base_response(
+            status="ok",
+            reason="ok",
+            enabled=True,
+            model=model,
+            advisory={
+                "summary": content[:RESPONSE_SUMMARY_LIMIT],
+                "boundary": {
+                    "preview_only": True,
+                    "no_write": True,
+                    "affects_score": False,
+                },
+            },
+            raw_response_included=False,
+        )
+
+    thinking_preview = _extract_thinking_preview(response)
+    if thinking_preview is None:
         return build_failure_response(
             "invalid_response",
             "Ollama response did not contain non-empty content.",
@@ -193,8 +214,14 @@ def normalize_ollama_response(
         reason="ok",
         enabled=True,
         model=model,
+        content_source=THINKING_CONTENT_SOURCE,
+        preview_mode=THINKING_PREVIEW_MODE,
+        preview_text_length=thinking_preview["length"],
         advisory={
-            "summary": content[:RESPONSE_SUMMARY_LIMIT],
+            "summary": thinking_preview["summary"],
+            "content_source": THINKING_CONTENT_SOURCE,
+            "preview_mode": THINKING_PREVIEW_MODE,
+            "preview_text_length": thinking_preview["length"],
             "boundary": {
                 "preview_only": True,
                 "no_write": True,
@@ -441,8 +468,8 @@ def _extract_response_content(response: Mapping[str, Any] | None) -> str | None:
         return None
 
     candidates = [
-        response.get("content"),
         response.get("response"),
+        response.get("content"),
     ]
 
     message = response.get("message")
@@ -453,6 +480,19 @@ def _extract_response_content(response: Mapping[str, Any] | None) -> str | None:
         if isinstance(candidate, str) and candidate.strip():
             return candidate.strip()
     return None
+
+
+def _extract_thinking_preview(response: Mapping[str, Any]) -> dict[str, int | str] | None:
+    thinking = response.get("thinking")
+    if not isinstance(thinking, str):
+        return None
+    normalized = thinking.strip()
+    if not normalized:
+        return None
+    return {
+        "summary": normalized[:THINKING_PREVIEW_SUMMARY_LIMIT],
+        "length": len(normalized),
+    }
 
 
 def _extract_request_prompt(request: Mapping[str, Any]) -> str | None:
