@@ -68,6 +68,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import app.engine.local_llm_ollama_preview_adapter as local_llm_ollama_preview_adapter
 import app.engine.local_llm_preview_mock as local_llm_preview_mock
+import app.engine.zdoc_zbid_preview_receiver as zdoc_zbid_preview_receiver
 from app.auth import get_auth_status, verify_api_key
 from app.cache import (
     cache_score_result,
@@ -6525,6 +6526,14 @@ def local_llm_preview_mock_api(payload: Optional[Dict[str, Any]] = None) -> Dict
         "mock_only": True,
         **mock_response,
     }
+
+
+@app.post("/local-llm/zdoc-preview-only/receive", tags=["系统状态"])
+def zdoc_zbid_preview_only_receive_api(
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, object]:
+    """Receive ZDoc preview-only metadata with no formal side effects."""
+    return zdoc_zbid_preview_receiver.receive_zdoc_zbid_preview_payload(payload or {})
 
 
 # API v1 路由
