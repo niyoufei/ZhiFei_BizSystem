@@ -66,6 +66,9 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import RedirectResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+import app.engine.local_llm_ollama_preview_adapter as local_llm_ollama_preview_adapter
+import app.engine.local_llm_preview_mock as local_llm_preview_mock
+import app.engine.zdoc_zbid_preview_receiver as zdoc_zbid_preview_receiver
 from app.auth import get_auth_status, verify_api_key
 from app.cache import (
     cache_score_result,
@@ -305,6 +308,13 @@ DEFAULT_REGION = "合肥"
 DEFAULT_QINGTIAN_MODEL_VERSION = "qingtian-2026.02"
 DEFAULT_SCORING_ENGINE_LOCKED = "v2.0.0"
 DEFAULT_CALIBRATOR_LOCKED = None
+LOCAL_LLM_PREVIEW_MOCK_API_FLAG = "LOCAL_LLM_PREVIEW_MOCK_API_ENABLED"
+LOCAL_LLM_PREVIEW_MOCK_API_TRUE_VALUES = {"true", "1", "yes", "on"}
+LOCAL_LLM_OLLAMA_PREVIEW_ADAPTER_FLAG = local_llm_ollama_preview_adapter.FEATURE_FLAG_NAME
+LOCAL_LLM_OLLAMA_REAL_TRANSPORT_FLAG = (
+    local_llm_ollama_preview_adapter.REAL_TRANSPORT_FEATURE_FLAG_NAME
+)
+LOCAL_LLM_OLLAMA_PREVIEW_DEFAULT_MODEL = "local-preview-no-real-model"
 DEFAULT_RULE_SCORE_WEIGHT = 0.7
 DEFAULT_LLM_SCORE_WEIGHT = 0.3
 DEFAULT_LLM_DELTA_CAP = 35.0
@@ -6352,6 +6362,178 @@ def readiness_check() -> ReadyResponse:
 @app.get("/__ping__", include_in_schema=False)
 def ui_click_ping(btn: str = "") -> dict:
     return {"ok": True, "btn": btn}
+
+
+def _local_llm_preview_mock_api_enabled() -> bool:
+    value = str(os.getenv(LOCAL_LLM_PREVIEW_MOCK_API_FLAG, "") or "").strip().lower()
+    return value in LOCAL_LLM_PREVIEW_MOCK_API_TRUE_VALUES
+
+
+def _local_llm_ollama_preview_adapter_enabled() -> bool:
+    value = os.getenv(LOCAL_LLM_OLLAMA_PREVIEW_ADAPTER_FLAG)
+    return local_llm_ollama_preview_adapter.is_ollama_preview_enabled(value)
+
+
+def _local_llm_ollama_real_transport_enabled() -> bool:
+    value = os.getenv(LOCAL_LLM_OLLAMA_REAL_TRANSPORT_FLAG)
+    return local_llm_ollama_preview_adapter.is_ollama_real_transport_enabled(value)
+
+
+def _local_llm_preview_mock_disabled_response() -> Dict[str, object]:
+    return {
+        "status": "disabled",
+        "enabled": False,
+        "disabled": True,
+        "reason": "feature_flag_disabled",
+        "feature_flag": LOCAL_LLM_PREVIEW_MOCK_API_FLAG,
+        "preview_only": True,
+        "mock_only": True,
+        "no_write": True,
+        "affects_score": False,
+    }
+
+
+def _build_local_llm_ollama_preview_response(
+    payload: Optional[Dict[str, Any]],
+) -> Dict[str, object]:
+    prompt = payload.get("text_excerpt") if isinstance(payload, dict) else None
+    model = LOCAL_LLM_OLLAMA_PREVIEW_DEFAULT_MODEL
+    if isinstance(payload, dict):
+        model = (
+            payload.get("ollama_model")
+            or payload.get("model")
+            or LOCAL_LLM_OLLAMA_PREVIEW_DEFAULT_MODEL
+        )
+    metadata = dict(payload) if isinstance(payload, dict) else {}
+    client = None
+    real_transport_enabled = _local_llm_ollama_real_transport_enabled()
+    timeout_seconds = local_llm_ollama_preview_adapter.get_ollama_timeout_seconds()
+    num_predict = local_llm_ollama_preview_adapter.get_ollama_num_predict()
+    adapter_response: Optional[
+        Dict[str, object]
+    ] = local_llm_ollama_preview_adapter.validate_ollama_preview_boundary(
+        prompt=prompt,
+        model=model,
+        metadata=metadata,
+    )
+
+    if adapter_response is None and real_transport_enabled:
+        try:
+            selected_model = local_llm_ollama_preview_adapter.select_local_ollama_model(
+                configured_model=os.getenv(local_llm_ollama_preview_adapter.MODEL_ENV_NAME),
+                timeout_seconds=timeout_seconds,
+            )
+            if selected_model:
+                model = selected_model
+                client = local_llm_ollama_preview_adapter.build_real_ollama_preview_client(
+                    timeout_seconds=timeout_seconds,
+                    num_predict=num_predict,
+                )
+            else:
+                adapter_response = local_llm_ollama_preview_adapter.build_failure_response(
+                    "model_unavailable",
+                    "No local Ollama model is configured or installed.",
+                    model=None,
+                    prompt=prompt,
+                )
+        except local_llm_ollama_preview_adapter.OllamaUnreachableError:
+            adapter_response = local_llm_ollama_preview_adapter.build_failure_response(
+                "ollama_unreachable",
+                "Local Ollama service is unreachable.",
+                model=None,
+                prompt=prompt,
+            )
+        except TimeoutError:
+            adapter_response = local_llm_ollama_preview_adapter.build_failure_response(
+                "timeout",
+                "Ollama preview request timed out.",
+                model=None,
+                prompt=prompt,
+            )
+        except local_llm_ollama_preview_adapter.OllamaInvalidResponseError:
+            adapter_response = local_llm_ollama_preview_adapter.build_failure_response(
+                "invalid_response",
+                "Ollama response did not contain non-empty content.",
+                model=None,
+                prompt=prompt,
+            )
+        except local_llm_ollama_preview_adapter.OllamaModelUnavailableError:
+            adapter_response = local_llm_ollama_preview_adapter.build_failure_response(
+                "model_unavailable",
+                "Ollama model is unavailable.",
+                model=None,
+                prompt=prompt,
+            )
+        except OSError:
+            adapter_response = local_llm_ollama_preview_adapter.build_failure_response(
+                "transport_failure",
+                "Ollama preview transport failed.",
+                model=None,
+                prompt=prompt,
+            )
+
+    if adapter_response is None:
+        adapter_response = local_llm_ollama_preview_adapter.run_ollama_preview(
+            feature_flag_value=os.getenv(LOCAL_LLM_OLLAMA_PREVIEW_ADAPTER_FLAG),
+            prompt=prompt,
+            model=model,
+            timeout_seconds=timeout_seconds,
+            client=client,
+            metadata=metadata,
+        )
+
+    return {
+        "enabled": True,
+        "feature_flag": LOCAL_LLM_PREVIEW_MOCK_API_FLAG,
+        "adapter_enabled": True,
+        "adapter_feature_flag": LOCAL_LLM_OLLAMA_PREVIEW_ADAPTER_FLAG,
+        "real_transport_enabled": real_transport_enabled,
+        "real_transport_feature_flag": LOCAL_LLM_OLLAMA_REAL_TRANSPORT_FLAG,
+        **adapter_response,
+    }
+
+
+@app.post("/local-llm/preview-mock", tags=["系统状态"])
+def local_llm_preview_mock_api(payload: Optional[Dict[str, Any]] = None) -> Dict[str, object]:
+    """Default-off local LLM preview/mock bridge with no storage or scoring side effects."""
+    if not _local_llm_preview_mock_api_enabled():
+        return _local_llm_preview_mock_disabled_response()
+
+    if _local_llm_ollama_preview_adapter_enabled():
+        return _build_local_llm_ollama_preview_response(payload)
+
+    try:
+        preview_input = local_llm_preview_mock.build_local_llm_preview_input(payload)
+        mock_response = local_llm_preview_mock.build_local_llm_mock_response(preview_input)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "status": "error",
+                "error": "invalid_preview_mock_payload",
+                "message": str(exc),
+                "preview_only": True,
+                "mock_only": True,
+                "no_write": True,
+                "affects_score": False,
+            },
+        )
+
+    return {
+        "status": "ok",
+        "enabled": True,
+        "feature_flag": LOCAL_LLM_PREVIEW_MOCK_API_FLAG,
+        "mock_only": True,
+        **mock_response,
+    }
+
+
+@app.post("/local-llm/zdoc-preview-only/receive", tags=["系统状态"])
+def zdoc_zbid_preview_only_receive_api(
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, object]:
+    """Receive ZDoc preview-only metadata with no formal side effects."""
+    return zdoc_zbid_preview_receiver.receive_zdoc_zbid_preview_payload(payload or {})
 
 
 # API v1 路由

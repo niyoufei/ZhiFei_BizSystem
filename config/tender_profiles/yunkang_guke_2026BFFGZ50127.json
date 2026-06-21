@@ -1,0 +1,32 @@
+{
+  "tender_id": "2026BFFGZ50127",
+  "tender_name": "合肥运康骨科医院局部改造工程",
+  "eval_method": "综合评估法",
+  "shigong_max_score": 5,
+  "bands": [
+    {"name": "一般", "lower": 0, "upper": 3, "lower_inclusive": false, "upper_inclusive": true},
+    {"name": "良好", "lower": 3, "upper": 4.5, "lower_inclusive": false, "upper_inclusive": false},
+    {"name": "优秀", "lower": 4.5, "upper": 5, "lower_inclusive": true, "upper_inclusive": true}
+  ],
+  "considerations": [
+    "针对工程项目整体理解",
+    "工程重点难点的保障体系与措施",
+    "拟采用的新技术、新工艺",
+    "确保工期与质量的保障体系与措施",
+    "确保人、材、机的保障体系与措施",
+    "确保安全文明生产的管理体系与措施"
+  ],
+  "quality_axes": ["针对性", "可行性", "语言精练度"],
+  "hard_lines": {
+    "max_pages": 50,
+    "require_site_plan": false,
+    "multiple_shigong_rejected": true,
+    "zero_if_not_provided": true,
+    "format_hints": ["A4", "行距固定值22磅", "页边距上2.5厘米其余2.0厘米", "宋体", "标题三号其余四号"]
+  },
+  "shigong_weight_type": "decisive",
+  "score_composition": {"技术文件": 5, "商务文件": 10, "报价文件": 85},
+  "judge_count_observed": 5,
+  "source": "招标文件 2.2.2(1) 详细评审标准；评标情况一览表（68家投标人，编号2026BFFGZ50127）",
+  "notes": "施组满分5分，评委均分聚合（简单平均）。入围者报价普遍踩满85、商务满10，施组分为唯一胜负手；全场顶值4.44（长春建设，第一中标候选人）。优秀档(>=4.5)实测无人到达。"
+}
