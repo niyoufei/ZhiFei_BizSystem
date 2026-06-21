@@ -1,0 +1,36 @@
+{
+  "tender_id": "2025BFBGZ50935",
+  "tender_name": "包河经开区延边路、月谭路、饮马井路等3条道路工程",
+  "eval_method": "技术评分合理价格法",
+  "shigong_max_score": 100,
+  "bands": [
+    {"name": "一般", "lower": 0, "upper": 60, "lower_inclusive": false, "upper_inclusive": true},
+    {"name": "良好", "lower": 60, "upper": 90, "lower_inclusive": false, "upper_inclusive": false},
+    {"name": "优秀", "lower": 90, "upper": 100, "lower_inclusive": true, "upper_inclusive": true}
+  ],
+  "considerations": [
+    "工程概况",
+    "主要施工方法",
+    "拟投入的主要物资计划",
+    "拟投入的主要施工机械、设备计划",
+    "劳动力安排计划",
+    "确保工程质量的技术组织措施",
+    "确保安全生产的技术组织措施",
+    "确保工期的技术组织措施",
+    "确保文明施工的技术组织措施",
+    "施工总平面布置图"
+  ],
+  "quality_axes": ["针对性", "可行性", "语言精练度"],
+  "hard_lines": {
+    "max_pages": 50,
+    "require_site_plan": true,
+    "multiple_shigong_rejected": true,
+    "zero_if_not_provided": true,
+    "format_hints": []
+  },
+  "shigong_weight_type": "gate",
+  "score_composition": {"施工组织设计": 100},
+  "judge_count_observed": 7,
+  "source": "招标文件正文 2.2.1/2.2.2；评标情况一览表（编号2025BFBGZ50935）",
+  "notes": "技术评分合理价格法、100分制、7位评委。施组分聚集79~82、顶值仅82.1。印证关注度机理：多数评委不调关注度→分数几乎相同（如庐金82.06/82.09/82.06/82.08/82.12/82.09/82.18），个别评委微调致小幅偏移，均分稳定可学。"
+}

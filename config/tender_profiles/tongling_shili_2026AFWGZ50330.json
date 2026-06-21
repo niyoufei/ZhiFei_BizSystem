@@ -1,0 +1,32 @@
+{
+  "tender_id": "2026AFWGZ50330",
+  "tender_name": "铜陵市立医院一号楼、五号楼服务能力提升项目五号楼改造工程项目",
+  "eval_method": "综合评估法",
+  "shigong_max_score": 5,
+  "bands": [
+    {"name": "较差", "lower": 0, "upper": 2, "lower_inclusive": true, "upper_inclusive": false},
+    {"name": "一般", "lower": 2, "upper": 3.5, "lower_inclusive": true, "upper_inclusive": false},
+    {"name": "优秀", "lower": 3.5, "upper": 5, "lower_inclusive": true, "upper_inclusive": true}
+  ],
+  "considerations": [
+    "针对工程项目整体理解",
+    "拟采用的新技术、新工艺",
+    "确保工期与质量的保障体系与措施",
+    "确保人、材、机的保障体系与措施",
+    "确保安全文明生产的管理体系与措施",
+    "涉及绿色建筑的技术措施"
+  ],
+  "quality_axes": ["针对性", "可行性", "语言精练度"],
+  "hard_lines": {
+    "max_pages": 50,
+    "require_site_plan": false,
+    "multiple_shigong_rejected": true,
+    "zero_if_not_provided": true,
+    "format_hints": []
+  },
+  "shigong_weight_type": "coupled",
+  "score_composition": {"技术文件": 5, "商务文件": 10, "报价文件": 85},
+  "judge_count_observed": 5,
+  "source": "招标文件 2.2.2(1) 详细评审标准；评标一览表（编号2026AFWGZ50330）",
+  "notes": "分档为三档：较差/一般/优秀（优秀线低至3.5）。价格分有差异，施组与价格联动：华南施组4.34高于新世纪4.28，但因报价84.10<84.17，综合98.44<98.45落败。五位评委分高度一致（无离群）。"
+}
