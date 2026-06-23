@@ -14,12 +14,18 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass
-from typing import Callable, Dict, Optional, Sequence
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
 from app.engine.tender_profile import (
+    HardRedline,
+    ScoringItem,
+    TenderProfile,
+    TenderProfileValidationError,
     TenderScoringProfile,
     percentile_in_field,
+    validate_tender_profile,
 )
 
 # 校准器签名：输入(内部0-100分, profile) -> 本标F分
@@ -105,3 +111,186 @@ def map_internal_to_target(
         percentile_in_field=(round(pct, 4) if pct is not None else None),
         method=method,
     )
+
+
+class TargetMappingError(ValueError):
+    """按标 target mapping bridge 构建失败。"""
+
+
+@dataclass(frozen=True)
+class TargetSignal:
+    """一个按标评分项映射到内部目标信号后的结构表示。"""
+
+    item_id: str
+    name: str
+    max_score: float
+    legacy_dimension_refs: Tuple[str, ...]
+    evidence_requirements: Tuple[str, ...]
+    band_count: int
+    band_labels: Tuple[str, ...]
+    band_triggers: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class TargetCoverage:
+    """按标 target mapping 覆盖情况。"""
+
+    item_count: int
+    total_score: float
+    mapped_item_count: int
+    unmapped_item_ids: Tuple[str, ...]
+    legacy_dimension_refs: Tuple[str, ...]
+    hard_redline_count: int
+
+
+@dataclass(frozen=True)
+class TargetMapping:
+    """TenderProfile.scoring_items 到内部 target signals 的兼容桥接结果。"""
+
+    tender_id: str
+    tender_name: str
+    version: str
+    score_scale: float
+    targets: Tuple[TargetSignal, ...]
+    hard_redlines: Tuple[Dict[str, object], ...]
+    coverage: TargetCoverage
+
+
+_LEGACY_DIMENSION_REF_RE = re.compile(r"^(?:dim|dimension)?_?(\d{1,2})$")
+_UNSAFE_REF_RE = re.compile(r"[^a-z0-9]+")
+
+
+def normalize_legacy_dimension_ref(ref: str) -> str:
+    """归一化 legacy dimension ref；非 01-16 自定义引用安全保留。"""
+    normalized = _UNSAFE_REF_RE.sub("_", str(ref).strip().lower()).strip("_")
+    if not normalized:
+        return ""
+
+    match = _LEGACY_DIMENSION_REF_RE.match(normalized)
+    if match:
+        number = int(match.group(1))
+        if 1 <= number <= 16:
+            return f"dim_{number:02d}"
+    return normalized
+
+
+def _normalize_legacy_dimension_refs(refs: Sequence[str]) -> Tuple[str, ...]:
+    normalized = {ref for ref in (normalize_legacy_dimension_ref(item) for item in refs) if ref}
+    return tuple(sorted(normalized))
+
+
+def collect_legacy_dimension_refs(profile: TenderProfile) -> list[str]:
+    """收集 profile 级与 item 级 legacy refs，并去重、排序、归一化。"""
+    refs = list(profile.legacy_dimension_refs)
+    for item in profile.scoring_items:
+        refs.extend(item.legacy_dimension_refs)
+    return list(_normalize_legacy_dimension_refs(refs))
+
+
+def _band_label(band: object) -> str:
+    return str(
+        getattr(band, "label", "") or getattr(band, "name", "") or getattr(band, "band_id", "")
+    )
+
+
+def _target_signal_from_item(item: ScoringItem) -> TargetSignal:
+    band_labels = tuple(label for label in (_band_label(band) for band in item.bands) if label)
+    band_triggers = tuple(
+        sorted(
+            {
+                str(trigger)
+                for band in item.bands
+                for trigger in getattr(band, "triggers", ())
+                if str(trigger).strip()
+            }
+        )
+    )
+    return TargetSignal(
+        item_id=item.item_id,
+        name=item.name,
+        max_score=float(item.max_score),
+        legacy_dimension_refs=_normalize_legacy_dimension_refs(item.legacy_dimension_refs),
+        evidence_requirements=tuple(str(req) for req in item.evidence_requirements),
+        band_count=len(item.bands),
+        band_labels=band_labels,
+        band_triggers=band_triggers,
+    )
+
+
+def _hard_redline_to_dict(redline: HardRedline) -> Dict[str, object]:
+    return {
+        "redline_id": redline.redline_id,
+        "description": redline.description,
+        "action": redline.action,
+        "applies_to": list(redline.applies_to),
+    }
+
+
+def build_target_mapping(profile: TenderProfile) -> TargetMapping:
+    """把 TenderProfile contract 桥接为内部 target mapping，不执行评分裁决。"""
+    try:
+        validate_tender_profile(profile)
+    except TenderProfileValidationError as exc:
+        raise TargetMappingError(f"TenderProfile 无法构建 target mapping: {exc}") from exc
+
+    targets = tuple(_target_signal_from_item(item) for item in profile.scoring_items)
+    unmapped_item_ids = tuple(
+        target.item_id for target in targets if not target.legacy_dimension_refs
+    )
+    coverage = TargetCoverage(
+        item_count=len(targets),
+        total_score=float(profile.score_scale),
+        mapped_item_count=len(targets) - len(unmapped_item_ids),
+        unmapped_item_ids=unmapped_item_ids,
+        legacy_dimension_refs=tuple(collect_legacy_dimension_refs(profile)),
+        hard_redline_count=len(profile.hard_redlines),
+    )
+    return TargetMapping(
+        tender_id=profile.tender_id,
+        tender_name=profile.tender_name,
+        version=profile.version,
+        score_scale=float(profile.score_scale),
+        targets=targets,
+        hard_redlines=tuple(_hard_redline_to_dict(redline) for redline in profile.hard_redlines),
+        coverage=coverage,
+    )
+
+
+def target_mapping_to_dict(mapping: TargetMapping) -> Dict[str, object]:
+    """返回 JSON 友好的 target mapping dict。"""
+    return {
+        "tender_id": mapping.tender_id,
+        "tender_name": mapping.tender_name,
+        "version": mapping.version,
+        "score_scale": float(mapping.score_scale),
+        "targets": [
+            {
+                "item_id": target.item_id,
+                "name": target.name,
+                "max_score": float(target.max_score),
+                "legacy_dimension_refs": list(target.legacy_dimension_refs),
+                "evidence_requirements": list(target.evidence_requirements),
+                "band_count": target.band_count,
+                "band_labels": list(target.band_labels),
+                "band_triggers": list(target.band_triggers),
+            }
+            for target in mapping.targets
+        ],
+        "hard_redlines": [
+            {
+                "redline_id": redline["redline_id"],
+                "description": redline["description"],
+                "action": redline["action"],
+                "applies_to": list(redline["applies_to"]),
+            }
+            for redline in mapping.hard_redlines
+        ],
+        "coverage": {
+            "item_count": mapping.coverage.item_count,
+            "total_score": float(mapping.coverage.total_score),
+            "mapped_item_count": mapping.coverage.mapped_item_count,
+            "unmapped_item_ids": list(mapping.coverage.unmapped_item_ids),
+            "legacy_dimension_refs": list(mapping.coverage.legacy_dimension_refs),
+            "hard_redline_count": mapping.coverage.hard_redline_count,
+        },
+    }
