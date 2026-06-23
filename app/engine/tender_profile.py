@@ -19,11 +19,18 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 # 仓库根目录下的 config/tender_profiles/（与既有 config/qingtian_hefei_chapter_factors_v1.json 同级）
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 TENDER_PROFILES_DIR = _REPO_ROOT / "config" / "tender_profiles"
+_FORBIDDEN_PROFILE_DIRS: Tuple[Path, ...] = (
+    _REPO_ROOT / "data",
+    _REPO_ROOT / "output",
+    _REPO_ROOT / "tmp",
+    _REPO_ROOT / "docs" / "final",
+    _REPO_ROOT / "docs" / "next",
+)
 
 # 评标办法（真实标中已出现的两类）
 EVAL_METHOD_COMPREHENSIVE = "综合评估法"
@@ -47,6 +54,10 @@ class TenderProfileError(ValueError):
     """招标评分配置非法时抛出。"""
 
 
+class TenderProfileValidationError(TenderProfileError):
+    """Tender profile contract 加载或校验失败。"""
+
+
 @dataclass(frozen=True)
 class ScoreBand:
     """一个分档区间，例如「良好 3<F<4.5」。边界包含与否按真实标精确建模。"""
@@ -56,11 +67,23 @@ class ScoreBand:
     upper: float
     lower_inclusive: bool = False
     upper_inclusive: bool = True
+    band_id: str = ""
+    label: str = ""
+    description: str = ""
+    triggers: Tuple[str, ...] = ()
 
     def contains(self, score: float) -> bool:
         lo_ok = score >= self.lower if self.lower_inclusive else score > self.lower
         hi_ok = score <= self.upper if self.upper_inclusive else score < self.upper
         return bool(lo_ok and hi_ok)
+
+    @property
+    def min_score(self) -> float:
+        return self.lower
+
+    @property
+    def max_score(self) -> float:
+        return self.upper
 
 
 @dataclass(frozen=True)
@@ -72,6 +95,50 @@ class HardLines:
     multiple_shigong_rejected: bool = True  # 提供两份及以上=备选方案=判废
     zero_if_not_provided: bool = True  # 未提供 / 无任何针对性、可行性=不得分
     format_hints: Tuple[str, ...] = ()  # 排版要求（说明性，不直接判废）
+
+
+HARD_REDLINE_ACTIONS: Tuple[str, ...] = (
+    "fail",
+    "zero_item",
+    "deduct",
+    "manual_review",
+)
+
+
+@dataclass(frozen=True)
+class HardRedline:
+    """002 contract 硬红线条目。"""
+
+    redline_id: str
+    description: str
+    action: str
+    applies_to: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ScoringItem:
+    """002 contract 评分项。"""
+
+    item_id: str
+    name: str
+    max_score: float
+    bands: Tuple[ScoreBand, ...] = ()
+    evidence_requirements: Tuple[str, ...] = ()
+    legacy_dimension_refs: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TenderProfile:
+    """002 contract 按标 tender profile。"""
+
+    tender_id: str
+    tender_name: str
+    version: str
+    score_scale: float
+    scoring_items: Tuple[ScoringItem, ...]
+    hard_redlines: Tuple[HardRedline, ...] = ()
+    legacy_dimension_refs: Tuple[str, ...] = ()
+    source_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -268,6 +335,255 @@ def profile_from_dict(data: object) -> TenderScoringProfile:
         source=str(data.get("source", "")),
         notes=str(data.get("notes", "")),
     )
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def _ensure_profile_path_allowed(path: Path) -> None:
+    resolved = path.resolve(strict=False)
+    for forbidden in _FORBIDDEN_PROFILE_DIRS:
+        if _is_relative_to(resolved, forbidden.resolve(strict=False)):
+            raise TenderProfileValidationError(f"不允许从受保护目录读取 tender profile: {path}")
+
+
+def _tuple_of_str(value: object, field_name: str) -> Tuple[str, ...]:
+    if value in (None, ""):
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise TenderProfileValidationError(f"{field_name} 必须是列表")
+    return tuple(str(item) for item in value)
+
+
+def _float_value(value: object, field_name: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise TenderProfileValidationError(f"{field_name} 必须是数字") from exc
+
+
+def _parse_contract_band(raw: object, field_name: str) -> ScoreBand:
+    if not isinstance(raw, dict):
+        raise TenderProfileValidationError(f"{field_name} 必须是对象")
+
+    min_raw = raw.get("min_score", raw.get("lower", 0.0))
+    max_raw = raw.get("max_score", raw.get("upper", min_raw))
+    min_score = _float_value(min_raw, f"{field_name}.min_score")
+    max_score = _float_value(max_raw, f"{field_name}.max_score")
+    band_id = str(raw.get("band_id") or raw.get("name") or raw.get("label") or "")
+    label = str(raw.get("label") or raw.get("name") or band_id)
+
+    return ScoreBand(
+        name=label or band_id,
+        lower=min_score,
+        upper=max_score,
+        lower_inclusive=bool(raw.get("lower_inclusive", True)),
+        upper_inclusive=bool(raw.get("upper_inclusive", True)),
+        band_id=band_id,
+        label=label,
+        description=str(raw.get("description", "")),
+        triggers=_tuple_of_str(raw.get("triggers") or (), f"{field_name}.triggers"),
+    )
+
+
+def _parse_scoring_item(raw: object, index: int) -> ScoringItem:
+    field_name = f"scoring_items[{index}]"
+    if not isinstance(raw, dict):
+        raise TenderProfileValidationError(f"{field_name} 必须是对象")
+
+    bands_raw = raw.get("bands") or []
+    if not isinstance(bands_raw, list):
+        raise TenderProfileValidationError(f"{field_name}.bands 必须是列表")
+
+    return ScoringItem(
+        item_id=str(raw.get("item_id", "")),
+        name=str(raw.get("name", "")),
+        max_score=_float_value(raw.get("max_score", 0.0), f"{field_name}.max_score"),
+        bands=tuple(
+            _parse_contract_band(band, f"{field_name}.bands[{band_index}]")
+            for band_index, band in enumerate(bands_raw)
+        ),
+        evidence_requirements=_tuple_of_str(
+            raw.get("evidence_requirements") or (),
+            f"{field_name}.evidence_requirements",
+        ),
+        legacy_dimension_refs=_tuple_of_str(
+            raw.get("legacy_dimension_refs") or (),
+            f"{field_name}.legacy_dimension_refs",
+        ),
+    )
+
+
+def _parse_hard_redline(raw: object, index: int) -> HardRedline:
+    field_name = f"hard_redlines[{index}]"
+    if not isinstance(raw, dict):
+        raise TenderProfileValidationError(f"{field_name} 必须是对象")
+
+    return HardRedline(
+        redline_id=str(raw.get("redline_id", "")),
+        description=str(raw.get("description", "")),
+        action=str(raw.get("action", "manual_review")),
+        applies_to=_tuple_of_str(raw.get("applies_to") or (), f"{field_name}.applies_to"),
+    )
+
+
+def _contract_profile_from_dict(data: object) -> TenderProfile:
+    if not isinstance(data, dict):
+        raise TenderProfileValidationError("tender profile 必须是 JSON 对象")
+
+    items_raw = data.get("scoring_items") or []
+    if not isinstance(items_raw, list):
+        raise TenderProfileValidationError("scoring_items 必须是列表")
+
+    redlines_raw = data.get("hard_redlines") or []
+    if not isinstance(redlines_raw, list):
+        raise TenderProfileValidationError("hard_redlines 必须是列表")
+
+    profile = TenderProfile(
+        tender_id=str(data.get("tender_id", "")),
+        tender_name=str(data.get("tender_name", "")),
+        version=str(data.get("version", "")),
+        score_scale=_float_value(data.get("score_scale", 0.0), "score_scale"),
+        scoring_items=tuple(
+            _parse_scoring_item(item, index) for index, item in enumerate(items_raw)
+        ),
+        hard_redlines=tuple(
+            _parse_hard_redline(redline, index) for index, redline in enumerate(redlines_raw)
+        ),
+        legacy_dimension_refs=_tuple_of_str(
+            data.get("legacy_dimension_refs") or (),
+            "legacy_dimension_refs",
+        ),
+        source_note=str(data.get("source_note", "")),
+    )
+    validate_tender_profile(profile)
+    return profile
+
+
+def validate_tender_profile(profile: TenderProfile) -> None:
+    missing = [
+        field_name
+        for field_name in ("tender_id", "tender_name", "version")
+        if not str(getattr(profile, field_name, "")).strip()
+    ]
+    if missing:
+        raise TenderProfileValidationError("必填字段不得为空: " + ", ".join(missing))
+
+    if float(profile.score_scale) <= 0:
+        raise TenderProfileValidationError("score_scale 必须为正数")
+
+    if not profile.scoring_items:
+        raise TenderProfileValidationError("scoring_items 不得为空")
+
+    seen_item_ids = set()
+    total_score = 0.0
+    for item in profile.scoring_items:
+        item_id = str(item.item_id).strip()
+        if not item_id:
+            raise TenderProfileValidationError("item_id 不得为空")
+        if item_id in seen_item_ids:
+            raise TenderProfileValidationError(f"item_id 不得重复: {item_id}")
+        seen_item_ids.add(item_id)
+
+        if float(item.max_score) <= 0:
+            raise TenderProfileValidationError(f"{item_id}.max_score 必须为正数")
+        total_score += float(item.max_score)
+
+        for band in item.bands:
+            if float(band.min_score) > float(band.max_score):
+                raise TenderProfileValidationError(f"{item_id} band min_score 不得大于 max_score")
+            if float(band.max_score) > float(item.max_score) + 0.000001:
+                raise TenderProfileValidationError(
+                    f"{item_id} band max_score 不得超过评分项 max_score"
+                )
+
+    if abs(total_score - float(profile.score_scale)) > 0.000001:
+        raise TenderProfileValidationError("scoring_items.max_score 合计必须等于 score_scale")
+
+    for redline in profile.hard_redlines:
+        if redline.action not in HARD_REDLINE_ACTIONS:
+            raise TenderProfileValidationError(f"HardRedline.action 非法: {redline.action}")
+
+
+def load_tender_profile(path: str | Path) -> TenderProfile:
+    p = Path(path)
+    _ensure_profile_path_allowed(p)
+    if not p.exists():
+        raise TenderProfileValidationError(f"配置文件不存在: {p}")
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise TenderProfileValidationError(f"配置文件 JSON 解析失败: {p} ({exc})") from exc
+    except OSError as exc:
+        raise TenderProfileValidationError(f"配置文件读取失败: {p} ({exc})") from exc
+
+    try:
+        return _contract_profile_from_dict(data)
+    except TenderProfileValidationError as exc:
+        raise TenderProfileValidationError(f"{p}: {exc}") from exc
+
+
+def load_tender_profile_by_id(
+    tender_id: str,
+    base_dir: str | Path = "config/tender_profiles",
+) -> TenderProfile:
+    filename = f"{tender_id}.json"
+    if Path(filename).name != filename:
+        raise TenderProfileValidationError(f"tender_id 不得包含路径分隔符: {tender_id}")
+
+    base = Path(base_dir)
+    if not base.is_absolute():
+        base = _REPO_ROOT / base
+    return load_tender_profile(base / filename)
+
+
+def _band_to_contract_dict(band: ScoreBand) -> Dict[str, Any]:
+    band_id = band.band_id or band.name
+    label = band.label or band.name
+    return {
+        "band_id": band_id,
+        "label": label,
+        "min_score": float(band.min_score),
+        "max_score": float(band.max_score),
+        "description": band.description,
+        "triggers": list(band.triggers),
+    }
+
+
+def tender_profile_to_dict(profile: TenderProfile) -> Dict[str, Any]:
+    return {
+        "tender_id": profile.tender_id,
+        "tender_name": profile.tender_name,
+        "version": profile.version,
+        "score_scale": float(profile.score_scale),
+        "scoring_items": [
+            {
+                "item_id": item.item_id,
+                "name": item.name,
+                "max_score": float(item.max_score),
+                "bands": [_band_to_contract_dict(band) for band in item.bands],
+                "evidence_requirements": list(item.evidence_requirements),
+                "legacy_dimension_refs": list(item.legacy_dimension_refs),
+            }
+            for item in profile.scoring_items
+        ],
+        "hard_redlines": [
+            {
+                "redline_id": redline.redline_id,
+                "description": redline.description,
+                "action": redline.action,
+                "applies_to": list(redline.applies_to),
+            }
+            for redline in profile.hard_redlines
+        ],
+        "legacy_dimension_refs": list(profile.legacy_dimension_refs),
+        "source_note": profile.source_note,
+    }
 
 
 def load_profile(path: Path | str) -> TenderScoringProfile:
