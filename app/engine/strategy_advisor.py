@@ -13,12 +13,22 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Dict, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
 
+from app.engine.compilation_advisor import (
+    CompilationAdvisorError,
+    build_compilation_advice,
+    compilation_advisor_to_dict,
+)
 from app.engine.tender_profile import (
+    TenderProfile,
+    TenderProfileValidationError,
     TenderScoringProfile,
     field_target_score,
+    load_tender_profile,
     summarize_field,
+    validate_tender_profile,
 )
 
 # 含金量 -> 建议投入强度
@@ -136,3 +146,277 @@ def recommend_target(
         ceiling_note=ceiling_note,
         current_gap=current_gap,
     )
+
+
+class StrategyAdvisorError(ValueError):
+    """按标策略建议生成失败。"""
+
+
+_STRATEGY_PRIORITIES = ("high", "medium", "low")
+_STRATEGY_TYPES = (
+    "mapping",
+    "evidence",
+    "redline",
+    "document",
+    "coverage",
+    "quality",
+    "scoring_response",
+)
+
+
+@dataclass(frozen=True)
+class StrategyRecommendation:
+    recommendation_id: str
+    item_id: str
+    title: str
+    priority: str
+    strategy_type: str
+    rationale: str
+    action: str
+    expected_effect: str
+    source_advice_ids: Tuple[str, ...] = ()
+    source_issue_codes: Tuple[str, ...] = ()
+    legacy_dimension_refs: Tuple[str, ...] = ()
+    evidence_requirement: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.priority not in _STRATEGY_PRIORITIES:
+            raise ValueError(f"非法 strategy priority: {self.priority}")
+        if self.strategy_type not in _STRATEGY_TYPES:
+            raise ValueError(f"非法 strategy type: {self.strategy_type}")
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "recommendation_id": self.recommendation_id,
+            "item_id": self.item_id,
+            "title": self.title,
+            "priority": self.priority,
+            "strategy_type": self.strategy_type,
+            "rationale": self.rationale,
+            "action": self.action,
+            "expected_effect": self.expected_effect,
+            "source_advice_ids": list(self.source_advice_ids),
+            "source_issue_codes": list(self.source_issue_codes),
+            "legacy_dimension_refs": list(self.legacy_dimension_refs),
+            "evidence_requirement": list(self.evidence_requirement),
+        }
+
+
+@dataclass(frozen=True)
+class StrategyAdvisorReport:
+    tender_id: str
+    tender_name: str
+    version: str
+    status: str
+    recommendations: Tuple[StrategyRecommendation, ...]
+    compilation_advice: Dict[str, object]
+    priority_counts: Dict[str, int]
+    strategy_type_counts: Dict[str, int]
+    focus_item_ids: Tuple[str, ...]
+    unmapped_item_ids: Tuple[str, ...]
+    missing_evidence_item_ids: Tuple[str, ...]
+    hard_redline_count: int
+    summary: Dict[str, object]
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "tender_id": self.tender_id,
+            "tender_name": self.tender_name,
+            "version": self.version,
+            "status": self.status,
+            "recommendations": [item.to_dict() for item in self.recommendations],
+            "compilation_advice": dict(self.compilation_advice),
+            "priority_counts": dict(self.priority_counts),
+            "strategy_type_counts": dict(self.strategy_type_counts),
+            "focus_item_ids": list(self.focus_item_ids),
+            "unmapped_item_ids": list(self.unmapped_item_ids),
+            "missing_evidence_item_ids": list(self.missing_evidence_item_ids),
+            "hard_redline_count": self.hard_redline_count,
+            "summary": dict(self.summary),
+        }
+
+
+def _strategy_status(recommendations: Sequence[StrategyRecommendation]) -> str:
+    if not recommendations:
+        return "pass"
+    if any(item.priority == "high" for item in recommendations):
+        return "action_required"
+    return "warning"
+
+
+def _strategy_type_counts(recommendations: Sequence[StrategyRecommendation]) -> Dict[str, int]:
+    return {
+        strategy_type: sum(1 for item in recommendations if item.strategy_type == strategy_type)
+        for strategy_type in _STRATEGY_TYPES
+    }
+
+
+def _stable_item_ids(recommendations: Sequence[StrategyRecommendation]) -> Tuple[str, ...]:
+    seen = set()
+    item_ids: List[str] = []
+    for item in recommendations:
+        item_id = str(item.item_id or "").strip()
+        if not item_id or item_id in seen:
+            continue
+        seen.add(item_id)
+        item_ids.append(item_id)
+    return tuple(item_ids)
+
+
+def _strategy_type_for_advice(advice: object) -> str:
+    category = str(getattr(advice, "category", ""))
+    legacy_refs = tuple(str(ref) for ref in getattr(advice, "legacy_dimension_refs", ()))
+    if category == "mapping":
+        return "scoring_response" if legacy_refs else "mapping"
+    if category in ("evidence", "redline", "document"):
+        return category
+    if category == "coverage":
+        return "coverage"
+    return "quality"
+
+
+def _strategy_action_for_advice(advice: object, strategy_type: str) -> str:
+    base_action = str(getattr(advice, "action", "")).strip()
+    if strategy_type in ("mapping", "scoring_response"):
+        return (
+            f"{base_action} 同步补齐评审口径映射说明，明确该评分项如何承接既有维度、"
+            "目标章节和高分响应口径。"
+        )
+    if strategy_type == "evidence":
+        return (
+            f"{base_action} 补充章节证据、量化指标、验收依据或图文锚点，并在对应章节形成"
+            "可核查闭环。"
+        )
+    if strategy_type == "redline":
+        return (
+            f"{base_action} 前置核查与人工复核红线约束；本策略仅提示风险，"
+            "不作否决、扣分、判废或裁决。"
+        )
+    if strategy_type == "document":
+        return f"{base_action} 仅做施组正文落位复核和补写建议，不作判废或扣分判断。"
+    return base_action or "按编制建议补齐高分响应策略。"
+
+
+def _strategy_effect(strategy_type: str) -> str:
+    effects = {
+        "mapping": "提高评分项到既有评审口径的可追溯性，降低漏项和错配风险。",
+        "scoring_response": "把评分项转换为可执行的章节响应动作，增强高分口径一致性。",
+        "evidence": "增强支撑材料、量化指标和验收依据的可核查性。",
+        "redline": "把 hard redline 前置为人工复核清单，避免误把提示项当作自动裁决。",
+        "document": "提升施组正文对证据要求和章节锚点的覆盖度。",
+        "coverage": "补齐覆盖缺口，减少评分项未响应风险。",
+        "quality": "提升策略表达的针对性、可行性和可执行性。",
+    }
+    return effects.get(strategy_type, "提升按标策略响应质量。")
+
+
+def _recommendation_from_advice(advice: object, index: int) -> StrategyRecommendation:
+    strategy_type = _strategy_type_for_advice(advice)
+    return StrategyRecommendation(
+        recommendation_id=f"strategy-{index:03d}",
+        item_id=str(getattr(advice, "item_id", "")),
+        title=str(getattr(advice, "title", "")),
+        priority=str(getattr(advice, "priority", "medium")),
+        strategy_type=strategy_type,
+        rationale=str(getattr(advice, "reason", "")),
+        action=_strategy_action_for_advice(advice, strategy_type),
+        expected_effect=_strategy_effect(strategy_type),
+        source_advice_ids=(str(getattr(advice, "advice_id", "")),),
+        source_issue_codes=tuple(str(code) for code in getattr(advice, "source_issue_codes", ())),
+        legacy_dimension_refs=tuple(
+            str(ref) for ref in getattr(advice, "legacy_dimension_refs", ())
+        ),
+        evidence_requirement=tuple(str(req) for req in getattr(advice, "evidence_requirement", ())),
+    )
+
+
+def _build_strategy_items(compilation_report: object) -> Tuple[StrategyRecommendation, ...]:
+    return tuple(
+        _recommendation_from_advice(advice, index)
+        for index, advice in enumerate(getattr(compilation_report, "advice_items", ()), start=1)
+    )
+
+
+def build_strategy_recommendations(
+    profile: TenderProfile,
+    document_text: str = "",
+    provided_evidence: dict | None = None,
+) -> StrategyAdvisorReport:
+    """把按标诊断与编制建议转换为结构化、可序列化的高分响应策略。"""
+    try:
+        validate_tender_profile(profile)
+    except TenderProfileValidationError as exc:
+        raise StrategyAdvisorError(f"TenderProfile 校验失败: {exc}") from exc
+
+    try:
+        compilation_report = build_compilation_advice(
+            profile,
+            document_text=document_text,
+            provided_evidence=provided_evidence,
+        )
+    except CompilationAdvisorError as exc:
+        raise StrategyAdvisorError(f"编制建议生成失败: {exc}") from exc
+
+    recommendations = _build_strategy_items(compilation_report)
+    strategy_type_counts = _strategy_type_counts(recommendations)
+    priority_counts = dict(getattr(compilation_report, "priority_counts", {}))
+    status = _strategy_status(recommendations)
+    compilation_dict = compilation_advisor_to_dict(compilation_report)
+    summary = {
+        "status": status,
+        "recommendation_count": len(recommendations),
+        "high_priority_count": priority_counts.get("high", 0),
+        "medium_priority_count": priority_counts.get("medium", 0),
+        "low_priority_count": priority_counts.get("low", 0),
+        "strategy_type_counts": dict(strategy_type_counts),
+        "compilation_status": getattr(compilation_report, "status", ""),
+        "diagnostics": dict(compilation_dict.get("diagnostics", {})),
+        "coverage": dict(getattr(compilation_report, "coverage", {})),
+        "unmapped_item_count": len(getattr(compilation_report, "unmapped_item_ids", ())),
+        "missing_evidence_item_count": len(
+            getattr(compilation_report, "missing_evidence_item_ids", ())
+        ),
+        "hard_redline_count": int(getattr(compilation_report, "hard_redline_count", 0)),
+        "does_not_disqualify": True,
+        "affects_score": False,
+    }
+
+    return StrategyAdvisorReport(
+        tender_id=profile.tender_id,
+        tender_name=profile.tender_name,
+        version=profile.version,
+        status=status,
+        recommendations=recommendations,
+        compilation_advice=compilation_dict,
+        priority_counts=priority_counts,
+        strategy_type_counts=strategy_type_counts,
+        focus_item_ids=_stable_item_ids(recommendations),
+        unmapped_item_ids=tuple(getattr(compilation_report, "unmapped_item_ids", ())),
+        missing_evidence_item_ids=tuple(
+            getattr(compilation_report, "missing_evidence_item_ids", ())
+        ),
+        hard_redline_count=int(getattr(compilation_report, "hard_redline_count", 0)),
+        summary=summary,
+    )
+
+
+def build_strategy_recommendations_from_file(
+    profile_path: str | Path,
+    document_text: str = "",
+    provided_evidence: dict | None = None,
+) -> StrategyAdvisorReport:
+    """从 TenderProfile JSON 加载并生成按标策略建议。"""
+    try:
+        profile = load_tender_profile(profile_path)
+    except TenderProfileValidationError as exc:
+        raise StrategyAdvisorError(f"TenderProfile 加载失败: {exc}") from exc
+    return build_strategy_recommendations(
+        profile,
+        document_text=document_text,
+        provided_evidence=provided_evidence,
+    )
+
+
+def strategy_advisor_to_dict(report: StrategyAdvisorReport) -> Dict[str, object]:
+    """返回 JSON 友好的按标策略建议报告 dict。"""
+    return report.to_dict()
