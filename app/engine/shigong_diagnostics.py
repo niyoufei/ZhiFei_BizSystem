@@ -19,10 +19,23 @@
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from app.engine.tender_profile import TenderScoringProfile
+from app.engine.target_mapping import build_target_mapping, target_mapping_to_dict
+from app.engine.tender_preflight import (
+    TenderPreflightError,
+    run_tender_preflight,
+    tender_preflight_to_dict,
+)
+from app.engine.tender_profile import (
+    TenderProfile,
+    TenderProfileValidationError,
+    TenderScoringProfile,
+    load_tender_profile,
+    validate_tender_profile,
+)
 
 # 量化参数（数字+单位）
 _PARAM_RE = re.compile(
@@ -369,3 +382,269 @@ def decompose_high_score_sample(
         strengths=tuple(strengths),
         summary=summary,
     )
+
+
+class ShigongDiagnosticsError(ValueError):
+    """施组合同诊断失败。"""
+
+
+@dataclass(frozen=True)
+class ShigongDiagnosticIssue:
+    code: str
+    severity: str
+    message: str
+    item_id: str = ""
+    details: Dict[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.severity not in ("info", "warning", "error"):
+            raise ValueError(f"非法 shigong diagnostic severity: {self.severity}")
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "code": self.code,
+            "severity": self.severity,
+            "message": self.message,
+            "item_id": self.item_id,
+            "details": dict(self.details),
+        }
+
+
+@dataclass(frozen=True)
+class ShigongDiagnosticReport:
+    tender_id: str
+    tender_name: str
+    version: str
+    status: str
+    issues: Tuple[ShigongDiagnosticIssue, ...]
+    preflight_status: str
+    coverage: Dict[str, object]
+    unmapped_item_ids: Tuple[str, ...]
+    missing_evidence_item_ids: Tuple[str, ...]
+    hard_redline_count: int
+    legacy_dimension_refs: Tuple[str, ...]
+    summary: Dict[str, object]
+
+
+def _diagnostic_issue_from_preflight(issue: object) -> ShigongDiagnosticIssue:
+    details = getattr(issue, "details", {})
+    return ShigongDiagnosticIssue(
+        code=str(getattr(issue, "code", "")),
+        severity=str(getattr(issue, "severity", "warning")),
+        message=str(getattr(issue, "message", "")),
+        item_id=str(getattr(issue, "item_id", "")),
+        details=dict(details) if isinstance(details, dict) else {"raw_details": str(details)},
+    )
+
+
+def _diagnostic_issue_counts(issues: Sequence[ShigongDiagnosticIssue]) -> Dict[str, int]:
+    return {
+        "info": sum(1 for issue in issues if issue.severity == "info"),
+        "warning": sum(1 for issue in issues if issue.severity == "warning"),
+        "error": sum(1 for issue in issues if issue.severity == "error"),
+    }
+
+
+def _diagnostic_status(issues: Sequence[ShigongDiagnosticIssue]) -> str:
+    if any(issue.severity == "error" for issue in issues):
+        return "error"
+    if any(issue.severity == "warning" for issue in issues):
+        return "warning"
+    return "pass"
+
+
+def _evidence_value_covers_requirement(value: object, requirement: str) -> bool:
+    req = str(requirement or "").strip()
+    if not req:
+        return True
+    if value is True:
+        return True
+    if value is None or value is False:
+        return False
+    if isinstance(value, str) and not value.strip():
+        return False
+
+    req_folded = req.casefold()
+    if isinstance(value, dict):
+        for key, nested_value in value.items():
+            key_text = str(key).casefold()
+            if req_folded == key_text and bool(nested_value):
+                return True
+            if req_folded in key_text and bool(nested_value):
+                return True
+            if _evidence_value_covers_requirement(nested_value, req):
+                return True
+        return False
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_evidence_value_covers_requirement(item, req) for item in value)
+    return req_folded in str(value).casefold()
+
+
+def _missing_provided_evidence_requirements(
+    item: object,
+    provided_evidence: dict | None,
+) -> Tuple[str, ...]:
+    requirements = tuple(str(req) for req in getattr(item, "evidence_requirements", ()))
+    if not requirements:
+        return ()
+
+    item_id = str(getattr(item, "item_id", ""))
+    item_evidence = provided_evidence.get(item_id) if provided_evidence else None
+    missing = []
+    for requirement in requirements:
+        if _evidence_value_covers_requirement(item_evidence, requirement):
+            continue
+        if provided_evidence and _evidence_value_covers_requirement(provided_evidence, requirement):
+            continue
+        missing.append(requirement)
+    return tuple(missing)
+
+
+def _document_missing_requirements(item: object, document_text: str) -> Tuple[str, ...]:
+    src = str(document_text or "").casefold()
+    return tuple(
+        str(req)
+        for req in getattr(item, "evidence_requirements", ())
+        if str(req).strip() and str(req).casefold() not in src
+    )
+
+
+def run_shigong_diagnostics(
+    profile: TenderProfile,
+    document_text: str = "",
+    provided_evidence: dict | None = None,
+) -> ShigongDiagnosticReport:
+    """生成按标 profile / preflight / mapping 兼容的施组上游诊断报告。"""
+    try:
+        validate_tender_profile(profile)
+    except TenderProfileValidationError as exc:
+        raise ShigongDiagnosticsError(f"TenderProfile 校验失败: {exc}") from exc
+
+    try:
+        preflight = run_tender_preflight(profile)
+    except TenderPreflightError as exc:
+        raise ShigongDiagnosticsError(f"TenderProfile preflight 失败: {exc}") from exc
+
+    try:
+        mapping = build_target_mapping(profile)
+    except ValueError as exc:
+        raise ShigongDiagnosticsError(f"TenderProfile target mapping 失败: {exc}") from exc
+
+    preflight_dict = tender_preflight_to_dict(preflight)
+    mapping_dict = target_mapping_to_dict(mapping)
+    issues: List[ShigongDiagnosticIssue] = [
+        _diagnostic_issue_from_preflight(issue) for issue in preflight.issues
+    ]
+
+    for item in profile.scoring_items:
+        missing = _missing_provided_evidence_requirements(item, provided_evidence)
+        if missing:
+            issues.append(
+                ShigongDiagnosticIssue(
+                    code="EVIDENCE_NOT_PROVIDED",
+                    severity="warning",
+                    message=f"评分项 evidence requirement 未被 provided_evidence 覆盖: {item.item_id}",
+                    item_id=item.item_id,
+                    details={"item_name": item.name, "missing_requirements": list(missing)},
+                )
+            )
+
+    document_is_empty = not str(document_text or "").strip()
+    if document_is_empty:
+        issues.append(
+            ShigongDiagnosticIssue(
+                code="DOCUMENT_TEXT_EMPTY",
+                severity="warning",
+                message="未提供施组正文，诊断仅基于 tender profile / preflight / mapping。",
+                details={"does_not_disqualify": True},
+            )
+        )
+    else:
+        for item in profile.scoring_items:
+            missing_terms = _document_missing_requirements(item, document_text)
+            if missing_terms:
+                issues.append(
+                    ShigongDiagnosticIssue(
+                        code="EVIDENCE_REQUIREMENT_NOT_IN_DOCUMENT",
+                        severity="info",
+                        message=f"施组正文未直接包含部分 evidence requirement 关键词: {item.item_id}",
+                        item_id=item.item_id,
+                        details={
+                            "item_name": item.name,
+                            "missing_requirements": list(missing_terms),
+                            "match_mode": "case_insensitive_contains",
+                        },
+                    )
+                )
+
+    issue_tuple = tuple(issues)
+    counts = _diagnostic_issue_counts(issue_tuple)
+    status = _diagnostic_status(issue_tuple)
+    missing_evidence_item_ids = tuple(
+        item.item_id for item in profile.scoring_items if not item.evidence_requirements
+    )
+    evidence_not_provided_count = sum(
+        1 for issue in issue_tuple if issue.code == "EVIDENCE_NOT_PROVIDED"
+    )
+    summary = {
+        "status": status,
+        "issue_count": len(issue_tuple),
+        "info_count": counts["info"],
+        "warning_count": counts["warning"],
+        "error_count": counts["error"],
+        "preflight": dict(preflight_dict["summary"]),
+        "mapping_coverage": dict(mapping_dict["coverage"]),
+        "missing_evidence_item_count": len(missing_evidence_item_ids),
+        "evidence_not_provided_count": evidence_not_provided_count,
+        "document_text_empty": document_is_empty,
+    }
+
+    return ShigongDiagnosticReport(
+        tender_id=profile.tender_id,
+        tender_name=profile.tender_name,
+        version=profile.version,
+        status=status,
+        issues=issue_tuple,
+        preflight_status=preflight.status,
+        coverage=dict(preflight_dict["coverage"]),
+        unmapped_item_ids=tuple(mapping.coverage.unmapped_item_ids),
+        missing_evidence_item_ids=missing_evidence_item_ids,
+        hard_redline_count=mapping.coverage.hard_redline_count,
+        legacy_dimension_refs=tuple(mapping.coverage.legacy_dimension_refs),
+        summary=summary,
+    )
+
+
+def run_shigong_diagnostics_from_file(
+    profile_path: str | Path,
+    document_text: str = "",
+    provided_evidence: dict | None = None,
+) -> ShigongDiagnosticReport:
+    """从 tender profile JSON 加载并生成施组诊断报告。"""
+    try:
+        profile = load_tender_profile(profile_path)
+    except TenderProfileValidationError as exc:
+        raise ShigongDiagnosticsError(f"TenderProfile 加载失败: {exc}") from exc
+    return run_shigong_diagnostics(
+        profile,
+        document_text=document_text,
+        provided_evidence=provided_evidence,
+    )
+
+
+def shigong_diagnostics_to_dict(report: ShigongDiagnosticReport) -> Dict[str, object]:
+    """返回 JSON 友好的施组诊断报告 dict。"""
+    return {
+        "tender_id": report.tender_id,
+        "tender_name": report.tender_name,
+        "version": report.version,
+        "status": report.status,
+        "issues": [issue.to_dict() for issue in report.issues],
+        "preflight_status": report.preflight_status,
+        "coverage": dict(report.coverage),
+        "unmapped_item_ids": list(report.unmapped_item_ids),
+        "missing_evidence_item_ids": list(report.missing_evidence_item_ids),
+        "hard_redline_count": report.hard_redline_count,
+        "legacy_dimension_refs": list(report.legacy_dimension_refs),
+        "summary": dict(report.summary),
+    }
