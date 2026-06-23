@@ -19,10 +19,22 @@ from __future__ import annotations
 
 import os
 from dataclasses import asdict, dataclass
-from typing import Callable, Dict, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from app.engine.shigong_diagnostics import ShigongDiagnosis
-from app.engine.tender_profile import TenderScoringProfile
+from app.engine.shigong_diagnostics import (
+    ShigongDiagnosis,
+    ShigongDiagnosticsError,
+    run_shigong_diagnostics,
+    shigong_diagnostics_to_dict,
+)
+from app.engine.tender_profile import (
+    TenderProfile,
+    TenderProfileValidationError,
+    TenderScoringProfile,
+    load_tender_profile,
+    validate_tender_profile,
+)
 
 COMPILATION_LLM_BACKEND_ENV = "COMPILATION_LLM_BACKEND"
 
@@ -195,3 +207,308 @@ def suggest_rewrite(
         factors=factors,
         source=source,
     )
+
+
+# ==================== 按标编制建议 ====================
+
+
+class CompilationAdvisorError(ValueError):
+    """按标编制建议生成失败。"""
+
+
+_ADVICE_PRIORITIES = ("high", "medium", "low")
+
+
+@dataclass(frozen=True)
+class CompilationAdviceItem:
+    advice_id: str
+    item_id: str
+    title: str
+    priority: str
+    category: str
+    reason: str
+    action: str
+    evidence_requirement: Tuple[str, ...] = ()
+    source_issue_codes: Tuple[str, ...] = ()
+    legacy_dimension_refs: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.priority not in _ADVICE_PRIORITIES:
+            raise ValueError(f"非法 compilation advice priority: {self.priority}")
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "advice_id": self.advice_id,
+            "item_id": self.item_id,
+            "title": self.title,
+            "priority": self.priority,
+            "category": self.category,
+            "reason": self.reason,
+            "action": self.action,
+            "evidence_requirement": list(self.evidence_requirement),
+            "source_issue_codes": list(self.source_issue_codes),
+            "legacy_dimension_refs": list(self.legacy_dimension_refs),
+        }
+
+
+@dataclass(frozen=True)
+class CompilationAdvisorReport:
+    tender_id: str
+    tender_name: str
+    version: str
+    status: str
+    advice_items: Tuple[CompilationAdviceItem, ...]
+    diagnostics: Dict[str, object]
+    coverage: Dict[str, object]
+    unmapped_item_ids: Tuple[str, ...]
+    missing_evidence_item_ids: Tuple[str, ...]
+    hard_redline_count: int
+    priority_counts: Dict[str, int]
+    summary: Dict[str, object]
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "tender_id": self.tender_id,
+            "tender_name": self.tender_name,
+            "version": self.version,
+            "status": self.status,
+            "advice_items": [item.to_dict() for item in self.advice_items],
+            "diagnostics": dict(self.diagnostics),
+            "coverage": dict(self.coverage),
+            "unmapped_item_ids": list(self.unmapped_item_ids),
+            "missing_evidence_item_ids": list(self.missing_evidence_item_ids),
+            "hard_redline_count": self.hard_redline_count,
+            "priority_counts": dict(self.priority_counts),
+            "summary": dict(self.summary),
+        }
+
+
+def _item_name(profile: TenderProfile, item_id: str) -> str:
+    for item in profile.scoring_items:
+        if item.item_id == item_id:
+            return item.name
+    return item_id
+
+
+def _item_evidence_requirements(profile: TenderProfile, item_id: str) -> Tuple[str, ...]:
+    for item in profile.scoring_items:
+        if item.item_id == item_id:
+            return tuple(str(req) for req in item.evidence_requirements)
+    return ()
+
+
+def _item_legacy_refs(profile: TenderProfile, item_id: str) -> Tuple[str, ...]:
+    for item in profile.scoring_items:
+        if item.item_id == item_id:
+            return tuple(str(ref) for ref in item.legacy_dimension_refs)
+    return ()
+
+
+def _issue_missing_requirements(issue: object, profile: TenderProfile) -> Tuple[str, ...]:
+    details = getattr(issue, "details", {})
+    if isinstance(details, dict):
+        missing = details.get("missing_requirements")
+        if isinstance(missing, (list, tuple)):
+            return tuple(str(req) for req in missing)
+    return _item_evidence_requirements(profile, str(getattr(issue, "item_id", "")))
+
+
+def _advice_status(advice_items: Sequence[CompilationAdviceItem]) -> str:
+    if not advice_items:
+        return "pass"
+    if any(item.priority == "high" for item in advice_items):
+        return "action_required"
+    return "warning"
+
+
+def _priority_counts(advice_items: Sequence[CompilationAdviceItem]) -> Dict[str, int]:
+    return {
+        priority: sum(1 for item in advice_items if item.priority == priority)
+        for priority in _ADVICE_PRIORITIES
+    }
+
+
+def _advice_from_issue(
+    issue: object,
+    profile: TenderProfile,
+    advice_id: str,
+) -> Optional[CompilationAdviceItem]:
+    code = str(getattr(issue, "code", ""))
+    item_id = str(getattr(issue, "item_id", ""))
+    item_name = _item_name(profile, item_id) if item_id else ""
+    legacy_refs = _item_legacy_refs(profile, item_id)
+    requirements = _issue_missing_requirements(issue, profile)
+
+    if code == "UNMAPPED_SCORING_ITEM":
+        return CompilationAdviceItem(
+            advice_id=advice_id,
+            item_id=item_id,
+            title=f"补齐评分项目标映射: {item_name or item_id}",
+            priority="high",
+            category="mapping",
+            reason="该评分项缺少 legacy_dimension_refs，无法稳定承接既有评分维度。",
+            action="为该评分项补充可追溯的 legacy_dimension_refs 或明确等价目标映射后再编制对应章节。",
+            evidence_requirement=requirements,
+            source_issue_codes=(code,),
+            legacy_dimension_refs=legacy_refs,
+        )
+
+    if code == "MISSING_EVIDENCE_REQUIREMENT":
+        return CompilationAdviceItem(
+            advice_id=advice_id,
+            item_id=item_id,
+            title=f"补齐评分项证据要求: {item_name or item_id}",
+            priority="high",
+            category="evidence",
+            reason="该评分项未声明 evidence requirements，编制时无法形成可核查的支撑材料清单。",
+            action="为该评分项补充明确的证明材料、现场数据、图表或验收记录要求，并在施组章节中逐项落位。",
+            evidence_requirement=requirements,
+            source_issue_codes=(code,),
+            legacy_dimension_refs=legacy_refs,
+        )
+
+    if code == "EVIDENCE_NOT_PROVIDED":
+        return CompilationAdviceItem(
+            advice_id=advice_id,
+            item_id=item_id,
+            title=f"收集评分项支撑证据: {item_name or item_id}",
+            priority="high",
+            category="evidence",
+            reason="该评分项已有 evidence requirements，但 provided_evidence 未覆盖。",
+            action="先补齐缺失支撑材料，再把证据写入对应施工组织章节，避免只出现空泛承诺。",
+            evidence_requirement=requirements,
+            source_issue_codes=(code,),
+            legacy_dimension_refs=legacy_refs,
+        )
+
+    if code == "HARD_REDLINE_DECLARED":
+        return CompilationAdviceItem(
+            advice_id=advice_id,
+            item_id=item_id,
+            title="复核 hard redline 编制约束",
+            priority="medium",
+            category="redline",
+            reason="TenderProfile 已声明 hard redline，编制时需要作为风险提示项单独复核。",
+            action="在编制清单中加入对应红线复核动作；本建议仅提示，不执行否决、扣分、判废或裁决。",
+            evidence_requirement=requirements,
+            source_issue_codes=(code,),
+            legacy_dimension_refs=legacy_refs,
+        )
+
+    if code == "DOCUMENT_TEXT_EMPTY":
+        return CompilationAdviceItem(
+            advice_id=advice_id,
+            item_id=item_id,
+            title="提供施组正文后再做文本落位复核",
+            priority="medium",
+            category="document",
+            reason="当前 document_text 为空，只能基于 profile / preflight / mapping 给出结构建议。",
+            action="补充施组正文后复核 evidence requirements 是否落入具体章节；本建议不判废、不扣分。",
+            evidence_requirement=requirements,
+            source_issue_codes=(code,),
+            legacy_dimension_refs=legacy_refs,
+        )
+
+    if code == "EVIDENCE_REQUIREMENT_NOT_IN_DOCUMENT":
+        return CompilationAdviceItem(
+            advice_id=advice_id,
+            item_id=item_id,
+            title=f"把证据要求写入施组正文: {item_name or item_id}",
+            priority="low",
+            category="document",
+            reason="施组正文未直接包含部分 evidence requirement 关键词。",
+            action="检查对应章节是否以等价表达覆盖证据要求；必要时补充可核查的材料名称、参数或验收动作。",
+            evidence_requirement=requirements,
+            source_issue_codes=(code,),
+            legacy_dimension_refs=legacy_refs,
+        )
+
+    return None
+
+
+def _build_advice_items(
+    profile: TenderProfile,
+    diagnostics: object,
+) -> Tuple[CompilationAdviceItem, ...]:
+    items: List[CompilationAdviceItem] = []
+    for issue in getattr(diagnostics, "issues", ()):
+        advice = _advice_from_issue(issue, profile, f"advice-{len(items) + 1:03d}")
+        if advice is not None:
+            items.append(advice)
+    return tuple(items)
+
+
+def build_compilation_advice(
+    profile: TenderProfile,
+    document_text: str = "",
+    provided_evidence: dict | None = None,
+) -> CompilationAdvisorReport:
+    """把按标诊断结果转换为结构化、可序列化的施组编制建议。"""
+    try:
+        validate_tender_profile(profile)
+    except TenderProfileValidationError as exc:
+        raise CompilationAdvisorError(f"TenderProfile 校验失败: {exc}") from exc
+
+    try:
+        diagnostics = run_shigong_diagnostics(
+            profile,
+            document_text=document_text,
+            provided_evidence=provided_evidence,
+        )
+    except ShigongDiagnosticsError as exc:
+        raise CompilationAdvisorError(f"施组诊断失败: {exc}") from exc
+
+    diagnostics_dict = shigong_diagnostics_to_dict(diagnostics)
+    advice_items = _build_advice_items(profile, diagnostics)
+    priority_counts = _priority_counts(advice_items)
+    status = _advice_status(advice_items)
+    summary = {
+        "status": status,
+        "advice_item_count": len(advice_items),
+        "high_priority_count": priority_counts["high"],
+        "medium_priority_count": priority_counts["medium"],
+        "low_priority_count": priority_counts["low"],
+        "diagnostics_status": diagnostics.status,
+        "diagnostics_issue_count": len(diagnostics.issues),
+        "coverage": dict(diagnostics.coverage),
+        "hard_redline_count": diagnostics.hard_redline_count,
+        "does_not_disqualify": True,
+        "affects_score": False,
+    }
+
+    return CompilationAdvisorReport(
+        tender_id=profile.tender_id,
+        tender_name=profile.tender_name,
+        version=profile.version,
+        status=status,
+        advice_items=advice_items,
+        diagnostics=diagnostics_dict,
+        coverage=dict(diagnostics.coverage),
+        unmapped_item_ids=tuple(diagnostics.unmapped_item_ids),
+        missing_evidence_item_ids=tuple(diagnostics.missing_evidence_item_ids),
+        hard_redline_count=diagnostics.hard_redline_count,
+        priority_counts=priority_counts,
+        summary=summary,
+    )
+
+
+def build_compilation_advice_from_file(
+    profile_path: str | Path,
+    document_text: str = "",
+    provided_evidence: dict | None = None,
+) -> CompilationAdvisorReport:
+    """从 TenderProfile JSON 加载并生成按标编制建议。"""
+    try:
+        profile = load_tender_profile(profile_path)
+    except TenderProfileValidationError as exc:
+        raise CompilationAdvisorError(f"TenderProfile 加载失败: {exc}") from exc
+    return build_compilation_advice(
+        profile,
+        document_text=document_text,
+        provided_evidence=provided_evidence,
+    )
+
+
+def compilation_advisor_to_dict(report: CompilationAdvisorReport) -> Dict[str, object]:
+    """返回 JSON 友好的按标编制建议报告 dict。"""
+    return report.to_dict()
