@@ -239,6 +239,23 @@ class TestIndexEndpoint:
         ):
             assert f"safeClick('{button_id}'" in page
 
+    def test_index_frontend_has_per_tender_minimal_panel(self, client):
+        """014 frontend gate should expose a minimal per-tender analysis panel."""
+        response = client.get("/")
+        assert response.status_code == 200
+        page = response.text
+        assert "按标分析（per-tender）" in page
+        assert "/api/v1/per-tender/analyze" in page
+        assert 'id="perTenderProfileJson"' in page
+        assert "profile JSON" in page
+        assert 'id="perTenderDocumentText"' in page
+        assert 'id="btnPerTenderAnalyze"' in page
+        assert "运行按标分析" in page
+        assert 'id="perTenderResult"' in page
+        assert "provided_evidence: {}" in page
+        assert "judge_scores: []" in page
+        assert "calibration_samples: []" in page
+
     def test_index_frontend_has_ollama_preview_export_actions(self, client):
         """Ollama preview result actions should be client-side and preview-only."""
         response = client.get("/")

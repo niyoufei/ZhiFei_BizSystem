@@ -15368,6 +15368,73 @@ def index(
         </div>
       </div>
 
+      <div class="section card" id="section-per-tender">
+        <h2>按标分析（per-tender）</h2>
+        <p class="note" style="margin:-4px 0 10px 0">使用虚构 profile 与粘贴文本调用后端按标分析接口；hard redline 仅作为提示展示。</p>
+        <div class="field-group" style="align-items:stretch">
+          <label for="perTenderProfileJson" style="flex-basis:100%;font-weight:700">profile JSON</label>
+          <textarea id="perTenderProfileJson" rows="14" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px">{
+  "tender_id": "synthetic-014",
+  "tender_name": "014 synthetic tender",
+  "version": "v014",
+  "score_scale": 10,
+  "legacy_dimension_refs": ["dim_01", "dim_02"],
+  "scoring_items": [
+    {
+      "item_id": "deployment",
+      "name": "施工部署",
+      "max_score": 4,
+      "legacy_dimension_refs": ["dim_01"],
+      "evidence_requirements": ["项目经理", "施工计划"],
+      "bands": [
+        {"band_id": "basic", "label": "基本", "min_score": 0, "max_score": 2},
+        {"band_id": "strong", "label": "优秀", "min_score": 2, "max_score": 4}
+      ]
+    },
+    {
+      "item_id": "resources",
+      "name": "资源配置",
+      "max_score": 3,
+      "legacy_dimension_refs": ["dim_02"],
+      "evidence_requirements": ["劳动力", "机械设备"],
+      "bands": [
+        {"band_id": "basic", "label": "基本", "min_score": 0, "max_score": 1.5},
+        {"band_id": "strong", "label": "优秀", "min_score": 1.5, "max_score": 3}
+      ]
+    },
+    {
+      "item_id": "safety",
+      "name": "质量安全",
+      "max_score": 3,
+      "legacy_dimension_refs": ["dim_03"],
+      "evidence_requirements": ["质量验收", "安全员"],
+      "bands": [
+        {"band_id": "basic", "label": "基本", "min_score": 0, "max_score": 1.5},
+        {"band_id": "strong", "label": "优秀", "min_score": 1.5, "max_score": 3}
+      ]
+    }
+  ],
+  "hard_redlines": [
+    {
+      "redline_id": "site_plan_required",
+      "description": "施工总平面布置图缺失需提示风险",
+      "action": "manual_review",
+      "applies_to": ["deployment"]
+    }
+  ],
+  "source_note": "synthetic inline profile for 014 frontend test"
+}</textarea>
+        </div>
+        <div class="field-group" style="align-items:stretch">
+          <label for="perTenderDocumentText" style="flex-basis:100%;font-weight:700">document_text</label>
+          <textarea id="perTenderDocumentText" rows="5" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc">本施工组织设计由项目经理牵头，劳动力和机械设备按每日计划投入。质量验收由质量员旁站复检，安全员每日检查不少于2次。</textarea>
+        </div>
+        <div class="action-row">
+          <button type="button" id="btnPerTenderAnalyze">运行按标分析</button>
+        </div>
+        <div id="perTenderResult" class="result-block" style="display:none"></div>
+      </div>
+
       <div class="section card">
         <h2>5) 对比与洞察</h2>
         <p style="font-size:12px;color:#64748b;margin:-4px 0 8px 0">对比排名：看多份施组分数排序；对比报告：看叙述性差异；洞察：看弱项与扣分建议；学习画像：生成维度权重供后续评分参考。</p>
@@ -20195,6 +20262,75 @@ def index(
             html += '<p style="font-size:12px;margin-top:8px">点击「编制系统指令」可查看/导出编制约束（必备章节、图表、禁止表述等）。</p>';
             el.innerHTML = html;
           } else { el.innerHTML = '<span class="error">' + (data.detail || '请求失败，若需认证请设置 API Key') + '</span>'; }
+        });
+        safeClick('btnPerTenderAnalyze', async () => {
+          const profileEl = document.getElementById('perTenderProfileJson');
+          const documentEl = document.getElementById('perTenderDocumentText');
+          const resultEl = document.getElementById('perTenderResult');
+          if (!resultEl) return;
+          resultEl.style.display = 'block';
+          let profile = {};
+          try {
+            profile = JSON.parse((profileEl && profileEl.value) || '{}');
+          } catch (err) {
+            const data = {
+              ok: false,
+              error: 'invalid_profile_json',
+              detail: String((err && err.message) || err || 'profile JSON 解析失败')
+            };
+            resultEl.innerHTML = '<p class="error"><strong>ok:</strong> false</p>'
+              + '<p><strong>error:</strong> ' + escapeHtmlText(data.error) + '</p>'
+              + '<p><strong>detail:</strong> ' + escapeHtmlText(data.detail) + '</p>';
+            showJson('output', data);
+            return;
+          }
+          const payload = {
+            profile: profile,
+            document_text: (documentEl && documentEl.value) || '',
+            provided_evidence: {},
+            judge_scores: [],
+            calibration_samples: []
+          };
+          resultEl.innerHTML = '<span class="success">按标分析运行中...</span>';
+          let res;
+          let data = {};
+          try {
+            res = await fetch('/api/v1/per-tender/analyze', {
+              method: 'POST',
+              headers: apiHeaders(true),
+              body: JSON.stringify(payload)
+            });
+            data = await res.json().catch(() => ({}));
+          } catch (err) {
+            data = {
+              ok: false,
+              error: 'request_failed',
+              detail: String((err && err.message) || err || '请求失败')
+            };
+            resultEl.innerHTML = '<p class="error"><strong>ok:</strong> false</p>'
+              + '<p><strong>error:</strong> ' + escapeHtmlText(data.error) + '</p>'
+              + '<p><strong>detail:</strong> ' + escapeHtmlText(data.detail) + '</p>';
+            showJson('output', data);
+            return;
+          }
+          const analysis = (data && data.analysis && typeof data.analysis === 'object') ? data.analysis : {};
+          const preflight = (analysis.preflight && typeof analysis.preflight === 'object') ? analysis.preflight : {};
+          const summary = data.summary || analysis.summary || preflight.summary || '';
+          const okValue = data.ok === true;
+          const statusValue = data.status || analysis.status || '';
+          const detailValue = data.detail || '';
+          const errorValue = data.error || '';
+          let html = '<p class="' + (okValue ? 'success' : 'error') + '"><strong>ok:</strong> ' + String(okValue) + '</p>'
+            + '<p><strong>tender_id:</strong> ' + escapeHtmlText(data.tender_id || analysis.tender_id || '') + '</p>'
+            + '<p><strong>status:</strong> ' + escapeHtmlText(statusValue) + '</p>'
+            + '<p><strong>summary:</strong> ' + escapeHtmlText(summary) + '</p>';
+          if (!okValue) {
+            html += '<p><strong>error:</strong> ' + escapeHtmlText(errorValue) + '</p>'
+              + '<p><strong>detail:</strong> ' + escapeHtmlText(detailValue) + '</p>';
+          }
+          html += '<details open><summary>原始 JSON 结果</summary><pre>' + escapeHtmlText(JSON.stringify(data, null, 2)) + '</pre></details>';
+          resultEl.innerHTML = html;
+          showJson('output', data);
         });
         safeClick('btnOllamaPreview', async () => {
           if (!ensureProjectForAction('ollamaPreviewResult')) return;
