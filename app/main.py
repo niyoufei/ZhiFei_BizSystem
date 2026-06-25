@@ -63,7 +63,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.exception_handlers import http_exception_handler
-from fastapi.responses import RedirectResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import app.engine.local_llm_ollama_preview_adapter as local_llm_ollama_preview_adapter
@@ -127,7 +127,20 @@ from app.engine.reflection import (
     mine_patch_package,
 )
 from app.engine.scorer import score_text
+from app.engine.shigong_analyzer import (
+    ShigongAnalyzerError,
+    analyze_shigong_submission,
+    shigong_analysis_to_dict,
+)
 from app.engine.surrogate_learning import calibrate_weights, compute_time_decay_weight
+from app.engine.tender_profile import (
+    HardRedline,
+    ScoreBand,
+    ScoringItem,
+    TenderProfile,
+    TenderProfileValidationError,
+    validate_tender_profile,
+)
 from app.engine.v2_scorer import compute_v2_rule_total, score_text_v2
 from app.i18n import DEFAULT_LOCALE, SUPPORTED_LOCALES, t
 from app.metrics import get_metrics, record_score, update_project_stats
@@ -6871,6 +6884,183 @@ def score_endpoint(
     # 记录评分指标
     record_score(result.total_score)
     return result
+
+
+def _per_tender_error(status_code: int, error: str, detail: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"ok": False, "error": error, "detail": detail},
+    )
+
+
+def _inline_tuple_of_str(value: object, field_name: str) -> tuple[str, ...]:
+    if value in (None, ""):
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise TenderProfileValidationError(f"{field_name} 必须是列表")
+    return tuple(str(item) for item in value)
+
+
+def _inline_float(value: object, field_name: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise TenderProfileValidationError(f"{field_name} 必须是数字") from exc
+
+
+def _parse_inline_score_band(raw: object, field_name: str) -> ScoreBand:
+    if not isinstance(raw, dict):
+        raise TenderProfileValidationError(f"{field_name} 必须是对象")
+
+    min_raw = raw.get("min_score", raw.get("lower", 0.0))
+    max_raw = raw.get("max_score", raw.get("upper", min_raw))
+    band_id = str(raw.get("band_id") or raw.get("name") or raw.get("label") or "")
+    label = str(raw.get("label") or raw.get("name") or band_id)
+    return ScoreBand(
+        name=label or band_id,
+        lower=_inline_float(min_raw, f"{field_name}.min_score"),
+        upper=_inline_float(max_raw, f"{field_name}.max_score"),
+        lower_inclusive=bool(raw.get("lower_inclusive", True)),
+        upper_inclusive=bool(raw.get("upper_inclusive", True)),
+        band_id=band_id,
+        label=label,
+        description=str(raw.get("description", "")),
+        triggers=_inline_tuple_of_str(raw.get("triggers") or (), f"{field_name}.triggers"),
+    )
+
+
+def _parse_inline_scoring_item(raw: object, index: int) -> ScoringItem:
+    field_name = f"profile.scoring_items[{index}]"
+    if not isinstance(raw, dict):
+        raise TenderProfileValidationError(f"{field_name} 必须是对象")
+
+    bands_raw = raw.get("bands") or []
+    if not isinstance(bands_raw, list):
+        raise TenderProfileValidationError(f"{field_name}.bands 必须是列表")
+
+    return ScoringItem(
+        item_id=str(raw.get("item_id", "")),
+        name=str(raw.get("name", "")),
+        max_score=_inline_float(raw.get("max_score", 0.0), f"{field_name}.max_score"),
+        bands=tuple(
+            _parse_inline_score_band(band, f"{field_name}.bands[{band_index}]")
+            for band_index, band in enumerate(bands_raw)
+        ),
+        evidence_requirements=_inline_tuple_of_str(
+            raw.get("evidence_requirements") or (),
+            f"{field_name}.evidence_requirements",
+        ),
+        legacy_dimension_refs=_inline_tuple_of_str(
+            raw.get("legacy_dimension_refs") or (),
+            f"{field_name}.legacy_dimension_refs",
+        ),
+    )
+
+
+def _parse_inline_hard_redline(raw: object, index: int) -> HardRedline:
+    field_name = f"profile.hard_redlines[{index}]"
+    if not isinstance(raw, dict):
+        raise TenderProfileValidationError(f"{field_name} 必须是对象")
+    return HardRedline(
+        redline_id=str(raw.get("redline_id", "")),
+        description=str(raw.get("description", "")),
+        action=str(raw.get("action", "manual_review")),
+        applies_to=_inline_tuple_of_str(raw.get("applies_to") or (), f"{field_name}.applies_to"),
+    )
+
+
+def _parse_inline_tender_profile(profile_payload: object) -> TenderProfile:
+    if not isinstance(profile_payload, dict):
+        raise TenderProfileValidationError("profile 必须是 JSON 对象")
+
+    items_raw = profile_payload.get("scoring_items") or []
+    if not isinstance(items_raw, list):
+        raise TenderProfileValidationError("profile.scoring_items 必须是列表")
+
+    redlines_raw = profile_payload.get("hard_redlines") or []
+    if not isinstance(redlines_raw, list):
+        raise TenderProfileValidationError("profile.hard_redlines 必须是列表")
+
+    profile = TenderProfile(
+        tender_id=str(profile_payload.get("tender_id", "")),
+        tender_name=str(profile_payload.get("tender_name", "")),
+        version=str(profile_payload.get("version", "")),
+        score_scale=_inline_float(profile_payload.get("score_scale", 0.0), "profile.score_scale"),
+        scoring_items=tuple(
+            _parse_inline_scoring_item(item, index) for index, item in enumerate(items_raw)
+        ),
+        hard_redlines=tuple(
+            _parse_inline_hard_redline(redline, index) for index, redline in enumerate(redlines_raw)
+        ),
+        legacy_dimension_refs=_inline_tuple_of_str(
+            profile_payload.get("legacy_dimension_refs") or (),
+            "profile.legacy_dimension_refs",
+        ),
+        source_note=str(profile_payload.get("source_note", "")),
+    )
+    validate_tender_profile(profile)
+    return profile
+
+
+def _optional_per_tender_dict(payload: Dict[str, Any], field_name: str) -> dict:
+    value = payload.get(field_name)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise TenderProfileValidationError(f"{field_name} 必须是对象")
+    return value
+
+
+def _optional_per_tender_list(payload: Dict[str, Any], field_name: str) -> list:
+    value = payload.get(field_name)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise TenderProfileValidationError(f"{field_name} 必须是列表")
+    return value
+
+
+@router.post("/per-tender/analyze", tags=["按标分析"], response_model=None)
+def analyze_per_tender(payload: Dict[str, Any]) -> dict | JSONResponse:
+    profile_payload = payload.get("profile")
+    if profile_payload is None:
+        return _per_tender_error(422, "profile_required", "profile 为必填字段")
+    if not isinstance(profile_payload, dict):
+        return _per_tender_error(422, "invalid_profile", "profile 必须是 JSON 对象")
+
+    document_text = payload.get("document_text") or ""
+    if not isinstance(document_text, str):
+        return _per_tender_error(422, "invalid_document_text", "document_text 必须是字符串")
+
+    try:
+        profile = _parse_inline_tender_profile(profile_payload)
+        provided_evidence = _optional_per_tender_dict(payload, "provided_evidence")
+        judge_scores = _optional_per_tender_list(payload, "judge_scores")
+        calibration_samples = _optional_per_tender_list(payload, "calibration_samples")
+    except TenderProfileValidationError as exc:
+        return _per_tender_error(422, "invalid_profile", str(exc))
+
+    try:
+        report = analyze_shigong_submission(
+            profile,
+            document_text=document_text,
+            provided_evidence=provided_evidence,
+            judge_scores=judge_scores,
+            calibration_samples=calibration_samples,
+        )
+        analysis = shigong_analysis_to_dict(report)
+    except ShigongAnalyzerError as exc:
+        return _per_tender_error(422, "analysis_failed", str(exc))
+    except Exception:
+        return _per_tender_error(500, "internal_error", "按标分析失败，请检查请求体后重试")
+
+    return {
+        "ok": True,
+        "engine": "shigong_analyzer",
+        "tender_id": report.tender_id,
+        "status": report.status,
+        "analysis": analysis,
+    }
 
 
 @router.post(

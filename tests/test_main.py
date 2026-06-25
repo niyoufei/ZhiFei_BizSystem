@@ -15,7 +15,9 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from app.main import app, create_app
+os.environ["API_KEYS"] = ""
+
+from app.main import app, create_app  # noqa: E402
 
 
 @pytest.fixture
@@ -705,6 +707,143 @@ class TestScoreEndpoint:
         response = client.post("/api/v1/score", json={"text": "测试文本"})
         assert response.status_code == 200
         mock_score.assert_called_once()
+
+
+def _synthetic_per_tender_profile() -> dict:
+    return {
+        "tender_id": "synthetic-013a",
+        "tender_name": "013A synthetic tender",
+        "version": "v013a",
+        "score_scale": 10,
+        "legacy_dimension_refs": ["dim_01", "dim_02"],
+        "scoring_items": [
+            {
+                "item_id": "deployment",
+                "name": "施工部署",
+                "max_score": 4,
+                "legacy_dimension_refs": ["dim_01"],
+                "evidence_requirements": ["项目经理", "施工计划"],
+                "bands": [
+                    {"band_id": "basic", "label": "基本", "min_score": 0, "max_score": 2},
+                    {"band_id": "strong", "label": "优秀", "min_score": 2, "max_score": 4},
+                ],
+            },
+            {
+                "item_id": "resources",
+                "name": "资源配置",
+                "max_score": 3,
+                "legacy_dimension_refs": ["dim_02"],
+                "evidence_requirements": ["劳动力", "机械设备"],
+                "bands": [
+                    {"band_id": "basic", "label": "基本", "min_score": 0, "max_score": 1.5},
+                    {"band_id": "strong", "label": "优秀", "min_score": 1.5, "max_score": 3},
+                ],
+            },
+            {
+                "item_id": "safety",
+                "name": "质量安全",
+                "max_score": 3,
+                "legacy_dimension_refs": ["dim_03"],
+                "evidence_requirements": ["质量验收", "安全员"],
+                "bands": [
+                    {"band_id": "basic", "label": "基本", "min_score": 0, "max_score": 1.5},
+                    {"band_id": "strong", "label": "优秀", "min_score": 1.5, "max_score": 3},
+                ],
+            },
+        ],
+        "hard_redlines": [
+            {
+                "redline_id": "site_plan_required",
+                "description": "施工总平面布置图缺失需提示风险",
+                "action": "manual_review",
+                "applies_to": ["deployment"],
+            }
+        ],
+        "source_note": "synthetic inline profile for 013A API tests",
+    }
+
+
+def _synthetic_per_tender_payload() -> dict:
+    return {
+        "profile": _synthetic_per_tender_profile(),
+        "document_text": (
+            "本施工组织设计由项目经理牵头，劳动力和机械设备按每日计划投入。"
+            "质量验收由质量员旁站复检，安全员每日检查不少于2次。"
+        ),
+        "provided_evidence": {
+            "deployment": ["项目经理", "施工计划"],
+            "resources": ["劳动力", "机械设备"],
+            "safety": ["质量验收", "安全员"],
+        },
+        "calibration_samples": [],
+    }
+
+
+class TestPerTenderAnalyzeEndpoint:
+    """Tests for POST /api/v1/per-tender/analyze endpoint."""
+
+    def test_per_tender_analyze_success_with_inline_profile(self, client):
+        response = client.post("/api/v1/per-tender/analyze", json=_synthetic_per_tender_payload())
+        assert response.status_code == 200
+        data = response.json()
+        assert data["ok"] is True
+        assert data["engine"] == "shigong_analyzer"
+        assert data["tender_id"] == "synthetic-013a"
+        assert "status" in data
+
+        analysis = data["analysis"]
+        assert analysis["tender_id"] == "synthetic-013a"
+        assert "target_mapping" in analysis
+        assert "coverage" in analysis["target_mapping"]
+        assert "preflight" in analysis
+        assert "summary" in analysis["preflight"]
+        assert "diagnostics" in analysis
+        assert "summary" in analysis["diagnostics"]
+        assert "compilation_advice" in analysis
+        assert "summary" in analysis["compilation_advice"]
+        assert "strategy_recommendations" in analysis
+        assert "summary" in analysis["strategy_recommendations"]
+        assert "text_calibration" in analysis
+        assert "summary" in analysis["text_calibration"]
+        assert analysis["judge_aggregation"] is None
+
+    def test_per_tender_analyze_with_judge_scores_includes_aggregation(self, client):
+        payload = _synthetic_per_tender_payload()
+        payload["judge_scores"] = [
+            {
+                "judge_id": "j1",
+                "item_scores": {"deployment": 3.6, "resources": 2.5, "safety": 2.6},
+            },
+            {
+                "judge_id": "j2",
+                "item_scores": {"deployment": 3.8, "resources": 2.6, "safety": 2.7},
+            },
+        ]
+
+        response = client.post("/api/v1/per-tender/analyze", json=payload)
+        assert response.status_code == 200
+        aggregation = response.json()["analysis"]["judge_aggregation"]
+        assert aggregation is not None
+        assert aggregation["judge_count"] == 2
+        assert aggregation["total_average_score"] == pytest.approx(8.9)
+
+    def test_per_tender_analyze_missing_profile_returns_contract_error(self, client):
+        response = client.post("/api/v1/per-tender/analyze", json={"document_text": "inline"})
+        assert response.status_code == 422
+        data = response.json()
+        assert data["ok"] is False
+        assert data["error"] == "profile_required"
+        assert "profile" in data["detail"]
+
+    def test_per_tender_analyze_invalid_profile_returns_contract_error(self, client):
+        profile = _synthetic_per_tender_profile()
+        profile["scoring_items"][0]["max_score"] = 5
+        response = client.post("/api/v1/per-tender/analyze", json={"profile": profile})
+        assert response.status_code == 422
+        data = response.json()
+        assert data["ok"] is False
+        assert data["error"] == "invalid_profile"
+        assert "score_scale" in data["detail"]
 
 
 class TestProjectsEndpoints:
