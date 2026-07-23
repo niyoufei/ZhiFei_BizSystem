@@ -6309,7 +6309,12 @@ def health_check() -> HealthResponse:
     return HealthResponse(status="healthy", version="1.0.0")
 
 
-@app.get("/metrics", tags=["监控指标"], include_in_schema=True)
+@app.get(
+    "/metrics",
+    tags=["监控指标"],
+    include_in_schema=True,
+    dependencies=[Depends(verify_api_key)],
+)
 def prometheus_metrics():
     """
     Prometheus 指标端点。
@@ -6372,7 +6377,7 @@ def readiness_check() -> ReadyResponse:
     return ReadyResponse(status=status, checks=checks)
 
 
-@app.get("/__ping__", include_in_schema=False)
+@app.get("/__ping__", include_in_schema=False, dependencies=[Depends(verify_api_key)])
 def ui_click_ping(btn: str = "") -> dict:
     return {"ok": True, "btn": btn}
 
@@ -6549,8 +6554,23 @@ def zdoc_zbid_preview_only_receive_api(
     return zdoc_zbid_preview_receiver.receive_zdoc_zbid_preview_payload(payload or {})
 
 
+class SensitiveReadAPIRouter(APIRouter):
+    """Require API authentication on GET/HEAD routes without affecting writes."""
+
+    def _authenticated_read(self, method: str, path: str, **kwargs):
+        dependencies = list(kwargs.pop("dependencies", None) or [])
+        dependencies.append(Depends(verify_api_key))
+        return getattr(super(), method)(path, dependencies=dependencies, **kwargs)
+
+    def get(self, path: str, **kwargs):
+        return self._authenticated_read("get", path, **kwargs)
+
+    def head(self, path: str, **kwargs):
+        return self._authenticated_read("head", path, **kwargs)
+
+
 # API v1 路由
-router = APIRouter(prefix="/api/v1")
+router = SensitiveReadAPIRouter(prefix="/api/v1")
 
 
 @router.get("/auth/status", tags=["系统状态"])
@@ -13756,7 +13776,7 @@ async def parse_file_to_text(file: UploadFile = File(...)) -> Dict[str, str]:
 
 
 # API 兼容路由（与执行文档中的 /api/projects/... 路径保持一致）
-compat_router = APIRouter(prefix="/api")
+compat_router = SensitiveReadAPIRouter(prefix="/api")
 
 
 @compat_router.get("/scoring/factors", response_model=ScoringFactorsResponse, tags=["系统状态"])
@@ -14421,41 +14441,10 @@ def index(
     msg: Optional[str] = Query(None),
     msg_type: Optional[str] = Query(None),
 ) -> Response:
-    ensure_data_dirs()
-    projects = load_projects()
-    if not os.environ.get("PYTEST_CURRENT_TEST"):
-        active_projects = [
-            p
-            for p in projects
-            if str(p.get("id") or "") != "p1" and not str(p.get("name") or "").startswith("E2E_")
-        ]
-        if not active_projects:
-            recovered = _recover_latest_orphan_project(projects)
-            if recovered is not None:
-                projects = load_projects()
-    project_ids = [str(p.get("id", "")) for p in projects]
-    if (not os.environ.get("PYTEST_CURRENT_TEST")) and project_id and project_id not in project_ids:
-        recovered = _recover_missing_project_from_artifacts(project_id, projects)
-        if recovered is not None:
-            projects = load_projects()
-            project_ids = [str(p.get("id", "")) for p in projects]
+    # The public shell must not embed project or customer data. The browser loads
+    # all business data from authenticated API requests after the page renders.
     selected_project_id = ""
-    if project_id and project_id in project_ids:
-        selected_project_id = project_id
-    elif project_ids:
-        # Default to latest created project for better usability.
-        selected_project_id = project_ids[-1]
-    project_options = []
-    for p in projects:
-        pid_raw = str(p.get("id", ""))
-        pid = html_lib.escape(pid_raw)
-        pname = html_lib.escape(str(p.get("name", p.get("id", ""))))
-        short_id = html_lib.escape(str(p.get("id", ""))[:8])
-        selected_attr = " selected" if pid_raw == selected_project_id else ""
-        project_options.append(
-            f'<option value="{pid}"{selected_attr}>{pname} ({short_id}…)</option>'
-        )
-    project_options_html = "".join(project_options)
+    project_options_html = ""
     create_notice_html = ""
     if create_ok:
         create_notice_html = (
@@ -14500,46 +14489,6 @@ def index(
     initial_weights_raw: Dict[str, int] = _default_weights_raw()
     initial_weights_norm: Dict[str, float] = _normalize_weights(initial_weights_raw)
     initial_profile_status = "请先选择项目并加载配置。"
-    if selected_project_id:
-        try:
-            project = _find_project(selected_project_id, projects)
-            profiles = load_expert_profiles()
-            profile: Optional[Dict[str, object]] = None
-            profile_id = str(project.get("expert_profile_id") or "")
-            if profile_id:
-                for item in profiles:
-                    if str(item.get("id") or "") == profile_id:
-                        profile = item
-                        break
-            if profile and isinstance(profile.get("weights_raw"), dict):
-                initial_weights_raw = _coerce_weights_raw(profile.get("weights_raw", {}))
-                initial_weights_norm = _normalize_weights(initial_weights_raw)
-                profile_name = str(profile.get("name") or "项目默认配置")
-                profile_id_text = str(profile.get("id") or "-")
-                updated_at_text = (
-                    str(project.get("updated_at") or profile.get("updated_at") or "")[:19] or "-"
-                )
-                initial_profile_status = (
-                    "当前生效配置："
-                    + html_lib.escape(profile_name)
-                    + "（ID: "
-                    + html_lib.escape(profile_id_text)
-                    + "，更新时间: "
-                    + html_lib.escape(updated_at_text)
-                    + "）"
-                )
-            else:
-                profile_name = str(project.get("name") or "项目") + " 默认配置"
-                updated_at_text = str(project.get("updated_at") or "")[:19] or "-"
-                initial_profile_status = (
-                    "当前生效配置："
-                    + html_lib.escape(profile_name)
-                    + "（ID: 未绑定，更新时间: "
-                    + html_lib.escape(updated_at_text)
-                    + "）"
-                )
-        except Exception:
-            initial_profile_status = "请先选择项目并加载配置。"
 
     initial_weights_rows = []
     for dim_id in DIMENSION_IDS:
@@ -14561,204 +14510,11 @@ def index(
             for dim_id in DIMENSION_IDS
         ]
     )
-    selected_project_for_view = (
-        next((p for p in projects if str(p.get("id", "")) == selected_project_id), {})
-        if selected_project_id
-        else {}
-    )
-    score_scale_initial = (
-        _resolve_project_score_scale_max(selected_project_for_view)
-        if selected_project_for_view
-        else DEFAULT_SCORE_SCALE_MAX
-    )
-    allow_pred_initial = bool(selected_project_for_view) and (
-        _select_calibrator_model(selected_project_for_view) is not None
-    )
-    initial_material_rows: List[str] = []
-    initial_submission_rows: List[str] = []
-    if selected_project_id:
-        try:
-            materials_all = load_materials()
-            selected_materials = [
-                m for m in materials_all if str(m.get("project_id", "")) == selected_project_id
-            ]
-            selected_materials.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
-            for m in selected_materials:
-                material_id = html_lib.escape(str(m.get("id", "")))
-                filename_raw = str(m.get("filename", ""))
-                filename = html_lib.escape(filename_raw)
-                material_type_label = html_lib.escape(
-                    _material_type_label(m.get("material_type"), filename=m.get("filename"))
-                )
-                created_at = html_lib.escape(str(m.get("created_at", ""))[:19])
-                initial_material_rows.append(
-                    "<tr>"
-                    + f"<td>{material_type_label}</td>"
-                    + f"<td>{filename}</td>"
-                    + f"<td>{created_at}</td>"
-                    + (
-                        "<td>"
-                        + f'<button type="button" class="btn-danger js-delete-material" data-material-id="{material_id}" data-project-id="{html_lib.escape(str(m.get("project_id") or ""))}" data-filename="{html_lib.escape(filename_raw)}" onclick="return window.__zhifeiFallbackDelete(event, \'material\', this.getAttribute(\'data-material-id\'), this.getAttribute(\'data-filename\'), this.getAttribute(\'data-project-id\'))">删除</button>'
-                        + "</td>"
-                    )
-                    + "</tr>"
-                )
-        except Exception:
-            initial_material_rows = []
-        try:
-            submissions_all = load_submissions()
-            selected_submissions = [
-                s for s in submissions_all if str(s.get("project_id", "")) == selected_project_id
-            ]
-            selected_submissions.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
-            for s in selected_submissions:
-                submission_id = html_lib.escape(str(s.get("id", "")))
-                filename_raw = str(s.get("filename", ""))
-                filename = html_lib.escape(filename_raw)
-                report_obj = s.get("report")
-                report = report_obj if isinstance(report_obj, dict) else {}
-                pred_total_raw = report.get("pred_total_score")
-                rule_total_raw = report.get("rule_total_score")
-                if not allow_pred_initial:
-                    pred_total_raw = None
-                llm_total_raw = report.get("llm_total_score")
-                pred_total = _convert_score_from_100(pred_total_raw, score_scale_initial)
-                rule_total = _convert_score_from_100(rule_total_raw, score_scale_initial)
-                llm_total = _convert_score_from_100(llm_total_raw, score_scale_initial)
-                scoring_status = str(report.get("scoring_status") or "").strip().lower()
-                is_pending = scoring_status == "pending"
-                is_blocked = scoring_status == "blocked"
-                report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
-                util_gate = (
-                    report_meta.get("material_utilization_gate")
-                    if isinstance(report_meta.get("material_utilization_gate"), dict)
-                    else {}
-                )
-                util_blocked = bool(util_gate.get("blocked"))
-                evidence_trace = (
-                    report_meta.get("evidence_trace")
-                    if isinstance(report_meta.get("evidence_trace"), dict)
-                    else {}
-                )
-                primary_total = (
-                    pred_total
-                    if pred_total is not None
-                    else _convert_score_from_100(s.get("total_score"), score_scale_initial)
-                )
-                if is_pending:
-                    score_cell = '<span class="note">待评分</span>'
-                elif is_blocked:
-                    score_cell = '<span class="error">待补资料后重评分</span>'
-                elif pred_total is not None:
-                    score_cell = html_lib.escape(str(pred_total))
-                    note_items: List[str] = []
-                    if rule_total is not None:
-                        note_items.append("规则: " + html_lib.escape(str(rule_total)))
-                    if llm_total is not None:
-                        note_items.append("LLM: " + html_lib.escape(str(llm_total)))
-                    if note_items:
-                        score_cell += '<div class="note">' + " / ".join(note_items) + "</div>"
-                else:
-                    score_cell = (
-                        "-" if primary_total is None else html_lib.escape(str(primary_total))
-                    )
-                evidence_hits = int(_to_float_or_none(evidence_trace.get("total_hits")) or 0)
-                evidence_file_hits = int(
-                    _to_float_or_none(evidence_trace.get("source_files_hit_count")) or 0
-                )
-                if not is_pending and evidence_hits > 0:
-                    score_cell += (
-                        '<div class="note">证据命中: '
-                        + html_lib.escape(str(evidence_hits))
-                        + " 条 / 文件覆盖: "
-                        + html_lib.escape(str(evidence_file_hits))
-                        + " 份</div>"
-                    )
-                util_summary = (
-                    report_meta.get("material_utilization")
-                    if isinstance(report_meta.get("material_utilization"), dict)
-                    else {}
-                )
-                util_by_type = (
-                    util_summary.get("by_type")
-                    if isinstance(util_summary.get("by_type"), dict)
-                    else {}
-                )
-                util_available_types = (
-                    util_summary.get("available_types")
-                    if isinstance(util_summary.get("available_types"), list)
-                    else []
-                )
-
-                def _type_short(t: str) -> str:
-                    if t == "tender_qa":
-                        return "招答"
-                    if t == "boq":
-                        return "清单"
-                    if t == "drawing":
-                        return "图纸"
-                    if t == "site_photo":
-                        return "照片"
-                    return t or "-"
-
-                coverage_tokens: List[str] = []
-                for type_key in ["tender_qa", "boq", "drawing", "site_photo"]:
-                    in_scope = type_key in util_available_types
-                    if not in_scope:
-                        coverage_tokens.append(_type_short(type_key) + "·")
-                        continue
-                    row = util_by_type.get(type_key) if isinstance(util_by_type, dict) else {}
-                    row = row if isinstance(row, dict) else {}
-                    retrieval_hit = int(_to_float_or_none(row.get("retrieval_hit")) or 0)
-                    consistency_hit = int(_to_float_or_none(row.get("consistency_hit")) or 0)
-                    coverage_tokens.append(
-                        _type_short(type_key)
-                        + ("✓" if (retrieval_hit + consistency_hit) > 0 else "×")
-                    )
-                if not is_pending and coverage_tokens:
-                    score_cell += (
-                        '<div class="note">类型覆盖: '
-                        + html_lib.escape(" / ".join(coverage_tokens))
-                        + "</div>"
-                    )
-                evidence_files = (
-                    evidence_trace.get("source_files_hit")
-                    if isinstance(evidence_trace.get("source_files_hit"), list)
-                    else []
-                )
-                evidence_files = [str(x).strip() for x in evidence_files if str(x).strip()]
-                if not is_pending and evidence_files:
-                    preview = "；".join(evidence_files[:2])
-                    suffix = " 等" if len(evidence_files) > 2 else ""
-                    score_cell += (
-                        '<div class="note">命中文件: '
-                        + html_lib.escape(preview)
-                        + suffix
-                        + "</div>"
-                    )
-                if util_blocked:
-                    score_cell += (
-                        '<div class="error">资料利用门禁未达标（建议补齐资料后重评分）</div>'
-                    )
-                created_at = html_lib.escape(str(s.get("created_at", ""))[:19])
-                initial_submission_rows.append(
-                    "<tr>"
-                    + f"<td>{filename}</td>"
-                    + f"<td>{score_cell}</td>"
-                    + f"<td>{created_at}</td>"
-                    + (
-                        "<td>"
-                        + f'<button type="button" class="btn-danger js-delete-submission" data-submission-id="{submission_id}" data-project-id="{html_lib.escape(str(s.get("project_id") or ""))}" data-filename="{html_lib.escape(filename_raw)}" onclick="return window.__zhifeiFallbackDelete(event, \'submission\', this.getAttribute(\'data-submission-id\'), this.getAttribute(\'data-filename\'), this.getAttribute(\'data-project-id\'))">删除</button>'
-                        + "</td>"
-                    )
-                    + "</tr>"
-                )
-        except Exception:
-            initial_submission_rows = []
-    initial_material_rows_html = "".join(initial_material_rows)
-    initial_submission_rows_html = "".join(initial_submission_rows)
-    initial_materials_empty_display = "none" if initial_material_rows else "block"
-    initial_submissions_empty_display = "none" if initial_submission_rows else "block"
+    score_scale_initial = DEFAULT_SCORE_SCALE_MAX
+    initial_material_rows_html = ""
+    initial_submission_rows_html = ""
+    initial_materials_empty_display = "block"
+    initial_submissions_empty_display = "block"
     html = """
     <html>
     <head>
@@ -14835,6 +14591,39 @@ def index(
             if (isJson) h['Content-Type'] = 'application/json';
             return h;
           }
+          if (!window.__qingtianApiKeyFetchInstalled) {
+            window.__qingtianApiKeyFetchInstalled = true;
+            const nativeFetch = window.fetch.bind(window);
+            window.fetch = function(input, init) {
+              let isBusinessApi = false;
+              try {
+                const rawUrl = (typeof input === 'string') ? input : String((input || {}).url || '');
+                const parsedUrl = new URL(rawUrl, window.location.href);
+                isBusinessApi = parsedUrl.origin === window.location.origin
+                  && parsedUrl.pathname.startsWith('/api/');
+              } catch (_) {}
+              if (!isBusinessApi) return nativeFetch(input, init);
+              const options = Object.assign({}, init || {});
+              const headers = new Headers(options.headers || {});
+              Object.entries(apiHeaders(false)).forEach(([name, value]) => {
+                if (!headers.has(name)) headers.set(name, value);
+              });
+              options.headers = headers;
+              return nativeFetch(input, options);
+            };
+            window.__qingtianDownloadProtected = async function(url, filename) {
+              const response = await window.fetch(url, { cache: 'no-store' });
+              if (!response.ok) throw new Error('HTTP ' + String(response.status || 0));
+              const blobUrl = URL.createObjectURL(await response.blob());
+              const anchor = document.createElement('a');
+              anchor.href = blobUrl;
+              anchor.download = filename;
+              document.body.appendChild(anchor);
+              anchor.click();
+              anchor.remove();
+              URL.revokeObjectURL(blobUrl);
+            };
+          }
           function esc(v) {
             return String(v == null ? '' : v)
               .replace(/&/g, '&amp;')
@@ -14906,24 +14695,20 @@ def index(
             }
             if (actionId === 'btnMaterialDepthReportDownload') {
               const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/materials/depth_report.md';
-              const a = document.createElement('a');
-              a.href = dlUrl;
-              a.download = 'material_depth_report_' + projectId + '.md';
-              document.body.appendChild(a);
-              a.click();
-              a.remove();
+              await window.__qingtianDownloadProtected(
+                dlUrl,
+                'material_depth_report_' + projectId + '.md'
+              );
               setResult(cfg.resultId, '资料深读体检报告下载已触发。', false);
               setOutput('[' + actionId + '] download ' + dlUrl);
               return true;
             }
             if (actionId === 'btnMaterialKnowledgeProfileDownload') {
               const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/materials/knowledge_profile.md';
-              const a = document.createElement('a');
-              a.href = dlUrl;
-              a.download = 'material_knowledge_profile_' + projectId + '.md';
-              document.body.appendChild(a);
-              a.click();
-              a.remove();
+              await window.__qingtianDownloadProtected(
+                dlUrl,
+                'material_knowledge_profile_' + projectId + '.md'
+              );
               setResult(cfg.resultId, '资料知识画像报告下载已触发。', false);
               setOutput('[' + actionId + '] download ' + dlUrl);
               return true;
@@ -16438,24 +16223,20 @@ def index(
             }
             if (actionId === 'btnMaterialDepthReportDownload') {
               const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/materials/depth_report.md';
-              const a = document.createElement('a');
-              a.href = dlUrl;
-              a.download = 'material_depth_report_' + projectId + '.md';
-              document.body.appendChild(a);
-              a.click();
-              a.remove();
+              await window.__qingtianDownloadProtected(
+                dlUrl,
+                'material_depth_report_' + projectId + '.md'
+              );
               fallbackSetResult(cfg.resultId, '资料深读体检报告下载已触发。', false);
               fallbackSetOutput('[' + actionId + '] download ' + dlUrl);
               return true;
             }
             if (actionId === 'btnMaterialKnowledgeProfileDownload') {
               const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/materials/knowledge_profile.md';
-              const a = document.createElement('a');
-              a.href = dlUrl;
-              a.download = 'material_knowledge_profile_' + projectId + '.md';
-              document.body.appendChild(a);
-              a.click();
-              a.remove();
+              await window.__qingtianDownloadProtected(
+                dlUrl,
+                'material_knowledge_profile_' + projectId + '.md'
+              );
               fallbackSetResult(cfg.resultId, '资料知识画像报告下载已触发。', false);
               fallbackSetOutput('[' + actionId + '] download ' + dlUrl);
               return true;
@@ -17430,12 +17211,10 @@ def index(
           }
           const url = '/api/v1/projects/' + encodeURIComponent(currentId) + '/analysis_bundle.md';
           setScoringFactorsResult('正在准备下载…', '若浏览器未自动下载，请检查弹窗或下载权限设置。', false);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = 'analysis_bundle_' + currentId + '.md';
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
+          await window.__qingtianDownloadProtected(
+            url,
+            'analysis_bundle_' + currentId + '.md'
+          );
         }
         async function refreshProjects() {
           setSelectMsg('正在加载…', false);
@@ -18421,12 +18200,10 @@ def index(
           if (!ensureProjectForAction('materialDepthReportResult')) return;
           const id = pid();
           const url = '/api/v1/projects/' + encodeURIComponent(id) + '/materials/depth_report.md';
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = 'material_depth_report_' + id + '.md';
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
+          await window.__qingtianDownloadProtected(
+            url,
+            'material_depth_report_' + id + '.md'
+          );
           setResultSuccess('materialDepthReportResult', '资料深读体检报告下载已触发。');
         });
         safeClick('btnMaterialKnowledgeProfile', async () => {
@@ -18458,12 +18235,10 @@ def index(
           if (!ensureProjectForAction('materialKnowledgeProfileResult')) return;
           const id = pid();
           const url = '/api/v1/projects/' + encodeURIComponent(id) + '/materials/knowledge_profile.md';
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = 'material_knowledge_profile_' + id + '.md';
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
+          await window.__qingtianDownloadProtected(
+            url,
+            'material_knowledge_profile_' + id + '.md'
+          );
           setResultSuccess('materialKnowledgeProfileResult', '资料知识画像报告下载已触发。');
         });
 
@@ -19992,15 +19767,13 @@ def index(
           el.innerHTML = html;
           const dlBtn = document.getElementById('btnEvidenceTraceDownload');
           if (dlBtn) {
-            dlBtn.onclick = () => {
+            dlBtn.onclick = async () => {
               const sid = String(data.submission_id || '').trim();
               if (!sid) return;
-              const a = document.createElement('a');
-              a.href = '/api/v1/projects/' + encodeURIComponent(projectId) + '/submissions/' + encodeURIComponent(sid) + '/evidence_trace.md';
-              a.download = 'evidence_trace_' + projectId + '_' + sid + '.md';
-              document.body.appendChild(a);
-              a.click();
-              a.remove();
+              await window.__qingtianDownloadProtected(
+                '/api/v1/projects/' + encodeURIComponent(projectId) + '/submissions/' + encodeURIComponent(sid) + '/evidence_trace.md',
+                'evidence_trace_' + projectId + '_' + sid + '.md'
+              );
             };
           }
         });
