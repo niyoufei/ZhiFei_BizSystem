@@ -8,6 +8,8 @@ from fastapi.testclient import TestClient
 import app.main as app_main
 
 PATH = "/local-llm/preview-mock"
+TEST_API_KEY = "test-auth-key-do-not-use"
+AUTH_HEADERS = {"X-API-Key": TEST_API_KEY}
 FLAG = "LOCAL_LLM_PREVIEW_MOCK_API_ENABLED"
 ADAPTER_FLAG = "LOCAL_LLM_OLLAMA_PREVIEW_ADAPTER_ENABLED"
 REAL_TRANSPORT_FLAG = "LOCAL_LLM_OLLAMA_REAL_TRANSPORT_ENABLED"
@@ -17,7 +19,7 @@ NUM_PREDICT_FLAG = "LOCAL_LLM_OLLAMA_NUM_PREDICT"
 
 
 def _client() -> TestClient:
-    return TestClient(app_main.app)
+    return TestClient(app_main.app, headers=AUTH_HEADERS)
 
 
 def _valid_payload() -> dict:
@@ -39,6 +41,7 @@ def _fail_call(*args, **kwargs):
 
 @pytest.fixture(autouse=True)
 def _clear_adapter_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("API_KEYS", TEST_API_KEY)
     monkeypatch.delenv(ADAPTER_FLAG, raising=False)
     monkeypatch.delenv(REAL_TRANSPORT_FLAG, raising=False)
     monkeypatch.delenv(MODEL_FLAG, raising=False)

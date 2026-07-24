@@ -64,7 +64,9 @@ from fastapi import (
 )
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.routing import APIRoute
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.routing import Match
 
 import app.engine.local_llm_ollama_preview_adapter as local_llm_ollama_preview_adapter
 import app.engine.local_llm_preview_mock as local_llm_preview_mock
@@ -5799,6 +5801,37 @@ app = FastAPI(
 setup_rate_limiting(app)
 
 
+def _route_requires_api_key(request: Request) -> bool:
+    for route in request.app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        match, _ = route.matches(request.scope)
+        if match != Match.FULL:
+            continue
+        pending = list(route.dependant.dependencies)
+        while pending:
+            dependency = pending.pop()
+            if dependency.call is verify_api_key:
+                return True
+            pending.extend(dependency.dependencies)
+        return False
+    return False
+
+
+@app.middleware("http")
+async def _authenticate_before_body_parsing(request: Request, call_next):
+    if _route_requires_api_key(request):
+        try:
+            verify_api_key(api_key_header=request.headers.get("X-API-Key"))
+        except HTTPException as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": exc.detail},
+                headers=exc.headers,
+            )
+    return await call_next(request)
+
+
 @app.exception_handler(StarletteHTTPException)
 async def _web_405_fallback_handler(request: Request, exc: StarletteHTTPException):
     """
@@ -5807,14 +5840,13 @@ async def _web_405_fallback_handler(request: Request, exc: StarletteHTTPExceptio
     if exc.status_code == 405:
         path = (request.url.path or "").rstrip("/")
         if path in ("/web/upload_materials", "/web/upload_shigong"):
-            project_id = request.query_params.get("project_id", "")
             message = "请在主页选择文件后点击“上传资料”提交。"
             anchor = "#section-materials"
             if path == "/web/upload_shigong":
                 message = "请在主页选择文件后点击“上传施组”提交。"
                 anchor = "#section-shigong"
             return RedirectResponse(
-                url=_web_upload_redirect_url(project_id, message, anchor),
+                url=_web_upload_redirect_url(message, anchor),
                 status_code=303,
             )
     return await http_exception_handler(request, exc)
@@ -6511,7 +6543,11 @@ def _build_local_llm_ollama_preview_response(
     }
 
 
-@app.post("/local-llm/preview-mock", tags=["系统状态"])
+@app.post(
+    "/local-llm/preview-mock",
+    tags=["系统状态"],
+    dependencies=[Depends(verify_api_key)],
+)
 def local_llm_preview_mock_api(payload: Optional[Dict[str, Any]] = None) -> Dict[str, object]:
     """Default-off local LLM preview/mock bridge with no storage or scoring side effects."""
     if not _local_llm_preview_mock_api_enabled():
@@ -6546,7 +6582,11 @@ def local_llm_preview_mock_api(payload: Optional[Dict[str, Any]] = None) -> Dict
     }
 
 
-@app.post("/local-llm/zdoc-preview-only/receive", tags=["系统状态"])
+@app.post(
+    "/local-llm/zdoc-preview-only/receive",
+    tags=["系统状态"],
+    dependencies=[Depends(verify_api_key)],
+)
 def zdoc_zbid_preview_only_receive_api(
     payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, object]:
@@ -6554,23 +6594,35 @@ def zdoc_zbid_preview_only_receive_api(
     return zdoc_zbid_preview_receiver.receive_zdoc_zbid_preview_payload(payload or {})
 
 
-class SensitiveReadAPIRouter(APIRouter):
-    """Require API authentication on GET/HEAD routes without affecting writes."""
+class AuthenticatedAPIRouter(APIRouter):
+    """Require API authentication on all business HTTP methods."""
 
-    def _authenticated_read(self, method: str, path: str, **kwargs):
+    def _authenticated_route(self, method: str, path: str, **kwargs):
         dependencies = list(kwargs.pop("dependencies", None) or [])
         dependencies.append(Depends(verify_api_key))
         return getattr(super(), method)(path, dependencies=dependencies, **kwargs)
 
     def get(self, path: str, **kwargs):
-        return self._authenticated_read("get", path, **kwargs)
+        return self._authenticated_route("get", path, **kwargs)
 
     def head(self, path: str, **kwargs):
-        return self._authenticated_read("head", path, **kwargs)
+        return self._authenticated_route("head", path, **kwargs)
+
+    def post(self, path: str, **kwargs):
+        return self._authenticated_route("post", path, **kwargs)
+
+    def put(self, path: str, **kwargs):
+        return self._authenticated_route("put", path, **kwargs)
+
+    def patch(self, path: str, **kwargs):
+        return self._authenticated_route("patch", path, **kwargs)
+
+    def delete(self, path: str, **kwargs):
+        return self._authenticated_route("delete", path, **kwargs)
 
 
 # API v1 路由
-router = SensitiveReadAPIRouter(prefix="/api/v1")
+router = AuthenticatedAPIRouter(prefix="/api/v1")
 
 
 @router.get("/auth/status", tags=["系统状态"])
@@ -13776,7 +13828,7 @@ async def parse_file_to_text(file: UploadFile = File(...)) -> Dict[str, str]:
 
 
 # API 兼容路由（与执行文档中的 /api/projects/... 路径保持一致）
-compat_router = SensitiveReadAPIRouter(prefix="/api")
+compat_router = AuthenticatedAPIRouter(prefix="/api")
 
 
 @compat_router.get("/scoring/factors", response_model=ScoringFactorsResponse, tags=["系统状态"])
@@ -14180,16 +14232,14 @@ def web_delete_project(
             status_code=303,
         )
     try:
-        result = _delete_project_cascade(pid, locale="zh")
-    except HTTPException as exc:
-        detail = str(getattr(exc, "detail", "删除失败"))
+        _delete_project_cascade(pid, locale="zh")
+    except HTTPException:
         return RedirectResponse(
-            url="/?msg_type=error&msg=" + quote_plus("删除失败：" + detail),
+            url="/?msg_type=error&msg=" + quote_plus("删除失败"),
             status_code=303,
         )
     return RedirectResponse(
-        url="/?msg_type=success&msg="
-        + quote_plus("项目已删除：" + str(result.get("project_name") or pid)),
+        url="/?msg_type=success&msg=" + quote_plus("项目已删除"),
         status_code=303,
     )
 
@@ -14212,16 +14262,13 @@ def web_upload_materials(
         )
     if not files:
         return RedirectResponse(
-            url="/?project_id="
-            + quote_plus(pid)
-            + "&msg_type=error&msg="
+            url="/?msg_type=error&msg="
             + quote_plus("上传资料失败：未选择文件")
             + "#section-materials",
             status_code=303,
         )
     ok_count = 0
     fail_count = 0
-    first_error = ""
     for f in files:
         try:
             upload_material(
@@ -14232,17 +14279,11 @@ def web_upload_materials(
                 locale="zh",
             )
             ok_count += 1
-        except Exception as exc:  # noqa: BLE001 - web fallback should keep processing
+        except Exception:  # noqa: BLE001 - web fallback should keep processing
             fail_count += 1
-            if not first_error:
-                first_error = str(exc)
     msg = f"资料上传完成：成功 {ok_count}，失败 {fail_count}"
-    if fail_count > 0 and first_error:
-        msg += f"；首个错误：{first_error}"
     return RedirectResponse(
-        url="/?project_id="
-        + quote_plus(pid)
-        + "&msg_type="
+        url="/?msg_type="
         + ("error" if fail_count > 0 else "success")
         + "&msg="
         + quote_plus(msg)
@@ -14251,11 +14292,8 @@ def web_upload_materials(
     )
 
 
-def _web_upload_redirect_url(project_id: str, message: str, anchor: str = "") -> str:
-    pid = (project_id or "").strip()
+def _web_upload_redirect_url(message: str, anchor: str = "") -> str:
     base = "/?msg_type=error&msg=" + quote_plus(message)
-    if pid:
-        base = "/?project_id=" + quote_plus(pid) + "&msg_type=error&msg=" + quote_plus(message)
     anchor_part = str(anchor or "").strip()
     if anchor_part and not anchor_part.startswith("#"):
         anchor_part = "#" + anchor_part
@@ -14267,13 +14305,13 @@ def _web_upload_redirect_url(project_id: str, message: str, anchor: str = "") ->
     methods=["GET", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS"],
     include_in_schema=False,
 )
-def web_upload_materials_get_fallback(project_id: str = ""):
+def web_upload_materials_get_fallback():
     """
     兼容误触发非 POST 的场景，避免直接 405 中断用户流程。
     """
     return RedirectResponse(
         url=_web_upload_redirect_url(
-            project_id, "请在主页选择文件后点击“上传资料”提交。", "#section-materials"
+            "请在主页选择文件后点击“上传资料”提交。", "#section-materials"
         ),
         status_code=303,
     )
@@ -14296,31 +14334,22 @@ def web_upload_shigong(
         )
     if not files:
         return RedirectResponse(
-            url="/?project_id="
-            + quote_plus(pid)
-            + "&msg_type=error&msg="
+            url="/?msg_type=error&msg="
             + quote_plus("上传施组失败：未选择文件")
             + "#section-shigong",
             status_code=303,
         )
     ok_count = 0
     fail_count = 0
-    first_error = ""
     for f in files:
         try:
             upload_shigong(project_id=pid, file=f, api_key=api_key, locale="zh")
             ok_count += 1
-        except Exception as exc:  # noqa: BLE001 - web fallback should keep processing
+        except Exception:  # noqa: BLE001 - web fallback should keep processing
             fail_count += 1
-            if not first_error:
-                first_error = str(exc)
     msg = f"施组上传完成：成功 {ok_count}，失败 {fail_count}"
-    if fail_count > 0 and first_error:
-        msg += f"；首个错误：{first_error}"
     return RedirectResponse(
-        url="/?project_id="
-        + quote_plus(pid)
-        + "&msg_type="
+        url="/?msg_type="
         + ("error" if fail_count > 0 else "success")
         + "&msg="
         + quote_plus(msg)
@@ -14375,20 +14404,12 @@ def web_score_shigong(
         elif warn_count > 0:
             msg += f"；资料门禁预警 {warn_count} 份"
         return RedirectResponse(
-            url="/?project_id="
-            + quote_plus(pid)
-            + "&msg_type=success&msg="
-            + quote_plus(msg)
-            + "#section-shigong",
+            url="/?msg_type=success&msg=" + quote_plus(msg) + "#section-shigong",
             status_code=303,
         )
-    except Exception as exc:  # noqa: BLE001 - web fallback should keep processing
+    except Exception:  # noqa: BLE001 - web fallback should keep processing
         return RedirectResponse(
-            url="/?project_id="
-            + quote_plus(pid)
-            + "&msg_type=error&msg="
-            + quote_plus("施组评分失败：" + str(exc))
-            + "#section-shigong",
+            url="/?msg_type=error&msg=" + quote_plus("施组评分失败") + "#section-shigong",
             status_code=303,
         )
 
@@ -14398,11 +14419,9 @@ def web_score_shigong(
     methods=["GET", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS"],
     include_in_schema=False,
 )
-def web_upload_shigong_get_fallback(project_id: str = ""):
+def web_upload_shigong_get_fallback():
     return RedirectResponse(
-        url=_web_upload_redirect_url(
-            project_id, "请在主页选择文件后点击“上传施组”提交。", "#section-shigong"
-        ),
+        url=_web_upload_redirect_url("请在主页选择文件后点击“上传施组”提交。", "#section-shigong"),
         status_code=303,
     )
 
@@ -14412,11 +14431,9 @@ def web_upload_shigong_get_fallback(project_id: str = ""):
     methods=["GET", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS"],
     include_in_schema=False,
 )
-def web_score_shigong_get_fallback(project_id: str = ""):
+def web_score_shigong_get_fallback():
     return RedirectResponse(
-        url=_web_upload_redirect_url(
-            project_id, "请在主页选择项目后点击“评分施组”提交。", "#section-shigong"
-        ),
+        url=_web_upload_redirect_url("请在主页选择项目后点击“评分施组”提交。", "#section-shigong"),
         status_code=303,
     )
 

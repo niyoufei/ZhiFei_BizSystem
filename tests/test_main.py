@@ -83,9 +83,9 @@ def test_health_ready_self_check_runtime_boundaries_are_visible():
 
     assert '@app.get("/health"' in main_text
     assert '@app.get("/ready"' in main_text
-    assert 'router = SensitiveReadAPIRouter(prefix="/api/v1")' in main_text
+    assert 'router = AuthenticatedAPIRouter(prefix="/api/v1")' in main_text
     assert '@router.get(\n    "/system/self_check"' in main_text
-    assert 'compat_router = SensitiveReadAPIRouter(prefix="/api")' in main_text
+    assert 'compat_router = AuthenticatedAPIRouter(prefix="/api")' in main_text
     assert '@compat_router.get("/system/self_check"' in main_text
     assert "/api/v1/system/self_check" in main_text
     assert "ensure_data_dirs()" in main_text
@@ -458,15 +458,38 @@ class TestWebFallbackOps:
 
     @patch("app.main._delete_project_cascade")
     def test_web_delete_project_success(self, mock_delete, client):
-        mock_delete.return_value = {"project_name": "项目A"}
+        mock_delete.return_value = {"project_name": "secret-project-name"}
         response = client.post(
-            "/web/delete_project", data={"project_id": "p1"}, follow_redirects=False
+            "/web/delete_project",
+            data={"project_id": "secret-project-id"},
+            follow_redirects=False,
         )
         assert response.status_code == 303
         location = response.headers.get("location", "")
         assert "msg_type=success" in location
         assert "project_id" not in location
+        assert "secret-project-id" not in location
+        assert "secret-project-name" not in location
         mock_delete.assert_called_once()
+
+    @patch("app.main._delete_project_cascade")
+    def test_web_delete_project_error_does_not_redirect_metadata(self, mock_delete, client):
+        mock_delete.side_effect = HTTPException(
+            status_code=404,
+            detail="secret-project-name secret-project-id",
+        )
+        response = client.post(
+            "/web/delete_project",
+            data={"project_id": "secret-project-id"},
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 303
+        location = response.headers.get("location", "")
+        assert "msg_type=error" in location
+        assert "project_id" not in location
+        assert "secret-project-id" not in location
+        assert "secret-project-name" not in location
 
     def test_web_upload_materials_requires_file(self, client):
         response = client.post(
@@ -476,11 +499,17 @@ class TestWebFallbackOps:
         assert "msg_type=error" in response.headers.get("location", "")
 
     def test_web_upload_materials_get_fallback_redirects(self, client):
-        response = client.get("/web/upload_materials", follow_redirects=False)
+        response = client.get(
+            "/web/upload_materials?project_id=secret-project-id&project_name=secret-project-name",
+            follow_redirects=False,
+        )
         assert response.status_code == 303
         location = response.headers.get("location", "")
         assert "msg_type=error" in location
         assert "%E4%B8%8A%E4%BC%A0%E8%B5%84%E6%96%99" in location
+        assert "project_id" not in location
+        assert "secret-project-id" not in location
+        assert "secret-project-name" not in location
 
     def test_web_upload_materials_put_fallback_redirects(self, client):
         response = client.put("/web/upload_materials", follow_redirects=False)
@@ -494,13 +523,13 @@ class TestWebFallbackOps:
         def _side_effect(*args, **kwargs):
             file_obj = kwargs.get("file")
             if file_obj and file_obj.filename == "bad.txt":
-                raise ValueError("bad file")
+                raise ValueError("secret-project-name secret-project-id")
             return {"status": "ok"}
 
         mock_upload_material.side_effect = _side_effect
         response = client.post(
             "/web/upload_materials",
-            data={"project_id": "p1"},
+            data={"project_id": "secret-project-id"},
             files=[
                 ("file", ("good.txt", BytesIO(b"ok"), "text/plain")),
                 ("file", ("bad.txt", BytesIO(b"bad"), "text/plain")),
@@ -509,29 +538,55 @@ class TestWebFallbackOps:
         )
         assert response.status_code == 303
         location = response.headers.get("location", "")
-        assert "project_id=p1" in location
         assert "msg_type=error" in location
+        assert "project_id" not in location
+        assert "secret-project-id" not in location
+        assert "secret-project-name" not in location
 
     @patch("app.main.upload_shigong")
     def test_web_upload_shigong_success(self, mock_upload_shigong, client):
         mock_upload_shigong.return_value = {"id": "s1"}
         response = client.post(
             "/web/upload_shigong",
-            data={"project_id": "p1"},
+            data={"project_id": "secret-project-id"},
             files=[("file", ("a.txt", BytesIO(b"demo"), "text/plain"))],
             follow_redirects=False,
         )
         assert response.status_code == 303
         location = response.headers.get("location", "")
-        assert "project_id=p1" in location
         assert "msg_type=success" in location
+        assert "project_id" not in location
+        assert "secret-project-id" not in location
+
+    @patch("app.main.upload_shigong")
+    def test_web_upload_shigong_error_does_not_redirect_metadata(self, mock_upload_shigong, client):
+        mock_upload_shigong.side_effect = ValueError("secret-project-name secret-project-id")
+        response = client.post(
+            "/web/upload_shigong",
+            data={"project_id": "secret-project-id"},
+            files=[("file", ("a.txt", BytesIO(b"demo"), "text/plain"))],
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 303
+        location = response.headers.get("location", "")
+        assert "msg_type=error" in location
+        assert "project_id" not in location
+        assert "secret-project-id" not in location
+        assert "secret-project-name" not in location
 
     def test_web_upload_shigong_get_fallback_redirects(self, client):
-        response = client.get("/web/upload_shigong", follow_redirects=False)
+        response = client.get(
+            "/web/upload_shigong?project_id=secret-project-id&project_name=secret-project-name",
+            follow_redirects=False,
+        )
         assert response.status_code == 303
         location = response.headers.get("location", "")
         assert "msg_type=error" in location
         assert "%E4%B8%8A%E4%BC%A0%E6%96%BD%E7%BB%84" in location
+        assert "project_id" not in location
+        assert "secret-project-id" not in location
+        assert "secret-project-name" not in location
 
     def test_web_upload_shigong_put_fallback_redirects(self, client):
         response = client.put("/web/upload_shigong", follow_redirects=False)
@@ -547,7 +602,7 @@ class TestWebFallbackOps:
         mock_rescore.return_value = SimpleNamespace(reports_generated=3)
         response = client.post(
             "/web/score_shigong",
-            data={"project_id": "p1"},
+            data={"project_id": "secret-project-id"},
             follow_redirects=False,
         )
         assert response.status_code == 303
@@ -555,6 +610,37 @@ class TestWebFallbackOps:
         assert "msg_type=success" in location
         assert "%E5%B7%B2%E9%87%8D%E7%AE%97+3+%E4%BB%BD" in location
         assert "#section-shigong" in location
+        assert "project_id" not in location
+        assert "secret-project-id" not in location
+
+    @patch("app.main.rescore_project_submissions")
+    def test_web_score_shigong_error_does_not_redirect_metadata(self, mock_rescore, client):
+        mock_rescore.side_effect = RuntimeError("secret-project-name secret-project-id")
+        response = client.post(
+            "/web/score_shigong",
+            data={"project_id": "secret-project-id"},
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 303
+        location = response.headers.get("location", "")
+        assert "msg_type=error" in location
+        assert "project_id" not in location
+        assert "secret-project-id" not in location
+        assert "secret-project-name" not in location
+
+    def test_web_score_shigong_fallback_does_not_redirect_metadata(self, client):
+        response = client.get(
+            "/web/score_shigong?project_id=secret-project-id&project_name=secret-project-name",
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 303
+        location = response.headers.get("location", "")
+        assert "msg_type=error" in location
+        assert "project_id" not in location
+        assert "secret-project-id" not in location
+        assert "secret-project-name" not in location
 
 
 class TestCleanupE2EEndpoint:
