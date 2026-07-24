@@ -572,9 +572,12 @@ def test_scenario_qingtian_real_sample_gate_short_circuits_after_preflight_failu
     assert "- final_result: FAIL" in output
 
 
-def test_scenario_qingtian_runtime_v1_does_not_require_submissions_json(tmp_path, capsys) -> None:
+def test_scenario_qingtian_runtime_v1_does_not_require_submissions_json(
+    tmp_path, capsys, monkeypatch
+) -> None:
     data_dir = tmp_path / "data"
     _write_json(data_dir / "projects.json", [{"id": "p1", "name": "项目1"}])
+    monkeypatch.setenv("QINGTIAN_SMOKE_API_KEY", "synthetic-smoke-test-key")
 
     with local_server() as base_url:
         code = smoke_guard.main(
@@ -817,7 +820,10 @@ def test_cli_probe_returns_zero_for_success(capsys: pytest.CaptureFixture[str]) 
     assert "- result: PASS" in output
 
 
-def test_cli_probe_returns_nonzero_for_failed_status(capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_probe_returns_nonzero_for_failed_status(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("QINGTIAN_SMOKE_API_KEY", "synthetic-smoke-test-key")
     with local_server() as base_url:
         code = smoke_guard.main(["probe", "--base-url", base_url, "--paths", "/missing"])
     output = capsys.readouterr().out

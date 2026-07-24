@@ -19,13 +19,39 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 DEFAULT_TIMEOUT = 5.0
 DEFAULT_EXPECTED_STATUSES = frozenset({200, 204, 301, 302})
 DEFAULT_SCENARIO_BASE_URL = "http://127.0.0.1:8013"
 DEFAULT_SCENARIO_STATUS = "200"
+SMOKE_API_KEY_ENV = "QINGTIAN_SMOKE_API_KEY"
+SMOKE_API_KEY_HEADER = "X-API-Key"
+INPROCESS_SMOKE_API_KEY = "smoke-guard-inprocess-test-key"
 LOCAL_SCENARIO_HOSTS = frozenset({"127.0.0.1", "localhost"})
+PUBLIC_PROBE_PATHS = frozenset(
+    {
+        "/",
+        "/health",
+        "/ready",
+        "/docs",
+        "/docs/oauth2-redirect",
+        "/openapi.json",
+        "/redoc",
+    }
+)
+PUBLIC_PROBE_PREFIXES = ("/static/",)
+PROTECTED_PROBE_PATHS = frozenset(
+    {
+        "/__ping__",
+        "/metrics",
+        "/api/v1/auth/status",
+        "/api/v1/rate_limit/status",
+        "/api/v1/cache/stats",
+        "/api/v1/config/status",
+        "/api/v1/config/llm_status",
+    }
+)
 SCENARIO_NAMES = (
     "basic-runtime",
     "light-page",
@@ -60,6 +86,25 @@ BROWSER_COPY_STATUS_MARKERS = (
 
 class SmokeGuardError(RuntimeError):
     """Raised when a smoke guard check cannot continue."""
+
+
+class _CrossOriginRedirectBlocked(RuntimeError):
+    """Raised before a protected probe can follow a cross-origin redirect."""
+
+
+class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        has_api_key = any(
+            name.lower() == SMOKE_API_KEY_HEADER.lower() for name, _ in req.header_items()
+        )
+        if has_api_key and _url_origin(req.full_url) != _url_origin(newurl):
+            raise _CrossOriginRedirectBlocked
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None and is_public_probe_path(newurl):
+            for name, _ in redirected.header_items():
+                if name.lower() == SMOKE_API_KEY_HEADER.lower():
+                    redirected.remove_header(name)
+        return redirected
 
 
 @dataclasses.dataclass(frozen=True)
@@ -179,6 +224,50 @@ def parse_statuses(value: str | None) -> set[int]:
     if not statuses:
         raise SmokeGuardError("No valid expected status codes were provided.")
     return statuses
+
+
+def resolve_smoke_api_key(environ: Mapping[str, str] | None = None) -> str | None:
+    source = os.environ if environ is None else environ
+    dedicated = source.get(SMOKE_API_KEY_ENV, "").strip()
+    if dedicated:
+        return dedicated
+    for candidate in source.get("API_KEYS", "").split(","):
+        candidate = candidate.strip()
+        if candidate:
+            return candidate
+    return None
+
+
+def _normalized_probe_path(path: str) -> str:
+    normalized = urllib.parse.urlsplit(path).path or "/"
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+    return normalized
+
+
+def is_public_probe_path(path: str) -> bool:
+    normalized = _normalized_probe_path(path)
+    return normalized in PUBLIC_PROBE_PATHS or any(
+        normalized.startswith(prefix) for prefix in PUBLIC_PROBE_PREFIXES
+    )
+
+
+def is_protected_probe_path(path: str) -> bool:
+    return not is_public_probe_path(path)
+
+
+def probe_headers(path: str, api_key: str | None) -> dict[str, str]:
+    if is_public_probe_path(path) or not api_key:
+        return {}
+    return {SMOKE_API_KEY_HEADER: api_key}
+
+
+def require_smoke_api_key(paths: Sequence[str], api_key: str | None) -> None:
+    if not api_key and any(is_protected_probe_path(path) for path in paths):
+        raise SmokeGuardError(
+            "SMOKE_AUTH_KEY_MISSING: "
+            f"Protected probes require {SMOKE_API_KEY_ENV}."
+        )
 
 
 def default_data_dir() -> Path:
@@ -371,6 +460,8 @@ def run_external_data_runtime(
     env = os.environ.copy()
     env["QINGTIAN_DATA_DIR"] = str(resolved_data_dir)
     env["QINGTIAN_PROJECT_ID"] = project_id
+    env["API_KEYS"] = INPROCESS_SMOKE_API_KEY
+    env.pop(SMOKE_API_KEY_ENV, None)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["PYTHONPATH"] = (
         str(repo_root)
@@ -397,8 +488,15 @@ print(f"DATA_DIR_MATCH={storage.DATA_DIR == expected_data_dir}")
 print(f"SUBMISSIONS_PATH_MATCH={storage.SUBMISSIONS_PATH == expected_data_dir / 'submissions.json'}")
 
 client = TestClient(app)
-evidence = client.get(f"/api/v1/projects/{quoted_project_id}/evidence_trace/latest")
-scoring_basis = client.get(f"/api/v1/projects/{quoted_project_id}/scoring_basis/latest")
+auth_headers = {"X-API-Key": os.environ["API_KEYS"]}
+evidence = client.get(
+    f"/api/v1/projects/{quoted_project_id}/evidence_trace/latest",
+    headers=auth_headers,
+)
+scoring_basis = client.get(
+    f"/api/v1/projects/{quoted_project_id}/scoring_basis/latest",
+    headers=auth_headers,
+)
 print(f"EVIDENCE_TRACE_STATUS={evidence.status_code}")
 print(f"SCORING_BASIS_STATUS={scoring_basis.status_code}")
 
@@ -565,7 +663,26 @@ def build_url(base_url: str, path: str) -> str:
         raise SmokeGuardError("--base-url is required.")
     if not path.startswith("/"):
         path = "/" + path
-    return urllib.parse.urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
+    url = urllib.parse.urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
+    query_keys = {
+        key.lower()
+        for key, _ in urllib.parse.parse_qsl(
+            urllib.parse.urlsplit(url).query,
+            keep_blank_values=True,
+        )
+    }
+    if query_keys.intersection({"api_key", "key"}):
+        raise SmokeGuardError("API key query parameters are not allowed.")
+    return url
+
+
+def _url_origin(url: str) -> tuple[str, str, int | None]:
+    parsed = urllib.parse.urlsplit(url)
+    scheme = parsed.scheme.lower()
+    port = parsed.port
+    if port is None:
+        port = {"http": 80, "https": 443}.get(scheme)
+    return scheme, (parsed.hostname or "").lower(), port
 
 
 def _decode_body(body: bytes, content_type: str) -> str:
@@ -584,6 +701,7 @@ def probe_url(
     timeout: float = DEFAULT_TIMEOUT,
     expected_statuses: Iterable[int] = DEFAULT_EXPECTED_STATUSES,
     expected_text: Sequence[str] = (),
+    headers: Mapping[str, str] | None = None,
 ) -> UrlProbeResult:
     expected = set(expected_statuses)
     url = build_url(base_url, path)
@@ -594,11 +712,14 @@ def probe_url(
     error = ""
 
     try:
-        request = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        request = urllib.request.Request(url, headers=dict(headers or {}), method="GET")
+        opener = urllib.request.build_opener(_SameOriginRedirectHandler())
+        with opener.open(request, timeout=timeout) as response:
             status_code = int(response.getcode())
             content_type = response.headers.get("content-type", "")
             body = response.read()
+    except _CrossOriginRedirectBlocked:
+        error = "SMOKE_CROSS_ORIGIN_REDIRECT_BLOCKED"
     except urllib.error.HTTPError as exc:
         status_code = int(exc.code)
         content_type = exc.headers.get("content-type", "") if exc.headers else ""
@@ -610,7 +731,14 @@ def probe_url(
     latency_ms = (time.monotonic() - started) * 1000
     decoded = _decode_body(body, content_type) if expected_text else ""
     text_matches = tuple(text in decoded for text in expected_text)
-    status_ok = status_code in expected
+    protected_auth_failure = bool(
+        is_protected_probe_path(path) and status_code in {401, 503}
+    )
+    if protected_auth_failure and status_code == 401:
+        error = "SMOKE_AUTH_KEY_INVALID"
+    elif protected_auth_failure:
+        error = "SMOKE_AUTH_NOT_CONFIGURED"
+    status_ok = status_code in expected and not protected_auth_failure
     text_ok = all(text_matches) if expected_text else True
     ok = bool(status_ok and text_ok and not (status_code is None and error))
     if status_code is not None and status_code not in expected:
@@ -639,6 +767,7 @@ def probe_urls(
     timeout: float = DEFAULT_TIMEOUT,
     expected_statuses: Iterable[int] = DEFAULT_EXPECTED_STATUSES,
     expected_text: Sequence[str] = (),
+    api_key: str | None = None,
 ) -> list[UrlProbeResult]:
     return [
         probe_url(
@@ -647,6 +776,7 @@ def probe_urls(
             timeout=timeout,
             expected_statuses=expected_statuses,
             expected_text=expected_text,
+            headers=probe_headers(path, api_key),
         )
         for path in paths
     ]
@@ -853,6 +983,7 @@ def wait_until_ready(
     timeout: float,
     probe_timeout: float,
     expected_statuses: Iterable[int],
+    api_key: str | None,
 ) -> list[UrlProbeResult]:
     deadline = time.monotonic() + timeout
     last_results: list[UrlProbeResult] = []
@@ -862,6 +993,7 @@ def wait_until_ready(
             paths,
             timeout=probe_timeout,
             expected_statuses=expected_statuses,
+            api_key=api_key,
         )
         if all(result.ok for result in last_results):
             return last_results
@@ -877,6 +1009,7 @@ def run_start_probe(
     startup_timeout: float,
     timeout: float,
     expected_statuses: Iterable[int],
+    api_key: str | None,
 ) -> list[UrlProbeResult]:
     command = prepare_start_command(start_cmd)
     process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -887,6 +1020,7 @@ def run_start_probe(
             timeout=startup_timeout,
             probe_timeout=timeout,
             expected_statuses=expected_statuses,
+            api_key=api_key,
         )
     finally:
         process.terminate()
@@ -906,12 +1040,18 @@ def render_url_report(
 ) -> str:
     passed = all(result.ok for result in results)
     failures = [result for result in results if not result.ok]
+    public_only = bool(paths) and all(is_public_probe_path(path) for path in paths)
+    protected_probes_executed = any(
+        is_protected_probe_path(result.path) for result in results
+    )
     lines = [
         f"# smoke_guard {title} report",
         "",
         f"- result: {'PASS' if passed else 'FAIL'}",
         f"- base_url: `{base_url}`",
         f"- paths: `{', '.join(paths)}`",
+        f"- public_only: {str(public_only).lower()}",
+        f"- protected_probes_executed: {str(protected_probes_executed).lower()}",
         "",
         "| path | status_code | latency_ms | content_type | body_bytes | expected_text | result |",
         "|---|---:|---:|---|---:|---|---|",
@@ -984,6 +1124,12 @@ def render_scenario_report(
     )
     if error:
         passed = False
+    public_only = bool(plan.paths) and all(
+        is_public_probe_path(path) for path in plan.paths
+    )
+    protected_probes_executed = any(
+        is_protected_probe_path(result.path) for result in results
+    )
     lines = [
         "# smoke_guard scenario report",
         "",
@@ -996,6 +1142,8 @@ def render_scenario_report(
         f"- forbidden_seen: {str(forbidden_seen).lower()}",
         f"- external_base_url_blocked: {str(external_base_url_blocked).lower()}",
         f"- report_latest_skipped: {str(plan.report_latest_skipped).lower()}",
+        f"- public_only: {str(public_only).lower()}",
+        f"- protected_probes_executed: {str(protected_probes_executed).lower()}",
         f"- final_result: {'PASS' if passed else 'FAIL'}",
     ]
     if error:
@@ -1287,12 +1435,15 @@ def build_parser() -> argparse.ArgumentParser:
 def run_probe_mode(args: argparse.Namespace, *, title: str = "probe") -> int:
     paths = parse_paths(args.paths)
     statuses = parse_statuses(args.expect_status)
+    api_key = resolve_smoke_api_key()
+    require_smoke_api_key(paths, api_key)
     results = probe_urls(
         args.base_url,
         paths,
         timeout=args.timeout,
         expected_statuses=statuses,
         expected_text=args.expect_text,
+        api_key=api_key,
     )
     print(
         render_url_report(title=title, base_url=args.base_url, paths=paths, results=results), end=""
@@ -1309,6 +1460,8 @@ def run_check_port_mode(args: argparse.Namespace) -> int:
 def run_start_probe_mode(args: argparse.Namespace) -> int:
     paths = parse_paths(args.paths)
     statuses = parse_statuses(args.expect_status)
+    api_key = resolve_smoke_api_key()
+    require_smoke_api_key(paths, api_key)
     results = run_start_probe(
         args.start_cmd,
         args.base_url,
@@ -1316,6 +1469,7 @@ def run_start_probe_mode(args: argparse.Namespace) -> int:
         startup_timeout=args.startup_timeout,
         timeout=args.timeout,
         expected_statuses=statuses,
+        api_key=api_key,
     )
     print(
         render_url_report(
@@ -1474,11 +1628,28 @@ def run_scenario_mode(args: argparse.Namespace) -> int:
         return 2
 
     statuses = parse_statuses(args.allow_status)
+    api_key = resolve_smoke_api_key()
+    try:
+        require_smoke_api_key(plan.paths, api_key)
+    except SmokeGuardError as exc:
+        print(
+            render_scenario_report(
+                plan=plan,
+                base_url=args.base_url,
+                results=[],
+                forbidden_seen=False,
+                external_base_url_blocked=False,
+                error=str(exc),
+            ),
+            end="",
+        )
+        return 2
     results = probe_urls(
         args.base_url,
         list(plan.paths),
         timeout=args.timeout,
         expected_statuses=statuses,
+        api_key=api_key,
     )
     print(
         render_scenario_report(
