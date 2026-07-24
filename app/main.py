@@ -14161,15 +14161,11 @@ def web_create_project(
             url="/?create_error=" + quote_plus("项目名称不能为空"), status_code=303
         )
     try:
-        rec = create_project(ProjectCreate(name=clean_name), api_key=api_key)
+        create_project(ProjectCreate(name=clean_name), api_key=api_key)
     except HTTPException as exc:
         detail = str(getattr(exc, "detail", "创建失败"))
         return RedirectResponse(url="/?create_error=" + quote_plus(detail), status_code=303)
-    project_id_value = str(getattr(rec, "id", "") or "")
-    return RedirectResponse(
-        url="/?create_ok=" + quote_plus(clean_name) + "&project_id=" + quote_plus(project_id_value),
-        status_code=303,
-    )
+    return RedirectResponse(url="/?created=1", status_code=303)
 
 
 @app.post("/web/delete_project", include_in_schema=False)
@@ -14435,9 +14431,8 @@ def index_head() -> Response:
 
 @app.get("/", tags=["系统状态"], include_in_schema=False)
 def index(
-    create_ok: Optional[str] = Query(None),
+    created: Optional[str] = Query(None),
     create_error: Optional[str] = Query(None),
-    project_id: Optional[str] = Query(None),
     msg: Optional[str] = Query(None),
     msg_type: Optional[str] = Query(None),
 ) -> Response:
@@ -14446,10 +14441,10 @@ def index(
     selected_project_id = ""
     project_options_html = ""
     create_notice_html = ""
-    if create_ok:
+    if created == "1":
         create_notice_html = (
             '<p style="margin:6px 0 0 0;font-size:13px;color:#15803d">'
-            "创建成功（表单模式）：" + html_lib.escape(create_ok) + "</p>"
+            "项目已创建，请使用 API key 刷新项目列表。</p>"
         )
     elif create_error:
         create_notice_html = (
@@ -14525,7 +14520,7 @@ def index(
         body { font-family: system-ui, sans-serif; margin: 0 auto; max-width: 1680px; padding: 20px; background: var(--bg); color: var(--text); line-height: 1.5; }
         h2 { margin-top: 12px; font-size: 1.8rem; color: var(--primary); }
         .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px 20px; margin-bottom: 18px; box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04); }
-        input[type="text"], select { padding: 8px 10px; margin-right: 8px; min-width: 200px; border:1px solid #cbd5e1; border-radius:8px; background:#f8fafc; }
+        input[type="text"], input[type="password"], select { padding: 8px 10px; margin-right: 8px; min-width: 200px; border:1px solid #cbd5e1; border-radius:8px; background:#f8fafc; }
         button { padding: 10px 16px; background: var(--primary); color: #fff; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; }
         button:hover { opacity: 0.9; }
         button:disabled { opacity: 0.45; cursor: not-allowed; }
@@ -14967,6 +14962,17 @@ def index(
           };
         })();
       </script>
+
+      <div class="section card" id="apiKeyControls">
+        <h2>API 访问认证</h2>
+        <div class="toolbar">
+          <label for="apiKeyInput">API key：</label>
+          <input id="apiKeyInput" type="password" autocomplete="off" placeholder="输入 X-API-Key" />
+          <button type="button" id="saveApiKey">保存</button>
+          <button type="button" id="clearApiKey" class="secondary">清除</button>
+        </div>
+        <p id="apiKeyStatus" class="muted" aria-live="polite">未保存 key</p>
+      </div>
 
       <div class="section card">
         <h2>1) 创建项目</h2>
@@ -15481,10 +15487,6 @@ def index(
               const v = String((el && el.value) || '').trim();
               if (v) return v;
             }
-            try {
-              const qid = new URL(window.location.href).searchParams.get('project_id') || '';
-              if (String(qid).trim()) return String(qid).trim();
-            } catch (_) {}
             return '';
           }
           function fallbackApiKey() {
@@ -16435,6 +16437,27 @@ def index(
         function storageRemove(key) {
           try { localStorage.removeItem(key); } catch (_) {}
         }
+        function redactStoredApiKey(value) {
+          const text = String(value == null ? '' : value);
+          const storedKey = storageGet('api_key');
+          return storedKey ? text.split(storedKey).join('[redacted]') : text;
+        }
+        function authAwareErrorMessage(res, text, fallback='服务请求失败') {
+          let payload = {};
+          try { payload = JSON.parse(String(text || '{}')); } catch (_) {}
+          const detail = (payload && typeof payload.detail === 'object') ? payload.detail : {};
+          const code = String((detail && detail.code) || (payload && payload.code) || '');
+          if (code === 'AUTH_KEY_MISSING') return '未保存 API key，请先在认证区保存。';
+          if (code === 'AUTH_KEY_INVALID') return 'API key 缺失或错误，请重新保存。';
+          if (code === 'AUTH_NOT_CONFIGURED') return '服务未配置认证，请联系服务管理员。';
+          const status = res && typeof res.status === 'number' ? res.status : 0;
+          if (status === 401) return 'API key 缺失或错误，请重新保存。';
+          if (status === 503) return '服务未配置认证或暂不可用。';
+          const rawDetail = (payload && typeof payload.detail === 'string')
+            ? payload.detail
+            : String(text || '').slice(0, 200);
+          return redactStoredApiKey(rawDetail || (status ? ('HTTP ' + status) : fallback));
+        }
         function pickProjectFromSelect(sel) {
           if (!sel) return '';
           if (sel.value) return sel.value;
@@ -16474,10 +16497,6 @@ def index(
             const v = String((el && el.value) || '').trim();
             if (v) return v;
           }
-          try {
-            const qid = new URL(window.location.href).searchParams.get('project_id') || '';
-            if (String(qid).trim()) return String(qid).trim();
-          } catch (_) {}
           return '';
         }
         function selectedScoreScaleMax() {
@@ -17027,6 +17046,38 @@ def index(
           el.textContent = msg || '';
           el.style.color = isError ? '#b91c1c' : '#15803d';
         }
+        function setApiKeyStatus(msg, isError) {
+          const el = document.getElementById('apiKeyStatus');
+          if (!el) return;
+          el.textContent = msg || '';
+          el.style.color = isError ? '#b91c1c' : '#15803d';
+        }
+        function syncApiKeyStatus() {
+          setApiKeyStatus(storageGet('api_key') ? '已保存' : '未保存 key', false);
+        }
+        safeClick('saveApiKey', () => {
+          const input = document.getElementById('apiKeyInput');
+          const key = String((input && input.value) || '').trim();
+          if (!key) {
+            setApiKeyStatus('未保存 key，请输入 API key。', true);
+            return;
+          }
+          try {
+            localStorage.setItem("api_key", key);
+          } catch (_) {
+            setApiKeyStatus('无法保存 API key，请检查浏览器存储权限。', true);
+            return;
+          }
+          if (input) input.value = '';
+          setApiKeyStatus('已保存', false);
+        });
+        safeClick('clearApiKey', () => {
+          try { localStorage.removeItem("api_key"); } catch (_) {}
+          const input = document.getElementById('apiKeyInput');
+          if (input) input.value = '';
+          setApiKeyStatus('未保存 key', false);
+        });
+        syncApiKeyStatus();
         function setSelfCheckResult(summary, details, isError) {
           const el = document.getElementById('selfCheckResult');
           if (!el) return;
@@ -17251,10 +17302,10 @@ def index(
             return at.localeCompare(bt);
           });
           if (!res.ok) {
-            const errMsg = (typeof list === 'object' && list && list.detail) ? String(list.detail) : (text || '').slice(0, 200);
-            setSelectMsg('刷新失败: ' + res.status + ' ' + errMsg, true);
+            const errMsg = authAwareErrorMessage(res, text, '刷新项目列表失败');
+            setSelectMsg('刷新失败: ' + errMsg, true);
             const out = document.getElementById('output');
-            if (out) { out.textContent = '刷新失败: ' + res.status + '\\n' + text; out.scrollIntoView({ behavior: 'smooth' }); }
+            if (out) { out.textContent = '刷新失败: ' + errMsg; out.scrollIntoView({ behavior: 'smooth' }); }
             return;
           }
           setSelectMsg(list.length ? '已加载 ' + list.length + ' 个项目，请在上方下拉框选择' : '暂无项目，请先在「1) 创建项目」中创建', false);
@@ -17476,9 +17527,8 @@ def index(
               setCreateMsg('创建成功，已刷新下方列表，请选择项目', false);
               await refreshProjects();
             } else {
-              let detail = text;
-              try { const j = JSON.parse(text); detail = (j && j.detail) || text; } catch (_) {}
-              setCreateMsg('创建失败: ' + res.status + ' ' + (detail || '').slice(0, 100), true);
+              const detail = authAwareErrorMessage(res, text, '创建项目失败');
+              setCreateMsg('创建失败: ' + detail, true);
               const outSc = document.getElementById('output');
               if (outSc) outSc.scrollIntoView({ behavior: 'smooth' });
             }

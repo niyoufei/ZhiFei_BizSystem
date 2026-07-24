@@ -10,7 +10,26 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from app.auth import API_KEYS_ENV, verify_api_key
-from app.main import app
+
+TEST_API_KEY = "test-auth-key-do-not-use"
+AUTH_HEADERS = {"X-API-Key": TEST_API_KEY}
+_ORIGINAL_API_KEYS = os.environ.get(API_KEYS_ENV)
+os.environ[API_KEYS_ENV] = TEST_API_KEY
+try:
+    from app.main import app
+finally:
+    if _ORIGINAL_API_KEYS is None:
+        os.environ.pop(API_KEYS_ENV, None)
+    else:
+        os.environ[API_KEYS_ENV] = _ORIGINAL_API_KEYS
+
+
+@pytest.fixture(autouse=True)
+def isolate_api_keys():
+    """Keep route-gate tests independent from developer environment state."""
+    with patch.dict(os.environ, {API_KEYS_ENV: TEST_API_KEY}, clear=False):
+        yield
+
 
 PUBLIC_GET_HEAD_PATHS = frozenset(
     {
@@ -152,12 +171,12 @@ def test_sensitive_read_rejects_missing_wrong_and_query_keys_without_leaking_the
 def test_correct_header_enters_original_sensitive_read_logic():
     client = TestClient(app)
     with (
-        patch.dict(os.environ, {API_KEYS_ENV: "correct-key"}),
+        patch.dict(os.environ, {API_KEYS_ENV: TEST_API_KEY}),
         patch("app.main.load_projects", return_value=[]) as load_projects,
     ):
         response = client.get(
             "/api/v1/projects",
-            headers={"X-API-Key": "correct-key"},
+            headers=AUTH_HEADERS,
         )
 
     assert response.status_code == 200
@@ -175,12 +194,17 @@ def test_public_root_does_not_load_or_embed_business_data():
         patch("app.main.load_submissions") as load_submissions,
         patch("app.main.load_expert_profiles") as load_expert_profiles,
     ):
-        response = client.get("/")
+        response = client.get(
+            "/?created=1&create_ok=secret-project-name&project_id=secret-project-id"
+        )
 
     assert response.status_code == 200
     assert "__qingtianApiKeyFetchInstalled" in response.text
     assert "X-API-Key" in response.text
     assert "?api_key" not in response.text
+    assert "项目已创建，请使用 API key 刷新项目列表。" in response.text
+    assert "secret-project-name" not in response.text
+    assert "secret-project-id" not in response.text
     ensure_data_dirs.assert_not_called()
     load_projects.assert_not_called()
     load_materials.assert_not_called()

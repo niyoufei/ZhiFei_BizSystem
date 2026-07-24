@@ -3,17 +3,38 @@
 from __future__ import annotations
 
 import io
-import tempfile
+import os
 from pathlib import Path
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 from docx import Document
+from fastapi.testclient import TestClient
 
 try:
     import pymupdf
 except Exception:  # noqa: BLE001 - environment-dependent optional dependency
     pymupdf = None
+
+TEST_API_KEY = "test-auth-key-do-not-use"
+AUTH_HEADERS = {"X-API-Key": TEST_API_KEY}
+_ORIGINAL_API_KEYS = os.environ.get("API_KEYS")
+os.environ["API_KEYS"] = TEST_API_KEY
+try:
+    from app.main import app
+finally:
+    if _ORIGINAL_API_KEYS is None:
+        os.environ.pop("API_KEYS", None)
+    else:
+        os.environ["API_KEYS"] = _ORIGINAL_API_KEYS
+
+
+@pytest.fixture(autouse=True)
+def isolate_api_keys():
+    """Keep UI integration tests independent from local authentication state."""
+    with patch.dict(os.environ, {"API_KEYS": TEST_API_KEY}, clear=False):
+        yield
 
 
 class TestReadUploadedFile:
@@ -127,7 +148,7 @@ class TestWebUIIntegration:
         assert hasattr(report, "total_score")
         assert hasattr(report, "dimension_scores")
 
-    def test_export_report_integration(self):
+    def test_export_report_integration(self, tmp_path: Path):
         """Test report export to DOCX."""
         from app.config import load_config
         from app.engine.docx_exporter import export_report_to_docx
@@ -138,7 +159,68 @@ class TestWebUIIntegration:
         report = score_text(text, config.rubric, config.lexicon)
         report_dict = report.model_dump()
 
-        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
-            output_path = export_report_to_docx(report_dict, tmp.name)
-            assert Path(output_path).exists()
-            assert Path(output_path).stat().st_size > 0
+        output_path = export_report_to_docx(report_dict, tmp_path / "report.docx")
+        assert Path(output_path).exists()
+        assert Path(output_path).stat().st_size > 0
+
+
+class TestEmbeddedAuthControls:
+    """Authentication controls and public redirect metadata boundaries."""
+
+    def test_root_exposes_password_save_and_clear_controls(self):
+        client = TestClient(app)
+        response = client.get("/")
+
+        assert response.status_code == 200
+        page = response.text
+        assert 'id="apiKeyInput" type="password"' in page
+        assert 'id="saveApiKey"' in page
+        assert 'id="clearApiKey"' in page
+        assert 'id="apiKeyStatus"' in page
+        assert 'localStorage.setItem("api_key", key)' in page
+        assert 'localStorage.removeItem("api_key")' in page
+        assert "if (input) input.value = '';" in page
+        assert "setApiKeyStatus('已保存', false)" in page
+        assert "未保存 key" in page
+        assert "AUTH_KEY_MISSING" in page
+        assert "AUTH_KEY_INVALID" in page
+        assert "AUTH_NOT_CONFIGURED" in page
+
+    def test_business_fetches_use_header_without_key_urls_or_console_output(self):
+        client = TestClient(app)
+        page = client.get("/").text
+
+        assert "X-API-Key" in page
+        assert "?api_key" not in page
+        assert "console.log" not in page
+        assert "__qingtianDownloadProtected" in page
+        assert "await response.blob()" in page
+        assert "await res.text()" in page
+
+    @patch("app.main.create_project")
+    def test_create_project_redirect_is_generic(self, create_project):
+        create_project.return_value = SimpleNamespace(id="secret-project-id")
+        client = TestClient(app)
+
+        response = client.post(
+            "/web/create_project",
+            data={"name": "secret-project-name"},
+            headers=AUTH_HEADERS,
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 303
+        assert response.headers["location"] == "/?created=1"
+        assert "secret-project-name" not in response.headers["location"]
+        assert "secret-project-id" not in response.headers["location"]
+
+    def test_root_ignores_project_metadata_query_values(self):
+        client = TestClient(app)
+        response = client.get(
+            "/?created=1&create_ok=secret-project-name&project_id=secret-project-id"
+        )
+
+        assert response.status_code == 200
+        assert "项目已创建，请使用 API key 刷新项目列表。" in response.text
+        assert "secret-project-name" not in response.text
+        assert "secret-project-id" not in response.text

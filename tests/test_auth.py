@@ -16,6 +16,25 @@ from app.auth import (
     verify_api_key,
 )
 
+TEST_API_KEY = "test-auth-key-do-not-use"
+AUTH_HEADERS = {"X-API-Key": TEST_API_KEY}
+_ORIGINAL_API_KEYS = os.environ.get(API_KEYS_ENV)
+os.environ[API_KEYS_ENV] = TEST_API_KEY
+try:
+    from app.main import app
+finally:
+    if _ORIGINAL_API_KEYS is None:
+        os.environ.pop(API_KEYS_ENV, None)
+    else:
+        os.environ[API_KEYS_ENV] = _ORIGINAL_API_KEYS
+
+
+@pytest.fixture(autouse=True)
+def isolate_api_keys():
+    """Provide a deterministic default while allowing explicit fail-closed cases."""
+    with patch.dict(os.environ, {API_KEYS_ENV: TEST_API_KEY}, clear=False):
+        yield
+
 
 class TestGetValidApiKeys:
     """Tests for get_valid_api_keys function."""
@@ -150,8 +169,6 @@ class TestIntegrationWithFastAPI:
         """Should be able to check auth status with a valid header key."""
         from fastapi.testclient import TestClient
 
-        from app.main import app
-
         with patch.dict(os.environ, {API_KEYS_ENV: "status-key"}):
             client = TestClient(app)
             response = client.get(
@@ -167,8 +184,6 @@ class TestIntegrationWithFastAPI:
         """Protected endpoint should fail closed when auth is unconfigured."""
         from fastapi.testclient import TestClient
 
-        from app.main import app
-
         with patch.dict(os.environ, {}, clear=True):
             os.environ.pop(API_KEYS_ENV, None)
             client = TestClient(app)
@@ -182,9 +197,7 @@ class TestIntegrationWithFastAPI:
 
         from fastapi.testclient import TestClient
 
-        from app.main import app
-
-        with patch.dict(os.environ, {API_KEYS_ENV: "test-api-key"}):
+        with patch.dict(os.environ, {API_KEYS_ENV: TEST_API_KEY}):
             client = TestClient(app)
 
             with patch("app.main.load_config") as mock_config, patch(
@@ -213,7 +226,7 @@ class TestIntegrationWithFastAPI:
                 response = client.post(
                     "/api/v1/score",
                     json={"text": "测试文本"},
-                    headers={"X-API-Key": "test-api-key"},
+                    headers=AUTH_HEADERS,
                 )
                 assert response.status_code == 200
 
@@ -221,12 +234,10 @@ class TestIntegrationWithFastAPI:
         """A valid key in the query string must not authenticate."""
         from fastapi.testclient import TestClient
 
-        from app.main import app
-
-        with patch.dict(os.environ, {API_KEYS_ENV: "test-api-key"}):
+        with patch.dict(os.environ, {API_KEYS_ENV: TEST_API_KEY}):
             client = TestClient(app)
             response = client.post(
-                "/api/v1/score?api_key=test-api-key",
+                f"/api/v1/score?api_key={TEST_API_KEY}",
                 json={"text": "测试文本"},
             )
             assert response.status_code == 401
@@ -236,9 +247,7 @@ class TestIntegrationWithFastAPI:
         """Protected endpoint should reject request without key when auth enabled."""
         from fastapi.testclient import TestClient
 
-        from app.main import app
-
-        with patch.dict(os.environ, {API_KEYS_ENV: "test-api-key"}):
+        with patch.dict(os.environ, {API_KEYS_ENV: TEST_API_KEY}):
             client = TestClient(app)
             response = client.post("/api/v1/score", json={"text": "测试文本"})
             assert response.status_code == 401
@@ -247,8 +256,6 @@ class TestIntegrationWithFastAPI:
     def test_protected_endpoint_rejects_invalid_key(self):
         """Protected endpoint should reject request with invalid key."""
         from fastapi.testclient import TestClient
-
-        from app.main import app
 
         with patch.dict(os.environ, {API_KEYS_ENV: "valid-key"}):
             client = TestClient(app)

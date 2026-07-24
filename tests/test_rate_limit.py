@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from unittest.mock import MagicMock, patch
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -16,6 +17,25 @@ from app.rate_limit import (
     rate_limit_exceeded_handler,
     setup_rate_limiting,
 )
+
+TEST_API_KEY = "test-auth-key-do-not-use"
+AUTH_HEADERS = {"X-API-Key": TEST_API_KEY}
+_ORIGINAL_API_KEYS = os.environ.get("API_KEYS")
+os.environ["API_KEYS"] = TEST_API_KEY
+try:
+    from app.main import app
+finally:
+    if _ORIGINAL_API_KEYS is None:
+        os.environ.pop("API_KEYS", None)
+    else:
+        os.environ["API_KEYS"] = _ORIGINAL_API_KEYS
+
+
+@pytest.fixture(autouse=True)
+def isolate_api_keys():
+    """Keep endpoint authentication isolated from local dotenv configuration."""
+    with patch.dict(os.environ, {"API_KEYS": TEST_API_KEY}, clear=False):
+        yield
 
 
 class TestGetRateLimitKey:
@@ -183,10 +203,8 @@ class TestRateLimitEndpoint:
 
     def test_rate_limit_status_endpoint(self):
         """Should return rate limit status via API."""
-        from app.main import app
-
         client = TestClient(app)
-        response = client.get("/api/v1/rate_limit/status")
+        response = client.get("/api/v1/rate_limit/status", headers=AUTH_HEADERS)
 
         assert response.status_code == 200
         data = response.json()
@@ -199,28 +217,49 @@ class TestRateLimitedEndpoints:
 
     def test_rate_limit_infrastructure_ready(self):
         """Rate limiting infrastructure should be set up on the app."""
-        from app.main import app
-
         # Check that limiter is attached to app state
         assert hasattr(app.state, "limiter")
         assert app.state.limiter is not None
 
     def test_endpoints_work_normally(self):
         """Endpoints should work normally with rate limiting infrastructure."""
-        from app.main import app
-
         client = TestClient(app)
 
         # Test score endpoint
-        response = client.post("/api/v1/score", json={"text": "测试文本"})
+        response = client.post(
+            "/api/v1/score",
+            json={"text": "测试文本"},
+            headers=AUTH_HEADERS,
+        )
         assert response.status_code == 200
 
         # Test rate limit status endpoint
-        response = client.get("/api/v1/rate_limit/status")
+        response = client.get("/api/v1/rate_limit/status", headers=AUTH_HEADERS)
         assert response.status_code == 200
         data = response.json()
         assert "enabled" in data
         assert "limits" in data
+
+    def test_auth_failures_do_not_enter_business_success_path(self):
+        """Missing and wrong keys should stop before the protected score logic."""
+        client = TestClient(app)
+        with patch("app.main.score_text") as score_text:
+            missing = client.post("/api/v1/score", json={"text": "测试文本"})
+            wrong = client.post(
+                "/api/v1/score",
+                json={"text": "测试文本"},
+                headers={"X-API-Key": "wrong-test-key"},
+            )
+
+        assert missing.status_code == 401
+        assert wrong.status_code == 401
+        score_text.assert_not_called()
+
+    def test_health_and_ready_remain_public(self):
+        """Public runtime probes must not require an authentication header."""
+        client = TestClient(app)
+        assert client.get("/health").status_code == 200
+        assert client.get("/ready").status_code == 200
 
 
 class TestRateLimitDisabled:

@@ -15,15 +15,34 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-os.environ["API_KEYS"] = ""
+TEST_API_KEY = "test-auth-key-do-not-use"
+AUTH_HEADERS = {"X-API-Key": TEST_API_KEY}
+_ORIGINAL_API_KEYS = os.environ.get("API_KEYS")
+os.environ["API_KEYS"] = TEST_API_KEY
+try:
+    from app.main import app, create_app  # noqa: E402
+finally:
+    if _ORIGINAL_API_KEYS is None:
+        os.environ.pop("API_KEYS", None)
+    else:
+        os.environ["API_KEYS"] = _ORIGINAL_API_KEYS
 
-from app.main import app, create_app  # noqa: E402
+
+@pytest.fixture(autouse=True)
+def isolate_api_keys():
+    """Keep authentication deterministic without leaking test configuration."""
+    with patch.dict(os.environ, {"API_KEYS": TEST_API_KEY}, clear=False):
+        yield
 
 
 @pytest.fixture
-def client():
+def client(request, monkeypatch):
     """Create a test client."""
-    return TestClient(app)
+    test_api_key = f"{TEST_API_KEY}-{abs(hash(request.node.nodeid))}"
+    monkeypatch.setenv("API_KEYS", test_api_key)
+    auth_headers = dict(AUTH_HEADERS)
+    auth_headers["X-API-Key"] = test_api_key
+    return TestClient(app, headers=auth_headers)
 
 
 def test_health_ready_self_check_runtime_boundaries_are_visible():
@@ -43,7 +62,7 @@ def test_health_ready_self_check_runtime_boundaries_are_visible():
         "_run_system_self_check": slice_between(
             "def _run_system_self_check", "\n\n# ===================="
         ),
-        "health_check": slice_between('@app.get("/health"', '\n\n@app.get("/metrics"'),
+        "health_check": slice_between('@app.get("/health"', '\n\n@app.get(\n    "/metrics"'),
         "readiness_check": slice_between('@app.get("/ready"', '\n\n@app.get("/__ping__"'),
         "system_self_check": slice_between(
             '@router.get(\n    "/system/self_check"', "\n\n@router.get("
@@ -64,9 +83,9 @@ def test_health_ready_self_check_runtime_boundaries_are_visible():
 
     assert '@app.get("/health"' in main_text
     assert '@app.get("/ready"' in main_text
-    assert 'router = APIRouter(prefix="/api/v1")' in main_text
+    assert 'router = SensitiveReadAPIRouter(prefix="/api/v1")' in main_text
     assert '@router.get(\n    "/system/self_check"' in main_text
-    assert 'compat_router = APIRouter(prefix="/api")' in main_text
+    assert 'compat_router = SensitiveReadAPIRouter(prefix="/api")' in main_text
     assert '@compat_router.get("/system/self_check"' in main_text
     assert "/api/v1/system/self_check" in main_text
     assert "ensure_data_dirs()" in main_text
@@ -413,11 +432,17 @@ class TestWebCreateProjectFallback:
 
     @patch("app.main.create_project")
     def test_web_create_project_success_redirects_ok(self, mock_create_project, client):
+        mock_create_project.return_value = MagicMock(id="secret-project-id")
         response = client.post(
             "/web/create_project", data={"name": "测试项目"}, follow_redirects=False
         )
         assert response.status_code == 303
-        assert "create_ok=" in response.headers.get("location", "")
+        location = response.headers.get("location", "")
+        assert location == "/?created=1"
+        assert "测试项目" not in location
+        assert "secret-project-id" not in location
+        assert "project_id" not in location
+        assert "create_ok" not in location
         assert mock_create_project.called
 
 
@@ -5066,7 +5091,6 @@ class TestOllamaEvolutionPreviewEndpoint:
         }
 
         with (
-            patch.dict(os.environ, {"API_KEYS": ""}, clear=False),
             patch("app.main.ensure_data_dirs"),
             patch("app.main.load_projects", return_value=[{"id": "p1", "meta": {}}]),
             patch("app.main.load_ground_truth", return_value=self._ground_truth_records()),
@@ -5116,7 +5140,6 @@ class TestOllamaEvolutionPreviewEndpoint:
         }
 
         with (
-            patch.dict(os.environ, {"API_KEYS": ""}, clear=False),
             patch("app.main.ensure_data_dirs"),
             patch("app.main.load_projects", return_value=[{"id": "p1", "meta": {}}]),
             patch("app.main.load_ground_truth", return_value=self._ground_truth_records()),
@@ -5156,7 +5179,6 @@ class TestOllamaEvolutionPreviewEndpoint:
         rule_report = self._rule_report()
 
         with (
-            patch.dict(os.environ, {"API_KEYS": ""}, clear=False),
             patch("app.main.ensure_data_dirs"),
             patch("app.main.load_projects", return_value=[{"id": "p1", "meta": {}}]),
             patch("app.main.load_ground_truth", return_value=self._ground_truth_records()),
