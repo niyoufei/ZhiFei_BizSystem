@@ -33,7 +33,7 @@ dev = [
   "pygments<2.19",
   "pytest",
   "pytest-cov",
-  "ruff",
+  "ruff==0.2.1",
 ]
 [project.scripts]
 zhifei-score = "app.cli:app"

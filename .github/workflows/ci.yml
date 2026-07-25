@@ -23,7 +23,27 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          pip install ruff
+          pip install "ruff==0.2.1"
+
+      - name: Verify Ruff version
+        run: |
+          python - <<'PY'
+          import subprocess
+
+          actual = subprocess.check_output(
+              ["ruff", "--version"],
+              text=True,
+          ).strip()
+
+          expected = "ruff 0.2.1"
+
+          if actual != expected:
+              raise SystemExit(
+                  f"RUFF_VERSION_MISMATCH: expected={expected}, actual={actual}"
+              )
+
+          print(actual)
+          PY
 
       - name: Run ruff
         run: python -m ruff check app/ tests/ scripts/

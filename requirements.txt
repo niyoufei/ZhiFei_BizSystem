@@ -9,7 +9,7 @@ PyYAML
 pytest
 Pygments<2.19
 pytest-cov
-ruff
+ruff==0.2.1
 black
 python-docx
 pymupdf
