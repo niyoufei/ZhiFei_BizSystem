@@ -233,6 +233,8 @@ from app.schemas import (
 from app.storage import (
     DATA_DIR,
     MATERIALS_DIR,
+    append_ground_truth_records,
+    atomic_json_transaction,
     ensure_data_dirs,
     load_calibration_models,
     load_calibration_samples,
@@ -890,9 +892,11 @@ def _ensure_project_expert_profile(
     return created, True
 
 
+@atomic_json_transaction("projects")
 def _recover_missing_project_from_artifacts(
     project_id: str, projects: List[Dict[str, object]]
 ) -> Optional[Dict[str, object]]:
+    projects[:] = load_projects()
     pid = str(project_id or "").strip()
     if not pid:
         return None
@@ -3807,6 +3811,7 @@ def _select_deployed_patch(project_id: str) -> Optional[Dict[str, object]]:
     return packages[0]
 
 
+@atomic_json_transaction("patch_deployments", "patch_packages")
 def _auto_govern_deployed_patch(
     *,
     project_id: str,
@@ -4670,6 +4675,7 @@ def _build_calibrator_summary(
     return summary
 
 
+@atomic_json_transaction("calibration_samples", "delta_cases", "qingtian_results")
 def _refresh_project_reflection_objects(project_id: str) -> None:
     submissions = [s for s in load_submissions() if str(s.get("project_id")) == project_id]
     submissions_by_id = {str(s.get("id")): s for s in submissions}
@@ -4828,6 +4834,7 @@ def _build_feedback_records_for_project(project_id: str) -> List[Dict[str, objec
     return feedback_records
 
 
+@atomic_json_transaction("expert_profiles", "projects")
 def _auto_update_from_delta_cases(project_id: str) -> Dict[str, object]:
     projects = load_projects()
     project = next((p for p in projects if str(p.get("id")) == project_id), None)
@@ -4940,6 +4947,7 @@ def _auto_update_from_delta_cases(project_id: str) -> Dict[str, object]:
     }
 
 
+@atomic_json_transaction("expert_profiles", "projects")
 def _auto_update_project_weights_from_delta_cases(project_id: str) -> Dict[str, object]:
     """
     优先使用「总分+标签」定向反演（模块一/二）；
@@ -5001,6 +5009,7 @@ def _auto_update_project_weights_from_delta_cases(project_id: str) -> Dict[str, 
     return _auto_update_from_delta_cases(project_id)
 
 
+@atomic_json_transaction("evolution_reports")
 def _sync_feedback_weights_to_evolution(
     project_id: str,
     weight_update: Dict[str, object],
@@ -5034,6 +5043,7 @@ def _sync_feedback_weights_to_evolution(
     }
 
 
+@atomic_json_transaction("evolution_reports")
 def _refresh_evolution_report_from_ground_truth(project_id: str) -> Dict[str, object]:
     projects = load_projects()
     project = next((p for p in projects if str(p.get("id")) == project_id), None)
@@ -5417,6 +5427,7 @@ def _collect_applied_feature_ids_from_report(
     return sorted(feature_ids)
 
 
+@atomic_json_transaction("high_score_features")
 def _auto_update_feature_confidence_on_ground_truth(
     *,
     report: Dict[str, object],
@@ -5461,6 +5472,19 @@ def _auto_update_feature_confidence_on_ground_truth(
     return update_result
 
 
+@atomic_json_transaction(
+    "calibration_samples",
+    "delta_cases",
+    "evidence_units",
+    "ground_truth",
+    "high_score_features",
+    "project_anchors",
+    "project_requirements",
+    "projects",
+    "qingtian_results",
+    "score_reports",
+    "submissions",
+)
 def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, object]) -> None:
     projects = load_projects()
     project = _find_project(project_id, projects)
@@ -5688,14 +5712,20 @@ def _rebuild_project_anchors_and_requirements(
         scoring_engine_version=scoring_engine_version,
     )
 
-    all_anchors = [a for a in load_project_anchors() if str(a.get("project_id")) != project_id]
-    all_requirements = [
-        r for r in load_project_requirements() if str(r.get("project_id")) != project_id
-    ]
-    all_anchors.extend(anchors)
-    all_requirements.extend(requirements)
-    save_project_anchors(all_anchors)
-    save_project_requirements(all_requirements)
+    @atomic_json_transaction("project_anchors", "project_requirements", "projects")
+    def commit() -> None:
+        if not any(str(p.get("id")) == project_id for p in load_projects()):
+            raise HTTPException(status_code=404, detail="项目不存在")
+        all_anchors = [a for a in load_project_anchors() if str(a.get("project_id")) != project_id]
+        all_requirements = [
+            r for r in load_project_requirements() if str(r.get("project_id")) != project_id
+        ]
+        all_anchors.extend(anchors)
+        all_requirements.extend(requirements)
+        save_project_anchors(all_anchors)
+        save_project_requirements(all_requirements)
+
+    commit()
     return anchors, requirements
 
 
@@ -5919,6 +5949,25 @@ def get_locale(
     return parse_accept_language(accept_language)
 
 
+@atomic_json_transaction(
+    "calibration_samples",
+    "delta_cases",
+    "evidence_units",
+    "evolution_reports",
+    "ground_truth",
+    "learning_profiles",
+    "materials",
+    "patch_deployments",
+    "patch_packages",
+    "project_anchors",
+    "project_context",
+    "project_requirements",
+    "projects",
+    "qingtian_results",
+    "score_history",
+    "score_reports",
+    "submissions",
+)
 def _build_data_hygiene_report(*, apply: bool) -> Dict[str, object]:
     """
     数据卫生巡检/修复：
@@ -7160,6 +7209,7 @@ def analyze_per_tender(payload: Dict[str, Any]) -> dict | JSONResponse:
     tags=["项目管理"],
     responses={**RESPONSES_401, **RESPONSES_422},
 )
+@atomic_json_transaction("projects")
 def create_project(
     payload: ProjectCreate,
     api_key: Optional[str] = Depends(verify_api_key),
@@ -7197,6 +7247,7 @@ def create_project(
 
 
 @router.get("/projects", response_model=list[ProjectRecord], tags=["项目管理"])
+@atomic_json_transaction("projects")
 def list_projects() -> list[ProjectRecord]:
     """
     获取所有项目列表。
@@ -7229,6 +7280,7 @@ def list_projects() -> list[ProjectRecord]:
     tags=["项目管理"],
     responses={**RESPONSES_404},
 )
+@atomic_json_transaction("expert_profiles", "projects")
 def get_project_expert_profile(
     project_id: str, locale: str = Depends(get_locale)
 ) -> ProjectExpertProfileResponse:
@@ -7259,6 +7311,7 @@ def get_project_expert_profile(
     tags=["项目管理"],
     responses={**RESPONSES_401, **RESPONSES_404, **RESPONSES_409},
 )
+@atomic_json_transaction("expert_profiles", "projects")
 def update_project_expert_profile(
     project_id: str,
     payload: ExpertProfileUpdate,
@@ -7316,7 +7369,8 @@ def rescore_project_submissions(
     except HTTPException:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
 
-    project_changed = _ensure_project_v2_fields(project)
+    project_before = copy.deepcopy(project)
+    _ensure_project_v2_fields(project)
     _assert_project_profile_operation_unlocked(project, bool(payload.force_unlock))
     score_scale_max = _normalize_score_scale_max(
         payload.score_scale_max,
@@ -7327,13 +7381,8 @@ def rescore_project_submissions(
     if int(project_meta.get("score_scale_max", DEFAULT_SCORE_SCALE_MAX)) != score_scale_max:
         project_meta["score_scale_max"] = score_scale_max
         project["meta"] = project_meta
-        project_changed = True
     profiles = load_expert_profiles()
     profile, created = _ensure_project_expert_profile(project, profiles)
-    if created:
-        save_expert_profiles(profiles)
-    if project_changed or created:
-        save_projects(projects)
 
     if payload.scope not in {"project", "submission"}:
         raise HTTPException(status_code=422, detail="scope 仅支持 project 或 submission")
@@ -7373,9 +7422,8 @@ def rescore_project_submissions(
         raise_on_fail=True,
     )
 
-    score_reports = load_score_reports()
-    all_evidence_units = load_evidence_units()
     generated = 0
+    computed_updates: List[Dict[str, object]] = []
     material_utilization_summaries: List[Dict[str, object]] = []
     material_utilization_by_submission: List[Dict[str, object]] = []
     material_utilization_gates: List[Dict[str, object]] = []
@@ -7399,11 +7447,6 @@ def rescore_project_submissions(
             material_quality_snapshot=material_quality_snapshot,
         )
         _apply_evolution_total_scale(project_id, report)
-        all_evidence_units = _replace_submission_evidence_units(
-            all_evidence_units,
-            submission_id=str(submission.get("id")),
-            new_units=evidence_units,
-        )
         if not _report_is_blocked(report):
             _mark_report_scored(report, trigger="manual_rescore")
         report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
@@ -7452,7 +7495,6 @@ def rescore_project_submissions(
             profile_snapshot=profile_for_meta,
             scoring_engine_version=payload.scoring_engine_version,
         )
-        score_reports.append(snapshot)
         generated += 1
 
         dimension_scores = {
@@ -7460,21 +7502,97 @@ def rescore_project_submissions(
             for dim_id, dim in report.get("dimension_scores", {}).items()
         }
         penalty_count = len(report.get("penalties", []))
+        history_args: Optional[Dict[str, object]] = None
         if not _report_is_blocked(report):
-            record_history_score(
-                project_id=project_id,
-                submission_id=str(submission.get("id")),
-                filename=str(submission.get("filename", "")),
-                total_score=report.get("total_score", 0.0),
-                dimension_scores=dimension_scores,
-                penalty_count=penalty_count,
-            )
+            history_args = {
+                "project_id": project_id,
+                "submission_id": str(submission.get("id")),
+                "filename": str(submission.get("filename", "")),
+                "total_score": report.get("total_score", 0.0),
+                "dimension_scores": dimension_scores,
+                "penalty_count": penalty_count,
+            }
+        computed_updates.append(
+            {
+                "submission_id": str(submission.get("id")),
+                "report": report,
+                "total_score": submission["total_score"],
+                "updated_at": now,
+                "expert_profile_id_used": submission["expert_profile_id_used"],
+                "snapshot": snapshot,
+                "evidence_units": evidence_units,
+                "history_args": history_args,
+            }
+        )
 
-    save_submissions(submissions)
-    save_score_reports(score_reports)
-    save_evidence_units(all_evidence_units)
     project["updated_at"] = _now_iso()
-    save_projects(projects)
+    project_patch = {
+        key: copy.deepcopy(value)
+        for key, value in project.items()
+        if project_before.get(key) != value
+    }
+    committed_ids: set[str] = set()
+
+    @atomic_json_transaction(
+        "evidence_units",
+        "expert_profiles",
+        "projects",
+        "score_reports",
+        "submissions",
+    )
+    def commit() -> None:
+        latest_projects = load_projects()
+        try:
+            latest_project = _find_project(project_id, latest_projects)
+        except HTTPException:
+            raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+        latest_project.update(copy.deepcopy(project_patch))
+
+        if created:
+            latest_profiles = load_expert_profiles()
+            if not any(str(item.get("id")) == str(profile.get("id")) for item in latest_profiles):
+                latest_profiles.append(copy.deepcopy(profile))
+            save_expert_profiles(latest_profiles)
+
+        latest_submissions = load_submissions()
+        submissions_by_id = {
+            str(item.get("id")): item
+            for item in latest_submissions
+            if isinstance(item, dict) and str(item.get("id"))
+        }
+        latest_reports = load_score_reports()
+        latest_evidence_units = load_evidence_units()
+        for item in computed_updates:
+            submission_id = str(item["submission_id"])
+            latest_submission = submissions_by_id.get(submission_id)
+            if latest_submission is None:
+                continue
+            latest_submission["report"] = copy.deepcopy(item["report"])
+            latest_submission["total_score"] = item["total_score"]
+            latest_submission["updated_at"] = item["updated_at"]
+            latest_submission["expert_profile_id_used"] = item["expert_profile_id_used"]
+            latest_reports.append(copy.deepcopy(item["snapshot"]))
+            latest_evidence_units = _replace_submission_evidence_units(
+                latest_evidence_units,
+                submission_id=submission_id,
+                new_units=copy.deepcopy(item["evidence_units"]),
+            )
+            committed_ids.add(submission_id)
+
+        save_submissions(latest_submissions)
+        save_score_reports(latest_reports)
+        save_evidence_units(latest_evidence_units)
+        save_projects(latest_projects)
+
+    commit()
+    generated = len(committed_ids)
+    for item in computed_updates:
+        if str(item["submission_id"]) not in committed_ids:
+            continue
+        history_args = item.get("history_args")
+        if isinstance(history_args, dict):
+            record_history_score(**history_args)
+
     # 重评分属于有效反馈信号：自动刷新样本并触发校准/调权重闭环。
     feedback_closed_loop = _run_feedback_closed_loop_safe(
         project_id,
@@ -7514,6 +7632,26 @@ def rescore_project_submissions(
     )
 
 
+@atomic_json_transaction(
+    "calibration_samples",
+    "delta_cases",
+    "evidence_units",
+    "evolution_reports",
+    "expert_profiles",
+    "ground_truth",
+    "learning_profiles",
+    "materials",
+    "patch_deployments",
+    "patch_packages",
+    "project_anchors",
+    "project_context",
+    "project_requirements",
+    "projects",
+    "qingtian_results",
+    "score_history",
+    "score_reports",
+    "submissions",
+)
 def _delete_project_cascade(project_id: str, *, locale: str = "zh") -> Dict[str, object]:
     """
     删除项目及其关联数据。
@@ -8008,6 +8146,7 @@ def _find_recent_duplicate_submission(
     tags=["项目管理"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
+@atomic_json_transaction("materials", "project_anchors", "project_requirements")
 def upload_material(
     project_id: str,
     file: UploadFile = File(...),
@@ -8432,6 +8571,7 @@ def get_project_constraint_pack(
     tags=["项目管理"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
+@atomic_json_transaction("materials")
 def delete_material(
     project_id: str,
     material_id: str,
@@ -10915,18 +11055,7 @@ def upload_shigong(
         text = _read_uploaded_file_content(content, normalized_filename)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
-    submissions = load_submissions()
     now_utc = datetime.now(timezone.utc)
-    duplicate = _find_recent_duplicate_submission(
-        submissions,
-        project_id=project_id,
-        filename=normalized_filename,
-        text=text,
-        now_utc=now_utc,
-    )
-    if duplicate is not None:
-        return SubmissionRecord(**duplicate)
-
     _, profile_snapshot, project = _resolve_project_scoring_context(project_id)
     scoring_engine_version = str(project.get("scoring_engine_version_locked") or "v1")
     submission_id = str(uuid4())
@@ -10953,10 +11082,30 @@ def upload_shigong(
         "updated_at": now_utc.isoformat(),
         "expert_profile_id_used": profile_snapshot.get("id") if profile_snapshot else None,
     }
-    submissions.append(record)
-    save_submissions(submissions)
+    committed: Dict[str, Dict[str, object]] = {}
 
-    return SubmissionRecord(**record)
+    @atomic_json_transaction("projects", "submissions")
+    def commit() -> None:
+        if not any(str(p.get("id")) == project_id for p in load_projects()):
+            raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+        submissions = load_submissions()
+        duplicate = _find_recent_duplicate_submission(
+            submissions,
+            project_id=project_id,
+            filename=normalized_filename,
+            text=text,
+            now_utc=now_utc,
+        )
+        if duplicate is not None:
+            committed["record"] = duplicate
+            return
+        submissions.append(record)
+        committed["record"] = record
+        save_submissions(submissions)
+
+    commit()
+
+    return SubmissionRecord(**committed["record"])
 
 
 @router.post(
@@ -10991,6 +11140,7 @@ def score_text_for_project(
     submission_id = str(uuid4())
     scoring_engine_version = str(project.get("scoring_engine_version_locked") or "v1")
     engine_version = _determine_engine_version(project, scoring_engine_version)
+    cache_payload: Optional[tuple[str, Dict[str, object], Optional[str]]] = None
 
     if engine_version == "v1":
         config_hash = _compute_multipliers_hash(multipliers) if multipliers else None
@@ -11009,7 +11159,7 @@ def score_text_for_project(
                 scoring_engine_version=scoring_engine_version,
             )
             # 缓存仅存“未缩放原始分”，避免后续读取时重复应用 total_score_scale。
-            cache_score_result(payload.text, raw_report, config_hash)
+            cache_payload = (payload.text, raw_report, config_hash)
             report = dict(raw_report)
         _apply_evolution_total_scale(project_id, report)
         evidence_units: List[Dict[str, object]] = []
@@ -11036,29 +11186,35 @@ def score_text_for_project(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "expert_profile_id_used": profile_snapshot.get("id") if profile_snapshot else None,
     }
-    submissions = load_submissions()
-    submissions.append(record)
-    save_submissions(submissions)
-
-    snapshots = load_score_reports()
-    snapshots.append(
-        _build_score_report_snapshot(
-            submission_id=submission_id,
-            project=project,
-            report=report,
-            profile_snapshot=profile_snapshot,
-            scoring_engine_version=scoring_engine_version,
-        )
+    snapshot = _build_score_report_snapshot(
+        submission_id=submission_id,
+        project=project,
+        report=report,
+        profile_snapshot=profile_snapshot,
+        scoring_engine_version=scoring_engine_version,
     )
-    save_score_reports(snapshots)
-    if evidence_units:
-        all_units = load_evidence_units()
-        all_units = _replace_submission_evidence_units(
-            all_units,
-            submission_id=submission_id,
-            new_units=evidence_units,
-        )
-        save_evidence_units(all_units)
+
+    @atomic_json_transaction("evidence_units", "projects", "score_reports", "submissions")
+    def commit() -> None:
+        if not any(str(p.get("id")) == project_id for p in load_projects()):
+            raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+        submissions = load_submissions()
+        submissions.append(record)
+        snapshots = load_score_reports()
+        snapshots.append(snapshot)
+        save_submissions(submissions)
+        save_score_reports(snapshots)
+        if evidence_units:
+            all_units = _replace_submission_evidence_units(
+                load_evidence_units(),
+                submission_id=submission_id,
+                new_units=evidence_units,
+            )
+            save_evidence_units(all_units)
+
+    commit()
+    if cache_payload is not None:
+        cache_score_result(*cache_payload)
 
     # 记录评分历史
     dimension_scores = {
@@ -11212,6 +11368,20 @@ def list_submissions(
     )
 
 
+@atomic_json_transaction(
+    "calibration_models",
+    "calibration_samples",
+    "delta_cases",
+    "evidence_units",
+    "evolution_reports",
+    "expert_profiles",
+    "patch_deployments",
+    "patch_packages",
+    "projects",
+    "qingtian_results",
+    "score_reports",
+    "submissions",
+)
 def _delete_submission_record(project_id: str, submission_id: str, locale: str) -> None:
     ensure_data_dirs()
     projects = load_projects()
@@ -11540,6 +11710,7 @@ def get_latest_submission_scoring_basis(
     tags=["施组提交"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
+@atomic_json_transaction("projects", "qingtian_results")
 def ingest_qingtian_result(
     submission_id: str,
     payload: QingTianResultCreate,
@@ -11602,6 +11773,7 @@ def get_latest_qingtian_result(submission_id: str) -> QingTianResultRecord:
     tags=["洞察与学习"],
     responses={**RESPONSES_401, **RESPONSES_422},
 )
+@atomic_json_transaction("calibration_models", "calibration_samples", "projects")
 def train_calibrator(
     payload: CalibratorTrainRequest,
     api_key: Optional[str] = Depends(verify_api_key),
@@ -11810,6 +11982,7 @@ def list_calibration_models() -> list[CalibratorModelRecord]:
     tags=["洞察与学习"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
+@atomic_json_transaction("calibration_models", "projects")
 def deploy_calibrator(
     payload: CalibratorDeployRequest,
     api_key: Optional[str] = Depends(verify_api_key),
@@ -11859,6 +12032,7 @@ def deploy_calibrator(
     tags=["洞察与学习"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
+@atomic_json_transaction("projects", "score_reports", "submissions")
 def apply_calibration_prediction(
     project_id: str,
     api_key: Optional[str] = Depends(verify_api_key),
@@ -11926,6 +12100,7 @@ def apply_calibration_prediction(
     tags=["洞察与学习"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
+@atomic_json_transaction("delta_cases")
 def rebuild_delta_cases(
     project_id: str,
     api_key: Optional[str] = Depends(verify_api_key),
@@ -11981,6 +12156,7 @@ def list_delta_cases(
     tags=["洞察与学习"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
+@atomic_json_transaction("calibration_samples")
 def rebuild_calibration_samples(
     project_id: str,
     api_key: Optional[str] = Depends(verify_api_key),
@@ -12039,6 +12215,7 @@ def list_calibration_samples(
     tags=["洞察与学习"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
+@atomic_json_transaction("patch_packages")
 def mine_patch(
     project_id: str,
     payload: PatchMineRequest,
@@ -12103,6 +12280,7 @@ def list_patches(
     tags=["洞察与学习"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
+@atomic_json_transaction("patch_packages")
 def shadow_eval_patch(
     patch_id: str,
     api_key: Optional[str] = Depends(verify_api_key),
@@ -12130,6 +12308,7 @@ def shadow_eval_patch(
     tags=["洞察与学习"],
     responses={**RESPONSES_401, **RESPONSES_404, **RESPONSES_422},
 )
+@atomic_json_transaction("patch_deployments", "patch_packages")
 def deploy_or_rollback_patch(
     patch_id: str,
     payload: PatchDeployRequest,
@@ -12180,6 +12359,17 @@ def deploy_or_rollback_patch(
     response_model=ReflectionAutoRunResponse,
     tags=["洞察与学习"],
     responses={**RESPONSES_401, **RESPONSES_404},
+)
+@atomic_json_transaction(
+    "calibration_models",
+    "calibration_samples",
+    "delta_cases",
+    "patch_deployments",
+    "patch_packages",
+    "projects",
+    "qingtian_results",
+    "score_reports",
+    "submissions",
 )
 def auto_run_reflection_pipeline(
     project_id: str,
@@ -12915,6 +13105,7 @@ def project_insights(
     tags=["洞察与学习"],
     responses={**RESPONSES_401, **RESPONSES_NO_SUBMISSIONS},
 )
+@atomic_json_transaction("learning_profiles")
 def update_learning_profile(
     project_id: str,
     api_key: Optional[str] = Depends(verify_api_key),
@@ -13051,6 +13242,7 @@ def get_project_trend(
     tags=["自我学习与进化"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
+@atomic_json_transaction("project_context")
 def set_project_context(
     project_id: str,
     payload: ProjectContextIn,
@@ -13273,6 +13465,24 @@ def _new_ground_truth_record(
     tags=["自我学习与进化"],
     responses={**RESPONSES_401, **RESPONSES_404, **RESPONSES_422},
 )
+@atomic_json_transaction(
+    "calibration_models",
+    "calibration_samples",
+    "delta_cases",
+    "evidence_units",
+    "evolution_reports",
+    "expert_profiles",
+    "ground_truth",
+    "high_score_features",
+    "patch_deployments",
+    "patch_packages",
+    "project_anchors",
+    "project_requirements",
+    "projects",
+    "qingtian_results",
+    "score_reports",
+    "submissions",
+)
 def add_ground_truth(
     project_id: str,
     payload: GroundTruthCreate,
@@ -13295,7 +13505,6 @@ def add_ground_truth(
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
     score_scale_max = _resolve_project_score_scale_max(project)
     _assert_valid_final_score(payload.final_score, score_scale_max=score_scale_max)
-    records = load_ground_truth()
     record = _new_ground_truth_record(
         project_id=project_id,
         shigong_text=payload.shigong_text,
@@ -13306,8 +13515,7 @@ def add_ground_truth(
         judge_weights=payload.judge_weights,
         qualitative_tags_by_judge=payload.qualitative_tags_by_judge,
     )
-    records.append(record)
-    save_ground_truth(records)
+    append_ground_truth_records([record])
     _sync_ground_truth_record_to_qingtian(project_id, record)
     record["feedback_closed_loop"] = _run_feedback_closed_loop_safe(
         project_id,
@@ -13322,6 +13530,24 @@ def add_ground_truth(
     response_model=GroundTruthRecord,
     tags=["自我学习与进化"],
     responses={**RESPONSES_401, **RESPONSES_404, **RESPONSES_422},
+)
+@atomic_json_transaction(
+    "calibration_models",
+    "calibration_samples",
+    "delta_cases",
+    "evidence_units",
+    "evolution_reports",
+    "expert_profiles",
+    "ground_truth",
+    "high_score_features",
+    "patch_deployments",
+    "patch_packages",
+    "project_anchors",
+    "project_requirements",
+    "projects",
+    "qingtian_results",
+    "score_reports",
+    "submissions",
 )
 def add_ground_truth_from_submission(
     project_id: str,
@@ -13414,7 +13640,6 @@ async def add_ground_truth_from_file(
         raise HTTPException(status_code=422, detail=str(e))
     if len(shigong_text.strip()) < 50:
         raise HTTPException(status_code=422, detail="施组全文过短，至少 50 字以便学习分析。")
-    records = load_ground_truth()
     record = _new_ground_truth_record(
         project_id=project_id,
         shigong_text=shigong_text,
@@ -13425,8 +13650,7 @@ async def add_ground_truth_from_file(
         judge_weights=None,
         qualitative_tags_by_judge=None,
     )
-    records.append(record)
-    save_ground_truth(records)
+    append_ground_truth_records([record])
     _sync_ground_truth_record_to_qingtian(project_id, record)
     record["feedback_closed_loop"] = _run_feedback_closed_loop_safe(
         project_id,
@@ -13502,9 +13726,7 @@ async def add_ground_truth_from_files(
             )
 
     if success_records:
-        records = load_ground_truth()
-        records.extend(success_records)
-        save_ground_truth(records)
+        append_ground_truth_records(success_records)
         for item in items:
             record = item.get("record")
             if item.get("ok") and isinstance(record, dict):
@@ -13556,6 +13778,15 @@ def list_ground_truth(
     status_code=204,
     tags=["自我学习与进化"],
     responses={**RESPONSES_401, **RESPONSES_404},
+)
+@atomic_json_transaction(
+    "calibration_samples",
+    "delta_cases",
+    "evidence_units",
+    "ground_truth",
+    "qingtian_results",
+    "score_reports",
+    "submissions",
 )
 def delete_ground_truth(
     project_id: str,
@@ -13626,6 +13857,7 @@ def delete_ground_truth(
     tags=["自我学习与进化"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
+@atomic_json_transaction("evolution_reports")
 def evolve_project(
     project_id: str,
     api_key: Optional[str] = Depends(verify_api_key),

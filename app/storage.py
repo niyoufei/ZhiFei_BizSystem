@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import contextlib
+import functools
+import inspect
 import json
 import os
 import tempfile
 import threading
+from contextlib import ExitStack
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, Iterator, List, TypeVar
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR_ENV_VAR = "QINGTIAN_DATA_DIR"
@@ -44,6 +47,31 @@ HIGH_SCORE_FEATURES_PATH = DATA_DIR / "high_score_features.json"
 
 _PATH_LOCKS: Dict[str, threading.RLock] = {}
 _PATH_LOCKS_GUARD = threading.Lock()
+_HELD_PATHS = threading.local()
+_STORE_PATH_ATTRIBUTES = {
+    "projects": "PROJECTS_PATH",
+    "submissions": "SUBMISSIONS_PATH",
+    "materials": "MATERIALS_PATH",
+    "learning_profiles": "LEARNING_PATH",
+    "score_history": "HISTORY_PATH",
+    "project_context": "PROJECT_CONTEXT_PATH",
+    "ground_truth": "GROUND_TRUTH_PATH",
+    "evolution_reports": "EVOLUTION_REPORTS_PATH",
+    "expert_profiles": "EXPERT_PROFILES_PATH",
+    "score_reports": "SCORE_REPORTS_PATH",
+    "project_anchors": "PROJECT_ANCHORS_PATH",
+    "project_requirements": "PROJECT_REQUIREMENTS_PATH",
+    "evidence_units": "EVIDENCE_UNITS_PATH",
+    "qingtian_results": "QINGTIAN_RESULTS_PATH",
+    "calibration_models": "CALIBRATION_MODELS_PATH",
+    "delta_cases": "DELTA_CASES_PATH",
+    "calibration_samples": "CALIBRATION_SAMPLES_PATH",
+    "patch_packages": "PATCH_PACKAGES_PATH",
+    "patch_deployments": "PATCH_DEPLOYMENTS_PATH",
+    "high_score_features": "HIGH_SCORE_FEATURES_PATH",
+}
+
+T = TypeVar("T")
 
 
 def ensure_data_dirs() -> None:
@@ -51,8 +79,12 @@ def ensure_data_dirs() -> None:
     MATERIALS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _normalize_path(path: Path) -> Path:
+    return Path(path).expanduser().resolve()
+
+
 def _get_path_lock(path: Path) -> threading.RLock:
-    key = str(path.resolve())
+    key = str(_normalize_path(path))
     with _PATH_LOCKS_GUARD:
         lock = _PATH_LOCKS.get(key)
         if lock is None:
@@ -66,24 +98,79 @@ def _exclusive_file_lock(path: Path):
     lock_file = path.with_suffix(path.suffix + ".lock")
     lock_file.parent.mkdir(parents=True, exist_ok=True)
     fp = lock_file.open("a+", encoding="utf-8")
-    try:
-        if os.name == "posix":
-            try:
-                import fcntl
+    if os.name != "posix":
+        fp.close()
+        raise RuntimeError("cross-process storage locking requires POSIX flock")
 
-                fcntl.flock(fp.fileno(), fcntl.LOCK_EX)
-            except Exception:
-                pass
+    import fcntl
+
+    locked = False
+    try:
+        fcntl.flock(fp.fileno(), fcntl.LOCK_EX)
+        locked = True
         yield
     finally:
-        if os.name == "posix":
-            try:
-                import fcntl
-
+        try:
+            if locked:
                 fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
-            except Exception:
-                pass
-        fp.close()
+        finally:
+            fp.close()
+
+
+def _held_path_keys() -> set[str]:
+    held = getattr(_HELD_PATHS, "keys", None)
+    if held is None:
+        held = set()
+        _HELD_PATHS.keys = held
+    return held
+
+
+@contextlib.contextmanager
+def path_transaction(*paths: Path) -> Iterator[None]:
+    normalized = sorted({_normalize_path(path) for path in paths}, key=str)
+    held = _held_path_keys()
+    new_paths = [path for path in normalized if str(path) not in held]
+    if held and new_paths and str(new_paths[0]) < max(held):
+        raise RuntimeError("nested storage transaction violates canonical lock order")
+
+    previous = set(held)
+    with ExitStack() as stack:
+        for path in new_paths:
+            stack.enter_context(_get_path_lock(path))
+        for path in new_paths:
+            stack.enter_context(_exclusive_file_lock(path))
+        held.update(str(path) for path in new_paths)
+        try:
+            yield
+        finally:
+            held.clear()
+            held.update(previous)
+
+
+def _store_paths(store_names: tuple[str, ...]) -> tuple[Path, ...]:
+    try:
+        return tuple(Path(globals()[_STORE_PATH_ATTRIBUTES[name]]) for name in store_names)
+    except KeyError as exc:
+        raise ValueError(f"unknown JSON store: {exc.args[0]}") from exc
+
+
+def atomic_json_transaction(*store_names: str):
+    unknown = set(store_names).difference(_STORE_PATH_ATTRIBUTES)
+    if unknown:
+        raise ValueError(f"unknown JSON stores: {sorted(unknown)}")
+
+    def decorate(func):
+        if inspect.iscoroutinefunction(func):
+            raise TypeError("atomic_json_transaction only supports synchronous functions")
+
+        @functools.wraps(func)
+        def wrapped(*args, **kwargs):
+            with path_transaction(*_store_paths(store_names)):
+                return func(*args, **kwargs)
+
+        return wrapped
+
+    return decorate
 
 
 def _fsync_parent_dir(path: Path) -> None:
@@ -103,8 +190,10 @@ def _fsync_parent_dir(path: Path) -> None:
                 pass
 
 
-def _atomic_write_text(path: Path, payload: str) -> None:
+def atomic_write_text(path: Path, payload: str) -> None:
+    path = _normalize_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    fd: int | None
     fd, temp_path = tempfile.mkstemp(
         prefix=f".{path.name}.",
         suffix=".tmp",
@@ -113,34 +202,52 @@ def _atomic_write_text(path: Path, payload: str) -> None:
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = None
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, path)
         _fsync_parent_dir(path)
     finally:
-        if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
+        if fd is not None:
+            os.close(fd)
+        Path(temp_path).unlink(missing_ok=True)
 
 
-def load_json(path: Path, default: Any) -> Any:
+def _load_json_unlocked(path: Path, default: T) -> T:
     if not path.exists():
         return default
-    lock = _get_path_lock(path)
-    with lock:
-        with _exclusive_file_lock(path):
-            return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_json(path: Path, default: T) -> T:
+    normalized = _normalize_path(path)
+    held = _held_path_keys()
+    if held and str(normalized) not in held:
+        # JSON writers always publish with os.replace, so an undeclared read-only
+        # dependency can safely observe either complete snapshot without acquiring
+        # a path out of canonical order. Any later write still has to acquire or
+        # predeclare the path and remains protected by path_transaction.
+        return _load_json_unlocked(normalized, default)
+    with path_transaction(normalized):
+        return _load_json_unlocked(normalized, default)
 
 
 def save_json(path: Path, data: Any) -> None:
-    lock = _get_path_lock(path)
-    payload = json.dumps(data, ensure_ascii=False, indent=2)
-    with lock:
-        with _exclusive_file_lock(path):
-            _atomic_write_text(path, payload)
+    normalized = _normalize_path(path)
+    with path_transaction(normalized):
+        payload = json.dumps(data, ensure_ascii=False, indent=2)
+        atomic_write_text(normalized, payload)
+
+
+def update_json(path: Path, default: T, update: Callable[[T], T]) -> T:
+    normalized = _normalize_path(path)
+    with path_transaction(normalized):
+        current = _load_json_unlocked(normalized, default)
+        updated = update(current)
+        payload = json.dumps(updated, ensure_ascii=False, indent=2)
+        atomic_write_text(normalized, payload)
+        return updated
 
 
 def load_projects() -> List[Dict[str, Any]]:
@@ -185,9 +292,12 @@ def save_score_history(data: List[Dict[str, Any]]) -> None:
 
 def append_score_history(entry: Dict[str, Any]) -> None:
     """追加单条评分历史记录"""
-    history = load_score_history()
-    history.append(entry)
-    save_score_history(history)
+
+    def append(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        history.append(entry)
+        return history
+
+    update_json(HISTORY_PATH, [], append)
 
 
 def get_project_score_history(project_id: str) -> List[Dict[str, Any]]:
@@ -213,6 +323,13 @@ def load_ground_truth() -> List[Dict[str, Any]]:
 
 def save_ground_truth(data: List[Dict[str, Any]]) -> None:
     save_json(GROUND_TRUTH_PATH, data)
+
+
+@atomic_json_transaction("ground_truth")
+def append_ground_truth_records(entries: List[Dict[str, Any]]) -> None:
+    records = load_ground_truth()
+    records.extend(entries)
+    save_ground_truth(records)
 
 
 def load_evolution_reports() -> Dict[str, Any]:
