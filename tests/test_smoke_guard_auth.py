@@ -76,9 +76,10 @@ def test_blank_dedicated_key_falls_back_to_first_nonempty_api_key() -> None:
 
 
 def test_blank_smoke_key_inputs_are_missing() -> None:
-    assert smoke_guard.resolve_smoke_api_key(
-        {"QINGTIAN_SMOKE_API_KEY": " ", "API_KEYS": " ,  , "}
-    ) is None
+    assert (
+        smoke_guard.resolve_smoke_api_key({"QINGTIAN_SMOKE_API_KEY": " ", "API_KEYS": " ,  , "})
+        is None
+    )
 
 
 def test_public_probe_does_not_send_api_key(monkeypatch: pytest.MonkeyPatch) -> None:

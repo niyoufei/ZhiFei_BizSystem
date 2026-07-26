@@ -265,8 +265,7 @@ def probe_headers(path: str, api_key: str | None) -> dict[str, str]:
 def require_smoke_api_key(paths: Sequence[str], api_key: str | None) -> None:
     if not api_key and any(is_protected_probe_path(path) for path in paths):
         raise SmokeGuardError(
-            "SMOKE_AUTH_KEY_MISSING: "
-            f"Protected probes require {SMOKE_API_KEY_ENV}."
+            "SMOKE_AUTH_KEY_MISSING: " f"Protected probes require {SMOKE_API_KEY_ENV}."
         )
 
 
@@ -731,9 +730,7 @@ def probe_url(
     latency_ms = (time.monotonic() - started) * 1000
     decoded = _decode_body(body, content_type) if expected_text else ""
     text_matches = tuple(text in decoded for text in expected_text)
-    protected_auth_failure = bool(
-        is_protected_probe_path(path) and status_code in {401, 503}
-    )
+    protected_auth_failure = bool(is_protected_probe_path(path) and status_code in {401, 503})
     if protected_auth_failure and status_code == 401:
         error = "SMOKE_AUTH_KEY_INVALID"
     elif protected_auth_failure:
@@ -1041,9 +1038,7 @@ def render_url_report(
     passed = all(result.ok for result in results)
     failures = [result for result in results if not result.ok]
     public_only = bool(paths) and all(is_public_probe_path(path) for path in paths)
-    protected_probes_executed = any(
-        is_protected_probe_path(result.path) for result in results
-    )
+    protected_probes_executed = any(is_protected_probe_path(result.path) for result in results)
     lines = [
         f"# smoke_guard {title} report",
         "",
@@ -1124,12 +1119,8 @@ def render_scenario_report(
     )
     if error:
         passed = False
-    public_only = bool(plan.paths) and all(
-        is_public_probe_path(path) for path in plan.paths
-    )
-    protected_probes_executed = any(
-        is_protected_probe_path(result.path) for result in results
-    )
+    public_only = bool(plan.paths) and all(is_public_probe_path(path) for path in plan.paths)
+    protected_probes_executed = any(is_protected_probe_path(result.path) for result in results)
     lines = [
         "# smoke_guard scenario report",
         "",
