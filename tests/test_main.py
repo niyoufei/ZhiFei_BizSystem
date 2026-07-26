@@ -92,6 +92,9 @@ def test_health_ready_self_check_runtime_boundaries_are_visible():
     assert 'prefix="selfcheck_"' in main_text
     assert 'suffix=".tmp"' in main_text
     assert "NamedTemporaryFile" in main_text
+    assert "TemporaryDirectory" in main_text
+    assert "tempfile.gettempdir()" in runtime_boundary_snippets["_run_system_self_check"]
+    assert 'dir="data"' not in runtime_boundary_snippets["_run_system_self_check"]
     assert "ollama serve" not in runtime_boundary_text
 
     assert "/health" in boundary_doc
@@ -4976,17 +4979,65 @@ class TestSystemSelfCheckCapabilities:
         mock_rate_limit_status,
         mock_dwg_bins,
         mock_data_hygiene,
+        tmp_path,
     ):
+        from app.cache import CACHE_PATH
         from app.main import _run_system_self_check
+        from app.storage import DATA_DIR
 
         mock_load_config.return_value = MagicMock(rubric={}, lexicon={})
-        payload = _run_system_self_check(None)
+        runtime_temp_root = tmp_path / "runtime"
+        runtime_temp_root.mkdir()
+        probe_paths = []
+        real_named_temporary_file = tempfile.NamedTemporaryFile
+
+        def tracked_named_temporary_file(*args, **kwargs):
+            handle = real_named_temporary_file(*args, **kwargs)
+            probe_paths.append(Path(handle.name).resolve())
+            return handle
+
+        with (
+            patch("app.main.tempfile.gettempdir", return_value=str(runtime_temp_root)),
+            patch(
+                "app.main.tempfile.NamedTemporaryFile",
+                side_effect=tracked_named_temporary_file,
+            ),
+        ):
+            payload = _run_system_self_check(None)
+
         names = {str(item.get("name")) for item in payload.get("items", [])}
         assert "parser_pdf" in names
         assert "parser_docx" in names
         assert "parser_ocr" in names
         assert "parser_dwg_converter" in names
         assert "data_hygiene" in names
+        assert len(probe_paths) == 1
+        protected_roots = {
+            Path(__file__).resolve().parents[1],
+            DATA_DIR.resolve(),
+            CACHE_PATH.parent.resolve(),
+        }
+        for probe_path in probe_paths:
+            assert runtime_temp_root.resolve() in probe_path.parents
+            assert all(
+                probe_path != root and root not in probe_path.parents for root in protected_roots
+            )
+            assert not probe_path.exists()
+        assert list(runtime_temp_root.iterdir()) == []
+
+        for unsafe_root in protected_roots:
+            with (
+                patch("app.main.tempfile.gettempdir", return_value=str(unsafe_root)),
+                patch("app.main.tempfile.NamedTemporaryFile") as mock_named_temporary_file,
+            ):
+                unsafe_payload = _run_system_self_check(None)
+            writable_item = next(
+                item
+                for item in unsafe_payload.get("items", [])
+                if item.get("name") == "data_dirs_writable"
+            )
+            assert writable_item.get("ok") is False
+            mock_named_temporary_file.assert_not_called()
 
     @patch(
         "app.main._build_data_hygiene_report",
@@ -5007,6 +5058,7 @@ class TestSystemSelfCheckCapabilities:
         mock_rate_limit_status,
         mock_dwg_bins,
         mock_data_hygiene,
+        tmp_path,
     ):
         from app.main import _run_system_self_check
 
@@ -5018,6 +5070,35 @@ class TestSystemSelfCheckCapabilities:
         assert dwg_item.get("ok") is False
         pdf_item = next((x for x in items if x.get("name") == "parser_pdf"), {})
         assert pdf_item.get("ok") is True
+
+        failure_runtime_root = tmp_path / "failure-runtime"
+        failure_runtime_root.mkdir()
+        failure_probe_paths = []
+
+        def failing_named_temporary_file(*args, **kwargs):
+            probe_path = Path(kwargs["dir"]) / "selfcheck_forced_failure.tmp"
+            probe_path.write_text("probe", encoding="utf-8")
+            failure_probe_paths.append(probe_path.resolve())
+            raise OSError("forced self-check probe failure")
+
+        with (
+            patch("app.main.tempfile.gettempdir", return_value=str(failure_runtime_root)),
+            patch(
+                "app.main.tempfile.NamedTemporaryFile",
+                side_effect=failing_named_temporary_file,
+            ),
+        ):
+            failure_payload = _run_system_self_check(None)
+
+        writable_item = next(
+            item
+            for item in failure_payload.get("items", [])
+            if item.get("name") == "data_dirs_writable"
+        )
+        assert writable_item.get("ok") is False
+        assert len(failure_probe_paths) == 1
+        assert not failure_probe_paths[0].exists()
+        assert list(failure_runtime_root.iterdir()) == []
 
 
 class TestDataHygieneEndpoints:

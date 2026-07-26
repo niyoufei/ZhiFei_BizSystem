@@ -73,6 +73,7 @@ import app.engine.local_llm_preview_mock as local_llm_preview_mock
 import app.engine.zdoc_zbid_preview_receiver as zdoc_zbid_preview_receiver
 from app.auth import get_auth_status, verify_api_key
 from app.cache import (
+    CACHE_PATH,
     cache_score_result,
     clear_score_cache,
     get_cache_stats,
@@ -230,6 +231,7 @@ from app.schemas import (
     WritingGuidance,
 )
 from app.storage import (
+    DATA_DIR,
     MATERIALS_DIR,
     ensure_data_dirs,
     load_calibration_models,
@@ -6196,10 +6198,27 @@ def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
     # data dirs + writable test
     try:
         ensure_data_dirs()
-        with tempfile.NamedTemporaryFile(
-            prefix="selfcheck_", suffix=".tmp", dir="data", delete=True
-        ) as _:
-            pass
+        protected_roots = (
+            Path(__file__).resolve().parents[1],
+            DATA_DIR.expanduser().resolve(),
+            CACHE_PATH.parent.expanduser().resolve(),
+        )
+        runtime_temp_root = Path(tempfile.gettempdir()).expanduser().resolve()
+        if any(
+            runtime_temp_root == root or root in runtime_temp_root.parents
+            for root in protected_roots
+        ):
+            raise RuntimeError("unsafe runtime temporary root for system self-check")
+        with tempfile.TemporaryDirectory(
+            prefix="qingtian_selfcheck_", dir=str(runtime_temp_root)
+        ) as temp_dir:
+            probe_root = Path(temp_dir).resolve()
+            if any(probe_root == root or root in probe_root.parents for root in protected_roots):
+                raise RuntimeError("unsafe temporary probe directory for system self-check")
+            with tempfile.NamedTemporaryFile(
+                prefix="selfcheck_", suffix=".tmp", dir=str(probe_root), delete=True
+            ) as _:
+                pass
         add("data_dirs_writable", True, "data directory writable")
     except Exception as e:
         add("data_dirs_writable", False, str(e))
