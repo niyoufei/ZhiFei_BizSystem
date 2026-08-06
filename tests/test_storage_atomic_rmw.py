@@ -6,6 +6,7 @@ import importlib
 import json
 import multiprocessing
 import os
+import stat
 import threading
 from io import BytesIO
 from pathlib import Path
@@ -260,6 +261,133 @@ def test_atomic_flush_failure_preserves_original_and_cleans_temp(
         storage.save_json(path, {"valid": False})
 
     assert path.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob(".state.json.*.tmp")) == []
+
+
+def test_atomic_save_preserves_existing_file_mode(tmp_path: Path) -> None:
+    from app import storage
+
+    path = tmp_path / "state.json"
+    path.write_text('{"version": "old"}', encoding="utf-8")
+    path.chmod(0o644)
+
+    storage.save_json(path, {"version": "new"})
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {"version": "new"}
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+    assert list(tmp_path.glob(".state.json.*.tmp")) == []
+
+
+def test_parent_directory_fsync_failure_propagates_after_replace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from app import storage
+
+    path = tmp_path / "state.json"
+    path.write_text('{"version": "old"}', encoding="utf-8")
+    path.chmod(0o644)
+    original_close = storage.os.close
+    original_fsync = storage.os.fsync
+    original_replace = storage.os.replace
+    directory_close_attempts = 0
+    file_fsyncs = 0
+    directory_fsyncs = 0
+    replaced = False
+    directory_fd: int | None = None
+
+    def record_replace(source: str, destination: Path) -> None:
+        nonlocal replaced
+        original_replace(source, destination)
+        replaced = True
+
+    def fail_directory_fsync(fd: int) -> None:
+        nonlocal directory_fd, directory_fsyncs, file_fsyncs
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            directory_fd = fd
+            directory_fsyncs += 1
+            assert replaced
+            raise OSError("controlled parent directory fsync failure")
+        file_fsyncs += 1
+        original_fsync(fd)
+
+    def fail_after_closing_directory(fd: int) -> None:
+        nonlocal directory_close_attempts
+        original_close(fd)
+        if fd == directory_fd:
+            directory_close_attempts += 1
+            raise OSError("controlled parent directory close failure")
+
+    monkeypatch.setattr(storage.os, "close", fail_after_closing_directory)
+    monkeypatch.setattr(storage.os, "replace", record_replace)
+    monkeypatch.setattr(storage.os, "fsync", fail_directory_fsync)
+
+    with pytest.raises(
+        OSError,
+        match="controlled parent directory fsync failure",
+    ) as exc_info:
+        storage.save_json(path, {"version": "new"})
+
+    assert file_fsyncs == 1
+    assert directory_fsyncs == 1
+    assert directory_close_attempts == 1
+    assert replaced
+    assert directory_fd is not None
+    assert exc_info.value.__notes__ == [
+        (
+            "closing parent directory descriptor also failed: "
+            "controlled parent directory close failure"
+        )
+    ]
+    with pytest.raises(OSError):
+        os.fstat(directory_fd)
+    assert json.loads(path.read_text(encoding="utf-8")) == {"version": "new"}
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+    assert list(tmp_path.glob(".state.json.*.tmp")) == []
+
+
+def test_parent_directory_open_failure_propagates_after_replace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from app import storage
+
+    path = tmp_path / "state.json"
+    path.write_text('{"version": "old"}', encoding="utf-8")
+    path.chmod(0o644)
+    original_open = storage.os.open
+    original_replace = storage.os.replace
+    replaced = False
+
+    def record_replace(source: str, destination: Path) -> None:
+        nonlocal replaced
+        original_replace(source, destination)
+        replaced = True
+
+    def fail_directory_open(
+        target: str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if Path(target) == tmp_path:
+            assert replaced
+            raise OSError("controlled parent directory open failure")
+        return original_open(target, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(storage.os, "replace", record_replace)
+    monkeypatch.setattr(storage.os, "open", fail_directory_open)
+
+    with pytest.raises(
+        OSError,
+        match="controlled parent directory open failure",
+    ):
+        storage.save_json(path, {"version": "new"})
+
+    assert replaced
+    assert json.loads(path.read_text(encoding="utf-8")) == {"version": "new"}
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
     assert list(tmp_path.glob(".state.json.*.tmp")) == []
 
 

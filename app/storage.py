@@ -5,6 +5,7 @@ import functools
 import inspect
 import json
 import os
+import stat
 import tempfile
 import threading
 from contextlib import ExitStack
@@ -168,6 +169,7 @@ def atomic_json_transaction(*store_names: str):
             with path_transaction(*_store_paths(store_names)):
                 return func(*args, **kwargs)
 
+        wrapped.__signature__ = inspect.signature(func, eval_str=True)
         return wrapped
 
     return decorate
@@ -176,23 +178,28 @@ def atomic_json_transaction(*store_names: str):
 def _fsync_parent_dir(path: Path) -> None:
     if os.name != "posix":
         return
-    dir_fd: int | None = None
+    dir_fd = os.open(str(path.parent), os.O_RDONLY)
     try:
-        dir_fd = os.open(str(path.parent), os.O_RDONLY)
         os.fsync(dir_fd)
-    except Exception:
-        return
-    finally:
-        if dir_fd is not None:
-            try:
-                os.close(dir_fd)
-            except Exception:
-                pass
+    except BaseException as fsync_error:
+        try:
+            os.close(dir_fd)
+        except BaseException as close_error:
+            fsync_error.add_note(
+                f"closing parent directory descriptor also failed: {close_error}"
+            )
+        raise
+    else:
+        os.close(dir_fd)
 
 
 def atomic_write_text(path: Path, payload: str) -> None:
     path = _normalize_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        existing_mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        existing_mode = None
     fd: int | None
     fd, temp_path = tempfile.mkstemp(
         prefix=f".{path.name}.",
@@ -205,6 +212,8 @@ def atomic_write_text(path: Path, payload: str) -> None:
             fd = None
             handle.write(payload)
             handle.flush()
+            if existing_mode is not None:
+                os.fchmod(handle.fileno(), existing_mode)
             os.fsync(handle.fileno())
         os.replace(temp_path, path)
         _fsync_parent_dir(path)
