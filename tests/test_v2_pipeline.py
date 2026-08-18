@@ -927,7 +927,7 @@ class TestGroundTruthAutoSync:
         mock_sync.assert_called_once()
 
     @patch("app.main._sync_ground_truth_record_to_qingtian")
-    @patch("app.main.save_ground_truth")
+    @patch("app.main.append_ground_truth_records")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
@@ -964,7 +964,7 @@ class TestGroundTruthAutoSync:
         mock_save_records.assert_called_once()
 
     @patch("app.main._sync_ground_truth_record_to_qingtian")
-    @patch("app.main.save_ground_truth")
+    @patch("app.main.append_ground_truth_records")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
@@ -1001,7 +1001,7 @@ class TestGroundTruthAutoSync:
         mock_save_records.assert_called_once()
 
     @patch("app.main._sync_ground_truth_record_to_qingtian")
-    @patch("app.main.save_ground_truth")
+    @patch("app.main.append_ground_truth_records")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
