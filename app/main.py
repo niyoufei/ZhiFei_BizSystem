@@ -8141,12 +8141,51 @@ def _find_recent_duplicate_submission(
     return None
 
 
+@atomic_json_transaction("materials")
+def _commit_uploaded_material_record(
+    project_id: str,
+    normalized_material_type: str,
+    normalized_name: str,
+    target: Path,
+) -> dict:
+    materials = load_materials()
+    existing_ids = [
+        str(m.get("id"))
+        for m in materials
+        if m.get("project_id") == project_id
+        and _normalize_material_type(m.get("material_type"), filename=m.get("filename"))
+        == normalized_material_type
+        and _normalize_uploaded_filename(m.get("filename", "")) == normalized_name
+        and m.get("id")
+    ]
+    materials = [
+        m
+        for m in materials
+        if not (
+            m.get("project_id") == project_id
+            and _normalize_material_type(m.get("material_type"), filename=m.get("filename"))
+            == normalized_material_type
+            and _normalize_uploaded_filename(m.get("filename", "")) == normalized_name
+        )
+    ]
+    record = {
+        "id": existing_ids[0] if existing_ids else str(uuid4()),
+        "project_id": project_id,
+        "material_type": normalized_material_type,
+        "filename": normalized_name,
+        "path": str(target),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    materials.append(record)
+    save_materials(materials)
+    return record
+
+
 @router.post(
     "/projects/{project_id}/materials",
     tags=["项目管理"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
-@atomic_json_transaction("materials", "project_anchors", "project_requirements")
 def upload_material(
     project_id: str,
     file: UploadFile = File(...),
@@ -8193,36 +8232,12 @@ def upload_material(
     content = file.file.read()
     target.write_bytes(content)
 
-    materials = load_materials()
-    existing_ids = [
-        str(m.get("id"))
-        for m in materials
-        if m.get("project_id") == project_id
-        and _normalize_material_type(m.get("material_type"), filename=m.get("filename"))
-        == normalized_material_type
-        and _normalize_uploaded_filename(m.get("filename", "")) == normalized_name
-        and m.get("id")
-    ]
-    materials = [
-        m
-        for m in materials
-        if not (
-            m.get("project_id") == project_id
-            and _normalize_material_type(m.get("material_type"), filename=m.get("filename"))
-            == normalized_material_type
-            and _normalize_uploaded_filename(m.get("filename", "")) == normalized_name
-        )
-    ]
-    record = {
-        "id": existing_ids[0] if existing_ids else str(uuid4()),
-        "project_id": project_id,
-        "material_type": normalized_material_type,
-        "filename": normalized_name,
-        "path": str(target),
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    materials.append(record)
-    save_materials(materials)
+    record = _commit_uploaded_material_record(
+        project_id,
+        normalized_material_type,
+        normalized_name,
+        target,
+    )
     _invalidate_material_index_cache(project_id)
     # 材料更新后立即重建锚点/要求，避免后续评分继续使用旧约束。
     constraint_sync: Dict[str, object] = {"rebuilt": False}
