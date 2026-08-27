@@ -76,6 +76,7 @@ import app.material_read_service as material_read_service
 import app.project_context_service as project_context_service
 import app.qingtian_result_service as qingtian_result_service
 import app.scoring_basis_service as scoring_basis_service
+import app.submission_scoring_service as submission_scoring_service
 from app.auth import get_auth_status, verify_api_key
 from app.cache import (
     CACHE_PATH,
@@ -4243,38 +4244,22 @@ def _resolve_submission_score_fields(
 
 
 def _report_is_blocked(report: Optional[Dict[str, object]]) -> bool:
-    if not isinstance(report, dict):
-        return False
-    status = str(report.get("scoring_status") or "").strip().lower()
-    if status == "blocked":
-        return True
-    meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
-    return bool(meta.get("score_blocked_by_material_utilization"))
+    return submission_scoring_service.report_is_blocked(report)
 
 
 def _submission_is_scored(submission: Dict[str, object]) -> bool:
-    report_obj = submission.get("report")
-    if isinstance(report_obj, dict):
-        if _report_is_blocked(report_obj):
-            return False
-        status = str(report_obj.get("scoring_status") or "").strip().lower()
-        if status == "pending":
-            return False
-        if status == "scored":
-            return True
-        if _to_float_or_none(report_obj.get("rule_total_score")) is not None:
-            return True
-        if _to_float_or_none(report_obj.get("pred_total_score")) is not None:
-            return True
-        if _to_float_or_none(report_obj.get("total_score")) is not None:
-            return True
-    return _to_float_or_none(submission.get("total_score")) is not None
+    return submission_scoring_service.submission_is_scored(
+        submission,
+        to_float_or_none=_to_float_or_none,
+    )
 
 
 def _mark_report_scored(report: Dict[str, object], *, trigger: str) -> None:
-    report["scoring_status"] = "scored"
-    report["scoring_trigger"] = trigger
-    report["scored_at"] = _now_iso()
+    submission_scoring_service.mark_report_scored(
+        report,
+        trigger=trigger,
+        now_iso=_now_iso,
+    )
 
 
 def _build_pending_submission_report(
@@ -4282,32 +4267,13 @@ def _build_pending_submission_report(
     project: Dict[str, object],
     scoring_engine_version: str,
 ) -> Dict[str, object]:
-    return {
-        "scoring_status": "pending",
-        "scoring_trigger": "upload_only",
-        "queued_at": _now_iso(),
-        "total_score": None,
-        "rule_total_score": None,
-        "pred_total_score": None,
-        "llm_total_score": None,
-        "pred_confidence": None,
-        "score_blend": None,
-        "dimension_scores": {},
-        "rule_dim_scores": {},
-        "pred_dim_scores": None,
-        "penalties": [],
-        "lint_findings": [],
-        "suggestions": [],
-        "requirement_hits": [],
-        "mandatory_req_hit_rate": None,
-        "evidence_units_count": 0,
-        "meta": {
-            "engine_version": _determine_engine_version(project, scoring_engine_version),
-            "region": project.get("region", DEFAULT_REGION),
-            "scoring_engine_version": scoring_engine_version,
-            "queued_for_scoring": True,
-        },
-    }
+    return submission_scoring_service.build_pending_submission_report(
+        project=project,
+        scoring_engine_version=scoring_engine_version,
+        default_region=DEFAULT_REGION,
+        determine_engine_version=_determine_engine_version,
+        now_iso=_now_iso,
+    )
 
 
 def _score_submission_for_project(
@@ -4358,68 +4324,13 @@ def _score_submission_for_project(
             project=project,
             submission_text=text,
         )
-        effective_requirements = list(requirements) + list(runtime_custom_requirements)
         meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
         strict_pre_flight = bool(meta.get("enforce_gb_redline", DEFAULT_ENFORCE_GB_REDLINE))
-        try:
-            v2_result = score_text_v2(
-                submission_id=submission_id,
-                text=text,
-                lexicon=config.lexicon,
-                weights_norm=weights_norm,
-                anchors=anchors,
-                requirements=effective_requirements,
-                strict_pre_flight=strict_pre_flight,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
-        report = _build_v2_report_payload(
-            v2_result,
-            text=text,
-            project=project,
-            profile_snapshot=profile_snapshot,
-            scoring_engine_version=scoring_engine_version,
-        )
         snapshot_for_meta = (
             dict(material_quality_snapshot)
             if isinstance(material_quality_snapshot, dict)
             else _build_material_quality_snapshot(project_id)
         )
-        report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
-        report_meta["input_injection"] = _build_scoring_input_injection_meta(
-            project_id=project_id,
-            text=text,
-            anchors_count=len(anchors),
-            base_requirements_count=len(requirements),
-            runtime_custom_requirements_count=len(runtime_custom_requirements),
-            weights_norm=weights_norm,
-            profile_snapshot=profile_snapshot,
-            constraints_rebuilt=constraints_rebuilt,
-            runtime_req_meta=runtime_req_meta,
-            material_quality_snapshot=snapshot_for_meta,
-        )
-        report_meta["material_quality"] = snapshot_for_meta
-        report_meta["material_retrieval"] = {
-            "chunks": int(
-                _to_float_or_none(runtime_req_meta.get("material_retrieval_chunks")) or 0
-            ),
-            "requirements": int(
-                _to_float_or_none(runtime_req_meta.get("material_retrieval_requirements")) or 0
-            ),
-            "preview": runtime_req_meta.get("material_retrieval_preview") or [],
-            "consistency_requirements": int(
-                _to_float_or_none(runtime_req_meta.get("material_consistency_requirements")) or 0
-            ),
-            "consistency_preview": runtime_req_meta.get("material_consistency_preview") or [],
-            "available_types": runtime_req_meta.get("material_available_types") or [],
-            "retrieval_types": runtime_req_meta.get("material_retrieval_types") or [],
-            "missing_types": runtime_req_meta.get("material_retrieval_missing_types") or [],
-        }
-        report_meta["material_utilization"] = _build_material_utilization_summary(
-            report,
-            runtime_req_meta,
-        )
-        gate_obj = snapshot_for_meta.get("gate")
         material_gate_cfg = _resolve_material_gate_config(project)
         material_required_types = (
             material_gate_cfg.get("required_types")
@@ -4427,80 +4338,60 @@ def _score_submission_for_project(
             else []
         )
         material_utilization_policy = _resolve_material_utilization_policy(project)
-        utilization_gate = _evaluate_material_utilization_gate(
-            report_meta.get("material_utilization")
-            if isinstance(report_meta.get("material_utilization"), dict)
-            else {},
-            policy=material_utilization_policy,
-            required_types=material_required_types,
-        )
-        if isinstance(gate_obj, dict):
-            report_meta["material_gate"] = gate_obj
-        report_meta["material_utilization_gate"] = utilization_gate
-        report_meta["material_utilization_alerts"] = _build_material_utilization_alerts(
-            report_meta.get("material_utilization")
-            if isinstance(report_meta.get("material_utilization"), dict)
-            else {},
-            gate_obj if isinstance(gate_obj, dict) else {},
-        )
-        report_meta["evidence_trace"] = _build_evidence_trace_summary(report)
-        if bool(utilization_gate.get("blocked")):
-            report_meta["score_confidence_level"] = "low"
-            report_meta["score_blocked_by_material_utilization"] = True
-            alerts = (
-                report_meta.get("material_utilization_alerts")
-                if isinstance(report_meta.get("material_utilization_alerts"), list)
-                else []
+        try:
+            report, evidence_units = submission_scoring_service.score_prepared_v2_submission(
+                submission_id=submission_id,
+                text=text,
+                project_id=project_id,
+                project=project,
+                config=config,
+                weights_norm=weights_norm,
+                profile_snapshot=profile_snapshot,
+                scoring_engine_version=scoring_engine_version,
+                anchors=anchors,
+                requirements=requirements,
+                runtime_custom_requirements=runtime_custom_requirements,
+                runtime_req_meta=runtime_req_meta,
+                constraints_rebuilt=constraints_rebuilt,
+                material_quality_snapshot=snapshot_for_meta,
+                material_required_types=material_required_types,
+                material_utilization_policy=material_utilization_policy,
+                strict_pre_flight=strict_pre_flight,
+                score_text_v2=score_text_v2,
+                build_v2_report_payload=_build_v2_report_payload,
+                build_scoring_input_injection_meta=_build_scoring_input_injection_meta,
+                build_material_utilization_summary=_build_material_utilization_summary,
+                evaluate_material_utilization_gate=_evaluate_material_utilization_gate,
+                build_material_utilization_alerts=_build_material_utilization_alerts,
+                build_evidence_trace_summary=_build_evidence_trace_summary,
+                to_float_or_none=_to_float_or_none,
+                now_iso=_now_iso,
             )
-            for reason in utilization_gate.get("reasons") or []:
-                reason_text = str(reason).strip()
-                if reason_text and reason_text not in alerts:
-                    alerts.append("资料利用门禁：" + reason_text)
-            report_meta["material_utilization_alerts"] = alerts[:8]
-            report["scoring_status"] = "blocked"
-            report["scoring_trigger"] = "material_utilization_gate"
-            report["scored_at"] = _now_iso()
-        elif bool(utilization_gate.get("warned")):
-            report_meta["score_confidence_level"] = "medium"
-        else:
-            report_meta["score_confidence_level"] = "high"
-        report["meta"] = report_meta
+        except submission_scoring_service.PreparedScoringInputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         _apply_deployed_patch_to_report(project_id, report)
         if _report_is_blocked(report):
-            return report, list(v2_result.get("evidence_units") or [])
+            return report, evidence_units
         submission_like = {"id": submission_id, "project_id": project_id, "text": text}
         _apply_prediction_to_report(report, submission_like=submission_like, project=project)
         _mark_report_scored(report, trigger="score_engine")
-        return report, list(v2_result.get("evidence_units") or [])
+        return report, evidence_units
 
-    legacy = score_text(
-        text,
-        config.rubric,
-        config.lexicon,
-        dimension_multipliers=multipliers,
-    ).model_dump()
-    legacy.setdefault("rule_total_score", float(legacy.get("total_score", 0.0)))
-    legacy.setdefault(
-        "rule_dim_scores", _rule_dim_scores_from_legacy(legacy.get("dimension_scores", {}))
+    legacy, evidence_units = submission_scoring_service.score_prepared_legacy_submission(
+        text=text,
+        project=project,
+        config=config,
+        multipliers=multipliers,
+        profile_snapshot=profile_snapshot,
+        scoring_engine_version=scoring_engine_version,
+        default_region=DEFAULT_REGION,
+        score_text_legacy=score_text,
+        rule_dim_scores_from_legacy=_rule_dim_scores_from_legacy,
+        build_evidence_trace_summary=_build_evidence_trace_summary,
     )
-    legacy.setdefault("pred_dim_scores", None)
-    legacy.setdefault("pred_total_score", None)
-    legacy.setdefault("pred_confidence", None)
-    legacy.setdefault("lint_findings", [])
-    legacy.setdefault("requirement_hits", [])
-    legacy.setdefault("mandatory_req_hit_rate", None)
-    legacy.setdefault("evidence_units_count", 0)
-    legacy.setdefault("meta", {})
-    legacy["meta"]["engine_version"] = "v1"
-    legacy["meta"]["region"] = project.get("region", DEFAULT_REGION)
-    legacy["meta"]["scoring_engine_version"] = scoring_engine_version
-    if profile_snapshot:
-        legacy["meta"]["expert_profile_snapshot"] = profile_snapshot
-        legacy["meta"]["expert_profile_id"] = profile_snapshot.get("id")
-    legacy["meta"]["evidence_trace"] = _build_evidence_trace_summary(legacy)
     _apply_deployed_patch_to_report(project_id, legacy)
     _mark_report_scored(legacy, trigger="score_engine")
-    return legacy, []
+    return legacy, evidence_units
 
 
 def _replace_submission_evidence_units(
