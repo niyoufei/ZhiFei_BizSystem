@@ -74,6 +74,7 @@ import app.evidence_trace_service as evidence_trace_service
 import app.latest_report_service as latest_report_service
 import app.material_read_service as material_read_service
 import app.project_context_service as project_context_service
+import app.qingtian_result_service as qingtian_result_service
 import app.scoring_basis_service as scoring_basis_service
 from app.auth import get_auth_status, verify_api_key
 from app.cache import (
@@ -11053,21 +11054,18 @@ def ingest_qingtian_result(
     projects = load_projects()
     project = _find_project(project_id, projects)
 
-    model_version = str(
-        payload.qingtian_model_version
-        or project.get("qingtian_model_version")
-        or DEFAULT_QINGTIAN_MODEL_VERSION
+    record = qingtian_result_service.build_qingtian_result_record(
+        submission_id=submission_id,
+        qingtian_model_version=payload.qingtian_model_version,
+        project_model_version=project.get("qingtian_model_version"),
+        default_model_version=DEFAULT_QINGTIAN_MODEL_VERSION,
+        qt_total_score=payload.qt_total_score,
+        qt_dim_scores=payload.qt_dim_scores,
+        qt_reasons=payload.qt_reasons,
+        raw_payload=payload.raw_payload,
+        record_id=str(uuid4()),
+        created_at=_now_iso(),
     )
-    record = {
-        "id": str(uuid4()),
-        "submission_id": submission_id,
-        "qingtian_model_version": model_version,
-        "qt_total_score": float(payload.qt_total_score),
-        "qt_dim_scores": payload.qt_dim_scores,
-        "qt_reasons": payload.qt_reasons,
-        "raw_payload": payload.raw_payload,
-        "created_at": _now_iso(),
-    }
     results = load_qingtian_results()
     results.append(record)
     save_qingtian_results(results)
@@ -11089,10 +11087,12 @@ def ingest_qingtian_result(
 def get_latest_qingtian_result(submission_id: str) -> QingTianResultRecord:
     """获取某个提交最新的青天真实评标结果。"""
     ensure_data_dirs()
-    results = [r for r in load_qingtian_results() if str(r.get("submission_id")) == submission_id]
-    if not results:
+    latest = qingtian_result_service.select_latest_qingtian_result(
+        load_qingtian_results(),
+        submission_id=submission_id,
+    )
+    if latest is None:
         raise HTTPException(status_code=404, detail="暂无青天评标结果")
-    latest = sorted(results, key=lambda x: str(x.get("created_at", "")), reverse=True)[0]
     return QingTianResultRecord(**latest)
 
 
