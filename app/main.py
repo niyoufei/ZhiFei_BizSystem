@@ -6830,7 +6830,15 @@ def rescore_project_submissions(
         for key, value in project.items()
         if project_before.get(key) != value
     }
-    committed_ids: set[str] = set()
+
+    def find_latest_project_for_rescore_commit(
+        latest_project_id: str,
+        latest_projects: List[Dict[str, object]],
+    ) -> Dict[str, object]:
+        try:
+            return _find_project(latest_project_id, latest_projects)
+        except HTTPException:
+            raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
 
     @atomic_json_transaction(
         "evidence_units",
@@ -6839,51 +6847,28 @@ def rescore_project_submissions(
         "score_reports",
         "submissions",
     )
-    def commit() -> None:
-        latest_projects = load_projects()
-        try:
-            latest_project = _find_project(project_id, latest_projects)
-        except HTTPException:
-            raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-        latest_project.update(copy.deepcopy(project_patch))
+    def commit() -> set[str]:
+        return rescore_service.commit_rescore_batch(
+            project_id=project_id,
+            project_patch=project_patch,
+            profile_created=created,
+            profile=profile,
+            computed_updates=computed_updates,
+            load_projects=load_projects,
+            find_latest_project=find_latest_project_for_rescore_commit,
+            load_expert_profiles=load_expert_profiles,
+            save_expert_profiles=save_expert_profiles,
+            load_submissions=load_submissions,
+            save_submissions=save_submissions,
+            load_score_reports=load_score_reports,
+            save_score_reports=save_score_reports,
+            load_evidence_units=load_evidence_units,
+            save_evidence_units=save_evidence_units,
+            save_projects=save_projects,
+            replace_submission_evidence_units=_replace_submission_evidence_units,
+        )
 
-        if created:
-            latest_profiles = load_expert_profiles()
-            if not any(str(item.get("id")) == str(profile.get("id")) for item in latest_profiles):
-                latest_profiles.append(copy.deepcopy(profile))
-            save_expert_profiles(latest_profiles)
-
-        latest_submissions = load_submissions()
-        submissions_by_id = {
-            str(item.get("id")): item
-            for item in latest_submissions
-            if isinstance(item, dict) and str(item.get("id"))
-        }
-        latest_reports = load_score_reports()
-        latest_evidence_units = load_evidence_units()
-        for item in computed_updates:
-            submission_id = str(item["submission_id"])
-            latest_submission = submissions_by_id.get(submission_id)
-            if latest_submission is None:
-                continue
-            latest_submission["report"] = copy.deepcopy(item["report"])
-            latest_submission["total_score"] = item["total_score"]
-            latest_submission["updated_at"] = item["updated_at"]
-            latest_submission["expert_profile_id_used"] = item["expert_profile_id_used"]
-            latest_reports.append(copy.deepcopy(item["snapshot"]))
-            latest_evidence_units = _replace_submission_evidence_units(
-                latest_evidence_units,
-                submission_id=submission_id,
-                new_units=copy.deepcopy(item["evidence_units"]),
-            )
-            committed_ids.add(submission_id)
-
-        save_submissions(latest_submissions)
-        save_score_reports(latest_reports)
-        save_evidence_units(latest_evidence_units)
-        save_projects(latest_projects)
-
-    commit()
+    committed_ids = commit()
     generated = len(committed_ids)
     for item in computed_updates:
         if str(item["submission_id"]) not in committed_ids:

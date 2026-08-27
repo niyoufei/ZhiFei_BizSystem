@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from typing import Callable, Dict, List, Optional
 
 
@@ -415,6 +416,69 @@ def prepare_rescore_batch(
         "failed_gate_filenames": failed_gate_filenames,
         "material_utilization_by_submission": material_utilization_by_submission,
     }
+
+
+def commit_rescore_batch(
+    *,
+    project_id: str,
+    project_patch: Dict[str, object],
+    profile_created: bool,
+    profile: Dict[str, object],
+    computed_updates: List[Dict[str, object]],
+    load_projects: Callable[[], List[Dict[str, object]]],
+    find_latest_project: Callable[[str, List[Dict[str, object]]], Dict[str, object]],
+    load_expert_profiles: Callable[[], List[Dict[str, object]]],
+    save_expert_profiles: Callable[[List[Dict[str, object]]], None],
+    load_submissions: Callable[[], List[Dict[str, object]]],
+    save_submissions: Callable[[List[Dict[str, object]]], None],
+    load_score_reports: Callable[[], List[Dict[str, object]]],
+    save_score_reports: Callable[[List[Dict[str, object]]], None],
+    load_evidence_units: Callable[[], List[Dict[str, object]]],
+    save_evidence_units: Callable[[List[Dict[str, object]]], None],
+    save_projects: Callable[[List[Dict[str, object]]], None],
+    replace_submission_evidence_units: Callable[..., List[Dict[str, object]]],
+) -> set[str]:
+    committed_ids: set[str] = set()
+    latest_projects = load_projects()
+    latest_project = find_latest_project(project_id, latest_projects)
+    latest_project.update(copy.deepcopy(project_patch))
+
+    if profile_created:
+        latest_profiles = load_expert_profiles()
+        if not any(str(item.get("id")) == str(profile.get("id")) for item in latest_profiles):
+            latest_profiles.append(copy.deepcopy(profile))
+        save_expert_profiles(latest_profiles)
+
+    latest_submissions = load_submissions()
+    submissions_by_id = {
+        str(item.get("id")): item
+        for item in latest_submissions
+        if isinstance(item, dict) and str(item.get("id"))
+    }
+    latest_reports = load_score_reports()
+    latest_evidence_units = load_evidence_units()
+    for item in computed_updates:
+        submission_id = str(item["submission_id"])
+        latest_submission = submissions_by_id.get(submission_id)
+        if latest_submission is None:
+            continue
+        latest_submission["report"] = copy.deepcopy(item["report"])
+        latest_submission["total_score"] = item["total_score"]
+        latest_submission["updated_at"] = item["updated_at"]
+        latest_submission["expert_profile_id_used"] = item["expert_profile_id_used"]
+        latest_reports.append(copy.deepcopy(item["snapshot"]))
+        latest_evidence_units = replace_submission_evidence_units(
+            latest_evidence_units,
+            submission_id=submission_id,
+            new_units=copy.deepcopy(item["evidence_units"]),
+        )
+        committed_ids.add(submission_id)
+
+    save_submissions(latest_submissions)
+    save_score_reports(latest_reports)
+    save_evidence_units(latest_evidence_units)
+    save_projects(latest_projects)
+    return committed_ids
 
 
 def summarize_rescore_material_utilization(
