@@ -70,6 +70,7 @@ import app.document_parser as _document_parser
 import app.engine.local_llm_ollama_preview_adapter as local_llm_ollama_preview_adapter
 import app.engine.local_llm_preview_mock as local_llm_preview_mock
 import app.engine.zdoc_zbid_preview_receiver as zdoc_zbid_preview_receiver
+import app.project_context_service as project_context_service
 from app.auth import get_auth_status, verify_api_key
 from app.cache import (
     CACHE_PATH,
@@ -12756,7 +12757,6 @@ def get_project_trend(
     tags=["自我学习与进化"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
-@atomic_json_transaction("project_context")
 def set_project_context(
     project_id: str,
     payload: ProjectContextIn,
@@ -12768,22 +12768,14 @@ def set_project_context(
     用于自我学习时结合项目信息分析高分逻辑。
     """
     ensure_data_dirs()
-    projects = load_projects()
-    if not any(p["id"] == project_id for p in projects):
-        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    ctx = load_project_context()
-    ctx[project_id] = {
-        "text": payload.text,
-        "filename": payload.filename,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    save_project_context(ctx)
-    return ProjectContextOut(
+    context = project_context_service.set_project_context(
         project_id=project_id,
-        text=ctx[project_id]["text"],
-        filename=ctx[project_id].get("filename"),
-        updated_at=ctx[project_id].get("updated_at"),
+        text=payload.text,
+        filename=payload.filename,
     )
+    if context is None:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    return ProjectContextOut(**context)
 
 
 @router.get(
@@ -12798,19 +12790,10 @@ def get_project_context_endpoint(
 ) -> ProjectContextOut:
     """获取项目投喂包/项目背景文本。"""
     ensure_data_dirs()
-    projects = load_projects()
-    if not any(p["id"] == project_id for p in projects):
+    context = project_context_service.get_project_context(project_id=project_id)
+    if context is None:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    ctx = load_project_context()
-    data = ctx.get(project_id)
-    if not data:
-        return ProjectContextOut(project_id=project_id, text="", filename=None, updated_at=None)
-    return ProjectContextOut(
-        project_id=project_id,
-        text=data.get("text", ""),
-        filename=data.get("filename"),
-        updated_at=data.get("updated_at"),
-    )
+    return ProjectContextOut(**context)
 
 
 def _normalize_judge_scores_or_422(
