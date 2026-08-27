@@ -70,6 +70,7 @@ import app.document_parser as _document_parser
 import app.engine.local_llm_ollama_preview_adapter as local_llm_ollama_preview_adapter
 import app.engine.local_llm_preview_mock as local_llm_preview_mock
 import app.engine.zdoc_zbid_preview_receiver as zdoc_zbid_preview_receiver
+import app.latest_report_service as latest_report_service
 import app.project_context_service as project_context_service
 from app.auth import get_auth_status, verify_api_key
 from app.cache import (
@@ -10990,69 +10991,14 @@ def delete_shigong_file(
 def get_latest_submission_report(submission_id: str) -> LatestReportResponse:
     """获取某个提交的最新评分报告（含UI摘要）。"""
     ensure_data_dirs()
-    reports = [r for r in load_score_reports() if str(r.get("submission_id")) == submission_id]
-    reports.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
-
-    report_obj: Dict[str, object]
-    if reports:
-        latest = reports[0]
-        report_obj = {
-            "id": latest.get("id"),
-            "submission_id": latest.get("submission_id"),
-            "scoring_engine_version": latest.get("scoring_engine_version"),
-            "rule_total_score": latest.get("rule_total_score"),
-            "pred_total_score": latest.get("pred_total_score"),
-            "llm_total_score": latest.get("llm_total_score"),
-            "pred_confidence": latest.get("pred_confidence"),
-            "score_blend": latest.get("score_blend"),
-            "rule_dim_scores": latest.get("rule_dim_scores", {}),
-            "pred_dim_scores": latest.get("pred_dim_scores"),
-            "penalties": latest.get("penalties", []),
-            "lint_findings": latest.get("lint_findings", []),
-            "suggestions": latest.get("suggestions", []),
-            "expert_profile_snapshot": latest.get("expert_profile_snapshot", {}),
-            "created_at": latest.get("created_at"),
-        }
-    else:
-        submissions = load_submissions()
-        try:
-            submission = _find_submission(submission_id, submissions)
-        except HTTPException:
-            raise HTTPException(status_code=404, detail="评分报告不存在")
-        report_obj = dict(submission.get("report") or {})
-        if not report_obj:
-            raise HTTPException(status_code=404, detail="评分报告不存在")
-        report_obj.setdefault("submission_id", submission_id)
-        report_obj.setdefault("rule_total_score", report_obj.get("total_score", 0.0))
-        report_obj.setdefault("pred_total_score", report_obj.get("pred_total_score"))
-        report_obj.setdefault("llm_total_score", report_obj.get("llm_total_score"))
-        report_obj.setdefault("pred_confidence", report_obj.get("pred_confidence"))
-        report_obj.setdefault("score_blend", report_obj.get("score_blend"))
-        report_obj.setdefault("rule_dim_scores", report_obj.get("rule_dim_scores", {}))
-        report_obj.setdefault("penalties", report_obj.get("penalties", []))
-        report_obj.setdefault("lint_findings", report_obj.get("lint_findings", []))
-        report_obj.setdefault("suggestions", report_obj.get("suggestions", []))
-
-    penalties = report_obj.get("penalties") or []
-    lint_findings = report_obj.get("lint_findings") or []
-    suggestions = report_obj.get("suggestions") or []
-
-    top_conflicts = [p for p in penalties if str(p.get("code") or "") == "P-CONSIST-001"][:10]
-    top_missing_requirements = [
-        f for f in lint_findings if str(f.get("issue_code") or "") == "MissingRequirement"
-    ][:10]
-
-    ui_summary = {
-        "pred_total_score": report_obj.get("pred_total_score"),
-        "llm_total_score": report_obj.get("llm_total_score"),
-        "pred_confidence": report_obj.get("pred_confidence"),
-        "score_blend": report_obj.get("score_blend"),
-        "rule_total_score": report_obj.get("rule_total_score", report_obj.get("total_score")),
-        "top10_suggestions": suggestions[:10],
-        "top_conflicts": top_conflicts,
-        "top_missing_requirements": top_missing_requirements,
-    }
-    return LatestReportResponse(report=report_obj, ui_summary=ui_summary)
+    projection = latest_report_service.get_latest_report_projection(
+        submission_id=submission_id,
+        load_score_reports=load_score_reports,
+        load_submissions=load_submissions,
+    )
+    if projection is None:
+        raise HTTPException(status_code=404, detail="评分报告不存在")
+    return LatestReportResponse(**projection)
 
 
 @router.get(
