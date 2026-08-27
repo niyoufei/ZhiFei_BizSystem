@@ -73,6 +73,7 @@ import app.engine.zdoc_zbid_preview_receiver as zdoc_zbid_preview_receiver
 import app.latest_report_service as latest_report_service
 import app.material_read_service as material_read_service
 import app.project_context_service as project_context_service
+import app.scoring_basis_service as scoring_basis_service
 from app.auth import get_auth_status, verify_api_key
 from app.cache import (
     CACHE_PATH,
@@ -2439,76 +2440,14 @@ def _build_submission_scoring_basis_report(
     project_id: str,
     submission: Dict[str, object],
 ) -> Dict[str, object]:
-    """构建评分依据审计：展示评分时注入的输入与资料命中链路。"""
-    submission_id = str(submission.get("id") or "")
-    filename = str(submission.get("filename") or "")
-    report = submission.get("report") if isinstance(submission.get("report"), dict) else {}
-    meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
-    input_injection = (
-        meta.get("input_injection") if isinstance(meta.get("input_injection"), dict) else {}
+    return scoring_basis_service.build_scoring_basis_projection(
+        project_id=project_id,
+        submission=submission,
+        build_material_quality_snapshot=_build_material_quality_snapshot,
+        build_evidence_trace_summary=_build_evidence_trace_summary,
+        to_float_or_none=_to_float_or_none,
+        now_iso=_now_iso,
     )
-    material_quality = (
-        meta.get("material_quality") if isinstance(meta.get("material_quality"), dict) else {}
-    )
-    if not material_quality:
-        material_quality = _build_material_quality_snapshot(project_id)
-    material_retrieval = (
-        meta.get("material_retrieval") if isinstance(meta.get("material_retrieval"), dict) else {}
-    )
-    material_utilization = (
-        meta.get("material_utilization")
-        if isinstance(meta.get("material_utilization"), dict)
-        else {}
-    )
-    material_utilization_gate = (
-        meta.get("material_utilization_gate")
-        if isinstance(meta.get("material_utilization_gate"), dict)
-        else {}
-    )
-    evidence_trace = (
-        meta.get("evidence_trace") if isinstance(meta.get("evidence_trace"), dict) else {}
-    )
-    if not evidence_trace:
-        evidence_trace = _build_evidence_trace_summary(report)
-
-    recommendations: List[str] = []
-    mece_inputs = (
-        input_injection.get("mece_inputs")
-        if isinstance(input_injection.get("mece_inputs"), dict)
-        else {}
-    )
-    if mece_inputs and not bool(mece_inputs.get("materials_quality_gate_passed", True)):
-        recommendations.append("资料门禁未通过：建议先完成“3) 项目资料”整改后再评分。")
-    if material_utilization_gate:
-        for reason in material_utilization_gate.get("reasons") or []:
-            reason_text = str(reason).strip()
-            if reason_text:
-                recommendations.append(reason_text)
-    if (_to_float_or_none(evidence_trace.get("total_requirements")) or 0) > 0 and (
-        _to_float_or_none(evidence_trace.get("total_hits")) or 0
-    ) <= 0:
-        recommendations.append("评分未命中任何资料证据：请补充与清单/图纸/答疑一致的量化约束。")
-
-    deduped_recommendations: List[str] = []
-    for item in recommendations:
-        text = str(item or "").strip()
-        if text and text not in deduped_recommendations:
-            deduped_recommendations.append(text)
-
-    return {
-        "project_id": project_id,
-        "submission_id": submission_id,
-        "filename": filename,
-        "generated_at": _now_iso(),
-        "scoring_status": str(report.get("scoring_status") or "unknown"),
-        "mece_inputs": mece_inputs,
-        "material_quality": material_quality,
-        "material_retrieval": material_retrieval,
-        "material_utilization": material_utilization,
-        "material_utilization_gate": material_utilization_gate,
-        "evidence_trace": evidence_trace,
-        "recommendations": deduped_recommendations[:16],
-    }
 
 
 def _render_evidence_trace_markdown(payload: Dict[str, object]) -> str:
