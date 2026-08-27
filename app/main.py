@@ -9836,30 +9836,24 @@ def upload_shigong(
         "updated_at": now_utc.isoformat(),
         "expert_profile_id_used": profile_snapshot.get("id") if profile_snapshot else None,
     }
-    committed: Dict[str, Dict[str, object]] = {}
+    committed_record = submission_scoring_service.commit_submission_upload(
+        project_id=project_id,
+        normalized_filename=normalized_filename,
+        text=text,
+        now_utc=now_utc,
+        record=record,
+        atomic_json_transaction=atomic_json_transaction,
+        load_projects=load_projects,
+        load_submissions=load_submissions,
+        save_submissions=save_submissions,
+        find_recent_duplicate_submission=_find_recent_duplicate_submission,
+        project_not_found_error=lambda: HTTPException(
+            status_code=404,
+            detail=t("api.project_not_found", locale=locale),
+        ),
+    )
 
-    @atomic_json_transaction("projects", "submissions")
-    def commit() -> None:
-        if not any(str(p.get("id")) == project_id for p in load_projects()):
-            raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-        submissions = load_submissions()
-        duplicate = _find_recent_duplicate_submission(
-            submissions,
-            project_id=project_id,
-            filename=normalized_filename,
-            text=text,
-            now_utc=now_utc,
-        )
-        if duplicate is not None:
-            committed["record"] = duplicate
-            return
-        submissions.append(record)
-        committed["record"] = record
-        save_submissions(submissions)
-
-    commit()
-
-    return SubmissionRecord(**committed["record"])
+    return SubmissionRecord(**committed_record)
 
 
 @router.post(

@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from typing import Callable, Dict, List, Optional
 
+TransactionDecorator = Callable[
+    [Callable[[], Dict[str, object]]],
+    Callable[[], Dict[str, object]],
+]
+TransactionFactory = Callable[..., TransactionDecorator]
+
 
 class PreparedScoringInputError(Exception):
     pass
@@ -85,6 +91,41 @@ def build_pending_submission_report(
             "queued_for_scoring": True,
         },
     }
+
+
+def commit_submission_upload(
+    *,
+    project_id: str,
+    normalized_filename: str,
+    text: str,
+    now_utc: object,
+    record: Dict[str, object],
+    atomic_json_transaction: TransactionFactory,
+    load_projects: Callable[[], List[Dict[str, object]]],
+    load_submissions: Callable[[], List[Dict[str, object]]],
+    save_submissions: Callable[[List[Dict[str, object]]], None],
+    find_recent_duplicate_submission: Callable[..., Optional[Dict[str, object]]],
+    project_not_found_error: Callable[[], Exception],
+) -> Dict[str, object]:
+    @atomic_json_transaction("projects", "submissions")
+    def commit() -> Dict[str, object]:
+        if not any(str(project.get("id")) == project_id for project in load_projects()):
+            raise project_not_found_error()
+        submissions = load_submissions()
+        duplicate = find_recent_duplicate_submission(
+            submissions,
+            project_id=project_id,
+            filename=normalized_filename,
+            text=text,
+            now_utc=now_utc,
+        )
+        if duplicate is not None:
+            return duplicate
+        submissions.append(record)
+        save_submissions(submissions)
+        return record
+
+    return commit()
 
 
 def score_prepared_v2_submission(
