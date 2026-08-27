@@ -71,6 +71,7 @@ import app.engine.local_llm_ollama_preview_adapter as local_llm_ollama_preview_a
 import app.engine.local_llm_preview_mock as local_llm_preview_mock
 import app.engine.zdoc_zbid_preview_receiver as zdoc_zbid_preview_receiver
 import app.latest_report_service as latest_report_service
+import app.material_read_service as material_read_service
 import app.project_context_service as project_context_service
 from app.auth import get_auth_status, verify_api_key
 from app.cache import (
@@ -8295,19 +8296,15 @@ def upload_material(
 def list_materials(project_id: str, locale: str = Depends(get_locale)) -> list[MaterialRecord]:
     """获取指定项目下已上传的资料列表。"""
     ensure_data_dirs()
-    projects = load_projects()
-    if not any(p["id"] == project_id for p in projects):
+    projection = material_read_service.get_material_catalog_projection(
+        project_id=project_id,
+        load_projects=load_projects,
+        load_materials=load_materials,
+        normalize_material_type=_normalize_material_type,
+    )
+    if projection is None:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    materials = [m for m in load_materials() if m.get("project_id") == project_id]
-    materials.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
-    normalized_rows: List[dict] = []
-    for material in materials:
-        row = dict(material)
-        row["material_type"] = _normalize_material_type(
-            row.get("material_type"), filename=row.get("filename")
-        )
-        normalized_rows.append(row)
-    return [MaterialRecord(**m) for m in normalized_rows]
+    return [MaterialRecord(**material) for material in projection]
 
 
 @router.get(
