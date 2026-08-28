@@ -66,6 +66,7 @@ from fastapi.routing import APIRoute
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.routing import Match
 
+import app.anchor_requirement_service as anchor_requirement_service
 import app.document_parser as _document_parser
 import app.engine.local_llm_ollama_preview_adapter as local_llm_ollama_preview_adapter
 import app.engine.local_llm_preview_mock as local_llm_preview_mock
@@ -5009,35 +5010,23 @@ def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, 
 def _rebuild_project_anchors_and_requirements(
     project_id: str,
 ) -> tuple[List[Dict[str, object]], List[Dict[str, object]]]:
-    merged_text = _build_constraints_source_text(project_id)
-    project = next((p for p in load_projects() if str(p.get("id")) == project_id), {})
-    region = str(project.get("region") or DEFAULT_REGION)
-    scoring_engine_version = str(
-        project.get("scoring_engine_version_locked") or DEFAULT_SCORING_ENGINE_LOCKED
+    return anchor_requirement_service.rebuild_project_anchors_and_requirements(
+        project_id=project_id,
+        default_region=DEFAULT_REGION,
+        default_scoring_engine_locked=DEFAULT_SCORING_ENGINE_LOCKED,
+        build_constraints_source_text=_build_constraints_source_text,
+        load_projects=load_projects,
+        extract_project_anchors_from_text=extract_project_anchors_from_text,
+        build_project_requirements_from_anchors=build_project_requirements_from_anchors,
+        load_project_anchors=load_project_anchors,
+        save_project_anchors=save_project_anchors,
+        load_project_requirements=load_project_requirements,
+        save_project_requirements=save_project_requirements,
+        project_not_found_error=lambda: HTTPException(
+            status_code=404,
+            detail="项目不存在",
+        ),
     )
-    anchors = extract_project_anchors_from_text(project_id, merged_text)
-    requirements = build_project_requirements_from_anchors(
-        project_id,
-        anchors,
-        region=region,
-        scoring_engine_version=scoring_engine_version,
-    )
-
-    @atomic_json_transaction("project_anchors", "project_requirements", "projects")
-    def commit() -> None:
-        if not any(str(p.get("id")) == project_id for p in load_projects()):
-            raise HTTPException(status_code=404, detail="项目不存在")
-        all_anchors = [a for a in load_project_anchors() if str(a.get("project_id")) != project_id]
-        all_requirements = [
-            r for r in load_project_requirements() if str(r.get("project_id")) != project_id
-        ]
-        all_anchors.extend(anchors)
-        all_requirements.extend(requirements)
-        save_project_anchors(all_anchors)
-        save_project_requirements(all_requirements)
-
-    commit()
-    return anchors, requirements
 
 
 def _build_constraint_pack(project_id: str) -> Dict[str, object]:
