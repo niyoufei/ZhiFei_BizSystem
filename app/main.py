@@ -10131,55 +10131,34 @@ def list_submissions(
     "submissions",
 )
 def _delete_submission_record(project_id: str, submission_id: str, locale: str) -> None:
-    ensure_data_dirs()
-    projects = load_projects()
-    if not any(p["id"] == project_id for p in projects):
-        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    submissions = load_submissions()
-    found = next(
-        (
-            s
-            for s in submissions
-            if s.get("id") == submission_id and s.get("project_id") == project_id
+    submission_scoring_service.delete_submission_cascade(
+        project_id=project_id,
+        submission_id=submission_id,
+        locale=locale,
+        ensure_data_dirs=ensure_data_dirs,
+        load_projects=load_projects,
+        load_submissions=load_submissions,
+        save_submissions=save_submissions,
+        load_score_reports=load_score_reports,
+        save_score_reports=save_score_reports,
+        load_evidence_units=load_evidence_units,
+        save_evidence_units=save_evidence_units,
+        load_qingtian_results=load_qingtian_results,
+        save_qingtian_results=save_qingtian_results,
+        load_delta_cases=load_delta_cases,
+        save_delta_cases=save_delta_cases,
+        load_calibration_samples=load_calibration_samples,
+        save_calibration_samples=save_calibration_samples,
+        project_not_found_error=lambda: HTTPException(
+            status_code=404,
+            detail=t("api.project_not_found", locale=locale),
         ),
-        None,
+        submission_not_found_error=lambda: HTTPException(
+            status_code=404,
+            detail="施组提交记录不存在",
+        ),
+        run_feedback_closed_loop_safe=_run_feedback_closed_loop_safe,
     )
-    if not found:
-        raise HTTPException(status_code=404, detail="施组提交记录不存在")
-    raw_path = str(found.get("path") or "").strip()
-    if raw_path:
-        p = Path(raw_path)
-        if p.exists():
-            p.unlink()
-    submissions = [
-        s
-        for s in submissions
-        if not (s.get("id") == submission_id and s.get("project_id") == project_id)
-    ]
-    save_submissions(submissions)
-    snapshots = load_score_reports()
-    snapshots = [
-        r
-        for r in snapshots
-        if not (r.get("submission_id") == submission_id and r.get("project_id") == project_id)
-    ]
-    save_score_reports(snapshots)
-    evidence_units = load_evidence_units()
-    evidence_units = [u for u in evidence_units if str(u.get("submission_id")) != submission_id]
-    save_evidence_units(evidence_units)
-    qingtian_results = load_qingtian_results()
-    qingtian_results = [q for q in qingtian_results if str(q.get("submission_id")) != submission_id]
-    save_qingtian_results(qingtian_results)
-    delta_cases = load_delta_cases()
-    delta_cases = [d for d in delta_cases if str(d.get("submission_id")) != submission_id]
-    save_delta_cases(delta_cases)
-    calibration_samples = load_calibration_samples()
-    calibration_samples = [
-        s for s in calibration_samples if str(s.get("submission_id")) != submission_id
-    ]
-    save_calibration_samples(calibration_samples)
-    # 删除属于显式反馈信号：自动刷新样本并触发校准/调权重闭环。
-    _run_feedback_closed_loop_safe(project_id, locale=locale, trigger="delete_submission")
 
 
 @router.delete(

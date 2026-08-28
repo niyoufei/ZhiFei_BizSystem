@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 TransactionDecorator = Callable[
@@ -126,6 +127,93 @@ def commit_submission_upload(
         return record
 
     return commit()
+
+
+def delete_submission_cascade(
+    *,
+    project_id: str,
+    submission_id: str,
+    locale: str,
+    ensure_data_dirs: Callable[[], None],
+    load_projects: Callable[[], List[Dict[str, object]]],
+    load_submissions: Callable[[], List[Dict[str, object]]],
+    save_submissions: Callable[[List[Dict[str, object]]], None],
+    load_score_reports: Callable[[], List[Dict[str, object]]],
+    save_score_reports: Callable[[List[Dict[str, object]]], None],
+    load_evidence_units: Callable[[], List[Dict[str, object]]],
+    save_evidence_units: Callable[[List[Dict[str, object]]], None],
+    load_qingtian_results: Callable[[], List[Dict[str, object]]],
+    save_qingtian_results: Callable[[List[Dict[str, object]]], None],
+    load_delta_cases: Callable[[], List[Dict[str, object]]],
+    save_delta_cases: Callable[[List[Dict[str, object]]], None],
+    load_calibration_samples: Callable[[], List[Dict[str, object]]],
+    save_calibration_samples: Callable[[List[Dict[str, object]]], None],
+    project_not_found_error: Callable[[], Exception],
+    submission_not_found_error: Callable[[], Exception],
+    run_feedback_closed_loop_safe: Callable[..., Dict[str, object]],
+) -> None:
+    ensure_data_dirs()
+    projects = load_projects()
+    if not any(project["id"] == project_id for project in projects):
+        raise project_not_found_error()
+    submissions = load_submissions()
+    found = next(
+        (
+            submission
+            for submission in submissions
+            if submission.get("id") == submission_id and submission.get("project_id") == project_id
+        ),
+        None,
+    )
+    if not found:
+        raise submission_not_found_error()
+    raw_path = str(found.get("path") or "").strip()
+    if raw_path:
+        path = Path(raw_path)
+        if path.exists():
+            path.unlink()
+    submissions = [
+        submission
+        for submission in submissions
+        if not (
+            submission.get("id") == submission_id and submission.get("project_id") == project_id
+        )
+    ]
+    save_submissions(submissions)
+    snapshots = load_score_reports()
+    snapshots = [
+        report
+        for report in snapshots
+        if not (
+            report.get("submission_id") == submission_id and report.get("project_id") == project_id
+        )
+    ]
+    save_score_reports(snapshots)
+    evidence_units = load_evidence_units()
+    evidence_units = [
+        unit for unit in evidence_units if str(unit.get("submission_id")) != submission_id
+    ]
+    save_evidence_units(evidence_units)
+    qingtian_results = load_qingtian_results()
+    qingtian_results = [
+        result for result in qingtian_results if str(result.get("submission_id")) != submission_id
+    ]
+    save_qingtian_results(qingtian_results)
+    delta_cases = load_delta_cases()
+    delta_cases = [case for case in delta_cases if str(case.get("submission_id")) != submission_id]
+    save_delta_cases(delta_cases)
+    calibration_samples = load_calibration_samples()
+    calibration_samples = [
+        sample
+        for sample in calibration_samples
+        if str(sample.get("submission_id")) != submission_id
+    ]
+    save_calibration_samples(calibration_samples)
+    run_feedback_closed_loop_safe(
+        project_id,
+        locale=locale,
+        trigger="delete_submission",
+    )
 
 
 def score_prepared_v2_submission(
