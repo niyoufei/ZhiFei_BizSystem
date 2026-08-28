@@ -74,6 +74,7 @@ import app.evidence_trace_service as evidence_trace_service
 import app.ground_truth_sync_service as ground_truth_sync_service
 import app.latest_report_service as latest_report_service
 import app.material_read_service as material_read_service
+import app.material_upload_service as material_upload_service
 import app.project_context_service as project_context_service
 import app.project_delete_service as project_delete_service
 import app.qingtian_result_service as qingtian_result_service
@@ -7402,31 +7403,16 @@ def upload_material(
     projects = load_projects()
     if not any(p["id"] == project_id for p in projects):
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    project_dir = MATERIALS_DIR / project_id / normalized_material_type
-    project_dir.mkdir(parents=True, exist_ok=True)
-    target = project_dir / normalized_name
-    content = file.file.read()
-    target.write_bytes(content)
-
-    record = _commit_uploaded_material_record(
-        project_id,
-        normalized_material_type,
-        normalized_name,
-        target,
+    return material_upload_service.write_material_upload(
+        project_id=project_id,
+        normalized_material_type=normalized_material_type,
+        normalized_name=normalized_name,
+        materials_dir=MATERIALS_DIR,
+        read_content=file.file.read,
+        commit_uploaded_material_record=_commit_uploaded_material_record,
+        invalidate_material_index_cache=_invalidate_material_index_cache,
+        rebuild_project_anchors_and_requirements=_rebuild_project_anchors_and_requirements,
     )
-    _invalidate_material_index_cache(project_id)
-    # 材料更新后立即重建锚点/要求，避免后续评分继续使用旧约束。
-    constraint_sync: Dict[str, object] = {"rebuilt": False}
-    try:
-        anchors, requirements = _rebuild_project_anchors_and_requirements(project_id)
-        constraint_sync = {
-            "rebuilt": True,
-            "anchors": len(anchors),
-            "requirements": len(requirements),
-        }
-    except Exception as exc:
-        constraint_sync = {"rebuilt": False, "error": f"{type(exc).__name__}: {exc}"}
-    return {"status": "ok", "material": record, "constraint_sync": constraint_sync}
 
 
 @router.get(
