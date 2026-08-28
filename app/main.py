@@ -67,6 +67,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.routing import Match
 
 import app.anchor_requirement_service as anchor_requirement_service
+import app.calibration_model_service as calibration_model_service
 import app.document_parser as _document_parser
 import app.engine.local_llm_ollama_preview_adapter as local_llm_ollama_preview_adapter
 import app.engine.local_llm_preview_mock as local_llm_preview_mock
@@ -3448,31 +3449,10 @@ def _build_v2_report_payload(
 
 
 def _select_calibrator_model(project: Dict[str, object]) -> Optional[Dict[str, object]]:
-    models = sorted(
-        load_calibration_models(), key=lambda x: str(x.get("created_at", "")), reverse=True
+    return calibration_model_service.select_calibrator_model(
+        project,
+        load_calibration_models=load_calibration_models,
     )
-    if not models:
-        return None
-    project_id = str(project.get("id") or "")
-    locked_version = str(project.get("calibrator_version_locked") or "")
-
-    def _scope_project_id(model: Dict[str, object]) -> str:
-        return str(((model.get("train_filter") or {}).get("project_id") or "")).strip()
-
-    def _compatible(model: Dict[str, object]) -> bool:
-        # 仅允许同项目训练出的校准器生效，避免跨项目污染总分。
-        return _scope_project_id(model) == project_id
-
-    if locked_version:
-        for model in models:
-            if str(model.get("calibrator_version") or "") == locked_version:
-                return model if _compatible(model) else None
-        return None
-
-    for model in models:
-        if bool(model.get("deployed")) and _compatible(model):
-            return model
-    return None
 
 
 def _select_deployed_patch(project_id: str) -> Optional[Dict[str, object]]:
@@ -3888,78 +3868,17 @@ def _apply_prediction_to_report(
     submission_like: Dict[str, object],
     project: Dict[str, object],
 ) -> Optional[str]:
-    model = _select_calibrator_model(project)
-    if not model:
-        report["pred_total_score"] = None
-        report["llm_total_score"] = None
-        report["pred_confidence"] = None
-        report["pred_dim_scores"] = None
-        report["score_blend"] = None
-        # `total_score` is the primary score used by UI/sorting.
-        report["total_score"] = float(
-            report.get("rule_total_score", report.get("total_score", 0.0))
-        )
-        submission_like["total_score"] = float(report.get("total_score", 0.0))
-        return None
-    artifact = model.get("model_artifact") or model.get("artifact") or {}
-    if not isinstance(artifact, dict):
-        report["pred_total_score"] = None
-        report["llm_total_score"] = None
-        report["pred_confidence"] = None
-        report["pred_dim_scores"] = None
-        report["score_blend"] = None
-        report["total_score"] = float(
-            report.get("rule_total_score", report.get("total_score", 0.0))
-        )
-        submission_like["total_score"] = float(report.get("total_score", 0.0))
-        return None
-    row = build_feature_row(report, submission=submission_like)
-    try:
-        pred, conf = predict_with_model(artifact, row.get("x_features") or {})
-    except Exception as e:
-        # 预测模型不应影响主流程可用性；失败时保留 rule 分并显式记录错误。
-        report["pred_total_score"] = None
-        report["llm_total_score"] = None
-        report["pred_confidence"] = None
-        report["pred_dim_scores"] = None
-        report["score_blend"] = None
-        report["total_score"] = float(
-            report.get("rule_total_score", report.get("total_score", 0.0))
-        )
-        submission_like["total_score"] = float(report.get("total_score", 0.0))
-        report.setdefault("meta", {})
-        report["meta"]["calibrator_version"] = model.get("calibrator_version")
-        report["meta"]["calibrator_error"] = f"{type(e).__name__}: {e}"
-        return str(model.get("calibrator_version") or "")
-
-    rule_total = float(report.get("rule_total_score", report.get("total_score", 0.0)))
-    fused_total, llm_total, blend_info = _fuse_rule_and_llm_scores(
-        rule_total=rule_total,
-        llm_total_raw=float(pred),
+    return calibration_model_service.apply_prediction_to_report(
+        report,
+        submission_like=submission_like,
         project=project,
-        report=report,
+        load_calibration_models=load_calibration_models,
+        build_feature_row=build_feature_row,
+        predict_with_model=predict_with_model,
+        fuse_rule_and_llm_scores=_fuse_rule_and_llm_scores,
+        to_float_or_none=_to_float_or_none,
+        clip_score=_clip_score,
     )
-    sigma = float(_to_float_or_none(conf.get("sigma")) or 0.0)
-    ci95_delta = 1.96 * sigma if sigma > 0 else 0.0
-    ci95_lower = _clip_score(fused_total - ci95_delta)
-    ci95_upper = _clip_score(fused_total + ci95_delta)
-    report["pred_total_score"] = fused_total
-    report["llm_total_score"] = llm_total
-    report["pred_confidence"] = {
-        **conf,
-        "raw_llm_score": float(pred),
-        "bounded_llm_score": llm_total,
-        "fused_ci95_lower": round(ci95_lower, 2),
-        "fused_ci95_upper": round(ci95_upper, 2),
-        "fused_sigma": round(sigma, 2),
-    }
-    report["score_blend"] = blend_info
-    report["pred_dim_scores"] = None
-    report["total_score"] = float(fused_total)
-    submission_like["total_score"] = float(fused_total)
-    report.setdefault("meta", {})
-    report["meta"]["calibrator_version"] = model.get("calibrator_version")
-    return str(model.get("calibrator_version") or "")
 
 
 def _to_float_or_none(value: Any) -> Optional[float]:
@@ -4179,29 +4098,7 @@ def _latest_records_by_submission(records: List[Dict[str, object]]) -> Dict[str,
 
 
 def _extract_auto_candidates(model_artifact: Dict[str, Any]) -> List[Dict[str, Any]]:
-    best_selection = model_artifact.get("best_selection") or {}
-    raw_candidates = best_selection.get("candidates") or []
-    if not isinstance(raw_candidates, list):
-        return []
-    normalized: List[Dict[str, Any]] = []
-    for item in raw_candidates:
-        if not isinstance(item, dict):
-            continue
-        metrics = item.get("metrics") or {}
-        cv_item = item.get("cv") or {}
-        normalized.append(
-            {
-                "model_type": str(item.get("model_type") or ""),
-                "ok": bool(item.get("ok")),
-                "gate_passed": bool(item.get("gate_passed")),
-                "cv_mae": metrics.get("cv_mae"),
-                "cv_rmse": metrics.get("cv_rmse"),
-                "cv_spearman": metrics.get("cv_spearman"),
-                "cv_mode": cv_item.get("mode"),
-                "cv_pred_count": cv_item.get("pred_count"),
-            }
-        )
-    return normalized
+    return calibration_model_service.extract_auto_candidates(model_artifact)
 
 
 def _build_calibrator_summary(
@@ -4217,28 +4114,18 @@ def _build_calibrator_summary(
     sample_count: Optional[int] = None,
     skipped_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
-    gate_payload: Dict[str, Any] = {}
-    if gate_passed is not None:
-        gate_payload["passed"] = bool(gate_passed)
-    if improve_threshold is not None:
-        gate_payload["improve_threshold"] = round(float(improve_threshold), 4)
-    if spearman_tolerance is not None:
-        gate_payload["spearman_tolerance"] = float(spearman_tolerance)
-
-    summary: Dict[str, Any] = {
-        "calibrator_version": calibrator_version,
-        "model_type": model_type,
-        "gate_passed": gate_passed,
-        "cv_metrics": cv_metrics or {},
-        "baseline_metrics": baseline_metrics or {},
-        "gate": gate_payload,
-        "auto_candidates": auto_candidates or [],
-    }
-    if sample_count is not None:
-        summary["sample_count"] = int(sample_count)
-    if skipped_reason:
-        summary["skipped_reason"] = skipped_reason
-    return summary
+    return calibration_model_service.build_calibrator_summary(
+        model_type=model_type,
+        calibrator_version=calibrator_version,
+        gate_passed=gate_passed,
+        cv_metrics=cv_metrics,
+        baseline_metrics=baseline_metrics,
+        improve_threshold=improve_threshold,
+        spearman_tolerance=spearman_tolerance,
+        auto_candidates=auto_candidates,
+        sample_count=sample_count,
+        skipped_reason=skipped_reason,
+    )
 
 
 @atomic_json_transaction("calibration_samples", "delta_cases", "qingtian_results")
@@ -10219,185 +10106,37 @@ def train_calibrator(
 ) -> CalibratorModelRecord:
     """训练校准器（支持 auto / ridge / offset / linear1d / isotonic1d）。"""
     ensure_data_dirs()
-    model_type = str(payload.model_type or "ridge").lower().strip()
-    if model_type not in {"auto", "ridge", "offset", "linear1d", "isotonic1d"}:
-        raise HTTPException(
-            status_code=422, detail="model_type 仅支持 auto/ridge/offset/linear1d/isotonic1d"
-        )
-
-    # 优先使用已落库的 FEATURE_ROW 样本
-    stored_samples = load_calibration_samples()
-    if payload.project_id:
-        stored_samples = [
-            s for s in stored_samples if str(s.get("project_id")) == payload.project_id
-        ]
-
-    feature_rows: List[Dict[str, object]] = []
-    for sample in stored_samples:
-        feature_rows.append(
-            {
-                "feature_schema_version": sample.get("feature_schema_version", "v2"),
-                "x_features": sample.get("x_features") or {},
-                "y_label": sample.get("y_label"),
-                "submission_id": sample.get("submission_id"),
-            }
-        )
-
-    # 若样本不足，在线拼接一次并反写样本表
-    if len(feature_rows) < 3:
-        submissions = load_submissions()
-        if payload.project_id:
-            submissions = [s for s in submissions if str(s.get("project_id")) == payload.project_id]
-        submission_map = {str(s.get("id")): s for s in submissions}
-
-        reports = load_score_reports()
-        if payload.project_id:
-            reports = [r for r in reports if str(r.get("project_id")) == payload.project_id]
-        latest_reports = _latest_records_by_submission(reports)
-
-        qt_results = load_qingtian_results()
-        latest_qt = _latest_records_by_submission(qt_results)
-
-        rebuilt_samples = build_calibration_samples(
-            project_id=str(payload.project_id or "__all__"),
-            latest_reports_by_submission=latest_reports,
-            latest_qingtian_by_submission=latest_qt,
-            submissions_by_id=submission_map,
-        )
-        if rebuilt_samples:
-            saved = load_calibration_samples()
-            for row in rebuilt_samples:
-                sid = str(row.get("submission_id"))
-                saved = [x for x in saved if str(x.get("submission_id")) != sid]
-                saved.append(row)
-            save_calibration_samples(saved)
-            feature_rows = [
-                {
-                    "feature_schema_version": s.get("feature_schema_version", "v2"),
-                    "x_features": s.get("x_features") or {},
-                    "y_label": s.get("y_label"),
-                    "submission_id": s.get("submission_id"),
-                }
-                for s in rebuilt_samples
-            ]
-
     try:
-        if model_type == "auto":
-            model_artifact = train_best_calibrator_auto(feature_rows, alpha=float(payload.alpha))
-        elif model_type == "offset":
-            model_artifact = train_offset_calibrator(feature_rows)
-        elif model_type == "linear1d":
-            model_artifact = train_linear1d_calibrator(feature_rows, alpha=float(payload.alpha))
-        elif model_type == "isotonic1d":
-            model_artifact = train_isotonic1d_calibrator(feature_rows)
-        else:
-            model_artifact = train_ridge_calibrator(feature_rows, alpha=float(payload.alpha))
-    except ValueError as exc:
+        record = calibration_model_service.train_calibration_model(
+            project_id=payload.project_id,
+            model_type_raw=payload.model_type,
+            alpha=float(payload.alpha),
+            auto_deploy=bool(payload.auto_deploy),
+            load_calibration_samples=load_calibration_samples,
+            load_submissions=load_submissions,
+            load_score_reports=load_score_reports,
+            latest_records_by_submission=_latest_records_by_submission,
+            load_qingtian_results=load_qingtian_results,
+            build_calibration_samples=build_calibration_samples,
+            save_calibration_samples=save_calibration_samples,
+            train_best_calibrator_auto=train_best_calibrator_auto,
+            train_offset_calibrator=train_offset_calibrator,
+            train_linear1d_calibrator=train_linear1d_calibrator,
+            train_isotonic1d_calibrator=train_isotonic1d_calibrator,
+            train_ridge_calibrator=train_ridge_calibrator,
+            cross_validate_calibrator=cross_validate_calibrator,
+            calc_metrics=calc_metrics,
+            load_calibration_models=load_calibration_models,
+            load_projects=load_projects,
+            save_projects=save_projects,
+            save_calibration_models=save_calibration_models,
+            now_iso=_now_iso,
+        )
+    except (
+        calibration_model_service.UnsupportedCalibrationModelTypeError,
+        calibration_model_service.CalibrationTrainingError,
+    ) as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-
-    selected_type = str(model_artifact.get("model_type") or model_type or "ridge")
-    # 为审计保留 auto 来源
-    version_prefix = f"calib_{'auto_' if model_type == 'auto' else ''}{selected_type}"
-
-    # 统一用 CV 口径做上线闸门（避免 in-sample 过拟合）
-    cv = cross_validate_calibrator(
-        model_type=selected_type,
-        feature_rows=feature_rows,
-        alpha=float(payload.alpha),
-        seed=42,
-    )
-    # baseline: raw rule_total_score
-    y_true = [float(r.get("y_label")) for r in feature_rows if r.get("y_label") is not None]
-    baseline_pred = [
-        max(0.0, min(100.0, float(((r.get("x_features") or {}).get("rule_total_score") or 0.0))))
-        for r in feature_rows
-        if r.get("y_label") is not None
-    ]
-    baseline_metrics = calc_metrics(y_true, baseline_pred)
-    cv_metrics = (
-        (cv.get("metrics") or {})
-        if bool(cv.get("ok"))
-        else {"mae": 0.0, "rmse": 0.0, "spearman": 0.0}
-    )
-    improve_threshold = max(0.2, float(baseline_metrics.get("mae") or 0.0) * 0.01)
-    spearman_tolerance = 0.02
-    gate_passed = (
-        bool(cv.get("ok"))
-        and float(cv_metrics.get("mae") or 0.0)
-        <= float(baseline_metrics.get("mae") or 0.0) - improve_threshold
-        and float(cv_metrics.get("spearman") or 0.0)
-        >= float(baseline_metrics.get("spearman") or 0.0) - spearman_tolerance
-    )
-    model_artifact.setdefault("metrics", {})
-    model_artifact["metrics"]["cv_mae"] = cv_metrics.get("mae")
-    model_artifact["metrics"]["cv_rmse"] = cv_metrics.get("rmse")
-    model_artifact["metrics"]["cv_spearman"] = cv_metrics.get("spearman")
-    model_artifact["metrics"]["cv_mode"] = cv.get("mode")
-    model_artifact["metrics"]["cv_pred_count"] = cv.get("pred_count")
-    model_artifact["metrics"]["baseline_mae"] = baseline_metrics.get("mae")
-    model_artifact["metrics"]["baseline_rmse"] = baseline_metrics.get("rmse")
-    model_artifact["metrics"]["baseline_spearman"] = baseline_metrics.get("spearman")
-    model_artifact["metrics"]["gate_improve_threshold"] = round(improve_threshold, 4)
-    model_artifact["metrics"]["gate_spearman_tolerance"] = spearman_tolerance
-    model_artifact["gate_passed"] = gate_passed
-
-    auto_candidates = _extract_auto_candidates(model_artifact)
-    version = f"{version_prefix}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
-    calibrator_summary = _build_calibrator_summary(
-        model_type=selected_type,
-        calibrator_version=version,
-        gate_passed=bool(gate_passed),
-        cv_metrics={
-            "mae": cv_metrics.get("mae"),
-            "rmse": cv_metrics.get("rmse"),
-            "spearman": cv_metrics.get("spearman"),
-            "mode": cv.get("mode"),
-            "pred_count": cv.get("pred_count"),
-        },
-        baseline_metrics={
-            "mae": baseline_metrics.get("mae"),
-            "rmse": baseline_metrics.get("rmse"),
-            "spearman": baseline_metrics.get("spearman"),
-        },
-        improve_threshold=improve_threshold,
-        spearman_tolerance=spearman_tolerance,
-        auto_candidates=auto_candidates,
-        sample_count=len(feature_rows),
-    )
-    record = {
-        "calibrator_version": version,
-        "model_type": selected_type,
-        "feature_schema_version": str(model_artifact.get("feature_schema_version", "v2")),
-        "train_filter": {"project_id": payload.project_id},
-        "metrics": {
-            **(model_artifact.get("metrics") or {}),
-            "gate_passed": bool(gate_passed),
-        },
-        "calibrator_summary": calibrator_summary,
-        "artifact_uri": f"json://calibration_models/{version}",
-        "model_artifact": model_artifact,
-        "deployed": False,
-        "created_at": _now_iso(),
-    }
-
-    models = load_calibration_models()
-    train_scope_project_id = str(payload.project_id or "").strip()
-    if payload.auto_deploy and bool(gate_passed) and train_scope_project_id:
-        for m in models:
-            if (
-                str(((m.get("train_filter") or {}).get("project_id") or ""))
-                == train_scope_project_id
-            ):
-                m["deployed"] = False
-        record["deployed"] = True
-        projects = load_projects()
-        for p in projects:
-            if str(p.get("id")) == train_scope_project_id:
-                p["calibrator_version_locked"] = version
-                p["updated_at"] = _now_iso()
-        save_projects(projects)
-    models.append(record)
-    save_calibration_models(models)
     return CalibratorModelRecord(**record)
 
 
@@ -10428,40 +10167,20 @@ def deploy_calibrator(
 ) -> CalibratorModelRecord:
     """部署某个校准器版本。"""
     ensure_data_dirs()
-    models = load_calibration_models()
-    target = None
-    for model in models:
-        if str(model.get("calibrator_version")) == payload.calibrator_version:
-            target = model
-            break
-    if target is None:
-        raise HTTPException(status_code=404, detail="校准器版本不存在")
-
-    target_scope = str(((target.get("train_filter") or {}).get("project_id") or "")).strip()
-    bind_project_id = str(payload.project_id or "").strip()
-    if bind_project_id:
-        if target_scope and target_scope != bind_project_id:
-            raise HTTPException(status_code=422, detail="校准器与目标项目不匹配，禁止跨项目部署")
-        if not target_scope:
-            target.setdefault("train_filter", {})
-            target["train_filter"]["project_id"] = bind_project_id
-            target_scope = bind_project_id
-
-    for model in models:
-        model_scope = str(((model.get("train_filter") or {}).get("project_id") or "")).strip()
-        if target_scope and model_scope == target_scope:
-            model["deployed"] = False
-    target["deployed"] = True
-    save_calibration_models(models)
-
-    if payload.project_id:
-        projects = load_projects()
-        for project in projects:
-            if str(project.get("id")) == payload.project_id:
-                project["calibrator_version_locked"] = payload.calibrator_version
-                project["updated_at"] = _now_iso()
-        save_projects(projects)
-
+    try:
+        target = calibration_model_service.deploy_calibration_model(
+            calibrator_version=payload.calibrator_version,
+            project_id=payload.project_id,
+            load_calibration_models=load_calibration_models,
+            save_calibration_models=save_calibration_models,
+            load_projects=load_projects,
+            save_projects=save_projects,
+            now_iso=_now_iso,
+        )
+    except calibration_model_service.CalibrationModelNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except calibration_model_service.CalibrationProjectBindingError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     return CalibratorModelRecord(**target)
 
 
@@ -10484,53 +10203,21 @@ def apply_calibration_prediction(
         project = _find_project(project_id, projects)
     except HTTPException:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-
-    model = _select_calibrator_model(project)
-    if not model:
-        return CalibratorPredictResponse(
-            ok=True,
-            project_id=project_id,
-            model_version=None,
-            updated_reports=0,
-            updated_submissions=0,
-        )
-
-    submissions = load_submissions()
-    submission_map = {
-        str(s.get("id")): s for s in submissions if str(s.get("project_id")) == project_id
-    }
-
-    reports = load_score_reports()
-    updated_reports = 0
-    for report in reports:
-        if str(report.get("project_id")) != project_id:
-            continue
-        sid = str(report.get("submission_id") or "")
-        sub = submission_map.get(sid)
-        if not sid or not sub:
-            continue
-        _apply_prediction_to_report(report, submission_like=sub, project=project)
-        updated_reports += 1
-    save_score_reports(reports)
-
-    updated_submissions = 0
-    for submission in submissions:
-        if str(submission.get("project_id")) != project_id:
-            continue
-        report = submission.get("report")
-        if not isinstance(report, dict):
-            continue
-        _apply_prediction_to_report(report, submission_like=submission, project=project)
-        updated_submissions += 1
-    save_submissions(submissions)
-
-    return CalibratorPredictResponse(
-        ok=True,
+    result = calibration_model_service.apply_calibration_prediction(
         project_id=project_id,
-        model_version=str(model.get("calibrator_version") or ""),
-        updated_reports=updated_reports,
-        updated_submissions=updated_submissions,
+        project=project,
+        load_calibration_models=load_calibration_models,
+        load_submissions=load_submissions,
+        load_score_reports=load_score_reports,
+        save_score_reports=save_score_reports,
+        save_submissions=save_submissions,
+        build_feature_row=build_feature_row,
+        predict_with_model=predict_with_model,
+        fuse_rule_and_llm_scores=_fuse_rule_and_llm_scores,
+        to_float_or_none=_to_float_or_none,
+        clip_score=_clip_score,
     )
+    return CalibratorPredictResponse(**result)
 
 
 @router.post(
@@ -10821,167 +10508,28 @@ def auto_run_reflection_pipeline(
     _refresh_project_reflection_objects(project_id)
     delta_cases = [d for d in load_delta_cases() if str(d.get("project_id")) == project_id]
     samples = [s for s in load_calibration_samples() if str(s.get("project_id")) == project_id]
-
-    calibrator_version = None
-    calibrator_deployed = False
-    calibrator_summary = _build_calibrator_summary(
-        model_type=None,
-        calibrator_version=None,
-        gate_passed=None,
-        sample_count=len(samples),
-        skipped_reason="insufficient_samples" if len(samples) < 3 else None,
+    calibration_run = calibration_model_service.run_auto_calibration_lifecycle(
+        project_id=project_id,
+        project=project,
+        projects=projects,
+        samples=samples,
+        train_best_calibrator_auto=train_best_calibrator_auto,
+        cross_validate_calibrator=cross_validate_calibrator,
+        calc_metrics=calc_metrics,
+        load_calibration_models=load_calibration_models,
+        save_calibration_models=save_calibration_models,
+        save_projects=save_projects,
+        load_submissions=load_submissions,
+        load_score_reports=load_score_reports,
+        save_score_reports=save_score_reports,
+        save_submissions=save_submissions,
+        build_feature_row=build_feature_row,
+        predict_with_model=predict_with_model,
+        fuse_rule_and_llm_scores=_fuse_rule_and_llm_scores,
+        to_float_or_none=_to_float_or_none,
+        clip_score=_clip_score,
+        now_iso=_now_iso,
     )
-    calibrator_model_type = calibrator_summary.get("model_type")
-    calibrator_gate_passed = calibrator_summary.get("gate_passed")
-    calibrator_cv_metrics: Dict[str, Any] = calibrator_summary.get("cv_metrics") or {}
-    calibrator_baseline_metrics: Dict[str, Any] = calibrator_summary.get("baseline_metrics") or {}
-    calibrator_gate: Dict[str, Any] = calibrator_summary.get("gate") or {}
-    calibrator_auto_candidates: List[Dict[str, Any]] = (
-        calibrator_summary.get("auto_candidates") or []
-    )
-    if len(samples) >= 3:
-        feature_rows = [
-            {
-                "feature_schema_version": s.get("feature_schema_version", "v2"),
-                "x_features": s.get("x_features") or {},
-                "y_label": s.get("y_label"),
-                "submission_id": s.get("submission_id"),
-            }
-            for s in samples
-        ]
-        # “最强自动校准”：多候选 + CV 闸门 + 自动选择最佳模型
-        model_artifact = train_best_calibrator_auto(feature_rows, alpha=1.0)
-        selected_type = str(model_artifact.get("model_type") or "ridge")
-        calibrator_model_type = selected_type
-
-        # 统一用 CV 口径做上线闸门（避免 in-sample 过拟合）
-        cv = cross_validate_calibrator(
-            model_type=selected_type,
-            feature_rows=feature_rows,
-            alpha=1.0,
-            seed=42,
-        )
-        # baseline: raw rule_total_score
-        y_true = [float(r.get("y_label")) for r in feature_rows if r.get("y_label") is not None]
-        baseline_pred = [
-            float(((r.get("x_features") or {}).get("rule_total_score") or 0.0))
-            for r in feature_rows
-            if r.get("y_label") is not None
-        ]
-        baseline_metrics = calc_metrics(y_true, baseline_pred)
-        cv_metrics = (
-            (cv.get("metrics") or {})
-            if bool(cv.get("ok"))
-            else {"mae": 0.0, "rmse": 0.0, "spearman": 0.0}
-        )
-        improve_threshold = max(0.2, float(baseline_metrics.get("mae") or 0.0) * 0.01)
-        spearman_tolerance = 0.02
-        gate_passed = (
-            bool(cv.get("ok"))
-            and float(cv_metrics.get("mae") or 0.0)
-            <= float(baseline_metrics.get("mae") or 0.0) - improve_threshold
-            and float(cv_metrics.get("spearman") or 0.0)
-            >= float(baseline_metrics.get("spearman") or 0.0) - spearman_tolerance
-        )
-        model_artifact.setdefault("metrics", {})
-        model_artifact["metrics"]["cv_mae"] = cv_metrics.get("mae")
-        model_artifact["metrics"]["cv_rmse"] = cv_metrics.get("rmse")
-        model_artifact["metrics"]["cv_spearman"] = cv_metrics.get("spearman")
-        model_artifact["metrics"]["cv_mode"] = cv.get("mode")
-        model_artifact["metrics"]["cv_pred_count"] = cv.get("pred_count")
-        model_artifact["metrics"]["baseline_mae"] = baseline_metrics.get("mae")
-        model_artifact["metrics"]["baseline_rmse"] = baseline_metrics.get("rmse")
-        model_artifact["metrics"]["baseline_spearman"] = baseline_metrics.get("spearman")
-        model_artifact["metrics"]["gate_improve_threshold"] = round(improve_threshold, 4)
-        model_artifact["metrics"]["gate_spearman_tolerance"] = spearman_tolerance
-        model_artifact["gate_passed"] = gate_passed
-
-        auto_candidates = _extract_auto_candidates(model_artifact)
-        calibrator_version = (
-            f"calib_auto_{selected_type}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
-        )
-        calibrator_summary = _build_calibrator_summary(
-            model_type=selected_type,
-            calibrator_version=calibrator_version,
-            gate_passed=bool(gate_passed),
-            cv_metrics={
-                "mae": cv_metrics.get("mae"),
-                "rmse": cv_metrics.get("rmse"),
-                "spearman": cv_metrics.get("spearman"),
-                "mode": cv.get("mode"),
-                "pred_count": cv.get("pred_count"),
-            },
-            baseline_metrics={
-                "mae": baseline_metrics.get("mae"),
-                "rmse": baseline_metrics.get("rmse"),
-                "spearman": baseline_metrics.get("spearman"),
-            },
-            improve_threshold=improve_threshold,
-            spearman_tolerance=spearman_tolerance,
-            auto_candidates=auto_candidates,
-            sample_count=len(feature_rows),
-        )
-        calibrator_model_type = calibrator_summary.get("model_type")
-        calibrator_gate_passed = calibrator_summary.get("gate_passed")
-        calibrator_cv_metrics = calibrator_summary.get("cv_metrics") or {}
-        calibrator_baseline_metrics = calibrator_summary.get("baseline_metrics") or {}
-        calibrator_gate = calibrator_summary.get("gate") or {}
-        calibrator_auto_candidates = calibrator_summary.get("auto_candidates") or []
-        record = {
-            "calibrator_version": calibrator_version,
-            "model_type": selected_type,
-            "feature_schema_version": str(model_artifact.get("feature_schema_version", "v2")),
-            "train_filter": {"project_id": project_id, "mode": "auto_run"},
-            "metrics": {
-                **(model_artifact.get("metrics") or {}),
-                "gate_passed": bool(gate_passed),
-            },
-            "calibrator_summary": calibrator_summary,
-            "artifact_uri": f"json://calibration_models/{calibrator_version}",
-            "model_artifact": model_artifact,
-            "deployed": bool(gate_passed),
-            "created_at": _now_iso(),
-        }
-        models = load_calibration_models()
-        if record["deployed"]:
-            for m in models:
-                if str(((m.get("train_filter") or {}).get("project_id") or "")) == project_id:
-                    m["deployed"] = False
-            project["calibrator_version_locked"] = calibrator_version
-            project["updated_at"] = _now_iso()
-            save_projects(projects)
-            calibrator_deployed = True
-        models.append(record)
-        save_calibration_models(models)
-
-    updated_reports = 0
-    updated_submissions = 0
-    if calibrator_deployed:
-        submissions = load_submissions()
-        submission_map = {
-            str(s.get("id")): s for s in submissions if str(s.get("project_id")) == project_id
-        }
-        reports = load_score_reports()
-        for report in reports:
-            if str(report.get("project_id")) != project_id:
-                continue
-            sid = str(report.get("submission_id") or "")
-            sub = submission_map.get(sid)
-            if not sub:
-                continue
-            _apply_prediction_to_report(report, submission_like=sub, project=project)
-            updated_reports += 1
-        save_score_reports(reports)
-
-        for sub in submissions:
-            if str(sub.get("project_id")) != project_id:
-                continue
-            rep = sub.get("report")
-            if not isinstance(rep, dict):
-                continue
-            _apply_prediction_to_report(rep, submission_like=sub, project=project)
-            updated_submissions += 1
-        save_submissions(submissions)
 
     patch_id = None
     patch_gate_passed = None
@@ -11045,17 +10593,17 @@ def auto_run_reflection_pipeline(
         project_id=project_id,
         delta_cases=len(delta_cases),
         calibration_samples=len(samples),
-        calibrator_version=calibrator_version,
-        calibrator_deployed=calibrator_deployed,
-        calibrator_summary=calibrator_summary,
-        calibrator_model_type=calibrator_model_type,
-        calibrator_gate_passed=calibrator_gate_passed,
-        calibrator_cv_metrics=calibrator_cv_metrics,
-        calibrator_baseline_metrics=calibrator_baseline_metrics,
-        calibrator_gate=calibrator_gate,
-        calibrator_auto_candidates=calibrator_auto_candidates,
-        prediction_updated_reports=updated_reports,
-        prediction_updated_submissions=updated_submissions,
+        calibrator_version=calibration_run["calibrator_version"],
+        calibrator_deployed=calibration_run["calibrator_deployed"],
+        calibrator_summary=calibration_run["calibrator_summary"],
+        calibrator_model_type=calibration_run["calibrator_model_type"],
+        calibrator_gate_passed=calibration_run["calibrator_gate_passed"],
+        calibrator_cv_metrics=calibration_run["calibrator_cv_metrics"],
+        calibrator_baseline_metrics=calibration_run["calibrator_baseline_metrics"],
+        calibrator_gate=calibration_run["calibrator_gate"],
+        calibrator_auto_candidates=calibration_run["calibrator_auto_candidates"],
+        prediction_updated_reports=calibration_run["prediction_updated_reports"],
+        prediction_updated_submissions=calibration_run["prediction_updated_submissions"],
         patch_id=patch_id,
         patch_gate_passed=patch_gate_passed,
         patch_deployed=patch_deployed,
