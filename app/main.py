@@ -71,6 +71,7 @@ import app.engine.local_llm_ollama_preview_adapter as local_llm_ollama_preview_a
 import app.engine.local_llm_preview_mock as local_llm_preview_mock
 import app.engine.zdoc_zbid_preview_receiver as zdoc_zbid_preview_receiver
 import app.evidence_trace_service as evidence_trace_service
+import app.feedback_closed_loop_service as feedback_closed_loop_service
 import app.ground_truth_sync_service as ground_truth_sync_service
 import app.latest_report_service as latest_report_service
 import app.material_read_service as material_read_service
@@ -4635,51 +4636,18 @@ def _refresh_evolution_report_from_ground_truth(project_id: str) -> Dict[str, ob
 
 
 def _run_feedback_closed_loop(project_id: str, *, locale: str, trigger: str) -> Dict[str, object]:
-    """
-    反馈信号闭环：刷新样本 -> 自动调权重 -> 自动反演校准。
-    所有步骤为 best-effort，不影响主流程返回。
-    """
-    result: Dict[str, object] = {
-        "ok": True,
-        "project_id": project_id,
-        "trigger": trigger,
-        "weight_update": {"updated": False},
-        "weight_sync_to_evolution": {"synced": False},
-        "auto_run": None,
-        "evolution_refresh": {"refreshed": False},
-    }
-    try:
-        _refresh_project_reflection_objects(project_id)
-    except Exception as exc:
-        result["ok"] = False
-        result["refresh_error"] = str(exc)
-        return result
-
-    try:
-        result["weight_update"] = _auto_update_project_weights_from_delta_cases(project_id)
-    except Exception as exc:
-        result["weight_update"] = {"updated": False, "error": str(exc)}
-    try:
-        result["weight_sync_to_evolution"] = _sync_feedback_weights_to_evolution(
-            project_id, result["weight_update"]
-        )
-    except Exception as exc:
-        result["weight_sync_to_evolution"] = {"synced": False, "error": str(exc)}
-
-    try:
-        auto_resp = auto_run_reflection_pipeline(project_id=project_id, api_key=None, locale=locale)
-        if hasattr(auto_resp, "model_dump"):
-            result["auto_run"] = auto_resp.model_dump()
-        else:
-            result["auto_run"] = dict(auto_resp)
-    except Exception as exc:
-        result["auto_run"] = {"ok": False, "error": str(exc)}
-        result["ok"] = False
-    try:
-        result["evolution_refresh"] = _refresh_evolution_report_from_ground_truth(project_id)
-    except Exception as exc:
-        result["evolution_refresh"] = {"refreshed": False, "error": str(exc)}
-    return result
+    return feedback_closed_loop_service.run_feedback_closed_loop(
+        project_id,
+        locale=locale,
+        trigger=trigger,
+        refresh_project_reflection_objects=_refresh_project_reflection_objects,
+        auto_update_project_weights_from_delta_cases=(
+            _auto_update_project_weights_from_delta_cases
+        ),
+        sync_feedback_weights_to_evolution=_sync_feedback_weights_to_evolution,
+        auto_run_reflection_pipeline=auto_run_reflection_pipeline,
+        refresh_evolution_report_from_ground_truth=(_refresh_evolution_report_from_ground_truth),
+    )
 
 
 def _run_feedback_closed_loop_safe(
@@ -4688,52 +4656,13 @@ def _run_feedback_closed_loop_safe(
     locale: str,
     trigger: str,
 ) -> Dict[str, object]:
-    """
-    闭环执行保护层：不抛错中断主流程，但必须显式返回失败信息并记录日志。
-    """
-    try:
-        raw_result = _run_feedback_closed_loop(project_id, locale=locale, trigger=trigger)
-        if isinstance(raw_result, dict):
-            result = dict(raw_result)
-        elif hasattr(raw_result, "model_dump"):
-            dumped = raw_result.model_dump()
-            if isinstance(dumped, dict):
-                result = dict(dumped)
-            else:
-                result = {
-                    "ok": bool(getattr(raw_result, "ok", False)),
-                    "project_id": project_id,
-                    "trigger": trigger,
-                    "raw": str(raw_result),
-                }
-        else:
-            result = {
-                "ok": bool(getattr(raw_result, "ok", False)),
-                "project_id": project_id,
-                "trigger": trigger,
-                "raw": str(raw_result),
-            }
-        if not bool(result.get("ok", True)):
-            logger.warning(
-                "feedback_closed_loop_non_ok project_id=%s trigger=%s result=%s",
-                project_id,
-                trigger,
-                result,
-            )
-        return result
-    except Exception as exc:
-        logger.exception(
-            "feedback_closed_loop_exception project_id=%s trigger=%s error=%s",
-            project_id,
-            trigger,
-            exc,
-        )
-        return {
-            "ok": False,
-            "project_id": project_id,
-            "trigger": trigger,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+    return feedback_closed_loop_service.run_feedback_closed_loop_safe(
+        project_id,
+        locale=locale,
+        trigger=trigger,
+        run_feedback_closed_loop=_run_feedback_closed_loop,
+        logger=logger,
+    )
 
 
 def _build_evolution_health_report(
