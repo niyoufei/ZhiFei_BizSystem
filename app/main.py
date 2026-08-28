@@ -80,6 +80,7 @@ import app.material_read_service as material_read_service
 import app.material_upload_service as material_upload_service
 import app.project_context_service as project_context_service
 import app.project_delete_service as project_delete_service
+import app.project_profile_service as project_profile_service
 import app.qingtian_result_service as qingtian_result_service
 import app.rescore_service as rescore_service
 import app.scoring_basis_service as scoring_basis_service
@@ -931,18 +932,13 @@ def _ensure_project_expert_profile(
     project: Dict[str, object],
     all_profiles: List[Dict[str, object]],
 ) -> tuple[Dict[str, object], bool]:
-    profile_id = str(project.get("expert_profile_id") or "")
-    if profile_id:
-        for profile in all_profiles:
-            if profile.get("id") == profile_id:
-                return profile, False
-
-    profile_name = f"{project.get('name', '项目')} 默认配置"
-    created = _new_expert_profile(profile_name, _default_weights_raw())
-    all_profiles.append(created)
-    project["expert_profile_id"] = created["id"]
-    project["updated_at"] = _now_iso()
-    return created, True
+    return project_profile_service.ensure_project_expert_profile(
+        project,
+        all_profiles,
+        new_expert_profile=_new_expert_profile,
+        default_weights_raw=_default_weights_raw,
+        now_iso=_now_iso,
+    )
 
 
 @atomic_json_transaction("projects")
@@ -1067,6 +1063,18 @@ def _find_project(project_id: str, projects: List[Dict[str, object]]) -> Dict[st
         if recovered is not None:
             return recovered
     raise HTTPException(status_code=404, detail="项目不存在")
+
+
+def _find_project_for_profile_request(
+    project_id: str,
+    projects: List[Dict[str, object]],
+    *,
+    locale: str,
+) -> Dict[str, object]:
+    try:
+        return _find_project(project_id, projects)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
 
 
 def _find_submission(submission_id: str, submissions: List[Dict[str, object]]) -> Dict[str, object]:
@@ -6586,20 +6594,21 @@ def get_project_expert_profile(
     project_id: str, locale: str = Depends(get_locale)
 ) -> ProjectExpertProfileResponse:
     """获取项目当前生效的专家16维关注度配置。"""
-    ensure_data_dirs()
-    projects = load_projects()
-    try:
-        project = _find_project(project_id, projects)
-    except HTTPException:
-        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-
-    project_changed = _ensure_project_v2_fields(project)
-    profiles = load_expert_profiles()
-    profile, created = _ensure_project_expert_profile(project, profiles)
-    if project_changed or created:
-        save_projects(projects)
-    if created:
-        save_expert_profiles(profiles)
+    project, profile = project_profile_service.get_project_expert_profile(
+        project_id=project_id,
+        ensure_data_dirs=ensure_data_dirs,
+        load_projects=load_projects,
+        find_project=lambda requested_id, projects: _find_project_for_profile_request(
+            requested_id,
+            projects,
+            locale=locale,
+        ),
+        ensure_project_v2_fields=_ensure_project_v2_fields,
+        load_expert_profiles=load_expert_profiles,
+        ensure_project_profile=_ensure_project_expert_profile,
+        save_projects=save_projects,
+        save_expert_profiles=save_expert_profiles,
+    )
     return ProjectExpertProfileResponse(
         project=ProjectRecord(**project),
         expert_profile=ExpertProfileRecord(**profile),
@@ -6620,28 +6629,27 @@ def update_project_expert_profile(
     locale: str = Depends(get_locale),
 ) -> ProjectExpertProfileResponse:
     """保存新的专家关注度配置并绑定到项目。"""
-    ensure_data_dirs()
-    projects = load_projects()
-    try:
-        project = _find_project(project_id, projects)
-    except HTTPException:
-        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-
-    _ensure_project_v2_fields(project)
-    _assert_project_profile_operation_unlocked(project, bool(payload.force_unlock))
-    weights_raw = _coerce_weights_raw(payload.weights_raw)
-    profile_name = (
-        payload.name or ""
-    ).strip() or f"{project.get('name', '项目')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    profile = _new_expert_profile(profile_name, weights_raw)
-
-    profiles = load_expert_profiles()
-    profiles.append(profile)
-    save_expert_profiles(profiles)
-
-    project["expert_profile_id"] = profile["id"]
-    project["updated_at"] = _now_iso()
-    save_projects(projects)
+    project, profile = project_profile_service.update_project_expert_profile(
+        project_id=project_id,
+        name=payload.name,
+        weights_raw=payload.weights_raw,
+        force_unlock=bool(payload.force_unlock),
+        ensure_data_dirs=ensure_data_dirs,
+        load_projects=load_projects,
+        find_project=lambda requested_id, projects: _find_project_for_profile_request(
+            requested_id,
+            projects,
+            locale=locale,
+        ),
+        ensure_project_v2_fields=_ensure_project_v2_fields,
+        assert_project_profile_operation_unlocked=_assert_project_profile_operation_unlocked,
+        coerce_weights_raw=_coerce_weights_raw,
+        new_expert_profile=_new_expert_profile,
+        load_expert_profiles=load_expert_profiles,
+        save_expert_profiles=save_expert_profiles,
+        save_projects=save_projects,
+        now_iso=_now_iso,
+    )
 
     return ProjectExpertProfileResponse(
         project=ProjectRecord(**project),
