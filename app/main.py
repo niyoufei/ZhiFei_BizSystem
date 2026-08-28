@@ -75,6 +75,7 @@ import app.evidence_trace_service as evidence_trace_service
 import app.feedback_closed_loop_service as feedback_closed_loop_service
 import app.ground_truth_sync_service as ground_truth_sync_service
 import app.latest_report_service as latest_report_service
+import app.material_delete_service as material_delete_service
 import app.material_read_service as material_read_service
 import app.material_upload_service as material_upload_service
 import app.project_context_service as project_context_service
@@ -7670,25 +7671,23 @@ def delete_material(
     locale: str = Depends(get_locale),
 ) -> dict:
     """删除指定项目下的一条资料记录及对应文件。"""
-    ensure_data_dirs()
-    projects = load_projects()
-    if not any(p["id"] == project_id for p in projects):
-        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    materials = load_materials()
-    found = None
-    for m in materials:
-        if m.get("id") == material_id and m.get("project_id") == project_id:
-            found = m
-            break
-    if not found:
-        raise HTTPException(status_code=404, detail="资料记录不存在")
-    path = Path(found["path"])
-    if path.exists():
-        path.unlink()
-    materials = [m for m in materials if m.get("id") != material_id]
-    save_materials(materials)
-    _invalidate_material_index_cache(project_id)
-    return {"ok": True, "id": material_id}
+    return material_delete_service.delete_material(
+        project_id=project_id,
+        material_id=material_id,
+        ensure_data_dirs=ensure_data_dirs,
+        load_projects=load_projects,
+        load_materials=load_materials,
+        save_materials=save_materials,
+        invalidate_material_index_cache=_invalidate_material_index_cache,
+        project_not_found_error=lambda: HTTPException(
+            status_code=404,
+            detail=t("api.project_not_found", locale=locale),
+        ),
+        material_not_found_error=lambda: HTTPException(
+            status_code=404,
+            detail="资料记录不存在",
+        ),
+    )
 
 
 def _resolve_dwg_converter_binaries() -> List[str]:
