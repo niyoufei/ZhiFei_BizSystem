@@ -9404,41 +9404,42 @@ def score_text_for_project(
         scoring_engine_version=scoring_engine_version,
     )
 
-    @atomic_json_transaction("evidence_units", "projects", "score_reports", "submissions")
-    def commit() -> None:
-        if not any(str(p.get("id")) == project_id for p in load_projects()):
-            raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-        submissions = load_submissions()
-        submissions.append(record)
-        snapshots = load_score_reports()
-        snapshots.append(snapshot)
-        save_submissions(submissions)
-        save_score_reports(snapshots)
-        if evidence_units:
-            all_units = _replace_submission_evidence_units(
-                load_evidence_units(),
-                submission_id=submission_id,
-                new_units=evidence_units,
-            )
-            save_evidence_units(all_units)
-
-    commit()
-    if cache_payload is not None:
-        cache_score_result(*cache_payload)
-
-    # 记录评分历史
     dimension_scores = {
         dim_id: dim.get("score", 0.0) for dim_id, dim in report.get("dimension_scores", {}).items()
     }
     penalty_count = len(report.get("penalties", []))
-    record_history_score(
+    submission_scoring_service.commit_inline_scoring_result(
         project_id=project_id,
-        submission_id=submission_id,
-        filename="inline",
-        total_score=float(report.get("total_score", report.get("rule_total_score", 0.0))),
-        dimension_scores=dimension_scores,
-        penalty_count=penalty_count,
+        record=record,
+        snapshot=snapshot,
+        evidence_units=evidence_units,
+        history_args={
+            "project_id": project_id,
+            "submission_id": submission_id,
+            "filename": "inline",
+            "total_score": float(report.get("total_score", report.get("rule_total_score", 0.0))),
+            "dimension_scores": dimension_scores,
+            "penalty_count": penalty_count,
+        },
+        atomic_json_transaction=atomic_json_transaction,
+        load_projects=load_projects,
+        load_submissions=load_submissions,
+        save_submissions=save_submissions,
+        load_score_reports=load_score_reports,
+        save_score_reports=save_score_reports,
+        load_evidence_units=load_evidence_units,
+        save_evidence_units=save_evidence_units,
+        load_score_history=load_score_history,
+        save_score_history=save_score_history,
+        record_history_score=record_history_score,
+        replace_submission_evidence_units=_replace_submission_evidence_units,
+        project_not_found_error=lambda: HTTPException(
+            status_code=404,
+            detail=t("api.project_not_found", locale=locale),
+        ),
     )
+    if cache_payload is not None:
+        cache_score_result(*cache_payload)
 
     return SubmissionRecord(**record)
 

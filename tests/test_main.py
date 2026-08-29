@@ -3376,6 +3376,7 @@ class TestMaterialAdvancedParsing:
 class TestScoreForProjectEndpoint:
     """Tests for /projects/{project_id}/score endpoint."""
 
+    @patch("app.main.submission_scoring_service.commit_inline_scoring_result")
     @patch("app.main.save_submissions")
     @patch("app.main.load_submissions")
     @patch("app.main.load_learning_profiles")
@@ -3392,6 +3393,7 @@ class TestScoreForProjectEndpoint:
         mock_profiles,
         mock_load_sub,
         mock_save_sub,
+        mock_commit_result,
         client,
     ):
         """Score for project should return submission record."""
@@ -3405,6 +3407,7 @@ class TestScoreForProjectEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["filename"] == "inline"
+        mock_commit_result.assert_called_once()
 
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
@@ -3414,6 +3417,7 @@ class TestScoreForProjectEndpoint:
         response = client.post("/api/v1/projects/nonexistent/score", json={"text": "test"})
         assert response.status_code == 404
 
+    @patch("app.main.submission_scoring_service.commit_inline_scoring_result")
     @patch("app.main.save_submissions")
     @patch("app.main.load_submissions")
     @patch("app.main.load_learning_profiles")
@@ -3430,6 +3434,7 @@ class TestScoreForProjectEndpoint:
         mock_profiles,
         mock_load_sub,
         mock_save_sub,
+        mock_commit_result,
         client,
     ):
         """Score for project should use learning profile multipliers."""
@@ -3447,6 +3452,75 @@ class TestScoreForProjectEndpoint:
         # Check multipliers were passed
         call_args = mock_score.call_args
         assert call_args.kwargs.get("dimension_multipliers") == {"D01": 1.3}
+        mock_commit_result.assert_called_once()
+
+    def test_score_for_project_commits_persistence_before_cache(self, client):
+        events = []
+        raw_report = {
+            "total_score": 75.0,
+            "rule_total_score": 75.0,
+            "dimension_scores": {},
+            "penalties": [],
+        }
+        with (
+            patch("app.main.ensure_data_dirs"),
+            patch("app.main.load_projects", return_value=[{"id": "p1"}]),
+            patch("app.main.load_config", return_value=MagicMock(rubric={}, lexicon={})),
+            patch(
+                "app.main._resolve_project_scoring_context",
+                return_value=(None, None, {"id": "p1"}),
+            ),
+            patch("app.main.get_cached_score", return_value=None),
+            patch(
+                "app.main._score_submission_for_project",
+                return_value=(raw_report, []),
+            ),
+            patch("app.main._apply_evolution_total_scale"),
+            patch(
+                "app.main.submission_scoring_service.commit_inline_scoring_result",
+                side_effect=lambda **_kwargs: events.append("commit"),
+            ),
+            patch(
+                "app.main.cache_score_result",
+                side_effect=lambda *_args: events.append("cache"),
+            ),
+        ):
+            response = client.post("/api/v1/projects/p1/score", json={"text": "测试文本"})
+
+        assert response.status_code == 200
+        assert events == ["commit", "cache"]
+
+    def test_score_for_project_does_not_cache_if_persistence_fails(self, client):
+        raw_report = {
+            "total_score": 75.0,
+            "rule_total_score": 75.0,
+            "dimension_scores": {},
+            "penalties": [],
+        }
+        with (
+            patch("app.main.ensure_data_dirs"),
+            patch("app.main.load_projects", return_value=[{"id": "p1"}]),
+            patch("app.main.load_config", return_value=MagicMock(rubric={}, lexicon={})),
+            patch(
+                "app.main._resolve_project_scoring_context",
+                return_value=(None, None, {"id": "p1"}),
+            ),
+            patch("app.main.get_cached_score", return_value=None),
+            patch(
+                "app.main._score_submission_for_project",
+                return_value=(raw_report, []),
+            ),
+            patch("app.main._apply_evolution_total_scale"),
+            patch(
+                "app.main.submission_scoring_service.commit_inline_scoring_result",
+                side_effect=RuntimeError("controlled persistence failure"),
+            ),
+            patch("app.main.cache_score_result") as mock_cache,
+        ):
+            with pytest.raises(RuntimeError, match="controlled persistence failure"):
+                client.post("/api/v1/projects/p1/score", json={"text": "测试文本"})
+
+        mock_cache.assert_not_called()
 
 
 class TestSubmissionsEndpoint:
@@ -4964,6 +5038,7 @@ class TestProjectLevelCacheIntegration:
         mock_cache_set.assert_not_called()
         mock_score.assert_not_called()
 
+    @patch("app.main.submission_scoring_service.commit_inline_scoring_result")
     @patch("app.main.get_cached_score")
     @patch("app.main.cache_score_result")
     @patch("app.main.load_evolution_reports")
@@ -4986,6 +5061,7 @@ class TestProjectLevelCacheIntegration:
         mock_load_evolution_reports,
         mock_cache_set,
         mock_cache_get,
+        mock_commit_result,
         client,
     ):
         """Score for project should check cache first."""
@@ -5014,7 +5090,9 @@ class TestProjectLevelCacheIntegration:
         cached_report = mock_cache_set.call_args[0][1]
         assert cached_report["total_score"] == 75.0
         assert cached_report["rule_total_score"] == 75.0
+        mock_commit_result.assert_called_once()
 
+    @patch("app.main.submission_scoring_service.commit_inline_scoring_result")
     @patch("app.main.get_cached_score")
     @patch("app.main.load_evolution_reports")
     @patch("app.main.save_submissions")
@@ -5035,6 +5113,7 @@ class TestProjectLevelCacheIntegration:
         mock_save_sub,
         mock_load_evolution_reports,
         mock_cache_get,
+        mock_commit_result,
         client,
     ):
         """Score for project should return cached result when available."""
@@ -5060,7 +5139,9 @@ class TestProjectLevelCacheIntegration:
 
         # 验证 score_text 没有被调用（使用了缓存）
         mock_score.assert_not_called()
+        mock_commit_result.assert_called_once()
 
+    @patch("app.main.submission_scoring_service.commit_inline_scoring_result")
     @patch("app.main.load_evolution_reports")
     @patch("app.main.get_cached_score")
     @patch("app.main.save_submissions")
@@ -5081,6 +5162,7 @@ class TestProjectLevelCacheIntegration:
         mock_save_sub,
         mock_cache_get,
         mock_load_evolution_reports,
+        mock_commit_result,
         client,
     ):
         """Cached raw report should apply evolution total scale only once at read time."""
@@ -5105,7 +5187,9 @@ class TestProjectLevelCacheIntegration:
         assert data["report"]["total_score"] == 88.0
         assert data["report"]["rule_total_score"] == 88.0
         mock_score.assert_not_called()
+        mock_commit_result.assert_called_once()
 
+    @patch("app.main.submission_scoring_service.commit_inline_scoring_result")
     @patch("app.main.get_cached_score")
     @patch("app.main.cache_score_result")
     @patch("app.main.save_submissions")
@@ -5126,6 +5210,7 @@ class TestProjectLevelCacheIntegration:
         mock_save_sub,
         mock_cache_set,
         mock_cache_get,
+        mock_commit_result,
         client,
     ):
         """Score for project should use config_hash when multipliers exist."""
@@ -5147,6 +5232,7 @@ class TestProjectLevelCacheIntegration:
         assert call_args[0][0] == "测试文本"
         # config_hash 应该不是 None（因为有 multipliers）
         assert call_args[0][1] is not None
+        mock_commit_result.assert_called_once()
 
 
 class TestSystemSelfCheckCapabilities:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
@@ -12,6 +13,19 @@ TransactionFactory = Callable[..., TransactionDecorator]
 
 class PreparedScoringInputError(Exception):
     pass
+
+
+def _append_rollback_note(error: BaseException, rollback_error: BaseException) -> None:
+    note = (
+        "inline scoring rollback also failed: " f"{type(rollback_error).__name__}: {rollback_error}"
+    )
+    add_note = getattr(error, "add_note", None)
+    if callable(add_note):
+        add_note(note)
+        return
+    notes = list(getattr(error, "__notes__", []))
+    notes.append(note)
+    error.__notes__ = notes
 
 
 def report_is_blocked(report: Optional[Dict[str, object]]) -> bool:
@@ -127,6 +141,85 @@ def commit_submission_upload(
         return record
 
     return commit()
+
+
+def commit_inline_scoring_result(
+    *,
+    project_id: str,
+    record: Dict[str, object],
+    snapshot: Dict[str, object],
+    evidence_units: List[Dict[str, object]],
+    history_args: Dict[str, object],
+    atomic_json_transaction: TransactionFactory,
+    load_projects: Callable[[], List[Dict[str, object]]],
+    load_submissions: Callable[[], List[Dict[str, object]]],
+    save_submissions: Callable[[List[Dict[str, object]]], None],
+    load_score_reports: Callable[[], List[Dict[str, object]]],
+    save_score_reports: Callable[[List[Dict[str, object]]], None],
+    load_evidence_units: Callable[[], List[Dict[str, object]]],
+    save_evidence_units: Callable[[List[Dict[str, object]]], None],
+    load_score_history: Callable[[], List[Dict[str, object]]],
+    save_score_history: Callable[[List[Dict[str, object]]], None],
+    record_history_score: Callable[..., object],
+    replace_submission_evidence_units: Callable[..., List[Dict[str, object]]],
+    project_not_found_error: Callable[[], Exception],
+) -> None:
+    @atomic_json_transaction(
+        "evidence_units",
+        "projects",
+        "score_history",
+        "score_reports",
+        "submissions",
+    )
+    def commit() -> None:
+        if not any(str(project.get("id")) == project_id for project in load_projects()):
+            raise project_not_found_error()
+
+        originals = {
+            "submissions": deepcopy(load_submissions()),
+            "score_reports": deepcopy(load_score_reports()),
+            "evidence_units": deepcopy(load_evidence_units()),
+            "score_history": deepcopy(load_score_history()),
+        }
+        savers = {
+            "submissions": save_submissions,
+            "score_reports": save_score_reports,
+            "evidence_units": save_evidence_units,
+            "score_history": save_score_history,
+        }
+        attempted: List[str] = []
+
+        try:
+            submissions = deepcopy(originals["submissions"])
+            submissions.append(deepcopy(record))
+            attempted.append("submissions")
+            save_submissions(submissions)
+
+            score_reports = deepcopy(originals["score_reports"])
+            score_reports.append(deepcopy(snapshot))
+            attempted.append("score_reports")
+            save_score_reports(score_reports)
+
+            if evidence_units:
+                updated_units = replace_submission_evidence_units(
+                    deepcopy(originals["evidence_units"]),
+                    submission_id=str(record.get("id") or ""),
+                    new_units=deepcopy(evidence_units),
+                )
+                attempted.append("evidence_units")
+                save_evidence_units(updated_units)
+
+            attempted.append("score_history")
+            record_history_score(**history_args)
+        except BaseException as error:
+            for name in reversed(attempted):
+                try:
+                    savers[name](deepcopy(originals[name]))
+                except BaseException as rollback_error:
+                    _append_rollback_note(error, rollback_error)
+            raise
+
+    commit()
 
 
 def delete_submission_cascade(
