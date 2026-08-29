@@ -185,9 +185,12 @@ def _fsync_parent_dir(path: Path) -> None:
         try:
             os.close(dir_fd)
         except BaseException as close_error:
-            fsync_error.add_note(
-                f"closing parent directory descriptor also failed: {close_error}"
-            )
+            close_note = f"closing parent directory descriptor also failed: {close_error}"
+            add_note = getattr(fsync_error, "add_note", None)
+            if callable(add_note):
+                add_note(close_note)
+            else:
+                fsync_error.args = (*fsync_error.args, close_note)
         raise
     else:
         os.close(dir_fd)
