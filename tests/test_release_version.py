@@ -59,6 +59,7 @@ def test_release_workflow_enforces_certified_delivery_gates():
     for required in (
         '"v*.*.*-rc.*"',
         'python-version: ["3.10", "3.11", "3.12"]',
+        'python -m scripts.verify_release --tag "${GITHUB_REF_NAME}"',
         "pip-audit --requirement requirements-runtime.txt",
         "zricethezav/gitleaks:v8.30.0",
         "severity: HIGH,CRITICAL",

@@ -30,7 +30,7 @@ jobs:
           python-version: "3.10"
           cache: pip
       - run: pip install -r requirements.txt "ruff==0.2.1"
-      - run: python scripts/verify_release.py --tag "${GITHUB_REF_NAME}"
+      - run: python -m scripts.verify_release --tag "${GITHUB_REF_NAME}"
       - run: python -m ruff check app/ tests/ scripts/
       - run: git diff --check
 
@@ -48,7 +48,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - run: pip install -r requirements.txt pytest pytest-cov
-      - run: python scripts/verify_release.py --tag "${GITHUB_REF_NAME}"
+      - run: python -m scripts.verify_release --tag "${GITHUB_REF_NAME}"
       - run: python -m pytest tests/ -v --cov=app --cov-report=term-missing
 
   dependency-audit:
