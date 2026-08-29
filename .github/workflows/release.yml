@@ -18,7 +18,7 @@ concurrency:
 env:
   IMAGE_NAME: ghcr.io/niyoufei/zhifei-bizsystem
   GRAFANA_IMAGE_NAME: ghcr.io/niyoufei/zhifei-bizsystem-grafana
-  RELEASE_VERSION: 1.1.0-rc.2
+  RELEASE_VERSION: 1.1.0-rc.3
 
 jobs:
   lint:
@@ -212,14 +212,16 @@ jobs:
           API_KEY: rc-monitor-key-921b86a4
           GRAFANA_PASSWORD: rc-grafana-password-02af41d8
         run: |
-          printf '%s\n' "${API_KEY}" >"${RUNNER_TEMP}/qingtian-api-key"
-          printf '%s\n' "${GRAFANA_PASSWORD}" >"${RUNNER_TEMP}/grafana-admin-password"
-          chmod 600 "${RUNNER_TEMP}/qingtian-api-key" "${RUNNER_TEMP}/grafana-admin-password"
+          secret_dir="${RUNNER_TEMP}/qingtian-r8-secrets"
+          install -d -m 0700 "${secret_dir}"
+          printf '%s\n' "${API_KEY}" >"${secret_dir}/qingtian-api-key"
+          printf '%s\n' "${GRAFANA_PASSWORD}" >"${secret_dir}/grafana-admin-password"
+          chmod 0644 "${secret_dir}/qingtian-api-key" "${secret_dir}/grafana-admin-password"
 
           QINGTIAN_IMAGE="qingtian-release:${GITHUB_SHA}" \
           R8_GRAFANA_IMAGE="qingtian-grafana-release:${GITHUB_SHA}" \
-          QINGTIAN_API_KEYS_FILE="${RUNNER_TEMP}/qingtian-api-key" \
-          R8_GRAFANA_ADMIN_PASSWORD_FILE="${RUNNER_TEMP}/grafana-admin-password" \
+          QINGTIAN_API_KEYS_FILE="${secret_dir}/qingtian-api-key" \
+          R8_GRAFANA_ADMIN_PASSWORD_FILE="${secret_dir}/grafana-admin-password" \
           QINGTIAN_PORT=18080 \
             docker compose --project-name qingtian-release-monitor \
               -f compose.yaml -f docker-compose.monitoring.yml up -d --no-build
@@ -384,7 +386,7 @@ jobs:
             > release-digest.txt
           printf '%s@%s\n' "${GRAFANA_IMAGE_NAME}" "${{ needs.publish.outputs.grafana_digest }}" \
             >> release-digest.txt
-          cp docs/release-v1.1.0-rc.2.md release-notes.md
+          cp docs/release-v1.1.0-rc.3.md release-notes.md
           printf "\n## Immutable images\n\n- \`%s@%s\`\n- \`%s@%s\`\n" \
             "${IMAGE_NAME}" "${{ needs.publish.outputs.app_digest }}" \
             "${GRAFANA_IMAGE_NAME}" "${{ needs.publish.outputs.grafana_digest }}" \

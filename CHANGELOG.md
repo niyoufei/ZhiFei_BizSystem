@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.0-rc.3 - 2026-08-30
+
+- Keeps secret files inside a host-private directory while making each bind-mounted file readable
+  by the distinct non-root application, Prometheus, and Grafana container users.
+- Supersedes the blocked rc.2 build; no rc.2 image or pre-release was published.
+
 ## 1.1.0-rc.2 - 2026-08-30
 
 - Adds bounded HTTP, readiness, rate-limit, and process-resource metrics for production

@@ -337,7 +337,7 @@ def run_drill(
     repo_root: Path,
     project: str,
     api_key_file: Path,
-    rc2_image: str,
+    candidate_image: str,
     rc1_image: str,
     output_dir: Path,
     restore_port: int,
@@ -345,7 +345,7 @@ def run_drill(
     report_path = output_dir / "drill-report.json"
     if report_path.exists():
         raise DrillBlocked(f"refusing to overwrite existing report: {report_path}")
-    if "@sha256:" not in rc2_image or "@sha256:" not in rc1_image:
+    if "@sha256:" not in candidate_image or "@sha256:" not in rc1_image:
         raise DrillBlocked("RC images must use immutable sha256 digests")
     output_dir.mkdir(parents=True, exist_ok=True)
     api_key = api_key_file.read_text(encoding="utf-8").strip()
@@ -365,12 +365,12 @@ def run_drill(
         "status": "RUNNING",
         "started_at": _utc_now(),
         "completed_at": None,
-        "rc2_image": rc2_image,
+        "candidate_image": candidate_image,
         "rc1_image": rc1_image,
         "source_snapshot": None,
-        "restored_rc2_snapshot": None,
+        "restored_candidate_snapshot": None,
         "rollback_rc1_snapshot": None,
-        "restored_again_rc2_snapshot": None,
+        "restored_again_candidate_snapshot": None,
         "checkpoint": None,
         "backup_manifest": {},
         "rpo_zero": False,
@@ -385,7 +385,7 @@ def run_drill(
         _run([*compose, "stop", "app"])
         original_stopped = True
 
-        offline_state = _offline_repository_state(rc2_image, mounts[DATA_DESTINATION])
+        offline_state = _offline_repository_state(candidate_image, mounts[DATA_DESTINATION])
         report["source_snapshot"] = {
             key: offline_state[key]
             for key in ("fingerprint", "integrity_check", "journal_mode", "store_count")
@@ -399,8 +399,10 @@ def run_drill(
         if int(report["checkpoint"]["checkpoint"][0]) != 0:
             raise DrillBlocked(f"source WAL checkpoint remained busy: {report['checkpoint']}")
 
-        _backup_volume(rc2_image, mounts[DATA_DESTINATION], DATA_DESTINATION, data_archive)
-        _backup_volume(rc2_image, mounts[CONFIG_DESTINATION], CONFIG_DESTINATION, config_archive)
+        _backup_volume(candidate_image, mounts[DATA_DESTINATION], DATA_DESTINATION, data_archive)
+        _backup_volume(
+            candidate_image, mounts[CONFIG_DESTINATION], CONFIG_DESTINATION, config_archive
+        )
         report["backup_manifest"] = {
             data_archive.name: {
                 "sha256": _sha256(data_archive),
@@ -414,13 +416,13 @@ def run_drill(
 
         _run(["docker", "volume", "create", restore_data])
         _run(["docker", "volume", "create", restore_config])
-        _restore_volume(rc2_image, restore_data, DATA_DESTINATION, data_archive)
-        _restore_volume(rc2_image, restore_config, CONFIG_DESTINATION, config_archive)
+        _restore_volume(candidate_image, restore_data, DATA_DESTINATION, data_archive)
+        _restore_volume(candidate_image, restore_config, CONFIG_DESTINATION, config_archive)
 
         restore_url = f"http://127.0.0.1:{restore_port}"
         _start_restore_container(
             name=restore_container,
-            image=rc2_image,
+            image=candidate_image,
             data_volume=restore_data,
             config_volume=restore_config,
             api_key_file=api_key_file,
@@ -430,10 +432,10 @@ def run_drill(
         report["rto_seconds"] = round(time.monotonic() - started_rto, 6)
         report["rto_le_900_seconds"] = report["rto_seconds"] <= 900
         _verify_restored_api(restore_url, api_key)
-        report["restored_rc2_snapshot"] = _repository_snapshot(restore_container)
+        report["restored_candidate_snapshot"] = _repository_snapshot(restore_container)
         report["rpo_zero"] = (
             report["source_snapshot"]["fingerprint"]
-            == report["restored_rc2_snapshot"]["fingerprint"]
+            == report["restored_candidate_snapshot"]["fingerprint"]
         )
         if not report["rpo_zero"]:
             raise DrillBlocked("restored logical fingerprint differs from source")
@@ -459,7 +461,7 @@ def run_drill(
         _run(["docker", "rm", "--force", restore_container])
         _start_restore_container(
             name=restore_container,
-            image=rc2_image,
+            image=candidate_image,
             data_volume=restore_data,
             config_volume=restore_config,
             api_key_file=api_key_file,
@@ -467,12 +469,14 @@ def run_drill(
         )
         _wait_ready(restore_url)
         _verify_restored_api(restore_url, api_key)
-        report["restored_again_rc2_snapshot"] = _repository_snapshot(restore_container)
+        report["restored_again_candidate_snapshot"] = _repository_snapshot(restore_container)
         if (
-            report["restored_again_rc2_snapshot"]["fingerprint"]
+            report["restored_again_candidate_snapshot"]["fingerprint"]
             != report["source_snapshot"]["fingerprint"]
         ):
-            raise DrillBlocked("RC2 restoration after rollback changed the logical fingerprint")
+            raise DrillBlocked(
+                "candidate restoration after rollback changed the logical fingerprint"
+            )
         if not report["rto_le_900_seconds"]:
             raise DrillBlocked(f"RTO exceeded 900 seconds: {report['rto_seconds']}")
         report["status"] = "PASS"
@@ -496,7 +500,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).parents[1])
     parser.add_argument("--project", default="qingtian-r8")
     parser.add_argument("--api-key-file", type=Path, required=True)
-    parser.add_argument("--rc2-image", required=True)
+    parser.add_argument("--candidate-image", required=True)
     parser.add_argument("--rc1-image", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--restore-port", type=int, default=18081)
@@ -513,7 +517,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             repo_root=args.repo_root.resolve(),
             project=args.project,
             api_key_file=args.api_key_file.resolve(),
-            rc2_image=args.rc2_image,
+            candidate_image=args.candidate_image,
             rc1_image=args.rc1_image,
             output_dir=args.output_dir.resolve(),
             restore_port=args.restore_port,
