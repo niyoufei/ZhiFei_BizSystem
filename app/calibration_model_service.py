@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 Record = Dict[str, object]
 Records = List[Record]
 Callback = Callable[..., Any]
+TransactionDecorator = Callable[[Callable[[], Any]], Callable[[], Any]]
+TransactionFactory = Callable[..., TransactionDecorator]
 
 
 class UnsupportedCalibrationModelTypeError(ValueError):
@@ -22,6 +25,47 @@ class CalibrationModelNotFoundError(LookupError):
 
 class CalibrationProjectBindingError(ValueError):
     pass
+
+
+def _append_rollback_note(error: BaseException, rollback_error: BaseException) -> None:
+    note = (
+        "calibration lifecycle rollback also failed: "
+        f"{type(rollback_error).__name__}: {rollback_error}"
+    )
+    add_note = getattr(error, "add_note", None)
+    if callable(add_note):
+        add_note(note)
+        return
+    notes = list(getattr(error, "__notes__", []))
+    notes.append(note)
+    error.__notes__ = notes
+
+
+def _tracked_saver(
+    name: str,
+    saver: Callable[[Records], None],
+    attempted: List[str],
+) -> Callable[[Records], None]:
+    def save(rows: Records) -> None:
+        if name not in attempted:
+            attempted.append(name)
+        saver(rows)
+
+    return save
+
+
+def _restore_attempted(
+    error: BaseException,
+    *,
+    attempted: List[str],
+    originals: Dict[str, Records],
+    savers: Dict[str, Callable[[Records], None]],
+) -> None:
+    for name in reversed(attempted):
+        try:
+            savers[name](deepcopy(originals[name]))
+        except BaseException as rollback_error:
+            _append_rollback_note(error, rollback_error)
 
 
 def select_calibrator_model(
@@ -209,7 +253,7 @@ def build_calibrator_summary(
     return summary
 
 
-def train_calibration_model(
+def _train_calibration_model(
     *,
     project_id: Optional[str],
     model_type_raw: object,
@@ -417,7 +461,53 @@ def train_calibration_model(
     return record
 
 
-def deploy_calibration_model(
+def train_calibration_model(
+    *,
+    atomic_json_transaction: TransactionFactory,
+    **kwargs: Any,
+) -> Record:
+    @atomic_json_transaction(
+        "calibration_models",
+        "calibration_samples",
+        "projects",
+        "qingtian_results",
+        "score_reports",
+        "submissions",
+    )
+    def commit() -> Record:
+        originals = {
+            "calibration_models": deepcopy(kwargs["load_calibration_models"]()),
+            "calibration_samples": deepcopy(kwargs["load_calibration_samples"]()),
+            "projects": deepcopy(kwargs["load_projects"]()),
+        }
+        savers = {
+            "calibration_models": kwargs["save_calibration_models"],
+            "calibration_samples": kwargs["save_calibration_samples"],
+            "projects": kwargs["save_projects"],
+        }
+        attempted: List[str] = []
+        operation_kwargs = dict(kwargs)
+        for name in savers:
+            operation_kwargs[f"save_{name}"] = _tracked_saver(
+                name,
+                savers[name],
+                attempted,
+            )
+        try:
+            return _train_calibration_model(**operation_kwargs)
+        except BaseException as error:
+            _restore_attempted(
+                error,
+                attempted=attempted,
+                originals=originals,
+                savers=savers,
+            )
+            raise
+
+    return commit()
+
+
+def _deploy_calibration_model(
     *,
     calibrator_version: str,
     project_id: Optional[str],
@@ -462,7 +552,48 @@ def deploy_calibration_model(
     return target
 
 
-def apply_calibration_prediction(
+def deploy_calibration_model(
+    *,
+    atomic_json_transaction: TransactionFactory,
+    **kwargs: Any,
+) -> Record:
+    @atomic_json_transaction("calibration_models", "projects")
+    def commit() -> Record:
+        originals = {
+            "calibration_models": deepcopy(kwargs["load_calibration_models"]()),
+            "projects": deepcopy(kwargs["load_projects"]()),
+        }
+        savers = {
+            "calibration_models": kwargs["save_calibration_models"],
+            "projects": kwargs["save_projects"],
+        }
+        attempted: List[str] = []
+        operation_kwargs = dict(kwargs)
+        operation_kwargs["save_calibration_models"] = _tracked_saver(
+            "calibration_models",
+            savers["calibration_models"],
+            attempted,
+        )
+        operation_kwargs["save_projects"] = _tracked_saver(
+            "projects",
+            savers["projects"],
+            attempted,
+        )
+        try:
+            return _deploy_calibration_model(**operation_kwargs)
+        except BaseException as error:
+            _restore_attempted(
+                error,
+                attempted=attempted,
+                originals=originals,
+                savers=savers,
+            )
+            raise
+
+    return commit()
+
+
+def _apply_calibration_prediction(
     *,
     project_id: str,
     project: Record,
@@ -548,7 +679,59 @@ def apply_calibration_prediction(
     }
 
 
-def run_auto_calibration_lifecycle(
+def apply_calibration_prediction(
+    *,
+    project_id: str,
+    atomic_json_transaction: TransactionFactory,
+    load_projects: Callable[[], Records],
+    find_project: Callable[[str, Records], Record],
+    **kwargs: Any,
+) -> Record:
+    @atomic_json_transaction(
+        "calibration_models",
+        "projects",
+        "score_reports",
+        "submissions",
+    )
+    def commit() -> Record:
+        project = find_project(project_id, load_projects())
+        originals = {
+            "score_reports": deepcopy(kwargs["load_score_reports"]()),
+            "submissions": deepcopy(kwargs["load_submissions"]()),
+        }
+        savers = {
+            "score_reports": kwargs["save_score_reports"],
+            "submissions": kwargs["save_submissions"],
+        }
+        attempted: List[str] = []
+        operation_kwargs = dict(kwargs)
+        operation_kwargs["project_id"] = project_id
+        operation_kwargs["project"] = project
+        operation_kwargs["save_score_reports"] = _tracked_saver(
+            "score_reports",
+            savers["score_reports"],
+            attempted,
+        )
+        operation_kwargs["save_submissions"] = _tracked_saver(
+            "submissions",
+            savers["submissions"],
+            attempted,
+        )
+        try:
+            return _apply_calibration_prediction(**operation_kwargs)
+        except BaseException as error:
+            _restore_attempted(
+                error,
+                attempted=attempted,
+                originals=originals,
+                savers=savers,
+            )
+            raise
+
+    return commit()
+
+
+def _run_auto_calibration_lifecycle(
     *,
     project_id: str,
     project: Record,
@@ -766,3 +949,58 @@ def run_auto_calibration_lifecycle(
         "prediction_updated_reports": updated_reports,
         "prediction_updated_submissions": updated_submissions,
     }
+
+
+def run_auto_calibration_lifecycle(
+    *,
+    project_id: str,
+    atomic_json_transaction: TransactionFactory,
+    load_projects: Callable[[], Records],
+    find_project: Callable[[str, Records], Record],
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    @atomic_json_transaction(
+        "calibration_models",
+        "projects",
+        "score_reports",
+        "submissions",
+    )
+    def commit() -> Dict[str, Any]:
+        original_projects = deepcopy(load_projects())
+        projects = deepcopy(original_projects)
+        project = find_project(project_id, projects)
+        originals = {
+            "calibration_models": deepcopy(kwargs["load_calibration_models"]()),
+            "projects": original_projects,
+            "score_reports": deepcopy(kwargs["load_score_reports"]()),
+            "submissions": deepcopy(kwargs["load_submissions"]()),
+        }
+        savers = {
+            "calibration_models": kwargs["save_calibration_models"],
+            "projects": kwargs["save_projects"],
+            "score_reports": kwargs["save_score_reports"],
+            "submissions": kwargs["save_submissions"],
+        }
+        attempted: List[str] = []
+        operation_kwargs = dict(kwargs)
+        operation_kwargs["project_id"] = project_id
+        operation_kwargs["project"] = project
+        operation_kwargs["projects"] = projects
+        for name in savers:
+            operation_kwargs[f"save_{name}"] = _tracked_saver(
+                name,
+                savers[name],
+                attempted,
+            )
+        try:
+            return _run_auto_calibration_lifecycle(**operation_kwargs)
+        except BaseException as error:
+            _restore_attempted(
+                error,
+                attempted=attempted,
+                originals=originals,
+                savers=savers,
+            )
+            raise
+
+    return commit()

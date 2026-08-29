@@ -9939,7 +9939,6 @@ def get_latest_qingtian_result(submission_id: str) -> QingTianResultRecord:
     tags=["洞察与学习"],
     responses={**RESPONSES_401, **RESPONSES_422},
 )
-@atomic_json_transaction("calibration_models", "calibration_samples", "projects")
 def train_calibrator(
     payload: CalibratorTrainRequest,
     api_key: Optional[str] = Depends(verify_api_key),
@@ -9948,6 +9947,7 @@ def train_calibrator(
     ensure_data_dirs()
     try:
         record = calibration_model_service.train_calibration_model(
+            atomic_json_transaction=atomic_json_transaction,
             project_id=payload.project_id,
             model_type_raw=payload.model_type,
             alpha=float(payload.alpha),
@@ -10000,7 +10000,6 @@ def list_calibration_models() -> list[CalibratorModelRecord]:
     tags=["洞察与学习"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
-@atomic_json_transaction("calibration_models", "projects")
 def deploy_calibrator(
     payload: CalibratorDeployRequest,
     api_key: Optional[str] = Depends(verify_api_key),
@@ -10009,6 +10008,7 @@ def deploy_calibrator(
     ensure_data_dirs()
     try:
         target = calibration_model_service.deploy_calibration_model(
+            atomic_json_transaction=atomic_json_transaction,
             calibrator_version=payload.calibrator_version,
             project_id=payload.project_id,
             load_calibration_models=load_calibration_models,
@@ -10030,7 +10030,6 @@ def deploy_calibrator(
     tags=["洞察与学习"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
-@atomic_json_transaction("projects", "score_reports", "submissions")
 def apply_calibration_prediction(
     project_id: str,
     api_key: Optional[str] = Depends(verify_api_key),
@@ -10038,25 +10037,25 @@ def apply_calibration_prediction(
 ) -> CalibratorPredictResponse:
     """将已部署校准器应用到项目已有评分报告。"""
     ensure_data_dirs()
-    projects = load_projects()
     try:
-        project = _find_project(project_id, projects)
+        result = calibration_model_service.apply_calibration_prediction(
+            project_id=project_id,
+            atomic_json_transaction=atomic_json_transaction,
+            load_projects=load_projects,
+            find_project=_find_project,
+            load_calibration_models=load_calibration_models,
+            load_submissions=load_submissions,
+            load_score_reports=load_score_reports,
+            save_score_reports=save_score_reports,
+            save_submissions=save_submissions,
+            build_feature_row=build_feature_row,
+            predict_with_model=predict_with_model,
+            fuse_rule_and_llm_scores=_fuse_rule_and_llm_scores,
+            to_float_or_none=_to_float_or_none,
+            clip_score=_clip_score,
+        )
     except HTTPException:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    result = calibration_model_service.apply_calibration_prediction(
-        project_id=project_id,
-        project=project,
-        load_calibration_models=load_calibration_models,
-        load_submissions=load_submissions,
-        load_score_reports=load_score_reports,
-        save_score_reports=save_score_reports,
-        save_submissions=save_submissions,
-        build_feature_row=build_feature_row,
-        predict_with_model=predict_with_model,
-        fuse_rule_and_llm_scores=_fuse_rule_and_llm_scores,
-        to_float_or_none=_to_float_or_none,
-        clip_score=_clip_score,
-    )
     return CalibratorPredictResponse(**result)
 
 
@@ -10322,8 +10321,9 @@ def auto_run_reflection_pipeline(
     samples = [s for s in load_calibration_samples() if str(s.get("project_id")) == project_id]
     calibration_run = calibration_model_service.run_auto_calibration_lifecycle(
         project_id=project_id,
-        project=project,
-        projects=projects,
+        atomic_json_transaction=atomic_json_transaction,
+        load_projects=load_projects,
+        find_project=_find_project,
         samples=samples,
         train_best_calibrator_auto=train_best_calibrator_auto,
         cross_validate_calibrator=cross_validate_calibrator,
