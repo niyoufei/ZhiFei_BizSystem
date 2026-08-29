@@ -1,12 +1,12 @@
-# QingTian v1.1.0-rc.3 生产准入候选
+# QingTian v1.1.0-rc.4 生产准入候选
 
 ## 基线
 
 - 主线基线：`aca8a3ba4aa416ebf1ce074f92a999d05798963b`
 - 前序候选：`v1.1.0-rc.1`
 - RC1 镜像：`ghcr.io/niyoufei/zhifei-bizsystem@sha256:d2d1c8c0d4003340cb5ed1571df49ec587359d3340972a02ce2396f45fbb790b`
-- RC3 包含 RC2 的可观测性和本机隔离认证基础设施，并修复 Linux 非 root 容器读取
-  bind-mounted secret 的权限问题；不改变业务 API 或存储 schema。
+- RC4 包含 RC3 的可观测性、非 root secret 修复和本机隔离认证基础设施，并在认证时
+  等待首次 Prometheus 抓取完成；不改变业务 API 或存储 schema。
 
 ## 发布门禁
 

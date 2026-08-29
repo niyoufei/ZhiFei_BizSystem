@@ -16,9 +16,9 @@ REPO_ROOT = Path(__file__).parents[1]
 
 
 def test_release_version_is_derived_from_single_runtime_source():
-    assert __version__ == "1.1.0rc3"
-    assert RELEASE_VERSION == "1.1.0-rc.3"
-    assert RELEASE_TAG == "v1.1.0-rc.3"
+    assert __version__ == "1.1.0rc4"
+    assert RELEASE_VERSION == "1.1.0-rc.4"
+    assert RELEASE_TAG == "v1.1.0-rc.4"
 
     pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     assert pyproject["project"]["dynamic"] == ["version"]
@@ -30,9 +30,9 @@ def test_release_version_is_derived_from_single_runtime_source():
 
 def test_release_tag_verifier_accepts_only_the_certified_tag():
     assert verify_release_tag(RELEASE_TAG) == {
-        "package_version": "1.1.0rc3",
-        "release_version": "1.1.0-rc.3",
-        "release_tag": "v1.1.0-rc.3",
+        "package_version": "1.1.0rc4",
+        "release_version": "1.1.0-rc.4",
+        "release_tag": "v1.1.0-rc.4",
     }
     with pytest.raises(ValueError, match="release tag mismatch"):
         verify_release_tag("v1.1.0")

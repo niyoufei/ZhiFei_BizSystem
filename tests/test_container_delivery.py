@@ -121,7 +121,7 @@ def test_container_and_compose_pin_security_persistence_and_health_contracts():
         'CMD ["python", "scripts/container_healthcheck.py"]',
         "tesseract-ocr-chi-sim",
         "org.opencontainers.image.version",
-        "APP_VERSION=1.1.0-rc.3",
+        "APP_VERSION=1.1.0-rc.4",
     ):
         assert required in dockerfile
     assert service["read_only"] is True

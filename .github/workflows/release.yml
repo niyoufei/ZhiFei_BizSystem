@@ -18,7 +18,7 @@ concurrency:
 env:
   IMAGE_NAME: ghcr.io/niyoufei/zhifei-bizsystem
   GRAFANA_IMAGE_NAME: ghcr.io/niyoufei/zhifei-bizsystem-grafana
-  RELEASE_VERSION: 1.1.0-rc.3
+  RELEASE_VERSION: 1.1.0-rc.4
 
 jobs:
   lint:
@@ -226,13 +226,29 @@ jobs:
             docker compose --project-name qingtian-release-monitor \
               -f compose.yaml -f docker-compose.monitoring.yml up -d --no-build
 
+          stack_ready=false
           for _ in $(seq 1 90); do
-            curl -fsS http://127.0.0.1:18080/ready >/dev/null \
+            if curl -fsS http://127.0.0.1:18080/ready >/dev/null \
               && curl -fsS http://127.0.0.1:19090/-/ready >/dev/null \
-              && curl -fsS http://127.0.0.1:13000/api/health >/dev/null \
-              && break
+              && curl -fsS http://127.0.0.1:13000/api/health >/dev/null; then
+              stack_ready=true
+              break
+            fi
             sleep 2
           done
+          test "${stack_ready}" = true
+
+          target_up=false
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:19090/api/v1/targets \
+              >/tmp/prometheus-targets.json \
+              && python -c 'import json; from pathlib import Path; p=json.loads(Path("/tmp/prometheus-targets.json").read_text()); q=[x for x in p["data"]["activeTargets"] if x["labels"].get("job")=="qingtian"]; raise SystemExit(0 if len(q)==1 and q[0]["health"]=="up" else 1)'; then
+              target_up=true
+              break
+            fi
+            sleep 2
+          done
+          test "${target_up}" = true
 
           curl -fsS http://127.0.0.1:19090/api/v1/targets >/tmp/prometheus-targets.json
           python - <<'PY'
@@ -386,7 +402,7 @@ jobs:
             > release-digest.txt
           printf '%s@%s\n' "${GRAFANA_IMAGE_NAME}" "${{ needs.publish.outputs.grafana_digest }}" \
             >> release-digest.txt
-          cp docs/release-v1.1.0-rc.3.md release-notes.md
+          cp docs/release-v1.1.0-rc.4.md release-notes.md
           printf "\n## Immutable images\n\n- \`%s@%s\`\n- \`%s@%s\`\n" \
             "${IMAGE_NAME}" "${{ needs.publish.outputs.app_digest }}" \
             "${GRAFANA_IMAGE_NAME}" "${{ needs.publish.outputs.grafana_digest }}" \
