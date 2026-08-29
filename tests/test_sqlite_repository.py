@@ -28,6 +28,7 @@ def backend(tmp_path):
 def test_backend_enables_wal_and_passes_integrity_check(backend):
     assert backend.journal_mode() == "wal"
     assert backend.integrity_check() == "ok"
+    assert backend.checkpoint()[0] == 0
 
 
 def test_round_trip_persists_across_backend_instances_and_increments_revision(
@@ -90,6 +91,19 @@ def test_transaction_rejects_access_to_undeclared_store(backend):
         commit()
 
     assert backend.load("submissions") == []
+
+
+def test_transaction_allows_undeclared_read_only_dependency(backend):
+    backend.save("submissions", [{"id": "s1"}])
+
+    @backend.transaction_factory("projects")
+    def commit():
+        assert backend.load("submissions") == [{"id": "s1"}]
+        backend.save("projects", [{"id": "p1"}])
+
+    commit()
+
+    assert backend.load("projects") == [{"id": "p1"}]
 
 
 def test_nested_transaction_uses_savepoint_for_declared_subset(backend):

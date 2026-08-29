@@ -84,11 +84,16 @@ class SQLiteRepositoryBackend:
     def _active_state(self) -> _TransactionState | None:
         return getattr(self._local, "transaction", None)
 
-    def _connection_for_active_store(self, name: str) -> sqlite3.Connection | None:
+    def _connection_for_active_store(
+        self,
+        name: str,
+        *,
+        write: bool,
+    ) -> sqlite3.Connection | None:
         state = self._active_state()
         if state is None:
             return None
-        if name not in state.allowed_stores:
+        if write and name not in state.allowed_stores:
             raise RuntimeError(f"store not declared in SQLite transaction: {name}")
         return state.connection
 
@@ -106,7 +111,7 @@ class SQLiteRepositoryBackend:
 
     def load(self, name: str) -> Any:
         self._validate_store(name)
-        active_connection = self._connection_for_active_store(name)
+        active_connection = self._connection_for_active_store(name, write=False)
         if active_connection is not None:
             return self._load_with_connection(active_connection, name)
         connection = self._connect()
@@ -136,7 +141,7 @@ class SQLiteRepositoryBackend:
 
     def save(self, name: str, value: Any) -> None:
         self._validate_store(name)
-        active_connection = self._connection_for_active_store(name)
+        active_connection = self._connection_for_active_store(name, write=True)
         if active_connection is not None:
             self._save_with_connection(active_connection, name, value)
             return
@@ -223,7 +228,7 @@ class SQLiteRepositoryBackend:
 
     def revision(self, name: str) -> int:
         self._validate_store(name)
-        active_connection = self._connection_for_active_store(name)
+        active_connection = self._connection_for_active_store(name, write=False)
         connection = active_connection or self._connect()
         try:
             row = connection.execute(
@@ -246,5 +251,15 @@ class SQLiteRepositoryBackend:
         connection = self._connect()
         try:
             return str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+        finally:
+            connection.close()
+
+    def checkpoint(self) -> tuple[int, int, int]:
+        if self._active_state() is not None:
+            raise RuntimeError("cannot checkpoint during an active SQLite transaction")
+        connection = self._connect()
+        try:
+            row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            return tuple(int(value) for value in row)
         finally:
             connection.close()
