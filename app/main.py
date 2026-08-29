@@ -9886,7 +9886,6 @@ def get_latest_submission_scoring_basis(
     tags=["施组提交"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
-@atomic_json_transaction("projects", "qingtian_results")
 def ingest_qingtian_result(
     submission_id: str,
     payload: QingTianResultCreate,
@@ -9894,33 +9893,25 @@ def ingest_qingtian_result(
 ) -> QingTianResultRecord:
     """写入青天真实评标结果。"""
     ensure_data_dirs()
-    submissions = load_submissions()
-    submission = _find_submission(submission_id, submissions)
-    project_id = str(submission.get("project_id") or "")
-    projects = load_projects()
-    project = _find_project(project_id, projects)
-
-    record = qingtian_result_service.build_qingtian_result_record(
+    record = qingtian_result_service.commit_qingtian_result(
         submission_id=submission_id,
         qingtian_model_version=payload.qingtian_model_version,
-        project_model_version=project.get("qingtian_model_version"),
         default_model_version=DEFAULT_QINGTIAN_MODEL_VERSION,
         qt_total_score=payload.qt_total_score,
         qt_dim_scores=payload.qt_dim_scores,
         qt_reasons=payload.qt_reasons,
         raw_payload=payload.raw_payload,
-        record_id=str(uuid4()),
-        created_at=_now_iso(),
+        atomic_json_transaction=atomic_json_transaction,
+        load_submissions=load_submissions,
+        find_submission=_find_submission,
+        load_projects=load_projects,
+        save_projects=save_projects,
+        find_project=_find_project,
+        load_qingtian_results=load_qingtian_results,
+        save_qingtian_results=save_qingtian_results,
+        record_id_factory=lambda: str(uuid4()),
+        now_iso=_now_iso,
     )
-    results = load_qingtian_results()
-    results.append(record)
-    save_qingtian_results(results)
-
-    if str(project.get("status") or "") == "scoring_preparation":
-        project["status"] = "submitted_to_qingtian"
-        project["updated_at"] = _now_iso()
-        save_projects(projects)
-
     return QingTianResultRecord(**record)
 
 
