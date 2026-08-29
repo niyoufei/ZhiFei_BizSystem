@@ -6401,6 +6401,7 @@ def rescore_project_submissions(
         "evidence_units",
         "expert_profiles",
         "projects",
+        "score_history",
         "score_reports",
         "submissions",
     )
@@ -6421,18 +6422,15 @@ def rescore_project_submissions(
             save_score_reports=save_score_reports,
             load_evidence_units=load_evidence_units,
             save_evidence_units=save_evidence_units,
+            load_score_history=load_score_history,
+            save_score_history=save_score_history,
             save_projects=save_projects,
+            record_history_score=record_history_score,
             replace_submission_evidence_units=_replace_submission_evidence_units,
         )
 
     committed_ids = commit()
     generated = len(committed_ids)
-    for item in computed_updates:
-        if str(item["submission_id"]) not in committed_ids:
-            continue
-        history_args = item.get("history_args")
-        if isinstance(history_args, dict):
-            record_history_score(**history_args)
 
     # 重评分属于有效反馈信号：自动刷新样本并触发校准/调权重闭环。
     feedback_closed_loop = _run_feedback_closed_loop_safe(

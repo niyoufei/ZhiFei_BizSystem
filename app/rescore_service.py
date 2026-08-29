@@ -4,6 +4,17 @@ import copy
 from typing import Callable, Dict, List, Optional
 
 
+def _append_rollback_note(error: BaseException, rollback_error: BaseException) -> None:
+    note = f"rescore rollback also failed: {type(rollback_error).__name__}: {rollback_error}"
+    add_note = getattr(error, "add_note", None)
+    if callable(add_note):
+        add_note(note)
+        return
+    notes = list(getattr(error, "__notes__", []))
+    notes.append(note)
+    error.__notes__ = notes
+
+
 def aggregate_material_utilization_summaries(
     summaries: List[Dict[str, object]],
     *,
@@ -435,28 +446,39 @@ def commit_rescore_batch(
     save_score_reports: Callable[[List[Dict[str, object]]], None],
     load_evidence_units: Callable[[], List[Dict[str, object]]],
     save_evidence_units: Callable[[List[Dict[str, object]]], None],
+    load_score_history: Callable[[], List[Dict[str, object]]],
+    save_score_history: Callable[[List[Dict[str, object]]], None],
     save_projects: Callable[[List[Dict[str, object]]], None],
+    record_history_score: Callable[..., object],
     replace_submission_evidence_units: Callable[..., List[Dict[str, object]]],
 ) -> set[str]:
     committed_ids: set[str] = set()
-    latest_projects = load_projects()
+    originals = {
+        "projects": copy.deepcopy(load_projects()),
+        "expert_profiles": copy.deepcopy(load_expert_profiles()),
+        "submissions": copy.deepcopy(load_submissions()),
+        "score_reports": copy.deepcopy(load_score_reports()),
+        "evidence_units": copy.deepcopy(load_evidence_units()),
+        "score_history": copy.deepcopy(load_score_history()),
+    }
+    latest_projects = copy.deepcopy(originals["projects"])
     latest_project = find_latest_project(project_id, latest_projects)
     latest_project.update(copy.deepcopy(project_patch))
 
+    latest_profiles = copy.deepcopy(originals["expert_profiles"])
     if profile_created:
-        latest_profiles = load_expert_profiles()
         if not any(str(item.get("id")) == str(profile.get("id")) for item in latest_profiles):
             latest_profiles.append(copy.deepcopy(profile))
-        save_expert_profiles(latest_profiles)
 
-    latest_submissions = load_submissions()
+    latest_submissions = copy.deepcopy(originals["submissions"])
     submissions_by_id = {
         str(item.get("id")): item
         for item in latest_submissions
         if isinstance(item, dict) and str(item.get("id"))
     }
-    latest_reports = load_score_reports()
-    latest_evidence_units = load_evidence_units()
+    latest_reports = copy.deepcopy(originals["score_reports"])
+    latest_evidence_units = copy.deepcopy(originals["evidence_units"])
+    history_args_list: List[Dict[str, object]] = []
     for item in computed_updates:
         submission_id = str(item["submission_id"])
         latest_submission = submissions_by_id.get(submission_id)
@@ -473,11 +495,44 @@ def commit_rescore_batch(
             new_units=copy.deepcopy(item["evidence_units"]),
         )
         committed_ids.add(submission_id)
+        history_args = item.get("history_args")
+        if isinstance(history_args, dict):
+            history_args_list.append(copy.deepcopy(history_args))
 
-    save_submissions(latest_submissions)
-    save_score_reports(latest_reports)
-    save_evidence_units(latest_evidence_units)
-    save_projects(latest_projects)
+    savers = {
+        "projects": save_projects,
+        "expert_profiles": save_expert_profiles,
+        "submissions": save_submissions,
+        "score_reports": save_score_reports,
+        "evidence_units": save_evidence_units,
+        "score_history": save_score_history,
+    }
+    attempted: List[str] = []
+
+    try:
+        if profile_created:
+            attempted.append("expert_profiles")
+            save_expert_profiles(latest_profiles)
+        attempted.append("submissions")
+        save_submissions(latest_submissions)
+        attempted.append("score_reports")
+        save_score_reports(latest_reports)
+        attempted.append("evidence_units")
+        save_evidence_units(latest_evidence_units)
+        attempted.append("projects")
+        save_projects(latest_projects)
+        if history_args_list:
+            attempted.append("score_history")
+            for history_args in history_args_list:
+                record_history_score(**history_args)
+    except BaseException as error:
+        for name in reversed(attempted):
+            try:
+                savers[name](copy.deepcopy(originals[name]))
+            except BaseException as rollback_error:
+                _append_rollback_note(error, rollback_error)
+        raise
+
     return committed_ids
 
 

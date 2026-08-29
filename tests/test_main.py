@@ -1181,6 +1181,10 @@ class TestExpertProfileEndpoints:
 
     @patch("app.main._run_feedback_closed_loop")
     @patch("app.main._validate_material_gate_for_scoring")
+    @patch("app.main.save_score_history")
+    @patch("app.main.load_score_history")
+    @patch("app.main.save_evidence_units")
+    @patch("app.main.load_evidence_units")
     @patch("app.main.record_history_score")
     @patch("app.main.save_score_reports")
     @patch("app.main.load_score_reports")
@@ -1205,6 +1209,10 @@ class TestExpertProfileEndpoints:
         mock_load_score_reports,
         mock_save_score_reports,
         mock_record_history,
+        mock_load_evidence_units,
+        mock_save_evidence_units,
+        mock_load_score_history,
+        mock_save_score_history,
         mock_material_gate,
         mock_feedback_loop,
         client,
@@ -1241,6 +1249,8 @@ class TestExpertProfileEndpoints:
             }
         ]
         mock_load_score_reports.return_value = []
+        mock_load_evidence_units.return_value = []
+        mock_load_score_history.return_value = []
         mock_load_config.return_value = MagicMock(rubric={}, lexicon={})
         mock_score_text.return_value = MagicMock(
             model_dump=lambda: {
@@ -1278,6 +1288,8 @@ class TestExpertProfileEndpoints:
         assert "material_utilization_gate" in data
         mock_save_submissions.assert_called_once()
         mock_save_score_reports.assert_called_once()
+        mock_save_evidence_units.assert_called_once()
+        mock_save_score_history.assert_not_called()
         mock_record_history.assert_called_once()
         mock_feedback_loop.assert_called_once_with("p1", locale="zh", trigger="rescore")
 
