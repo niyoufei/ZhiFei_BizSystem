@@ -52,7 +52,7 @@ services:
       - no-new-privileges:true
 
   grafana:
-    image: ${R8_GRAFANA_IMAGE:?R8_GRAFANA_IMAGE must use the RC2 immutable digest}
+    image: ${R8_GRAFANA_IMAGE:?R8_GRAFANA_IMAGE must use the candidate immutable digest}
     restart: unless-stopped
     ports:
       - "127.0.0.1:${R8_GRAFANA_PORT:-13000}:3000"

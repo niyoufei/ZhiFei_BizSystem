@@ -20,9 +20,9 @@ from starlette.routing import Route
 ROUTE_MANIFEST_SHA256 = (
     "852a6fa50cc45cfeed121802b9027251947d59d7b3008ed0a4cd0da7fe89cd8c"  # gitleaks:allow
 )
-# R8 adds certified metrics auth and 1.1.0rc2 version metadata.
+# R8 adds certified metrics auth and 1.1.0rc3 version metadata.
 OPENAPI_CANONICAL_SHA256 = (
-    "741658ee3fe7e45f034e86540f0c46f5dd14ea0b6d84bc7e5ae9bf4e04f1aa74"  # gitleaks:allow
+    "5dde84a2a637af2e8fda49a4e8e13457790b1c7a185f2b46c0765706178518df"  # gitleaks:allow
 )
 AUTH_MATRIX_SHA256 = (
     "c65f5c1c39dc89a57144b92be5c25ce51cf08c744464e4c718ba44a4482dfc67"  # gitleaks:allow
@@ -203,7 +203,7 @@ def test_formal_app_factory_and_route_counts(runtime_modules) -> None:
 def test_openapi_versions_and_counts(runtime_modules) -> None:
     openapi = runtime_modules.main.app.openapi()
     assert openapi.get("openapi") == "3.1.0"
-    assert openapi.get("info", {}).get("version") == "1.1.0rc2"
+    assert openapi.get("info", {}).get("version") == "1.1.0rc3"
 
     paths = openapi.get("paths", {})
     operations = sum(
