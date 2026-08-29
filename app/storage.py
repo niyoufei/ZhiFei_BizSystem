@@ -190,7 +190,9 @@ def _fsync_parent_dir(path: Path) -> None:
             if callable(add_note):
                 add_note(close_note)
             else:
-                fsync_error.args = (*fsync_error.args, close_note)
+                notes = list(getattr(fsync_error, "__notes__", []))
+                notes.append(close_note)
+                fsync_error.__notes__ = notes
         raise
     else:
         os.close(dir_fd)
