@@ -63,6 +63,7 @@ def test_release_workflow_enforces_certified_delivery_gates():
         "pip-audit --requirement requirements-runtime.txt",
         "zricethezav/gitleaks:v8.30.0",
         "severity: HIGH,CRITICAL",
+        "aquasecurity/trivy-action@v0.36.0",
         "--read-only",
         "--cap-drop ALL",
         "tesseract --list-langs",

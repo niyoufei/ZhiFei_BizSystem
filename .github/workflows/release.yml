@@ -150,7 +150,7 @@ jobs:
           assert any(project["id"] == project_id for project in projects)
           PY
       - name: Scan release image
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: qingtian-release:${{ github.sha }}
           format: table
