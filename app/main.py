@@ -69,6 +69,7 @@ from starlette.routing import Match
 import app.adaptive_configuration_service as adaptive_configuration_service
 import app.anchor_requirement_service as anchor_requirement_service
 import app.calibration_model_service as calibration_model_service
+import app.data_hygiene_service as data_hygiene_service
 import app.document_parser as _document_parser
 import app.engine.local_llm_ollama_preview_adapter as local_llm_ollama_preview_adapter
 import app.engine.local_llm_preview_mock as local_llm_preview_mock
@@ -4943,283 +4944,54 @@ def get_locale(
     return parse_accept_language(accept_language)
 
 
-@atomic_json_transaction(
-    "calibration_samples",
-    "delta_cases",
-    "evidence_units",
-    "evolution_reports",
-    "ground_truth",
-    "learning_profiles",
-    "materials",
-    "patch_deployments",
-    "patch_packages",
-    "project_anchors",
-    "project_context",
-    "project_requirements",
-    "projects",
-    "qingtian_results",
-    "score_history",
-    "score_reports",
-    "submissions",
-)
 def _build_data_hygiene_report(*, apply: bool) -> Dict[str, object]:
-    """
-    数据卫生巡检/修复：
-    - 清理 project_id 不存在的孤儿记录
-    - 清理 submission_id 不存在的孤儿记录
-    - 清理 project_id 维度的 dict 型映射残留键
-    """
     ensure_data_dirs()
-    projects = load_projects()
-    valid_project_ids = {str(p.get("id") or "").strip() for p in projects if str(p.get("id") or "")}
-    datasets: List[Dict[str, object]] = []
-    orphan_records_total = 0
-    cleaned_records_total = 0
-
-    def _append_dataset(
-        *,
-        name: str,
-        total: int,
-        orphan_count: int,
-        cleaned_count: int = 0,
-        mode: str = "project_id",
-    ) -> None:
-        nonlocal orphan_records_total, cleaned_records_total
-        orphan_records_total += int(orphan_count)
-        cleaned_records_total += int(cleaned_count)
-        datasets.append(
-            {
-                "name": name,
-                "total": int(total),
-                "orphan_count": int(orphan_count),
-                "cleaned_count": int(cleaned_count),
-                "mode": mode,
-            }
-        )
-
-    def _scan_project_scoped_rows(
-        *,
-        name: str,
-        rows: List[Dict[str, object]],
-        save_fn,
-    ) -> List[Dict[str, object]]:
-        kept: List[Dict[str, object]] = []
-        orphan_count = 0
-        for row in rows:
-            if not isinstance(row, dict):
-                kept.append(row)
-                continue
-            pid = str(row.get("project_id") or "").strip()
-            if pid and pid not in valid_project_ids:
-                orphan_count += 1
-                continue
-            kept.append(row)
-        cleaned_count = orphan_count if apply else 0
-        if apply and orphan_count > 0:
-            save_fn(kept)
-        _append_dataset(
-            name=name,
-            total=len(rows),
-            orphan_count=orphan_count,
-            cleaned_count=cleaned_count,
-            mode="project_id",
-        )
-        return kept
-
-    submissions_rows = load_submissions()
-    submissions_kept = _scan_project_scoped_rows(
-        name="submissions",
-        rows=submissions_rows,
-        save_fn=save_submissions,
-    )
-    valid_submission_ids = {
-        str(row.get("id") or "").strip()
-        for row in submissions_kept
-        if isinstance(row, dict) and str(row.get("id") or "").strip()
+    loaders = {
+        "projects": load_projects,
+        "submissions": load_submissions,
+        "materials": load_materials,
+        "learning_profiles": load_learning_profiles,
+        "score_history": load_score_history,
+        "ground_truth": load_ground_truth,
+        "project_anchors": load_project_anchors,
+        "project_requirements": load_project_requirements,
+        "delta_cases": load_delta_cases,
+        "calibration_samples": load_calibration_samples,
+        "calibration_models": load_calibration_models,
+        "patch_packages": load_patch_packages,
+        "patch_deployments": load_patch_deployments,
+        "score_reports": load_score_reports,
+        "evidence_units": load_evidence_units,
+        "qingtian_results": load_qingtian_results,
+        "project_context": load_project_context,
+        "evolution_reports": load_evolution_reports,
     }
-
-    def _scan_submission_linked_rows(
-        *,
-        name: str,
-        rows: List[Dict[str, object]],
-        save_fn,
-        submission_key: str = "submission_id",
-    ) -> None:
-        kept: List[Dict[str, object]] = []
-        orphan_count = 0
-        for row in rows:
-            if not isinstance(row, dict):
-                kept.append(row)
-                continue
-            pid = str(row.get("project_id") or "").strip()
-            sid = str(row.get(submission_key) or "").strip()
-            orphan_by_project = bool(pid) and pid not in valid_project_ids
-            orphan_by_submission = bool(sid) and sid not in valid_submission_ids
-            if orphan_by_project or orphan_by_submission:
-                orphan_count += 1
-                continue
-            kept.append(row)
-        cleaned_count = orphan_count if apply else 0
-        if apply and orphan_count > 0:
-            save_fn(kept)
-        _append_dataset(
-            name=name,
-            total=len(rows),
-            orphan_count=orphan_count,
-            cleaned_count=cleaned_count,
-            mode=f"project_id|{submission_key}",
-        )
-
-    _scan_project_scoped_rows(
-        name="materials",
-        rows=load_materials(),
-        save_fn=save_materials,
-    )
-    _scan_project_scoped_rows(
-        name="learning_profiles",
-        rows=load_learning_profiles(),
-        save_fn=save_learning_profiles,
-    )
-    _scan_project_scoped_rows(
-        name="score_history",
-        rows=load_score_history(),
-        save_fn=save_score_history,
-    )
-    _scan_project_scoped_rows(
-        name="ground_truth_scores",
-        rows=load_ground_truth(),
-        save_fn=save_ground_truth,
-    )
-    _scan_project_scoped_rows(
-        name="project_anchors",
-        rows=load_project_anchors(),
-        save_fn=save_project_anchors,
-    )
-    _scan_project_scoped_rows(
-        name="project_requirements",
-        rows=load_project_requirements(),
-        save_fn=save_project_requirements,
-    )
-    _scan_project_scoped_rows(
-        name="delta_cases",
-        rows=load_delta_cases(),
-        save_fn=save_delta_cases,
-    )
-    _scan_project_scoped_rows(
-        name="calibration_samples",
-        rows=load_calibration_samples(),
-        save_fn=save_calibration_samples,
-    )
-
-    patch_packages_rows = _scan_project_scoped_rows(
-        name="patch_packages",
-        rows=load_patch_packages(),
-        save_fn=save_patch_packages,
-    )
-    valid_patch_ids = {
-        str(p.get("id") or "").strip()
-        for p in patch_packages_rows
-        if isinstance(p, dict) and str(p.get("id") or "").strip()
+    savers = {
+        "submissions": save_submissions,
+        "materials": save_materials,
+        "learning_profiles": save_learning_profiles,
+        "score_history": save_score_history,
+        "ground_truth": save_ground_truth,
+        "project_anchors": save_project_anchors,
+        "project_requirements": save_project_requirements,
+        "delta_cases": save_delta_cases,
+        "calibration_samples": save_calibration_samples,
+        "calibration_models": save_calibration_models,
+        "patch_packages": save_patch_packages,
+        "patch_deployments": save_patch_deployments,
+        "score_reports": save_score_reports,
+        "evidence_units": save_evidence_units,
+        "qingtian_results": save_qingtian_results,
+        "project_context": save_project_context,
+        "evolution_reports": save_evolution_reports,
     }
-
-    # patch_deployments 额外校验 patch_id
-    patch_deployments_rows = load_patch_deployments()
-    patch_deployments_kept: List[Dict[str, object]] = []
-    patch_deployments_orphan = 0
-    for row in patch_deployments_rows:
-        if not isinstance(row, dict):
-            patch_deployments_kept.append(row)
-            continue
-        pid = str(row.get("project_id") or "").strip()
-        patch_id = str(row.get("patch_id") or "").strip()
-        orphan_by_project = bool(pid) and pid not in valid_project_ids
-        orphan_by_patch = bool(patch_id) and patch_id not in valid_patch_ids
-        if orphan_by_project or orphan_by_patch:
-            patch_deployments_orphan += 1
-            continue
-        patch_deployments_kept.append(row)
-    if apply and patch_deployments_orphan > 0:
-        save_patch_deployments(patch_deployments_kept)
-    _append_dataset(
-        name="patch_deployments",
-        total=len(patch_deployments_rows),
-        orphan_count=patch_deployments_orphan,
-        cleaned_count=(patch_deployments_orphan if apply else 0),
-        mode="project_id|patch_id",
+    return data_hygiene_service.build_data_hygiene_report(
+        apply=apply,
+        atomic_json_transaction=atomic_json_transaction,
+        loaders=loaders,
+        savers=savers,
+        now_iso=_now_iso,
     )
-
-    _scan_submission_linked_rows(
-        name="score_reports",
-        rows=load_score_reports(),
-        save_fn=save_score_reports,
-        submission_key="submission_id",
-    )
-    _scan_submission_linked_rows(
-        name="evidence_units",
-        rows=load_evidence_units(),
-        save_fn=save_evidence_units,
-        submission_key="submission_id",
-    )
-    _scan_submission_linked_rows(
-        name="qingtian_results",
-        rows=load_qingtian_results(),
-        save_fn=save_qingtian_results,
-        submission_key="submission_id",
-    )
-
-    def _scan_project_map(*, name: str, data: Dict[str, object], save_fn) -> None:
-        if not isinstance(data, dict):
-            _append_dataset(name=name, total=0, orphan_count=0, cleaned_count=0, mode="project_map")
-            return
-        orphan_keys = [str(k) for k in data.keys() if str(k) not in valid_project_ids]
-        cleaned_count = len(orphan_keys) if apply else 0
-        if apply and orphan_keys:
-            new_data = {k: v for k, v in data.items() if str(k) in valid_project_ids}
-            save_fn(new_data)
-        _append_dataset(
-            name=name,
-            total=len(data),
-            orphan_count=len(orphan_keys),
-            cleaned_count=cleaned_count,
-            mode="project_map",
-        )
-
-    _scan_project_map(
-        name="project_context",
-        data=load_project_context(),
-        save_fn=save_project_context,
-    )
-    _scan_project_map(
-        name="evolution_reports",
-        data=load_evolution_reports(),
-        save_fn=save_evolution_reports,
-    )
-
-    recommendations: List[str] = []
-    if orphan_records_total <= 0:
-        recommendations.append("数据卫生良好：未发现跨项目孤儿记录。")
-    elif apply:
-        recommendations.append(
-            f"已清理孤儿记录 {cleaned_records_total} 条，建议执行一次 doctor/acceptance 回归。"
-        )
-    else:
-        recommendations.append(
-            f"发现孤儿记录 {orphan_records_total} 条，建议调用 /api/v1/system/data_hygiene/repair 进行修复。"
-        )
-    if orphan_records_total > 0:
-        recommendations.append(
-            "建议在批量删除项目后执行数据卫生巡检，避免历史孤儿记录影响统计与审计。"
-        )
-
-    return {
-        "generated_at": _now_iso(),
-        "apply_mode": bool(apply),
-        "valid_project_count": len(valid_project_ids),
-        "orphan_records_total": int(orphan_records_total),
-        "cleaned_records_total": int(cleaned_records_total),
-        "datasets": datasets,
-        "recommendations": recommendations,
-    }
 
 
 def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
@@ -6513,26 +6285,6 @@ def rescore_project_submissions(
     )
 
 
-@atomic_json_transaction(
-    "calibration_samples",
-    "delta_cases",
-    "evidence_units",
-    "evolution_reports",
-    "expert_profiles",
-    "ground_truth",
-    "learning_profiles",
-    "materials",
-    "patch_deployments",
-    "patch_packages",
-    "project_anchors",
-    "project_context",
-    "project_requirements",
-    "projects",
-    "qingtian_results",
-    "score_history",
-    "score_reports",
-    "submissions",
-)
 def _delete_project_cascade(project_id: str, *, locale: str = "zh") -> Dict[str, object]:
     """
     删除项目及其关联数据。
@@ -6551,6 +6303,7 @@ def _delete_project_cascade(project_id: str, *, locale: str = "zh") -> Dict[str,
     """
     return project_delete_service.delete_project_cascade(
         project_id=project_id,
+        atomic_json_transaction=atomic_json_transaction,
         materials_dir=MATERIALS_DIR,
         ensure_data_dirs=ensure_data_dirs,
         load_projects=load_projects,
@@ -6586,6 +6339,8 @@ def _delete_project_cascade(project_id: str, *, locale: str = "zh") -> Dict[str,
         save_project_context=save_project_context,
         load_ground_truth=load_ground_truth,
         save_ground_truth=save_ground_truth,
+        load_calibration_models=load_calibration_models,
+        save_calibration_models=save_calibration_models,
         load_evolution_reports=load_evolution_reports,
         save_evolution_reports=save_evolution_reports,
         load_expert_profiles=load_expert_profiles,

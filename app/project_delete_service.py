@@ -1,15 +1,126 @@
 from __future__ import annotations
 
 import shutil
+import tempfile
+from copy import deepcopy
 from pathlib import Path
-from typing import Callable, Dict, List
+from typing import Any, Callable, Dict, List
 
 Record = Dict[str, object]
 LoadRecords = Callable[[], List[Record]]
 SaveRecords = Callable[[List[Record]], None]
+LoaderMap = Dict[str, Callable[[], Any]]
+SaverMap = Dict[str, Callable[[Any], None]]
+TransactionDecorator = Callable[[Callable[[], Record]], Callable[[], Record]]
+TransactionFactory = Callable[..., TransactionDecorator]
+
+PROJECT_DELETE_STORES = (
+    "calibration_models",
+    "calibration_samples",
+    "delta_cases",
+    "evidence_units",
+    "evolution_reports",
+    "expert_profiles",
+    "ground_truth",
+    "learning_profiles",
+    "materials",
+    "patch_deployments",
+    "patch_packages",
+    "project_anchors",
+    "project_context",
+    "project_requirements",
+    "projects",
+    "qingtian_results",
+    "score_history",
+    "score_reports",
+    "submissions",
+)
 
 
-def delete_project_cascade(
+def _append_rollback_note(error: BaseException, rollback_error: BaseException) -> None:
+    note = (
+        "project-delete rollback also failed: " f"{type(rollback_error).__name__}: {rollback_error}"
+    )
+    add_note = getattr(error, "add_note", None)
+    if callable(add_note):
+        add_note(note)
+        return
+    notes = list(getattr(error, "__notes__", []))
+    notes.append(note)
+    error.__notes__ = notes
+
+
+def _restore_staged_paths(
+    staged_paths: List[tuple[Path, Path]],
+    *,
+    error: BaseException,
+) -> None:
+    for staged, original in reversed(staged_paths):
+        if not staged.exists():
+            continue
+        try:
+            original.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(staged), str(original))
+        except BaseException as rollback_error:
+            _append_rollback_note(error, rollback_error)
+
+
+def _stage_project_files(
+    *,
+    project_id: str,
+    materials_dir: Path,
+    materials: List[Record],
+) -> tuple[Path | None, List[tuple[Path, Path]], List[str]]:
+    project_dir = (materials_dir / project_id).resolve()
+    materials_root = materials_dir.resolve()
+    candidates: List[Path] = []
+    warnings: List[str] = []
+    project_dir_is_managed = project_dir.is_relative_to(materials_root)
+    if not project_dir_is_managed:
+        warnings.append(f"skipped project directory outside managed root: {project_dir}")
+    elif project_dir.exists():
+        candidates.append(project_dir)
+    for material in materials:
+        if str(material.get("project_id") or "") != project_id:
+            continue
+        raw_path = str(material.get("path") or "").strip()
+        if not raw_path:
+            continue
+        path = Path(raw_path).expanduser().resolve()
+        if project_dir_is_managed and (path == project_dir or path.is_relative_to(project_dir)):
+            continue
+        if not path.is_relative_to(materials_root):
+            warnings.append(f"skipped material outside managed root: {path}")
+            continue
+        if path.exists() and path.is_file() and path not in candidates:
+            candidates.append(path)
+    if not candidates:
+        return None, [], warnings
+
+    materials_dir.parent.mkdir(parents=True, exist_ok=True)
+    quarantine = Path(
+        tempfile.mkdtemp(
+            prefix=f".project-delete-{project_id}-",
+            dir=str(materials_dir.parent),
+        )
+    )
+    staged_paths: List[tuple[Path, Path]] = []
+    try:
+        for index, original in enumerate(candidates):
+            staged = quarantine / f"{index:04d}-{original.name}"
+            shutil.move(str(original), str(staged))
+            staged_paths.append((staged, original))
+    except BaseException as error:
+        _restore_staged_paths(staged_paths, error=error)
+        try:
+            shutil.rmtree(quarantine)
+        except BaseException as cleanup_error:
+            _append_rollback_note(error, cleanup_error)
+        raise
+    return quarantine, staged_paths, warnings
+
+
+def _delete_project_records(
     *,
     project_id: str,
     materials_dir: Path,
@@ -47,6 +158,8 @@ def delete_project_cascade(
     save_project_context: Callable[[Dict[str, object]], None],
     load_ground_truth: LoadRecords,
     save_ground_truth: SaveRecords,
+    load_calibration_models: LoadRecords,
+    save_calibration_models: SaveRecords,
     load_evolution_reports: Callable[[], Dict[str, object]],
     save_evolution_reports: Callable[[Dict[str, object]], None],
     load_expert_profiles: LoadRecords,
@@ -68,6 +181,7 @@ def delete_project_cascade(
         "ground_truth": 0,
         "delta_cases": 0,
         "calibration_samples": 0,
+        "calibration_models": 0,
         "patch_packages": 0,
     }
 
@@ -76,19 +190,7 @@ def delete_project_cascade(
     materials = load_materials()
     project_materials = [m for m in materials if m.get("project_id") == project_id]
     removed_counts["materials"] = len(project_materials)
-    for material in project_materials:
-        path = Path(str(material.get("path") or ""))
-        if path.exists() and path.is_file():
-            try:
-                path.unlink()
-            except Exception:
-                pass
     save_materials([m for m in materials if m.get("project_id") != project_id])
-    invalidate_material_index_cache(project_id)
-
-    project_dir = materials_dir / project_id
-    if project_dir.exists():
-        shutil.rmtree(project_dir, ignore_errors=True)
 
     submissions = load_submissions()
     project_submission_ids = {
@@ -178,6 +280,19 @@ def delete_project_cascade(
     )
     save_ground_truth([r for r in ground_truth if r.get("project_id") != project_id])
 
+    calibration_models = load_calibration_models()
+    kept_models: List[Record] = []
+    for model in calibration_models:
+        train_filter = model.get("train_filter")
+        scoped_project_id = (
+            str(train_filter.get("project_id") or "") if isinstance(train_filter, dict) else ""
+        )
+        if scoped_project_id == project_id:
+            removed_counts["calibration_models"] += 1
+            continue
+        kept_models.append(model)
+    save_calibration_models(kept_models)
+
     reports = load_evolution_reports()
     if project_id in reports:
         reports.pop(project_id, None)
@@ -198,3 +313,75 @@ def delete_project_cascade(
         "project_name": target_name,
         "removed_counts": removed_counts,
     }
+
+
+def delete_project_cascade(
+    *,
+    project_id: str,
+    atomic_json_transaction: TransactionFactory,
+    **kwargs: Any,
+) -> Dict[str, object]:
+    kwargs["ensure_data_dirs"]()
+
+    @atomic_json_transaction(*PROJECT_DELETE_STORES)
+    def commit() -> Record:
+        originals = {name: deepcopy(kwargs[f"load_{name}"]()) for name in PROJECT_DELETE_STORES}
+        if not any(str(project.get("id") or "") == project_id for project in originals["projects"]):
+            raise kwargs["project_not_found_error"]()
+
+        quarantine, staged_paths, cleanup_warnings = _stage_project_files(
+            project_id=project_id,
+            materials_dir=kwargs["materials_dir"],
+            materials=originals["materials"],
+        )
+        savers = {name: kwargs[f"save_{name}"] for name in PROJECT_DELETE_STORES}
+        attempted: List[str] = []
+        operation_kwargs = dict(kwargs)
+        operation_kwargs["ensure_data_dirs"] = lambda: None
+        operation_kwargs["invalidate_material_index_cache"] = lambda _project_id: None
+        for name, saver in savers.items():
+
+            def tracked_save(data: Any, *, _name=name, _saver=saver) -> None:
+                if _name not in attempted:
+                    attempted.append(_name)
+                _saver(data)
+
+            operation_kwargs[f"save_{name}"] = tracked_save
+
+        try:
+            result = _delete_project_records(project_id=project_id, **operation_kwargs)
+        except BaseException as error:
+            for name in reversed(attempted):
+                try:
+                    savers[name](deepcopy(originals[name]))
+                except BaseException as rollback_error:
+                    _append_rollback_note(error, rollback_error)
+            _restore_staged_paths(staged_paths, error=error)
+            if quarantine is not None and quarantine.exists():
+                try:
+                    shutil.rmtree(quarantine)
+                except BaseException as cleanup_error:
+                    _append_rollback_note(error, cleanup_error)
+            raise
+
+        result["cleanup_warnings"] = cleanup_warnings
+        result["_quarantine"] = quarantine
+        return result
+
+    result = commit()
+    cleanup_warnings = list(result.pop("cleanup_warnings", []))
+    quarantine = result.pop("_quarantine", None)
+    try:
+        kwargs["invalidate_material_index_cache"](project_id)
+    except BaseException as error:
+        cleanup_warnings.append(
+            f"material index cache invalidation failed: {type(error).__name__}: {error}"
+        )
+    if isinstance(quarantine, Path) and quarantine.exists():
+        try:
+            shutil.rmtree(quarantine)
+        except BaseException as error:
+            cleanup_warnings.append(f"quarantine cleanup failed: {type(error).__name__}: {error}")
+    if cleanup_warnings:
+        result["cleanup_warnings"] = cleanup_warnings
+    return result
