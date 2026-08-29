@@ -176,19 +176,11 @@ def sync_ground_truth_record_to_qingtian(
     }
     report_for_feedback = matched_submission.get("report")
     if isinstance(report_for_feedback, dict):
-        try:
-            feature_confidence_update = auto_update_feature_confidence_on_ground_truth(
-                report=report_for_feedback,
-                gt_record=gt_record,
-                project_score_scale_max=project_score_scale,
-            )
-        except Exception as exc:
-            feature_confidence_update = {
-                "updated": 0,
-                "retired": 0,
-                "reason": "feature_confidence_update_error",
-                "error": str(exc),
-            }
+        feature_confidence_update = auto_update_feature_confidence_on_ground_truth(
+            report=report_for_feedback,
+            gt_record=gt_record,
+            project_score_scale_max=project_score_scale,
+        )
 
     if source_gt_id:
         all_gt_records = load_ground_truth()

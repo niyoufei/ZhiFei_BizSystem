@@ -295,7 +295,6 @@ from app.schemas import (
 from app.storage import (
     DATA_DIR,
     MATERIALS_DIR,
-    append_ground_truth_records,
     atomic_json_transaction,
     ensure_data_dirs,
     load_calibration_models,
@@ -305,6 +304,7 @@ from app.storage import (
     load_evolution_reports,
     load_expert_profiles,
     load_ground_truth,
+    load_high_score_features,
     load_learning_profiles,
     load_materials,
     load_patch_deployments,
@@ -324,6 +324,7 @@ from app.storage import (
     save_evolution_reports,
     save_expert_profiles,
     save_ground_truth,
+    save_high_score_features,
     save_learning_profiles,
     save_materials,
     save_patch_deployments,
@@ -4655,6 +4656,48 @@ def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, 
         save_qingtian_results=save_qingtian_results,
         save_projects=save_projects,
         refresh_project_reflection_objects=_refresh_project_reflection_objects,
+    )
+
+
+def _commit_ground_truth_additions(
+    project_id: str,
+    records: List[Dict[str, object]],
+    *,
+    locale: str,
+) -> None:
+    ground_truth_write_service.commit_ground_truth_additions(
+        project_id,
+        records,
+        atomic_json_transaction=atomic_json_transaction,
+        load_projects=load_projects,
+        save_projects=save_projects,
+        load_ground_truth=load_ground_truth,
+        save_ground_truth=save_ground_truth,
+        load_submissions=load_submissions,
+        save_submissions=save_submissions,
+        load_score_reports=load_score_reports,
+        save_score_reports=save_score_reports,
+        load_evidence_units=load_evidence_units,
+        save_evidence_units=save_evidence_units,
+        load_score_history=load_score_history,
+        save_score_history=save_score_history,
+        load_qingtian_results=load_qingtian_results,
+        save_qingtian_results=save_qingtian_results,
+        load_high_score_features=load_high_score_features,
+        save_high_score_features=save_high_score_features,
+        load_calibration_samples=load_calibration_samples,
+        save_calibration_samples=save_calibration_samples,
+        load_delta_cases=load_delta_cases,
+        save_delta_cases=save_delta_cases,
+        sync_ground_truth_record=_sync_ground_truth_record_to_qingtian,
+        project_not_found_error=lambda: HTTPException(
+            status_code=404,
+            detail=t("api.project_not_found", locale=locale),
+        ),
+        source_submission_not_found_error=lambda: HTTPException(
+            status_code=404,
+            detail="未找到对应施组，请先在步骤4上传施组。",
+        ),
     )
 
 
@@ -11124,25 +11167,6 @@ def _new_ground_truth_record(
     tags=["自我学习与进化"],
     responses={**RESPONSES_401, **RESPONSES_404, **RESPONSES_422},
 )
-@atomic_json_transaction(
-    "calibration_models",
-    "calibration_samples",
-    "delta_cases",
-    "evidence_units",
-    "evolution_reports",
-    "expert_profiles",
-    "ground_truth",
-    "high_score_features",
-    "patch_deployments",
-    "patch_packages",
-    "project_anchors",
-    "project_requirements",
-    "projects",
-    "qingtian_results",
-    "score_history",
-    "score_reports",
-    "submissions",
-)
 def add_ground_truth(
     project_id: str,
     payload: GroundTruthCreate,
@@ -11175,8 +11199,7 @@ def add_ground_truth(
         judge_weights=payload.judge_weights,
         qualitative_tags_by_judge=payload.qualitative_tags_by_judge,
     )
-    append_ground_truth_records([record])
-    _sync_ground_truth_record_to_qingtian(project_id, record)
+    _commit_ground_truth_additions(project_id, [record], locale=locale)
     record["feedback_closed_loop"] = _run_feedback_closed_loop_safe(
         project_id,
         locale=locale,
@@ -11190,25 +11213,6 @@ def add_ground_truth(
     response_model=GroundTruthRecord,
     tags=["自我学习与进化"],
     responses={**RESPONSES_401, **RESPONSES_404, **RESPONSES_422},
-)
-@atomic_json_transaction(
-    "calibration_models",
-    "calibration_samples",
-    "delta_cases",
-    "evidence_units",
-    "evolution_reports",
-    "expert_profiles",
-    "ground_truth",
-    "high_score_features",
-    "patch_deployments",
-    "patch_packages",
-    "project_anchors",
-    "project_requirements",
-    "projects",
-    "qingtian_results",
-    "score_history",
-    "score_reports",
-    "submissions",
 )
 def add_ground_truth_from_submission(
     project_id: str,
@@ -11255,10 +11259,7 @@ def add_ground_truth_from_submission(
     record["source_submission_id"] = submission_id
     record["source_submission_filename"] = submission.get("filename")
 
-    records = load_ground_truth()
-    records.append(record)
-    save_ground_truth(records)
-    _sync_ground_truth_record_to_qingtian(project_id, record)
+    _commit_ground_truth_additions(project_id, [record], locale=locale)
     record["feedback_closed_loop"] = _run_feedback_closed_loop_safe(
         project_id,
         locale=locale,
@@ -11311,8 +11312,7 @@ async def add_ground_truth_from_file(
         judge_weights=None,
         qualitative_tags_by_judge=None,
     )
-    append_ground_truth_records([record])
-    _sync_ground_truth_record_to_qingtian(project_id, record)
+    _commit_ground_truth_additions(project_id, [record], locale=locale)
     record["feedback_closed_loop"] = _run_feedback_closed_loop_safe(
         project_id,
         locale=locale,
@@ -11387,14 +11387,7 @@ async def add_ground_truth_from_files(
             )
 
     if success_records:
-        append_ground_truth_records(success_records)
-        for item in items:
-            record = item.get("record")
-            if item.get("ok") and isinstance(record, dict):
-                try:
-                    _sync_ground_truth_record_to_qingtian(project_id, record)
-                except Exception as e:
-                    item["detail"] = f"已保存，但同步青天失败：{e}"
+        _commit_ground_truth_additions(project_id, success_records, locale=locale)
         closed_loop_result = _run_feedback_closed_loop_safe(
             project_id,
             locale=locale,

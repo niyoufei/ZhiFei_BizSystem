@@ -8,6 +8,8 @@ Records = List[Record]
 Loader = Callable[[], Records]
 Saver = Callable[[Records], None]
 Refresh = Callable[[str], object]
+TransactionDecorator = Callable[[Callable[[], None]], Callable[[], None]]
+TransactionFactory = Callable[..., TransactionDecorator]
 
 
 def _is_synthetic_ground_truth_submission(
@@ -39,7 +41,7 @@ def _linked_ground_truth_id(result: Record) -> str:
 
 def _append_rollback_note(error: BaseException, rollback_error: BaseException) -> None:
     note = (
-        "ground-truth delete rollback also failed: "
+        "ground-truth write rollback also failed: "
         f"{type(rollback_error).__name__}: {rollback_error}"
     )
     add_note = getattr(error, "add_note", None)
@@ -49,6 +51,131 @@ def _append_rollback_note(error: BaseException, rollback_error: BaseException) -
     notes = list(getattr(error, "__notes__", []))
     notes.append(note)
     error.__notes__ = notes
+
+
+def commit_ground_truth_additions(
+    project_id: str,
+    records: Records,
+    *,
+    atomic_json_transaction: TransactionFactory,
+    load_projects: Loader,
+    save_projects: Saver,
+    load_ground_truth: Loader,
+    save_ground_truth: Saver,
+    load_submissions: Loader,
+    save_submissions: Saver,
+    load_score_reports: Loader,
+    save_score_reports: Saver,
+    load_evidence_units: Loader,
+    save_evidence_units: Saver,
+    load_score_history: Loader,
+    save_score_history: Saver,
+    load_qingtian_results: Loader,
+    save_qingtian_results: Saver,
+    load_high_score_features: Loader,
+    save_high_score_features: Saver,
+    load_calibration_samples: Loader,
+    save_calibration_samples: Saver,
+    load_delta_cases: Loader,
+    save_delta_cases: Saver,
+    sync_ground_truth_record: Callable[[str, Record], None],
+    project_not_found_error: Callable[[], Exception],
+    source_submission_not_found_error: Callable[[], Exception],
+) -> None:
+    if not records:
+        return
+
+    @atomic_json_transaction(
+        "calibration_samples",
+        "delta_cases",
+        "evidence_units",
+        "ground_truth",
+        "high_score_features",
+        "project_anchors",
+        "project_requirements",
+        "projects",
+        "qingtian_results",
+        "score_history",
+        "score_reports",
+        "submissions",
+    )
+    def commit() -> None:
+        originals = {
+            "projects": deepcopy(load_projects()),
+            "ground_truth": deepcopy(load_ground_truth()),
+            "submissions": deepcopy(load_submissions()),
+            "score_reports": deepcopy(load_score_reports()),
+            "evidence_units": deepcopy(load_evidence_units()),
+            "score_history": deepcopy(load_score_history()),
+            "qingtian_results": deepcopy(load_qingtian_results()),
+            "high_score_features": deepcopy(load_high_score_features()),
+            "calibration_samples": deepcopy(load_calibration_samples()),
+            "delta_cases": deepcopy(load_delta_cases()),
+        }
+        if not any(str(project.get("id") or "") == project_id for project in originals["projects"]):
+            raise project_not_found_error()
+
+        source_submission_ids = {
+            str(record.get("source_submission_id") or "").strip()
+            for record in records
+            if str(record.get("source_submission_id") or "").strip()
+        }
+        if source_submission_ids:
+            available_submission_ids = {
+                str(submission.get("id") or "")
+                for submission in originals["submissions"]
+                if str(submission.get("project_id") or "") == project_id
+            }
+            if not source_submission_ids.issubset(available_submission_ids):
+                raise source_submission_not_found_error()
+
+        savers = {
+            "projects": save_projects,
+            "ground_truth": save_ground_truth,
+            "submissions": save_submissions,
+            "score_reports": save_score_reports,
+            "evidence_units": save_evidence_units,
+            "score_history": save_score_history,
+            "qingtian_results": save_qingtian_results,
+            "high_score_features": save_high_score_features,
+            "calibration_samples": save_calibration_samples,
+            "delta_cases": save_delta_cases,
+        }
+        attempted: List[str] = []
+
+        def mark_attempted(name: str) -> None:
+            if name not in attempted:
+                attempted.append(name)
+
+        try:
+            updated_ground_truth = deepcopy(originals["ground_truth"])
+            updated_ground_truth.extend(deepcopy(records))
+            mark_attempted("ground_truth")
+            save_ground_truth(updated_ground_truth)
+
+            for name in (
+                "submissions",
+                "score_reports",
+                "evidence_units",
+                "score_history",
+                "qingtian_results",
+                "high_score_features",
+                "projects",
+                "calibration_samples",
+                "delta_cases",
+            ):
+                mark_attempted(name)
+            for record in records:
+                sync_ground_truth_record(project_id, deepcopy(record))
+        except BaseException as error:
+            for name in reversed(attempted):
+                try:
+                    savers[name](deepcopy(originals[name]))
+                except BaseException as rollback_error:
+                    _append_rollback_note(error, rollback_error)
+            raise
+
+    commit()
 
 
 def delete_ground_truth_cascade(

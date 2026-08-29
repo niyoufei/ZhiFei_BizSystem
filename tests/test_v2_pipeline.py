@@ -849,7 +849,7 @@ class TestPatchPackageEndpoints:
 
 
 class TestGroundTruthAutoSync:
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.save_ground_truth")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_projects")
@@ -874,7 +874,7 @@ class TestGroundTruthAutoSync:
         assert resp.status_code == 200
         mock_sync.assert_called_once()
 
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.save_ground_truth")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_submissions")
@@ -910,10 +910,9 @@ class TestGroundTruthAutoSync:
         data = resp.json()
         assert data["project_id"] == "p1"
         assert data["source"] == "青天大模型"
-        mock_save_records.assert_called_once()
         mock_sync.assert_called_once()
 
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.save_ground_truth")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_submissions")
@@ -949,10 +948,9 @@ class TestGroundTruthAutoSync:
         data = resp.json()
         assert data["judge_count"] == 7
         assert len(data["judge_scores"]) == 7
-        mock_save_records.assert_called_once()
         mock_sync.assert_called_once()
 
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.save_ground_truth")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_submissions")
@@ -989,7 +987,7 @@ class TestGroundTruthAutoSync:
         mock_save_records.assert_not_called()
         mock_sync.assert_not_called()
 
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.save_ground_truth")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_submissions")
@@ -1022,10 +1020,9 @@ class TestGroundTruthAutoSync:
         }
         resp = _client().post("/api/projects/p1/ground_truth/from_submission", json=payload)
         assert resp.status_code == 200
-        mock_save_records.assert_called_once()
         mock_sync.assert_called_once()
 
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.save_ground_truth")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_projects")
@@ -1053,7 +1050,7 @@ class TestGroundTruthAutoSync:
         assert resp.status_code == 200
         mock_sync.assert_called_once()
 
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.save_ground_truth")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_projects")
@@ -1083,8 +1080,7 @@ class TestGroundTruthAutoSync:
         assert data["judge_count"] == 7
         mock_sync.assert_called_once()
 
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
-    @patch("app.main.append_ground_truth_records")
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
@@ -1093,7 +1089,6 @@ class TestGroundTruthAutoSync:
         mock_ensure,
         mock_load_projects,
         mock_load_records,
-        mock_save_records,
         mock_sync,
     ):
         mock_load_projects.return_value = [{"id": "p1"}]
@@ -1117,11 +1112,10 @@ class TestGroundTruthAutoSync:
         assert data["total_files"] == 2
         assert data["success_count"] == 2
         assert data["failed_count"] == 0
-        assert mock_sync.call_count == 2
-        mock_save_records.assert_called_once()
+        mock_sync.assert_called_once()
+        assert len(mock_sync.call_args.args[1]) == 2
 
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
-    @patch("app.main.append_ground_truth_records")
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
@@ -1130,7 +1124,6 @@ class TestGroundTruthAutoSync:
         mock_ensure,
         mock_load_projects,
         mock_load_records,
-        mock_save_records,
         mock_sync,
     ):
         mock_load_projects.return_value = [{"id": "p1"}]
@@ -1154,11 +1147,41 @@ class TestGroundTruthAutoSync:
         assert data["total_files"] == 2
         assert data["success_count"] == 1
         assert data["failed_count"] == 1
-        assert mock_sync.call_count == 1
-        mock_save_records.assert_called_once()
+        mock_sync.assert_called_once()
+        assert len(mock_sync.call_args.args[1]) == 1
 
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
-    @patch("app.main.append_ground_truth_records")
+    @patch("app.main._run_feedback_closed_loop_safe")
+    @patch(
+        "app.main._commit_ground_truth_additions",
+        side_effect=RuntimeError("controlled ground-truth commit failure"),
+    )
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_batch_commit_failure_does_not_run_feedback(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_commit,
+        mock_feedback,
+    ):
+        mock_load_projects.return_value = [{"id": "p1"}]
+        file_content = ("施组正文内容" * 30).encode("utf-8")
+
+        with pytest.raises(RuntimeError, match="controlled ground-truth commit failure"):
+            _client().post(
+                "/api/v1/projects/p1/ground_truth/from_files",
+                files=[("files", ("ok.txt", file_content, "text/plain"))],
+                data={
+                    "judge_scores": "[80,81,82,83,84]",
+                    "final_score": "82",
+                    "source": "青天大模型",
+                },
+            )
+
+        mock_commit.assert_called_once()
+        mock_feedback.assert_not_called()
+
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
@@ -1167,7 +1190,6 @@ class TestGroundTruthAutoSync:
         mock_ensure,
         mock_load_projects,
         mock_load_records,
-        mock_save_records,
         mock_sync,
     ):
         mock_load_projects.return_value = [{"id": "p1"}]
@@ -1187,8 +1209,8 @@ class TestGroundTruthAutoSync:
         assert data["total_files"] == 1
         assert data["success_count"] == 1
         assert data["failed_count"] == 0
-        assert mock_sync.call_count == 1
-        mock_save_records.assert_called_once()
+        mock_sync.assert_called_once()
+        assert len(mock_sync.call_args.args[1]) == 1
 
 
 class TestAutoRunReflection:
@@ -2115,7 +2137,7 @@ class TestScoringMeceInjection:
 
 
 class TestEvolutionClosedLoop:
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.save_ground_truth")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_submissions")
@@ -2156,9 +2178,8 @@ class TestEvolutionClosedLoop:
         assert data["final_score_100"] == 86.0
         assert data["judge_count"] == 5
         assert mock_sync_qt.called
-        synced_record = mock_sync_qt.call_args.args[1]
+        synced_record = mock_sync_qt.call_args.args[1][0]
         assert float(synced_record["final_score_100"]) == 86.0
-        mock_save_ground_truth.assert_called_once()
 
     @patch("app.main.save_evolution_reports")
     @patch("app.main.load_evolution_reports")
