@@ -79,6 +79,7 @@ import app.latest_report_service as latest_report_service
 import app.material_delete_service as material_delete_service
 import app.material_read_service as material_read_service
 import app.material_upload_service as material_upload_service
+import app.patch_evolution_service as patch_evolution_service
 import app.project_context_service as project_context_service
 import app.project_delete_service as project_delete_service
 import app.project_profile_service as project_profile_service
@@ -3456,15 +3457,10 @@ def _select_calibrator_model(project: Dict[str, object]) -> Optional[Dict[str, o
 
 
 def _select_deployed_patch(project_id: str) -> Optional[Dict[str, object]]:
-    packages = [
-        p
-        for p in load_patch_packages()
-        if str(p.get("project_id")) == project_id and str(p.get("status")) == "deployed"
-    ]
-    if not packages:
-        return None
-    packages.sort(key=lambda x: str(x.get("updated_at", "")), reverse=True)
-    return packages[0]
+    return patch_evolution_service.select_deployed_patch(
+        project_id,
+        load_patch_packages=load_patch_packages,
+    )
 
 
 @atomic_json_transaction("patch_deployments", "patch_packages")
@@ -3473,188 +3469,27 @@ def _auto_govern_deployed_patch(
     project_id: str,
     delta_cases: List[Dict[str, object]],
 ) -> Dict[str, object]:
-    """
-    对当前已部署补丁做自动治理：
-    - shadow 评估通过：保留部署
-    - shadow 评估失败且样本充分：自动回滚，并尝试回退到 rollback_pointer
-    """
-    result: Dict[str, object] = {
-        "checked": False,
-        "project_id": project_id,
-        "patch_id": None,
-        "gate_passed": None,
-        "sample_count": 0,
-        "action": "skip",
-        "reason": "no_deployed_patch",
-        "rolled_back": False,
-        "rollback_to_patch_id": None,
-        "metrics_before_after": {},
-        "deployment_record_ids": [],
-    }
-    if not delta_cases:
-        result["reason"] = "no_delta_cases"
-        return result
-
-    packages = load_patch_packages()
-    deployed = [
-        p
-        for p in packages
-        if str(p.get("project_id")) == project_id and str(p.get("status")) == "deployed"
-    ]
-    if not deployed:
-        return result
-
-    deployed = sorted(deployed, key=lambda x: str(x.get("updated_at", "")), reverse=True)
-    patch = deployed[0]
-    patch_id = str(patch.get("id") or "")
-    result["checked"] = True
-    result["patch_id"] = patch_id
-
-    shadow = evaluate_patch_shadow(patch=patch, delta_cases=delta_cases)
-    metrics = shadow.get("metrics_before_after") or {}
-    sample_count = int(_to_float_or_none(metrics.get("sample_count")) or len(delta_cases) or 0)
-    gate_passed = bool(shadow.get("gate_passed"))
-    result["sample_count"] = sample_count
-    result["gate_passed"] = gate_passed
-    result["metrics_before_after"] = metrics
-
-    # 样本不足时不做自动回滚，避免少量噪声导致频繁抖动。
-    min_rollback_samples = 3
-    if gate_passed:
-        result["action"] = "keep"
-        result["reason"] = "shadow_passed"
-        return result
-    if sample_count < min_rollback_samples:
-        result["action"] = "skip"
-        result["reason"] = "insufficient_samples_for_rollback"
-        return result
-
-    now_iso = _now_iso()
-    rollback_pointer = str(patch.get("rollback_pointer") or "").strip()
-    rollback_target = None
-    if rollback_pointer:
-        rollback_target = next(
-            (
-                p
-                for p in packages
-                if str(p.get("id") or "") == rollback_pointer
-                and str(p.get("project_id") or "") == project_id
-            ),
-            None,
-        )
-
-    for row in packages:
-        if str(row.get("project_id") or "") != project_id:
-            continue
-        if str(row.get("status") or "") == "deployed":
-            row["status"] = "shadow_pass"
-            row["updated_at"] = now_iso
-
-    patch["status"] = "rolled_back"
-    patch["updated_at"] = now_iso
-
-    rollback_to_patch_id: Optional[str] = None
-    if rollback_target is not None:
-        rollback_target["status"] = "deployed"
-        rollback_target["updated_at"] = now_iso
-        rollback_to_patch_id = str(rollback_target.get("id") or "")
-
-    save_patch_packages(packages)
-
-    deployment_record_ids: List[str] = []
-    deploys = load_patch_deployments()
-    rollback_record = {
-        "id": str(uuid4()),
-        "patch_id": patch_id,
-        "project_id": project_id,
-        "action": "auto_rollback",
-        "deployed": False,
-        "metrics_before_after": metrics,
-        "rollback_to_version": rollback_to_patch_id or rollback_pointer or None,
-        "created_at": now_iso,
-    }
-    deploys.append(rollback_record)
-    deployment_record_ids.append(str(rollback_record["id"]))
-    if rollback_to_patch_id:
-        promote_record = {
-            "id": str(uuid4()),
-            "patch_id": rollback_to_patch_id,
-            "project_id": project_id,
-            "action": "auto_promote_rollback_pointer",
-            "deployed": True,
-            "metrics_before_after": metrics,
-            "rollback_to_version": None,
-            "created_at": now_iso,
-        }
-        deploys.append(promote_record)
-        deployment_record_ids.append(str(promote_record["id"]))
-    save_patch_deployments(deploys)
-
-    result["action"] = "rollback"
-    result["reason"] = "shadow_failed"
-    result["rolled_back"] = True
-    result["rollback_to_patch_id"] = rollback_to_patch_id
-    result["deployment_record_ids"] = deployment_record_ids
-    return result
+    return patch_evolution_service.auto_govern_deployed_patch(
+        project_id=project_id,
+        delta_cases=delta_cases,
+        load_patch_packages=load_patch_packages,
+        save_patch_packages=save_patch_packages,
+        load_patch_deployments=load_patch_deployments,
+        save_patch_deployments=save_patch_deployments,
+        evaluate_patch_shadow=evaluate_patch_shadow,
+        to_float_or_none=_to_float_or_none,
+        now_iso=_now_iso,
+        new_id=lambda: str(uuid4()),
+    )
 
 
 def _apply_deployed_patch_to_report(project_id: str, report: Dict[str, object]) -> None:
-    patch = _select_deployed_patch(project_id)
-    if not patch:
-        return
-    payload = patch.get("patch_payload") or {}
-    penalties = report.get("penalties")
-    if not isinstance(penalties, list) or not penalties:
-        report.setdefault("meta", {})
-        report["meta"]["patch_id"] = patch.get("id")
-        return
-
-    multipliers = payload.get("penalty_multiplier") or {}
-    old_penalty_total = sum(
-        float(p.get("points", p.get("deduct", 0.0))) for p in penalties if isinstance(p, dict)
+    patch_evolution_service.apply_deployed_patch_to_report(
+        project_id,
+        report,
+        load_patch_packages=load_patch_packages,
+        compute_v2_rule_total=compute_v2_rule_total,
     )
-    new_penalty_total = 0.0
-    for penalty in penalties:
-        if not isinstance(penalty, dict):
-            continue
-        code = str(penalty.get("code") or "")
-        mul = float(multipliers.get(code, 1.0)) if code else 1.0
-        if "points" in penalty and penalty.get("points") is not None:
-            penalty["points"] = round(float(penalty.get("points", 0.0)) * mul, 2)
-            new_penalty_total += float(penalty["points"])
-        elif "deduct" in penalty and penalty.get("deduct") is not None:
-            penalty["deduct"] = round(float(penalty.get("deduct", 0.0)) * mul, 2)
-            new_penalty_total += float(penalty["deduct"])
-        else:
-            new_penalty_total += 0.0
-
-    has_dim_components = ("dim_total_90" in report) or ("dim_total_80" in report)
-    if has_dim_components:
-        dim_total_80 = float(report.get("dim_total_80", 0.0))
-        dim_total_90 = report.get("dim_total_90")
-        if dim_total_90 is not None:
-            # 统一回推为 dim_total_80 再走同一聚合公式，避免历史/新字段混用时口径漂移
-            dim_total_80 = max(0.0, min(80.0, float(dim_total_90) * (80.0 / 90.0)))
-        consistency_bonus = float(report.get("consistency_bonus", 0.0))
-        new_rule_total, normalized_dim_total_90 = compute_v2_rule_total(
-            dim_total_80=dim_total_80,
-            consistency_bonus=consistency_bonus,
-            penalty_points=new_penalty_total,
-        )
-        report["rule_total_score"] = new_rule_total
-        report["total_score"] = new_rule_total
-        report["dim_total_80"] = round(dim_total_80, 2)
-        report["dim_total_90"] = normalized_dim_total_90
-    else:
-        old_total = float(report.get("rule_total_score", report.get("total_score", 0.0)))
-        delta = new_penalty_total - old_penalty_total
-        new_total = max(0.0, min(100.0, round(old_total - delta, 2)))
-        report["rule_total_score"] = new_total
-        report["total_score"] = new_total
-
-    report.setdefault("meta", {})
-    report["meta"]["patch_id"] = patch.get("id")
-    report["meta"]["patch_status"] = patch.get("status")
 
 
 def _clip_score(value: float, low: float = 0.0, high: float = 100.0) -> float:
@@ -10339,30 +10174,18 @@ def mine_patch(
     projects = load_projects()
     if not any(str(p.get("id")) == project_id for p in projects):
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    delta_cases = [d for d in load_delta_cases() if str(d.get("project_id")) == project_id]
-    if not delta_cases:
+    try:
+        package = patch_evolution_service.mine_patch(
+            project_id=project_id,
+            patch_type=payload.patch_type,
+            top_k=int(payload.top_k),
+            load_delta_cases=load_delta_cases,
+            load_patch_packages=load_patch_packages,
+            save_patch_packages=save_patch_packages,
+            mine_patch_package=mine_patch_package,
+        )
+    except patch_evolution_service.PatchDeltaCasesNotFoundError:
         raise HTTPException(status_code=404, detail="暂无 DELTA_CASE，请先重建")
-
-    packages = load_patch_packages()
-    rollback_pointer = None
-    deployed = [
-        p
-        for p in packages
-        if str(p.get("project_id")) == project_id and str(p.get("status")) == "deployed"
-    ]
-    if deployed:
-        deployed = sorted(deployed, key=lambda x: str(x.get("updated_at", "")), reverse=True)
-        rollback_pointer = str(deployed[0].get("id") or "")
-
-    package = mine_patch_package(
-        project_id=project_id,
-        delta_cases=delta_cases,
-        patch_type=payload.patch_type,
-        top_k=int(payload.top_k),
-        rollback_pointer=rollback_pointer,
-    )
-    packages.append(package)
-    save_patch_packages(packages)
     return PatchPackageRecord(**package)
 
 
@@ -10381,8 +10204,10 @@ def list_patches(
     projects = load_projects()
     if not any(str(p.get("id")) == project_id for p in projects):
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    rows = [p for p in load_patch_packages() if str(p.get("project_id")) == project_id]
-    rows = sorted(rows, key=lambda x: str(x.get("updated_at", "")), reverse=True)
+    rows = patch_evolution_service.list_patches(
+        project_id=project_id,
+        load_patch_packages=load_patch_packages,
+    )
     return [PatchPackageRecord(**p) for p in rows]
 
 
@@ -10399,18 +10224,17 @@ def shadow_eval_patch(
 ) -> PatchShadowEvalResponse:
     """对候选补丁做 shadow 评估并更新状态。"""
     ensure_data_dirs()
-    packages = load_patch_packages()
-    patch = next((p for p in packages if str(p.get("id")) == patch_id), None)
-    if patch is None:
+    try:
+        result = patch_evolution_service.shadow_eval_patch(
+            patch_id=patch_id,
+            load_patch_packages=load_patch_packages,
+            save_patch_packages=save_patch_packages,
+            load_delta_cases=load_delta_cases,
+            evaluate_patch_shadow=evaluate_patch_shadow,
+            now_iso=_now_iso,
+        )
+    except patch_evolution_service.PatchNotFoundError:
         raise HTTPException(status_code=404, detail="补丁包不存在")
-    project_id = str(patch.get("project_id") or "")
-    delta_cases = [d for d in load_delta_cases() if str(d.get("project_id")) == project_id]
-
-    result = evaluate_patch_shadow(patch=patch, delta_cases=delta_cases)
-    patch["shadow_metrics"] = result.get("metrics_before_after", {})
-    patch["status"] = "shadow_pass" if bool(result.get("gate_passed")) else "candidate"
-    patch["updated_at"] = _now_iso()
-    save_patch_packages(packages)
     return PatchShadowEvalResponse(**result)
 
 
@@ -10428,42 +10252,23 @@ def deploy_or_rollback_patch(
 ) -> PatchDeploymentRecord:
     """发布或回滚补丁。"""
     ensure_data_dirs()
-    packages = load_patch_packages()
-    patch = next((p for p in packages if str(p.get("id")) == patch_id), None)
-    if patch is None:
+    try:
+        record = patch_evolution_service.deploy_or_rollback_patch(
+            patch_id=patch_id,
+            action_raw=payload.action,
+            rollback_to_version=payload.rollback_to_version,
+            load_patch_packages=load_patch_packages,
+            save_patch_packages=save_patch_packages,
+            load_patch_deployments=load_patch_deployments,
+            save_patch_deployments=save_patch_deployments,
+            now_iso=_now_iso,
+            new_id=lambda: str(uuid4()),
+        )
+    except patch_evolution_service.PatchNotFoundError:
         raise HTTPException(status_code=404, detail="补丁包不存在")
-
-    action = str(payload.action or "deploy").lower()
-    if action not in {"deploy", "rollback"}:
+    except patch_evolution_service.UnsupportedPatchActionError:
         raise HTTPException(status_code=422, detail="action 仅支持 deploy 或 rollback")
-
-    project_id = str(patch.get("project_id") or "")
-    deployed = action == "deploy"
-    if deployed:
-        for p in packages:
-            if str(p.get("project_id")) == project_id and str(p.get("status")) == "deployed":
-                p["status"] = "shadow_pass"
-                p["updated_at"] = _now_iso()
-        patch["status"] = "deployed"
-    else:
-        patch["status"] = "rolled_back"
-    patch["updated_at"] = _now_iso()
-    save_patch_packages(packages)
-
-    rec = {
-        "id": str(uuid4()),
-        "patch_id": patch_id,
-        "project_id": project_id,
-        "action": action,
-        "deployed": deployed,
-        "metrics_before_after": patch.get("shadow_metrics") or {},
-        "rollback_to_version": payload.rollback_to_version or patch.get("rollback_pointer"),
-        "created_at": _now_iso(),
-    }
-    deploys = load_patch_deployments()
-    deploys.append(rec)
-    save_patch_deployments(deploys)
-    return PatchDeploymentRecord(**rec)
+    return PatchDeploymentRecord(**record)
 
 
 @router.post(
@@ -10531,62 +10336,19 @@ def auto_run_reflection_pipeline(
         now_iso=_now_iso,
     )
 
-    patch_id = None
-    patch_gate_passed = None
-    patch_deployed = False
-    patch_auto_govern: Dict[str, object] = {
-        "checked": False,
-        "reason": "not_run",
-        "action": "skip",
-    }
-    if delta_cases:
-        patch_auto_govern = _auto_govern_deployed_patch(
-            project_id=project_id,
-            delta_cases=delta_cases,
-        )
-        packages = load_patch_packages()
-        deployed = [
-            p
-            for p in packages
-            if str(p.get("project_id")) == project_id and str(p.get("status")) == "deployed"
-        ]
-        rollback_pointer = str(deployed[0].get("id")) if deployed else None
-        patch = mine_patch_package(
-            project_id=project_id,
-            delta_cases=delta_cases,
-            patch_type="threshold",
-            top_k=5,
-            rollback_pointer=rollback_pointer,
-        )
-        patch_id = str(patch.get("id"))
-        shadow = evaluate_patch_shadow(patch=patch, delta_cases=delta_cases)
-        patch_gate_passed = bool(shadow.get("gate_passed"))
-        patch["shadow_metrics"] = shadow.get("metrics_before_after", {})
-        patch["status"] = "shadow_pass" if patch_gate_passed else "candidate"
-        patch["updated_at"] = _now_iso()
-
-        if patch_gate_passed:
-            for p in packages:
-                if str(p.get("project_id")) == project_id and str(p.get("status")) == "deployed":
-                    p["status"] = "shadow_pass"
-            patch["status"] = "deployed"
-            patch_deployed = True
-            deploy_rec = {
-                "id": str(uuid4()),
-                "patch_id": patch_id,
-                "project_id": project_id,
-                "action": "deploy",
-                "deployed": True,
-                "metrics_before_after": patch.get("shadow_metrics") or {},
-                "rollback_to_version": patch.get("rollback_pointer"),
-                "created_at": _now_iso(),
-            }
-            deploys = load_patch_deployments()
-            deploys.append(deploy_rec)
-            save_patch_deployments(deploys)
-
-        packages.append(patch)
-        save_patch_packages(packages)
+    patch_run = patch_evolution_service.run_auto_patch_lifecycle(
+        project_id=project_id,
+        delta_cases=delta_cases,
+        auto_govern_deployed_patch=_auto_govern_deployed_patch,
+        load_patch_packages=load_patch_packages,
+        save_patch_packages=save_patch_packages,
+        load_patch_deployments=load_patch_deployments,
+        save_patch_deployments=save_patch_deployments,
+        mine_patch_package=mine_patch_package,
+        evaluate_patch_shadow=evaluate_patch_shadow,
+        now_iso=_now_iso,
+        new_id=lambda: str(uuid4()),
+    )
 
     return ReflectionAutoRunResponse(
         ok=True,
@@ -10604,10 +10366,10 @@ def auto_run_reflection_pipeline(
         calibrator_auto_candidates=calibration_run["calibrator_auto_candidates"],
         prediction_updated_reports=calibration_run["prediction_updated_reports"],
         prediction_updated_submissions=calibration_run["prediction_updated_submissions"],
-        patch_id=patch_id,
-        patch_gate_passed=patch_gate_passed,
-        patch_deployed=patch_deployed,
-        patch_auto_govern=patch_auto_govern,
+        patch_id=patch_run["patch_id"],
+        patch_gate_passed=patch_run["patch_gate_passed"],
+        patch_deployed=patch_run["patch_deployed"],
+        patch_auto_govern=patch_run["patch_auto_govern"],
     )
 
 
