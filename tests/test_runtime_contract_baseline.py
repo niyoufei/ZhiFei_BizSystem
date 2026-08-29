@@ -18,7 +18,8 @@ from fastapi.routing import APIRoute
 from starlette.routing import Route
 
 ROUTE_MANIFEST_SHA256 = "852a6fa50cc45cfeed121802b9027251947d59d7b3008ed0a4cd0da7fe89cd8c"
-OPENAPI_CANONICAL_SHA256 = "7ba83f46c53faee76d2ffc94f772143a46cf5be24fb8e03ac20040dc0e67d105"
+# R3C28 changed only the two atomic-configuration endpoint descriptions.
+OPENAPI_CANONICAL_SHA256 = "630607dd633f58ea5b1349831cf9b1b4ce76ba12118803f21ad1645ee49a7f61"
 AUTH_MATRIX_SHA256 = "c65f5c1c39dc89a57144b92be5c25ce51cf08c744464e4c718ba44a4482dfc67"
 FRONTEND_ADAPTER_SHA256 = "4afc2aa2d276f5e1c6b50ca3a62381a5a163b641233585f2e9cff642780569fb"
 

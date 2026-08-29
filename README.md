@@ -42,6 +42,23 @@
 
 该索引用于交接、验收和回退定位；不改变运行逻辑，不接核心评分主链。
 
+## 容器化生产部署
+
+生产交付使用非 root、只读根文件系统、SQLite/WAL 持久化卷和 secret 文件认证。完整的
+构建、健康检查、备份与回滚步骤见 **[容器部署与交付](docs/container-deployment.md)**。
+
+```bash
+umask 077
+mkdir -p secrets
+python3 -c 'import secrets; print(secrets.token_urlsafe(48))' > secrets/api_keys.txt
+docker compose build --pull
+docker compose up -d
+docker compose ps
+```
+
+默认仅监听 `127.0.0.1:8000`。未配置 API key 时，受保护端点会 fail-closed 返回 503；
+认证仅接受 `X-API-Key` 请求头，不接受 URL query 参数。
+
 ---
 
 ## 环境准备（可选阅读）
@@ -156,17 +173,11 @@ export API_KEYS="your-secret-key-1,your-secret-key-2"
 python3 -m app.main
 ```
 
-**认证方式**（二选一）：
+**认证方式**：仅接受 Header 认证。
 
 ```bash
-# 方式 1：Header 认证（推荐）
 curl -X POST http://localhost:8000/score \
   -H "X-API-Key: your-secret-key-1" \
-  -H "Content-Type: application/json" \
-  -d '{"text": "施工组织设计文本..."}'
-
-# 方式 2：Query 参数认证
-curl -X POST "http://localhost:8000/score?api_key=your-secret-key-1" \
   -H "Content-Type: application/json" \
   -d '{"text": "施工组织设计文本..."}'
 ```
@@ -188,9 +199,9 @@ SPARK_APIPASSWORD=your-spark-apipassword
 ```
 
 **注意**：
-- 如果未设置 `API_KEYS` 环境变量，则跳过认证（开发模式）
-- GET 查询端点（如 `/projects`、`/auth/status`）保持公开
-- POST 写入端点（如 `/score`、`/projects`）受认证保护
+- 如果未设置 `API_KEYS` 环境变量，受保护端点 fail-closed 返回 503
+- `/health`、`/ready` 和公开首页保持无需认证；业务 API 按路由合同执行认证
+- API key 不得进入 URL、日志或版本库
 
 #### 请求限流（Rate Limiting）
 
