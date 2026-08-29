@@ -14,6 +14,7 @@ from app.auth import (
     get_valid_api_keys,
     is_auth_enabled,
     verify_api_key,
+    verify_metrics_api_key,
 )
 
 TEST_API_KEY = "test-auth-key-do-not-use"
@@ -141,6 +142,37 @@ class TestVerifyApiKey:
             assert verify_api_key(api_key_header="key3") == "key3"
 
 
+class TestVerifyMetricsApiKey:
+    def test_bearer_key_is_accepted_for_metrics(self):
+        with patch.dict(os.environ, {API_KEYS_ENV: "metrics-key"}):
+            assert (
+                verify_metrics_api_key(
+                    api_key_header=None,
+                    authorization="Bearer metrics-key",
+                )
+                == "metrics-key"
+            )
+
+    def test_invalid_bearer_key_is_rejected(self):
+        with patch.dict(os.environ, {API_KEYS_ENV: "metrics-key"}):
+            with pytest.raises(HTTPException) as exc_info:
+                verify_metrics_api_key(
+                    api_key_header=None,
+                    authorization="Bearer wrong-key",
+                )
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail["code"] == "AUTH_KEY_INVALID"
+
+    def test_invalid_x_api_key_is_not_rescued_by_valid_bearer(self):
+        with patch.dict(os.environ, {API_KEYS_ENV: "metrics-key"}):
+            with pytest.raises(HTTPException) as exc_info:
+                verify_metrics_api_key(
+                    api_key_header="wrong-key",
+                    authorization="Bearer metrics-key",
+                )
+        assert exc_info.value.detail["code"] == "AUTH_KEY_INVALID"
+
+
 class TestGetAuthStatus:
     """Tests for get_auth_status function."""
 
@@ -179,6 +211,23 @@ class TestIntegrationWithFastAPI:
             data = response.json()
             assert "auth_enabled" in data
             assert "configured_keys_count" in data
+
+    def test_bearer_auth_is_limited_to_metrics(self):
+        from fastapi.testclient import TestClient
+
+        with patch.dict(os.environ, {API_KEYS_ENV: "metrics-key"}):
+            client = TestClient(app)
+            metrics = client.get(
+                "/metrics",
+                headers={"Authorization": "Bearer metrics-key"},
+            )
+            business = client.get(
+                "/api/v1/projects",
+                headers={"Authorization": "Bearer metrics-key"},
+            )
+        assert metrics.status_code == 200
+        assert business.status_code == 401
+        assert business.json()["detail"]["code"] == "AUTH_KEY_MISSING"
 
     def test_protected_endpoint_without_auth(self):
         """Protected endpoint should fail closed when auth is unconfigured."""

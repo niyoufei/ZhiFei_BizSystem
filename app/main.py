@@ -12,6 +12,7 @@ import re
 import shutil  # noqa: F401
 import tempfile
 import threading
+import time
 from collections import Counter
 from datetime import datetime, timezone
 
@@ -94,7 +95,7 @@ import app.reflection_sample_service as reflection_sample_service
 import app.rescore_service as rescore_service
 import app.scoring_basis_service as scoring_basis_service
 import app.submission_scoring_service as submission_scoring_service
-from app.auth import get_auth_status, verify_api_key
+from app.auth import get_auth_status, verify_api_key, verify_metrics_api_key
 from app.cache import (
     cache_score_result,
     clear_score_cache,
@@ -210,7 +211,13 @@ from app.engine.tender_profile import (
 )
 from app.engine.v2_scorer import compute_v2_rule_total, score_text_v2
 from app.i18n import DEFAULT_LOCALE, SUPPORTED_LOCALES, t
-from app.metrics import get_metrics, record_score, update_project_stats
+from app.metrics import (
+    get_metrics,
+    record_request,
+    record_score,
+    update_project_stats,
+    update_readiness_status,
+)
 from app.rate_limit import get_rate_limit_status, setup_rate_limiting
 from app.schemas import (
     RESPONSES_401,
@@ -4817,6 +4824,40 @@ async def _authenticate_before_body_parsing(request: Request, call_next):
     return await call_next(request)
 
 
+def _metrics_route_template(request: Request) -> str:
+    """Return a bounded route label without embedding user-controlled IDs."""
+    for route in request.app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        match, _ = route.matches(request.scope)
+        if match == Match.FULL:
+            return str(route.path)
+    return "__unmatched__"
+
+
+@app.middleware("http")
+async def _record_http_request_metrics(request: Request, call_next):
+    started = time.perf_counter()
+    endpoint = _metrics_route_template(request)
+    try:
+        response = await call_next(request)
+    except BaseException:
+        record_request(
+            request.method,
+            endpoint,
+            500,
+            max(0.0, time.perf_counter() - started),
+        )
+        raise
+    record_request(
+        request.method,
+        endpoint,
+        response.status_code,
+        max(0.0, time.perf_counter() - started),
+    )
+    return response
+
+
 @app.exception_handler(StarletteHTTPException)
 async def _web_405_fallback_handler(request: Request, exc: StarletteHTTPException):
     """
@@ -5123,7 +5164,7 @@ def health_check() -> HealthResponse:
     "/metrics",
     tags=["监控指标"],
     include_in_schema=True,
-    dependencies=[Depends(verify_api_key)],
+    dependencies=[Depends(verify_metrics_api_key)],
 )
 def prometheus_metrics():
     """
@@ -5183,6 +5224,7 @@ def readiness_check() -> ReadyResponse:
     # 所有检查通过则就绪
     all_ready = all(checks.values())
     status = "ready" if all_ready else "not_ready"
+    update_readiness_status(all_ready)
 
     return ReadyResponse(status=status, checks=checks)
 

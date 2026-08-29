@@ -20,9 +20,9 @@ from starlette.routing import Route
 ROUTE_MANIFEST_SHA256 = (
     "852a6fa50cc45cfeed121802b9027251947d59d7b3008ed0a4cd0da7fe89cd8c"  # gitleaks:allow
 )
-# R7 adds the certified 1.1.0rc1 OpenAPI and health-example version metadata.
+# R8 adds certified metrics auth and 1.1.0rc2 version metadata.
 OPENAPI_CANONICAL_SHA256 = (
-    "335199e1a5043fcefa957b85b6686c6bc36d10ec8d250a7b3f169eec87e02b78"  # gitleaks:allow
+    "741658ee3fe7e45f034e86540f0c46f5dd14ea0b6d84bc7e5ae9bf4e04f1aa74"  # gitleaks:allow
 )
 AUTH_MATRIX_SHA256 = (
     "c65f5c1c39dc89a57144b92be5c25ce51cf08c744464e4c718ba44a4482dfc67"  # gitleaks:allow
@@ -55,11 +55,11 @@ def runtime_modules(tmp_path_factory: pytest.TempPathFactory):
         monkeypatch.undo()
 
 
-def _requires_api_key(route: APIRoute, verify_api_key: Any) -> bool:
+def _requires_api_key(route: APIRoute, *verifiers: Any) -> bool:
     pending = list(route.dependant.dependencies)
     while pending:
         dependency = pending.pop()
-        if dependency.call is verify_api_key:
+        if dependency.call in verifiers:
             return True
         pending.extend(dependency.dependencies)
     return False
@@ -93,7 +93,7 @@ def _stable_type(value: Any) -> str:
     return getattr(value, "__name__", None) or re.sub(r"\s+", "", str(value).replace("typing.", ""))
 
 
-def _route_records(app: FastAPI, verify_api_key: Any) -> list[dict[str, Any]]:
+def _route_records(app: FastAPI, *verifiers: Any) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for route in app.routes:
         if not isinstance(route, Route):
@@ -108,7 +108,7 @@ def _route_records(app: FastAPI, verify_api_key: Any) -> list[dict[str, Any]]:
                 "route_class": type(route).__name__,
                 "owner": _owner(path),
                 "category": _category(path),
-                "auth": _requires_api_key(route, verify_api_key) if is_api_route else False,
+                "auth": _requires_api_key(route, *verifiers) if is_api_route else False,
                 "include_in_schema": bool(getattr(route, "include_in_schema", False)),
                 "declared_status": getattr(route, "status_code", None) or 200,
                 "response_model": (
@@ -180,7 +180,7 @@ def test_formal_app_factory_and_route_counts(runtime_modules) -> None:
     assert isinstance(app, FastAPI), f"app.main:app type difference: actual={type(app)!r}"
     assert main.create_app() is app, "create_app() must return the app.main:app singleton"
 
-    records = _route_records(app, main.verify_api_key)
+    records = _route_records(app, main.verify_api_key, main.verify_metrics_api_key)
     _assert_count("HTTP Route/APIRoute object", len(records), 146)
     _assert_count("method-path binding", sum(len(route.methods or []) for route in app.routes), 165)
     _assert_count("FastAPI APIRoute", sum(isinstance(route, APIRoute) for route in app.routes), 142)
@@ -203,7 +203,7 @@ def test_formal_app_factory_and_route_counts(runtime_modules) -> None:
 def test_openapi_versions_and_counts(runtime_modules) -> None:
     openapi = runtime_modules.main.app.openapi()
     assert openapi.get("openapi") == "3.1.0"
-    assert openapi.get("info", {}).get("version") == "1.1.0rc1"
+    assert openapi.get("info", {}).get("version") == "1.1.0rc2"
 
     paths = openapi.get("paths", {})
     operations = sum(
@@ -250,6 +250,9 @@ def test_auth_contract(runtime_modules) -> None:
             route, main.verify_api_key
         ), f"auth difference for GET {path}: expected=no_auth actual=auth"
 
+    metrics_route = _single_api_route(app, "/metrics", "GET")
+    assert _requires_api_key(metrics_route, main.verify_metrics_api_key)
+
 
 @pytest.mark.parametrize(
     "path",
@@ -278,7 +281,7 @@ def test_root_and_frontend_adapter_contract(runtime_modules) -> None:
             route.include_in_schema is False
         ), f"schema visibility difference for {method} /: expected=hidden actual=schema"
 
-    records = _route_records(app, main.verify_api_key)
+    records = _route_records(app, main.verify_api_key, main.verify_metrics_api_key)
     web_records = [record for record in records if record["path"].startswith("/web/")]
     _assert_count("/web/* adapter route object", len(web_records), 8)
     _assert_count(
@@ -331,7 +334,7 @@ def test_root_and_frontend_adapter_contract(runtime_modules) -> None:
 
 def test_frozen_runtime_contract_hashes(runtime_modules) -> None:
     main = runtime_modules.main
-    records = _route_records(main.app, main.verify_api_key)
+    records = _route_records(main.app, main.verify_api_key, main.verify_metrics_api_key)
 
     route_manifest = (
         "\n".join(

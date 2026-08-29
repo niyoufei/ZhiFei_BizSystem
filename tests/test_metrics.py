@@ -11,7 +11,10 @@ from app.metrics import (
     CACHE_SIZE,
     CONFIG_CACHED,
     CONFIG_RELOADS,
+    PROCESS_COLLECTOR,
     PROJECTS_TOTAL,
+    RATE_LIMIT_EXCEEDED,
+    READINESS_STATUS,
     REGISTRY,
     REQUEST_COUNT,
     SCORE_REQUESTS,
@@ -23,11 +26,13 @@ from app.metrics import (
     record_cache_hit,
     record_cache_miss,
     record_config_reload,
+    record_rate_limit_exceeded,
     record_request,
     record_score,
     update_cache_size,
     update_config_cached,
     update_project_stats,
+    update_readiness_status,
 )
 
 
@@ -86,6 +91,24 @@ class TestRecordRequest:
         metrics = get_metrics().decode("utf-8")
         assert "404" in metrics
         assert "500" in metrics
+
+
+class TestOperationalMetrics:
+    def test_readiness_status_is_updated(self):
+        update_readiness_status(True)
+        assert READINESS_STATUS._value.get() == 1
+        update_readiness_status(False)
+        assert READINESS_STATUS._value.get() == 0
+
+    def test_rate_limit_categories_are_bounded(self):
+        before = RATE_LIMIT_EXCEEDED.labels(category="unknown")._value.get()
+        record_rate_limit_exceeded("user-controlled-value")
+        assert RATE_LIMIT_EXCEEDED.labels(category="unknown")._value.get() == before + 1
+
+    def test_process_metrics_are_exported_from_custom_registry(self):
+        # ProcessCollector emits values on Linux (/proc). macOS has no /proc,
+        # so registration is the cross-platform contract exercised here.
+        assert PROCESS_COLLECTOR in REGISTRY._collector_to_names
 
 
 class TestRecordScore:
@@ -255,6 +278,8 @@ class TestMetricsIntegration:
         expected_metrics = [
             "qingtian_http_requests_total",
             "qingtian_http_request_duration_seconds",
+            "qingtian_readiness_status",
+            "qingtian_rate_limit_exceeded_total",
             "qingtian_score_requests_total",
             "qingtian_score_distribution",
             "qingtian_active_score_tasks",

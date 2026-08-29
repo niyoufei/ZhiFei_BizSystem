@@ -771,6 +771,14 @@ class TestMetricsEndpoint:
         # 应该仍然返回 200，即使统计收集失败
         assert response.status_code == 200
 
+    def test_http_metrics_use_route_templates_not_project_ids(self, client):
+        client.get("/api/v1/projects/r8-high-cardinality-id/submissions")
+
+        metrics = client.get("/metrics").text
+
+        assert 'endpoint="/api/v1/projects/{project_id}/submissions"' in metrics
+        assert "r8-high-cardinality-id" not in metrics
+
 
 class TestHealthEndpoints:
     """Tests for health check endpoints."""
@@ -781,7 +789,7 @@ class TestHealthEndpoints:
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "healthy"
-        assert data["version"] == "1.1.0rc1"
+        assert data["version"] == "1.1.0rc2"
 
     def test_health_response_structure(self, client):
         """Health response should have correct structure."""
@@ -4570,7 +4578,7 @@ class TestMainExecution:
 
     def test_app_version(self):
         """App should have correct version."""
-        assert app.version == "1.1.0rc1"
+        assert app.version == "1.1.0rc2"
 
 
 class TestApiI18n:

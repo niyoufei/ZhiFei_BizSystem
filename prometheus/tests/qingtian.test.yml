@@ -1,0 +1,24 @@
+rule_files:
+  - ../alerts/qingtian.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: readiness alert fires and recovers
+    interval: 1m
+    input_series:
+      - series: 'qingtian_readiness_status{job="qingtian"}'
+        values: '0 0 0 0 1 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: QingtianServiceUnhealthy
+        exp_alerts:
+          - exp_labels:
+              job: qingtian
+              severity: critical
+            exp_annotations:
+              summary: 擎天服务健康检查失败
+              description: 健康检查端点返回不健康状态超过 2 分钟。
+      - eval_time: 5m
+        alertname: QingtianServiceUnhealthy
+        exp_alerts: []

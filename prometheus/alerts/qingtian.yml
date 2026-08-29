@@ -17,7 +17,7 @@ groups:
       - alert: QingtianHighErrorRate
         expr: |
           (
-            sum(rate(qingtian_http_requests_total{status=~"5.."}[5m]))
+            sum(rate(qingtian_http_requests_total{status_code=~"5.."}[5m]))
             /
             sum(rate(qingtian_http_requests_total[5m]))
           ) > 0.05
@@ -29,7 +29,7 @@ groups:
           description: "5xx 错误率超过 5%，当前值: {{ $value | printf \"%.2f\" }}%"
 
       - alert: QingtianServiceUnhealthy
-        expr: qingtian_health_status == 0
+        expr: qingtian_readiness_status == 0
         for: 2m
         labels:
           severity: critical
@@ -55,7 +55,7 @@ groups:
       - alert: QingtianScoringTimeout
         expr: |
           histogram_quantile(0.99,
-            sum(rate(qingtian_scoring_duration_seconds_bucket[5m])) by (le)
+            sum(rate(qingtian_http_request_duration_seconds_bucket{endpoint=~".*/score"}[5m])) by (le)
           ) > 30
         for: 3m
         labels:
@@ -113,7 +113,11 @@ groups:
     rules:
       - alert: QingtianLowAverageScore
         expr: |
-          avg(qingtian_scoring_score_value) < 60
+          (
+            sum(rate(qingtian_score_distribution_sum[30m]))
+            /
+            sum(rate(qingtian_score_distribution_count[30m]))
+          ) < 60
         for: 30m
         labels:
           severity: info
@@ -123,7 +127,7 @@ groups:
 
       - alert: QingtianNoScoringActivity
         expr: |
-          sum(increase(qingtian_scoring_requests_total[1h])) == 0
+          sum(increase(qingtian_score_requests_total[1h])) == 0
         for: 2h
         labels:
           severity: info
@@ -167,7 +171,7 @@ groups:
 
       - alert: QingtianHighCPUUsage
         expr: |
-          rate(process_cpu_seconds_total{job="qingtian"}[5m]) > 0.8
+          100 * rate(process_cpu_seconds_total{job="qingtian"}[5m]) > 80
         for: 10m
         labels:
           severity: warning

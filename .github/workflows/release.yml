@@ -17,7 +17,8 @@ concurrency:
 
 env:
   IMAGE_NAME: ghcr.io/niyoufei/zhifei-bizsystem
-  RELEASE_VERSION: 1.1.0-rc.1
+  GRAFANA_IMAGE_NAME: ghcr.io/niyoufei/zhifei-bizsystem-grafana
+  RELEASE_VERSION: 1.1.0-rc.2
 
 jobs:
   lint:
@@ -33,6 +34,26 @@ jobs:
       - run: python -m scripts.verify_release --tag "${GITHUB_REF_NAME}"
       - run: python -m ruff check app/ tests/ scripts/
       - run: git diff --check
+      - name: Validate monitoring contracts
+        run: |
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/prometheus:/etc/prometheus:ro" \
+            -v /dev/null:/run/secrets/qingtian_api_key:ro \
+            prom/prometheus@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0 \
+            check config /etc/prometheus/prometheus.yml
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/prometheus:/etc/prometheus:ro" \
+            prom/prometheus@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0 \
+            test rules /etc/prometheus/tests/qingtian.test.yml
+          docker run --rm --entrypoint amtool \
+            -v "$PWD/prometheus:/etc/alertmanager:ro" \
+            prom/alertmanager@sha256:82eb974c2aca363117a5771746c271f35a7d3da688193251a51a2f3ec783f81d \
+            check-config /etc/alertmanager/alertmanager.yml
+          QINGTIAN_IMAGE=ghcr.io/example/qingtian@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+          R8_GRAFANA_IMAGE=ghcr.io/example/grafana@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+          QINGTIAN_API_KEYS_FILE=/dev/null \
+          R8_GRAFANA_ADMIN_PASSWORD_FILE=/dev/null \
+            docker compose -f compose.yaml -f docker-compose.monitoring.yml config --quiet
 
   test:
     name: Release Test (Python ${{ matrix.python-version }})
@@ -85,6 +106,11 @@ jobs:
           docker build \
             --build-arg APP_VERSION="${RELEASE_VERSION}" \
             --tag "qingtian-release:${GITHUB_SHA}" .
+      - name: Build hardened Grafana image
+        run: |
+          docker build \
+            --file Dockerfile.grafana \
+            --tag "qingtian-grafana-release:${GITHUB_SHA}" .
       - name: Exercise hardened runtime and persistence
         env:
           API_KEY: rc-container-key-6f3c28a1
@@ -149,7 +175,7 @@ jobs:
           projects = json.loads(Path("/tmp/projects-after.json").read_text())
           assert any(project["id"] == project_id for project in projects)
           PY
-      - name: Scan release image
+      - name: Scan application release image
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: qingtian-release:${{ github.sha }}
@@ -157,21 +183,102 @@ jobs:
           exit-code: "1"
           ignore-unfixed: true
           severity: HIGH,CRITICAL
+      - name: Scan Grafana release image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: qingtian-grafana-release:${{ github.sha }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+      - name: Scan Prometheus image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: prom/prometheus@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+      - name: Scan Alertmanager image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: prom/alertmanager@sha256:82eb974c2aca363117a5771746c271f35a7d3da688193251a51a2f3ec783f81d
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+      - name: Exercise isolated monitoring stack
+        env:
+          API_KEY: rc-monitor-key-921b86a4
+          GRAFANA_PASSWORD: rc-grafana-password-02af41d8
+        run: |
+          printf '%s\n' "${API_KEY}" >"${RUNNER_TEMP}/qingtian-api-key"
+          printf '%s\n' "${GRAFANA_PASSWORD}" >"${RUNNER_TEMP}/grafana-admin-password"
+          chmod 600 "${RUNNER_TEMP}/qingtian-api-key" "${RUNNER_TEMP}/grafana-admin-password"
+
+          QINGTIAN_IMAGE="qingtian-release:${GITHUB_SHA}" \
+          R8_GRAFANA_IMAGE="qingtian-grafana-release:${GITHUB_SHA}" \
+          QINGTIAN_API_KEYS_FILE="${RUNNER_TEMP}/qingtian-api-key" \
+          R8_GRAFANA_ADMIN_PASSWORD_FILE="${RUNNER_TEMP}/grafana-admin-password" \
+          QINGTIAN_PORT=18080 \
+            docker compose --project-name qingtian-release-monitor \
+              -f compose.yaml -f docker-compose.monitoring.yml up -d --no-build
+
+          for _ in $(seq 1 90); do
+            curl -fsS http://127.0.0.1:18080/ready >/dev/null \
+              && curl -fsS http://127.0.0.1:19090/-/ready >/dev/null \
+              && curl -fsS http://127.0.0.1:13000/api/health >/dev/null \
+              && break
+            sleep 2
+          done
+
+          curl -fsS http://127.0.0.1:19090/api/v1/targets >/tmp/prometheus-targets.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path("/tmp/prometheus-targets.json").read_text())
+          targets = payload["data"]["activeTargets"]
+          qingtian = [item for item in targets if item["labels"].get("job") == "qingtian"]
+          assert len(qingtian) == 1
+          assert qingtian[0]["health"] == "up", qingtian[0]
+          PY
+
+          datasource_uid="$(curl -fsS -u "qingtian-admin:${GRAFANA_PASSWORD}" \
+            http://127.0.0.1:13000/api/datasources/name/Prometheus \
+            | python -c 'import json,sys; print(json.load(sys.stdin)["uid"])')"
+          curl -fsS -u "qingtian-admin:${GRAFANA_PASSWORD}" \
+            "http://127.0.0.1:13000/api/datasources/uid/${datasource_uid}/health" \
+            >/tmp/grafana-datasource-health.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path("/tmp/grafana-datasource-health.json").read_text())
+          assert payload["status"] == "OK", payload
+          PY
       - name: Container logs
         if: always()
         run: docker logs qingtian-release || true
       - name: Remove container and volumes
         if: always()
         run: |
+          QINGTIAN_IMAGE="qingtian-release:${GITHUB_SHA}" \
+          R8_GRAFANA_IMAGE="qingtian-grafana-release:${GITHUB_SHA}" \
+          QINGTIAN_API_KEYS_FILE=/dev/null \
+          R8_GRAFANA_ADMIN_PASSWORD_FILE=/dev/null \
+            docker compose --project-name qingtian-release-monitor \
+              -f compose.yaml -f docker-compose.monitoring.yml down --volumes || true
           docker rm --force qingtian-release || true
           docker volume rm qingtian-release-data qingtian-release-config || true
 
   publish:
-    name: Publish multi-architecture image
+    name: Publish multi-architecture images
     runs-on: ubuntu-latest
     needs: [container-delivery]
     outputs:
-      digest: ${{ steps.build.outputs.digest }}
+      app_digest: ${{ steps.build_app.outputs.digest }}
+      grafana_digest: ${{ steps.build_grafana.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
@@ -181,8 +288,8 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push immutable image
-        id: build
+      - name: Build and push immutable application image
+        id: build_app
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -197,30 +304,69 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
           sbom: true
           provenance: mode=max
-      - name: Attest build provenance
+      - name: Build and push immutable Grafana image
+        id: build_grafana
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.grafana
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.GRAFANA_IMAGE_NAME }}:${{ env.RELEASE_VERSION }}
+            ${{ env.GRAFANA_IMAGE_NAME }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.version=${{ env.RELEASE_VERSION }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          sbom: true
+          provenance: mode=max
+      - name: Attest application build provenance
         uses: actions/attest-build-provenance@v3
         with:
           subject-name: ${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.build.outputs.digest }}
+          subject-digest: ${{ steps.build_app.outputs.digest }}
           push-to-registry: true
-      - name: Generate release SBOM
+      - name: Attest Grafana build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ env.GRAFANA_IMAGE_NAME }}
+          subject-digest: ${{ steps.build_grafana.outputs.digest }}
+          push-to-registry: true
+      - name: Generate application SBOM
         uses: anchore/sbom-action@v0
         with:
-          image: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          image: ${{ env.IMAGE_NAME }}@${{ steps.build_app.outputs.digest }}
           format: spdx-json
-          output-file: release.spdx.json
+          output-file: application-release.spdx.json
           upload-artifact: false
-      - name: Attest release SBOM
+      - name: Generate Grafana SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.GRAFANA_IMAGE_NAME }}@${{ steps.build_grafana.outputs.digest }}
+          format: spdx-json
+          output-file: grafana-release.spdx.json
+          upload-artifact: false
+      - name: Attest application SBOM
         uses: actions/attest-sbom@v3
         with:
           subject-name: ${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          sbom-path: release.spdx.json
+          subject-digest: ${{ steps.build_app.outputs.digest }}
+          sbom-path: application-release.spdx.json
+          push-to-registry: true
+      - name: Attest Grafana SBOM
+        uses: actions/attest-sbom@v3
+        with:
+          subject-name: ${{ env.GRAFANA_IMAGE_NAME }}
+          subject-digest: ${{ steps.build_grafana.outputs.digest }}
+          sbom-path: grafana-release.spdx.json
           push-to-registry: true
       - uses: actions/upload-artifact@v4
         with:
           name: release-sbom
-          path: release.spdx.json
+          path: |
+            application-release.spdx.json
+            grafana-release.spdx.json
           if-no-files-found: error
 
   github-release:
@@ -234,11 +380,15 @@ jobs:
           name: release-sbom
       - name: Record immutable digest
         run: |
-          printf '%s@%s\n' "${IMAGE_NAME}" "${{ needs.publish.outputs.digest }}" \
+          printf '%s@%s\n' "${IMAGE_NAME}" "${{ needs.publish.outputs.app_digest }}" \
             > release-digest.txt
-          cp docs/release-v1.1.0-rc.1.md release-notes.md
-          printf "\n## Immutable image\n\n\`%s@%s\`\n" \
-            "${IMAGE_NAME}" "${{ needs.publish.outputs.digest }}" >> release-notes.md
+          printf '%s@%s\n' "${GRAFANA_IMAGE_NAME}" "${{ needs.publish.outputs.grafana_digest }}" \
+            >> release-digest.txt
+          cp docs/release-v1.1.0-rc.2.md release-notes.md
+          printf "\n## Immutable images\n\n- \`%s@%s\`\n- \`%s@%s\`\n" \
+            "${IMAGE_NAME}" "${{ needs.publish.outputs.app_digest }}" \
+            "${GRAFANA_IMAGE_NAME}" "${{ needs.publish.outputs.grafana_digest }}" \
+            >> release-notes.md
       - name: Create GitHub pre-release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -248,4 +398,4 @@ jobs:
             --prerelease \
             --title "QingTian ${GITHUB_REF_NAME}" \
             --notes-file release-notes.md \
-            release.spdx.json release-digest.txt
+            application-release.spdx.json grafana-release.spdx.json release-digest.txt
