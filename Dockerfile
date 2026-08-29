@@ -1,7 +1,7 @@
 ARG PYTHON_VERSION=3.12.13
 FROM python:${PYTHON_VERSION}-slim-bookworm
 
-ARG APP_VERSION=1.1.0-rc.1
+ARG APP_VERSION=1.1.0-rc.2
 
 LABEL org.opencontainers.image.title="QingTian ZhiFei BizSystem" \
       org.opencontainers.image.description="Explainable construction tender scoring service" \

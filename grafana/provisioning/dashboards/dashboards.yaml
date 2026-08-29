@@ -6,8 +6,8 @@ providers:
     folder: "Qingtian"
     folderUid: "qingtian"
     type: file
-    disableDeletion: false
+    disableDeletion: true
     updateIntervalSeconds: 10
-    allowUiUpdates: true
+    allowUiUpdates: false
     options:
       path: /var/lib/grafana/dashboards

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.0-rc.2 - 2026-08-30
+
+- Adds bounded HTTP, readiness, rate-limit, and process-resource metrics for production
+  qualification without changing business routes or payloads.
+- Repairs Prometheus alert expressions so every rule references emitted metric names and labels.
+- Adds a digest-pinned, localhost-only Prometheus/Alertmanager/Grafana staging profile and
+  recoverable 72-hour qualification tooling.
+- Keeps scoring, storage schema, public business DTOs, and cache keys compatible with rc.1.
+
 ## 1.1.0-rc.1 - 2026-08-29
 
 ### Added

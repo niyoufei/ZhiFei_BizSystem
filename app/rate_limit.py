@@ -16,6 +16,8 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
+from app.metrics import record_rate_limit_exceeded
+
 _RATE_WINDOW_STATE: dict[str, deque[float]] = {}
 _RATE_WINDOW_LOCK = threading.Lock()
 
@@ -44,6 +46,7 @@ def get_rate_limits() -> dict[str, str | bool]:
 def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> Response:
     """Custom handler for rate limit exceeded errors."""
     retry_info = str(exc.detail) if hasattr(exc, "detail") else "unknown"
+    record_rate_limit_exceeded("slowapi")
     return JSONResponse(
         status_code=429,
         content={
@@ -189,6 +192,7 @@ def setup_rate_limiting(app: FastAPI) -> None:
     async def _rate_limit_guard(request: Request, call_next):
         allowed, retry_after, category = _check_in_memory_rate_limit(request)
         if not allowed:
+            record_rate_limit_exceeded(category)
             return JSONResponse(
                 status_code=429,
                 headers={"Retry-After": str(retry_after)},

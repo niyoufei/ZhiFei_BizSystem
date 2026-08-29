@@ -4,11 +4,12 @@ Prometheus 指标模块
 提供系统运行时指标的收集和导出功能。
 """
 
-from prometheus_client import Counter, Gauge, Histogram, generate_latest
+from prometheus_client import Counter, Gauge, Histogram, ProcessCollector, generate_latest
 from prometheus_client.core import CollectorRegistry
 
 # 创建自定义注册表（避免与默认注册表冲突）
 REGISTRY = CollectorRegistry()
+PROCESS_COLLECTOR = ProcessCollector(registry=REGISTRY)
 
 # ==================== 请求指标 ====================
 
@@ -26,6 +27,21 @@ REQUEST_LATENCY = Histogram(
     "HTTP 请求延迟（秒）",
     ["method", "endpoint"],
     buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+    registry=REGISTRY,
+)
+
+# 就绪状态（1=ready，0=not_ready/尚未检查）
+READINESS_STATUS = Gauge(
+    "qingtian_readiness_status",
+    "服务是否已准备好处理请求（1=ready，0=not_ready）",
+    registry=REGISTRY,
+)
+
+# 限流触发计数（按固定类别，避免高基数标签）
+RATE_LIMIT_EXCEEDED = Counter(
+    "qingtian_rate_limit_exceeded_total",
+    "触发请求速率限制的次数",
+    ["category"],
     registry=REGISTRY,
 )
 
@@ -136,6 +152,19 @@ def record_request(method: str, endpoint: str, status_code: int, duration: float
     """
     REQUEST_COUNT.labels(method=method, endpoint=endpoint, status_code=str(status_code)).inc()
     REQUEST_LATENCY.labels(method=method, endpoint=endpoint).observe(duration)
+
+
+def update_readiness_status(ready: bool) -> None:
+    """记录最近一次 readiness 检查结果。"""
+    READINESS_STATUS.set(1 if ready else 0)
+
+
+def record_rate_limit_exceeded(category: str) -> None:
+    """记录一次限流拒绝，只接受规范化的低基数类别。"""
+    normalized = str(category or "unknown").strip().lower()
+    if normalized not in {"default", "score", "upload", "slowapi", "unknown"}:
+        normalized = "unknown"
+    RATE_LIMIT_EXCEEDED.labels(category=normalized).inc()
 
 
 def record_score(score: float) -> None:

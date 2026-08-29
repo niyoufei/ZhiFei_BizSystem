@@ -6,7 +6,7 @@ import hmac
 import os
 from typing import Optional
 
-from fastapi import HTTPException, Security, status
+from fastapi import Header, HTTPException, Security, status
 from fastapi.security import APIKeyHeader
 
 # API Key 配置
@@ -72,6 +72,51 @@ def verify_api_key(
         )
 
     return api_key_header
+
+
+def verify_metrics_api_key(
+    api_key_header: Optional[str] = Security(api_key_header),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+) -> str:
+    """Validate metrics access through X-API-Key or an equivalent Bearer token.
+
+    Business endpoints continue to accept only ``X-API-Key``.  The Bearer form
+    exists solely so Prometheus can use its native ``authorization`` stanza.
+    If both headers are present, ``X-API-Key`` is authoritative and an invalid
+    value is never rescued by the Bearer token.
+    """
+    candidate = api_key_header
+    if candidate is None and authorization:
+        scheme, separator, token = authorization.partition(" ")
+        if separator and scheme.lower() == "bearer" and token.strip():
+            candidate = token.strip()
+
+    valid_keys = get_valid_api_keys()
+    if not valid_keys:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "AUTH_NOT_CONFIGURED",
+                "message": "API authentication is not configured.",
+            },
+        )
+    if not candidate:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "AUTH_KEY_MISSING",
+                "message": "X-API-Key or Bearer token is required.",
+            },
+        )
+    if not any(hmac.compare_digest(candidate, valid_key) for valid_key in valid_keys):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "AUTH_KEY_INVALID",
+                "message": "Invalid API key.",
+            },
+        )
+    return candidate
 
 
 def get_auth_status() -> dict:

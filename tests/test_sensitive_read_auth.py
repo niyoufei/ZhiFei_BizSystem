@@ -9,7 +9,7 @@ import pytest
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
-from app.auth import API_KEYS_ENV, verify_api_key
+from app.auth import API_KEYS_ENV, verify_api_key, verify_metrics_api_key
 
 TEST_API_KEY = "test-auth-key-do-not-use"
 AUTH_HEADERS = {"X-API-Key": TEST_API_KEY}
@@ -74,6 +74,13 @@ def _business_routes() -> list[APIRoute]:
     ]
 
 
+def _has_required_auth(route: APIRoute) -> bool:
+    calls = _dependency_calls(route)
+    if route.path == "/metrics":
+        return verify_metrics_api_key in calls
+    return verify_api_key in calls
+
+
 def test_authenticated_router_covers_every_business_http_method():
     test_router = AuthenticatedAPIRouter()
 
@@ -121,7 +128,7 @@ def test_every_non_public_business_route_requires_api_key():
         for route in routes
         for method in (route.methods or set()) & BUSINESS_HTTP_METHODS
         if (method, route.path) not in PUBLIC_ROUTE_METHODS
-        if verify_api_key not in _dependency_calls(route)
+        if not _has_required_auth(route)
     )
     assert missing_auth == []
 

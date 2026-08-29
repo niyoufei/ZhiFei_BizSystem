@@ -1,0 +1,24 @@
+# R8 Grafana excludes unrelated bundled plugins with scanner findings and adds
+# only Grafana Labs' signed Prometheus datasource release, verified per arch.
+FROM alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS plugin
+
+ARG TARGETARCH
+RUN apk add --no-cache unzip \
+    && case "$TARGETARCH" in \
+      amd64) archive_sha256="33c5316c52e8745e38ea844d5357723c0ebe15ce28cdaf6000cdffe95a01af72" ;; \
+      arm64) archive_sha256="a5f89b1c61d591ba146b8522095c7c78da5ec4aa80f5e865488914be472d8bdd" ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && wget -q \
+      "https://github.com/grafana/grafana-prometheus-datasource/releases/download/v13.1.9/prometheus-13.1.9.linux_${TARGETARCH}.zip" \
+      -O /tmp/prometheus.zip \
+    && echo "${archive_sha256}  /tmp/prometheus.zip" | sha256sum -c - \
+    && unzip -q /tmp/prometheus.zip -d /tmp/plugin
+
+FROM grafana/grafana@sha256:b035710db1d835beebcc7bd8d16d2d2735e9a97b341015b0951c8f7b0043fcec
+
+USER root
+RUN apk upgrade --no-cache \
+    && mkdir -p /usr/share/grafana/data/plugins-bundled
+COPY --from=plugin --chown=grafana:root /tmp/plugin/prometheus /usr/share/grafana/data/plugins-bundled/prometheus
+USER grafana
