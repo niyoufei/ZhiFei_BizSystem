@@ -77,6 +77,7 @@ import app.evolution_report_service as evolution_report_service
 import app.feedback_closed_loop_service as feedback_closed_loop_service
 import app.ground_truth_sync_service as ground_truth_sync_service
 import app.latest_report_service as latest_report_service
+import app.learning_profile_service as learning_profile_service
 import app.material_delete_service as material_delete_service
 import app.material_read_service as material_read_service
 import app.material_upload_service as material_upload_service
@@ -10833,17 +10834,14 @@ def update_learning_profile(
     submissions = [s for s in submissions_all if _submission_is_scored(s)]
     if not submissions:
         raise HTTPException(status_code=404, detail="暂无已评分施组，请先点击“评分施组”。")
-    profile = build_learning_profile(submissions)
-    profiles = load_learning_profiles()
-    record = {
-        "project_id": project_id,
-        "dimension_multipliers": profile["dimension_multipliers"],
-        "rationale": profile["rationale"],
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    profiles = [p for p in profiles if p.get("project_id") != project_id]
-    profiles.append(record)
-    save_learning_profiles(profiles)
+    record = learning_profile_service.generate_and_persist(
+        project_id,
+        submissions,
+        build_learning_profile=build_learning_profile,
+        load_learning_profiles=load_learning_profiles,
+        save_learning_profiles=save_learning_profiles,
+        now_iso=_now_iso,
+    )
     return LearningProfile(**record)
 
 
