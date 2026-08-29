@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import threading
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -1439,6 +1440,172 @@ class TestMaterialsEndpoint:
         data = response.json()
         assert data["status"] == "ok"
         assert "material" in data
+
+    def test_material_upload_transaction_serializes_same_target(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        from app import main, storage
+
+        materials_dir = tmp_path / "materials"
+        materials_path = tmp_path / "materials.json"
+        materials_path.write_text("[]", encoding="utf-8")
+        monkeypatch.setattr(main, "MATERIALS_DIR", materials_dir)
+        monkeypatch.setattr(storage, "MATERIALS_PATH", materials_path)
+
+        first_commit_entered = threading.Event()
+        release_first_commit = threading.Event()
+        second_commit_entered = threading.Event()
+        observations = []
+        call_count = 0
+        call_count_lock = threading.Lock()
+
+        def commit_record(project_id, material_type, filename, target):
+            nonlocal call_count
+            with call_count_lock:
+                call_count += 1
+                current_call = call_count
+            observed = target.read_bytes()
+            observations.append((str(target), observed))
+            if current_call == 1:
+                first_commit_entered.set()
+                assert release_first_commit.wait(timeout=5)
+            else:
+                second_commit_entered.set()
+            return {
+                "id": f"m{current_call}",
+                "project_id": project_id,
+                "material_type": material_type,
+                "filename": filename,
+                "path": str(target),
+                "created_at": "2026-08-29T00:00:00+00:00",
+            }, []
+
+        monkeypatch.setattr(main, "_commit_uploaded_material_record", commit_record)
+        errors = []
+
+        def upload(content):
+            try:
+                main._write_material_upload_transaction("p1", "boq", "same.txt", content)
+            except BaseException as exc:
+                errors.append(exc)
+
+        first = threading.Thread(target=upload, args=(b"first",))
+        second = threading.Thread(target=upload, args=(b"second",))
+        first.start()
+        assert first_commit_entered.wait(timeout=5)
+        second.start()
+
+        assert not second_commit_entered.wait(timeout=0.2)
+        first_target = Path(observations[0][0])
+        assert first_target.read_bytes() == b"first"
+
+        release_first_commit.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert errors == []
+        assert [content for _, content in observations] == [b"first", b"second"]
+        second_target = Path(observations[1][0])
+        assert second_target != first_target
+        assert second_target.read_bytes() == b"second"
+
+    def test_material_upload_preserves_both_versions_when_record_commit_is_uncertain(
+        self, tmp_path
+    ):
+        from app import material_upload_service
+
+        target = tmp_path / "p1" / "boq" / "same.txt"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"previous")
+
+        def fail_commit(*_args):
+            raise OSError("controlled record write failure")
+
+        with pytest.raises(OSError, match="controlled record write failure"):
+            material_upload_service.write_material_file_and_record(
+                project_id="p1",
+                normalized_material_type="boq",
+                normalized_name="same.txt",
+                materials_dir=tmp_path,
+                content=b"replacement",
+                commit_uploaded_material_record=fail_commit,
+            )
+
+        assert target.read_bytes() == b"previous"
+        versioned_files = list((target.parent / ".objects").glob("*/same.txt"))
+        assert len(versioned_files) == 1
+        assert versioned_files[0].read_bytes() == b"replacement"
+        assert list((target.parent / ".objects").glob("*/.same.txt.*.tmp")) == []
+
+    def test_material_upload_removes_superseded_same_material_files(self, tmp_path):
+        from app import material_upload_service
+
+        project_dir = tmp_path / "p1" / "boq"
+        legacy_target = project_dir / "same.txt"
+        old_version = project_dir / ".objects" / ("0" * 32) / "same.txt"
+        old_version.parent.mkdir(parents=True)
+        legacy_target.write_bytes(b"legacy")
+        old_version.write_bytes(b"old-version")
+
+        def commit_record(project_id, material_type, filename, target):
+            return {
+                "id": "m1",
+                "project_id": project_id,
+                "material_type": material_type,
+                "filename": filename,
+                "path": str(target),
+                "created_at": "2026-08-29T00:00:00+00:00",
+            }, [legacy_target, old_version]
+
+        record = material_upload_service.write_material_file_and_record(
+            project_id="p1",
+            normalized_material_type="boq",
+            normalized_name="same.txt",
+            materials_dir=tmp_path,
+            content=b"replacement",
+            commit_uploaded_material_record=commit_record,
+        )
+
+        assert not legacy_target.exists()
+        assert not old_version.exists()
+        assert Path(str(record["path"])).read_bytes() == b"replacement"
+
+    def test_material_upload_does_not_remove_out_of_scope_candidates(self, tmp_path):
+        from app import material_upload_service
+
+        project_dir = tmp_path / "p1" / "boq"
+        other_project = tmp_path / "p2" / "boq" / "same.txt"
+        wrong_name = project_dir / "other.txt"
+        malformed_version = project_dir / ".objects" / "not-a-version" / "same.txt"
+        for candidate in (other_project, wrong_name, malformed_version):
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            candidate.write_bytes(b"must-remain")
+
+        def commit_record(project_id, material_type, filename, target):
+            return {
+                "id": "m1",
+                "project_id": project_id,
+                "material_type": material_type,
+                "filename": filename,
+                "path": str(target),
+                "created_at": "2026-08-29T00:00:00+00:00",
+            }, [other_project, wrong_name, malformed_version]
+
+        material_upload_service.write_material_file_and_record(
+            project_id="p1",
+            normalized_material_type="boq",
+            normalized_name="same.txt",
+            materials_dir=tmp_path,
+            content=b"replacement",
+            commit_uploaded_material_record=commit_record,
+        )
+
+        for candidate in (other_project, wrong_name, malformed_version):
+            assert candidate.read_bytes() == b"must-remain"
 
     @patch("app.main.save_materials")
     @patch("app.main.load_materials")

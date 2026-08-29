@@ -6890,27 +6890,29 @@ def _commit_uploaded_material_record(
     normalized_material_type: str,
     normalized_name: str,
     target: Path,
-) -> dict:
+) -> tuple[dict, List[Path]]:
     materials = load_materials()
-    existing_ids = [
-        str(m.get("id"))
-        for m in materials
-        if m.get("project_id") == project_id
-        and _normalize_material_type(m.get("material_type"), filename=m.get("filename"))
-        == normalized_material_type
-        and _normalize_uploaded_filename(m.get("filename", "")) == normalized_name
-        and m.get("id")
-    ]
-    materials = [
-        m
-        for m in materials
-        if not (
-            m.get("project_id") == project_id
-            and _normalize_material_type(m.get("material_type"), filename=m.get("filename"))
+
+    def same_logical_material(material: dict) -> bool:
+        return (
+            material.get("project_id") == project_id
+            and _normalize_material_type(
+                material.get("material_type"), filename=material.get("filename")
+            )
             == normalized_material_type
-            and _normalize_uploaded_filename(m.get("filename", "")) == normalized_name
+            and _normalize_uploaded_filename(material.get("filename", "")) == normalized_name
         )
+
+    existing_materials = [material for material in materials if same_logical_material(material)]
+    existing_ids = [
+        str(material.get("id")) for material in existing_materials if material.get("id")
     ]
+    superseded_paths = [
+        Path(str(material.get("path")))
+        for material in existing_materials
+        if str(material.get("path") or "").strip()
+    ]
+    materials = [material for material in materials if not same_logical_material(material)]
     record = {
         "id": existing_ids[0] if existing_ids else str(uuid4()),
         "project_id": project_id,
@@ -6921,7 +6923,24 @@ def _commit_uploaded_material_record(
     }
     materials.append(record)
     save_materials(materials)
-    return record
+    return record, superseded_paths
+
+
+@atomic_json_transaction("materials")
+def _write_material_upload_transaction(
+    project_id: str,
+    normalized_material_type: str,
+    normalized_name: str,
+    content: bytes,
+) -> dict:
+    return material_upload_service.write_material_file_and_record(
+        project_id=project_id,
+        normalized_material_type=normalized_material_type,
+        normalized_name=normalized_name,
+        materials_dir=MATERIALS_DIR,
+        content=content,
+        commit_uploaded_material_record=_commit_uploaded_material_record,
+    )
 
 
 @router.post(
@@ -6969,13 +6988,16 @@ def upload_material(
     projects = load_projects()
     if not any(p["id"] == project_id for p in projects):
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    return material_upload_service.write_material_upload(
+    content = file.file.read()
+    record = _write_material_upload_transaction(
+        project_id,
+        normalized_material_type,
+        normalized_name,
+        content,
+    )
+    return material_upload_service.build_material_upload_response(
         project_id=project_id,
-        normalized_material_type=normalized_material_type,
-        normalized_name=normalized_name,
-        materials_dir=MATERIALS_DIR,
-        read_content=file.file.read,
-        commit_uploaded_material_record=_commit_uploaded_material_record,
+        record=record,
         invalidate_material_index_cache=_invalidate_material_index_cache,
         rebuild_project_anchors_and_requirements=_rebuild_project_anchors_and_requirements,
     )
