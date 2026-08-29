@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.0-rc.4 - 2026-08-30
+
+- Waits for the first authenticated Prometheus scrape before certifying the target as UP.
+- Supersedes the blocked rc.3 build; no rc.3 image or pre-release was published.
+
 ## 1.1.0-rc.3 - 2026-08-30
 
 - Keeps secret files inside a host-private directory while making each bind-mounted file readable

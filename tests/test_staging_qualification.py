@@ -125,7 +125,7 @@ def test_drill_rejects_movable_image_tags_before_docker_access(tmp_path):
             repo_root=REPO_ROOT,
             project="qingtian-r8",
             api_key_file=key_file,
-            candidate_image="ghcr.io/example/app:1.1.0-rc.3",
+            candidate_image="ghcr.io/example/app:1.1.0-rc.4",
             rc1_image="ghcr.io/example/app:1.1.0-rc.1",
             output_dir=tmp_path / "drill",
             restore_port=18081,
