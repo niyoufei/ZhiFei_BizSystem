@@ -3,15 +3,23 @@ from __future__ import annotations
 import inspect
 from copy import deepcopy
 
+import pytest
 from fastapi.testclient import TestClient
 
 import app.main as app_main
 
 PATH = "/local-llm/zdoc-preview-only/receive"
+TEST_API_KEY = "test-auth-key-do-not-use"
+AUTH_HEADERS = {"X-API-Key": TEST_API_KEY}
 
 
 def _client() -> TestClient:
-    return TestClient(app_main.app)
+    return TestClient(app_main.app, headers=AUTH_HEADERS)
+
+
+@pytest.fixture(autouse=True)
+def _configure_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("API_KEYS", TEST_API_KEY)
 
 
 def _valid_payload() -> dict:

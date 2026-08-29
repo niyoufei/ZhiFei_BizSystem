@@ -324,6 +324,79 @@ class TestConfigLoader:
         config2 = loader.load()
         assert config2.rubric == {"key1": "new_value"}
 
+    def test_configloader_active_snapshot_removal_falls_back_to_legacy(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Removing an active snapshot explicitly restores the legacy pair."""
+        rubric_file = tmp_path / "rubric.yaml"
+        lexicon_file = tmp_path / "lexicon.yaml"
+        active_file = tmp_path / "active_config.yaml"
+        rubric_file.write_text("generation: legacy-rubric\n", encoding="utf-8")
+        lexicon_file.write_text("generation: legacy-lexicon\n", encoding="utf-8")
+        active_file.write_text(
+            "rubric:\n  generation: active-rubric\n" "lexicon:\n  generation: active-lexicon\n",
+            encoding="utf-8",
+        )
+
+        import app.config as config_module
+
+        monkeypatch.setattr(config_module, "RESOURCES_DIR", tmp_path)
+        loader = ConfigLoader()
+        assert loader.load().lexicon == {"generation": "active-lexicon"}
+        active_status = loader.get_status()
+        assert active_status["rubric_path"] == str(active_file)
+        assert active_status["lexicon_path"] == str(active_file)
+
+        active_file.unlink()
+
+        config = loader.load()
+        assert config.lexicon == {"generation": "legacy-lexicon"}
+        assert config.rubric == {"generation": "legacy-rubric"}
+        assert loader.get_status()["source"] == "legacy"
+
+    @pytest.mark.parametrize(
+        ("invalid_snapshot", "message"),
+        [
+            ("- not-a-mapping\n", "must be a mapping"),
+            ("lexicon: {}\n", "must contain rubric and lexicon"),
+        ],
+    )
+    def test_configloader_invalid_active_snapshot_fails_closed(
+        self,
+        tmp_path,
+        monkeypatch,
+        invalid_snapshot,
+        message,
+    ):
+        """A malformed active snapshot must never fall back to stale legacy data."""
+        (tmp_path / "rubric.yaml").write_text(
+            "generation: legacy-rubric\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "lexicon.yaml").write_text(
+            "generation: legacy-lexicon\n",
+            encoding="utf-8",
+        )
+        active_file = tmp_path / "active_config.yaml"
+        active_file.write_text(
+            "rubric:\n  generation: active-rubric\n" "lexicon:\n  generation: active-lexicon\n",
+            encoding="utf-8",
+        )
+
+        import app.config as config_module
+
+        monkeypatch.setattr(config_module, "RESOURCES_DIR", tmp_path)
+        loader = ConfigLoader()
+        assert loader.load().lexicon == {"generation": "active-lexicon"}
+
+        active_file.write_text(invalid_snapshot, encoding="utf-8")
+
+        with pytest.raises(ValueError, match=message):
+            loader.load()
+        assert loader.get_status()["source"] == "active"
+
     def test_configloader_thread_safety(self):
         """ConfigLoader is thread-safe for concurrent access."""
         import threading

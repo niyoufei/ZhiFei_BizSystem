@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import threading
@@ -23,7 +24,7 @@ from app.metrics import (
     record_cache_miss,
     update_cache_size,
 )
-from app.storage import DATA_DIR, ensure_data_dirs
+from app.storage import DATA_DIR, ensure_data_dirs, load_json, path_transaction, save_json
 
 CACHE_PATH = DATA_DIR / "score_cache.json"
 DEFAULT_TTL = 3600  # 1 小时
@@ -140,29 +141,30 @@ class ScoreCache:
         key = self._compute_key(text, config_hash)
 
         with self._lock:
-            self._stats.total_requests += 1
+            with self._persistence_transaction():
+                self._stats.total_requests += 1
 
-            entry = self._cache.get(key)
-            if entry is None:
-                self._stats.misses += 1
-                record_cache_miss()
-                return None
+                entry = self._cache.get(key)
+                if entry is None:
+                    self._stats.misses += 1
+                    record_cache_miss()
+                    return None
 
-            if entry.is_expired():
-                del self._cache[key]
-                self._stats.misses += 1
-                self._stats.evictions += 1
-                self._stats.size = len(self._cache)
-                record_cache_miss()
-                record_cache_eviction(1)
-                update_cache_size(self._stats.size)
-                self._save_to_disk()
-                return None
+                if entry.is_expired():
+                    del self._cache[key]
+                    self._stats.misses += 1
+                    self._stats.evictions += 1
+                    self._stats.size = len(self._cache)
+                    record_cache_miss()
+                    record_cache_eviction(1)
+                    update_cache_size(self._stats.size)
+                    self._save_to_disk()
+                    return None
 
-            entry.hits += 1
-            self._stats.hits += 1
-            record_cache_hit()
-            return entry.value
+                entry.hits += 1
+                self._stats.hits += 1
+                record_cache_hit()
+                return entry.value
 
     def set(
         self,
@@ -192,18 +194,19 @@ class ScoreCache:
         )
 
         with self._lock:
-            # 如果缓存已满，清理过期条目
-            if len(self._cache) >= self.max_size:
-                self._evict_expired()
+            with self._persistence_transaction():
+                # 如果缓存已满，清理过期条目
+                if len(self._cache) >= self.max_size:
+                    self._evict_expired()
 
-            # 如果仍然满，清理最旧的条目
-            if len(self._cache) >= self.max_size:
-                self._evict_oldest()
+                # 如果仍然满，清理最旧的条目
+                if len(self._cache) >= self.max_size:
+                    self._evict_oldest()
 
-            self._cache[key] = entry
-            self._stats.size = len(self._cache)
-            update_cache_size(self._stats.size)
-            self._save_to_disk()
+                self._cache[key] = entry
+                self._stats.size = len(self._cache)
+                update_cache_size(self._stats.size)
+                self._save_to_disk()
 
         return key
 
@@ -220,15 +223,16 @@ class ScoreCache:
         """
         key = self._compute_key(text, config_hash)
         with self._lock:
-            if key in self._cache:
-                del self._cache[key]
-                self._stats.evictions += 1
-                self._stats.size = len(self._cache)
-                record_cache_eviction(1)
-                update_cache_size(self._stats.size)
-                self._save_to_disk()
-                return True
-            return False
+            with self._persistence_transaction():
+                if key in self._cache:
+                    del self._cache[key]
+                    self._stats.evictions += 1
+                    self._stats.size = len(self._cache)
+                    record_cache_eviction(1)
+                    update_cache_size(self._stats.size)
+                    self._save_to_disk()
+                    return True
+                return False
 
     def clear(self) -> int:
         """
@@ -238,15 +242,16 @@ class ScoreCache:
             清除的条目数
         """
         with self._lock:
-            count = len(self._cache)
-            self._cache.clear()
-            self._stats.evictions += count
-            self._stats.size = 0
-            if count > 0:
-                record_cache_eviction(count)
-            update_cache_size(0)
-            self._save_to_disk()
-            return count
+            with self._persistence_transaction():
+                count = len(self._cache)
+                self._cache.clear()
+                self._stats.evictions += count
+                self._stats.size = 0
+                if count > 0:
+                    record_cache_eviction(count)
+                update_cache_size(0)
+                self._save_to_disk()
+                return count
 
     def get_stats(self) -> CacheStats:
         """获取缓存统计"""
@@ -287,26 +292,33 @@ class ScoreCache:
         """持久化缓存到磁盘"""
         if not self.persist:
             return
-        try:
-            ensure_data_dirs()
-            data = {k: v.to_dict() for k, v in self._cache.items()}
-            CACHE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass  # 静默失败，缓存丢失不影响核心功能
+        ensure_data_dirs()
+        data = {k: v.to_dict() for k, v in self._cache.items()}
+        save_json(CACHE_PATH, data)
 
     def _load_from_disk(self) -> None:
         """从磁盘加载缓存"""
-        if not self.persist or not CACHE_PATH.exists():
+        if not self.persist:
             return
-        try:
-            data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
-            for key, entry_data in data.items():
-                entry = CacheEntry.from_dict(entry_data)
-                if not entry.is_expired():
-                    self._cache[key] = entry
-            self._stats.size = len(self._cache)
-        except Exception:
-            pass  # 静默失败，从空缓存开始
+        data = load_json(CACHE_PATH, {})
+        if not isinstance(data, dict):
+            raise ValueError("score cache must contain a JSON object")
+        loaded: Dict[str, CacheEntry] = {}
+        for key, entry_data in data.items():
+            entry = CacheEntry.from_dict(entry_data)
+            if not entry.is_expired():
+                loaded[key] = entry
+        self._cache = loaded
+        self._stats.size = len(self._cache)
+
+    @contextlib.contextmanager
+    def _persistence_transaction(self):
+        if not self.persist:
+            yield
+            return
+        with path_transaction(CACHE_PATH):
+            self._load_from_disk()
+            yield
 
 
 # 全局缓存实例

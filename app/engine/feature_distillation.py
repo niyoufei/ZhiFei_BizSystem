@@ -11,7 +11,11 @@ from pydantic import ValidationError
 
 from app.config import RESOURCES_DIR
 from app.schemas import ExtractedFeature
-from app.storage import load_high_score_features, save_high_score_features
+from app.storage import (
+    atomic_json_transaction,
+    load_high_score_features,
+    save_high_score_features,
+)
 
 FEATURE_BOOTSTRAP_PATH = RESOURCES_DIR / "high_score_templates.json"
 
@@ -231,6 +235,7 @@ def select_top_logic_skeletons(
     return candidates[: max(1, top_k)]
 
 
+@atomic_json_transaction("high_score_features")
 def update_feature_confidence(
     applied_feature_ids: Sequence[str],
     actual_score: float,

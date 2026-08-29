@@ -1,0 +1,251 @@
+name: Release candidate
+
+on:
+  push:
+    tags:
+      - "v*.*.*-rc.*"
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/niyoufei/zhifei-bizsystem
+  RELEASE_VERSION: 1.1.0-rc.1
+
+jobs:
+  lint:
+    name: Release Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+      - run: pip install -r requirements.txt "ruff==0.2.1"
+      - run: python scripts/verify_release.py --tag "${GITHUB_REF_NAME}"
+      - run: python -m ruff check app/ tests/ scripts/
+      - run: git diff --check
+
+  test:
+    name: Release Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: pip install -r requirements.txt pytest pytest-cov
+      - run: python scripts/verify_release.py --tag "${GITHUB_REF_NAME}"
+      - run: python -m pytest tests/ -v --cov=app --cov-report=term-missing
+
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install "pip-audit==2.9.0"
+      - run: pip-audit --requirement requirements-runtime.txt
+
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan tracked release contents
+        run: |
+          docker run --rm -v "$PWD:/repo" \
+            zricethezav/gitleaks:v8.30.0 dir /repo \
+            --no-banner --redact --verbose
+
+  container-delivery:
+    name: Release Container delivery
+    runs-on: ubuntu-latest
+    needs: [lint, test, dependency-audit, secret-scan]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build amd64 release image
+        run: |
+          docker build \
+            --build-arg APP_VERSION="${RELEASE_VERSION}" \
+            --tag "qingtian-release:${GITHUB_SHA}" .
+      - name: Exercise hardened runtime and persistence
+        env:
+          API_KEY: rc-container-key-6f3c28a1
+        run: |
+          docker volume create qingtian-release-data
+          docker volume create qingtian-release-config
+          docker run --detach --name qingtian-release \
+            --publish 127.0.0.1:18000:8000 \
+            --env API_KEYS="${API_KEY}" \
+            --read-only \
+            --tmpfs /tmp:size=256m,mode=1777 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --volume qingtian-release-data:/var/lib/qingtian \
+            --volume qingtian-release-config:/srv/qingtian/app/resources \
+            "qingtian-release:${GITHUB_SHA}"
+
+          for _ in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:18000/ready >/dev/null && break
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:18000/health
+          curl -fsS http://127.0.0.1:18000/ready
+          test "$(docker exec qingtian-release id -u)" = "10001"
+          test "$(curl -sS -o /tmp/unauthorized.json -w '%{http_code}' \
+            http://127.0.0.1:18000/api/v1/projects)" = "401"
+          curl -fsS -H "X-API-Key: ${API_KEY}" \
+            http://127.0.0.1:18000/api/v1/projects >/tmp/projects-before.json
+          docker exec qingtian-release sh -c \
+            "tesseract --list-langs 2>/dev/null | grep -qx chi_sim"
+          docker exec -i qingtian-release python - <<'PY'
+          import sqlite3
+
+          connection = sqlite3.connect("/var/lib/qingtian/qingtian.sqlite3")
+          assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+          PY
+
+          curl -fsS -H "X-API-Key: ${API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{"name":"R7 release persistence probe"}' \
+            http://127.0.0.1:18000/api/v1/projects >/tmp/project-created.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path("/tmp/project-created.json").read_text())
+          Path("/tmp/project-id.txt").write_text(payload["id"])
+          PY
+
+          docker restart qingtian-release
+          for _ in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:18000/ready >/dev/null && break
+            sleep 2
+          done
+          curl -fsS -H "X-API-Key: ${API_KEY}" \
+            http://127.0.0.1:18000/api/v1/projects >/tmp/projects-after.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          project_id = Path("/tmp/project-id.txt").read_text()
+          projects = json.loads(Path("/tmp/projects-after.json").read_text())
+          assert any(project["id"] == project_id for project in projects)
+          PY
+      - name: Scan release image
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: qingtian-release:${{ github.sha }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+      - name: Container logs
+        if: always()
+        run: docker logs qingtian-release || true
+      - name: Remove container and volumes
+        if: always()
+        run: |
+          docker rm --force qingtian-release || true
+          docker volume rm qingtian-release-data qingtian-release-config || true
+
+  publish:
+    name: Publish multi-architecture image
+    runs-on: ubuntu-latest
+    needs: [container-delivery]
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push immutable image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: APP_VERSION=${{ env.RELEASE_VERSION }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ env.RELEASE_VERSION }}
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.version=${{ env.RELEASE_VERSION }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          sbom: true
+          provenance: mode=max
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      - name: Generate release SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: release.spdx.json
+          upload-artifact: false
+      - name: Attest release SBOM
+        uses: actions/attest-sbom@v3
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: release.spdx.json
+          push-to-registry: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-sbom
+          path: release.spdx.json
+          if-no-files-found: error
+
+  github-release:
+    name: GitHub pre-release
+    runs-on: ubuntu-latest
+    needs: [publish]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-sbom
+      - name: Record immutable digest
+        run: |
+          printf '%s@%s\n' "${IMAGE_NAME}" "${{ needs.publish.outputs.digest }}" \
+            > release-digest.txt
+          cp docs/release-v1.1.0-rc.1.md release-notes.md
+          printf "\n## Immutable image\n\n\`%s@%s\`\n" \
+            "${IMAGE_NAME}" "${{ needs.publish.outputs.digest }}" >> release-notes.md
+      - name: Create GitHub pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --prerelease \
+            --title "QingTian ${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md \
+            release.spdx.json release-digest.txt

@@ -1,8 +1,12 @@
 import csv
+import io
 import os
 import subprocess
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+from app.storage import atomic_write_text, path_transaction
 
 BASE = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DATA = os.path.join(BASE, "data", "projects.csv")
@@ -18,18 +22,27 @@ USERS = {
 SESSIONS = {}
 
 
-def load_projects():
-    with open(DATA, newline="", encoding="utf-8") as f:
+def _load_projects_unlocked(path: Path):
+    with path.open(newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
 
+def load_projects():
+    path = Path(DATA)
+    with path_transaction(path):
+        return _load_projects_unlocked(path)
+
+
 def save_project(row):
-    rows = load_projects()
-    rows.append(row)
-    with open(DATA, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=rows[0].keys())
+    path = Path(DATA)
+    with path_transaction(path):
+        rows = _load_projects_unlocked(path)
+        rows.append(row)
+        output = io.StringIO(newline="")
+        w = csv.DictWriter(output, fieldnames=rows[0].keys())
         w.writeheader()
         w.writerows(rows)
+        atomic_write_text(path, output.getvalue())
 
 
 class H(BaseHTTPRequestHandler):

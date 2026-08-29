@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import threading
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -15,15 +16,34 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-os.environ["API_KEYS"] = ""
+TEST_API_KEY = "test-auth-key-do-not-use"
+AUTH_HEADERS = {"X-API-Key": TEST_API_KEY}
+_ORIGINAL_API_KEYS = os.environ.get("API_KEYS")
+os.environ["API_KEYS"] = TEST_API_KEY
+try:
+    from app.main import app, create_app  # noqa: E402
+finally:
+    if _ORIGINAL_API_KEYS is None:
+        os.environ.pop("API_KEYS", None)
+    else:
+        os.environ["API_KEYS"] = _ORIGINAL_API_KEYS
 
-from app.main import app, create_app  # noqa: E402
+
+@pytest.fixture(autouse=True)
+def isolate_api_keys():
+    """Keep authentication deterministic without leaking test configuration."""
+    with patch.dict(os.environ, {"API_KEYS": TEST_API_KEY}, clear=False):
+        yield
 
 
 @pytest.fixture
-def client():
+def client(request, monkeypatch):
     """Create a test client."""
-    return TestClient(app)
+    test_api_key = f"{TEST_API_KEY}-{abs(hash(request.node.nodeid))}"
+    monkeypatch.setenv("API_KEYS", test_api_key)
+    auth_headers = dict(AUTH_HEADERS)
+    auth_headers["X-API-Key"] = test_api_key
+    return TestClient(app, headers=auth_headers)
 
 
 def test_health_ready_self_check_runtime_boundaries_are_visible():
@@ -43,7 +63,7 @@ def test_health_ready_self_check_runtime_boundaries_are_visible():
         "_run_system_self_check": slice_between(
             "def _run_system_self_check", "\n\n# ===================="
         ),
-        "health_check": slice_between('@app.get("/health"', '\n\n@app.get("/metrics"'),
+        "health_check": slice_between('@app.get("/health"', '\n\n@app.get(\n    "/metrics"'),
         "readiness_check": slice_between('@app.get("/ready"', '\n\n@app.get("/__ping__"'),
         "system_self_check": slice_between(
             '@router.get(\n    "/system/self_check"', "\n\n@router.get("
@@ -64,15 +84,19 @@ def test_health_ready_self_check_runtime_boundaries_are_visible():
 
     assert '@app.get("/health"' in main_text
     assert '@app.get("/ready"' in main_text
-    assert 'router = APIRouter(prefix="/api/v1")' in main_text
+    assert 'router = AuthenticatedAPIRouter(prefix="/api/v1")' in main_text
     assert '@router.get(\n    "/system/self_check"' in main_text
-    assert 'compat_router = APIRouter(prefix="/api")' in main_text
+    assert 'compat_router = AuthenticatedAPIRouter(prefix="/api")' in main_text
     assert '@compat_router.get("/system/self_check"' in main_text
     assert "/api/v1/system/self_check" in main_text
     assert "ensure_data_dirs()" in main_text
     assert 'prefix="selfcheck_"' in main_text
     assert 'suffix=".tmp"' in main_text
     assert "NamedTemporaryFile" in main_text
+    assert "DATA_DIR.expanduser().resolve()" in runtime_boundary_snippets["_run_system_self_check"]
+    assert "dir=str(data_dir)" in runtime_boundary_snippets["_run_system_self_check"]
+    assert "tempfile.gettempdir()" not in runtime_boundary_snippets["_run_system_self_check"]
+    assert 'dir="data"' not in runtime_boundary_snippets["_run_system_self_check"]
     assert "ollama serve" not in runtime_boundary_text
 
     assert "/health" in boundary_doc
@@ -105,8 +129,47 @@ class TestIndexEndpoint:
         """Index endpoint should return HTML page."""
         response = client.get("/")
         assert response.status_code == 200
-        assert "<html>" in response.text
+        assert "<html" in response.text
         assert "青天评标系统" in response.text
+
+    def test_index_exposes_responsive_semantic_workflow_navigation(self, client):
+        """The primary workflow should remain usable by keyboard and on narrow screens."""
+        page = client.get("/").text
+
+        assert '<html lang="zh-CN">' in page
+        assert '<meta name="viewport" content="width=device-width, initial-scale=1">' in page
+        assert '<a class="skip-link" href="#mainContent">跳到主要内容</a>' in page
+        assert '<nav class="workflow-nav" aria-label="主要工作流程">' in page
+        assert '<main id="mainContent" tabindex="-1">' in page
+        for section_id in (
+            "apiKeyControls",
+            "section-create",
+            "section-project",
+            "section-materials",
+            "section-shigong",
+            "section-compare",
+            "section-evolution",
+            "section-output",
+        ):
+            assert f'id="{section_id}"' in page
+            assert f'href="#{section_id}"' in page or section_id == "mainContent"
+        assert "@media (max-width: 760px)" in page
+        assert "@media (prefers-reduced-motion: reduce)" in page
+        assert ":focus-visible" in page
+
+    def test_index_prevents_duplicate_actions_and_announces_async_results(self, client):
+        """Async buttons should be single-flight and result changes should be announced."""
+        page = client.get("/").text
+
+        assert "if (el.dataset.qingtianBusy === 'true') return;" in page
+        assert "el.dataset.qingtianBusy = 'true';" in page
+        assert "el.setAttribute('aria-busy', 'true');" in page
+        assert "delete el.dataset.qingtianBusy;" in page
+        assert "el.setAttribute('aria-busy', 'false');" in page
+        assert "initializeProductAccessibility();" in page
+        assert "document.querySelectorAll('.result-block')" in page
+        assert "el.setAttribute('role', 'status');" in page
+        assert "el.setAttribute('aria-live', 'polite');" in page
 
     def test_index_contains_forms(self, client):
         """Index page should contain all forms."""
@@ -413,11 +476,17 @@ class TestWebCreateProjectFallback:
 
     @patch("app.main.create_project")
     def test_web_create_project_success_redirects_ok(self, mock_create_project, client):
+        mock_create_project.return_value = MagicMock(id="secret-project-id")
         response = client.post(
             "/web/create_project", data={"name": "测试项目"}, follow_redirects=False
         )
         assert response.status_code == 303
-        assert "create_ok=" in response.headers.get("location", "")
+        location = response.headers.get("location", "")
+        assert location == "/?created=1"
+        assert "测试项目" not in location
+        assert "secret-project-id" not in location
+        assert "project_id" not in location
+        assert "create_ok" not in location
         assert mock_create_project.called
 
 
@@ -433,15 +502,38 @@ class TestWebFallbackOps:
 
     @patch("app.main._delete_project_cascade")
     def test_web_delete_project_success(self, mock_delete, client):
-        mock_delete.return_value = {"project_name": "项目A"}
+        mock_delete.return_value = {"project_name": "secret-project-name"}
         response = client.post(
-            "/web/delete_project", data={"project_id": "p1"}, follow_redirects=False
+            "/web/delete_project",
+            data={"project_id": "secret-project-id"},
+            follow_redirects=False,
         )
         assert response.status_code == 303
         location = response.headers.get("location", "")
         assert "msg_type=success" in location
         assert "project_id" not in location
+        assert "secret-project-id" not in location
+        assert "secret-project-name" not in location
         mock_delete.assert_called_once()
+
+    @patch("app.main._delete_project_cascade")
+    def test_web_delete_project_error_does_not_redirect_metadata(self, mock_delete, client):
+        mock_delete.side_effect = HTTPException(
+            status_code=404,
+            detail="secret-project-name secret-project-id",
+        )
+        response = client.post(
+            "/web/delete_project",
+            data={"project_id": "secret-project-id"},
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 303
+        location = response.headers.get("location", "")
+        assert "msg_type=error" in location
+        assert "project_id" not in location
+        assert "secret-project-id" not in location
+        assert "secret-project-name" not in location
 
     def test_web_upload_materials_requires_file(self, client):
         response = client.post(
@@ -451,11 +543,17 @@ class TestWebFallbackOps:
         assert "msg_type=error" in response.headers.get("location", "")
 
     def test_web_upload_materials_get_fallback_redirects(self, client):
-        response = client.get("/web/upload_materials", follow_redirects=False)
+        response = client.get(
+            "/web/upload_materials?project_id=secret-project-id&project_name=secret-project-name",
+            follow_redirects=False,
+        )
         assert response.status_code == 303
         location = response.headers.get("location", "")
         assert "msg_type=error" in location
         assert "%E4%B8%8A%E4%BC%A0%E8%B5%84%E6%96%99" in location
+        assert "project_id" not in location
+        assert "secret-project-id" not in location
+        assert "secret-project-name" not in location
 
     def test_web_upload_materials_put_fallback_redirects(self, client):
         response = client.put("/web/upload_materials", follow_redirects=False)
@@ -469,13 +567,13 @@ class TestWebFallbackOps:
         def _side_effect(*args, **kwargs):
             file_obj = kwargs.get("file")
             if file_obj and file_obj.filename == "bad.txt":
-                raise ValueError("bad file")
+                raise ValueError("secret-project-name secret-project-id")
             return {"status": "ok"}
 
         mock_upload_material.side_effect = _side_effect
         response = client.post(
             "/web/upload_materials",
-            data={"project_id": "p1"},
+            data={"project_id": "secret-project-id"},
             files=[
                 ("file", ("good.txt", BytesIO(b"ok"), "text/plain")),
                 ("file", ("bad.txt", BytesIO(b"bad"), "text/plain")),
@@ -484,29 +582,55 @@ class TestWebFallbackOps:
         )
         assert response.status_code == 303
         location = response.headers.get("location", "")
-        assert "project_id=p1" in location
         assert "msg_type=error" in location
+        assert "project_id" not in location
+        assert "secret-project-id" not in location
+        assert "secret-project-name" not in location
 
     @patch("app.main.upload_shigong")
     def test_web_upload_shigong_success(self, mock_upload_shigong, client):
         mock_upload_shigong.return_value = {"id": "s1"}
         response = client.post(
             "/web/upload_shigong",
-            data={"project_id": "p1"},
+            data={"project_id": "secret-project-id"},
             files=[("file", ("a.txt", BytesIO(b"demo"), "text/plain"))],
             follow_redirects=False,
         )
         assert response.status_code == 303
         location = response.headers.get("location", "")
-        assert "project_id=p1" in location
         assert "msg_type=success" in location
+        assert "project_id" not in location
+        assert "secret-project-id" not in location
+
+    @patch("app.main.upload_shigong")
+    def test_web_upload_shigong_error_does_not_redirect_metadata(self, mock_upload_shigong, client):
+        mock_upload_shigong.side_effect = ValueError("secret-project-name secret-project-id")
+        response = client.post(
+            "/web/upload_shigong",
+            data={"project_id": "secret-project-id"},
+            files=[("file", ("a.txt", BytesIO(b"demo"), "text/plain"))],
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 303
+        location = response.headers.get("location", "")
+        assert "msg_type=error" in location
+        assert "project_id" not in location
+        assert "secret-project-id" not in location
+        assert "secret-project-name" not in location
 
     def test_web_upload_shigong_get_fallback_redirects(self, client):
-        response = client.get("/web/upload_shigong", follow_redirects=False)
+        response = client.get(
+            "/web/upload_shigong?project_id=secret-project-id&project_name=secret-project-name",
+            follow_redirects=False,
+        )
         assert response.status_code == 303
         location = response.headers.get("location", "")
         assert "msg_type=error" in location
         assert "%E4%B8%8A%E4%BC%A0%E6%96%BD%E7%BB%84" in location
+        assert "project_id" not in location
+        assert "secret-project-id" not in location
+        assert "secret-project-name" not in location
 
     def test_web_upload_shigong_put_fallback_redirects(self, client):
         response = client.put("/web/upload_shigong", follow_redirects=False)
@@ -522,7 +646,7 @@ class TestWebFallbackOps:
         mock_rescore.return_value = SimpleNamespace(reports_generated=3)
         response = client.post(
             "/web/score_shigong",
-            data={"project_id": "p1"},
+            data={"project_id": "secret-project-id"},
             follow_redirects=False,
         )
         assert response.status_code == 303
@@ -530,6 +654,37 @@ class TestWebFallbackOps:
         assert "msg_type=success" in location
         assert "%E5%B7%B2%E9%87%8D%E7%AE%97+3+%E4%BB%BD" in location
         assert "#section-shigong" in location
+        assert "project_id" not in location
+        assert "secret-project-id" not in location
+
+    @patch("app.main.rescore_project_submissions")
+    def test_web_score_shigong_error_does_not_redirect_metadata(self, mock_rescore, client):
+        mock_rescore.side_effect = RuntimeError("secret-project-name secret-project-id")
+        response = client.post(
+            "/web/score_shigong",
+            data={"project_id": "secret-project-id"},
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 303
+        location = response.headers.get("location", "")
+        assert "msg_type=error" in location
+        assert "project_id" not in location
+        assert "secret-project-id" not in location
+        assert "secret-project-name" not in location
+
+    def test_web_score_shigong_fallback_does_not_redirect_metadata(self, client):
+        response = client.get(
+            "/web/score_shigong?project_id=secret-project-id&project_name=secret-project-name",
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 303
+        location = response.headers.get("location", "")
+        assert "msg_type=error" in location
+        assert "project_id" not in location
+        assert "secret-project-id" not in location
+        assert "secret-project-name" not in location
 
 
 class TestCleanupE2EEndpoint:
@@ -626,7 +781,7 @@ class TestHealthEndpoints:
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "healthy"
-        assert data["version"] == "1.0.0"
+        assert data["version"] == "1.1.0rc1"
 
     def test_health_response_structure(self, client):
         """Health response should have correct structure."""
@@ -1065,6 +1220,10 @@ class TestExpertProfileEndpoints:
 
     @patch("app.main._run_feedback_closed_loop")
     @patch("app.main._validate_material_gate_for_scoring")
+    @patch("app.main.save_score_history")
+    @patch("app.main.load_score_history")
+    @patch("app.main.save_evidence_units")
+    @patch("app.main.load_evidence_units")
     @patch("app.main.record_history_score")
     @patch("app.main.save_score_reports")
     @patch("app.main.load_score_reports")
@@ -1089,6 +1248,10 @@ class TestExpertProfileEndpoints:
         mock_load_score_reports,
         mock_save_score_reports,
         mock_record_history,
+        mock_load_evidence_units,
+        mock_save_evidence_units,
+        mock_load_score_history,
+        mock_save_score_history,
         mock_material_gate,
         mock_feedback_loop,
         client,
@@ -1125,6 +1288,8 @@ class TestExpertProfileEndpoints:
             }
         ]
         mock_load_score_reports.return_value = []
+        mock_load_evidence_units.return_value = []
+        mock_load_score_history.return_value = []
         mock_load_config.return_value = MagicMock(rubric={}, lexicon={})
         mock_score_text.return_value = MagicMock(
             model_dump=lambda: {
@@ -1162,6 +1327,8 @@ class TestExpertProfileEndpoints:
         assert "material_utilization_gate" in data
         mock_save_submissions.assert_called_once()
         mock_save_score_reports.assert_called_once()
+        mock_save_evidence_units.assert_called_once()
+        mock_save_score_history.assert_not_called()
         mock_record_history.assert_called_once()
         mock_feedback_loop.assert_called_once_with("p1", locale="zh", trigger="rescore")
 
@@ -1325,6 +1492,172 @@ class TestMaterialsEndpoint:
         data = response.json()
         assert data["status"] == "ok"
         assert "material" in data
+
+    def test_material_upload_transaction_serializes_same_target(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        from app import main, storage
+
+        materials_dir = tmp_path / "materials"
+        materials_path = tmp_path / "materials.json"
+        materials_path.write_text("[]", encoding="utf-8")
+        monkeypatch.setattr(main, "MATERIALS_DIR", materials_dir)
+        monkeypatch.setattr(storage, "MATERIALS_PATH", materials_path)
+
+        first_commit_entered = threading.Event()
+        release_first_commit = threading.Event()
+        second_commit_entered = threading.Event()
+        observations = []
+        call_count = 0
+        call_count_lock = threading.Lock()
+
+        def commit_record(project_id, material_type, filename, target):
+            nonlocal call_count
+            with call_count_lock:
+                call_count += 1
+                current_call = call_count
+            observed = target.read_bytes()
+            observations.append((str(target), observed))
+            if current_call == 1:
+                first_commit_entered.set()
+                assert release_first_commit.wait(timeout=5)
+            else:
+                second_commit_entered.set()
+            return {
+                "id": f"m{current_call}",
+                "project_id": project_id,
+                "material_type": material_type,
+                "filename": filename,
+                "path": str(target),
+                "created_at": "2026-08-29T00:00:00+00:00",
+            }, []
+
+        monkeypatch.setattr(main, "_commit_uploaded_material_record", commit_record)
+        errors = []
+
+        def upload(content):
+            try:
+                main._write_material_upload_transaction("p1", "boq", "same.txt", content)
+            except BaseException as exc:
+                errors.append(exc)
+
+        first = threading.Thread(target=upload, args=(b"first",))
+        second = threading.Thread(target=upload, args=(b"second",))
+        first.start()
+        assert first_commit_entered.wait(timeout=5)
+        second.start()
+
+        assert not second_commit_entered.wait(timeout=0.2)
+        first_target = Path(observations[0][0])
+        assert first_target.read_bytes() == b"first"
+
+        release_first_commit.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert errors == []
+        assert [content for _, content in observations] == [b"first", b"second"]
+        second_target = Path(observations[1][0])
+        assert second_target != first_target
+        assert second_target.read_bytes() == b"second"
+
+    def test_material_upload_preserves_both_versions_when_record_commit_is_uncertain(
+        self, tmp_path
+    ):
+        from app import material_upload_service
+
+        target = tmp_path / "p1" / "boq" / "same.txt"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"previous")
+
+        def fail_commit(*_args):
+            raise OSError("controlled record write failure")
+
+        with pytest.raises(OSError, match="controlled record write failure"):
+            material_upload_service.write_material_file_and_record(
+                project_id="p1",
+                normalized_material_type="boq",
+                normalized_name="same.txt",
+                materials_dir=tmp_path,
+                content=b"replacement",
+                commit_uploaded_material_record=fail_commit,
+            )
+
+        assert target.read_bytes() == b"previous"
+        versioned_files = list((target.parent / ".objects").glob("*/same.txt"))
+        assert len(versioned_files) == 1
+        assert versioned_files[0].read_bytes() == b"replacement"
+        assert list((target.parent / ".objects").glob("*/.same.txt.*.tmp")) == []
+
+    def test_material_upload_removes_superseded_same_material_files(self, tmp_path):
+        from app import material_upload_service
+
+        project_dir = tmp_path / "p1" / "boq"
+        legacy_target = project_dir / "same.txt"
+        old_version = project_dir / ".objects" / ("0" * 32) / "same.txt"
+        old_version.parent.mkdir(parents=True)
+        legacy_target.write_bytes(b"legacy")
+        old_version.write_bytes(b"old-version")
+
+        def commit_record(project_id, material_type, filename, target):
+            return {
+                "id": "m1",
+                "project_id": project_id,
+                "material_type": material_type,
+                "filename": filename,
+                "path": str(target),
+                "created_at": "2026-08-29T00:00:00+00:00",
+            }, [legacy_target, old_version]
+
+        record = material_upload_service.write_material_file_and_record(
+            project_id="p1",
+            normalized_material_type="boq",
+            normalized_name="same.txt",
+            materials_dir=tmp_path,
+            content=b"replacement",
+            commit_uploaded_material_record=commit_record,
+        )
+
+        assert not legacy_target.exists()
+        assert not old_version.exists()
+        assert Path(str(record["path"])).read_bytes() == b"replacement"
+
+    def test_material_upload_does_not_remove_out_of_scope_candidates(self, tmp_path):
+        from app import material_upload_service
+
+        project_dir = tmp_path / "p1" / "boq"
+        other_project = tmp_path / "p2" / "boq" / "same.txt"
+        wrong_name = project_dir / "other.txt"
+        malformed_version = project_dir / ".objects" / "not-a-version" / "same.txt"
+        for candidate in (other_project, wrong_name, malformed_version):
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            candidate.write_bytes(b"must-remain")
+
+        def commit_record(project_id, material_type, filename, target):
+            return {
+                "id": "m1",
+                "project_id": project_id,
+                "material_type": material_type,
+                "filename": filename,
+                "path": str(target),
+                "created_at": "2026-08-29T00:00:00+00:00",
+            }, [other_project, wrong_name, malformed_version]
+
+        material_upload_service.write_material_file_and_record(
+            project_id="p1",
+            normalized_material_type="boq",
+            normalized_name="same.txt",
+            materials_dir=tmp_path,
+            content=b"replacement",
+            commit_uploaded_material_record=commit_record,
+        )
+
+        for candidate in (other_project, wrong_name, malformed_version):
+            assert candidate.read_bytes() == b"must-remain"
 
     @patch("app.main.save_materials")
     @patch("app.main.load_materials")
@@ -3094,6 +3427,7 @@ class TestMaterialAdvancedParsing:
 class TestScoreForProjectEndpoint:
     """Tests for /projects/{project_id}/score endpoint."""
 
+    @patch("app.main.submission_scoring_service.commit_inline_scoring_result")
     @patch("app.main.save_submissions")
     @patch("app.main.load_submissions")
     @patch("app.main.load_learning_profiles")
@@ -3110,6 +3444,7 @@ class TestScoreForProjectEndpoint:
         mock_profiles,
         mock_load_sub,
         mock_save_sub,
+        mock_commit_result,
         client,
     ):
         """Score for project should return submission record."""
@@ -3123,6 +3458,7 @@ class TestScoreForProjectEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["filename"] == "inline"
+        mock_commit_result.assert_called_once()
 
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
@@ -3132,6 +3468,7 @@ class TestScoreForProjectEndpoint:
         response = client.post("/api/v1/projects/nonexistent/score", json={"text": "test"})
         assert response.status_code == 404
 
+    @patch("app.main.submission_scoring_service.commit_inline_scoring_result")
     @patch("app.main.save_submissions")
     @patch("app.main.load_submissions")
     @patch("app.main.load_learning_profiles")
@@ -3148,6 +3485,7 @@ class TestScoreForProjectEndpoint:
         mock_profiles,
         mock_load_sub,
         mock_save_sub,
+        mock_commit_result,
         client,
     ):
         """Score for project should use learning profile multipliers."""
@@ -3165,6 +3503,75 @@ class TestScoreForProjectEndpoint:
         # Check multipliers were passed
         call_args = mock_score.call_args
         assert call_args.kwargs.get("dimension_multipliers") == {"D01": 1.3}
+        mock_commit_result.assert_called_once()
+
+    def test_score_for_project_commits_persistence_before_cache(self, client):
+        events = []
+        raw_report = {
+            "total_score": 75.0,
+            "rule_total_score": 75.0,
+            "dimension_scores": {},
+            "penalties": [],
+        }
+        with (
+            patch("app.main.ensure_data_dirs"),
+            patch("app.main.load_projects", return_value=[{"id": "p1"}]),
+            patch("app.main.load_config", return_value=MagicMock(rubric={}, lexicon={})),
+            patch(
+                "app.main._resolve_project_scoring_context",
+                return_value=(None, None, {"id": "p1"}),
+            ),
+            patch("app.main.get_cached_score", return_value=None),
+            patch(
+                "app.main._score_submission_for_project",
+                return_value=(raw_report, []),
+            ),
+            patch("app.main._apply_evolution_total_scale"),
+            patch(
+                "app.main.submission_scoring_service.commit_inline_scoring_result",
+                side_effect=lambda **_kwargs: events.append("commit"),
+            ),
+            patch(
+                "app.main.cache_score_result",
+                side_effect=lambda *_args: events.append("cache"),
+            ),
+        ):
+            response = client.post("/api/v1/projects/p1/score", json={"text": "测试文本"})
+
+        assert response.status_code == 200
+        assert events == ["commit", "cache"]
+
+    def test_score_for_project_does_not_cache_if_persistence_fails(self, client):
+        raw_report = {
+            "total_score": 75.0,
+            "rule_total_score": 75.0,
+            "dimension_scores": {},
+            "penalties": [],
+        }
+        with (
+            patch("app.main.ensure_data_dirs"),
+            patch("app.main.load_projects", return_value=[{"id": "p1"}]),
+            patch("app.main.load_config", return_value=MagicMock(rubric={}, lexicon={})),
+            patch(
+                "app.main._resolve_project_scoring_context",
+                return_value=(None, None, {"id": "p1"}),
+            ),
+            patch("app.main.get_cached_score", return_value=None),
+            patch(
+                "app.main._score_submission_for_project",
+                return_value=(raw_report, []),
+            ),
+            patch("app.main._apply_evolution_total_scale"),
+            patch(
+                "app.main.submission_scoring_service.commit_inline_scoring_result",
+                side_effect=RuntimeError("controlled persistence failure"),
+            ),
+            patch("app.main.cache_score_result") as mock_cache,
+        ):
+            with pytest.raises(RuntimeError, match="controlled persistence failure"):
+                client.post("/api/v1/projects/p1/score", json={"text": "测试文本"})
+
+        mock_cache.assert_not_called()
 
 
 class TestSubmissionsEndpoint:
@@ -4085,46 +4492,25 @@ class TestAdaptiveApplyEndpoint:
         response = client.post("/api/v1/projects/p1/adaptive_apply")
         assert response.status_code == 404
 
-    @patch("yaml.safe_dump")
-    @patch("pathlib.Path")
-    @patch("app.main.apply_adaptive_patch")
-    @patch("app.main.build_adaptive_patch")
-    @patch("app.main.build_adaptive_suggestions")
-    @patch("app.main.load_config")
+    @patch("app.main.adaptive_configuration_service.apply_and_persist")
     @patch("app.main.load_submissions")
     @patch("app.main.ensure_data_dirs")
     def test_adaptive_apply_success(
         self,
         mock_ensure,
         mock_load_sub,
-        mock_config,
-        mock_suggestions,
-        mock_patch,
-        mock_apply,
-        mock_path,
-        mock_yaml_dump,
+        mock_apply_and_persist,
         client,
     ):
         """Adaptive apply should update lexicon and return result."""
         mock_load_sub.return_value = [{"id": "s1", "project_id": "p1"}]
-        mock_config.return_value = MagicMock(lexicon={})
-        mock_suggestions.return_value = {"penalty_stats": {}}
-        mock_patch.return_value = {"lexicon_additions": {}, "rubric_adjustments": {}}
-        mock_apply.return_value = ({"updated": True}, ["change1", "change2"])
-
-        # Mock Path operations
-        mock_lexicon_path = MagicMock()
-        mock_lexicon_path.read_text.return_value = "old: content"
-        mock_backup_path = MagicMock()
-        mock_backup_path.__str__ = MagicMock(return_value="/backup/path.yaml")
-        mock_lexicon_path.with_name.return_value = mock_backup_path
-
-        # Configure Path mock chain
-        mock_path_instance = MagicMock()
-        mock_path_instance.resolve.return_value.parent.__truediv__ = (
-            lambda self, x: mock_lexicon_path
-        )
-        mock_path.return_value = mock_path_instance
+        mock_apply_and_persist.return_value = {
+            "project_id": "p1",
+            "applied": True,
+            "changes": ["change1", "change2"],
+            "backup_path": "/backup/path.yaml",
+            "source": {},
+        }
 
         response = client.post("/api/v1/projects/p1/adaptive_apply")
         assert response.status_code == 200
@@ -4132,6 +4518,47 @@ class TestAdaptiveApplyEndpoint:
         assert data["project_id"] == "p1"
         assert data["applied"] is True
         assert "changes" in data
+        mock_apply_and_persist.assert_called_once()
+
+
+class TestGroundTruthDeleteEndpoint:
+    @patch(
+        "app.main.ground_truth_write_service.delete_ground_truth_cascade",
+        return_value=True,
+    )
+    @patch("app.main.load_projects", return_value=[{"id": "p1"}])
+    @patch("app.main.ensure_data_dirs")
+    def test_delete_ground_truth_delegates_and_returns_204(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_delete,
+        client,
+    ):
+        response = client.delete("/api/v1/projects/p1/ground_truth/gt1")
+
+        assert response.status_code == 204
+        mock_delete.assert_called_once()
+        assert mock_delete.call_args.args == ("p1", "gt1")
+
+    @patch(
+        "app.main.ground_truth_write_service.delete_ground_truth_cascade",
+        return_value=False,
+    )
+    @patch("app.main.load_projects", return_value=[{"id": "p1"}])
+    @patch("app.main.ensure_data_dirs")
+    def test_delete_ground_truth_missing_record_preserves_404_contract(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_delete,
+        client,
+    ):
+        response = client.delete("/api/v1/projects/p1/ground_truth/missing")
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == "真实评标记录不存在"
+        mock_delete.assert_called_once()
 
 
 class TestMainExecution:
@@ -4143,7 +4570,7 @@ class TestMainExecution:
 
     def test_app_version(self):
         """App should have correct version."""
-        assert app.version == "1.0.0"
+        assert app.version == "1.1.0rc1"
 
 
 class TestApiI18n:
@@ -4662,6 +5089,7 @@ class TestProjectLevelCacheIntegration:
         mock_cache_set.assert_not_called()
         mock_score.assert_not_called()
 
+    @patch("app.main.submission_scoring_service.commit_inline_scoring_result")
     @patch("app.main.get_cached_score")
     @patch("app.main.cache_score_result")
     @patch("app.main.load_evolution_reports")
@@ -4684,6 +5112,7 @@ class TestProjectLevelCacheIntegration:
         mock_load_evolution_reports,
         mock_cache_set,
         mock_cache_get,
+        mock_commit_result,
         client,
     ):
         """Score for project should check cache first."""
@@ -4712,7 +5141,9 @@ class TestProjectLevelCacheIntegration:
         cached_report = mock_cache_set.call_args[0][1]
         assert cached_report["total_score"] == 75.0
         assert cached_report["rule_total_score"] == 75.0
+        mock_commit_result.assert_called_once()
 
+    @patch("app.main.submission_scoring_service.commit_inline_scoring_result")
     @patch("app.main.get_cached_score")
     @patch("app.main.load_evolution_reports")
     @patch("app.main.save_submissions")
@@ -4733,6 +5164,7 @@ class TestProjectLevelCacheIntegration:
         mock_save_sub,
         mock_load_evolution_reports,
         mock_cache_get,
+        mock_commit_result,
         client,
     ):
         """Score for project should return cached result when available."""
@@ -4758,7 +5190,9 @@ class TestProjectLevelCacheIntegration:
 
         # 验证 score_text 没有被调用（使用了缓存）
         mock_score.assert_not_called()
+        mock_commit_result.assert_called_once()
 
+    @patch("app.main.submission_scoring_service.commit_inline_scoring_result")
     @patch("app.main.load_evolution_reports")
     @patch("app.main.get_cached_score")
     @patch("app.main.save_submissions")
@@ -4779,6 +5213,7 @@ class TestProjectLevelCacheIntegration:
         mock_save_sub,
         mock_cache_get,
         mock_load_evolution_reports,
+        mock_commit_result,
         client,
     ):
         """Cached raw report should apply evolution total scale only once at read time."""
@@ -4803,7 +5238,9 @@ class TestProjectLevelCacheIntegration:
         assert data["report"]["total_score"] == 88.0
         assert data["report"]["rule_total_score"] == 88.0
         mock_score.assert_not_called()
+        mock_commit_result.assert_called_once()
 
+    @patch("app.main.submission_scoring_service.commit_inline_scoring_result")
     @patch("app.main.get_cached_score")
     @patch("app.main.cache_score_result")
     @patch("app.main.save_submissions")
@@ -4824,6 +5261,7 @@ class TestProjectLevelCacheIntegration:
         mock_save_sub,
         mock_cache_set,
         mock_cache_get,
+        mock_commit_result,
         client,
     ):
         """Score for project should use config_hash when multipliers exist."""
@@ -4845,6 +5283,7 @@ class TestProjectLevelCacheIntegration:
         assert call_args[0][0] == "测试文本"
         # config_hash 应该不是 None（因为有 multipliers）
         assert call_args[0][1] is not None
+        mock_commit_result.assert_called_once()
 
 
 class TestSystemSelfCheckCapabilities:
@@ -4865,17 +5304,46 @@ class TestSystemSelfCheckCapabilities:
         mock_rate_limit_status,
         mock_dwg_bins,
         mock_data_hygiene,
+        tmp_path,
     ):
+        from app import main
         from app.main import _run_system_self_check
 
         mock_load_config.return_value = MagicMock(rubric={}, lexicon={})
-        payload = _run_system_self_check(None)
+        actual_data_dir = tmp_path / "app-data"
+        actual_data_dir.mkdir()
+        probe_paths = []
+        real_named_temporary_file = tempfile.NamedTemporaryFile
+
+        def tracked_named_temporary_file(*args, **kwargs):
+            handle = real_named_temporary_file(*args, **kwargs)
+            probe_paths.append(Path(handle.name).resolve())
+            return handle
+
+        with (
+            patch.object(main, "DATA_DIR", actual_data_dir),
+            patch(
+                "app.main.tempfile.NamedTemporaryFile",
+                side_effect=tracked_named_temporary_file,
+            ),
+        ):
+            payload = _run_system_self_check(None)
+
         names = {str(item.get("name")) for item in payload.get("items", [])}
         assert "parser_pdf" in names
         assert "parser_docx" in names
         assert "parser_ocr" in names
         assert "parser_dwg_converter" in names
         assert "data_hygiene" in names
+        assert len(probe_paths) == 1
+        for probe_path in probe_paths:
+            assert probe_path.parent == actual_data_dir.resolve()
+            assert not probe_path.exists()
+        assert list(actual_data_dir.iterdir()) == []
+        writable_item = next(
+            item for item in payload.get("items", []) if item.get("name") == "data_dirs_writable"
+        )
+        assert writable_item.get("ok") is True
 
     @patch(
         "app.main._build_data_hygiene_report",
@@ -4896,17 +5364,48 @@ class TestSystemSelfCheckCapabilities:
         mock_rate_limit_status,
         mock_dwg_bins,
         mock_data_hygiene,
+        tmp_path,
     ):
+        from app import main
         from app.main import _run_system_self_check
 
         mock_load_config.return_value = MagicMock(rubric={}, lexicon={})
-        payload = _run_system_self_check(None)
+        success_data_dir = tmp_path / "success-data"
+        success_data_dir.mkdir()
+        with patch.object(main, "DATA_DIR", success_data_dir):
+            payload = _run_system_self_check(None)
         assert payload.get("ok") is True
         items = payload.get("items") or []
         dwg_item = next((x for x in items if x.get("name") == "parser_dwg_converter"), {})
         assert dwg_item.get("ok") is False
         pdf_item = next((x for x in items if x.get("name") == "parser_pdf"), {})
         assert pdf_item.get("ok") is True
+
+        failure_data_dir = tmp_path / "failure-data"
+        failure_data_dir.mkdir()
+        failure_probe_dirs = []
+
+        def failing_named_temporary_file(*args, **kwargs):
+            failure_probe_dirs.append(Path(kwargs["dir"]).resolve())
+            raise OSError("forced self-check probe failure")
+
+        with (
+            patch.object(main, "DATA_DIR", failure_data_dir),
+            patch(
+                "app.main.tempfile.NamedTemporaryFile",
+                side_effect=failing_named_temporary_file,
+            ),
+        ):
+            failure_payload = _run_system_self_check(None)
+
+        writable_item = next(
+            item
+            for item in failure_payload.get("items", [])
+            if item.get("name") == "data_dirs_writable"
+        )
+        assert writable_item.get("ok") is False
+        assert failure_probe_dirs == [failure_data_dir.resolve()]
+        assert list(failure_data_dir.iterdir()) == []
 
 
 class TestDataHygieneEndpoints:
@@ -5066,7 +5565,6 @@ class TestOllamaEvolutionPreviewEndpoint:
         }
 
         with (
-            patch.dict(os.environ, {"API_KEYS": ""}, clear=False),
             patch("app.main.ensure_data_dirs"),
             patch("app.main.load_projects", return_value=[{"id": "p1", "meta": {}}]),
             patch("app.main.load_ground_truth", return_value=self._ground_truth_records()),
@@ -5116,7 +5614,6 @@ class TestOllamaEvolutionPreviewEndpoint:
         }
 
         with (
-            patch.dict(os.environ, {"API_KEYS": ""}, clear=False),
             patch("app.main.ensure_data_dirs"),
             patch("app.main.load_projects", return_value=[{"id": "p1", "meta": {}}]),
             patch("app.main.load_ground_truth", return_value=self._ground_truth_records()),
@@ -5156,7 +5653,6 @@ class TestOllamaEvolutionPreviewEndpoint:
         rule_report = self._rule_report()
 
         with (
-            patch.dict(os.environ, {"API_KEYS": ""}, clear=False),
             patch("app.main.ensure_data_dirs"),
             patch("app.main.load_projects", return_value=[{"id": "p1", "meta": {}}]),
             patch("app.main.load_ground_truth", return_value=self._ground_truth_records()),

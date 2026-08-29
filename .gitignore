@@ -83,6 +83,7 @@ MANIFEST
 .env
 .env.*
 !.env.example
+secrets/
 
 # =========================
 # Project local generated files

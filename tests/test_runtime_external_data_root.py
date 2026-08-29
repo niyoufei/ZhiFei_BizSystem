@@ -57,6 +57,7 @@ def test_runtime_latest_routes_read_external_data_root(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[1]
     env = os.environ.copy()
     env["QINGTIAN_DATA_DIR"] = str(data_dir)
+    env["API_KEYS"] = "test-auth-key-do-not-use"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["PYTHONPATH"] = (
         str(repo_root)
@@ -79,13 +80,20 @@ print(f"DATA_DIR_MATCH={storage.DATA_DIR == expected_data_dir}")
 print(f"SUBMISSIONS_PATH_MATCH={storage.SUBMISSIONS_PATH == expected_data_dir / 'submissions.json'}")
 
 client = TestClient(app)
-evidence = client.get("/api/v1/projects/p1/evidence_trace/latest")
-scoring_basis = client.get("/api/v1/projects/p1/scoring_basis/latest")
+auth_headers = {"X-API-Key": "test-auth-key-do-not-use"}
+health = client.get("/health")
+ready = client.get("/ready")
+evidence = client.get("/api/v1/projects/p1/evidence_trace/latest", headers=auth_headers)
+scoring_basis = client.get("/api/v1/projects/p1/scoring_basis/latest", headers=auth_headers)
+print(f"HEALTH_STATUS={health.status_code}")
+print(f"READY_STATUS={ready.status_code}")
 print(f"EVIDENCE_STATUS={evidence.status_code}")
 print(f"SCORING_BASIS_STATUS={scoring_basis.status_code}")
 print(f"EVIDENCE_BODY={evidence.text[:300]}")
 print(f"SCORING_BASIS_BODY={scoring_basis.text[:300]}")
 
+assert health.status_code == 200
+assert ready.status_code == 200
 assert evidence.status_code == 200
 assert scoring_basis.status_code == 200
 
@@ -112,6 +120,8 @@ assert scoring_basis_payload["scoring_status"] == "scored"
     assert result.returncode == 0, result.stdout + result.stderr
     assert "DATA_DIR_MATCH=True" in result.stdout
     assert "SUBMISSIONS_PATH_MATCH=True" in result.stdout
+    assert "HEALTH_STATUS=200" in result.stdout
+    assert "READY_STATUS=200" in result.stdout
     assert "EVIDENCE_STATUS=200" in result.stdout
     assert "SCORING_BASIS_STATUS=200" in result.stdout
     assert "EVIDENCE_SUBMISSION_ID=tmp-runtime-s1" in result.stdout

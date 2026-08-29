@@ -33,6 +33,8 @@ class ConfigLoader:
         self._config: Optional[AppConfig] = None
         self._rubric_mtime: float = 0.0
         self._lexicon_mtime: float = 0.0
+        self._source = "none"
+        self._active_identity: Optional[tuple[int, int, int]] = None
 
     def _load_yaml(self, path: Path) -> Dict[str, Any]:
         """加载 YAML 文件"""
@@ -47,8 +49,45 @@ class ConfigLoader:
         except (OSError, FileNotFoundError):
             return 0.0
 
+    def _get_identity(self, path: Path) -> Optional[tuple[int, int, int]]:
+        try:
+            stat = path.stat()
+        except (OSError, FileNotFoundError):
+            return None
+        return stat.st_ino, stat.st_mtime_ns, stat.st_size
+
+    def _load_active_snapshot(
+        self,
+        path: Path,
+    ) -> tuple[Dict[str, Any], Dict[str, Any], tuple[int, int, int]]:
+        for _ in range(3):
+            identity_before = self._get_identity(path)
+            if identity_before is None:
+                raise FileNotFoundError(path)
+            data = self._load_yaml(path)
+            identity_after = self._get_identity(path)
+            if identity_before != identity_after:
+                continue
+            if not isinstance(data, dict):
+                raise ValueError("active configuration snapshot must be a mapping")
+            rubric = data.get("rubric")
+            lexicon = data.get("lexicon")
+            if not isinstance(rubric, dict) or not isinstance(lexicon, dict):
+                raise ValueError("active configuration snapshot must contain rubric and lexicon")
+            return rubric, lexicon, identity_after
+        raise RuntimeError("active configuration snapshot changed repeatedly while loading")
+
     def _needs_reload(self) -> bool:
         """检查是否需要重新加载配置"""
+        active_path = RESOURCES_DIR / "active_config.yaml"
+        active_identity = self._get_identity(active_path)
+        if active_identity is not None:
+            return (
+                self._config is None
+                or self._source != "active"
+                or active_identity != self._active_identity
+            )
+
         rubric_path = RESOURCES_DIR / "rubric.yaml"
         lexicon_path = RESOURCES_DIR / "lexicon.yaml"
 
@@ -57,6 +96,7 @@ class ConfigLoader:
 
         return (
             self._config is None
+            or self._source != "legacy"
             or current_rubric_mtime != self._rubric_mtime
             or current_lexicon_mtime != self._lexicon_mtime
         )
@@ -73,14 +113,24 @@ class ConfigLoader:
         """
         with self._lock:
             if force_reload or self._needs_reload():
+                active_path = RESOURCES_DIR / "active_config.yaml"
                 rubric_path = RESOURCES_DIR / "rubric.yaml"
                 lexicon_path = RESOURCES_DIR / "lexicon.yaml"
-
-                rubric = self._load_yaml(rubric_path)
-                lexicon = self._load_yaml(lexicon_path)
-
-                self._rubric_mtime = self._get_mtime(rubric_path)
-                self._lexicon_mtime = self._get_mtime(lexicon_path)
+                try:
+                    rubric, lexicon, active_identity = self._load_active_snapshot(active_path)
+                except FileNotFoundError:
+                    rubric = self._load_yaml(rubric_path)
+                    lexicon = self._load_yaml(lexicon_path)
+                    self._rubric_mtime = self._get_mtime(rubric_path)
+                    self._lexicon_mtime = self._get_mtime(lexicon_path)
+                    self._source = "legacy"
+                    self._active_identity = None
+                else:
+                    active_mtime = active_identity[1] / 1_000_000_000
+                    self._rubric_mtime = active_mtime
+                    self._lexicon_mtime = active_mtime
+                    self._source = "active"
+                    self._active_identity = active_identity
                 self._config = AppConfig(rubric=rubric, lexicon=lexicon)
 
             return self._config  # type: ignore[return-value]
@@ -91,19 +141,31 @@ class ConfigLoader:
 
     def get_status(self) -> Dict[str, Any]:
         """获取配置加载状态"""
-        rubric_path = RESOURCES_DIR / "rubric.yaml"
-        lexicon_path = RESOURCES_DIR / "lexicon.yaml"
+        with self._lock:
+            rubric_path = RESOURCES_DIR / "rubric.yaml"
+            lexicon_path = RESOURCES_DIR / "lexicon.yaml"
+            active_path = RESOURCES_DIR / "active_config.yaml"
+            active_identity = self._get_identity(active_path)
+            active_mtime = active_identity[1] / 1_000_000_000 if active_identity else 0.0
+            rubric_current_mtime = active_mtime if active_identity else self._get_mtime(rubric_path)
+            lexicon_current_mtime = (
+                active_mtime if active_identity else self._get_mtime(lexicon_path)
+            )
+            effective_rubric_path = active_path if active_identity else rubric_path
+            effective_lexicon_path = active_path if active_identity else lexicon_path
 
-        return {
-            "cached": self._config is not None,
-            "rubric_path": str(rubric_path),
-            "lexicon_path": str(lexicon_path),
-            "rubric_mtime": self._rubric_mtime,
-            "lexicon_mtime": self._lexicon_mtime,
-            "rubric_current_mtime": self._get_mtime(rubric_path),
-            "lexicon_current_mtime": self._get_mtime(lexicon_path),
-            "needs_reload": self._needs_reload(),
-        }
+            return {
+                "cached": self._config is not None,
+                "source": self._source,
+                "active_config_path": str(active_path),
+                "rubric_path": str(effective_rubric_path),
+                "lexicon_path": str(effective_lexicon_path),
+                "rubric_mtime": self._rubric_mtime,
+                "lexicon_mtime": self._lexicon_mtime,
+                "rubric_current_mtime": rubric_current_mtime,
+                "lexicon_current_mtime": lexicon_current_mtime,
+                "needs_reload": self._needs_reload(),
+            }
 
 
 # 全局配置加载器实例

@@ -14,7 +14,6 @@ from tools.release_guard import (
     validate_zip_entries,
 )
 
-
 PREFIX = "ZhiFei_BizSystem-v0.1.19-qingtian-analysis-bundle-markdown-copy/"
 
 

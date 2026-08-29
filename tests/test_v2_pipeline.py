@@ -2,16 +2,36 @@
 
 from __future__ import annotations
 
+import copy
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app
+TEST_API_KEY = "test-auth-key-do-not-use"
+AUTH_HEADERS = {"X-API-Key": TEST_API_KEY}
+_ORIGINAL_API_KEYS = os.environ.get("API_KEYS")
+os.environ["API_KEYS"] = TEST_API_KEY
+try:
+    from app.main import app
+finally:
+    if _ORIGINAL_API_KEYS is None:
+        os.environ.pop("API_KEYS", None)
+    else:
+        os.environ["API_KEYS"] = _ORIGINAL_API_KEYS
+
+
+@pytest.fixture(autouse=True)
+def isolate_api_keys():
+    """Keep protected API tests independent from developer environment state."""
+    with patch.dict(os.environ, {"API_KEYS": TEST_API_KEY}, clear=False):
+        yield
 
 
 def _client() -> TestClient:
-    return TestClient(app)
+    return TestClient(app, headers=AUTH_HEADERS)
 
 
 class TestLatestReportEndpoint:
@@ -671,9 +691,165 @@ class TestPatchPackageEndpoints:
         mock_save_packages.assert_called_once()
         mock_save_deploys.assert_called_once()
 
+    @patch("app.main.save_patch_deployments")
+    @patch("app.main.load_patch_deployments")
+    @patch("app.main.save_patch_packages")
+    @patch("app.main.load_patch_packages")
+    @patch("app.main.ensure_data_dirs")
+    def test_patch_deploy_rejects_candidate_without_writes(
+        self,
+        mock_ensure,
+        mock_load_packages,
+        mock_save_packages,
+        mock_load_deploys,
+        mock_save_deploys,
+    ):
+        mock_load_packages.return_value = [
+            {"id": "pck1", "project_id": "p1", "status": "candidate"}
+        ]
+
+        resp = _client().post("/api/v1/patches/pck1/deploy", json={"action": "deploy"})
+
+        assert resp.status_code == 422
+        assert "shadow_pass" in resp.json()["detail"]
+        mock_save_packages.assert_not_called()
+        mock_load_deploys.assert_not_called()
+        mock_save_deploys.assert_not_called()
+
+    @patch("app.main.save_patch_deployments")
+    @patch("app.main.load_patch_deployments")
+    @patch("app.main.save_patch_packages")
+    @patch("app.main.load_patch_packages")
+    @patch("app.main.ensure_data_dirs")
+    def test_patch_deploy_rejects_explicit_rollback_target_without_writes(
+        self,
+        mock_ensure,
+        mock_load_packages,
+        mock_save_packages,
+        mock_load_deploys,
+        mock_save_deploys,
+    ):
+        mock_load_packages.return_value = [
+            {"id": "pck1", "project_id": "p1", "status": "shadow_pass"},
+            {"id": "pck-other", "project_id": "p2", "status": "deployed"},
+        ]
+
+        resp = _client().post(
+            "/api/v1/patches/pck1/deploy",
+            json={"action": "deploy", "rollback_to_version": "pck-other"},
+        )
+
+        assert resp.status_code == 422
+        assert "deploy 不接受" in resp.json()["detail"]
+        mock_save_packages.assert_not_called()
+        mock_load_deploys.assert_not_called()
+        mock_save_deploys.assert_not_called()
+
+    @patch("app.main.save_patch_deployments")
+    @patch("app.main.load_patch_deployments")
+    @patch("app.main.save_patch_packages")
+    @patch("app.main.load_patch_packages")
+    @patch("app.main.ensure_data_dirs")
+    def test_patch_rollback_promotes_same_project_target(
+        self,
+        mock_ensure,
+        mock_load_packages,
+        mock_save_packages,
+        mock_load_deploys,
+        mock_save_deploys,
+    ):
+        mock_load_packages.return_value = [
+            {
+                "id": "pck1",
+                "project_id": "p1",
+                "status": "deployed",
+                "rollback_pointer": "pck0",
+            },
+            {"id": "pck0", "project_id": "p1", "status": "shadow_pass"},
+        ]
+        mock_load_deploys.return_value = []
+
+        resp = _client().post("/api/v1/patches/pck1/deploy", json={"action": "rollback"})
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["deployed"] is False
+        assert data["rollback_to_version"] == "pck0"
+        saved_packages = mock_save_packages.call_args[0][0]
+        statuses = {item["id"]: item["status"] for item in saved_packages}
+        assert statuses == {"pck1": "rolled_back", "pck0": "deployed"}
+        mock_save_deploys.assert_called_once()
+
+    @patch("app.main.save_patch_deployments")
+    @patch("app.main.load_patch_deployments")
+    @patch("app.main.save_patch_packages")
+    @patch("app.main.load_patch_packages")
+    @patch("app.main.ensure_data_dirs")
+    def test_patch_rollback_rejects_cross_project_target_without_writes(
+        self,
+        mock_ensure,
+        mock_load_packages,
+        mock_save_packages,
+        mock_load_deploys,
+        mock_save_deploys,
+    ):
+        mock_load_packages.return_value = [
+            {
+                "id": "pck1",
+                "project_id": "p1",
+                "status": "deployed",
+                "rollback_pointer": "pck-other",
+            },
+            {"id": "pck-other", "project_id": "p2", "status": "shadow_pass"},
+        ]
+
+        resp = _client().post("/api/v1/patches/pck1/deploy", json={"action": "rollback"})
+
+        assert resp.status_code == 422
+        assert "不属于当前项目" in resp.json()["detail"]
+        mock_save_packages.assert_not_called()
+        mock_load_deploys.assert_not_called()
+        mock_save_deploys.assert_not_called()
+
+    @patch("app.main.save_patch_deployments")
+    @patch("app.main.load_patch_deployments")
+    @patch("app.main.save_patch_packages")
+    @patch("app.main.load_patch_packages")
+    @patch("app.main.ensure_data_dirs")
+    def test_patch_transition_restores_packages_when_deployment_write_fails(
+        self,
+        mock_ensure,
+        mock_load_packages,
+        mock_save_packages,
+        mock_load_deploys,
+        mock_save_deploys,
+    ):
+        original_packages = [
+            {
+                "id": "pck1",
+                "project_id": "p1",
+                "status": "shadow_pass",
+                "rollback_pointer": "pck0",
+            },
+            {"id": "pck0", "project_id": "p1", "status": "deployed"},
+        ]
+        mock_load_packages.return_value = copy.deepcopy(original_packages)
+        mock_load_deploys.return_value = []
+        mock_save_deploys.side_effect = [OSError("controlled deployment write failure"), None]
+
+        with pytest.raises(OSError, match="controlled deployment write failure"):
+            _client().post("/api/v1/patches/pck1/deploy", json={"action": "deploy"})
+
+        assert mock_save_packages.call_count == 2
+        restored_packages = mock_save_packages.call_args_list[1].args[0]
+        assert restored_packages == original_packages
+        assert mock_save_deploys.call_count == 2
+        restored_deployments = mock_save_deploys.call_args_list[1].args[0]
+        assert restored_deployments == []
+
 
 class TestGroundTruthAutoSync:
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.save_ground_truth")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_projects")
@@ -698,7 +874,7 @@ class TestGroundTruthAutoSync:
         assert resp.status_code == 200
         mock_sync.assert_called_once()
 
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.save_ground_truth")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_submissions")
@@ -734,10 +910,9 @@ class TestGroundTruthAutoSync:
         data = resp.json()
         assert data["project_id"] == "p1"
         assert data["source"] == "青天大模型"
-        mock_save_records.assert_called_once()
         mock_sync.assert_called_once()
 
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.save_ground_truth")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_submissions")
@@ -773,10 +948,9 @@ class TestGroundTruthAutoSync:
         data = resp.json()
         assert data["judge_count"] == 7
         assert len(data["judge_scores"]) == 7
-        mock_save_records.assert_called_once()
         mock_sync.assert_called_once()
 
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.save_ground_truth")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_submissions")
@@ -813,7 +987,7 @@ class TestGroundTruthAutoSync:
         mock_save_records.assert_not_called()
         mock_sync.assert_not_called()
 
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.save_ground_truth")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_submissions")
@@ -846,10 +1020,9 @@ class TestGroundTruthAutoSync:
         }
         resp = _client().post("/api/projects/p1/ground_truth/from_submission", json=payload)
         assert resp.status_code == 200
-        mock_save_records.assert_called_once()
         mock_sync.assert_called_once()
 
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.save_ground_truth")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_projects")
@@ -877,7 +1050,7 @@ class TestGroundTruthAutoSync:
         assert resp.status_code == 200
         mock_sync.assert_called_once()
 
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.save_ground_truth")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_projects")
@@ -907,8 +1080,7 @@ class TestGroundTruthAutoSync:
         assert data["judge_count"] == 7
         mock_sync.assert_called_once()
 
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
-    @patch("app.main.save_ground_truth")
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
@@ -917,7 +1089,6 @@ class TestGroundTruthAutoSync:
         mock_ensure,
         mock_load_projects,
         mock_load_records,
-        mock_save_records,
         mock_sync,
     ):
         mock_load_projects.return_value = [{"id": "p1"}]
@@ -941,11 +1112,10 @@ class TestGroundTruthAutoSync:
         assert data["total_files"] == 2
         assert data["success_count"] == 2
         assert data["failed_count"] == 0
-        assert mock_sync.call_count == 2
-        mock_save_records.assert_called_once()
+        mock_sync.assert_called_once()
+        assert len(mock_sync.call_args.args[1]) == 2
 
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
-    @patch("app.main.save_ground_truth")
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
@@ -954,7 +1124,6 @@ class TestGroundTruthAutoSync:
         mock_ensure,
         mock_load_projects,
         mock_load_records,
-        mock_save_records,
         mock_sync,
     ):
         mock_load_projects.return_value = [{"id": "p1"}]
@@ -978,11 +1147,41 @@ class TestGroundTruthAutoSync:
         assert data["total_files"] == 2
         assert data["success_count"] == 1
         assert data["failed_count"] == 1
-        assert mock_sync.call_count == 1
-        mock_save_records.assert_called_once()
+        mock_sync.assert_called_once()
+        assert len(mock_sync.call_args.args[1]) == 1
 
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
-    @patch("app.main.save_ground_truth")
+    @patch("app.main._run_feedback_closed_loop_safe")
+    @patch(
+        "app.main._commit_ground_truth_additions",
+        side_effect=RuntimeError("controlled ground-truth commit failure"),
+    )
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_batch_commit_failure_does_not_run_feedback(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_commit,
+        mock_feedback,
+    ):
+        mock_load_projects.return_value = [{"id": "p1"}]
+        file_content = ("施组正文内容" * 30).encode("utf-8")
+
+        with pytest.raises(RuntimeError, match="controlled ground-truth commit failure"):
+            _client().post(
+                "/api/v1/projects/p1/ground_truth/from_files",
+                files=[("files", ("ok.txt", file_content, "text/plain"))],
+                data={
+                    "judge_scores": "[80,81,82,83,84]",
+                    "final_score": "82",
+                    "source": "青天大模型",
+                },
+            )
+
+        mock_commit.assert_called_once()
+        mock_feedback.assert_not_called()
+
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_projects")
     @patch("app.main.ensure_data_dirs")
@@ -991,7 +1190,6 @@ class TestGroundTruthAutoSync:
         mock_ensure,
         mock_load_projects,
         mock_load_records,
-        mock_save_records,
         mock_sync,
     ):
         mock_load_projects.return_value = [{"id": "p1"}]
@@ -1011,8 +1209,8 @@ class TestGroundTruthAutoSync:
         assert data["total_files"] == 1
         assert data["success_count"] == 1
         assert data["failed_count"] == 0
-        assert mock_sync.call_count == 1
-        mock_save_records.assert_called_once()
+        mock_sync.assert_called_once()
+        assert len(mock_sync.call_args.args[1]) == 1
 
 
 class TestAutoRunReflection:
@@ -1939,7 +2137,7 @@ class TestScoringMeceInjection:
 
 
 class TestEvolutionClosedLoop:
-    @patch("app.main._sync_ground_truth_record_to_qingtian")
+    @patch("app.main._commit_ground_truth_additions")
     @patch("app.main.save_ground_truth")
     @patch("app.main.load_ground_truth")
     @patch("app.main.load_submissions")
@@ -1980,9 +2178,8 @@ class TestEvolutionClosedLoop:
         assert data["final_score_100"] == 86.0
         assert data["judge_count"] == 5
         assert mock_sync_qt.called
-        synced_record = mock_sync_qt.call_args.args[1]
+        synced_record = mock_sync_qt.call_args.args[1][0]
         assert float(synced_record["final_score_100"]) == 86.0
-        mock_save_ground_truth.assert_called_once()
 
     @patch("app.main.save_evolution_reports")
     @patch("app.main.load_evolution_reports")

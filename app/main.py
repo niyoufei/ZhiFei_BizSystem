@@ -9,11 +9,9 @@ import json
 import logging
 import os
 import re
-import shutil
-import subprocess
+import shutil  # noqa: F401
 import tempfile
 import threading
-import unicodedata
 from collections import Counter
 from datetime import datetime, timezone
 
@@ -64,11 +62,38 @@ from fastapi import (
 )
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.routing import APIRoute
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.routing import Match
 
+import app.adaptive_configuration_service as adaptive_configuration_service
+import app.anchor_requirement_service as anchor_requirement_service
+import app.calibration_model_service as calibration_model_service
+import app.data_hygiene_service as data_hygiene_service
+import app.document_parser as _document_parser
 import app.engine.local_llm_ollama_preview_adapter as local_llm_ollama_preview_adapter
 import app.engine.local_llm_preview_mock as local_llm_preview_mock
 import app.engine.zdoc_zbid_preview_receiver as zdoc_zbid_preview_receiver
+import app.evidence_trace_service as evidence_trace_service
+import app.evolution_report_service as evolution_report_service
+import app.feedback_closed_loop_service as feedback_closed_loop_service
+import app.ground_truth_sync_service as ground_truth_sync_service
+import app.ground_truth_write_service as ground_truth_write_service
+import app.latest_report_service as latest_report_service
+import app.learning_profile_service as learning_profile_service
+import app.material_delete_service as material_delete_service
+import app.material_read_service as material_read_service
+import app.material_upload_service as material_upload_service
+import app.patch_evolution_service as patch_evolution_service
+import app.project_context_service as project_context_service
+import app.project_delete_service as project_delete_service
+import app.project_lifecycle_service as project_lifecycle_service
+import app.project_profile_service as project_profile_service
+import app.qingtian_result_service as qingtian_result_service
+import app.reflection_sample_service as reflection_sample_service
+import app.rescore_service as rescore_service
+import app.scoring_basis_service as scoring_basis_service
+import app.submission_scoring_service as submission_scoring_service
 from app.auth import get_auth_status, verify_api_key
 from app.cache import (
     cache_score_result,
@@ -77,6 +102,48 @@ from app.cache import (
     get_cached_score,
 )
 from app.config import get_config_status, load_config, reload_config
+from app.document_parser import (
+    DEFAULT_PDF_OCR_MAX_PAGES as DEFAULT_PDF_OCR_MAX_PAGES,
+)
+from app.document_parser import (
+    DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR as DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR,
+)
+from app.document_parser import (
+    _decode_dxf_text as _decode_dxf_text,
+)
+from app.document_parser import (
+    _dwg_converter_command_candidates as _dwg_converter_command_candidates,
+)
+from app.document_parser import (
+    _extract_binary_text_snippet as _extract_binary_text_snippet,
+)
+from app.document_parser import (
+    _extract_dwg_binary_markers as _extract_dwg_binary_markers,
+)
+from app.document_parser import (
+    _extract_dwg_text as _extract_dwg_text,
+)
+from app.document_parser import (
+    _extract_dxf_text as _extract_dxf_text,
+)
+from app.document_parser import (
+    _extract_image_content as _extract_image_content,
+)
+from app.document_parser import (
+    _extract_pdf_text as _extract_pdf_text,
+)
+from app.document_parser import (
+    _extract_pdf_text_with_pypdf as _extract_pdf_text_with_pypdf,
+)
+from app.document_parser import (
+    _iter_dxf_group_pairs as _iter_dxf_group_pairs,
+)
+from app.document_parser import (
+    _looks_like_ascii_dxf as _looks_like_ascii_dxf,
+)
+from app.document_parser import (
+    _normalize_uploaded_filename,
+)
 from app.engine.adaptive import (
     apply_adaptive_patch,
     apply_rubric_patch,
@@ -228,7 +295,9 @@ from app.schemas import (
     WritingGuidance,
 )
 from app.storage import (
+    DATA_DIR,
     MATERIALS_DIR,
+    atomic_json_transaction,
     ensure_data_dirs,
     load_calibration_models,
     load_calibration_samples,
@@ -237,6 +306,7 @@ from app.storage import (
     load_evolution_reports,
     load_expert_profiles,
     load_ground_truth,
+    load_high_score_features,
     load_learning_profiles,
     load_materials,
     load_patch_deployments,
@@ -256,6 +326,7 @@ from app.storage import (
     save_evolution_reports,
     save_expert_profiles,
     save_ground_truth,
+    save_high_score_features,
     save_learning_profiles,
     save_materials,
     save_patch_deployments,
@@ -269,6 +340,7 @@ from app.storage import (
     save_score_reports,
     save_submissions,
 )
+from app.version import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -373,8 +445,6 @@ DEFAULT_MATERIAL_RETRIEVAL_PER_FILE_QUOTA = 3
 DEFAULT_MIN_MATERIAL_RETRIEVAL_FILE_COVERAGE_RATE = 0.0
 DEFAULT_ENFORCE_UPLOADED_TYPE_COVERAGE = True
 DEFAULT_MIN_UPLOADED_TYPE_COVERAGE_RATE = 1.0
-DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR = 200
-DEFAULT_PDF_OCR_MAX_PAGES = 30
 DEFAULT_MATERIAL_INDEX_CACHE_SIZE = 12
 DEFAULT_CALIBRATION_MIN_SAMPLES = 20
 DEFAULT_CALIBRATION_FRESHNESS_DAYS = 90
@@ -872,129 +942,47 @@ def _ensure_project_expert_profile(
     project: Dict[str, object],
     all_profiles: List[Dict[str, object]],
 ) -> tuple[Dict[str, object], bool]:
-    profile_id = str(project.get("expert_profile_id") or "")
-    if profile_id:
-        for profile in all_profiles:
-            if profile.get("id") == profile_id:
-                return profile, False
-
-    profile_name = f"{project.get('name', '项目')} 默认配置"
-    created = _new_expert_profile(profile_name, _default_weights_raw())
-    all_profiles.append(created)
-    project["expert_profile_id"] = created["id"]
-    project["updated_at"] = _now_iso()
-    return created, True
+    return project_profile_service.ensure_project_expert_profile(
+        project,
+        all_profiles,
+        new_expert_profile=_new_expert_profile,
+        default_weights_raw=_default_weights_raw,
+        now_iso=_now_iso,
+    )
 
 
+@atomic_json_transaction("projects")
 def _recover_missing_project_from_artifacts(
     project_id: str, projects: List[Dict[str, object]]
 ) -> Optional[Dict[str, object]]:
-    pid = str(project_id or "").strip()
-    if not pid:
-        return None
-    for p in projects:
-        if str(p.get("id") or "") == pid:
-            return p
-
-    submissions = [s for s in load_submissions() if str(s.get("project_id") or "") == pid]
-    materials = [m for m in load_materials() if str(m.get("project_id") or "") == pid]
-    ground_truth = [g for g in load_ground_truth() if str(g.get("project_id") or "") == pid]
-    evo_reports = load_evolution_reports()
-    has_evolution = pid in evo_reports
-
-    if not submissions and not materials and not ground_truth and not has_evolution:
-        return None
-
-    name_seed = ""
-    for row in materials + submissions:
-        filename = str(row.get("filename") or "").strip()
-        if filename:
-            name_seed = filename
-            break
-    if name_seed:
-        stem = name_seed.rsplit(".", 1)[0].strip()
-        recovered_name = (stem or name_seed) + "（恢复）"
-    else:
-        recovered_name = f"恢复项目_{pid[:8]}"
-
-    time_points: List[str] = []
-    for row in submissions:
-        created_at = str(row.get("created_at") or "").strip()
-        updated_at = str(row.get("updated_at") or "").strip()
-        if created_at:
-            time_points.append(created_at)
-        if updated_at:
-            time_points.append(updated_at)
-    for row in materials + ground_truth:
-        created_at = str(row.get("created_at") or "").strip()
-        if created_at:
-            time_points.append(created_at)
-    evo_updated_at = str((evo_reports.get(pid) or {}).get("updated_at") or "").strip()
-    if evo_updated_at:
-        time_points.append(evo_updated_at)
-    created_at = min(time_points) if time_points else _now_iso()
-    updated_at = max(time_points) if time_points else _now_iso()
-
-    score_scale_max = DEFAULT_SCORE_SCALE_MAX
-    for s in submissions:
-        report = s.get("report")
-        if not isinstance(report, dict):
-            continue
-        meta = report.get("meta")
-        if not isinstance(meta, dict):
-            continue
-        raw = meta.get("score_scale_max")
-        if str(raw) == "5":
-            score_scale_max = 5
-            break
-        if str(raw) == "100":
-            score_scale_max = 100
-
-    recovered = {
-        "id": pid,
-        "name": recovered_name,
-        "meta": {"score_scale_max": score_scale_max},
-        "region": DEFAULT_REGION,
-        "expert_profile_id": None,
-        "qingtian_model_version": DEFAULT_QINGTIAN_MODEL_VERSION,
-        "scoring_engine_version_locked": DEFAULT_SCORING_ENGINE_LOCKED,
-        "calibrator_version_locked": DEFAULT_CALIBRATOR_LOCKED,
-        "status": "scoring_preparation",
-        "created_at": created_at,
-        "updated_at": updated_at,
-    }
-    _ensure_project_v2_fields(recovered)
-    projects.append(recovered)
-    save_projects(projects)
-    return recovered
+    return project_lifecycle_service.recover_missing_project_from_artifacts(
+        project_id,
+        projects,
+        load_projects=load_projects,
+        load_submissions=load_submissions,
+        load_materials=load_materials,
+        load_ground_truth=load_ground_truth,
+        load_evolution_reports=load_evolution_reports,
+        save_projects=save_projects,
+        ensure_project_v2_fields=_ensure_project_v2_fields,
+        now_iso=_now_iso,
+        default_score_scale_max=DEFAULT_SCORE_SCALE_MAX,
+        default_region=DEFAULT_REGION,
+        default_qingtian_model_version=DEFAULT_QINGTIAN_MODEL_VERSION,
+        default_scoring_engine_locked=DEFAULT_SCORING_ENGINE_LOCKED,
+        default_calibrator_locked=DEFAULT_CALIBRATOR_LOCKED,
+    )
 
 
 def _recover_latest_orphan_project(
     projects: List[Dict[str, object]],
 ) -> Optional[Dict[str, object]]:
-    existing_ids = {str(p.get("id") or "") for p in projects}
-    latest_pid = ""
-    latest_at = ""
-
-    for row in load_submissions():
-        pid = str(row.get("project_id") or "").strip()
-        if not pid or pid in existing_ids:
-            continue
-        ts = str(row.get("updated_at") or row.get("created_at") or "").strip()
-        if ts and ts > latest_at:
-            latest_at = ts
-            latest_pid = pid
-    for row in load_materials():
-        pid = str(row.get("project_id") or "").strip()
-        if not pid or pid in existing_ids:
-            continue
-        ts = str(row.get("created_at") or "").strip()
-        if ts and ts > latest_at:
-            latest_at = ts
-            latest_pid = pid
-    if not latest_pid:
-        return None
-    return _recover_missing_project_from_artifacts(latest_pid, projects)
+    return project_lifecycle_service.recover_latest_orphan_project(
+        projects,
+        load_submissions=load_submissions,
+        load_materials=load_materials,
+        recover_missing_project=_recover_missing_project_from_artifacts,
+    )
 
 
 def _find_project(project_id: str, projects: List[Dict[str, object]]) -> Dict[str, object]:
@@ -1006,6 +994,18 @@ def _find_project(project_id: str, projects: List[Dict[str, object]]) -> Dict[st
         if recovered is not None:
             return recovered
     raise HTTPException(status_code=404, detail="项目不存在")
+
+
+def _find_project_for_profile_request(
+    project_id: str,
+    projects: List[Dict[str, object]],
+    *,
+    locale: str,
+) -> Dict[str, object]:
+    try:
+        return _find_project(project_id, projects)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
 
 
 def _find_submission(submission_id: str, submissions: List[Dict[str, object]]) -> Dict[str, object]:
@@ -1939,76 +1939,7 @@ def _build_material_utilization_summary(
 
 
 def _build_evidence_trace_summary(report: Dict[str, object]) -> Dict[str, object]:
-    req_hits_raw = report.get("requirement_hits")
-    req_hits = req_hits_raw if isinstance(req_hits_raw, list) else []
-    total_requirements = 0
-    total_hits = 0
-    mandatory_total = 0
-    mandatory_hit = 0
-    runtime_hits = 0
-    source_pack_counter: Counter[str] = Counter()
-    source_file_hits: List[str] = []
-    preview_rows: List[Dict[str, object]] = []
-
-    for item in req_hits:
-        if not isinstance(item, dict):
-            continue
-        total_requirements += 1
-        mandatory = bool(item.get("mandatory"))
-        if mandatory:
-            mandatory_total += 1
-        if not bool(item.get("hit")):
-            continue
-        total_hits += 1
-        if mandatory:
-            mandatory_hit += 1
-
-        source_pack = str(item.get("source_pack_id") or "").strip() or "unknown"
-        source_pack_counter[source_pack] += 1
-        if source_pack in {"runtime_material_rag", "runtime_material_consistency"}:
-            runtime_hits += 1
-
-        source_filename = str(item.get("source_filename") or "").strip()
-        if not source_filename:
-            chunk_id = str(item.get("chunk_id") or "").strip()
-            if "#c" in chunk_id:
-                source_filename = chunk_id.split("#c", 1)[0].strip()
-        if source_filename and source_filename not in source_file_hits:
-            source_file_hits.append(source_filename)
-
-        if len(preview_rows) < 16:
-            preview_rows.append(
-                {
-                    "dimension_id": str(item.get("dimension_id") or ""),
-                    "label": str(item.get("label") or ""),
-                    "reason": str(item.get("reason") or ""),
-                    "mandatory": mandatory,
-                    "source_pack_id": source_pack,
-                    "material_type": str(item.get("material_type") or ""),
-                    "source_filename": source_filename,
-                    "chunk_id": str(item.get("chunk_id") or ""),
-                }
-            )
-
-    mandatory_hit_rate = (
-        round(float(mandatory_hit) / float(mandatory_total), 4) if mandatory_total > 0 else None
-    )
-    overall_hit_rate = (
-        round(float(total_hits) / float(total_requirements), 4) if total_requirements > 0 else None
-    )
-    return {
-        "total_requirements": total_requirements,
-        "total_hits": total_hits,
-        "overall_hit_rate": overall_hit_rate,
-        "mandatory_total": mandatory_total,
-        "mandatory_hit": mandatory_hit,
-        "mandatory_hit_rate": mandatory_hit_rate,
-        "runtime_material_hits": runtime_hits,
-        "source_files_hit": source_file_hits[:120],
-        "source_files_hit_count": len(source_file_hits),
-        "source_pack_hit_counts": dict(source_pack_counter),
-        "preview": preview_rows,
-    }
+    return evidence_trace_service.build_evidence_trace_summary(report)
 
 
 def _parse_reason_ratio(reason: str, marker: str) -> tuple[int, int]:
@@ -2389,76 +2320,14 @@ def _build_submission_scoring_basis_report(
     project_id: str,
     submission: Dict[str, object],
 ) -> Dict[str, object]:
-    """构建评分依据审计：展示评分时注入的输入与资料命中链路。"""
-    submission_id = str(submission.get("id") or "")
-    filename = str(submission.get("filename") or "")
-    report = submission.get("report") if isinstance(submission.get("report"), dict) else {}
-    meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
-    input_injection = (
-        meta.get("input_injection") if isinstance(meta.get("input_injection"), dict) else {}
+    return scoring_basis_service.build_scoring_basis_projection(
+        project_id=project_id,
+        submission=submission,
+        build_material_quality_snapshot=_build_material_quality_snapshot,
+        build_evidence_trace_summary=_build_evidence_trace_summary,
+        to_float_or_none=_to_float_or_none,
+        now_iso=_now_iso,
     )
-    material_quality = (
-        meta.get("material_quality") if isinstance(meta.get("material_quality"), dict) else {}
-    )
-    if not material_quality:
-        material_quality = _build_material_quality_snapshot(project_id)
-    material_retrieval = (
-        meta.get("material_retrieval") if isinstance(meta.get("material_retrieval"), dict) else {}
-    )
-    material_utilization = (
-        meta.get("material_utilization")
-        if isinstance(meta.get("material_utilization"), dict)
-        else {}
-    )
-    material_utilization_gate = (
-        meta.get("material_utilization_gate")
-        if isinstance(meta.get("material_utilization_gate"), dict)
-        else {}
-    )
-    evidence_trace = (
-        meta.get("evidence_trace") if isinstance(meta.get("evidence_trace"), dict) else {}
-    )
-    if not evidence_trace:
-        evidence_trace = _build_evidence_trace_summary(report)
-
-    recommendations: List[str] = []
-    mece_inputs = (
-        input_injection.get("mece_inputs")
-        if isinstance(input_injection.get("mece_inputs"), dict)
-        else {}
-    )
-    if mece_inputs and not bool(mece_inputs.get("materials_quality_gate_passed", True)):
-        recommendations.append("资料门禁未通过：建议先完成“3) 项目资料”整改后再评分。")
-    if material_utilization_gate:
-        for reason in material_utilization_gate.get("reasons") or []:
-            reason_text = str(reason).strip()
-            if reason_text:
-                recommendations.append(reason_text)
-    if (_to_float_or_none(evidence_trace.get("total_requirements")) or 0) > 0 and (
-        _to_float_or_none(evidence_trace.get("total_hits")) or 0
-    ) <= 0:
-        recommendations.append("评分未命中任何资料证据：请补充与清单/图纸/答疑一致的量化约束。")
-
-    deduped_recommendations: List[str] = []
-    for item in recommendations:
-        text = str(item or "").strip()
-        if text and text not in deduped_recommendations:
-            deduped_recommendations.append(text)
-
-    return {
-        "project_id": project_id,
-        "submission_id": submission_id,
-        "filename": filename,
-        "generated_at": _now_iso(),
-        "scoring_status": str(report.get("scoring_status") or "unknown"),
-        "mece_inputs": mece_inputs,
-        "material_quality": material_quality,
-        "material_retrieval": material_retrieval,
-        "material_utilization": material_utilization,
-        "material_utilization_gate": material_utilization_gate,
-        "evidence_trace": evidence_trace,
-        "recommendations": deduped_recommendations[:16],
-    }
 
 
 def _render_evidence_trace_markdown(payload: Dict[str, object]) -> str:
@@ -2549,231 +2418,11 @@ def _render_evidence_trace_markdown(payload: Dict[str, object]) -> str:
 def _aggregate_material_utilization_summaries(
     summaries: List[Dict[str, object]],
 ) -> Dict[str, object]:
-    """聚合多份施组评分的资料利用统计，便于前端直接展示。"""
-    by_type: Dict[str, Dict[str, int]] = {}
-    available_types: List[str] = []
-    uncovered_types: List[str] = []
-    retrieval_total = 0
-    retrieval_hit = 0
-    consistency_total = 0
-    consistency_hit = 0
-    fallback_total = 0
-    fallback_hit = 0
-    retrieval_file_total = 0
-    retrieval_file_hit = 0
-    retrieval_selected_filenames: set[str] = set()
-    retrieval_hit_filenames: set[str] = set()
-    retrieval_selected_via_counts: Dict[str, int] = {}
-    retrieval_total_via_counts: Dict[str, int] = {}
-    retrieval_hit_via_counts: Dict[str, int] = {}
-    retrieval_top_k = 0
-    retrieval_per_type_quota = 0
-    retrieval_per_file_quota = 0
-    retrieval_base_top_k = 0
-    retrieval_base_per_type_quota = 0
-    retrieval_base_per_file_quota = 0
-    material_total_size_mb = 0.0
-    material_type_count = 0
-    material_file_count = 0
-    retrieval_budget_reasons: List[str] = []
-    query_terms_count = 0
-    query_numeric_terms_count = 0
-
-    def _rate(hit_cnt: int, total_cnt: int) -> Optional[float]:
-        if total_cnt <= 0:
-            return None
-        return round(float(hit_cnt) / float(total_cnt), 4)
-
-    def _ensure_bucket(material_type: str) -> Dict[str, int]:
-        if material_type not in by_type:
-            by_type[material_type] = {
-                "retrieval_total": 0,
-                "retrieval_hit": 0,
-                "consistency_total": 0,
-                "consistency_hit": 0,
-                "fallback_total": 0,
-                "fallback_hit": 0,
-            }
-        return by_type[material_type]
-
-    for raw in summaries:
-        if not isinstance(raw, dict):
-            continue
-        retrieval_total += int(_to_float_or_none(raw.get("retrieval_total")) or 0)
-        retrieval_hit += int(_to_float_or_none(raw.get("retrieval_hit")) or 0)
-        retrieval_file_total += int(_to_float_or_none(raw.get("retrieval_file_total")) or 0)
-        retrieval_file_hit += int(_to_float_or_none(raw.get("retrieval_file_hit")) or 0)
-        selected_files_raw = raw.get("retrieval_selected_filenames")
-        if isinstance(selected_files_raw, list):
-            for item in selected_files_raw:
-                filename = str(item or "").strip()
-                if filename:
-                    retrieval_selected_filenames.add(filename)
-        hit_files_raw = raw.get("retrieval_hit_filenames")
-        if isinstance(hit_files_raw, list):
-            for item in hit_files_raw:
-                filename = str(item or "").strip()
-                if filename:
-                    retrieval_hit_filenames.add(filename)
-        retrieval_top_k = max(
-            retrieval_top_k,
-            int(_to_float_or_none(raw.get("retrieval_top_k")) or 0),
-        )
-        retrieval_per_type_quota = max(
-            retrieval_per_type_quota,
-            int(_to_float_or_none(raw.get("retrieval_per_type_quota")) or 0),
-        )
-        retrieval_per_file_quota = max(
-            retrieval_per_file_quota,
-            int(_to_float_or_none(raw.get("retrieval_per_file_quota")) or 0),
-        )
-        retrieval_base_top_k = max(
-            retrieval_base_top_k,
-            int(_to_float_or_none(raw.get("retrieval_base_top_k")) or 0),
-        )
-        retrieval_base_per_type_quota = max(
-            retrieval_base_per_type_quota,
-            int(_to_float_or_none(raw.get("retrieval_base_per_type_quota")) or 0),
-        )
-        retrieval_base_per_file_quota = max(
-            retrieval_base_per_file_quota,
-            int(_to_float_or_none(raw.get("retrieval_base_per_file_quota")) or 0),
-        )
-        material_total_size_mb = max(
-            material_total_size_mb,
-            float(_to_float_or_none(raw.get("material_total_size_mb")) or 0.0),
-        )
-        material_type_count = max(
-            material_type_count,
-            int(_to_float_or_none(raw.get("material_type_count")) or 0),
-        )
-        material_file_count = max(
-            material_file_count,
-            int(_to_float_or_none(raw.get("material_file_count")) or 0),
-        )
-        reasons_raw = raw.get("retrieval_budget_reasons")
-        if isinstance(reasons_raw, list):
-            for item in reasons_raw:
-                text = str(item or "").strip()
-                if text and text not in retrieval_budget_reasons:
-                    retrieval_budget_reasons.append(text)
-        selected_via_raw = raw.get("retrieval_selected_via_counts")
-        if isinstance(selected_via_raw, dict):
-            for key, value in selected_via_raw.items():
-                mode = str(key or "").strip() or "unknown"
-                retrieval_selected_via_counts[mode] = int(
-                    retrieval_selected_via_counts.get(mode, 0)
-                ) + int(_to_float_or_none(value) or 0)
-        total_via_raw = raw.get("retrieval_total_via_counts")
-        if isinstance(total_via_raw, dict):
-            for key, value in total_via_raw.items():
-                mode = str(key or "").strip() or "unknown"
-                retrieval_total_via_counts[mode] = int(
-                    retrieval_total_via_counts.get(mode, 0)
-                ) + int(_to_float_or_none(value) or 0)
-        hit_via_raw = raw.get("retrieval_hit_via_counts")
-        if isinstance(hit_via_raw, dict):
-            for key, value in hit_via_raw.items():
-                mode = str(key or "").strip() or "unknown"
-                retrieval_hit_via_counts[mode] = int(retrieval_hit_via_counts.get(mode, 0)) + int(
-                    _to_float_or_none(value) or 0
-                )
-        query_terms_count += int(_to_float_or_none(raw.get("query_terms_count")) or 0)
-        query_numeric_terms_count += int(
-            _to_float_or_none(raw.get("query_numeric_terms_count")) or 0
-        )
-        consistency_total += int(_to_float_or_none(raw.get("consistency_total")) or 0)
-        consistency_hit += int(_to_float_or_none(raw.get("consistency_hit")) or 0)
-
-        raw_types = raw.get("available_types")
-        if isinstance(raw_types, list):
-            for item in raw_types:
-                key = _normalize_material_type(item)
-                if key not in available_types:
-                    available_types.append(key)
-                    _ensure_bucket(key)
-
-        raw_uncovered = raw.get("uncovered_types")
-        if isinstance(raw_uncovered, list):
-            for item in raw_uncovered:
-                key = _normalize_material_type(item)
-                if key not in uncovered_types:
-                    uncovered_types.append(key)
-
-        raw_by_type = raw.get("by_type")
-        if not isinstance(raw_by_type, dict):
-            continue
-        for mat_type_raw, row in raw_by_type.items():
-            key = _normalize_material_type(mat_type_raw)
-            bucket = _ensure_bucket(key)
-            row_dict = row if isinstance(row, dict) else {}
-            rt = int(_to_float_or_none(row_dict.get("retrieval_total")) or 0)
-            rh = int(_to_float_or_none(row_dict.get("retrieval_hit")) or 0)
-            ct = int(_to_float_or_none(row_dict.get("consistency_total")) or 0)
-            ch = int(_to_float_or_none(row_dict.get("consistency_hit")) or 0)
-            ft = int(_to_float_or_none(row_dict.get("fallback_total")) or 0)
-            fh = int(_to_float_or_none(row_dict.get("fallback_hit")) or 0)
-            bucket["retrieval_total"] += rt
-            bucket["retrieval_hit"] += rh
-            bucket["consistency_total"] += ct
-            bucket["consistency_hit"] += ch
-            bucket["fallback_total"] += ft
-            bucket["fallback_hit"] += fh
-            fallback_total += ft
-            fallback_hit += fh
-
-    normalized_by_type: Dict[str, Dict[str, object]] = {}
-    for mat_type, row in by_type.items():
-        normalized_by_type[mat_type] = {
-            "retrieval_total": row["retrieval_total"],
-            "retrieval_hit": row["retrieval_hit"],
-            "retrieval_hit_rate": _rate(row["retrieval_hit"], row["retrieval_total"]),
-            "consistency_total": row["consistency_total"],
-            "consistency_hit": row["consistency_hit"],
-            "consistency_hit_rate": _rate(row["consistency_hit"], row["consistency_total"]),
-            "fallback_total": row["fallback_total"],
-            "fallback_hit": row["fallback_hit"],
-            "fallback_hit_rate": _rate(row["fallback_hit"], row["fallback_total"]),
-        }
-
-    retrieval_unhit_filenames = sorted(retrieval_selected_filenames - retrieval_hit_filenames)
-
-    return {
-        "retrieval_total": retrieval_total,
-        "retrieval_hit": retrieval_hit,
-        "retrieval_hit_rate": _rate(retrieval_hit, retrieval_total),
-        "retrieval_file_total": retrieval_file_total,
-        "retrieval_file_hit": retrieval_file_hit,
-        "retrieval_file_coverage_rate": _rate(retrieval_file_hit, retrieval_file_total),
-        "retrieval_selected_filenames": sorted(retrieval_selected_filenames)[:120],
-        "retrieval_hit_filenames": sorted(retrieval_hit_filenames)[:120],
-        "retrieval_unhit_filenames": retrieval_unhit_filenames[:120],
-        "retrieval_unhit_file_count": len(retrieval_unhit_filenames),
-        "retrieval_top_k": retrieval_top_k,
-        "retrieval_per_type_quota": retrieval_per_type_quota,
-        "retrieval_per_file_quota": retrieval_per_file_quota,
-        "retrieval_base_top_k": retrieval_base_top_k,
-        "retrieval_base_per_type_quota": retrieval_base_per_type_quota,
-        "retrieval_base_per_file_quota": retrieval_base_per_file_quota,
-        "retrieval_budget_reasons": retrieval_budget_reasons[:12],
-        "material_total_size_mb": round(material_total_size_mb, 3),
-        "material_type_count": material_type_count,
-        "material_file_count": material_file_count,
-        "retrieval_selected_via_counts": retrieval_selected_via_counts,
-        "retrieval_total_via_counts": retrieval_total_via_counts,
-        "retrieval_hit_via_counts": retrieval_hit_via_counts,
-        "consistency_total": consistency_total,
-        "consistency_hit": consistency_hit,
-        "consistency_hit_rate": _rate(consistency_hit, consistency_total),
-        "fallback_total": fallback_total,
-        "fallback_hit": fallback_hit,
-        "fallback_hit_rate": _rate(fallback_hit, fallback_total),
-        "query_terms_count": query_terms_count,
-        "query_numeric_terms_count": query_numeric_terms_count,
-        "by_type": normalized_by_type,
-        "available_types": available_types,
-        "uncovered_types": uncovered_types,
-    }
+    return rescore_service.aggregate_material_utilization_summaries(
+        summaries,
+        to_float_or_none=_to_float_or_none,
+        normalize_material_type=_normalize_material_type,
+    )
 
 
 def _build_material_utilization_alerts(
@@ -3181,48 +2830,13 @@ def _evaluate_material_utilization_gate(
     }
 
 
-def _aggregate_material_utilization_gates(gates: List[Dict[str, object]]) -> Dict[str, object]:
-    if not gates:
-        return {
-            "enabled": False,
-            "mode": DEFAULT_MATERIAL_UTILIZATION_GATE_MODE,
-            "blocked_submissions": 0,
-            "warn_submissions": 0,
-            "pass_submissions": 0,
-            "failed_submissions": 0,
-            "failed_filenames": [],
-        }
-    enabled = any(bool(g.get("enabled")) for g in gates if isinstance(g, dict))
-    mode = "block"
-    if all(str(g.get("mode", "")).lower() == "warn" for g in gates if isinstance(g, dict)):
-        mode = "warn"
-    blocked_submissions = 0
-    warn_submissions = 0
-    pass_submissions = 0
-    failed_submissions = 0
-    failed_filenames: List[str] = []
-    for g in gates:
-        if not isinstance(g, dict):
-            continue
-        level = str(g.get("level") or "").strip().lower()
-        passed = bool(g.get("passed", False))
-        if passed:
-            pass_submissions += 1
-        else:
-            failed_submissions += 1
-        if level == "blocked":
-            blocked_submissions += 1
-        elif level == "warn":
-            warn_submissions += 1
-    return {
-        "enabled": enabled,
-        "mode": mode,
-        "blocked_submissions": blocked_submissions,
-        "warn_submissions": warn_submissions,
-        "pass_submissions": pass_submissions,
-        "failed_submissions": failed_submissions,
-        "failed_filenames": failed_filenames,
-    }
+def _aggregate_material_utilization_gates(
+    gates: List[Dict[str, object]],
+) -> Dict[str, object]:
+    return rescore_service.aggregate_material_utilization_gates(
+        gates,
+        default_mode=DEFAULT_MATERIAL_UTILIZATION_GATE_MODE,
+    )
 
 
 def _get_rubric_dim_cfg(rubric_dimensions: Dict[str, object], dim_id: str) -> Dict[str, object]:
@@ -3764,232 +3378,46 @@ def _build_v2_report_payload(
 
 
 def _select_calibrator_model(project: Dict[str, object]) -> Optional[Dict[str, object]]:
-    models = sorted(
-        load_calibration_models(), key=lambda x: str(x.get("created_at", "")), reverse=True
+    return calibration_model_service.select_calibrator_model(
+        project,
+        load_calibration_models=load_calibration_models,
     )
-    if not models:
-        return None
-    project_id = str(project.get("id") or "")
-    locked_version = str(project.get("calibrator_version_locked") or "")
-
-    def _scope_project_id(model: Dict[str, object]) -> str:
-        return str(((model.get("train_filter") or {}).get("project_id") or "")).strip()
-
-    def _compatible(model: Dict[str, object]) -> bool:
-        # 仅允许同项目训练出的校准器生效，避免跨项目污染总分。
-        return _scope_project_id(model) == project_id
-
-    if locked_version:
-        for model in models:
-            if str(model.get("calibrator_version") or "") == locked_version:
-                return model if _compatible(model) else None
-        return None
-
-    for model in models:
-        if bool(model.get("deployed")) and _compatible(model):
-            return model
-    return None
 
 
 def _select_deployed_patch(project_id: str) -> Optional[Dict[str, object]]:
-    packages = [
-        p
-        for p in load_patch_packages()
-        if str(p.get("project_id")) == project_id and str(p.get("status")) == "deployed"
-    ]
-    if not packages:
-        return None
-    packages.sort(key=lambda x: str(x.get("updated_at", "")), reverse=True)
-    return packages[0]
+    return patch_evolution_service.select_deployed_patch(
+        project_id,
+        load_patch_packages=load_patch_packages,
+    )
 
 
+@atomic_json_transaction("patch_deployments", "patch_packages")
 def _auto_govern_deployed_patch(
     *,
     project_id: str,
     delta_cases: List[Dict[str, object]],
 ) -> Dict[str, object]:
-    """
-    对当前已部署补丁做自动治理：
-    - shadow 评估通过：保留部署
-    - shadow 评估失败且样本充分：自动回滚，并尝试回退到 rollback_pointer
-    """
-    result: Dict[str, object] = {
-        "checked": False,
-        "project_id": project_id,
-        "patch_id": None,
-        "gate_passed": None,
-        "sample_count": 0,
-        "action": "skip",
-        "reason": "no_deployed_patch",
-        "rolled_back": False,
-        "rollback_to_patch_id": None,
-        "metrics_before_after": {},
-        "deployment_record_ids": [],
-    }
-    if not delta_cases:
-        result["reason"] = "no_delta_cases"
-        return result
-
-    packages = load_patch_packages()
-    deployed = [
-        p
-        for p in packages
-        if str(p.get("project_id")) == project_id and str(p.get("status")) == "deployed"
-    ]
-    if not deployed:
-        return result
-
-    deployed = sorted(deployed, key=lambda x: str(x.get("updated_at", "")), reverse=True)
-    patch = deployed[0]
-    patch_id = str(patch.get("id") or "")
-    result["checked"] = True
-    result["patch_id"] = patch_id
-
-    shadow = evaluate_patch_shadow(patch=patch, delta_cases=delta_cases)
-    metrics = shadow.get("metrics_before_after") or {}
-    sample_count = int(_to_float_or_none(metrics.get("sample_count")) or len(delta_cases) or 0)
-    gate_passed = bool(shadow.get("gate_passed"))
-    result["sample_count"] = sample_count
-    result["gate_passed"] = gate_passed
-    result["metrics_before_after"] = metrics
-
-    # 样本不足时不做自动回滚，避免少量噪声导致频繁抖动。
-    min_rollback_samples = 3
-    if gate_passed:
-        result["action"] = "keep"
-        result["reason"] = "shadow_passed"
-        return result
-    if sample_count < min_rollback_samples:
-        result["action"] = "skip"
-        result["reason"] = "insufficient_samples_for_rollback"
-        return result
-
-    now_iso = _now_iso()
-    rollback_pointer = str(patch.get("rollback_pointer") or "").strip()
-    rollback_target = None
-    if rollback_pointer:
-        rollback_target = next(
-            (
-                p
-                for p in packages
-                if str(p.get("id") or "") == rollback_pointer
-                and str(p.get("project_id") or "") == project_id
-            ),
-            None,
-        )
-
-    for row in packages:
-        if str(row.get("project_id") or "") != project_id:
-            continue
-        if str(row.get("status") or "") == "deployed":
-            row["status"] = "shadow_pass"
-            row["updated_at"] = now_iso
-
-    patch["status"] = "rolled_back"
-    patch["updated_at"] = now_iso
-
-    rollback_to_patch_id: Optional[str] = None
-    if rollback_target is not None:
-        rollback_target["status"] = "deployed"
-        rollback_target["updated_at"] = now_iso
-        rollback_to_patch_id = str(rollback_target.get("id") or "")
-
-    save_patch_packages(packages)
-
-    deployment_record_ids: List[str] = []
-    deploys = load_patch_deployments()
-    rollback_record = {
-        "id": str(uuid4()),
-        "patch_id": patch_id,
-        "project_id": project_id,
-        "action": "auto_rollback",
-        "deployed": False,
-        "metrics_before_after": metrics,
-        "rollback_to_version": rollback_to_patch_id or rollback_pointer or None,
-        "created_at": now_iso,
-    }
-    deploys.append(rollback_record)
-    deployment_record_ids.append(str(rollback_record["id"]))
-    if rollback_to_patch_id:
-        promote_record = {
-            "id": str(uuid4()),
-            "patch_id": rollback_to_patch_id,
-            "project_id": project_id,
-            "action": "auto_promote_rollback_pointer",
-            "deployed": True,
-            "metrics_before_after": metrics,
-            "rollback_to_version": None,
-            "created_at": now_iso,
-        }
-        deploys.append(promote_record)
-        deployment_record_ids.append(str(promote_record["id"]))
-    save_patch_deployments(deploys)
-
-    result["action"] = "rollback"
-    result["reason"] = "shadow_failed"
-    result["rolled_back"] = True
-    result["rollback_to_patch_id"] = rollback_to_patch_id
-    result["deployment_record_ids"] = deployment_record_ids
-    return result
+    return patch_evolution_service.auto_govern_deployed_patch(
+        project_id=project_id,
+        delta_cases=delta_cases,
+        load_patch_packages=load_patch_packages,
+        save_patch_packages=save_patch_packages,
+        load_patch_deployments=load_patch_deployments,
+        save_patch_deployments=save_patch_deployments,
+        evaluate_patch_shadow=evaluate_patch_shadow,
+        to_float_or_none=_to_float_or_none,
+        now_iso=_now_iso,
+        new_id=lambda: str(uuid4()),
+    )
 
 
 def _apply_deployed_patch_to_report(project_id: str, report: Dict[str, object]) -> None:
-    patch = _select_deployed_patch(project_id)
-    if not patch:
-        return
-    payload = patch.get("patch_payload") or {}
-    penalties = report.get("penalties")
-    if not isinstance(penalties, list) or not penalties:
-        report.setdefault("meta", {})
-        report["meta"]["patch_id"] = patch.get("id")
-        return
-
-    multipliers = payload.get("penalty_multiplier") or {}
-    old_penalty_total = sum(
-        float(p.get("points", p.get("deduct", 0.0))) for p in penalties if isinstance(p, dict)
+    patch_evolution_service.apply_deployed_patch_to_report(
+        project_id,
+        report,
+        load_patch_packages=load_patch_packages,
+        compute_v2_rule_total=compute_v2_rule_total,
     )
-    new_penalty_total = 0.0
-    for penalty in penalties:
-        if not isinstance(penalty, dict):
-            continue
-        code = str(penalty.get("code") or "")
-        mul = float(multipliers.get(code, 1.0)) if code else 1.0
-        if "points" in penalty and penalty.get("points") is not None:
-            penalty["points"] = round(float(penalty.get("points", 0.0)) * mul, 2)
-            new_penalty_total += float(penalty["points"])
-        elif "deduct" in penalty and penalty.get("deduct") is not None:
-            penalty["deduct"] = round(float(penalty.get("deduct", 0.0)) * mul, 2)
-            new_penalty_total += float(penalty["deduct"])
-        else:
-            new_penalty_total += 0.0
-
-    has_dim_components = ("dim_total_90" in report) or ("dim_total_80" in report)
-    if has_dim_components:
-        dim_total_80 = float(report.get("dim_total_80", 0.0))
-        dim_total_90 = report.get("dim_total_90")
-        if dim_total_90 is not None:
-            # 统一回推为 dim_total_80 再走同一聚合公式，避免历史/新字段混用时口径漂移
-            dim_total_80 = max(0.0, min(80.0, float(dim_total_90) * (80.0 / 90.0)))
-        consistency_bonus = float(report.get("consistency_bonus", 0.0))
-        new_rule_total, normalized_dim_total_90 = compute_v2_rule_total(
-            dim_total_80=dim_total_80,
-            consistency_bonus=consistency_bonus,
-            penalty_points=new_penalty_total,
-        )
-        report["rule_total_score"] = new_rule_total
-        report["total_score"] = new_rule_total
-        report["dim_total_80"] = round(dim_total_80, 2)
-        report["dim_total_90"] = normalized_dim_total_90
-    else:
-        old_total = float(report.get("rule_total_score", report.get("total_score", 0.0)))
-        delta = new_penalty_total - old_penalty_total
-        new_total = max(0.0, min(100.0, round(old_total - delta, 2)))
-        report["rule_total_score"] = new_total
-        report["total_score"] = new_total
-
-    report.setdefault("meta", {})
-    report["meta"]["patch_id"] = patch.get("id")
-    report["meta"]["patch_status"] = patch.get("status")
 
 
 def _clip_score(value: float, low: float = 0.0, high: float = 100.0) -> float:
@@ -4203,78 +3631,17 @@ def _apply_prediction_to_report(
     submission_like: Dict[str, object],
     project: Dict[str, object],
 ) -> Optional[str]:
-    model = _select_calibrator_model(project)
-    if not model:
-        report["pred_total_score"] = None
-        report["llm_total_score"] = None
-        report["pred_confidence"] = None
-        report["pred_dim_scores"] = None
-        report["score_blend"] = None
-        # `total_score` is the primary score used by UI/sorting.
-        report["total_score"] = float(
-            report.get("rule_total_score", report.get("total_score", 0.0))
-        )
-        submission_like["total_score"] = float(report.get("total_score", 0.0))
-        return None
-    artifact = model.get("model_artifact") or model.get("artifact") or {}
-    if not isinstance(artifact, dict):
-        report["pred_total_score"] = None
-        report["llm_total_score"] = None
-        report["pred_confidence"] = None
-        report["pred_dim_scores"] = None
-        report["score_blend"] = None
-        report["total_score"] = float(
-            report.get("rule_total_score", report.get("total_score", 0.0))
-        )
-        submission_like["total_score"] = float(report.get("total_score", 0.0))
-        return None
-    row = build_feature_row(report, submission=submission_like)
-    try:
-        pred, conf = predict_with_model(artifact, row.get("x_features") or {})
-    except Exception as e:
-        # 预测模型不应影响主流程可用性；失败时保留 rule 分并显式记录错误。
-        report["pred_total_score"] = None
-        report["llm_total_score"] = None
-        report["pred_confidence"] = None
-        report["pred_dim_scores"] = None
-        report["score_blend"] = None
-        report["total_score"] = float(
-            report.get("rule_total_score", report.get("total_score", 0.0))
-        )
-        submission_like["total_score"] = float(report.get("total_score", 0.0))
-        report.setdefault("meta", {})
-        report["meta"]["calibrator_version"] = model.get("calibrator_version")
-        report["meta"]["calibrator_error"] = f"{type(e).__name__}: {e}"
-        return str(model.get("calibrator_version") or "")
-
-    rule_total = float(report.get("rule_total_score", report.get("total_score", 0.0)))
-    fused_total, llm_total, blend_info = _fuse_rule_and_llm_scores(
-        rule_total=rule_total,
-        llm_total_raw=float(pred),
+    return calibration_model_service.apply_prediction_to_report(
+        report,
+        submission_like=submission_like,
         project=project,
-        report=report,
+        load_calibration_models=load_calibration_models,
+        build_feature_row=build_feature_row,
+        predict_with_model=predict_with_model,
+        fuse_rule_and_llm_scores=_fuse_rule_and_llm_scores,
+        to_float_or_none=_to_float_or_none,
+        clip_score=_clip_score,
     )
-    sigma = float(_to_float_or_none(conf.get("sigma")) or 0.0)
-    ci95_delta = 1.96 * sigma if sigma > 0 else 0.0
-    ci95_lower = _clip_score(fused_total - ci95_delta)
-    ci95_upper = _clip_score(fused_total + ci95_delta)
-    report["pred_total_score"] = fused_total
-    report["llm_total_score"] = llm_total
-    report["pred_confidence"] = {
-        **conf,
-        "raw_llm_score": float(pred),
-        "bounded_llm_score": llm_total,
-        "fused_ci95_lower": round(ci95_lower, 2),
-        "fused_ci95_upper": round(ci95_upper, 2),
-        "fused_sigma": round(sigma, 2),
-    }
-    report["score_blend"] = blend_info
-    report["pred_dim_scores"] = None
-    report["total_score"] = float(fused_total)
-    submission_like["total_score"] = float(fused_total)
-    report.setdefault("meta", {})
-    report["meta"]["calibrator_version"] = model.get("calibrator_version")
-    return str(model.get("calibrator_version") or "")
 
 
 def _to_float_or_none(value: Any) -> Optional[float]:
@@ -4320,38 +3687,22 @@ def _resolve_submission_score_fields(
 
 
 def _report_is_blocked(report: Optional[Dict[str, object]]) -> bool:
-    if not isinstance(report, dict):
-        return False
-    status = str(report.get("scoring_status") or "").strip().lower()
-    if status == "blocked":
-        return True
-    meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
-    return bool(meta.get("score_blocked_by_material_utilization"))
+    return submission_scoring_service.report_is_blocked(report)
 
 
 def _submission_is_scored(submission: Dict[str, object]) -> bool:
-    report_obj = submission.get("report")
-    if isinstance(report_obj, dict):
-        if _report_is_blocked(report_obj):
-            return False
-        status = str(report_obj.get("scoring_status") or "").strip().lower()
-        if status == "pending":
-            return False
-        if status == "scored":
-            return True
-        if _to_float_or_none(report_obj.get("rule_total_score")) is not None:
-            return True
-        if _to_float_or_none(report_obj.get("pred_total_score")) is not None:
-            return True
-        if _to_float_or_none(report_obj.get("total_score")) is not None:
-            return True
-    return _to_float_or_none(submission.get("total_score")) is not None
+    return submission_scoring_service.submission_is_scored(
+        submission,
+        to_float_or_none=_to_float_or_none,
+    )
 
 
 def _mark_report_scored(report: Dict[str, object], *, trigger: str) -> None:
-    report["scoring_status"] = "scored"
-    report["scoring_trigger"] = trigger
-    report["scored_at"] = _now_iso()
+    submission_scoring_service.mark_report_scored(
+        report,
+        trigger=trigger,
+        now_iso=_now_iso,
+    )
 
 
 def _build_pending_submission_report(
@@ -4359,32 +3710,13 @@ def _build_pending_submission_report(
     project: Dict[str, object],
     scoring_engine_version: str,
 ) -> Dict[str, object]:
-    return {
-        "scoring_status": "pending",
-        "scoring_trigger": "upload_only",
-        "queued_at": _now_iso(),
-        "total_score": None,
-        "rule_total_score": None,
-        "pred_total_score": None,
-        "llm_total_score": None,
-        "pred_confidence": None,
-        "score_blend": None,
-        "dimension_scores": {},
-        "rule_dim_scores": {},
-        "pred_dim_scores": None,
-        "penalties": [],
-        "lint_findings": [],
-        "suggestions": [],
-        "requirement_hits": [],
-        "mandatory_req_hit_rate": None,
-        "evidence_units_count": 0,
-        "meta": {
-            "engine_version": _determine_engine_version(project, scoring_engine_version),
-            "region": project.get("region", DEFAULT_REGION),
-            "scoring_engine_version": scoring_engine_version,
-            "queued_for_scoring": True,
-        },
-    }
+    return submission_scoring_service.build_pending_submission_report(
+        project=project,
+        scoring_engine_version=scoring_engine_version,
+        default_region=DEFAULT_REGION,
+        determine_engine_version=_determine_engine_version,
+        now_iso=_now_iso,
+    )
 
 
 def _score_submission_for_project(
@@ -4435,68 +3767,13 @@ def _score_submission_for_project(
             project=project,
             submission_text=text,
         )
-        effective_requirements = list(requirements) + list(runtime_custom_requirements)
         meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
         strict_pre_flight = bool(meta.get("enforce_gb_redline", DEFAULT_ENFORCE_GB_REDLINE))
-        try:
-            v2_result = score_text_v2(
-                submission_id=submission_id,
-                text=text,
-                lexicon=config.lexicon,
-                weights_norm=weights_norm,
-                anchors=anchors,
-                requirements=effective_requirements,
-                strict_pre_flight=strict_pre_flight,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
-        report = _build_v2_report_payload(
-            v2_result,
-            text=text,
-            project=project,
-            profile_snapshot=profile_snapshot,
-            scoring_engine_version=scoring_engine_version,
-        )
         snapshot_for_meta = (
             dict(material_quality_snapshot)
             if isinstance(material_quality_snapshot, dict)
             else _build_material_quality_snapshot(project_id)
         )
-        report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
-        report_meta["input_injection"] = _build_scoring_input_injection_meta(
-            project_id=project_id,
-            text=text,
-            anchors_count=len(anchors),
-            base_requirements_count=len(requirements),
-            runtime_custom_requirements_count=len(runtime_custom_requirements),
-            weights_norm=weights_norm,
-            profile_snapshot=profile_snapshot,
-            constraints_rebuilt=constraints_rebuilt,
-            runtime_req_meta=runtime_req_meta,
-            material_quality_snapshot=snapshot_for_meta,
-        )
-        report_meta["material_quality"] = snapshot_for_meta
-        report_meta["material_retrieval"] = {
-            "chunks": int(
-                _to_float_or_none(runtime_req_meta.get("material_retrieval_chunks")) or 0
-            ),
-            "requirements": int(
-                _to_float_or_none(runtime_req_meta.get("material_retrieval_requirements")) or 0
-            ),
-            "preview": runtime_req_meta.get("material_retrieval_preview") or [],
-            "consistency_requirements": int(
-                _to_float_or_none(runtime_req_meta.get("material_consistency_requirements")) or 0
-            ),
-            "consistency_preview": runtime_req_meta.get("material_consistency_preview") or [],
-            "available_types": runtime_req_meta.get("material_available_types") or [],
-            "retrieval_types": runtime_req_meta.get("material_retrieval_types") or [],
-            "missing_types": runtime_req_meta.get("material_retrieval_missing_types") or [],
-        }
-        report_meta["material_utilization"] = _build_material_utilization_summary(
-            report,
-            runtime_req_meta,
-        )
-        gate_obj = snapshot_for_meta.get("gate")
         material_gate_cfg = _resolve_material_gate_config(project)
         material_required_types = (
             material_gate_cfg.get("required_types")
@@ -4504,80 +3781,60 @@ def _score_submission_for_project(
             else []
         )
         material_utilization_policy = _resolve_material_utilization_policy(project)
-        utilization_gate = _evaluate_material_utilization_gate(
-            report_meta.get("material_utilization")
-            if isinstance(report_meta.get("material_utilization"), dict)
-            else {},
-            policy=material_utilization_policy,
-            required_types=material_required_types,
-        )
-        if isinstance(gate_obj, dict):
-            report_meta["material_gate"] = gate_obj
-        report_meta["material_utilization_gate"] = utilization_gate
-        report_meta["material_utilization_alerts"] = _build_material_utilization_alerts(
-            report_meta.get("material_utilization")
-            if isinstance(report_meta.get("material_utilization"), dict)
-            else {},
-            gate_obj if isinstance(gate_obj, dict) else {},
-        )
-        report_meta["evidence_trace"] = _build_evidence_trace_summary(report)
-        if bool(utilization_gate.get("blocked")):
-            report_meta["score_confidence_level"] = "low"
-            report_meta["score_blocked_by_material_utilization"] = True
-            alerts = (
-                report_meta.get("material_utilization_alerts")
-                if isinstance(report_meta.get("material_utilization_alerts"), list)
-                else []
+        try:
+            report, evidence_units = submission_scoring_service.score_prepared_v2_submission(
+                submission_id=submission_id,
+                text=text,
+                project_id=project_id,
+                project=project,
+                config=config,
+                weights_norm=weights_norm,
+                profile_snapshot=profile_snapshot,
+                scoring_engine_version=scoring_engine_version,
+                anchors=anchors,
+                requirements=requirements,
+                runtime_custom_requirements=runtime_custom_requirements,
+                runtime_req_meta=runtime_req_meta,
+                constraints_rebuilt=constraints_rebuilt,
+                material_quality_snapshot=snapshot_for_meta,
+                material_required_types=material_required_types,
+                material_utilization_policy=material_utilization_policy,
+                strict_pre_flight=strict_pre_flight,
+                score_text_v2=score_text_v2,
+                build_v2_report_payload=_build_v2_report_payload,
+                build_scoring_input_injection_meta=_build_scoring_input_injection_meta,
+                build_material_utilization_summary=_build_material_utilization_summary,
+                evaluate_material_utilization_gate=_evaluate_material_utilization_gate,
+                build_material_utilization_alerts=_build_material_utilization_alerts,
+                build_evidence_trace_summary=_build_evidence_trace_summary,
+                to_float_or_none=_to_float_or_none,
+                now_iso=_now_iso,
             )
-            for reason in utilization_gate.get("reasons") or []:
-                reason_text = str(reason).strip()
-                if reason_text and reason_text not in alerts:
-                    alerts.append("资料利用门禁：" + reason_text)
-            report_meta["material_utilization_alerts"] = alerts[:8]
-            report["scoring_status"] = "blocked"
-            report["scoring_trigger"] = "material_utilization_gate"
-            report["scored_at"] = _now_iso()
-        elif bool(utilization_gate.get("warned")):
-            report_meta["score_confidence_level"] = "medium"
-        else:
-            report_meta["score_confidence_level"] = "high"
-        report["meta"] = report_meta
+        except submission_scoring_service.PreparedScoringInputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         _apply_deployed_patch_to_report(project_id, report)
         if _report_is_blocked(report):
-            return report, list(v2_result.get("evidence_units") or [])
+            return report, evidence_units
         submission_like = {"id": submission_id, "project_id": project_id, "text": text}
         _apply_prediction_to_report(report, submission_like=submission_like, project=project)
         _mark_report_scored(report, trigger="score_engine")
-        return report, list(v2_result.get("evidence_units") or [])
+        return report, evidence_units
 
-    legacy = score_text(
-        text,
-        config.rubric,
-        config.lexicon,
-        dimension_multipliers=multipliers,
-    ).model_dump()
-    legacy.setdefault("rule_total_score", float(legacy.get("total_score", 0.0)))
-    legacy.setdefault(
-        "rule_dim_scores", _rule_dim_scores_from_legacy(legacy.get("dimension_scores", {}))
+    legacy, evidence_units = submission_scoring_service.score_prepared_legacy_submission(
+        text=text,
+        project=project,
+        config=config,
+        multipliers=multipliers,
+        profile_snapshot=profile_snapshot,
+        scoring_engine_version=scoring_engine_version,
+        default_region=DEFAULT_REGION,
+        score_text_legacy=score_text,
+        rule_dim_scores_from_legacy=_rule_dim_scores_from_legacy,
+        build_evidence_trace_summary=_build_evidence_trace_summary,
     )
-    legacy.setdefault("pred_dim_scores", None)
-    legacy.setdefault("pred_total_score", None)
-    legacy.setdefault("pred_confidence", None)
-    legacy.setdefault("lint_findings", [])
-    legacy.setdefault("requirement_hits", [])
-    legacy.setdefault("mandatory_req_hit_rate", None)
-    legacy.setdefault("evidence_units_count", 0)
-    legacy.setdefault("meta", {})
-    legacy["meta"]["engine_version"] = "v1"
-    legacy["meta"]["region"] = project.get("region", DEFAULT_REGION)
-    legacy["meta"]["scoring_engine_version"] = scoring_engine_version
-    if profile_snapshot:
-        legacy["meta"]["expert_profile_snapshot"] = profile_snapshot
-        legacy["meta"]["expert_profile_id"] = profile_snapshot.get("id")
-    legacy["meta"]["evidence_trace"] = _build_evidence_trace_summary(legacy)
     _apply_deployed_patch_to_report(project_id, legacy)
     _mark_report_scored(legacy, trigger="score_engine")
-    return legacy, []
+    return legacy, evidence_units
 
 
 def _replace_submission_evidence_units(
@@ -4604,29 +3861,7 @@ def _latest_records_by_submission(records: List[Dict[str, object]]) -> Dict[str,
 
 
 def _extract_auto_candidates(model_artifact: Dict[str, Any]) -> List[Dict[str, Any]]:
-    best_selection = model_artifact.get("best_selection") or {}
-    raw_candidates = best_selection.get("candidates") or []
-    if not isinstance(raw_candidates, list):
-        return []
-    normalized: List[Dict[str, Any]] = []
-    for item in raw_candidates:
-        if not isinstance(item, dict):
-            continue
-        metrics = item.get("metrics") or {}
-        cv_item = item.get("cv") or {}
-        normalized.append(
-            {
-                "model_type": str(item.get("model_type") or ""),
-                "ok": bool(item.get("ok")),
-                "gate_passed": bool(item.get("gate_passed")),
-                "cv_mae": metrics.get("cv_mae"),
-                "cv_rmse": metrics.get("cv_rmse"),
-                "cv_spearman": metrics.get("cv_spearman"),
-                "cv_mode": cv_item.get("mode"),
-                "cv_pred_count": cv_item.get("pred_count"),
-            }
-        )
-    return normalized
+    return calibration_model_service.extract_auto_candidates(model_artifact)
 
 
 def _build_calibrator_summary(
@@ -4642,94 +3877,40 @@ def _build_calibrator_summary(
     sample_count: Optional[int] = None,
     skipped_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
-    gate_payload: Dict[str, Any] = {}
-    if gate_passed is not None:
-        gate_payload["passed"] = bool(gate_passed)
-    if improve_threshold is not None:
-        gate_payload["improve_threshold"] = round(float(improve_threshold), 4)
-    if spearman_tolerance is not None:
-        gate_payload["spearman_tolerance"] = float(spearman_tolerance)
-
-    summary: Dict[str, Any] = {
-        "calibrator_version": calibrator_version,
-        "model_type": model_type,
-        "gate_passed": gate_passed,
-        "cv_metrics": cv_metrics or {},
-        "baseline_metrics": baseline_metrics or {},
-        "gate": gate_payload,
-        "auto_candidates": auto_candidates or [],
-    }
-    if sample_count is not None:
-        summary["sample_count"] = int(sample_count)
-    if skipped_reason:
-        summary["skipped_reason"] = skipped_reason
-    return summary
+    return calibration_model_service.build_calibrator_summary(
+        model_type=model_type,
+        calibrator_version=calibrator_version,
+        gate_passed=gate_passed,
+        cv_metrics=cv_metrics,
+        baseline_metrics=baseline_metrics,
+        improve_threshold=improve_threshold,
+        spearman_tolerance=spearman_tolerance,
+        auto_candidates=auto_candidates,
+        sample_count=sample_count,
+        skipped_reason=skipped_reason,
+    )
 
 
+@atomic_json_transaction("calibration_samples", "delta_cases", "qingtian_results")
 def _refresh_project_reflection_objects(project_id: str) -> None:
-    submissions = [s for s in load_submissions() if str(s.get("project_id")) == project_id]
-    submissions_by_id = {str(s.get("id")): s for s in submissions}
-    latest_reports = _latest_records_by_submission(
-        [r for r in load_score_reports() if str(r.get("project_id")) == project_id]
-    )
-    projects = load_projects()
-    project = next((p for p in projects if str(p.get("id")) == project_id), {})
-    project_score_scale = _resolve_project_score_scale_max(project) if project else 100
-
-    qingtian_results = load_qingtian_results()
-    qingtian_changed = False
-    scoped_qt: List[Dict[str, object]] = []
-    for q in qingtian_results:
-        sid = str(q.get("submission_id") or "")
-        if sid not in submissions_by_id:
-            continue
-        raw_payload = q.get("raw_payload") if isinstance(q.get("raw_payload"), dict) else {}
-        normalized_record = _ground_truth_record_for_learning(
-            {
-                "final_score": raw_payload.get("final_score"),
-                "final_score_raw": raw_payload.get("final_score_raw"),
-                "final_score_100": raw_payload.get("final_score_100"),
-                "score_scale_max": raw_payload.get("score_scale_max"),
-                "judge_scores": raw_payload.get("judge_scores") or [],
-            },
-            default_score_scale_max=project_score_scale,
-        )
-        normalized_qt_score = float(normalized_record.get("final_score", 0.0))
-        old_qt_score = _to_float_or_none(q.get("qt_total_score"))
-        if old_qt_score is None or abs(old_qt_score - normalized_qt_score) > 1e-6:
-            q["qt_total_score"] = normalized_qt_score
-            qingtian_changed = True
-        merged_payload = dict(raw_payload or {})
-        merged_payload["final_score_raw"] = normalized_record.get("final_score_raw")
-        merged_payload["final_score_100"] = normalized_qt_score
-        merged_payload["score_scale_max"] = normalized_record.get("score_scale_max")
-        if merged_payload != raw_payload:
-            q["raw_payload"] = merged_payload
-            qingtian_changed = True
-        scoped_qt.append(q)
-    if qingtian_changed:
-        save_qingtian_results(qingtian_results)
-
-    latest_qt = _latest_records_by_submission(scoped_qt)
-
-    delta_cases = build_delta_cases(
+    reflection_sample_service.refresh_project_reflection_objects(
         project_id=project_id,
-        latest_reports_by_submission=latest_reports,
-        latest_qingtian_by_submission=latest_qt,
+        load_submissions=load_submissions,
+        load_score_reports=load_score_reports,
+        latest_records_by_submission=_latest_records_by_submission,
+        load_projects=load_projects,
+        resolve_project_score_scale_max=_resolve_project_score_scale_max,
+        load_qingtian_results=load_qingtian_results,
+        ground_truth_record_for_learning=_ground_truth_record_for_learning,
+        to_float_or_none=_to_float_or_none,
+        save_qingtian_results=save_qingtian_results,
+        build_delta_cases=build_delta_cases,
+        load_delta_cases=load_delta_cases,
+        save_delta_cases=save_delta_cases,
+        build_calibration_samples=build_calibration_samples,
+        load_calibration_samples=load_calibration_samples,
+        save_calibration_samples=save_calibration_samples,
     )
-    all_delta = [d for d in load_delta_cases() if str(d.get("project_id")) != project_id]
-    all_delta.extend(delta_cases)
-    save_delta_cases(all_delta)
-
-    samples = build_calibration_samples(
-        project_id=project_id,
-        latest_reports_by_submission=latest_reports,
-        latest_qingtian_by_submission=latest_qt,
-        submissions_by_id=submissions_by_id,
-    )
-    all_samples = [s for s in load_calibration_samples() if str(s.get("project_id")) != project_id]
-    all_samples.extend(samples)
-    save_calibration_samples(all_samples)
 
 
 def _build_feedback_records_for_project(project_id: str) -> List[Dict[str, object]]:
@@ -4824,6 +4005,7 @@ def _build_feedback_records_for_project(project_id: str) -> List[Dict[str, objec
     return feedback_records
 
 
+@atomic_json_transaction("expert_profiles", "projects")
 def _auto_update_from_delta_cases(project_id: str) -> Dict[str, object]:
     projects = load_projects()
     project = next((p for p in projects if str(p.get("id")) == project_id), None)
@@ -4936,6 +4118,7 @@ def _auto_update_from_delta_cases(project_id: str) -> Dict[str, object]:
     }
 
 
+@atomic_json_transaction("expert_profiles", "projects")
 def _auto_update_project_weights_from_delta_cases(project_id: str) -> Dict[str, object]:
     """
     优先使用「总分+标签」定向反演（模块一/二）；
@@ -4997,121 +4180,50 @@ def _auto_update_project_weights_from_delta_cases(project_id: str) -> Dict[str, 
     return _auto_update_from_delta_cases(project_id)
 
 
+@atomic_json_transaction("evolution_reports")
 def _sync_feedback_weights_to_evolution(
     project_id: str,
     weight_update: Dict[str, object],
 ) -> Dict[str, object]:
-    if not bool(weight_update.get("updated")):
-        return {"synced": False, "reason": "weight_not_updated"}
-    multipliers = weight_update.get("new_dimension_multipliers") or {}
-    if not isinstance(multipliers, dict) or not multipliers:
-        return {"synced": False, "reason": "missing_multipliers"}
-    reports = load_evolution_reports()
-    evo = reports.get(project_id) or {}
-    scoring_evolution = (
-        evo.get("scoring_evolution") if isinstance(evo.get("scoring_evolution"), dict) else {}
+    return evolution_report_service.sync_feedback_weights(
+        project_id,
+        weight_update,
+        dimension_ids=DIMENSION_IDS,
+        load_evolution_reports=load_evolution_reports,
+        save_evolution_reports=save_evolution_reports,
+        now_iso=_now_iso,
     )
-    scoring_evolution = dict(scoring_evolution or {})
-    scoring_evolution["dimension_multipliers"] = {
-        dim_id: float(multipliers.get(dim_id, 1.0)) for dim_id in DIMENSION_IDS
-    }
-    scoring_evolution.setdefault("rationale", {})
-    scoring_evolution["updated_by_feedback"] = True
-    scoring_evolution["updated_by_feedback_at"] = _now_iso()
-    evo["scoring_evolution"] = scoring_evolution
-    evo.setdefault("project_id", project_id)
-    evo.setdefault("sample_count", 0)
-    evo["updated_at"] = _now_iso()
-    reports[project_id] = evo
-    save_evolution_reports(reports)
-    return {
-        "synced": True,
-        "dimension_multipliers_count": len(scoring_evolution.get("dimension_multipliers") or {}),
-    }
 
 
+@atomic_json_transaction("evolution_reports")
 def _refresh_evolution_report_from_ground_truth(project_id: str) -> Dict[str, object]:
-    projects = load_projects()
-    project = next((p for p in projects if str(p.get("id")) == project_id), None)
-    if project is None:
-        return {"refreshed": False, "reason": "project_not_found"}
-    project_score_scale = _resolve_project_score_scale_max(project)
-    records_raw = [r for r in load_ground_truth() if str(r.get("project_id")) == project_id]
-    records = [
-        _ground_truth_record_for_learning(
-            r if isinstance(r, dict) else {},
-            default_score_scale_max=project_score_scale,
-        )
-        for r in records_raw
-    ]
-    ctx_data = load_project_context().get(project_id) or {}
-    project_context = str(ctx_data.get("text") or "").strip()
-    materials_text = _merge_materials_text(project_id)
-    if materials_text:
-        project_context = (
-            (project_context + "\n\n" + materials_text) if project_context else materials_text
-        )
-
-    report = build_evolution_report(project_id, records, project_context)
-    reports = load_evolution_reports()
-    prev = reports.get(project_id) or {}
-    # 自动闭环刷新时仅更新规则进化结果与编制指导；保留已有 LLM 增强来源标记。
-    if isinstance(prev.get("enhanced_by"), str):
-        report["enhanced_by"] = prev.get("enhanced_by")
-    reports[project_id] = report
-    save_evolution_reports(reports)
-    return {
-        "refreshed": True,
-        "sample_count": int(report.get("sample_count", 0) or 0),
-    }
+    return evolution_report_service.refresh_from_ground_truth(
+        project_id,
+        load_projects=load_projects,
+        resolve_project_score_scale_max=_resolve_project_score_scale_max,
+        load_ground_truth=load_ground_truth,
+        normalize_ground_truth_record=_ground_truth_record_for_learning,
+        load_project_context=load_project_context,
+        merge_materials_text=_merge_materials_text,
+        build_evolution_report=build_evolution_report,
+        load_evolution_reports=load_evolution_reports,
+        save_evolution_reports=save_evolution_reports,
+    )
 
 
 def _run_feedback_closed_loop(project_id: str, *, locale: str, trigger: str) -> Dict[str, object]:
-    """
-    反馈信号闭环：刷新样本 -> 自动调权重 -> 自动反演校准。
-    所有步骤为 best-effort，不影响主流程返回。
-    """
-    result: Dict[str, object] = {
-        "ok": True,
-        "project_id": project_id,
-        "trigger": trigger,
-        "weight_update": {"updated": False},
-        "weight_sync_to_evolution": {"synced": False},
-        "auto_run": None,
-        "evolution_refresh": {"refreshed": False},
-    }
-    try:
-        _refresh_project_reflection_objects(project_id)
-    except Exception as exc:
-        result["ok"] = False
-        result["refresh_error"] = str(exc)
-        return result
-
-    try:
-        result["weight_update"] = _auto_update_project_weights_from_delta_cases(project_id)
-    except Exception as exc:
-        result["weight_update"] = {"updated": False, "error": str(exc)}
-    try:
-        result["weight_sync_to_evolution"] = _sync_feedback_weights_to_evolution(
-            project_id, result["weight_update"]
-        )
-    except Exception as exc:
-        result["weight_sync_to_evolution"] = {"synced": False, "error": str(exc)}
-
-    try:
-        auto_resp = auto_run_reflection_pipeline(project_id=project_id, api_key=None, locale=locale)
-        if hasattr(auto_resp, "model_dump"):
-            result["auto_run"] = auto_resp.model_dump()
-        else:
-            result["auto_run"] = dict(auto_resp)
-    except Exception as exc:
-        result["auto_run"] = {"ok": False, "error": str(exc)}
-        result["ok"] = False
-    try:
-        result["evolution_refresh"] = _refresh_evolution_report_from_ground_truth(project_id)
-    except Exception as exc:
-        result["evolution_refresh"] = {"refreshed": False, "error": str(exc)}
-    return result
+    return feedback_closed_loop_service.run_feedback_closed_loop(
+        project_id,
+        locale=locale,
+        trigger=trigger,
+        refresh_project_reflection_objects=_refresh_project_reflection_objects,
+        auto_update_project_weights_from_delta_cases=(
+            _auto_update_project_weights_from_delta_cases
+        ),
+        sync_feedback_weights_to_evolution=_sync_feedback_weights_to_evolution,
+        auto_run_reflection_pipeline=auto_run_reflection_pipeline,
+        refresh_evolution_report_from_ground_truth=(_refresh_evolution_report_from_ground_truth),
+    )
 
 
 def _run_feedback_closed_loop_safe(
@@ -5120,52 +4232,13 @@ def _run_feedback_closed_loop_safe(
     locale: str,
     trigger: str,
 ) -> Dict[str, object]:
-    """
-    闭环执行保护层：不抛错中断主流程，但必须显式返回失败信息并记录日志。
-    """
-    try:
-        raw_result = _run_feedback_closed_loop(project_id, locale=locale, trigger=trigger)
-        if isinstance(raw_result, dict):
-            result = dict(raw_result)
-        elif hasattr(raw_result, "model_dump"):
-            dumped = raw_result.model_dump()
-            if isinstance(dumped, dict):
-                result = dict(dumped)
-            else:
-                result = {
-                    "ok": bool(getattr(raw_result, "ok", False)),
-                    "project_id": project_id,
-                    "trigger": trigger,
-                    "raw": str(raw_result),
-                }
-        else:
-            result = {
-                "ok": bool(getattr(raw_result, "ok", False)),
-                "project_id": project_id,
-                "trigger": trigger,
-                "raw": str(raw_result),
-            }
-        if not bool(result.get("ok", True)):
-            logger.warning(
-                "feedback_closed_loop_non_ok project_id=%s trigger=%s result=%s",
-                project_id,
-                trigger,
-                result,
-            )
-        return result
-    except Exception as exc:
-        logger.exception(
-            "feedback_closed_loop_exception project_id=%s trigger=%s error=%s",
-            project_id,
-            trigger,
-            exc,
-        )
-        return {
-            "ok": False,
-            "project_id": project_id,
-            "trigger": trigger,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+    return feedback_closed_loop_service.run_feedback_closed_loop_safe(
+        project_id,
+        locale=locale,
+        trigger=trigger,
+        run_feedback_closed_loop=_run_feedback_closed_loop,
+        logger=logger,
+    )
 
 
 def _build_evolution_health_report(
@@ -5413,6 +4486,7 @@ def _collect_applied_feature_ids_from_report(
     return sorted(feature_ids)
 
 
+@atomic_json_transaction("high_score_features")
 def _auto_update_feature_confidence_on_ground_truth(
     *,
     report: Dict[str, object],
@@ -5457,242 +4531,120 @@ def _auto_update_feature_confidence_on_ground_truth(
     return update_result
 
 
+@atomic_json_transaction(
+    "calibration_samples",
+    "delta_cases",
+    "evidence_units",
+    "ground_truth",
+    "high_score_features",
+    "project_anchors",
+    "project_requirements",
+    "projects",
+    "qingtian_results",
+    "score_history",
+    "score_reports",
+    "submissions",
+)
 def _sync_ground_truth_record_to_qingtian(project_id: str, gt_record: Dict[str, object]) -> None:
-    projects = load_projects()
-    project = _find_project(project_id, projects)
-    config = load_config()
-    multipliers, profile_snapshot, _ = _resolve_project_scoring_context(project_id)
-    scoring_engine_version = str(project.get("scoring_engine_version_locked") or "v1")
-    source_gt_id = str(gt_record.get("id") or "")
-    gt_text = str(gt_record.get("shigong_text") or "")
-
-    submissions = load_submissions()
-    matched_submission = None
-    for s in submissions:
-        if str(s.get("project_id")) != project_id:
-            continue
-        if str(s.get("source_ground_truth_id") or "") == source_gt_id:
-            matched_submission = s
-            break
-        if str(s.get("text") or "").strip() == gt_text.strip() and gt_text.strip():
-            matched_submission = s
-            break
-
-    scored_submission = False
-    submission_changed = False
-    evidence_units_new: List[Dict[str, object]] = []
-    now_iso = _now_iso()
-    if matched_submission is None:
-        matched_submission = {
-            "id": str(uuid4()),
-            "project_id": project_id,
-            "filename": f"ground_truth_{source_gt_id[:8]}.txt",
-            "total_score": 0.0,
-            "report": _build_pending_submission_report(
-                project=project,
-                scoring_engine_version=scoring_engine_version,
-            ),
-            "text": gt_text,
-            "created_at": now_iso,
-            "updated_at": now_iso,
-            "expert_profile_id_used": profile_snapshot.get("id") if profile_snapshot else None,
-            "source_ground_truth_id": source_gt_id,
-            "bidder_name": f"GT_{source_gt_id[:8]}",
-        }
-        submissions.append(matched_submission)
-        submission_changed = True
-
-    if str(matched_submission.get("source_ground_truth_id") or "") != source_gt_id:
-        matched_submission["source_ground_truth_id"] = source_gt_id
-        submission_changed = True
-    if gt_text.strip() and str(matched_submission.get("text") or "").strip() != gt_text.strip():
-        matched_submission["text"] = gt_text
-        submission_changed = True
-
-    if not _submission_is_scored(matched_submission):
-        report, evidence_units_new = _score_submission_for_project(
-            submission_id=str(matched_submission.get("id")),
-            text=gt_text,
-            project_id=project_id,
-            project=project,
-            config=config,
-            multipliers=multipliers,
-            profile_snapshot=profile_snapshot,
-            scoring_engine_version=scoring_engine_version,
-        )
-        if not _report_is_blocked(report):
-            _mark_report_scored(report, trigger="ground_truth_sync")
-        matched_submission["report"] = report
-        matched_submission["total_score"] = float(
-            report.get("total_score", report.get("rule_total_score", 0.0))
-        )
-        matched_submission["expert_profile_id_used"] = (
-            profile_snapshot.get("id") if profile_snapshot else None
-        )
-        matched_submission["updated_at"] = _now_iso()
-        scored_submission = True
-        submission_changed = True
-
-    if submission_changed:
-        save_submissions(submissions)
-
-    if scored_submission:
-        snapshots = load_score_reports()
-        snapshots.append(
-            _build_score_report_snapshot(
-                submission_id=str(matched_submission.get("id")),
-                project=project,
-                report=matched_submission.get("report") or {},
-                profile_snapshot=profile_snapshot,
-                scoring_engine_version=scoring_engine_version,
-            )
-        )
-        save_score_reports(snapshots)
-        if evidence_units_new:
-            all_units = load_evidence_units()
-            all_units = _replace_submission_evidence_units(
-                all_units,
-                submission_id=str(matched_submission.get("id")),
-                new_units=evidence_units_new,
-            )
-            save_evidence_units(all_units)
-
-        report = matched_submission.get("report") or {}
-        dimension_scores = {
-            dim_id: (dim.get("score", 0.0) if isinstance(dim, dict) else 0.0)
-            for dim_id, dim in (report.get("dimension_scores") or {}).items()
-        }
-        penalty_count = len(report.get("penalties", []))
-        if not _report_is_blocked(report):
-            record_history_score(
-                project_id=project_id,
-                submission_id=str(matched_submission.get("id")),
-                filename=str(matched_submission.get("filename", "")),
-                total_score=float(report.get("total_score", report.get("rule_total_score", 0.0))),
-                dimension_scores=dimension_scores,
-                penalty_count=penalty_count,
-            )
-
-    qt_results = load_qingtian_results()
-    matched_qt = next(
-        (
-            r
-            for r in qt_results
-            if str((r.get("raw_payload") or {}).get("ground_truth_record_id") or "") == source_gt_id
-        ),
-        None,
-    )
-    project_score_scale = _resolve_project_score_scale_max(project)
-    gt_for_learning = _ground_truth_record_for_learning(
+    ground_truth_sync_service.sync_ground_truth_record_to_qingtian(
+        project_id,
         gt_record,
-        default_score_scale_max=project_score_scale,
+        default_qingtian_model_version=DEFAULT_QINGTIAN_MODEL_VERSION,
+        load_projects=load_projects,
+        find_project=_find_project,
+        load_config=load_config,
+        resolve_project_scoring_context=_resolve_project_scoring_context,
+        load_submissions=load_submissions,
+        build_pending_submission_report=_build_pending_submission_report,
+        now_iso=_now_iso,
+        submission_is_scored=_submission_is_scored,
+        score_submission_for_project=_score_submission_for_project,
+        report_is_blocked=_report_is_blocked,
+        mark_report_scored=_mark_report_scored,
+        save_submissions=save_submissions,
+        load_score_reports=load_score_reports,
+        build_score_report_snapshot=_build_score_report_snapshot,
+        save_score_reports=save_score_reports,
+        load_evidence_units=load_evidence_units,
+        replace_submission_evidence_units=_replace_submission_evidence_units,
+        save_evidence_units=save_evidence_units,
+        record_history_score=record_history_score,
+        load_qingtian_results=load_qingtian_results,
+        resolve_project_score_scale_max=_resolve_project_score_scale_max,
+        ground_truth_record_for_learning=_ground_truth_record_for_learning,
+        auto_update_feature_confidence_on_ground_truth=(
+            _auto_update_feature_confidence_on_ground_truth
+        ),
+        load_ground_truth=load_ground_truth,
+        save_ground_truth=save_ground_truth,
+        save_qingtian_results=save_qingtian_results,
+        save_projects=save_projects,
+        refresh_project_reflection_objects=_refresh_project_reflection_objects,
     )
-    feature_confidence_update: Dict[str, object] = {
-        "updated": 0,
-        "retired": 0,
-        "reason": "not_executed",
-    }
-    report_for_feedback = matched_submission.get("report")
-    if isinstance(report_for_feedback, dict):
-        try:
-            feature_confidence_update = _auto_update_feature_confidence_on_ground_truth(
-                report=report_for_feedback,
-                gt_record=gt_record,
-                project_score_scale_max=project_score_scale,
-            )
-        except Exception as exc:
-            feature_confidence_update = {
-                "updated": 0,
-                "retired": 0,
-                "reason": "feature_confidence_update_error",
-                "error": str(exc),
-            }
 
-    if source_gt_id:
-        all_gt_records = load_ground_truth()
-        changed_gt = False
-        for row in all_gt_records:
-            if str(row.get("id") or "") != source_gt_id:
-                continue
-            row["feature_confidence_update"] = feature_confidence_update
-            row["updated_at"] = _now_iso()
-            changed_gt = True
-            break
-        if changed_gt:
-            save_ground_truth(all_gt_records)
 
-    if matched_qt is None:
-        qt_results.append(
-            {
-                "id": str(uuid4()),
-                "submission_id": str(matched_submission.get("id")),
-                "qingtian_model_version": str(
-                    project.get("qingtian_model_version") or DEFAULT_QINGTIAN_MODEL_VERSION
-                ),
-                "qt_total_score": float(gt_for_learning.get("final_score", 0.0)),
-                "qt_dim_scores": None,
-                "qt_reasons": [
-                    {
-                        "kind": "ground_truth",
-                        "text": f"评委分: {gt_record.get('judge_scores')}",
-                    }
-                ],
-                "raw_payload": {
-                    "ground_truth_record_id": source_gt_id,
-                    "source": gt_record.get("source"),
-                    "judge_scores": gt_record.get("judge_scores"),
-                    "final_score": gt_record.get("final_score"),
-                    "final_score_raw": gt_for_learning.get("final_score_raw"),
-                    "final_score_100": gt_for_learning.get("final_score"),
-                    "score_scale_max": gt_for_learning.get("score_scale_max"),
-                    "feature_confidence_update": feature_confidence_update,
-                },
-                "created_at": _now_iso(),
-            }
-        )
-        save_qingtian_results(qt_results)
-    else:
-        raw_payload = matched_qt.get("raw_payload")
-        if not isinstance(raw_payload, dict):
-            raw_payload = {}
-        raw_payload["feature_confidence_update"] = feature_confidence_update
-        matched_qt["raw_payload"] = raw_payload
-        save_qingtian_results(qt_results)
-
-    if str(project.get("status") or "") == "scoring_preparation":
-        project["status"] = "submitted_to_qingtian"
-        project["updated_at"] = _now_iso()
-        save_projects(projects)
-
-    _refresh_project_reflection_objects(project_id)
+def _commit_ground_truth_additions(
+    project_id: str,
+    records: List[Dict[str, object]],
+    *,
+    locale: str,
+) -> None:
+    ground_truth_write_service.commit_ground_truth_additions(
+        project_id,
+        records,
+        atomic_json_transaction=atomic_json_transaction,
+        load_projects=load_projects,
+        save_projects=save_projects,
+        load_ground_truth=load_ground_truth,
+        save_ground_truth=save_ground_truth,
+        load_submissions=load_submissions,
+        save_submissions=save_submissions,
+        load_score_reports=load_score_reports,
+        save_score_reports=save_score_reports,
+        load_evidence_units=load_evidence_units,
+        save_evidence_units=save_evidence_units,
+        load_score_history=load_score_history,
+        save_score_history=save_score_history,
+        load_qingtian_results=load_qingtian_results,
+        save_qingtian_results=save_qingtian_results,
+        load_high_score_features=load_high_score_features,
+        save_high_score_features=save_high_score_features,
+        load_calibration_samples=load_calibration_samples,
+        save_calibration_samples=save_calibration_samples,
+        load_delta_cases=load_delta_cases,
+        save_delta_cases=save_delta_cases,
+        sync_ground_truth_record=_sync_ground_truth_record_to_qingtian,
+        project_not_found_error=lambda: HTTPException(
+            status_code=404,
+            detail=t("api.project_not_found", locale=locale),
+        ),
+        source_submission_not_found_error=lambda: HTTPException(
+            status_code=404,
+            detail="未找到对应施组，请先在步骤4上传施组。",
+        ),
+    )
 
 
 def _rebuild_project_anchors_and_requirements(
     project_id: str,
 ) -> tuple[List[Dict[str, object]], List[Dict[str, object]]]:
-    merged_text = _build_constraints_source_text(project_id)
-    project = next((p for p in load_projects() if str(p.get("id")) == project_id), {})
-    region = str(project.get("region") or DEFAULT_REGION)
-    scoring_engine_version = str(
-        project.get("scoring_engine_version_locked") or DEFAULT_SCORING_ENGINE_LOCKED
+    return anchor_requirement_service.rebuild_project_anchors_and_requirements(
+        project_id=project_id,
+        default_region=DEFAULT_REGION,
+        default_scoring_engine_locked=DEFAULT_SCORING_ENGINE_LOCKED,
+        build_constraints_source_text=_build_constraints_source_text,
+        load_projects=load_projects,
+        extract_project_anchors_from_text=extract_project_anchors_from_text,
+        build_project_requirements_from_anchors=build_project_requirements_from_anchors,
+        load_project_anchors=load_project_anchors,
+        save_project_anchors=save_project_anchors,
+        load_project_requirements=load_project_requirements,
+        save_project_requirements=save_project_requirements,
+        project_not_found_error=lambda: HTTPException(
+            status_code=404,
+            detail="项目不存在",
+        ),
     )
-    anchors = extract_project_anchors_from_text(project_id, merged_text)
-    requirements = build_project_requirements_from_anchors(
-        project_id,
-        anchors,
-        region=region,
-        scoring_engine_version=scoring_engine_version,
-    )
-
-    all_anchors = [a for a in load_project_anchors() if str(a.get("project_id")) != project_id]
-    all_requirements = [
-        r for r in load_project_requirements() if str(r.get("project_id")) != project_id
-    ]
-    all_anchors.extend(anchors)
-    all_requirements.extend(requirements)
-    save_project_anchors(all_anchors)
-    save_project_requirements(all_requirements)
-    return anchors, requirements
 
 
 def _build_constraint_pack(project_id: str) -> Dict[str, object]:
@@ -5755,7 +4707,7 @@ def _build_constraint_pack(project_id: str) -> Dict[str, object]:
 
 app = FastAPI(
     title="青天评标系统 API",
-    version="1.0.0",
+    version=__version__,
     description="""
 ## 施工组织设计智能评审系统
 
@@ -5795,8 +4747,74 @@ app = FastAPI(
     },
 )
 
+
+def _normalize_openapi_compatibility(schema: dict[str, Any]) -> None:
+    """Preserve the certified OpenAPI surface across framework security updates."""
+    component_schemas = schema.get("components", {}).get("schemas", {})
+    for component in component_schemas.values():
+        pending: list[Any] = [component]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, dict):
+                if value.get("contentMediaType") == "application/octet-stream":
+                    value.pop("contentMediaType")
+                    value["format"] = "binary"
+                pending.extend(value.values())
+            elif isinstance(value, list):
+                pending.extend(value)
+
+    validation_error = component_schemas.get("ValidationError")
+    if isinstance(validation_error, dict):
+        properties = validation_error.get("properties")
+        if isinstance(properties, dict):
+            properties.pop("input", None)
+            properties.pop("ctx", None)
+
+
+_framework_openapi = app.openapi
+
+
+def _certified_openapi() -> dict[str, Any]:
+    schema = _framework_openapi()
+    _normalize_openapi_compatibility(schema)
+    return schema
+
+
+app.openapi = _certified_openapi
+
 # Setup rate limiting (infrastructure ready, decorators disabled due to compatibility)
 setup_rate_limiting(app)
+
+
+def _route_requires_api_key(request: Request) -> bool:
+    for route in request.app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        match, _ = route.matches(request.scope)
+        if match != Match.FULL:
+            continue
+        pending = list(route.dependant.dependencies)
+        while pending:
+            dependency = pending.pop()
+            if dependency.call is verify_api_key:
+                return True
+            pending.extend(dependency.dependencies)
+        return False
+    return False
+
+
+@app.middleware("http")
+async def _authenticate_before_body_parsing(request: Request, call_next):
+    if _route_requires_api_key(request):
+        try:
+            verify_api_key(api_key_header=request.headers.get("X-API-Key"))
+        except HTTPException as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": exc.detail},
+                headers=exc.headers,
+            )
+    return await call_next(request)
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -5807,14 +4825,13 @@ async def _web_405_fallback_handler(request: Request, exc: StarletteHTTPExceptio
     if exc.status_code == 405:
         path = (request.url.path or "").rstrip("/")
         if path in ("/web/upload_materials", "/web/upload_shigong"):
-            project_id = request.query_params.get("project_id", "")
             message = "请在主页选择文件后点击“上传资料”提交。"
             anchor = "#section-materials"
             if path == "/web/upload_shigong":
                 message = "请在主页选择文件后点击“上传施组”提交。"
                 anchor = "#section-shigong"
             return RedirectResponse(
-                url=_web_upload_redirect_url(project_id, message, anchor),
+                url=_web_upload_redirect_url(message, anchor),
                 status_code=303,
             )
     return await http_exception_handler(request, exc)
@@ -5886,263 +4903,53 @@ def get_locale(
 
 
 def _build_data_hygiene_report(*, apply: bool) -> Dict[str, object]:
-    """
-    数据卫生巡检/修复：
-    - 清理 project_id 不存在的孤儿记录
-    - 清理 submission_id 不存在的孤儿记录
-    - 清理 project_id 维度的 dict 型映射残留键
-    """
     ensure_data_dirs()
-    projects = load_projects()
-    valid_project_ids = {str(p.get("id") or "").strip() for p in projects if str(p.get("id") or "")}
-    datasets: List[Dict[str, object]] = []
-    orphan_records_total = 0
-    cleaned_records_total = 0
-
-    def _append_dataset(
-        *,
-        name: str,
-        total: int,
-        orphan_count: int,
-        cleaned_count: int = 0,
-        mode: str = "project_id",
-    ) -> None:
-        nonlocal orphan_records_total, cleaned_records_total
-        orphan_records_total += int(orphan_count)
-        cleaned_records_total += int(cleaned_count)
-        datasets.append(
-            {
-                "name": name,
-                "total": int(total),
-                "orphan_count": int(orphan_count),
-                "cleaned_count": int(cleaned_count),
-                "mode": mode,
-            }
-        )
-
-    def _scan_project_scoped_rows(
-        *,
-        name: str,
-        rows: List[Dict[str, object]],
-        save_fn,
-    ) -> List[Dict[str, object]]:
-        kept: List[Dict[str, object]] = []
-        orphan_count = 0
-        for row in rows:
-            if not isinstance(row, dict):
-                kept.append(row)
-                continue
-            pid = str(row.get("project_id") or "").strip()
-            if pid and pid not in valid_project_ids:
-                orphan_count += 1
-                continue
-            kept.append(row)
-        cleaned_count = orphan_count if apply else 0
-        if apply and orphan_count > 0:
-            save_fn(kept)
-        _append_dataset(
-            name=name,
-            total=len(rows),
-            orphan_count=orphan_count,
-            cleaned_count=cleaned_count,
-            mode="project_id",
-        )
-        return kept
-
-    submissions_rows = load_submissions()
-    submissions_kept = _scan_project_scoped_rows(
-        name="submissions",
-        rows=submissions_rows,
-        save_fn=save_submissions,
-    )
-    valid_submission_ids = {
-        str(row.get("id") or "").strip()
-        for row in submissions_kept
-        if isinstance(row, dict) and str(row.get("id") or "").strip()
+    loaders = {
+        "projects": load_projects,
+        "submissions": load_submissions,
+        "materials": load_materials,
+        "learning_profiles": load_learning_profiles,
+        "score_history": load_score_history,
+        "ground_truth": load_ground_truth,
+        "project_anchors": load_project_anchors,
+        "project_requirements": load_project_requirements,
+        "delta_cases": load_delta_cases,
+        "calibration_samples": load_calibration_samples,
+        "calibration_models": load_calibration_models,
+        "patch_packages": load_patch_packages,
+        "patch_deployments": load_patch_deployments,
+        "score_reports": load_score_reports,
+        "evidence_units": load_evidence_units,
+        "qingtian_results": load_qingtian_results,
+        "project_context": load_project_context,
+        "evolution_reports": load_evolution_reports,
     }
-
-    def _scan_submission_linked_rows(
-        *,
-        name: str,
-        rows: List[Dict[str, object]],
-        save_fn,
-        submission_key: str = "submission_id",
-    ) -> None:
-        kept: List[Dict[str, object]] = []
-        orphan_count = 0
-        for row in rows:
-            if not isinstance(row, dict):
-                kept.append(row)
-                continue
-            pid = str(row.get("project_id") or "").strip()
-            sid = str(row.get(submission_key) or "").strip()
-            orphan_by_project = bool(pid) and pid not in valid_project_ids
-            orphan_by_submission = bool(sid) and sid not in valid_submission_ids
-            if orphan_by_project or orphan_by_submission:
-                orphan_count += 1
-                continue
-            kept.append(row)
-        cleaned_count = orphan_count if apply else 0
-        if apply and orphan_count > 0:
-            save_fn(kept)
-        _append_dataset(
-            name=name,
-            total=len(rows),
-            orphan_count=orphan_count,
-            cleaned_count=cleaned_count,
-            mode=f"project_id|{submission_key}",
-        )
-
-    _scan_project_scoped_rows(
-        name="materials",
-        rows=load_materials(),
-        save_fn=save_materials,
-    )
-    _scan_project_scoped_rows(
-        name="learning_profiles",
-        rows=load_learning_profiles(),
-        save_fn=save_learning_profiles,
-    )
-    _scan_project_scoped_rows(
-        name="score_history",
-        rows=load_score_history(),
-        save_fn=save_score_history,
-    )
-    _scan_project_scoped_rows(
-        name="ground_truth_scores",
-        rows=load_ground_truth(),
-        save_fn=save_ground_truth,
-    )
-    _scan_project_scoped_rows(
-        name="project_anchors",
-        rows=load_project_anchors(),
-        save_fn=save_project_anchors,
-    )
-    _scan_project_scoped_rows(
-        name="project_requirements",
-        rows=load_project_requirements(),
-        save_fn=save_project_requirements,
-    )
-    _scan_project_scoped_rows(
-        name="delta_cases",
-        rows=load_delta_cases(),
-        save_fn=save_delta_cases,
-    )
-    _scan_project_scoped_rows(
-        name="calibration_samples",
-        rows=load_calibration_samples(),
-        save_fn=save_calibration_samples,
-    )
-
-    patch_packages_rows = _scan_project_scoped_rows(
-        name="patch_packages",
-        rows=load_patch_packages(),
-        save_fn=save_patch_packages,
-    )
-    valid_patch_ids = {
-        str(p.get("id") or "").strip()
-        for p in patch_packages_rows
-        if isinstance(p, dict) and str(p.get("id") or "").strip()
+    savers = {
+        "submissions": save_submissions,
+        "materials": save_materials,
+        "learning_profiles": save_learning_profiles,
+        "score_history": save_score_history,
+        "ground_truth": save_ground_truth,
+        "project_anchors": save_project_anchors,
+        "project_requirements": save_project_requirements,
+        "delta_cases": save_delta_cases,
+        "calibration_samples": save_calibration_samples,
+        "calibration_models": save_calibration_models,
+        "patch_packages": save_patch_packages,
+        "patch_deployments": save_patch_deployments,
+        "score_reports": save_score_reports,
+        "evidence_units": save_evidence_units,
+        "qingtian_results": save_qingtian_results,
+        "project_context": save_project_context,
+        "evolution_reports": save_evolution_reports,
     }
-
-    # patch_deployments 额外校验 patch_id
-    patch_deployments_rows = load_patch_deployments()
-    patch_deployments_kept: List[Dict[str, object]] = []
-    patch_deployments_orphan = 0
-    for row in patch_deployments_rows:
-        if not isinstance(row, dict):
-            patch_deployments_kept.append(row)
-            continue
-        pid = str(row.get("project_id") or "").strip()
-        patch_id = str(row.get("patch_id") or "").strip()
-        orphan_by_project = bool(pid) and pid not in valid_project_ids
-        orphan_by_patch = bool(patch_id) and patch_id not in valid_patch_ids
-        if orphan_by_project or orphan_by_patch:
-            patch_deployments_orphan += 1
-            continue
-        patch_deployments_kept.append(row)
-    if apply and patch_deployments_orphan > 0:
-        save_patch_deployments(patch_deployments_kept)
-    _append_dataset(
-        name="patch_deployments",
-        total=len(patch_deployments_rows),
-        orphan_count=patch_deployments_orphan,
-        cleaned_count=(patch_deployments_orphan if apply else 0),
-        mode="project_id|patch_id",
+    return data_hygiene_service.build_data_hygiene_report(
+        apply=apply,
+        atomic_json_transaction=atomic_json_transaction,
+        loaders=loaders,
+        savers=savers,
+        now_iso=_now_iso,
     )
-
-    _scan_submission_linked_rows(
-        name="score_reports",
-        rows=load_score_reports(),
-        save_fn=save_score_reports,
-        submission_key="submission_id",
-    )
-    _scan_submission_linked_rows(
-        name="evidence_units",
-        rows=load_evidence_units(),
-        save_fn=save_evidence_units,
-        submission_key="submission_id",
-    )
-    _scan_submission_linked_rows(
-        name="qingtian_results",
-        rows=load_qingtian_results(),
-        save_fn=save_qingtian_results,
-        submission_key="submission_id",
-    )
-
-    def _scan_project_map(*, name: str, data: Dict[str, object], save_fn) -> None:
-        if not isinstance(data, dict):
-            _append_dataset(name=name, total=0, orphan_count=0, cleaned_count=0, mode="project_map")
-            return
-        orphan_keys = [str(k) for k in data.keys() if str(k) not in valid_project_ids]
-        cleaned_count = len(orphan_keys) if apply else 0
-        if apply and orphan_keys:
-            new_data = {k: v for k, v in data.items() if str(k) in valid_project_ids}
-            save_fn(new_data)
-        _append_dataset(
-            name=name,
-            total=len(data),
-            orphan_count=len(orphan_keys),
-            cleaned_count=cleaned_count,
-            mode="project_map",
-        )
-
-    _scan_project_map(
-        name="project_context",
-        data=load_project_context(),
-        save_fn=save_project_context,
-    )
-    _scan_project_map(
-        name="evolution_reports",
-        data=load_evolution_reports(),
-        save_fn=save_evolution_reports,
-    )
-
-    recommendations: List[str] = []
-    if orphan_records_total <= 0:
-        recommendations.append("数据卫生良好：未发现跨项目孤儿记录。")
-    elif apply:
-        recommendations.append(
-            f"已清理孤儿记录 {cleaned_records_total} 条，建议执行一次 doctor/acceptance 回归。"
-        )
-    else:
-        recommendations.append(
-            f"发现孤儿记录 {orphan_records_total} 条，建议调用 /api/v1/system/data_hygiene/repair 进行修复。"
-        )
-    if orphan_records_total > 0:
-        recommendations.append(
-            "建议在批量删除项目后执行数据卫生巡检，避免历史孤儿记录影响统计与审计。"
-        )
-
-    return {
-        "generated_at": _now_iso(),
-        "apply_mode": bool(apply),
-        "valid_project_count": len(valid_project_ids),
-        "orphan_records_total": int(orphan_records_total),
-        "cleaned_records_total": int(cleaned_records_total),
-        "datasets": datasets,
-        "recommendations": recommendations,
-    }
 
 
 def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
@@ -6164,10 +4971,13 @@ def _run_system_self_check(project_id: Optional[str]) -> Dict[str, object]:
     # data dirs + writable test
     try:
         ensure_data_dirs()
+        data_dir = DATA_DIR.expanduser().resolve()
         with tempfile.NamedTemporaryFile(
-            prefix="selfcheck_", suffix=".tmp", dir="data", delete=True
-        ) as _:
-            pass
+            prefix="selfcheck_", suffix=".tmp", dir=str(data_dir), delete=True
+        ) as probe:
+            probe.write(b"qingtian-self-check")
+            probe.flush()
+            os.fsync(probe.fileno())
         add("data_dirs_writable", True, "data directory writable")
     except Exception as e:
         add("data_dirs_writable", False, str(e))
@@ -6306,10 +5116,15 @@ def health_check() -> HealthResponse:
     - 不检查外部依赖
     - 响应时间应小于 100ms
     """
-    return HealthResponse(status="healthy", version="1.0.0")
+    return HealthResponse(status="healthy", version=__version__)
 
 
-@app.get("/metrics", tags=["监控指标"], include_in_schema=True)
+@app.get(
+    "/metrics",
+    tags=["监控指标"],
+    include_in_schema=True,
+    dependencies=[Depends(verify_api_key)],
+)
 def prometheus_metrics():
     """
     Prometheus 指标端点。
@@ -6372,7 +5187,7 @@ def readiness_check() -> ReadyResponse:
     return ReadyResponse(status=status, checks=checks)
 
 
-@app.get("/__ping__", include_in_schema=False)
+@app.get("/__ping__", include_in_schema=False, dependencies=[Depends(verify_api_key)])
 def ui_click_ping(btn: str = "") -> dict:
     return {"ok": True, "btn": btn}
 
@@ -6506,7 +5321,11 @@ def _build_local_llm_ollama_preview_response(
     }
 
 
-@app.post("/local-llm/preview-mock", tags=["系统状态"])
+@app.post(
+    "/local-llm/preview-mock",
+    tags=["系统状态"],
+    dependencies=[Depends(verify_api_key)],
+)
 def local_llm_preview_mock_api(payload: Optional[Dict[str, Any]] = None) -> Dict[str, object]:
     """Default-off local LLM preview/mock bridge with no storage or scoring side effects."""
     if not _local_llm_preview_mock_api_enabled():
@@ -6541,7 +5360,11 @@ def local_llm_preview_mock_api(payload: Optional[Dict[str, Any]] = None) -> Dict
     }
 
 
-@app.post("/local-llm/zdoc-preview-only/receive", tags=["系统状态"])
+@app.post(
+    "/local-llm/zdoc-preview-only/receive",
+    tags=["系统状态"],
+    dependencies=[Depends(verify_api_key)],
+)
 def zdoc_zbid_preview_only_receive_api(
     payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, object]:
@@ -6549,8 +5372,35 @@ def zdoc_zbid_preview_only_receive_api(
     return zdoc_zbid_preview_receiver.receive_zdoc_zbid_preview_payload(payload or {})
 
 
+class AuthenticatedAPIRouter(APIRouter):
+    """Require API authentication on all business HTTP methods."""
+
+    def _authenticated_route(self, method: str, path: str, **kwargs):
+        dependencies = list(kwargs.pop("dependencies", None) or [])
+        dependencies.append(Depends(verify_api_key))
+        return getattr(super(), method)(path, dependencies=dependencies, **kwargs)
+
+    def get(self, path: str, **kwargs):
+        return self._authenticated_route("get", path, **kwargs)
+
+    def head(self, path: str, **kwargs):
+        return self._authenticated_route("head", path, **kwargs)
+
+    def post(self, path: str, **kwargs):
+        return self._authenticated_route("post", path, **kwargs)
+
+    def put(self, path: str, **kwargs):
+        return self._authenticated_route("put", path, **kwargs)
+
+    def patch(self, path: str, **kwargs):
+        return self._authenticated_route("patch", path, **kwargs)
+
+    def delete(self, path: str, **kwargs):
+        return self._authenticated_route("delete", path, **kwargs)
+
+
 # API v1 路由
-router = APIRouter(prefix="/api/v1")
+router = AuthenticatedAPIRouter(prefix="/api/v1")
 
 
 @router.get("/auth/status", tags=["系统状态"])
@@ -6780,7 +5630,7 @@ def config_reload_endpoint(
     """
     强制重新加载配置文件。
 
-    立即从磁盘重新加载 rubric.yaml 和 lexicon.yaml 配置文件。
+    立即从磁盘重新加载当前有效配置；优先读取原子快照，缺失时读取旧版配置文件。
     用于在修改配置文件后立即生效，无需重启服务。
 
     **需要 API Key 认证**
@@ -7069,6 +5919,7 @@ def analyze_per_tender(payload: Dict[str, Any]) -> dict | JSONResponse:
     tags=["项目管理"],
     responses={**RESPONSES_401, **RESPONSES_422},
 )
+@atomic_json_transaction("projects")
 def create_project(
     payload: ProjectCreate,
     api_key: Optional[str] = Depends(verify_api_key),
@@ -7082,30 +5933,28 @@ def create_project(
     **需要 API Key 认证**
     """
     ensure_data_dirs()
-    projects = load_projects()
-    if any(p["name"] == payload.name for p in projects):
-        raise HTTPException(status_code=422, detail="项目名称已存在，请更换名称")
-    project_id = str(uuid4())
-    record = {
-        "id": project_id,
-        "name": payload.name,
-        "meta": payload.meta or {},
-        "region": DEFAULT_REGION,
-        "expert_profile_id": None,
-        "qingtian_model_version": DEFAULT_QINGTIAN_MODEL_VERSION,
-        "scoring_engine_version_locked": DEFAULT_SCORING_ENGINE_LOCKED,
-        "calibrator_version_locked": DEFAULT_CALIBRATOR_LOCKED,
-        "status": "scoring_preparation",
-        "created_at": _now_iso(),
-        "updated_at": _now_iso(),
-    }
-    _ensure_project_v2_fields(record)
-    projects.append(record)
-    save_projects(projects)
+    record = project_lifecycle_service.create_project_record(
+        name=payload.name,
+        meta=payload.meta,
+        load_projects=load_projects,
+        save_projects=save_projects,
+        duplicate_name_error=lambda: HTTPException(
+            status_code=422,
+            detail="项目名称已存在，请更换名称",
+        ),
+        new_id=lambda: str(uuid4()),
+        now_iso=_now_iso,
+        ensure_project_v2_fields=_ensure_project_v2_fields,
+        default_region=DEFAULT_REGION,
+        default_qingtian_model_version=DEFAULT_QINGTIAN_MODEL_VERSION,
+        default_scoring_engine_locked=DEFAULT_SCORING_ENGINE_LOCKED,
+        default_calibrator_locked=DEFAULT_CALIBRATOR_LOCKED,
+    )
     return ProjectRecord(**record)
 
 
 @router.get("/projects", response_model=list[ProjectRecord], tags=["项目管理"])
+@atomic_json_transaction("projects")
 def list_projects() -> list[ProjectRecord]:
     """
     获取所有项目列表。
@@ -7113,22 +5962,13 @@ def list_projects() -> list[ProjectRecord]:
     返回系统中已创建的所有项目记录。
     """
     ensure_data_dirs()
-    projects = load_projects()
-    if not os.environ.get("PYTEST_CURRENT_TEST"):
-        active_projects = [
-            p
-            for p in projects
-            if str(p.get("id") or "") != "p1" and not str(p.get("name") or "").startswith("E2E_")
-        ]
-        if not active_projects:
-            recovered = _recover_latest_orphan_project(projects)
-            if recovered is not None:
-                projects = load_projects()
-    changed = False
-    for p in projects:
-        changed = _ensure_project_v2_fields(p) or changed
-    if changed:
-        save_projects(projects)
+    projects = project_lifecycle_service.list_project_records(
+        load_projects=load_projects,
+        save_projects=save_projects,
+        ensure_project_v2_fields=_ensure_project_v2_fields,
+        recovery_enabled=not bool(os.environ.get("PYTEST_CURRENT_TEST")),
+        recover_latest_orphan_project=_recover_latest_orphan_project,
+    )
     return [ProjectRecord(**p) for p in projects]
 
 
@@ -7138,24 +5978,26 @@ def list_projects() -> list[ProjectRecord]:
     tags=["项目管理"],
     responses={**RESPONSES_404},
 )
+@atomic_json_transaction("expert_profiles", "projects")
 def get_project_expert_profile(
     project_id: str, locale: str = Depends(get_locale)
 ) -> ProjectExpertProfileResponse:
     """获取项目当前生效的专家16维关注度配置。"""
-    ensure_data_dirs()
-    projects = load_projects()
-    try:
-        project = _find_project(project_id, projects)
-    except HTTPException:
-        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-
-    project_changed = _ensure_project_v2_fields(project)
-    profiles = load_expert_profiles()
-    profile, created = _ensure_project_expert_profile(project, profiles)
-    if project_changed or created:
-        save_projects(projects)
-    if created:
-        save_expert_profiles(profiles)
+    project, profile = project_profile_service.get_project_expert_profile(
+        project_id=project_id,
+        ensure_data_dirs=ensure_data_dirs,
+        load_projects=load_projects,
+        find_project=lambda requested_id, projects: _find_project_for_profile_request(
+            requested_id,
+            projects,
+            locale=locale,
+        ),
+        ensure_project_v2_fields=_ensure_project_v2_fields,
+        load_expert_profiles=load_expert_profiles,
+        ensure_project_profile=_ensure_project_expert_profile,
+        save_projects=save_projects,
+        save_expert_profiles=save_expert_profiles,
+    )
     return ProjectExpertProfileResponse(
         project=ProjectRecord(**project),
         expert_profile=ExpertProfileRecord(**profile),
@@ -7168,6 +6010,7 @@ def get_project_expert_profile(
     tags=["项目管理"],
     responses={**RESPONSES_401, **RESPONSES_404, **RESPONSES_409},
 )
+@atomic_json_transaction("expert_profiles", "projects")
 def update_project_expert_profile(
     project_id: str,
     payload: ExpertProfileUpdate,
@@ -7175,28 +6018,27 @@ def update_project_expert_profile(
     locale: str = Depends(get_locale),
 ) -> ProjectExpertProfileResponse:
     """保存新的专家关注度配置并绑定到项目。"""
-    ensure_data_dirs()
-    projects = load_projects()
-    try:
-        project = _find_project(project_id, projects)
-    except HTTPException:
-        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-
-    _ensure_project_v2_fields(project)
-    _assert_project_profile_operation_unlocked(project, bool(payload.force_unlock))
-    weights_raw = _coerce_weights_raw(payload.weights_raw)
-    profile_name = (
-        payload.name or ""
-    ).strip() or f"{project.get('name', '项目')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    profile = _new_expert_profile(profile_name, weights_raw)
-
-    profiles = load_expert_profiles()
-    profiles.append(profile)
-    save_expert_profiles(profiles)
-
-    project["expert_profile_id"] = profile["id"]
-    project["updated_at"] = _now_iso()
-    save_projects(projects)
+    project, profile = project_profile_service.update_project_expert_profile(
+        project_id=project_id,
+        name=payload.name,
+        weights_raw=payload.weights_raw,
+        force_unlock=bool(payload.force_unlock),
+        ensure_data_dirs=ensure_data_dirs,
+        load_projects=load_projects,
+        find_project=lambda requested_id, projects: _find_project_for_profile_request(
+            requested_id,
+            projects,
+            locale=locale,
+        ),
+        ensure_project_v2_fields=_ensure_project_v2_fields,
+        assert_project_profile_operation_unlocked=_assert_project_profile_operation_unlocked,
+        coerce_weights_raw=_coerce_weights_raw,
+        new_expert_profile=_new_expert_profile,
+        load_expert_profiles=load_expert_profiles,
+        save_expert_profiles=save_expert_profiles,
+        save_projects=save_projects,
+        now_iso=_now_iso,
+    )
 
     return ProjectExpertProfileResponse(
         project=ProjectRecord(**project),
@@ -7225,7 +6067,8 @@ def rescore_project_submissions(
     except HTTPException:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
 
-    project_changed = _ensure_project_v2_fields(project)
+    project_before = copy.deepcopy(project)
+    _ensure_project_v2_fields(project)
     _assert_project_profile_operation_unlocked(project, bool(payload.force_unlock))
     score_scale_max = _normalize_score_scale_max(
         payload.score_scale_max,
@@ -7236,13 +6079,8 @@ def rescore_project_submissions(
     if int(project_meta.get("score_scale_max", DEFAULT_SCORE_SCALE_MAX)) != score_scale_max:
         project_meta["score_scale_max"] = score_scale_max
         project["meta"] = project_meta
-        project_changed = True
     profiles = load_expert_profiles()
     profile, created = _ensure_project_expert_profile(project, profiles)
-    if created:
-        save_expert_profiles(profiles)
-    if project_changed or created:
-        save_projects(projects)
 
     if payload.scope not in {"project", "submission"}:
         raise HTTPException(status_code=422, detail="scope 仅支持 project 或 submission")
@@ -7282,127 +6120,97 @@ def rescore_project_submissions(
         raise_on_fail=True,
     )
 
-    score_reports = load_score_reports()
-    all_evidence_units = load_evidence_units()
-    generated = 0
-    material_utilization_summaries: List[Dict[str, object]] = []
-    material_utilization_by_submission: List[Dict[str, object]] = []
-    material_utilization_gates: List[Dict[str, object]] = []
-    failed_gate_filenames: List[str] = []
-    now = _now_iso()
-    for submission in targets:
-        text = submission.get("text") or ""
-        if not text.strip():
-            continue
-        report, evidence_units = _score_submission_for_project(
-            submission_id=str(submission.get("id")),
-            text=text,
-            project_id=project_id,
-            project=project,
-            config=config,
-            multipliers=multipliers,
-            profile_snapshot=profile_snapshot,
-            scoring_engine_version=payload.scoring_engine_version,
-            anchors=anchors,
-            requirements=requirements,
-            material_quality_snapshot=material_quality_snapshot,
-        )
-        _apply_evolution_total_scale(project_id, report)
-        all_evidence_units = _replace_submission_evidence_units(
-            all_evidence_units,
-            submission_id=str(submission.get("id")),
-            new_units=evidence_units,
-        )
-        if not _report_is_blocked(report):
-            _mark_report_scored(report, trigger="manual_rescore")
-        report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
-        report_meta = dict(report_meta or {})
-        report_meta["score_scale_max"] = score_scale_max
-        report_meta["score_scale_label"] = _score_scale_label(score_scale_max)
-        report["meta"] = report_meta
-        material_utilization = report_meta.get("material_utilization")
-        if isinstance(material_utilization, dict):
-            material_utilization_summaries.append(material_utilization)
-            material_utilization_gate = (
-                report_meta.get("material_utilization_gate")
-                if isinstance(report_meta.get("material_utilization_gate"), dict)
-                else {}
-            )
-            detail_item: Dict[str, object] = {
-                "submission_id": str(submission.get("id") or ""),
-                "filename": str(submission.get("filename") or ""),
-                "summary": material_utilization,
-            }
-            if material_utilization_gate:
-                detail_item["gate"] = material_utilization_gate
-                material_utilization_gates.append(material_utilization_gate)
-                if not bool(material_utilization_gate.get("passed", True)):
-                    filename_text = str(submission.get("filename") or "")
-                    if filename_text and filename_text not in failed_gate_filenames:
-                        failed_gate_filenames.append(filename_text)
-            alerts = report_meta.get("material_utilization_alerts")
-            if isinstance(alerts, list):
-                detail_item["alerts"] = [str(x) for x in alerts[:6] if str(x).strip()]
-            material_utilization_by_submission.append(detail_item)
-
-        submission["report"] = report
-        submission["total_score"] = float(
-            report.get("total_score", report.get("rule_total_score", 0.0))
-        )
-        submission["updated_at"] = now
-        submission["expert_profile_id_used"] = (
-            profile_for_meta.get("id") if profile_for_meta else None
-        )
-
-        snapshot = _build_score_report_snapshot(
-            submission_id=str(submission.get("id")),
-            project=project,
-            report=report,
-            profile_snapshot=profile_for_meta,
-            scoring_engine_version=payload.scoring_engine_version,
-        )
-        score_reports.append(snapshot)
-        generated += 1
-
-        dimension_scores = {
-            dim_id: dim.get("score", 0.0)
-            for dim_id, dim in report.get("dimension_scores", {}).items()
-        }
-        penalty_count = len(report.get("penalties", []))
-        if not _report_is_blocked(report):
-            record_history_score(
-                project_id=project_id,
-                submission_id=str(submission.get("id")),
-                filename=str(submission.get("filename", "")),
-                total_score=report.get("total_score", 0.0),
-                dimension_scores=dimension_scores,
-                penalty_count=penalty_count,
-            )
-
-    save_submissions(submissions)
-    save_score_reports(score_reports)
-    save_evidence_units(all_evidence_units)
+    prepared_batch = rescore_service.prepare_rescore_batch(
+        targets=targets,
+        project_id=project_id,
+        project=project,
+        config=config,
+        multipliers=multipliers,
+        profile_snapshot=profile_snapshot,
+        profile_for_meta=profile_for_meta,
+        scoring_engine_version=payload.scoring_engine_version,
+        score_scale_max=score_scale_max,
+        score_scale_label=_score_scale_label(score_scale_max),
+        anchors=anchors,
+        requirements=requirements,
+        material_quality_snapshot=material_quality_snapshot,
+        score_submission_for_project=_score_submission_for_project,
+        apply_evolution_total_scale=_apply_evolution_total_scale,
+        report_is_blocked=_report_is_blocked,
+        mark_report_scored=_mark_report_scored,
+        build_score_report_snapshot=_build_score_report_snapshot,
+        now_iso=_now_iso,
+    )
+    computed_updates = prepared_batch["computed_updates"]
     project["updated_at"] = _now_iso()
-    save_projects(projects)
+    project_patch = {
+        key: copy.deepcopy(value)
+        for key, value in project.items()
+        if project_before.get(key) != value
+    }
+
+    def find_latest_project_for_rescore_commit(
+        latest_project_id: str,
+        latest_projects: List[Dict[str, object]],
+    ) -> Dict[str, object]:
+        try:
+            return _find_project(latest_project_id, latest_projects)
+        except HTTPException:
+            raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+
+    @atomic_json_transaction(
+        "evidence_units",
+        "expert_profiles",
+        "projects",
+        "score_history",
+        "score_reports",
+        "submissions",
+    )
+    def commit() -> set[str]:
+        return rescore_service.commit_rescore_batch(
+            project_id=project_id,
+            project_patch=project_patch,
+            profile_created=created,
+            profile=profile,
+            computed_updates=computed_updates,
+            load_projects=load_projects,
+            find_latest_project=find_latest_project_for_rescore_commit,
+            load_expert_profiles=load_expert_profiles,
+            save_expert_profiles=save_expert_profiles,
+            load_submissions=load_submissions,
+            save_submissions=save_submissions,
+            load_score_reports=load_score_reports,
+            save_score_reports=save_score_reports,
+            load_evidence_units=load_evidence_units,
+            save_evidence_units=save_evidence_units,
+            load_score_history=load_score_history,
+            save_score_history=save_score_history,
+            save_projects=save_projects,
+            record_history_score=record_history_score,
+            replace_submission_evidence_units=_replace_submission_evidence_units,
+        )
+
+    committed_ids = commit()
+    generated = len(committed_ids)
+
     # 重评分属于有效反馈信号：自动刷新样本并触发校准/调权重闭环。
     feedback_closed_loop = _run_feedback_closed_loop_safe(
         project_id,
         locale=locale,
         trigger="rescore",
     )
-    material_utilization = _aggregate_material_utilization_summaries(material_utilization_summaries)
-    material_gate = (
-        material_quality_snapshot.get("gate")
-        if isinstance(material_quality_snapshot, dict)
-        and isinstance(material_quality_snapshot.get("gate"), dict)
-        else {}
+    material_summary = rescore_service.summarize_rescore_material_utilization(
+        prepared_batch=prepared_batch,
+        material_quality_snapshot=material_quality_snapshot,
+        build_material_utilization_alerts=_build_material_utilization_alerts,
+        to_float_or_none=_to_float_or_none,
+        normalize_material_type=_normalize_material_type,
+        default_material_utilization_gate_mode=DEFAULT_MATERIAL_UTILIZATION_GATE_MODE,
     )
-    material_utilization_alerts = _build_material_utilization_alerts(
-        material_utilization,
-        material_gate if isinstance(material_gate, dict) else {},
-    )
-    material_utilization_gate = _aggregate_material_utilization_gates(material_utilization_gates)
-    material_utilization_gate["failed_filenames"] = failed_gate_filenames
+    material_utilization = material_summary["material_utilization"]
+    material_utilization_alerts = material_summary["material_utilization_alerts"]
+    material_utilization_gate = material_summary["material_utilization_gate"]
+    material_utilization_by_submission = material_summary["material_utilization_by_submission"]
 
     return RescoreResponse(
         ok=True,
@@ -7439,152 +6247,55 @@ def _delete_project_cascade(project_id: str, *, locale: str = "zh") -> Dict[str,
 
     **需要 API Key 认证**（未配置 API_KEYS 时无需）
     """
-    ensure_data_dirs()
-    projects = load_projects()
-    target = next((p for p in projects if str(p.get("id")) == project_id), None)
-    if target is None:
-        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    target_name = str(target.get("name") or project_id)
-    target_profile_id = str(target.get("expert_profile_id") or "")
-
-    removed_counts = {
-        "materials": 0,
-        "submissions": 0,
-        "score_reports": 0,
-        "ground_truth": 0,
-        "delta_cases": 0,
-        "calibration_samples": 0,
-        "patch_packages": 0,
-    }
-
-    save_projects([p for p in projects if p.get("id") != project_id])
-
-    materials = load_materials()
-    project_materials = [m for m in materials if m.get("project_id") == project_id]
-    removed_counts["materials"] = len(project_materials)
-    for m in project_materials:
-        path = Path(str(m.get("path") or ""))
-        if path.exists() and path.is_file():
-            try:
-                path.unlink()
-            except Exception:
-                pass
-    save_materials([m for m in materials if m.get("project_id") != project_id])
-    _invalidate_material_index_cache(project_id)
-
-    project_dir = MATERIALS_DIR / project_id
-    if project_dir.exists():
-        shutil.rmtree(project_dir, ignore_errors=True)
-
-    submissions = load_submissions()
-    project_submission_ids = {
-        str(s.get("id")) for s in submissions if s.get("project_id") == project_id
-    }
-    removed_counts["submissions"] = len(project_submission_ids)
-    save_submissions([s for s in submissions if s.get("project_id") != project_id])
-
-    score_reports = load_score_reports()
-    removed_counts["score_reports"] = sum(
-        1 for r in score_reports if r.get("project_id") == project_id
+    return project_delete_service.delete_project_cascade(
+        project_id=project_id,
+        atomic_json_transaction=atomic_json_transaction,
+        materials_dir=MATERIALS_DIR,
+        ensure_data_dirs=ensure_data_dirs,
+        load_projects=load_projects,
+        save_projects=save_projects,
+        load_materials=load_materials,
+        save_materials=save_materials,
+        invalidate_material_index_cache=_invalidate_material_index_cache,
+        load_submissions=load_submissions,
+        save_submissions=save_submissions,
+        load_score_reports=load_score_reports,
+        save_score_reports=save_score_reports,
+        load_evidence_units=load_evidence_units,
+        save_evidence_units=save_evidence_units,
+        load_qingtian_results=load_qingtian_results,
+        save_qingtian_results=save_qingtian_results,
+        load_delta_cases=load_delta_cases,
+        save_delta_cases=save_delta_cases,
+        load_calibration_samples=load_calibration_samples,
+        save_calibration_samples=save_calibration_samples,
+        load_patch_packages=load_patch_packages,
+        save_patch_packages=save_patch_packages,
+        load_patch_deployments=load_patch_deployments,
+        save_patch_deployments=save_patch_deployments,
+        load_project_anchors=load_project_anchors,
+        save_project_anchors=save_project_anchors,
+        load_project_requirements=load_project_requirements,
+        save_project_requirements=save_project_requirements,
+        load_learning_profiles=load_learning_profiles,
+        save_learning_profiles=save_learning_profiles,
+        load_score_history=load_score_history,
+        save_score_history=save_score_history,
+        load_project_context=load_project_context,
+        save_project_context=save_project_context,
+        load_ground_truth=load_ground_truth,
+        save_ground_truth=save_ground_truth,
+        load_calibration_models=load_calibration_models,
+        save_calibration_models=save_calibration_models,
+        load_evolution_reports=load_evolution_reports,
+        save_evolution_reports=save_evolution_reports,
+        load_expert_profiles=load_expert_profiles,
+        save_expert_profiles=save_expert_profiles,
+        project_not_found_error=lambda: HTTPException(
+            status_code=404,
+            detail=t("api.project_not_found", locale=locale),
+        ),
     )
-    save_score_reports([r for r in score_reports if r.get("project_id") != project_id])
-    evidence_units = load_evidence_units()
-    save_evidence_units(
-        [u for u in evidence_units if str(u.get("submission_id")) not in project_submission_ids]
-    )
-    qingtian_results = load_qingtian_results()
-    save_qingtian_results(
-        [q for q in qingtian_results if str(q.get("submission_id")) not in project_submission_ids]
-    )
-    delta_cases = load_delta_cases()
-    removed_counts["delta_cases"] = sum(
-        1
-        for d in delta_cases
-        if str(d.get("project_id")) == project_id
-        or str(d.get("submission_id")) in project_submission_ids
-    )
-    save_delta_cases(
-        [
-            d
-            for d in delta_cases
-            if str(d.get("project_id")) != project_id
-            and str(d.get("submission_id")) not in project_submission_ids
-        ]
-    )
-    calibration_samples = load_calibration_samples()
-    removed_counts["calibration_samples"] = sum(
-        1
-        for s in calibration_samples
-        if str(s.get("project_id")) == project_id
-        or str(s.get("submission_id")) in project_submission_ids
-    )
-    save_calibration_samples(
-        [
-            s
-            for s in calibration_samples
-            if str(s.get("project_id")) != project_id
-            and str(s.get("submission_id")) not in project_submission_ids
-        ]
-    )
-    patch_packages = load_patch_packages()
-    removed_patch_ids = {
-        str(p.get("id")) for p in patch_packages if str(p.get("project_id")) == project_id
-    }
-    removed_counts["patch_packages"] = len(removed_patch_ids)
-    save_patch_packages([p for p in patch_packages if str(p.get("project_id")) != project_id])
-    patch_deployments = load_patch_deployments()
-    save_patch_deployments(
-        [
-            d
-            for d in patch_deployments
-            if str(d.get("project_id")) != project_id
-            and str(d.get("patch_id")) not in removed_patch_ids
-        ]
-    )
-
-    anchors = load_project_anchors()
-    save_project_anchors([a for a in anchors if a.get("project_id") != project_id])
-    requirements = load_project_requirements()
-    save_project_requirements([r for r in requirements if r.get("project_id") != project_id])
-
-    learning_profiles = load_learning_profiles()
-    save_learning_profiles([p for p in learning_profiles if p.get("project_id") != project_id])
-
-    score_history = load_score_history()
-    save_score_history([h for h in score_history if h.get("project_id") != project_id])
-
-    context = load_project_context()
-    if project_id in context:
-        context.pop(project_id, None)
-        save_project_context(context)
-
-    ground_truth = load_ground_truth()
-    removed_counts["ground_truth"] = sum(
-        1 for r in ground_truth if r.get("project_id") == project_id
-    )
-    save_ground_truth([r for r in ground_truth if r.get("project_id") != project_id])
-
-    reports = load_evolution_reports()
-    if project_id in reports:
-        reports.pop(project_id, None)
-        save_evolution_reports(reports)
-
-    # 清理未被其它项目引用的专家配置
-    if target_profile_id:
-        remaining_projects = load_projects()
-        in_use = any(
-            str(p.get("expert_profile_id") or "") == target_profile_id for p in remaining_projects
-        )
-        if not in_use:
-            profiles = load_expert_profiles()
-            profiles = [ep for ep in profiles if str(ep.get("id") or "") != target_profile_id]
-            save_expert_profiles(profiles)
-
-    return {
-        "project_id": project_id,
-        "project_name": target_name,
-        "removed_counts": removed_counts,
-    }
 
 
 @router.delete(
@@ -7793,14 +6504,6 @@ DIMENSION_RAG_KEYWORDS: Dict[str, List[str]] = {
 }
 
 
-def _normalize_uploaded_filename(filename: str) -> str:
-    raw = unicodedata.normalize("NFKC", str(filename or "")).replace("\u3000", " ").strip()
-    base = Path(raw).name.strip()
-    while base.endswith("."):
-        base = base[:-1].rstrip()
-    return base
-
-
 def _infer_material_type_from_filename(filename: object) -> str:
     normalized = _normalize_uploaded_filename(str(filename or "")).lower()
     ext = Path(normalized).suffix.lower()
@@ -7912,6 +6615,65 @@ def _find_recent_duplicate_submission(
     return None
 
 
+@atomic_json_transaction("materials")
+def _commit_uploaded_material_record(
+    project_id: str,
+    normalized_material_type: str,
+    normalized_name: str,
+    target: Path,
+) -> tuple[dict, List[Path]]:
+    materials = load_materials()
+
+    def same_logical_material(material: dict) -> bool:
+        return (
+            material.get("project_id") == project_id
+            and _normalize_material_type(
+                material.get("material_type"), filename=material.get("filename")
+            )
+            == normalized_material_type
+            and _normalize_uploaded_filename(material.get("filename", "")) == normalized_name
+        )
+
+    existing_materials = [material for material in materials if same_logical_material(material)]
+    existing_ids = [
+        str(material.get("id")) for material in existing_materials if material.get("id")
+    ]
+    superseded_paths = [
+        Path(str(material.get("path")))
+        for material in existing_materials
+        if str(material.get("path") or "").strip()
+    ]
+    materials = [material for material in materials if not same_logical_material(material)]
+    record = {
+        "id": existing_ids[0] if existing_ids else str(uuid4()),
+        "project_id": project_id,
+        "material_type": normalized_material_type,
+        "filename": normalized_name,
+        "path": str(target),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    materials.append(record)
+    save_materials(materials)
+    return record, superseded_paths
+
+
+@atomic_json_transaction("materials")
+def _write_material_upload_transaction(
+    project_id: str,
+    normalized_material_type: str,
+    normalized_name: str,
+    content: bytes,
+) -> dict:
+    return material_upload_service.write_material_file_and_record(
+        project_id=project_id,
+        normalized_material_type=normalized_material_type,
+        normalized_name=normalized_name,
+        materials_dir=MATERIALS_DIR,
+        content=content,
+        commit_uploaded_material_record=_commit_uploaded_material_record,
+    )
+
+
 @router.post(
     "/projects/{project_id}/materials",
     tags=["项目管理"],
@@ -7957,55 +6719,19 @@ def upload_material(
     projects = load_projects()
     if not any(p["id"] == project_id for p in projects):
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    project_dir = MATERIALS_DIR / project_id / normalized_material_type
-    project_dir.mkdir(parents=True, exist_ok=True)
-    target = project_dir / normalized_name
     content = file.file.read()
-    target.write_bytes(content)
-
-    materials = load_materials()
-    existing_ids = [
-        str(m.get("id"))
-        for m in materials
-        if m.get("project_id") == project_id
-        and _normalize_material_type(m.get("material_type"), filename=m.get("filename"))
-        == normalized_material_type
-        and _normalize_uploaded_filename(m.get("filename", "")) == normalized_name
-        and m.get("id")
-    ]
-    materials = [
-        m
-        for m in materials
-        if not (
-            m.get("project_id") == project_id
-            and _normalize_material_type(m.get("material_type"), filename=m.get("filename"))
-            == normalized_material_type
-            and _normalize_uploaded_filename(m.get("filename", "")) == normalized_name
-        )
-    ]
-    record = {
-        "id": existing_ids[0] if existing_ids else str(uuid4()),
-        "project_id": project_id,
-        "material_type": normalized_material_type,
-        "filename": normalized_name,
-        "path": str(target),
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    materials.append(record)
-    save_materials(materials)
-    _invalidate_material_index_cache(project_id)
-    # 材料更新后立即重建锚点/要求，避免后续评分继续使用旧约束。
-    constraint_sync: Dict[str, object] = {"rebuilt": False}
-    try:
-        anchors, requirements = _rebuild_project_anchors_and_requirements(project_id)
-        constraint_sync = {
-            "rebuilt": True,
-            "anchors": len(anchors),
-            "requirements": len(requirements),
-        }
-    except Exception as exc:
-        constraint_sync = {"rebuilt": False, "error": f"{type(exc).__name__}: {exc}"}
-    return {"status": "ok", "material": record, "constraint_sync": constraint_sync}
+    record = _write_material_upload_transaction(
+        project_id,
+        normalized_material_type,
+        normalized_name,
+        content,
+    )
+    return material_upload_service.build_material_upload_response(
+        project_id=project_id,
+        record=record,
+        invalidate_material_index_cache=_invalidate_material_index_cache,
+        rebuild_project_anchors_and_requirements=_rebuild_project_anchors_and_requirements,
+    )
 
 
 @router.get(
@@ -8017,19 +6743,15 @@ def upload_material(
 def list_materials(project_id: str, locale: str = Depends(get_locale)) -> list[MaterialRecord]:
     """获取指定项目下已上传的资料列表。"""
     ensure_data_dirs()
-    projects = load_projects()
-    if not any(p["id"] == project_id for p in projects):
+    projection = material_read_service.get_material_catalog_projection(
+        project_id=project_id,
+        load_projects=load_projects,
+        load_materials=load_materials,
+        normalize_material_type=_normalize_material_type,
+    )
+    if projection is None:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    materials = [m for m in load_materials() if m.get("project_id") == project_id]
-    materials.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
-    normalized_rows: List[dict] = []
-    for material in materials:
-        row = dict(material)
-        row["material_type"] = _normalize_material_type(
-            row.get("material_type"), filename=row.get("filename")
-        )
-        normalized_rows.append(row)
-    return [MaterialRecord(**m) for m in normalized_rows]
+    return [MaterialRecord(**material) for material in projection]
 
 
 @router.get(
@@ -8341,6 +7063,7 @@ def get_project_constraint_pack(
     tags=["项目管理"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
+@atomic_json_transaction("materials")
 def delete_material(
     project_id: str,
     material_id: str,
@@ -8348,417 +7071,27 @@ def delete_material(
     locale: str = Depends(get_locale),
 ) -> dict:
     """删除指定项目下的一条资料记录及对应文件。"""
-    ensure_data_dirs()
-    projects = load_projects()
-    if not any(p["id"] == project_id for p in projects):
-        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    materials = load_materials()
-    found = None
-    for m in materials:
-        if m.get("id") == material_id and m.get("project_id") == project_id:
-            found = m
-            break
-    if not found:
-        raise HTTPException(status_code=404, detail="资料记录不存在")
-    path = Path(found["path"])
-    if path.exists():
-        path.unlink()
-    materials = [m for m in materials if m.get("id") != material_id]
-    save_materials(materials)
-    _invalidate_material_index_cache(project_id)
-    return {"ok": True, "id": material_id}
-
-
-def _decode_dxf_text(content: bytes) -> str:
-    if b"\x00" in content[:4096]:
-        raise ValueError("DXF 解析失败：检测到二进制 DXF，请先另存为 ASCII DXF。")
-    for encoding in ("utf-8-sig", "gb18030", "latin-1"):
-        try:
-            return content.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return content.decode("utf-8", errors="ignore")
-
-
-def _iter_dxf_group_pairs(text: str) -> List[tuple[int, str]]:
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    pairs: List[tuple[int, str]] = []
-    idx = 0
-    while idx + 1 < len(lines):
-        code_raw = lines[idx].strip()
-        value = lines[idx + 1].strip()
-        idx += 2
-        if not code_raw:
-            continue
-        try:
-            code = int(code_raw)
-        except ValueError:
-            continue
-        pairs.append((code, value))
-    return pairs
-
-
-def _extract_dxf_text(content: bytes) -> str:
-    raw_text = _decode_dxf_text(content)
-    pairs = _iter_dxf_group_pairs(raw_text)
-    if not pairs:
-        return "[DXF解析摘要]\n未读取到有效 DXF 组码。"
-
-    acadver = ""
-    codepage = ""
-    insunits: Optional[int] = None
-    unit_map = {
-        0: "未指定",
-        1: "英寸",
-        2: "英尺",
-        4: "毫米",
-        5: "厘米",
-        6: "米",
-        20: "秒",
-        21: "分",
-        22: "时",
-    }
-    for i, (code, value) in enumerate(pairs[:-1]):
-        if code != 9:
-            continue
-        key = value.upper()
-        next_code, next_value = pairs[i + 1]
-        if key == "$ACADVER" and next_code in (1, 3):
-            acadver = next_value.strip()
-        elif key == "$DWGCODEPAGE" and next_code in (1, 3):
-            codepage = next_value.strip()
-        elif key == "$INSUNITS" and next_code in (70, 280):
-            try:
-                insunits = int(float(next_value.strip()))
-            except Exception:
-                insunits = None
-
-    text_entity_types = {"TEXT", "MTEXT", "ATTDEF", "ATTRIB"}
-    entity_counts: Dict[str, int] = {}
-    extracted_texts: List[str] = []
-    layers: set[str] = set()
-    blocks: set[str] = set()
-
-    in_entities = False
-    waiting_section_name = False
-    current_entity_type = ""
-    current_entity_texts: List[str] = []
-    current_layer = ""
-    current_block = ""
-
-    def _flush_entity() -> None:
-        nonlocal current_entity_type, current_entity_texts, current_layer, current_block
-        if not current_entity_type:
-            return
-        entity_counts[current_entity_type] = entity_counts.get(current_entity_type, 0) + 1
-        if current_layer:
-            layers.add(current_layer)
-        if current_block:
-            blocks.add(current_block)
-        for item in current_entity_texts:
-            if not item:
-                continue
-            normalized = (
-                item.replace("\\P", "\n")
-                .replace("\\~", " ")
-                .replace("{", "")
-                .replace("}", "")
-                .strip()
-            )
-            if normalized and normalized not in extracted_texts:
-                extracted_texts.append(normalized)
-        current_entity_type = ""
-        current_entity_texts = []
-        current_layer = ""
-        current_block = ""
-
-    for code, value in pairs:
-        token = value.upper().strip()
-        if waiting_section_name and code == 2:
-            in_entities = token == "ENTITIES"
-            waiting_section_name = False
-            continue
-
-        if code == 0:
-            if token == "SECTION":
-                _flush_entity()
-                waiting_section_name = True
-                continue
-            if token in {"ENDSEC", "EOF"}:
-                _flush_entity()
-                in_entities = False
-                continue
-            if in_entities:
-                _flush_entity()
-                current_entity_type = token
-                continue
-
-        if not in_entities or not current_entity_type:
-            continue
-        if code == 8:
-            current_layer = value.strip()
-            continue
-        if code == 2 and current_entity_type == "INSERT":
-            current_block = value.strip()
-            continue
-        if code in (1, 3) and current_entity_type in text_entity_types:
-            current_entity_texts.append(value)
-
-    _flush_entity()
-
-    summary_lines = ["[DXF解析摘要]"]
-    if acadver:
-        summary_lines.append(f"ACAD版本: {acadver}")
-    if codepage:
-        summary_lines.append(f"编码页: {codepage}")
-    if insunits is not None:
-        summary_lines.append(f"插入单位: {insunits}({unit_map.get(insunits, '未知')})")
-    if entity_counts:
-        top_entities = sorted(entity_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-        summary_lines.append(
-            "实体统计: " + "、".join(f"{etype}:{count}" for etype, count in top_entities)
-        )
-    if layers:
-        summary_lines.append("图层: " + "、".join(sorted(layers)[:20]))
-    if blocks:
-        summary_lines.append("块参照: " + "、".join(sorted(blocks)[:20]))
-
-    if extracted_texts:
-        summary_lines.append("")
-        summary_lines.append("[DXF文本实体提取]")
-        summary_lines.extend(extracted_texts[:160])
-    return "\n".join(summary_lines).strip()
-
-
-def _looks_like_ascii_dxf(content: bytes) -> bool:
-    sample = content[:4096]
-    if not sample or b"\x00" in sample:
-        return False
-    text = sample.decode("latin-1", errors="ignore").replace("\r", "\n").upper()
-    return "SECTION" in text and ("ENTITIES" in text or "HEADER" in text) and "\n0\n" in text
-
-
-def _extract_dwg_binary_markers(content: bytes, *, max_tokens: int = 30) -> Dict[str, object]:
-    sample = content[: min(len(content), 1_500_000)]
-    versions = sorted(
-        {
-            item.decode("ascii", errors="ignore")
-            for item in re.findall(rb"AC10\d{2}", sample)
-            if item
-        }
+    return material_delete_service.delete_material(
+        project_id=project_id,
+        material_id=material_id,
+        ensure_data_dirs=ensure_data_dirs,
+        load_projects=load_projects,
+        load_materials=load_materials,
+        save_materials=save_materials,
+        invalidate_material_index_cache=_invalidate_material_index_cache,
+        project_not_found_error=lambda: HTTPException(
+            status_code=404,
+            detail=t("api.project_not_found", locale=locale),
+        ),
+        material_not_found_error=lambda: HTTPException(
+            status_code=404,
+            detail="资料记录不存在",
+        ),
     )
-    raw_tokens = re.findall(rb"[A-Za-z_][A-Za-z0-9_./:-]{2,48}", sample)
-    blocklist_prefix = ("http", "https", "xmlns", "schema", "version", "content")
-    token_counter: Counter[str] = Counter()
-    for token_bytes in raw_tokens:
-        token = token_bytes.decode("latin-1", errors="ignore").strip()
-        lower = token.lower()
-        if len(token) < 3:
-            continue
-        if any(lower.startswith(prefix) for prefix in blocklist_prefix):
-            continue
-        if lower in {"acdb", "objectdbx", "autocad", "dwg"}:
-            continue
-        if re.fullmatch(r"[0-9a-f]{8,}", lower):
-            continue
-        token_counter[token] += 1
-    top_tokens = [tok for tok, _ in token_counter.most_common(max(1, int(max_tokens)))]
-    return {"versions": versions, "tokens": top_tokens}
-
-
-def _dwg_converter_command_candidates(
-    binary: str,
-    *,
-    in_path: Path,
-    input_dir: Path,
-    output_dir: Path,
-) -> List[List[str]]:
-    name = Path(binary).name.lower()
-    out_file = output_dir / f"{in_path.stem}.dxf"
-    candidates: List[List[str]] = []
-    if "dwg2dxf" in name:
-        candidates.append([binary, str(in_path), str(out_file)])
-    elif any(mark in name for mark in ("odafileconverter", "oda_file_converter", "teigha")):
-        # ODA/Teigha 不同版本参数略有差异，按候选命令依次尝试。
-        candidates.append([binary, str(input_dir), str(output_dir), "ACAD2018", "DXF", "0", "1"])
-        candidates.append(
-            [binary, str(input_dir), str(output_dir), "ACAD2018", "DXF", "0", "1", "*.DWG"]
-        )
-        candidates.append([binary, str(in_path), str(out_file)])
-    else:
-        candidates.append([binary, str(in_path), str(out_file)])
-        candidates.append([binary, str(input_dir), str(output_dir)])
-    return candidates
 
 
 def _resolve_dwg_converter_binaries() -> List[str]:
-    converter_names: List[str] = []
-    converter_paths: List[str] = []
-    env_converters_raw = str(os.getenv("DWG_CONVERTER_BIN") or "").strip()
-    if env_converters_raw:
-        for item in re.split(r"[;,]", env_converters_raw):
-            s = item.strip()
-            if not s:
-                continue
-            p = Path(s)
-            if p.exists() and p.is_file():
-                converter_paths.append(str(p))
-                continue
-            if p.exists() and p.is_dir():
-                for bin_name in (
-                    "dwg2dxf",
-                    "ODAFileConverter",
-                    "oda_file_converter",
-                    "TeighaFileConverter",
-                ):
-                    candidate = p / bin_name
-                    if candidate.exists() and candidate.is_file():
-                        converter_paths.append(str(candidate))
-                continue
-            if s not in converter_names:
-                converter_names.append(s)
-    converter_names.extend(
-        [
-            "dwg2dxf",
-            "ODAFileConverter",
-            "oda_file_converter",
-            "TeighaFileConverter",
-            "dwgread",
-        ]
-    )
-    converter_names = list(dict.fromkeys(converter_names))
-    binaries: List[str] = [p for p in converter_paths if p]
-    common_paths = [
-        "/Applications/ODAFileConverter.app/Contents/MacOS/ODAFileConverter",
-        "/Applications/Teigha File Converter.app/Contents/MacOS/TeighaFileConverter",
-        "/opt/homebrew/bin/dwg2dxf",
-        "/usr/local/bin/dwg2dxf",
-        "/opt/homebrew/bin/dwgread",
-        "/usr/local/bin/dwgread",
-    ]
-    for raw_path in common_paths:
-        p = Path(raw_path)
-        if p.exists() and p.is_file():
-            binaries.append(str(p))
-    for name in converter_names:
-        if not name:
-            continue
-        resolved = name if Path(name).exists() else shutil.which(name)
-        if resolved:
-            binaries.append(str(resolved))
-    return list(dict.fromkeys(binaries))
-
-
-def _extract_dwg_text(content: bytes, filename: str) -> str:
-    """
-    DWG 预处理链：
-    1) 优先尝试系统级转换器将 DWG 转 DXF（若已安装）
-    2) 转换成功后复用 DXF 解析
-    3) 无转换器或转换失败时保留元信息并给出明确提示
-    """
-    if _looks_like_ascii_dxf(content):
-        try:
-            dxf_text = _extract_dxf_text(content)
-            return f"[DWG预处理] 文件: {filename}\n检测到ASCII DXF内容，按DXF解析。\n\n{dxf_text}"
-        except Exception:
-            pass
-    # 对明显异常的小体量 DWG 直接走标识兜底，避免调用外部转换器造成长时间阻塞。
-    if len(content) < 256:
-        markers = _extract_dwg_binary_markers(content, max_tokens=26)
-        versions = [str(x) for x in (markers.get("versions") or []) if str(x).strip()]
-        token_preview = [str(x) for x in (markers.get("tokens") or []) if str(x).strip()]
-        marker_text = "、".join(versions[:4]) if versions else "未识别"
-        tokens_text = "、".join(token_preview[:16]) if token_preview else "未提取到有效标识"
-        return (
-            f"[DWG图纸] 文件: {filename}，字节数: {len(content)}\n"
-            "DWG预处理: 文件体积过小，已跳过外部转换器尝试\n"
-            f"版本标记: {marker_text}\n"
-            f"二进制标识提取: {tokens_text}\n"
-            "当前未完成稳定结构化解析，建议同时上传 PDF 或 ASCII DXF 以提升评分准确性。"
-        )
-
-    binaries = _resolve_dwg_converter_binaries()
-
-    converter_display = ["dwg2dxf", "ODAFileConverter", "oda_file_converter", "TeighaFileConverter"]
-    notes: List[str] = []
-    with tempfile.TemporaryDirectory(prefix="dwg_bridge_") as tmpdir:
-        tmp_root = Path(tmpdir)
-        input_dir = tmp_root / "in"
-        output_dir = tmp_root / "out"
-        input_dir.mkdir(parents=True, exist_ok=True)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        in_path = input_dir / _normalize_uploaded_filename(filename)
-        in_path.write_bytes(content)
-
-        for name in converter_display:
-            if not any(Path(b).name.lower() == name.lower() for b in binaries):
-                notes.append(f"{name}: not_found")
-        for binary in binaries:
-            cmd_candidates = _dwg_converter_command_candidates(
-                binary,
-                in_path=in_path,
-                input_dir=input_dir,
-                output_dir=output_dir,
-            )
-            for cmd in cmd_candidates:
-                cmd_signature = " ".join(cmd[:3])
-                try:
-                    completed = subprocess.run(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        timeout=45,
-                        check=False,
-                        text=True,
-                    )
-                    if completed.returncode != 0:
-                        err = (completed.stderr or completed.stdout or "").strip().splitlines()
-                        notes.append(
-                            f"{Path(binary).name}: rc={completed.returncode} {err[0] if err else ''}"
-                        )
-                        continue
-                    dxf_candidates = sorted(
-                        {
-                            *output_dir.rglob("*.dxf"),
-                            *tmp_root.rglob(f"{in_path.stem}.dxf"),
-                        }
-                    )
-                    if not dxf_candidates:
-                        notes.append(f"{Path(binary).name}: no_dxf_output ({cmd_signature})")
-                        continue
-                    for dxf_candidate in dxf_candidates:
-                        try:
-                            dxf_text = _extract_dxf_text(dxf_candidate.read_bytes())
-                        except Exception as exc:  # noqa: BLE001 - converter output might be malformed
-                            notes.append(
-                                f"{Path(binary).name}: dxf_parse_failed {type(exc).__name__}: {exc}"
-                            )
-                            continue
-                        head = [
-                            f"[DWG预处理] 文件: {filename}",
-                            f"转换器: {Path(binary).name}",
-                            f"命令: {cmd_signature}",
-                            f"输出DXF: {dxf_candidate.name}",
-                        ]
-                        return "\n".join(head + ["", dxf_text]).strip()
-                except subprocess.TimeoutExpired:
-                    notes.append(f"{Path(binary).name}: timeout ({cmd_signature})")
-                except Exception as exc:  # noqa: BLE001 - continue next converter
-                    notes.append(f"{Path(binary).name}: exception {type(exc).__name__}: {exc}")
-
-    markers = _extract_dwg_binary_markers(content, max_tokens=26)
-    versions = [str(x) for x in (markers.get("versions") or []) if str(x).strip()]
-    token_preview = [str(x) for x in (markers.get("tokens") or []) if str(x).strip()]
-    notes_text = "；".join(notes[:6]) if notes else "未检测到可用转换器"
-    marker_text = "、".join(versions[:4]) if versions else "未识别"
-    tokens_text = "、".join(token_preview[:16]) if token_preview else "未提取到有效标识"
-    return (
-        f"[DWG图纸] 文件: {filename}，字节数: {len(content)}\n"
-        f"DWG预处理: {notes_text}\n"
-        f"版本标记: {marker_text}\n"
-        f"二进制标识提取: {tokens_text}\n"
-        "当前未完成稳定结构化解析，建议同时上传 PDF 或 ASCII DXF 以提升评分准确性。"
-    )
+    return _document_parser._resolve_dwg_converter_binaries()
 
 
 def _safe_float_from_cell(value: object) -> Optional[float]:
@@ -8986,168 +7319,24 @@ def _build_boq_structured_summary(
     return summary
 
 
-def _extract_binary_text_snippet(content: bytes, *, max_chars: int = 4000) -> str:
-    decoded = content.decode("utf-8", errors="ignore")
-    cleaned = "".join(ch if ch.isprintable() else " " for ch in decoded)
-    compact = " ".join(cleaned.split())
-    if not compact:
-        return ""
-    return compact[: max(256, int(max_chars))]
-
-
-def _extract_image_content(content: bytes, filename: str) -> str:
-    lines = [f"[图像资料] 文件: {filename}", f"字节数: {len(content)}"]
-    if Image is None:
-        lines.append("图像解析: 当前环境未安装 Pillow，已纳入文件元信息。")
-        return "\n".join(lines)
-    try:
-        with Image.open(io.BytesIO(content)) as img:
-            lines.append(f"格式: {img.format or '未知'}")
-            lines.append(f"尺寸: {img.width}x{img.height}")
-            lines.append(f"模式: {img.mode}")
-            if pytesseract is not None:
-                try:
-                    ocr_text = str(
-                        pytesseract.image_to_string(img, lang="chi_sim+eng") or ""
-                    ).strip()
-                except Exception:
-                    ocr_text = ""
-                if ocr_text:
-                    lines.append("[OCR文本提取]")
-                    lines.append(ocr_text[:4000])
-                else:
-                    lines.append("OCR文本提取: 未识别到有效文本。")
-            else:
-                lines.append("OCR文本提取: 当前环境未安装 pytesseract，已纳入图像元信息。")
-    except Exception as exc:
-        lines.append(f"图像解析失败: {exc}")
-    return "\n".join(lines)
-
-
 def _pdf_backend_name() -> str:
-    if pymupdf is not None:
-        return "pymupdf"
-    if PdfReader is not None:
-        return "pypdf"
-    return "none"
-
-
-def _extract_pdf_text_with_pypdf(content: bytes) -> str:
-    if PdfReader is None:
-        return ""
-    if not bytes(content or b"").lstrip().startswith(b"%PDF"):
-        return ""
-    try:
-        reader = PdfReader(io.BytesIO(content))
-    except Exception:
-        return ""
-    parts: List[str] = []
-    for idx, page in enumerate(getattr(reader, "pages", []) or [], start=1):
-        try:
-            page_text = str(page.extract_text() or "")
-        except Exception:
-            page_text = ""
-        page_text = page_text.strip()
-        if page_text:
-            parts.append(f"[PAGE:{idx}]\n{page_text}")
-    return "\n\n".join(parts).strip()
-
-
-def _extract_pdf_text(content: bytes, filename: str) -> str:
-    if pymupdf is not None:
-        doc = pymupdf.open(stream=content, filetype="pdf")
-        try:
-            parts: List[str] = []
-            for idx, page in enumerate(doc, start=1):
-                # Embed stable page markers so downstream diagnostics can map evidence to pages.
-                page_text = page.get_text() or ""
-                parts.append(f"[PAGE:{idx}]\n{page_text}")
-            merged_pdf_text = "\n\n".join(parts).strip()
-            text_chars = len(merged_pdf_text.replace("\n", "").strip())
-            need_ocr = text_chars < DEFAULT_PDF_TEXT_MIN_CHARS_FOR_OCR
-            if need_ocr and pytesseract is not None and Image is not None:
-                ocr_chunks: List[str] = []
-                for idx, page in enumerate(doc, start=1):
-                    if idx > DEFAULT_PDF_OCR_MAX_PAGES:
-                        break
-                    try:
-                        pix = page.get_pixmap(matrix=pymupdf.Matrix(2.0, 2.0), alpha=False)
-                        with Image.open(io.BytesIO(pix.tobytes("png"))) as img:
-                            ocr_text = str(
-                                pytesseract.image_to_string(img, lang="chi_sim+eng") or ""
-                            ).strip()
-                    except Exception:
-                        ocr_text = ""
-                    if ocr_text:
-                        ocr_chunks.append(f"[PAGE_OCR:{idx}]\n{ocr_text[:5000]}")
-                if ocr_chunks:
-                    merged_pdf_text = (
-                        merged_pdf_text + "\n\n[PDF_OCR_FALLBACK]\n" + "\n\n".join(ocr_chunks)
-                    ).strip()
-            if merged_pdf_text:
-                return f"[PDF_BACKEND:pymupdf]\n{merged_pdf_text}"
-        finally:
-            doc.close()
-
-    pypdf_text = _extract_pdf_text_with_pypdf(content)
-    if pypdf_text:
-        return f"[PDF_BACKEND:pypdf]\n{pypdf_text}"
-
-    if _pdf_backend_name() == "none":
-        raise ValueError(
-            "PDF 解析不可用：请安装与当前系统架构兼容的 PyMuPDF，或安装 pypdf 作为兼容解析后端。"
-        )
-    return f"[PDF资料] 文件: {filename}（未提取到有效文本）"
+    return _document_parser._pdf_backend_name(
+        pymupdf_backend=pymupdf,
+        pdf_reader_backend=PdfReader,
+    )
 
 
 def _read_uploaded_file_content(content: bytes, filename: str) -> str:
     """根据文件名解析上传文件为文本，覆盖招标/清单/图纸/现场照片常见格式。"""
-    name = filename.lower()
-    if name.endswith(".txt") or name.endswith(".md") or name.endswith(".csv"):
-        return content.decode("utf-8", errors="ignore")
-    if name.endswith(".docx"):
-        if Document is None:
-            raise ValueError("DOCX 解析不可用：请安装与当前系统架构兼容的 python-docx/lxml。")
-        doc = Document(io.BytesIO(content))
-        return "\n".join(p.text for p in doc.paragraphs)
-    if name.endswith(".doc") or name.endswith(".docm"):
-        snippet = _extract_binary_text_snippet(content)
-        if snippet:
-            return snippet
-        return f"[DOC资料] 文件: {filename}（当前环境未启用结构化解析，已纳入文件元信息）"
-    if name.endswith(".pdf"):
-        return _extract_pdf_text(content, filename)
-    if name.endswith(".json"):
-        return content.decode("utf-8", errors="ignore")
-    if name.endswith(".xlsx") or name.endswith(".xls") or name.endswith(".xlsm"):
-        try:
-            import openpyxl
-
-            wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
-            parts = []
-            for sheet in wb.worksheets:
-                for row in sheet.iter_rows(values_only=True):
-                    parts.append("\t".join(str(c) if c is not None else "" for c in row))
-            wb.close()
-            return "\n".join(parts)
-        except Exception as e:
-            raise ValueError(f"Excel 解析失败: {e}") from e
-    if name.endswith(".dxf"):
-        try:
-            return _extract_dxf_text(content)
-        except ValueError:
-            raise
-        except Exception as e:
-            raise ValueError(f"DXF 解析失败: {e}") from e
-    if name.endswith(".dwg"):
-        return _extract_dwg_text(content, filename)
-    if name.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")):
-        return _extract_image_content(content, filename)
-    snippet = _extract_binary_text_snippet(content, max_chars=2000)
-    if snippet:
-        return snippet
-    raise ValueError(
-        "仅支持 .txt、.md、.csv、.doc/.docx/.docm、.pdf、.json、.xlsx/.xls/.xlsm、.dxf/.dwg、图片格式"
+    return _document_parser._read_uploaded_file_content(
+        content,
+        filename,
+        document_backend=Document,
+        pymupdf_backend=pymupdf,
+        pdf_reader_backend=PdfReader,
+        image_backend=Image,
+        ocr_backend=pytesseract,
+        resolve_dwg_converter_binaries=_resolve_dwg_converter_binaries,
     )
 
 
@@ -10824,18 +9013,7 @@ def upload_shigong(
         text = _read_uploaded_file_content(content, normalized_filename)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
-    submissions = load_submissions()
     now_utc = datetime.now(timezone.utc)
-    duplicate = _find_recent_duplicate_submission(
-        submissions,
-        project_id=project_id,
-        filename=normalized_filename,
-        text=text,
-        now_utc=now_utc,
-    )
-    if duplicate is not None:
-        return SubmissionRecord(**duplicate)
-
     _, profile_snapshot, project = _resolve_project_scoring_context(project_id)
     scoring_engine_version = str(project.get("scoring_engine_version_locked") or "v1")
     submission_id = str(uuid4())
@@ -10862,10 +9040,24 @@ def upload_shigong(
         "updated_at": now_utc.isoformat(),
         "expert_profile_id_used": profile_snapshot.get("id") if profile_snapshot else None,
     }
-    submissions.append(record)
-    save_submissions(submissions)
+    committed_record = submission_scoring_service.commit_submission_upload(
+        project_id=project_id,
+        normalized_filename=normalized_filename,
+        text=text,
+        now_utc=now_utc,
+        record=record,
+        atomic_json_transaction=atomic_json_transaction,
+        load_projects=load_projects,
+        load_submissions=load_submissions,
+        save_submissions=save_submissions,
+        find_recent_duplicate_submission=_find_recent_duplicate_submission,
+        project_not_found_error=lambda: HTTPException(
+            status_code=404,
+            detail=t("api.project_not_found", locale=locale),
+        ),
+    )
 
-    return SubmissionRecord(**record)
+    return SubmissionRecord(**committed_record)
 
 
 @router.post(
@@ -10900,6 +9092,7 @@ def score_text_for_project(
     submission_id = str(uuid4())
     scoring_engine_version = str(project.get("scoring_engine_version_locked") or "v1")
     engine_version = _determine_engine_version(project, scoring_engine_version)
+    cache_payload: Optional[tuple[str, Dict[str, object], Optional[str]]] = None
 
     if engine_version == "v1":
         config_hash = _compute_multipliers_hash(multipliers) if multipliers else None
@@ -10918,7 +9111,7 @@ def score_text_for_project(
                 scoring_engine_version=scoring_engine_version,
             )
             # 缓存仅存“未缩放原始分”，避免后续读取时重复应用 total_score_scale。
-            cache_score_result(payload.text, raw_report, config_hash)
+            cache_payload = (payload.text, raw_report, config_hash)
             report = dict(raw_report)
         _apply_evolution_total_scale(project_id, report)
         evidence_units: List[Dict[str, object]] = []
@@ -10945,43 +9138,50 @@ def score_text_for_project(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "expert_profile_id_used": profile_snapshot.get("id") if profile_snapshot else None,
     }
-    submissions = load_submissions()
-    submissions.append(record)
-    save_submissions(submissions)
-
-    snapshots = load_score_reports()
-    snapshots.append(
-        _build_score_report_snapshot(
-            submission_id=submission_id,
-            project=project,
-            report=report,
-            profile_snapshot=profile_snapshot,
-            scoring_engine_version=scoring_engine_version,
-        )
+    snapshot = _build_score_report_snapshot(
+        submission_id=submission_id,
+        project=project,
+        report=report,
+        profile_snapshot=profile_snapshot,
+        scoring_engine_version=scoring_engine_version,
     )
-    save_score_reports(snapshots)
-    if evidence_units:
-        all_units = load_evidence_units()
-        all_units = _replace_submission_evidence_units(
-            all_units,
-            submission_id=submission_id,
-            new_units=evidence_units,
-        )
-        save_evidence_units(all_units)
 
-    # 记录评分历史
     dimension_scores = {
         dim_id: dim.get("score", 0.0) for dim_id, dim in report.get("dimension_scores", {}).items()
     }
     penalty_count = len(report.get("penalties", []))
-    record_history_score(
+    submission_scoring_service.commit_inline_scoring_result(
         project_id=project_id,
-        submission_id=submission_id,
-        filename="inline",
-        total_score=float(report.get("total_score", report.get("rule_total_score", 0.0))),
-        dimension_scores=dimension_scores,
-        penalty_count=penalty_count,
+        record=record,
+        snapshot=snapshot,
+        evidence_units=evidence_units,
+        history_args={
+            "project_id": project_id,
+            "submission_id": submission_id,
+            "filename": "inline",
+            "total_score": float(report.get("total_score", report.get("rule_total_score", 0.0))),
+            "dimension_scores": dimension_scores,
+            "penalty_count": penalty_count,
+        },
+        atomic_json_transaction=atomic_json_transaction,
+        load_projects=load_projects,
+        load_submissions=load_submissions,
+        save_submissions=save_submissions,
+        load_score_reports=load_score_reports,
+        save_score_reports=save_score_reports,
+        load_evidence_units=load_evidence_units,
+        save_evidence_units=save_evidence_units,
+        load_score_history=load_score_history,
+        save_score_history=save_score_history,
+        record_history_score=record_history_score,
+        replace_submission_evidence_units=_replace_submission_evidence_units,
+        project_not_found_error=lambda: HTTPException(
+            status_code=404,
+            detail=t("api.project_not_found", locale=locale),
+        ),
     )
+    if cache_payload is not None:
+        cache_score_result(*cache_payload)
 
     return SubmissionRecord(**record)
 
@@ -11121,56 +9321,49 @@ def list_submissions(
     )
 
 
+@atomic_json_transaction(
+    "calibration_models",
+    "calibration_samples",
+    "delta_cases",
+    "evidence_units",
+    "evolution_reports",
+    "expert_profiles",
+    "patch_deployments",
+    "patch_packages",
+    "projects",
+    "qingtian_results",
+    "score_reports",
+    "submissions",
+)
 def _delete_submission_record(project_id: str, submission_id: str, locale: str) -> None:
-    ensure_data_dirs()
-    projects = load_projects()
-    if not any(p["id"] == project_id for p in projects):
-        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    submissions = load_submissions()
-    found = next(
-        (
-            s
-            for s in submissions
-            if s.get("id") == submission_id and s.get("project_id") == project_id
+    submission_scoring_service.delete_submission_cascade(
+        project_id=project_id,
+        submission_id=submission_id,
+        locale=locale,
+        ensure_data_dirs=ensure_data_dirs,
+        load_projects=load_projects,
+        load_submissions=load_submissions,
+        save_submissions=save_submissions,
+        load_score_reports=load_score_reports,
+        save_score_reports=save_score_reports,
+        load_evidence_units=load_evidence_units,
+        save_evidence_units=save_evidence_units,
+        load_qingtian_results=load_qingtian_results,
+        save_qingtian_results=save_qingtian_results,
+        load_delta_cases=load_delta_cases,
+        save_delta_cases=save_delta_cases,
+        load_calibration_samples=load_calibration_samples,
+        save_calibration_samples=save_calibration_samples,
+        project_not_found_error=lambda: HTTPException(
+            status_code=404,
+            detail=t("api.project_not_found", locale=locale),
         ),
-        None,
+        submission_not_found_error=lambda: HTTPException(
+            status_code=404,
+            detail="施组提交记录不存在",
+        ),
+        run_feedback_closed_loop_safe=_run_feedback_closed_loop_safe,
     )
-    if not found:
-        raise HTTPException(status_code=404, detail="施组提交记录不存在")
-    raw_path = str(found.get("path") or "").strip()
-    if raw_path:
-        p = Path(raw_path)
-        if p.exists():
-            p.unlink()
-    submissions = [
-        s
-        for s in submissions
-        if not (s.get("id") == submission_id and s.get("project_id") == project_id)
-    ]
-    save_submissions(submissions)
-    snapshots = load_score_reports()
-    snapshots = [
-        r
-        for r in snapshots
-        if not (r.get("submission_id") == submission_id and r.get("project_id") == project_id)
-    ]
-    save_score_reports(snapshots)
-    evidence_units = load_evidence_units()
-    evidence_units = [u for u in evidence_units if str(u.get("submission_id")) != submission_id]
-    save_evidence_units(evidence_units)
-    qingtian_results = load_qingtian_results()
-    qingtian_results = [q for q in qingtian_results if str(q.get("submission_id")) != submission_id]
-    save_qingtian_results(qingtian_results)
-    delta_cases = load_delta_cases()
-    delta_cases = [d for d in delta_cases if str(d.get("submission_id")) != submission_id]
-    save_delta_cases(delta_cases)
-    calibration_samples = load_calibration_samples()
-    calibration_samples = [
-        s for s in calibration_samples if str(s.get("submission_id")) != submission_id
-    ]
-    save_calibration_samples(calibration_samples)
-    # 删除属于显式反馈信号：自动刷新样本并触发校准/调权重闭环。
-    _run_feedback_closed_loop_safe(project_id, locale=locale, trigger="delete_submission")
 
 
 @router.delete(
@@ -11214,69 +9407,14 @@ def delete_shigong_file(
 def get_latest_submission_report(submission_id: str) -> LatestReportResponse:
     """获取某个提交的最新评分报告（含UI摘要）。"""
     ensure_data_dirs()
-    reports = [r for r in load_score_reports() if str(r.get("submission_id")) == submission_id]
-    reports.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
-
-    report_obj: Dict[str, object]
-    if reports:
-        latest = reports[0]
-        report_obj = {
-            "id": latest.get("id"),
-            "submission_id": latest.get("submission_id"),
-            "scoring_engine_version": latest.get("scoring_engine_version"),
-            "rule_total_score": latest.get("rule_total_score"),
-            "pred_total_score": latest.get("pred_total_score"),
-            "llm_total_score": latest.get("llm_total_score"),
-            "pred_confidence": latest.get("pred_confidence"),
-            "score_blend": latest.get("score_blend"),
-            "rule_dim_scores": latest.get("rule_dim_scores", {}),
-            "pred_dim_scores": latest.get("pred_dim_scores"),
-            "penalties": latest.get("penalties", []),
-            "lint_findings": latest.get("lint_findings", []),
-            "suggestions": latest.get("suggestions", []),
-            "expert_profile_snapshot": latest.get("expert_profile_snapshot", {}),
-            "created_at": latest.get("created_at"),
-        }
-    else:
-        submissions = load_submissions()
-        try:
-            submission = _find_submission(submission_id, submissions)
-        except HTTPException:
-            raise HTTPException(status_code=404, detail="评分报告不存在")
-        report_obj = dict(submission.get("report") or {})
-        if not report_obj:
-            raise HTTPException(status_code=404, detail="评分报告不存在")
-        report_obj.setdefault("submission_id", submission_id)
-        report_obj.setdefault("rule_total_score", report_obj.get("total_score", 0.0))
-        report_obj.setdefault("pred_total_score", report_obj.get("pred_total_score"))
-        report_obj.setdefault("llm_total_score", report_obj.get("llm_total_score"))
-        report_obj.setdefault("pred_confidence", report_obj.get("pred_confidence"))
-        report_obj.setdefault("score_blend", report_obj.get("score_blend"))
-        report_obj.setdefault("rule_dim_scores", report_obj.get("rule_dim_scores", {}))
-        report_obj.setdefault("penalties", report_obj.get("penalties", []))
-        report_obj.setdefault("lint_findings", report_obj.get("lint_findings", []))
-        report_obj.setdefault("suggestions", report_obj.get("suggestions", []))
-
-    penalties = report_obj.get("penalties") or []
-    lint_findings = report_obj.get("lint_findings") or []
-    suggestions = report_obj.get("suggestions") or []
-
-    top_conflicts = [p for p in penalties if str(p.get("code") or "") == "P-CONSIST-001"][:10]
-    top_missing_requirements = [
-        f for f in lint_findings if str(f.get("issue_code") or "") == "MissingRequirement"
-    ][:10]
-
-    ui_summary = {
-        "pred_total_score": report_obj.get("pred_total_score"),
-        "llm_total_score": report_obj.get("llm_total_score"),
-        "pred_confidence": report_obj.get("pred_confidence"),
-        "score_blend": report_obj.get("score_blend"),
-        "rule_total_score": report_obj.get("rule_total_score", report_obj.get("total_score")),
-        "top10_suggestions": suggestions[:10],
-        "top_conflicts": top_conflicts,
-        "top_missing_requirements": top_missing_requirements,
-    }
-    return LatestReportResponse(report=report_obj, ui_summary=ui_summary)
+    projection = latest_report_service.get_latest_report_projection(
+        submission_id=submission_id,
+        load_score_reports=load_score_reports,
+        load_submissions=load_submissions,
+    )
+    if projection is None:
+        raise HTTPException(status_code=404, detail="评分报告不存在")
+    return LatestReportResponse(**projection)
 
 
 @router.get(
@@ -11456,36 +9594,25 @@ def ingest_qingtian_result(
 ) -> QingTianResultRecord:
     """写入青天真实评标结果。"""
     ensure_data_dirs()
-    submissions = load_submissions()
-    submission = _find_submission(submission_id, submissions)
-    project_id = str(submission.get("project_id") or "")
-    projects = load_projects()
-    project = _find_project(project_id, projects)
-
-    model_version = str(
-        payload.qingtian_model_version
-        or project.get("qingtian_model_version")
-        or DEFAULT_QINGTIAN_MODEL_VERSION
+    record = qingtian_result_service.commit_qingtian_result(
+        submission_id=submission_id,
+        qingtian_model_version=payload.qingtian_model_version,
+        default_model_version=DEFAULT_QINGTIAN_MODEL_VERSION,
+        qt_total_score=payload.qt_total_score,
+        qt_dim_scores=payload.qt_dim_scores,
+        qt_reasons=payload.qt_reasons,
+        raw_payload=payload.raw_payload,
+        atomic_json_transaction=atomic_json_transaction,
+        load_submissions=load_submissions,
+        find_submission=_find_submission,
+        load_projects=load_projects,
+        save_projects=save_projects,
+        find_project=_find_project,
+        load_qingtian_results=load_qingtian_results,
+        save_qingtian_results=save_qingtian_results,
+        record_id_factory=lambda: str(uuid4()),
+        now_iso=_now_iso,
     )
-    record = {
-        "id": str(uuid4()),
-        "submission_id": submission_id,
-        "qingtian_model_version": model_version,
-        "qt_total_score": float(payload.qt_total_score),
-        "qt_dim_scores": payload.qt_dim_scores,
-        "qt_reasons": payload.qt_reasons,
-        "raw_payload": payload.raw_payload,
-        "created_at": _now_iso(),
-    }
-    results = load_qingtian_results()
-    results.append(record)
-    save_qingtian_results(results)
-
-    if str(project.get("status") or "") == "scoring_preparation":
-        project["status"] = "submitted_to_qingtian"
-        project["updated_at"] = _now_iso()
-        save_projects(projects)
-
     return QingTianResultRecord(**record)
 
 
@@ -11498,10 +9625,12 @@ def ingest_qingtian_result(
 def get_latest_qingtian_result(submission_id: str) -> QingTianResultRecord:
     """获取某个提交最新的青天真实评标结果。"""
     ensure_data_dirs()
-    results = [r for r in load_qingtian_results() if str(r.get("submission_id")) == submission_id]
-    if not results:
+    latest = qingtian_result_service.select_latest_qingtian_result(
+        load_qingtian_results(),
+        submission_id=submission_id,
+    )
+    if latest is None:
         raise HTTPException(status_code=404, detail="暂无青天评标结果")
-    latest = sorted(results, key=lambda x: str(x.get("created_at", "")), reverse=True)[0]
     return QingTianResultRecord(**latest)
 
 
@@ -11517,185 +9646,38 @@ def train_calibrator(
 ) -> CalibratorModelRecord:
     """训练校准器（支持 auto / ridge / offset / linear1d / isotonic1d）。"""
     ensure_data_dirs()
-    model_type = str(payload.model_type or "ridge").lower().strip()
-    if model_type not in {"auto", "ridge", "offset", "linear1d", "isotonic1d"}:
-        raise HTTPException(
-            status_code=422, detail="model_type 仅支持 auto/ridge/offset/linear1d/isotonic1d"
-        )
-
-    # 优先使用已落库的 FEATURE_ROW 样本
-    stored_samples = load_calibration_samples()
-    if payload.project_id:
-        stored_samples = [
-            s for s in stored_samples if str(s.get("project_id")) == payload.project_id
-        ]
-
-    feature_rows: List[Dict[str, object]] = []
-    for sample in stored_samples:
-        feature_rows.append(
-            {
-                "feature_schema_version": sample.get("feature_schema_version", "v2"),
-                "x_features": sample.get("x_features") or {},
-                "y_label": sample.get("y_label"),
-                "submission_id": sample.get("submission_id"),
-            }
-        )
-
-    # 若样本不足，在线拼接一次并反写样本表
-    if len(feature_rows) < 3:
-        submissions = load_submissions()
-        if payload.project_id:
-            submissions = [s for s in submissions if str(s.get("project_id")) == payload.project_id]
-        submission_map = {str(s.get("id")): s for s in submissions}
-
-        reports = load_score_reports()
-        if payload.project_id:
-            reports = [r for r in reports if str(r.get("project_id")) == payload.project_id]
-        latest_reports = _latest_records_by_submission(reports)
-
-        qt_results = load_qingtian_results()
-        latest_qt = _latest_records_by_submission(qt_results)
-
-        rebuilt_samples = build_calibration_samples(
-            project_id=str(payload.project_id or "__all__"),
-            latest_reports_by_submission=latest_reports,
-            latest_qingtian_by_submission=latest_qt,
-            submissions_by_id=submission_map,
-        )
-        if rebuilt_samples:
-            saved = load_calibration_samples()
-            for row in rebuilt_samples:
-                sid = str(row.get("submission_id"))
-                saved = [x for x in saved if str(x.get("submission_id")) != sid]
-                saved.append(row)
-            save_calibration_samples(saved)
-            feature_rows = [
-                {
-                    "feature_schema_version": s.get("feature_schema_version", "v2"),
-                    "x_features": s.get("x_features") or {},
-                    "y_label": s.get("y_label"),
-                    "submission_id": s.get("submission_id"),
-                }
-                for s in rebuilt_samples
-            ]
-
     try:
-        if model_type == "auto":
-            model_artifact = train_best_calibrator_auto(feature_rows, alpha=float(payload.alpha))
-        elif model_type == "offset":
-            model_artifact = train_offset_calibrator(feature_rows)
-        elif model_type == "linear1d":
-            model_artifact = train_linear1d_calibrator(feature_rows, alpha=float(payload.alpha))
-        elif model_type == "isotonic1d":
-            model_artifact = train_isotonic1d_calibrator(feature_rows)
-        else:
-            model_artifact = train_ridge_calibrator(feature_rows, alpha=float(payload.alpha))
-    except ValueError as exc:
+        record = calibration_model_service.train_calibration_model(
+            atomic_json_transaction=atomic_json_transaction,
+            project_id=payload.project_id,
+            model_type_raw=payload.model_type,
+            alpha=float(payload.alpha),
+            auto_deploy=bool(payload.auto_deploy),
+            load_calibration_samples=load_calibration_samples,
+            load_submissions=load_submissions,
+            load_score_reports=load_score_reports,
+            latest_records_by_submission=_latest_records_by_submission,
+            load_qingtian_results=load_qingtian_results,
+            build_calibration_samples=build_calibration_samples,
+            save_calibration_samples=save_calibration_samples,
+            train_best_calibrator_auto=train_best_calibrator_auto,
+            train_offset_calibrator=train_offset_calibrator,
+            train_linear1d_calibrator=train_linear1d_calibrator,
+            train_isotonic1d_calibrator=train_isotonic1d_calibrator,
+            train_ridge_calibrator=train_ridge_calibrator,
+            cross_validate_calibrator=cross_validate_calibrator,
+            calc_metrics=calc_metrics,
+            load_calibration_models=load_calibration_models,
+            load_projects=load_projects,
+            save_projects=save_projects,
+            save_calibration_models=save_calibration_models,
+            now_iso=_now_iso,
+        )
+    except (
+        calibration_model_service.UnsupportedCalibrationModelTypeError,
+        calibration_model_service.CalibrationTrainingError,
+    ) as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-
-    selected_type = str(model_artifact.get("model_type") or model_type or "ridge")
-    # 为审计保留 auto 来源
-    version_prefix = f"calib_{'auto_' if model_type == 'auto' else ''}{selected_type}"
-
-    # 统一用 CV 口径做上线闸门（避免 in-sample 过拟合）
-    cv = cross_validate_calibrator(
-        model_type=selected_type,
-        feature_rows=feature_rows,
-        alpha=float(payload.alpha),
-        seed=42,
-    )
-    # baseline: raw rule_total_score
-    y_true = [float(r.get("y_label")) for r in feature_rows if r.get("y_label") is not None]
-    baseline_pred = [
-        max(0.0, min(100.0, float(((r.get("x_features") or {}).get("rule_total_score") or 0.0))))
-        for r in feature_rows
-        if r.get("y_label") is not None
-    ]
-    baseline_metrics = calc_metrics(y_true, baseline_pred)
-    cv_metrics = (
-        (cv.get("metrics") or {})
-        if bool(cv.get("ok"))
-        else {"mae": 0.0, "rmse": 0.0, "spearman": 0.0}
-    )
-    improve_threshold = max(0.2, float(baseline_metrics.get("mae") or 0.0) * 0.01)
-    spearman_tolerance = 0.02
-    gate_passed = (
-        bool(cv.get("ok"))
-        and float(cv_metrics.get("mae") or 0.0)
-        <= float(baseline_metrics.get("mae") or 0.0) - improve_threshold
-        and float(cv_metrics.get("spearman") or 0.0)
-        >= float(baseline_metrics.get("spearman") or 0.0) - spearman_tolerance
-    )
-    model_artifact.setdefault("metrics", {})
-    model_artifact["metrics"]["cv_mae"] = cv_metrics.get("mae")
-    model_artifact["metrics"]["cv_rmse"] = cv_metrics.get("rmse")
-    model_artifact["metrics"]["cv_spearman"] = cv_metrics.get("spearman")
-    model_artifact["metrics"]["cv_mode"] = cv.get("mode")
-    model_artifact["metrics"]["cv_pred_count"] = cv.get("pred_count")
-    model_artifact["metrics"]["baseline_mae"] = baseline_metrics.get("mae")
-    model_artifact["metrics"]["baseline_rmse"] = baseline_metrics.get("rmse")
-    model_artifact["metrics"]["baseline_spearman"] = baseline_metrics.get("spearman")
-    model_artifact["metrics"]["gate_improve_threshold"] = round(improve_threshold, 4)
-    model_artifact["metrics"]["gate_spearman_tolerance"] = spearman_tolerance
-    model_artifact["gate_passed"] = gate_passed
-
-    auto_candidates = _extract_auto_candidates(model_artifact)
-    version = f"{version_prefix}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
-    calibrator_summary = _build_calibrator_summary(
-        model_type=selected_type,
-        calibrator_version=version,
-        gate_passed=bool(gate_passed),
-        cv_metrics={
-            "mae": cv_metrics.get("mae"),
-            "rmse": cv_metrics.get("rmse"),
-            "spearman": cv_metrics.get("spearman"),
-            "mode": cv.get("mode"),
-            "pred_count": cv.get("pred_count"),
-        },
-        baseline_metrics={
-            "mae": baseline_metrics.get("mae"),
-            "rmse": baseline_metrics.get("rmse"),
-            "spearman": baseline_metrics.get("spearman"),
-        },
-        improve_threshold=improve_threshold,
-        spearman_tolerance=spearman_tolerance,
-        auto_candidates=auto_candidates,
-        sample_count=len(feature_rows),
-    )
-    record = {
-        "calibrator_version": version,
-        "model_type": selected_type,
-        "feature_schema_version": str(model_artifact.get("feature_schema_version", "v2")),
-        "train_filter": {"project_id": payload.project_id},
-        "metrics": {
-            **(model_artifact.get("metrics") or {}),
-            "gate_passed": bool(gate_passed),
-        },
-        "calibrator_summary": calibrator_summary,
-        "artifact_uri": f"json://calibration_models/{version}",
-        "model_artifact": model_artifact,
-        "deployed": False,
-        "created_at": _now_iso(),
-    }
-
-    models = load_calibration_models()
-    train_scope_project_id = str(payload.project_id or "").strip()
-    if payload.auto_deploy and bool(gate_passed) and train_scope_project_id:
-        for m in models:
-            if (
-                str(((m.get("train_filter") or {}).get("project_id") or ""))
-                == train_scope_project_id
-            ):
-                m["deployed"] = False
-        record["deployed"] = True
-        projects = load_projects()
-        for p in projects:
-            if str(p.get("id")) == train_scope_project_id:
-                p["calibrator_version_locked"] = version
-                p["updated_at"] = _now_iso()
-        save_projects(projects)
-    models.append(record)
-    save_calibration_models(models)
     return CalibratorModelRecord(**record)
 
 
@@ -11725,40 +9707,21 @@ def deploy_calibrator(
 ) -> CalibratorModelRecord:
     """部署某个校准器版本。"""
     ensure_data_dirs()
-    models = load_calibration_models()
-    target = None
-    for model in models:
-        if str(model.get("calibrator_version")) == payload.calibrator_version:
-            target = model
-            break
-    if target is None:
-        raise HTTPException(status_code=404, detail="校准器版本不存在")
-
-    target_scope = str(((target.get("train_filter") or {}).get("project_id") or "")).strip()
-    bind_project_id = str(payload.project_id or "").strip()
-    if bind_project_id:
-        if target_scope and target_scope != bind_project_id:
-            raise HTTPException(status_code=422, detail="校准器与目标项目不匹配，禁止跨项目部署")
-        if not target_scope:
-            target.setdefault("train_filter", {})
-            target["train_filter"]["project_id"] = bind_project_id
-            target_scope = bind_project_id
-
-    for model in models:
-        model_scope = str(((model.get("train_filter") or {}).get("project_id") or "")).strip()
-        if target_scope and model_scope == target_scope:
-            model["deployed"] = False
-    target["deployed"] = True
-    save_calibration_models(models)
-
-    if payload.project_id:
-        projects = load_projects()
-        for project in projects:
-            if str(project.get("id")) == payload.project_id:
-                project["calibrator_version_locked"] = payload.calibrator_version
-                project["updated_at"] = _now_iso()
-        save_projects(projects)
-
+    try:
+        target = calibration_model_service.deploy_calibration_model(
+            atomic_json_transaction=atomic_json_transaction,
+            calibrator_version=payload.calibrator_version,
+            project_id=payload.project_id,
+            load_calibration_models=load_calibration_models,
+            save_calibration_models=save_calibration_models,
+            load_projects=load_projects,
+            save_projects=save_projects,
+            now_iso=_now_iso,
+        )
+    except calibration_model_service.CalibrationModelNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except calibration_model_service.CalibrationProjectBindingError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     return CalibratorModelRecord(**target)
 
 
@@ -11775,58 +9738,26 @@ def apply_calibration_prediction(
 ) -> CalibratorPredictResponse:
     """将已部署校准器应用到项目已有评分报告。"""
     ensure_data_dirs()
-    projects = load_projects()
     try:
-        project = _find_project(project_id, projects)
+        result = calibration_model_service.apply_calibration_prediction(
+            project_id=project_id,
+            atomic_json_transaction=atomic_json_transaction,
+            load_projects=load_projects,
+            find_project=_find_project,
+            load_calibration_models=load_calibration_models,
+            load_submissions=load_submissions,
+            load_score_reports=load_score_reports,
+            save_score_reports=save_score_reports,
+            save_submissions=save_submissions,
+            build_feature_row=build_feature_row,
+            predict_with_model=predict_with_model,
+            fuse_rule_and_llm_scores=_fuse_rule_and_llm_scores,
+            to_float_or_none=_to_float_or_none,
+            clip_score=_clip_score,
+        )
     except HTTPException:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-
-    model = _select_calibrator_model(project)
-    if not model:
-        return CalibratorPredictResponse(
-            ok=True,
-            project_id=project_id,
-            model_version=None,
-            updated_reports=0,
-            updated_submissions=0,
-        )
-
-    submissions = load_submissions()
-    submission_map = {
-        str(s.get("id")): s for s in submissions if str(s.get("project_id")) == project_id
-    }
-
-    reports = load_score_reports()
-    updated_reports = 0
-    for report in reports:
-        if str(report.get("project_id")) != project_id:
-            continue
-        sid = str(report.get("submission_id") or "")
-        sub = submission_map.get(sid)
-        if not sid or not sub:
-            continue
-        _apply_prediction_to_report(report, submission_like=sub, project=project)
-        updated_reports += 1
-    save_score_reports(reports)
-
-    updated_submissions = 0
-    for submission in submissions:
-        if str(submission.get("project_id")) != project_id:
-            continue
-        report = submission.get("report")
-        if not isinstance(report, dict):
-            continue
-        _apply_prediction_to_report(report, submission_like=submission, project=project)
-        updated_submissions += 1
-    save_submissions(submissions)
-
-    return CalibratorPredictResponse(
-        ok=True,
-        project_id=project_id,
-        model_version=str(model.get("calibrator_version") or ""),
-        updated_reports=updated_reports,
-        updated_submissions=updated_submissions,
-    )
+    return CalibratorPredictResponse(**result)
 
 
 @router.post(
@@ -11835,6 +9766,7 @@ def apply_calibration_prediction(
     tags=["洞察与学习"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
+@atomic_json_transaction("delta_cases")
 def rebuild_delta_cases(
     project_id: str,
     api_key: Optional[str] = Depends(verify_api_key),
@@ -11846,21 +9778,15 @@ def rebuild_delta_cases(
     if not any(str(p.get("id")) == project_id for p in projects):
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
 
-    reports = [r for r in load_score_reports() if str(r.get("project_id")) == project_id]
-    latest_reports = _latest_records_by_submission(reports)
-    qtrs = load_qingtian_results()
-    latest_qt = _latest_records_by_submission(
-        [q for q in qtrs if str(q.get("submission_id")) in latest_reports]
-    )
-
-    new_cases = build_delta_cases(
+    new_cases = reflection_sample_service.rebuild_project_delta_cases(
         project_id=project_id,
-        latest_reports_by_submission=latest_reports,
-        latest_qingtian_by_submission=latest_qt,
+        load_score_reports=load_score_reports,
+        latest_records_by_submission=_latest_records_by_submission,
+        load_qingtian_results=load_qingtian_results,
+        build_delta_cases=build_delta_cases,
+        load_delta_cases=load_delta_cases,
+        save_delta_cases=save_delta_cases,
     )
-    all_cases = [d for d in load_delta_cases() if str(d.get("project_id")) != project_id]
-    all_cases.extend(new_cases)
-    save_delta_cases(all_cases)
     return [DeltaCaseRecord(**d) for d in new_cases]
 
 
@@ -11890,6 +9816,7 @@ def list_delta_cases(
     tags=["洞察与学习"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
+@atomic_json_transaction("calibration_samples")
 def rebuild_calibration_samples(
     project_id: str,
     api_key: Optional[str] = Depends(verify_api_key),
@@ -11901,24 +9828,16 @@ def rebuild_calibration_samples(
     if not any(str(p.get("id")) == project_id for p in projects):
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
 
-    submissions = [s for s in load_submissions() if str(s.get("project_id")) == project_id]
-    submissions_by_id = {str(s.get("id")): s for s in submissions}
-    latest_reports = _latest_records_by_submission(
-        [r for r in load_score_reports() if str(r.get("project_id")) == project_id]
-    )
-    latest_qt = _latest_records_by_submission(
-        [q for q in load_qingtian_results() if str(q.get("submission_id")) in submissions_by_id]
-    )
-
-    samples = build_calibration_samples(
+    samples = reflection_sample_service.rebuild_project_calibration_samples(
         project_id=project_id,
-        latest_reports_by_submission=latest_reports,
-        latest_qingtian_by_submission=latest_qt,
-        submissions_by_id=submissions_by_id,
+        load_submissions=load_submissions,
+        load_score_reports=load_score_reports,
+        latest_records_by_submission=_latest_records_by_submission,
+        load_qingtian_results=load_qingtian_results,
+        build_calibration_samples=build_calibration_samples,
+        load_calibration_samples=load_calibration_samples,
+        save_calibration_samples=save_calibration_samples,
     )
-    all_samples = [s for s in load_calibration_samples() if str(s.get("project_id")) != project_id]
-    all_samples.extend(samples)
-    save_calibration_samples(all_samples)
     return [CalibrationSampleRecord(**s) for s in samples]
 
 
@@ -11948,6 +9867,7 @@ def list_calibration_samples(
     tags=["洞察与学习"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
+@atomic_json_transaction("patch_packages")
 def mine_patch(
     project_id: str,
     payload: PatchMineRequest,
@@ -11959,30 +9879,18 @@ def mine_patch(
     projects = load_projects()
     if not any(str(p.get("id")) == project_id for p in projects):
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    delta_cases = [d for d in load_delta_cases() if str(d.get("project_id")) == project_id]
-    if not delta_cases:
+    try:
+        package = patch_evolution_service.mine_patch(
+            project_id=project_id,
+            patch_type=payload.patch_type,
+            top_k=int(payload.top_k),
+            load_delta_cases=load_delta_cases,
+            load_patch_packages=load_patch_packages,
+            save_patch_packages=save_patch_packages,
+            mine_patch_package=mine_patch_package,
+        )
+    except patch_evolution_service.PatchDeltaCasesNotFoundError:
         raise HTTPException(status_code=404, detail="暂无 DELTA_CASE，请先重建")
-
-    packages = load_patch_packages()
-    rollback_pointer = None
-    deployed = [
-        p
-        for p in packages
-        if str(p.get("project_id")) == project_id and str(p.get("status")) == "deployed"
-    ]
-    if deployed:
-        deployed = sorted(deployed, key=lambda x: str(x.get("updated_at", "")), reverse=True)
-        rollback_pointer = str(deployed[0].get("id") or "")
-
-    package = mine_patch_package(
-        project_id=project_id,
-        delta_cases=delta_cases,
-        patch_type=payload.patch_type,
-        top_k=int(payload.top_k),
-        rollback_pointer=rollback_pointer,
-    )
-    packages.append(package)
-    save_patch_packages(packages)
     return PatchPackageRecord(**package)
 
 
@@ -12001,8 +9909,10 @@ def list_patches(
     projects = load_projects()
     if not any(str(p.get("id")) == project_id for p in projects):
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    rows = [p for p in load_patch_packages() if str(p.get("project_id")) == project_id]
-    rows = sorted(rows, key=lambda x: str(x.get("updated_at", "")), reverse=True)
+    rows = patch_evolution_service.list_patches(
+        project_id=project_id,
+        load_patch_packages=load_patch_packages,
+    )
     return [PatchPackageRecord(**p) for p in rows]
 
 
@@ -12012,24 +9922,24 @@ def list_patches(
     tags=["洞察与学习"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
+@atomic_json_transaction("patch_packages")
 def shadow_eval_patch(
     patch_id: str,
     api_key: Optional[str] = Depends(verify_api_key),
 ) -> PatchShadowEvalResponse:
     """对候选补丁做 shadow 评估并更新状态。"""
     ensure_data_dirs()
-    packages = load_patch_packages()
-    patch = next((p for p in packages if str(p.get("id")) == patch_id), None)
-    if patch is None:
+    try:
+        result = patch_evolution_service.shadow_eval_patch(
+            patch_id=patch_id,
+            load_patch_packages=load_patch_packages,
+            save_patch_packages=save_patch_packages,
+            load_delta_cases=load_delta_cases,
+            evaluate_patch_shadow=evaluate_patch_shadow,
+            now_iso=_now_iso,
+        )
+    except patch_evolution_service.PatchNotFoundError:
         raise HTTPException(status_code=404, detail="补丁包不存在")
-    project_id = str(patch.get("project_id") or "")
-    delta_cases = [d for d in load_delta_cases() if str(d.get("project_id")) == project_id]
-
-    result = evaluate_patch_shadow(patch=patch, delta_cases=delta_cases)
-    patch["shadow_metrics"] = result.get("metrics_before_after", {})
-    patch["status"] = "shadow_pass" if bool(result.get("gate_passed")) else "candidate"
-    patch["updated_at"] = _now_iso()
-    save_patch_packages(packages)
     return PatchShadowEvalResponse(**result)
 
 
@@ -12039,6 +9949,7 @@ def shadow_eval_patch(
     tags=["洞察与学习"],
     responses={**RESPONSES_401, **RESPONSES_404, **RESPONSES_422},
 )
+@atomic_json_transaction("patch_deployments", "patch_packages")
 def deploy_or_rollback_patch(
     patch_id: str,
     payload: PatchDeployRequest,
@@ -12046,42 +9957,25 @@ def deploy_or_rollback_patch(
 ) -> PatchDeploymentRecord:
     """发布或回滚补丁。"""
     ensure_data_dirs()
-    packages = load_patch_packages()
-    patch = next((p for p in packages if str(p.get("id")) == patch_id), None)
-    if patch is None:
+    try:
+        record = patch_evolution_service.deploy_or_rollback_patch(
+            patch_id=patch_id,
+            action_raw=payload.action,
+            rollback_to_version=payload.rollback_to_version,
+            load_patch_packages=load_patch_packages,
+            save_patch_packages=save_patch_packages,
+            load_patch_deployments=load_patch_deployments,
+            save_patch_deployments=save_patch_deployments,
+            now_iso=_now_iso,
+            new_id=lambda: str(uuid4()),
+        )
+    except patch_evolution_service.PatchNotFoundError:
         raise HTTPException(status_code=404, detail="补丁包不存在")
-
-    action = str(payload.action or "deploy").lower()
-    if action not in {"deploy", "rollback"}:
+    except patch_evolution_service.UnsupportedPatchActionError:
         raise HTTPException(status_code=422, detail="action 仅支持 deploy 或 rollback")
-
-    project_id = str(patch.get("project_id") or "")
-    deployed = action == "deploy"
-    if deployed:
-        for p in packages:
-            if str(p.get("project_id")) == project_id and str(p.get("status")) == "deployed":
-                p["status"] = "shadow_pass"
-                p["updated_at"] = _now_iso()
-        patch["status"] = "deployed"
-    else:
-        patch["status"] = "rolled_back"
-    patch["updated_at"] = _now_iso()
-    save_patch_packages(packages)
-
-    rec = {
-        "id": str(uuid4()),
-        "patch_id": patch_id,
-        "project_id": project_id,
-        "action": action,
-        "deployed": deployed,
-        "metrics_before_after": patch.get("shadow_metrics") or {},
-        "rollback_to_version": payload.rollback_to_version or patch.get("rollback_pointer"),
-        "created_at": _now_iso(),
-    }
-    deploys = load_patch_deployments()
-    deploys.append(rec)
-    save_patch_deployments(deploys)
-    return PatchDeploymentRecord(**rec)
+    except patch_evolution_service.InvalidPatchTransitionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return PatchDeploymentRecord(**record)
 
 
 @router.post(
@@ -12089,6 +9983,17 @@ def deploy_or_rollback_patch(
     response_model=ReflectionAutoRunResponse,
     tags=["洞察与学习"],
     responses={**RESPONSES_401, **RESPONSES_404},
+)
+@atomic_json_transaction(
+    "calibration_models",
+    "calibration_samples",
+    "delta_cases",
+    "patch_deployments",
+    "patch_packages",
+    "projects",
+    "qingtian_results",
+    "score_reports",
+    "submissions",
 )
 def auto_run_reflection_pipeline(
     project_id: str,
@@ -12115,245 +10020,64 @@ def auto_run_reflection_pipeline(
     _refresh_project_reflection_objects(project_id)
     delta_cases = [d for d in load_delta_cases() if str(d.get("project_id")) == project_id]
     samples = [s for s in load_calibration_samples() if str(s.get("project_id")) == project_id]
-
-    calibrator_version = None
-    calibrator_deployed = False
-    calibrator_summary = _build_calibrator_summary(
-        model_type=None,
-        calibrator_version=None,
-        gate_passed=None,
-        sample_count=len(samples),
-        skipped_reason="insufficient_samples" if len(samples) < 3 else None,
+    calibration_run = calibration_model_service.run_auto_calibration_lifecycle(
+        project_id=project_id,
+        atomic_json_transaction=atomic_json_transaction,
+        load_projects=load_projects,
+        find_project=_find_project,
+        samples=samples,
+        train_best_calibrator_auto=train_best_calibrator_auto,
+        cross_validate_calibrator=cross_validate_calibrator,
+        calc_metrics=calc_metrics,
+        load_calibration_models=load_calibration_models,
+        save_calibration_models=save_calibration_models,
+        save_projects=save_projects,
+        load_submissions=load_submissions,
+        load_score_reports=load_score_reports,
+        save_score_reports=save_score_reports,
+        save_submissions=save_submissions,
+        build_feature_row=build_feature_row,
+        predict_with_model=predict_with_model,
+        fuse_rule_and_llm_scores=_fuse_rule_and_llm_scores,
+        to_float_or_none=_to_float_or_none,
+        clip_score=_clip_score,
+        now_iso=_now_iso,
     )
-    calibrator_model_type = calibrator_summary.get("model_type")
-    calibrator_gate_passed = calibrator_summary.get("gate_passed")
-    calibrator_cv_metrics: Dict[str, Any] = calibrator_summary.get("cv_metrics") or {}
-    calibrator_baseline_metrics: Dict[str, Any] = calibrator_summary.get("baseline_metrics") or {}
-    calibrator_gate: Dict[str, Any] = calibrator_summary.get("gate") or {}
-    calibrator_auto_candidates: List[Dict[str, Any]] = (
-        calibrator_summary.get("auto_candidates") or []
+
+    patch_run = patch_evolution_service.run_auto_patch_lifecycle(
+        project_id=project_id,
+        delta_cases=delta_cases,
+        auto_govern_deployed_patch=_auto_govern_deployed_patch,
+        load_patch_packages=load_patch_packages,
+        save_patch_packages=save_patch_packages,
+        load_patch_deployments=load_patch_deployments,
+        save_patch_deployments=save_patch_deployments,
+        mine_patch_package=mine_patch_package,
+        evaluate_patch_shadow=evaluate_patch_shadow,
+        now_iso=_now_iso,
+        new_id=lambda: str(uuid4()),
     )
-    if len(samples) >= 3:
-        feature_rows = [
-            {
-                "feature_schema_version": s.get("feature_schema_version", "v2"),
-                "x_features": s.get("x_features") or {},
-                "y_label": s.get("y_label"),
-                "submission_id": s.get("submission_id"),
-            }
-            for s in samples
-        ]
-        # “最强自动校准”：多候选 + CV 闸门 + 自动选择最佳模型
-        model_artifact = train_best_calibrator_auto(feature_rows, alpha=1.0)
-        selected_type = str(model_artifact.get("model_type") or "ridge")
-        calibrator_model_type = selected_type
-
-        # 统一用 CV 口径做上线闸门（避免 in-sample 过拟合）
-        cv = cross_validate_calibrator(
-            model_type=selected_type,
-            feature_rows=feature_rows,
-            alpha=1.0,
-            seed=42,
-        )
-        # baseline: raw rule_total_score
-        y_true = [float(r.get("y_label")) for r in feature_rows if r.get("y_label") is not None]
-        baseline_pred = [
-            float(((r.get("x_features") or {}).get("rule_total_score") or 0.0))
-            for r in feature_rows
-            if r.get("y_label") is not None
-        ]
-        baseline_metrics = calc_metrics(y_true, baseline_pred)
-        cv_metrics = (
-            (cv.get("metrics") or {})
-            if bool(cv.get("ok"))
-            else {"mae": 0.0, "rmse": 0.0, "spearman": 0.0}
-        )
-        improve_threshold = max(0.2, float(baseline_metrics.get("mae") or 0.0) * 0.01)
-        spearman_tolerance = 0.02
-        gate_passed = (
-            bool(cv.get("ok"))
-            and float(cv_metrics.get("mae") or 0.0)
-            <= float(baseline_metrics.get("mae") or 0.0) - improve_threshold
-            and float(cv_metrics.get("spearman") or 0.0)
-            >= float(baseline_metrics.get("spearman") or 0.0) - spearman_tolerance
-        )
-        model_artifact.setdefault("metrics", {})
-        model_artifact["metrics"]["cv_mae"] = cv_metrics.get("mae")
-        model_artifact["metrics"]["cv_rmse"] = cv_metrics.get("rmse")
-        model_artifact["metrics"]["cv_spearman"] = cv_metrics.get("spearman")
-        model_artifact["metrics"]["cv_mode"] = cv.get("mode")
-        model_artifact["metrics"]["cv_pred_count"] = cv.get("pred_count")
-        model_artifact["metrics"]["baseline_mae"] = baseline_metrics.get("mae")
-        model_artifact["metrics"]["baseline_rmse"] = baseline_metrics.get("rmse")
-        model_artifact["metrics"]["baseline_spearman"] = baseline_metrics.get("spearman")
-        model_artifact["metrics"]["gate_improve_threshold"] = round(improve_threshold, 4)
-        model_artifact["metrics"]["gate_spearman_tolerance"] = spearman_tolerance
-        model_artifact["gate_passed"] = gate_passed
-
-        auto_candidates = _extract_auto_candidates(model_artifact)
-        calibrator_version = (
-            f"calib_auto_{selected_type}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
-        )
-        calibrator_summary = _build_calibrator_summary(
-            model_type=selected_type,
-            calibrator_version=calibrator_version,
-            gate_passed=bool(gate_passed),
-            cv_metrics={
-                "mae": cv_metrics.get("mae"),
-                "rmse": cv_metrics.get("rmse"),
-                "spearman": cv_metrics.get("spearman"),
-                "mode": cv.get("mode"),
-                "pred_count": cv.get("pred_count"),
-            },
-            baseline_metrics={
-                "mae": baseline_metrics.get("mae"),
-                "rmse": baseline_metrics.get("rmse"),
-                "spearman": baseline_metrics.get("spearman"),
-            },
-            improve_threshold=improve_threshold,
-            spearman_tolerance=spearman_tolerance,
-            auto_candidates=auto_candidates,
-            sample_count=len(feature_rows),
-        )
-        calibrator_model_type = calibrator_summary.get("model_type")
-        calibrator_gate_passed = calibrator_summary.get("gate_passed")
-        calibrator_cv_metrics = calibrator_summary.get("cv_metrics") or {}
-        calibrator_baseline_metrics = calibrator_summary.get("baseline_metrics") or {}
-        calibrator_gate = calibrator_summary.get("gate") or {}
-        calibrator_auto_candidates = calibrator_summary.get("auto_candidates") or []
-        record = {
-            "calibrator_version": calibrator_version,
-            "model_type": selected_type,
-            "feature_schema_version": str(model_artifact.get("feature_schema_version", "v2")),
-            "train_filter": {"project_id": project_id, "mode": "auto_run"},
-            "metrics": {
-                **(model_artifact.get("metrics") or {}),
-                "gate_passed": bool(gate_passed),
-            },
-            "calibrator_summary": calibrator_summary,
-            "artifact_uri": f"json://calibration_models/{calibrator_version}",
-            "model_artifact": model_artifact,
-            "deployed": bool(gate_passed),
-            "created_at": _now_iso(),
-        }
-        models = load_calibration_models()
-        if record["deployed"]:
-            for m in models:
-                if str(((m.get("train_filter") or {}).get("project_id") or "")) == project_id:
-                    m["deployed"] = False
-            project["calibrator_version_locked"] = calibrator_version
-            project["updated_at"] = _now_iso()
-            save_projects(projects)
-            calibrator_deployed = True
-        models.append(record)
-        save_calibration_models(models)
-
-    updated_reports = 0
-    updated_submissions = 0
-    if calibrator_deployed:
-        submissions = load_submissions()
-        submission_map = {
-            str(s.get("id")): s for s in submissions if str(s.get("project_id")) == project_id
-        }
-        reports = load_score_reports()
-        for report in reports:
-            if str(report.get("project_id")) != project_id:
-                continue
-            sid = str(report.get("submission_id") or "")
-            sub = submission_map.get(sid)
-            if not sub:
-                continue
-            _apply_prediction_to_report(report, submission_like=sub, project=project)
-            updated_reports += 1
-        save_score_reports(reports)
-
-        for sub in submissions:
-            if str(sub.get("project_id")) != project_id:
-                continue
-            rep = sub.get("report")
-            if not isinstance(rep, dict):
-                continue
-            _apply_prediction_to_report(rep, submission_like=sub, project=project)
-            updated_submissions += 1
-        save_submissions(submissions)
-
-    patch_id = None
-    patch_gate_passed = None
-    patch_deployed = False
-    patch_auto_govern: Dict[str, object] = {
-        "checked": False,
-        "reason": "not_run",
-        "action": "skip",
-    }
-    if delta_cases:
-        patch_auto_govern = _auto_govern_deployed_patch(
-            project_id=project_id,
-            delta_cases=delta_cases,
-        )
-        packages = load_patch_packages()
-        deployed = [
-            p
-            for p in packages
-            if str(p.get("project_id")) == project_id and str(p.get("status")) == "deployed"
-        ]
-        rollback_pointer = str(deployed[0].get("id")) if deployed else None
-        patch = mine_patch_package(
-            project_id=project_id,
-            delta_cases=delta_cases,
-            patch_type="threshold",
-            top_k=5,
-            rollback_pointer=rollback_pointer,
-        )
-        patch_id = str(patch.get("id"))
-        shadow = evaluate_patch_shadow(patch=patch, delta_cases=delta_cases)
-        patch_gate_passed = bool(shadow.get("gate_passed"))
-        patch["shadow_metrics"] = shadow.get("metrics_before_after", {})
-        patch["status"] = "shadow_pass" if patch_gate_passed else "candidate"
-        patch["updated_at"] = _now_iso()
-
-        if patch_gate_passed:
-            for p in packages:
-                if str(p.get("project_id")) == project_id and str(p.get("status")) == "deployed":
-                    p["status"] = "shadow_pass"
-            patch["status"] = "deployed"
-            patch_deployed = True
-            deploy_rec = {
-                "id": str(uuid4()),
-                "patch_id": patch_id,
-                "project_id": project_id,
-                "action": "deploy",
-                "deployed": True,
-                "metrics_before_after": patch.get("shadow_metrics") or {},
-                "rollback_to_version": patch.get("rollback_pointer"),
-                "created_at": _now_iso(),
-            }
-            deploys = load_patch_deployments()
-            deploys.append(deploy_rec)
-            save_patch_deployments(deploys)
-
-        packages.append(patch)
-        save_patch_packages(packages)
 
     return ReflectionAutoRunResponse(
         ok=True,
         project_id=project_id,
         delta_cases=len(delta_cases),
         calibration_samples=len(samples),
-        calibrator_version=calibrator_version,
-        calibrator_deployed=calibrator_deployed,
-        calibrator_summary=calibrator_summary,
-        calibrator_model_type=calibrator_model_type,
-        calibrator_gate_passed=calibrator_gate_passed,
-        calibrator_cv_metrics=calibrator_cv_metrics,
-        calibrator_baseline_metrics=calibrator_baseline_metrics,
-        calibrator_gate=calibrator_gate,
-        calibrator_auto_candidates=calibrator_auto_candidates,
-        prediction_updated_reports=updated_reports,
-        prediction_updated_submissions=updated_submissions,
-        patch_id=patch_id,
-        patch_gate_passed=patch_gate_passed,
-        patch_deployed=patch_deployed,
-        patch_auto_govern=patch_auto_govern,
+        calibrator_version=calibration_run["calibrator_version"],
+        calibrator_deployed=calibration_run["calibrator_deployed"],
+        calibrator_summary=calibration_run["calibrator_summary"],
+        calibrator_model_type=calibration_run["calibrator_model_type"],
+        calibrator_gate_passed=calibration_run["calibrator_gate_passed"],
+        calibrator_cv_metrics=calibration_run["calibrator_cv_metrics"],
+        calibrator_baseline_metrics=calibration_run["calibrator_baseline_metrics"],
+        calibrator_gate=calibration_run["calibrator_gate"],
+        calibrator_auto_candidates=calibration_run["calibrator_auto_candidates"],
+        prediction_updated_reports=calibration_run["prediction_updated_reports"],
+        prediction_updated_submissions=calibration_run["prediction_updated_submissions"],
+        patch_id=patch_run["patch_id"],
+        patch_gate_passed=patch_run["patch_gate_passed"],
+        patch_deployed=patch_run["patch_deployed"],
+        patch_auto_govern=patch_run["patch_auto_govern"],
     )
 
 
@@ -12680,7 +10404,7 @@ def adaptive_apply(
 
     **需要 API Key 认证**
 
-    ⚠️ 此操作会修改系统配置文件（lexicon.yaml、rubric.yaml）
+    ⚠️ 此操作会发布包含词库与评分规则的原子配置快照
 
     支持 Accept-Language header 进行多语言响应。
     """
@@ -12688,47 +10412,19 @@ def adaptive_apply(
     submissions = [s for s in load_submissions() if s["project_id"] == project_id]
     if not submissions:
         raise HTTPException(status_code=404, detail=t("api.no_submissions", locale=locale))
-    config = load_config()
-    stats_result = build_adaptive_suggestions(submissions, config.lexicon)
-    stats = stats_result["penalty_stats"]
-    patch = build_adaptive_patch(config.lexicon, stats)
-
-    from pathlib import Path
-
-    import yaml
-
-    res_dir = Path(__file__).resolve().parent / "resources"
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    all_changes: list[str] = []
-
-    # 词库补丁：备份并写回
-    lexicon_path = res_dir / "lexicon.yaml"
-    lex_backup = lexicon_path.with_name(f"lexicon.yaml.bak_{ts}")
-    lex_backup.write_text(lexicon_path.read_text(encoding="utf-8"), encoding="utf-8")
-    updated_lexicon, lex_changes = apply_adaptive_patch(config.lexicon, patch)
-    lexicon_path.write_text(yaml.safe_dump(updated_lexicon, allow_unicode=True), encoding="utf-8")
-    all_changes.extend(lex_changes)
-
-    # 规则补丁：备份并写回
-    rubric_path = res_dir / "rubric.yaml"
-    rubric_backup = rubric_path.with_name(f"rubric.yaml.bak_{ts}")
-    rubric_backup.write_text(rubric_path.read_text(encoding="utf-8"), encoding="utf-8")
-    updated_rubric, rubric_changes = apply_rubric_patch(
-        config.rubric, patch.get("rubric_adjustments", {})
+    result = adaptive_configuration_service.apply_and_persist(
+        project_id,
+        submissions,
+        resources_dir=Path(__file__).resolve().parent / "resources",
+        backup_timestamp=datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"),
+        load_config=load_config,
+        reload_config=reload_config,
+        build_adaptive_suggestions=build_adaptive_suggestions,
+        build_adaptive_patch=build_adaptive_patch,
+        apply_adaptive_patch=apply_adaptive_patch,
+        apply_rubric_patch=apply_rubric_patch,
     )
-    rubric_path.write_text(yaml.safe_dump(updated_rubric, allow_unicode=True), encoding="utf-8")
-    all_changes.extend(rubric_changes)
-
-    # 使内存中的配置失效，下次 load_config 会重新读盘
-    reload_config()
-
-    return AdaptiveApplyResult(
-        project_id=project_id,
-        applied=True,
-        changes=all_changes,
-        backup_path=str(lex_backup),
-        source=stats_result.get("source") or {},
-    )
+    return AdaptiveApplyResult(**result)
 
 
 @router.get(
@@ -12824,6 +10520,7 @@ def project_insights(
     tags=["洞察与学习"],
     responses={**RESPONSES_401, **RESPONSES_NO_SUBMISSIONS},
 )
+@atomic_json_transaction("learning_profiles")
 def update_learning_profile(
     project_id: str,
     api_key: Optional[str] = Depends(verify_api_key),
@@ -12846,17 +10543,14 @@ def update_learning_profile(
     submissions = [s for s in submissions_all if _submission_is_scored(s)]
     if not submissions:
         raise HTTPException(status_code=404, detail="暂无已评分施组，请先点击“评分施组”。")
-    profile = build_learning_profile(submissions)
-    profiles = load_learning_profiles()
-    record = {
-        "project_id": project_id,
-        "dimension_multipliers": profile["dimension_multipliers"],
-        "rationale": profile["rationale"],
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    profiles = [p for p in profiles if p.get("project_id") != project_id]
-    profiles.append(record)
-    save_learning_profiles(profiles)
+    record = learning_profile_service.generate_and_persist(
+        project_id,
+        submissions,
+        build_learning_profile=build_learning_profile,
+        load_learning_profiles=load_learning_profiles,
+        save_learning_profiles=save_learning_profiles,
+        now_iso=_now_iso,
+    )
     return LearningProfile(**record)
 
 
@@ -12971,22 +10665,14 @@ def set_project_context(
     用于自我学习时结合项目信息分析高分逻辑。
     """
     ensure_data_dirs()
-    projects = load_projects()
-    if not any(p["id"] == project_id for p in projects):
-        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    ctx = load_project_context()
-    ctx[project_id] = {
-        "text": payload.text,
-        "filename": payload.filename,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    save_project_context(ctx)
-    return ProjectContextOut(
+    context = project_context_service.set_project_context(
         project_id=project_id,
-        text=ctx[project_id]["text"],
-        filename=ctx[project_id].get("filename"),
-        updated_at=ctx[project_id].get("updated_at"),
+        text=payload.text,
+        filename=payload.filename,
     )
+    if context is None:
+        raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
+    return ProjectContextOut(**context)
 
 
 @router.get(
@@ -13001,19 +10687,10 @@ def get_project_context_endpoint(
 ) -> ProjectContextOut:
     """获取项目投喂包/项目背景文本。"""
     ensure_data_dirs()
-    projects = load_projects()
-    if not any(p["id"] == project_id for p in projects):
+    context = project_context_service.get_project_context(project_id=project_id)
+    if context is None:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    ctx = load_project_context()
-    data = ctx.get(project_id)
-    if not data:
-        return ProjectContextOut(project_id=project_id, text="", filename=None, updated_at=None)
-    return ProjectContextOut(
-        project_id=project_id,
-        text=data.get("text", ""),
-        filename=data.get("filename"),
-        updated_at=data.get("updated_at"),
-    )
+    return ProjectContextOut(**context)
 
 
 def _normalize_judge_scores_or_422(
@@ -13204,7 +10881,6 @@ def add_ground_truth(
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
     score_scale_max = _resolve_project_score_scale_max(project)
     _assert_valid_final_score(payload.final_score, score_scale_max=score_scale_max)
-    records = load_ground_truth()
     record = _new_ground_truth_record(
         project_id=project_id,
         shigong_text=payload.shigong_text,
@@ -13215,9 +10891,7 @@ def add_ground_truth(
         judge_weights=payload.judge_weights,
         qualitative_tags_by_judge=payload.qualitative_tags_by_judge,
     )
-    records.append(record)
-    save_ground_truth(records)
-    _sync_ground_truth_record_to_qingtian(project_id, record)
+    _commit_ground_truth_additions(project_id, [record], locale=locale)
     record["feedback_closed_loop"] = _run_feedback_closed_loop_safe(
         project_id,
         locale=locale,
@@ -13277,10 +10951,7 @@ def add_ground_truth_from_submission(
     record["source_submission_id"] = submission_id
     record["source_submission_filename"] = submission.get("filename")
 
-    records = load_ground_truth()
-    records.append(record)
-    save_ground_truth(records)
-    _sync_ground_truth_record_to_qingtian(project_id, record)
+    _commit_ground_truth_additions(project_id, [record], locale=locale)
     record["feedback_closed_loop"] = _run_feedback_closed_loop_safe(
         project_id,
         locale=locale,
@@ -13323,7 +10994,6 @@ async def add_ground_truth_from_file(
         raise HTTPException(status_code=422, detail=str(e))
     if len(shigong_text.strip()) < 50:
         raise HTTPException(status_code=422, detail="施组全文过短，至少 50 字以便学习分析。")
-    records = load_ground_truth()
     record = _new_ground_truth_record(
         project_id=project_id,
         shigong_text=shigong_text,
@@ -13334,9 +11004,7 @@ async def add_ground_truth_from_file(
         judge_weights=None,
         qualitative_tags_by_judge=None,
     )
-    records.append(record)
-    save_ground_truth(records)
-    _sync_ground_truth_record_to_qingtian(project_id, record)
+    _commit_ground_truth_additions(project_id, [record], locale=locale)
     record["feedback_closed_loop"] = _run_feedback_closed_loop_safe(
         project_id,
         locale=locale,
@@ -13411,16 +11079,7 @@ async def add_ground_truth_from_files(
             )
 
     if success_records:
-        records = load_ground_truth()
-        records.extend(success_records)
-        save_ground_truth(records)
-        for item in items:
-            record = item.get("record")
-            if item.get("ok") and isinstance(record, dict):
-                try:
-                    _sync_ground_truth_record_to_qingtian(project_id, record)
-                except Exception as e:
-                    item["detail"] = f"已保存，但同步青天失败：{e}"
+        _commit_ground_truth_additions(project_id, success_records, locale=locale)
         closed_loop_result = _run_feedback_closed_loop_safe(
             project_id,
             locale=locale,
@@ -13466,6 +11125,16 @@ def list_ground_truth(
     tags=["自我学习与进化"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
+@atomic_json_transaction(
+    "calibration_samples",
+    "delta_cases",
+    "evidence_units",
+    "ground_truth",
+    "qingtian_results",
+    "score_history",
+    "score_reports",
+    "submissions",
+)
 def delete_ground_truth(
     project_id: str,
     record_id: str,
@@ -13477,56 +11146,29 @@ def delete_ground_truth(
     projects = load_projects()
     if not any(p["id"] == project_id for p in projects):
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    records = load_ground_truth()
-    if not any(r.get("id") == record_id and r.get("project_id") == project_id for r in records):
-        raise HTTPException(status_code=404, detail="真实评标记录不存在")
-    removed = next(
-        (r for r in records if r.get("id") == record_id and r.get("project_id") == project_id),
-        None,
+    deleted = ground_truth_write_service.delete_ground_truth_cascade(
+        project_id,
+        record_id,
+        load_ground_truth=load_ground_truth,
+        save_ground_truth=save_ground_truth,
+        load_qingtian_results=load_qingtian_results,
+        save_qingtian_results=save_qingtian_results,
+        load_submissions=load_submissions,
+        save_submissions=save_submissions,
+        load_score_reports=load_score_reports,
+        save_score_reports=save_score_reports,
+        load_evidence_units=load_evidence_units,
+        save_evidence_units=save_evidence_units,
+        load_score_history=load_score_history,
+        save_score_history=save_score_history,
+        load_calibration_samples=load_calibration_samples,
+        save_calibration_samples=save_calibration_samples,
+        load_delta_cases=load_delta_cases,
+        save_delta_cases=save_delta_cases,
+        refresh_project_reflection_objects=_refresh_project_reflection_objects,
     )
-    records = [
-        r for r in records if not (r.get("id") == record_id and r.get("project_id") == project_id)
-    ]
-    save_ground_truth(records)
-    if removed is not None:
-        gt_id = str(removed.get("id") or "")
-        qtrs = load_qingtian_results()
-        linked_submission_ids = {
-            str(q.get("submission_id") or "")
-            for q in qtrs
-            if str((q.get("raw_payload") or {}).get("ground_truth_record_id") or "") == gt_id
-        }
-        qtrs = [
-            q
-            for q in qtrs
-            if str((q.get("raw_payload") or {}).get("ground_truth_record_id") or "") != gt_id
-        ]
-        save_qingtian_results(qtrs)
-
-        submissions = load_submissions()
-        auto_submission_ids = {
-            str(s.get("id") or "")
-            for s in submissions
-            if str(s.get("source_ground_truth_id") or "") == gt_id
-            and str(s.get("project_id")) == project_id
-        }
-        remove_submission_ids = linked_submission_ids.union(auto_submission_ids)
-        if remove_submission_ids:
-            submissions = [
-                s for s in submissions if str(s.get("id") or "") not in remove_submission_ids
-            ]
-            save_submissions(submissions)
-            reports = load_score_reports()
-            reports = [
-                r for r in reports if str(r.get("submission_id") or "") not in remove_submission_ids
-            ]
-            save_score_reports(reports)
-            units = load_evidence_units()
-            units = [
-                u for u in units if str(u.get("submission_id") or "") not in remove_submission_ids
-            ]
-            save_evidence_units(units)
-        _refresh_project_reflection_objects(project_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="真实评标记录不存在")
 
 
 @router.post(
@@ -13535,6 +11177,7 @@ def delete_ground_truth(
     tags=["自我学习与进化"],
     responses={**RESPONSES_401, **RESPONSES_404},
 )
+@atomic_json_transaction("evolution_reports")
 def evolve_project(
     project_id: str,
     api_key: Optional[str] = Depends(verify_api_key),
@@ -13549,34 +11192,19 @@ def evolve_project(
     project = next((p for p in projects if p["id"] == project_id), None)
     if project is None:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    project_score_scale = _resolve_project_score_scale_max(project)
-    records_raw = [r for r in load_ground_truth() if r.get("project_id") == project_id]
-    records = [
-        _ground_truth_record_for_learning(
-            r if isinstance(r, dict) else {},
-            default_score_scale_max=project_score_scale,
-        )
-        for r in records_raw
-    ]
-    ctx_data = load_project_context().get(project_id) or {}
-    project_context = (ctx_data.get("text") or "").strip()
-    materials_text = _merge_materials_text(project_id)
-    if materials_text:
-        project_context = (
-            (project_context + "\n\n" + materials_text) if project_context else materials_text
-        )
-    report = build_evolution_report(project_id, records, project_context)
-    enhanced = enhance_evolution_report_with_llm(project_id, report, records, project_context)
-    if enhanced is not None:
-        report["high_score_logic"] = enhanced.get("high_score_logic", report["high_score_logic"])
-        report["writing_guidance"] = enhanced.get("writing_guidance", report["writing_guidance"])
-        report["sample_count"] = enhanced.get("sample_count", report["sample_count"])
-        report["updated_at"] = enhanced.get("updated_at", report["updated_at"])
-        report["enhanced_by"] = enhanced.get("enhanced_by")  # 可追溯：spark | openai | gemini
-        # 保留规则版产出的 scoring_evolution、compilation_instructions（LLM 仅增强文字部分）
-    reports = load_evolution_reports()
-    reports[project_id] = report
-    save_evolution_reports(reports)
+    report = evolution_report_service.generate_and_persist(
+        project_id,
+        project,
+        resolve_project_score_scale_max=_resolve_project_score_scale_max,
+        load_ground_truth=load_ground_truth,
+        normalize_ground_truth_record=_ground_truth_record_for_learning,
+        load_project_context=load_project_context,
+        merge_materials_text=_merge_materials_text,
+        build_evolution_report=build_evolution_report,
+        enhance_evolution_report=enhance_evolution_report_with_llm,
+        load_evolution_reports=load_evolution_reports,
+        save_evolution_reports=save_evolution_reports,
+    )
     return EvolutionReport(**report)
 
 
@@ -13756,7 +11384,7 @@ async def parse_file_to_text(file: UploadFile = File(...)) -> Dict[str, str]:
 
 
 # API 兼容路由（与执行文档中的 /api/projects/... 路径保持一致）
-compat_router = APIRouter(prefix="/api")
+compat_router = AuthenticatedAPIRouter(prefix="/api")
 
 
 @compat_router.get("/scoring/factors", response_model=ScoringFactorsResponse, tags=["系统状态"])
@@ -14141,15 +11769,11 @@ def web_create_project(
             url="/?create_error=" + quote_plus("项目名称不能为空"), status_code=303
         )
     try:
-        rec = create_project(ProjectCreate(name=clean_name), api_key=api_key)
+        create_project(ProjectCreate(name=clean_name), api_key=api_key)
     except HTTPException as exc:
         detail = str(getattr(exc, "detail", "创建失败"))
         return RedirectResponse(url="/?create_error=" + quote_plus(detail), status_code=303)
-    project_id_value = str(getattr(rec, "id", "") or "")
-    return RedirectResponse(
-        url="/?create_ok=" + quote_plus(clean_name) + "&project_id=" + quote_plus(project_id_value),
-        status_code=303,
-    )
+    return RedirectResponse(url="/?created=1", status_code=303)
 
 
 @app.post("/web/delete_project", include_in_schema=False)
@@ -14164,16 +11788,14 @@ def web_delete_project(
             status_code=303,
         )
     try:
-        result = _delete_project_cascade(pid, locale="zh")
-    except HTTPException as exc:
-        detail = str(getattr(exc, "detail", "删除失败"))
+        _delete_project_cascade(pid, locale="zh")
+    except HTTPException:
         return RedirectResponse(
-            url="/?msg_type=error&msg=" + quote_plus("删除失败：" + detail),
+            url="/?msg_type=error&msg=" + quote_plus("删除失败"),
             status_code=303,
         )
     return RedirectResponse(
-        url="/?msg_type=success&msg="
-        + quote_plus("项目已删除：" + str(result.get("project_name") or pid)),
+        url="/?msg_type=success&msg=" + quote_plus("项目已删除"),
         status_code=303,
     )
 
@@ -14196,16 +11818,13 @@ def web_upload_materials(
         )
     if not files:
         return RedirectResponse(
-            url="/?project_id="
-            + quote_plus(pid)
-            + "&msg_type=error&msg="
+            url="/?msg_type=error&msg="
             + quote_plus("上传资料失败：未选择文件")
             + "#section-materials",
             status_code=303,
         )
     ok_count = 0
     fail_count = 0
-    first_error = ""
     for f in files:
         try:
             upload_material(
@@ -14216,17 +11835,11 @@ def web_upload_materials(
                 locale="zh",
             )
             ok_count += 1
-        except Exception as exc:  # noqa: BLE001 - web fallback should keep processing
+        except Exception:  # noqa: BLE001 - web fallback should keep processing
             fail_count += 1
-            if not first_error:
-                first_error = str(exc)
     msg = f"资料上传完成：成功 {ok_count}，失败 {fail_count}"
-    if fail_count > 0 and first_error:
-        msg += f"；首个错误：{first_error}"
     return RedirectResponse(
-        url="/?project_id="
-        + quote_plus(pid)
-        + "&msg_type="
+        url="/?msg_type="
         + ("error" if fail_count > 0 else "success")
         + "&msg="
         + quote_plus(msg)
@@ -14235,11 +11848,8 @@ def web_upload_materials(
     )
 
 
-def _web_upload_redirect_url(project_id: str, message: str, anchor: str = "") -> str:
-    pid = (project_id or "").strip()
+def _web_upload_redirect_url(message: str, anchor: str = "") -> str:
     base = "/?msg_type=error&msg=" + quote_plus(message)
-    if pid:
-        base = "/?project_id=" + quote_plus(pid) + "&msg_type=error&msg=" + quote_plus(message)
     anchor_part = str(anchor or "").strip()
     if anchor_part and not anchor_part.startswith("#"):
         anchor_part = "#" + anchor_part
@@ -14251,13 +11861,13 @@ def _web_upload_redirect_url(project_id: str, message: str, anchor: str = "") ->
     methods=["GET", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS"],
     include_in_schema=False,
 )
-def web_upload_materials_get_fallback(project_id: str = ""):
+def web_upload_materials_get_fallback():
     """
     兼容误触发非 POST 的场景，避免直接 405 中断用户流程。
     """
     return RedirectResponse(
         url=_web_upload_redirect_url(
-            project_id, "请在主页选择文件后点击“上传资料”提交。", "#section-materials"
+            "请在主页选择文件后点击“上传资料”提交。", "#section-materials"
         ),
         status_code=303,
     )
@@ -14280,31 +11890,22 @@ def web_upload_shigong(
         )
     if not files:
         return RedirectResponse(
-            url="/?project_id="
-            + quote_plus(pid)
-            + "&msg_type=error&msg="
+            url="/?msg_type=error&msg="
             + quote_plus("上传施组失败：未选择文件")
             + "#section-shigong",
             status_code=303,
         )
     ok_count = 0
     fail_count = 0
-    first_error = ""
     for f in files:
         try:
             upload_shigong(project_id=pid, file=f, api_key=api_key, locale="zh")
             ok_count += 1
-        except Exception as exc:  # noqa: BLE001 - web fallback should keep processing
+        except Exception:  # noqa: BLE001 - web fallback should keep processing
             fail_count += 1
-            if not first_error:
-                first_error = str(exc)
     msg = f"施组上传完成：成功 {ok_count}，失败 {fail_count}"
-    if fail_count > 0 and first_error:
-        msg += f"；首个错误：{first_error}"
     return RedirectResponse(
-        url="/?project_id="
-        + quote_plus(pid)
-        + "&msg_type="
+        url="/?msg_type="
         + ("error" if fail_count > 0 else "success")
         + "&msg="
         + quote_plus(msg)
@@ -14359,20 +11960,12 @@ def web_score_shigong(
         elif warn_count > 0:
             msg += f"；资料门禁预警 {warn_count} 份"
         return RedirectResponse(
-            url="/?project_id="
-            + quote_plus(pid)
-            + "&msg_type=success&msg="
-            + quote_plus(msg)
-            + "#section-shigong",
+            url="/?msg_type=success&msg=" + quote_plus(msg) + "#section-shigong",
             status_code=303,
         )
-    except Exception as exc:  # noqa: BLE001 - web fallback should keep processing
+    except Exception:  # noqa: BLE001 - web fallback should keep processing
         return RedirectResponse(
-            url="/?project_id="
-            + quote_plus(pid)
-            + "&msg_type=error&msg="
-            + quote_plus("施组评分失败：" + str(exc))
-            + "#section-shigong",
+            url="/?msg_type=error&msg=" + quote_plus("施组评分失败") + "#section-shigong",
             status_code=303,
         )
 
@@ -14382,11 +11975,9 @@ def web_score_shigong(
     methods=["GET", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS"],
     include_in_schema=False,
 )
-def web_upload_shigong_get_fallback(project_id: str = ""):
+def web_upload_shigong_get_fallback():
     return RedirectResponse(
-        url=_web_upload_redirect_url(
-            project_id, "请在主页选择文件后点击“上传施组”提交。", "#section-shigong"
-        ),
+        url=_web_upload_redirect_url("请在主页选择文件后点击“上传施组”提交。", "#section-shigong"),
         status_code=303,
     )
 
@@ -14396,11 +11987,9 @@ def web_upload_shigong_get_fallback(project_id: str = ""):
     methods=["GET", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS"],
     include_in_schema=False,
 )
-def web_score_shigong_get_fallback(project_id: str = ""):
+def web_score_shigong_get_fallback():
     return RedirectResponse(
-        url=_web_upload_redirect_url(
-            project_id, "请在主页选择项目后点击“评分施组”提交。", "#section-shigong"
-        ),
+        url=_web_upload_redirect_url("请在主页选择项目后点击“评分施组”提交。", "#section-shigong"),
         status_code=303,
     )
 
@@ -14415,52 +12004,20 @@ def index_head() -> Response:
 
 @app.get("/", tags=["系统状态"], include_in_schema=False)
 def index(
-    create_ok: Optional[str] = Query(None),
+    created: Optional[str] = Query(None),
     create_error: Optional[str] = Query(None),
-    project_id: Optional[str] = Query(None),
     msg: Optional[str] = Query(None),
     msg_type: Optional[str] = Query(None),
 ) -> Response:
-    ensure_data_dirs()
-    projects = load_projects()
-    if not os.environ.get("PYTEST_CURRENT_TEST"):
-        active_projects = [
-            p
-            for p in projects
-            if str(p.get("id") or "") != "p1" and not str(p.get("name") or "").startswith("E2E_")
-        ]
-        if not active_projects:
-            recovered = _recover_latest_orphan_project(projects)
-            if recovered is not None:
-                projects = load_projects()
-    project_ids = [str(p.get("id", "")) for p in projects]
-    if (not os.environ.get("PYTEST_CURRENT_TEST")) and project_id and project_id not in project_ids:
-        recovered = _recover_missing_project_from_artifacts(project_id, projects)
-        if recovered is not None:
-            projects = load_projects()
-            project_ids = [str(p.get("id", "")) for p in projects]
+    # The public shell must not embed project or customer data. The browser loads
+    # all business data from authenticated API requests after the page renders.
     selected_project_id = ""
-    if project_id and project_id in project_ids:
-        selected_project_id = project_id
-    elif project_ids:
-        # Default to latest created project for better usability.
-        selected_project_id = project_ids[-1]
-    project_options = []
-    for p in projects:
-        pid_raw = str(p.get("id", ""))
-        pid = html_lib.escape(pid_raw)
-        pname = html_lib.escape(str(p.get("name", p.get("id", ""))))
-        short_id = html_lib.escape(str(p.get("id", ""))[:8])
-        selected_attr = " selected" if pid_raw == selected_project_id else ""
-        project_options.append(
-            f'<option value="{pid}"{selected_attr}>{pname} ({short_id}…)</option>'
-        )
-    project_options_html = "".join(project_options)
+    project_options_html = ""
     create_notice_html = ""
-    if create_ok:
+    if created == "1":
         create_notice_html = (
             '<p style="margin:6px 0 0 0;font-size:13px;color:#15803d">'
-            "创建成功（表单模式）：" + html_lib.escape(create_ok) + "</p>"
+            "项目已创建，请使用 API key 刷新项目列表。</p>"
         )
     elif create_error:
         create_notice_html = (
@@ -14500,46 +12057,6 @@ def index(
     initial_weights_raw: Dict[str, int] = _default_weights_raw()
     initial_weights_norm: Dict[str, float] = _normalize_weights(initial_weights_raw)
     initial_profile_status = "请先选择项目并加载配置。"
-    if selected_project_id:
-        try:
-            project = _find_project(selected_project_id, projects)
-            profiles = load_expert_profiles()
-            profile: Optional[Dict[str, object]] = None
-            profile_id = str(project.get("expert_profile_id") or "")
-            if profile_id:
-                for item in profiles:
-                    if str(item.get("id") or "") == profile_id:
-                        profile = item
-                        break
-            if profile and isinstance(profile.get("weights_raw"), dict):
-                initial_weights_raw = _coerce_weights_raw(profile.get("weights_raw", {}))
-                initial_weights_norm = _normalize_weights(initial_weights_raw)
-                profile_name = str(profile.get("name") or "项目默认配置")
-                profile_id_text = str(profile.get("id") or "-")
-                updated_at_text = (
-                    str(project.get("updated_at") or profile.get("updated_at") or "")[:19] or "-"
-                )
-                initial_profile_status = (
-                    "当前生效配置："
-                    + html_lib.escape(profile_name)
-                    + "（ID: "
-                    + html_lib.escape(profile_id_text)
-                    + "，更新时间: "
-                    + html_lib.escape(updated_at_text)
-                    + "）"
-                )
-            else:
-                profile_name = str(project.get("name") or "项目") + " 默认配置"
-                updated_at_text = str(project.get("updated_at") or "")[:19] or "-"
-                initial_profile_status = (
-                    "当前生效配置："
-                    + html_lib.escape(profile_name)
-                    + "（ID: 未绑定，更新时间: "
-                    + html_lib.escape(updated_at_text)
-                    + "）"
-                )
-        except Exception:
-            initial_profile_status = "请先选择项目并加载配置。"
 
     initial_weights_rows = []
     for dim_id in DIMENSION_IDS:
@@ -14561,218 +12078,27 @@ def index(
             for dim_id in DIMENSION_IDS
         ]
     )
-    selected_project_for_view = (
-        next((p for p in projects if str(p.get("id", "")) == selected_project_id), {})
-        if selected_project_id
-        else {}
-    )
-    score_scale_initial = (
-        _resolve_project_score_scale_max(selected_project_for_view)
-        if selected_project_for_view
-        else DEFAULT_SCORE_SCALE_MAX
-    )
-    allow_pred_initial = bool(selected_project_for_view) and (
-        _select_calibrator_model(selected_project_for_view) is not None
-    )
-    initial_material_rows: List[str] = []
-    initial_submission_rows: List[str] = []
-    if selected_project_id:
-        try:
-            materials_all = load_materials()
-            selected_materials = [
-                m for m in materials_all if str(m.get("project_id", "")) == selected_project_id
-            ]
-            selected_materials.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
-            for m in selected_materials:
-                material_id = html_lib.escape(str(m.get("id", "")))
-                filename_raw = str(m.get("filename", ""))
-                filename = html_lib.escape(filename_raw)
-                material_type_label = html_lib.escape(
-                    _material_type_label(m.get("material_type"), filename=m.get("filename"))
-                )
-                created_at = html_lib.escape(str(m.get("created_at", ""))[:19])
-                initial_material_rows.append(
-                    "<tr>"
-                    + f"<td>{material_type_label}</td>"
-                    + f"<td>{filename}</td>"
-                    + f"<td>{created_at}</td>"
-                    + (
-                        "<td>"
-                        + f'<button type="button" class="btn-danger js-delete-material" data-material-id="{material_id}" data-project-id="{html_lib.escape(str(m.get("project_id") or ""))}" data-filename="{html_lib.escape(filename_raw)}" onclick="return window.__zhifeiFallbackDelete(event, \'material\', this.getAttribute(\'data-material-id\'), this.getAttribute(\'data-filename\'), this.getAttribute(\'data-project-id\'))">删除</button>'
-                        + "</td>"
-                    )
-                    + "</tr>"
-                )
-        except Exception:
-            initial_material_rows = []
-        try:
-            submissions_all = load_submissions()
-            selected_submissions = [
-                s for s in submissions_all if str(s.get("project_id", "")) == selected_project_id
-            ]
-            selected_submissions.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
-            for s in selected_submissions:
-                submission_id = html_lib.escape(str(s.get("id", "")))
-                filename_raw = str(s.get("filename", ""))
-                filename = html_lib.escape(filename_raw)
-                report_obj = s.get("report")
-                report = report_obj if isinstance(report_obj, dict) else {}
-                pred_total_raw = report.get("pred_total_score")
-                rule_total_raw = report.get("rule_total_score")
-                if not allow_pred_initial:
-                    pred_total_raw = None
-                llm_total_raw = report.get("llm_total_score")
-                pred_total = _convert_score_from_100(pred_total_raw, score_scale_initial)
-                rule_total = _convert_score_from_100(rule_total_raw, score_scale_initial)
-                llm_total = _convert_score_from_100(llm_total_raw, score_scale_initial)
-                scoring_status = str(report.get("scoring_status") or "").strip().lower()
-                is_pending = scoring_status == "pending"
-                is_blocked = scoring_status == "blocked"
-                report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
-                util_gate = (
-                    report_meta.get("material_utilization_gate")
-                    if isinstance(report_meta.get("material_utilization_gate"), dict)
-                    else {}
-                )
-                util_blocked = bool(util_gate.get("blocked"))
-                evidence_trace = (
-                    report_meta.get("evidence_trace")
-                    if isinstance(report_meta.get("evidence_trace"), dict)
-                    else {}
-                )
-                primary_total = (
-                    pred_total
-                    if pred_total is not None
-                    else _convert_score_from_100(s.get("total_score"), score_scale_initial)
-                )
-                if is_pending:
-                    score_cell = '<span class="note">待评分</span>'
-                elif is_blocked:
-                    score_cell = '<span class="error">待补资料后重评分</span>'
-                elif pred_total is not None:
-                    score_cell = html_lib.escape(str(pred_total))
-                    note_items: List[str] = []
-                    if rule_total is not None:
-                        note_items.append("规则: " + html_lib.escape(str(rule_total)))
-                    if llm_total is not None:
-                        note_items.append("LLM: " + html_lib.escape(str(llm_total)))
-                    if note_items:
-                        score_cell += '<div class="note">' + " / ".join(note_items) + "</div>"
-                else:
-                    score_cell = (
-                        "-" if primary_total is None else html_lib.escape(str(primary_total))
-                    )
-                evidence_hits = int(_to_float_or_none(evidence_trace.get("total_hits")) or 0)
-                evidence_file_hits = int(
-                    _to_float_or_none(evidence_trace.get("source_files_hit_count")) or 0
-                )
-                if not is_pending and evidence_hits > 0:
-                    score_cell += (
-                        '<div class="note">证据命中: '
-                        + html_lib.escape(str(evidence_hits))
-                        + " 条 / 文件覆盖: "
-                        + html_lib.escape(str(evidence_file_hits))
-                        + " 份</div>"
-                    )
-                util_summary = (
-                    report_meta.get("material_utilization")
-                    if isinstance(report_meta.get("material_utilization"), dict)
-                    else {}
-                )
-                util_by_type = (
-                    util_summary.get("by_type")
-                    if isinstance(util_summary.get("by_type"), dict)
-                    else {}
-                )
-                util_available_types = (
-                    util_summary.get("available_types")
-                    if isinstance(util_summary.get("available_types"), list)
-                    else []
-                )
-
-                def _type_short(t: str) -> str:
-                    if t == "tender_qa":
-                        return "招答"
-                    if t == "boq":
-                        return "清单"
-                    if t == "drawing":
-                        return "图纸"
-                    if t == "site_photo":
-                        return "照片"
-                    return t or "-"
-
-                coverage_tokens: List[str] = []
-                for type_key in ["tender_qa", "boq", "drawing", "site_photo"]:
-                    in_scope = type_key in util_available_types
-                    if not in_scope:
-                        coverage_tokens.append(_type_short(type_key) + "·")
-                        continue
-                    row = util_by_type.get(type_key) if isinstance(util_by_type, dict) else {}
-                    row = row if isinstance(row, dict) else {}
-                    retrieval_hit = int(_to_float_or_none(row.get("retrieval_hit")) or 0)
-                    consistency_hit = int(_to_float_or_none(row.get("consistency_hit")) or 0)
-                    coverage_tokens.append(
-                        _type_short(type_key)
-                        + ("✓" if (retrieval_hit + consistency_hit) > 0 else "×")
-                    )
-                if not is_pending and coverage_tokens:
-                    score_cell += (
-                        '<div class="note">类型覆盖: '
-                        + html_lib.escape(" / ".join(coverage_tokens))
-                        + "</div>"
-                    )
-                evidence_files = (
-                    evidence_trace.get("source_files_hit")
-                    if isinstance(evidence_trace.get("source_files_hit"), list)
-                    else []
-                )
-                evidence_files = [str(x).strip() for x in evidence_files if str(x).strip()]
-                if not is_pending and evidence_files:
-                    preview = "；".join(evidence_files[:2])
-                    suffix = " 等" if len(evidence_files) > 2 else ""
-                    score_cell += (
-                        '<div class="note">命中文件: '
-                        + html_lib.escape(preview)
-                        + suffix
-                        + "</div>"
-                    )
-                if util_blocked:
-                    score_cell += (
-                        '<div class="error">资料利用门禁未达标（建议补齐资料后重评分）</div>'
-                    )
-                created_at = html_lib.escape(str(s.get("created_at", ""))[:19])
-                initial_submission_rows.append(
-                    "<tr>"
-                    + f"<td>{filename}</td>"
-                    + f"<td>{score_cell}</td>"
-                    + f"<td>{created_at}</td>"
-                    + (
-                        "<td>"
-                        + f'<button type="button" class="btn-danger js-delete-submission" data-submission-id="{submission_id}" data-project-id="{html_lib.escape(str(s.get("project_id") or ""))}" data-filename="{html_lib.escape(filename_raw)}" onclick="return window.__zhifeiFallbackDelete(event, \'submission\', this.getAttribute(\'data-submission-id\'), this.getAttribute(\'data-filename\'), this.getAttribute(\'data-project-id\'))">删除</button>'
-                        + "</td>"
-                    )
-                    + "</tr>"
-                )
-        except Exception:
-            initial_submission_rows = []
-    initial_material_rows_html = "".join(initial_material_rows)
-    initial_submission_rows_html = "".join(initial_submission_rows)
-    initial_materials_empty_display = "none" if initial_material_rows else "block"
-    initial_submissions_empty_display = "none" if initial_submission_rows else "block"
+    score_scale_initial = DEFAULT_SCORE_SCALE_MAX
+    initial_material_rows_html = ""
+    initial_submission_rows_html = ""
+    initial_materials_empty_display = "block"
+    initial_submissions_empty_display = "block"
     html = """
-    <html>
+    <html lang="zh-CN">
     <head>
       <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
       <title>青天评标系统</title>
       <style>
         :root { --bg:#f4f6fb; --card:#fff; --border:#dbe2ef; --primary:#2563eb; --text:#1e293b; }
         body { font-family: system-ui, sans-serif; margin: 0 auto; max-width: 1680px; padding: 20px; background: var(--bg); color: var(--text); line-height: 1.5; }
         h2 { margin-top: 12px; font-size: 1.8rem; color: var(--primary); }
         .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px 20px; margin-bottom: 18px; box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04); }
-        input[type="text"], select { padding: 8px 10px; margin-right: 8px; min-width: 200px; border:1px solid #cbd5e1; border-radius:8px; background:#f8fafc; }
+        input[type="text"], input[type="password"], select { padding: 8px 10px; margin-right: 8px; min-width: 200px; border:1px solid #cbd5e1; border-radius:8px; background:#f8fafc; }
         button { padding: 10px 16px; background: var(--primary); color: #fff; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; }
         button:hover { opacity: 0.9; }
         button:disabled { opacity: 0.45; cursor: not-allowed; }
+        button[aria-busy="true"]::after { content:""; display:inline-block; width:.75em; height:.75em; margin-left:8px; border:2px solid currentColor; border-right-color:transparent; border-radius:50%; animation:qingtian-spin .7s linear infinite; }
         button.secondary { background: #64748b; }
         button.btn-danger { background: #dc2626; color: #fff; position:relative; z-index:2; pointer-events:auto; }
         pre { white-space: pre-wrap; font-size: 12px; margin: 0; line-height: 1.45; }
@@ -14808,13 +12134,45 @@ def index(
         .weight-row input[type="range"] { width:100%; }
         .weight-row .raw-value { font-weight:600; color:#0f172a; text-align:right; }
         .weight-row .norm-value { color:#334155; text-align:right; font-size:12px; }
+        .skip-link { position:fixed; left:16px; top:-64px; z-index:1000; padding:10px 14px; border-radius:8px; background:#0f172a; color:#fff; text-decoration:none; }
+        .skip-link:focus { top:12px; }
+        .workflow-nav { position:sticky; top:0; z-index:20; display:flex; gap:8px; overflow-x:auto; margin:0 0 16px; padding:10px; border:1px solid var(--border); border-radius:12px; background:rgba(255,255,255,.96); box-shadow:0 4px 18px rgba(15,23,42,.08); }
+        .workflow-nav a { flex:0 0 auto; padding:7px 10px; border-radius:7px; color:#1d4ed8; font-size:13px; font-weight:650; text-decoration:none; }
+        .workflow-nav a:hover { background:#dbeafe; }
+        .section { scroll-margin-top:76px; }
+        :where(a,button,input,select,textarea,summary):focus-visible { outline:3px solid #f59e0b; outline-offset:3px; }
+        @keyframes qingtian-spin { to { transform:rotate(360deg); } }
+        @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior:auto !important; animation-duration:.01ms !important; animation-iteration-count:1 !important; } }
+        @media (max-width: 760px) {
+          body { padding:12px; }
+          h1 { font-size:1.55rem; }
+          h2 { font-size:1.3rem; }
+          .card { padding:14px; border-radius:10px; }
+          .toolbar, .inline-form, .action-row { align-items:stretch; }
+          input[type="text"], input[type="password"], select, textarea { box-sizing:border-box; width:100%; min-width:0; margin-right:0; }
+          button { min-height:44px; }
+          table { display:block; overflow-x:auto; white-space:nowrap; }
+          .weight-row { grid-template-columns:1fr 52px 72px; }
+          .weight-row label { grid-column:1 / -1; }
+        }
       </style>
     </head>
     <body>
+      <a class="skip-link" href="#mainContent">跳到主要内容</a>
       <h1>青天评标系统 - 上传与对比 (v2)</h1>
       <p style="margin:-8px 0 16px 0;padding:10px;background:#e0f2fe;border-radius:6px;font-size:14px;">
         <strong>首次使用：</strong>① 创建项目 → ② 刷新并选择项目 → ③ 上传施组文件 → ④ 点击“评分施组”出分。数据保存在本机，无需额外配置。
       </p>
+      <nav class="workflow-nav" aria-label="主要工作流程">
+        <a href="#apiKeyControls">认证</a>
+        <a href="#section-create">创建项目</a>
+        <a href="#section-project">选择项目</a>
+        <a href="#section-materials">上传资料</a>
+        <a href="#section-shigong">上传与评分施组</a>
+        <a href="#section-compare">对比洞察</a>
+        <a href="#section-evolution">学习进化</a>
+        <a href="#section-output">原始输出</a>
+      </nav>
       __GLOBAL_NOTICE_HTML__
       <script>
         (function () {
@@ -14834,6 +12192,39 @@ def index(
             } catch (_) {}
             if (isJson) h['Content-Type'] = 'application/json';
             return h;
+          }
+          if (!window.__qingtianApiKeyFetchInstalled) {
+            window.__qingtianApiKeyFetchInstalled = true;
+            const nativeFetch = window.fetch.bind(window);
+            window.fetch = function(input, init) {
+              let isBusinessApi = false;
+              try {
+                const rawUrl = (typeof input === 'string') ? input : String((input || {}).url || '');
+                const parsedUrl = new URL(rawUrl, window.location.href);
+                isBusinessApi = parsedUrl.origin === window.location.origin
+                  && parsedUrl.pathname.startsWith('/api/');
+              } catch (_) {}
+              if (!isBusinessApi) return nativeFetch(input, init);
+              const options = Object.assign({}, init || {});
+              const headers = new Headers(options.headers || {});
+              Object.entries(apiHeaders(false)).forEach(([name, value]) => {
+                if (!headers.has(name)) headers.set(name, value);
+              });
+              options.headers = headers;
+              return nativeFetch(input, options);
+            };
+            window.__qingtianDownloadProtected = async function(url, filename) {
+              const response = await window.fetch(url, { cache: 'no-store' });
+              if (!response.ok) throw new Error('HTTP ' + String(response.status || 0));
+              const blobUrl = URL.createObjectURL(await response.blob());
+              const anchor = document.createElement('a');
+              anchor.href = blobUrl;
+              anchor.download = filename;
+              document.body.appendChild(anchor);
+              anchor.click();
+              anchor.remove();
+              URL.revokeObjectURL(blobUrl);
+            };
           }
           function esc(v) {
             return String(v == null ? '' : v)
@@ -14906,24 +12297,20 @@ def index(
             }
             if (actionId === 'btnMaterialDepthReportDownload') {
               const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/materials/depth_report.md';
-              const a = document.createElement('a');
-              a.href = dlUrl;
-              a.download = 'material_depth_report_' + projectId + '.md';
-              document.body.appendChild(a);
-              a.click();
-              a.remove();
+              await window.__qingtianDownloadProtected(
+                dlUrl,
+                'material_depth_report_' + projectId + '.md'
+              );
               setResult(cfg.resultId, '资料深读体检报告下载已触发。', false);
               setOutput('[' + actionId + '] download ' + dlUrl);
               return true;
             }
             if (actionId === 'btnMaterialKnowledgeProfileDownload') {
               const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/materials/knowledge_profile.md';
-              const a = document.createElement('a');
-              a.href = dlUrl;
-              a.download = 'material_knowledge_profile_' + projectId + '.md';
-              document.body.appendChild(a);
-              a.click();
-              a.remove();
+              await window.__qingtianDownloadProtected(
+                dlUrl,
+                'material_knowledge_profile_' + projectId + '.md'
+              );
               setResult(cfg.resultId, '资料知识画像报告下载已触发。', false);
               setOutput('[' + actionId + '] download ' + dlUrl);
               return true;
@@ -15183,7 +12570,19 @@ def index(
         })();
       </script>
 
-      <div class="section card">
+      <main id="mainContent" tabindex="-1">
+      <div class="section card" id="apiKeyControls">
+        <h2>API 访问认证</h2>
+        <div class="toolbar">
+          <label for="apiKeyInput">API key：</label>
+          <input id="apiKeyInput" type="password" autocomplete="off" placeholder="输入 X-API-Key" />
+          <button type="button" id="saveApiKey">保存</button>
+          <button type="button" id="clearApiKey" class="secondary">清除</button>
+        </div>
+        <p id="apiKeyStatus" class="muted" aria-live="polite">未保存 key</p>
+      </div>
+
+      <div class="section card" id="section-create">
         <h2>1) 创建项目</h2>
         <form id="createProject" method="post" action="/web/create_project">
           项目名称：<input name="name" placeholder="例如：XX标段施组评审" />
@@ -15194,7 +12593,7 @@ def index(
         <p style="margin:4px 0 0 0;font-size:13px;color:#64748b">创建后可从下方下拉选择项目，或复制返回的 id 使用。</p>
       </div>
 
-      <div class="section card">
+      <div class="section card" id="section-project">
         <h2>2) 选择项目</h2>
         <div class="toolbar">
           <button type="button" id="refreshProjects">刷新项目列表</button>
@@ -15231,7 +12630,7 @@ def index(
         <p class="muted">下方所有操作将使用选中的项目。选择项目后建议先上传项目资料（招标、清单等），再上传施组进行评分。删除项目会同时删除该项目全部资料与记录。</p>
       </div>
 
-      <div class="section card">
+      <div class="section card" id="section-delivery">
         <h2>评分报告 / 证据链交付入口</h2>
         <p class="muted">本区集中提示已有交付路径，便于验收人员核对评分报告、证据链、评分依据、分析包和对比报告等交付物；页面仅提示交付路径，不新增后端接口，不改变运行逻辑，不接核心评分主链。</p>
         <ul style="margin:8px 0 0 18px;color:#334155;font-size:13px;line-height:1.7">
@@ -15324,7 +12723,7 @@ def index(
         </div>
       </div>
 
-      <div class="section card">
+      <div class="section card" id="section-weights">
         <h2>2.5) 青天评标关注度（16维）</h2>
         <p style="font-size:12px;color:#64748b;margin:-4px 0 10px 0">先设置16维关注度，再点击“应用到本项目并重算”。同一项目内所有施组将统一按该配置重算，历史快照会保留。</p>
         <div id="expertProfileStatus" style="font-size:13px;color:#334155;margin-bottom:8px">__EXPERT_PROFILE_STATUS__</div>
@@ -15435,7 +12834,7 @@ def index(
         <div id="perTenderResult" class="result-block" style="display:none"></div>
       </div>
 
-      <div class="section card">
+      <div class="section card" id="section-compare">
         <h2>5) 对比与洞察</h2>
         <p style="font-size:12px;color:#64748b;margin:-4px 0 8px 0">对比排名：看多份施组分数排序；对比报告：看叙述性差异；洞察：看弱项与扣分建议；学习画像：生成维度权重供后续评分参考。</p>
         <div class="action-row">
@@ -15474,7 +12873,7 @@ def index(
         <div id="adaptiveApplyResult" class="result-block" style="display:none"></div>
       </div>
 
-      <div class="section card">
+      <div class="section card" id="section-evolution">
         <h2>7) 自我学习与进化</h2>
         <p style="font-size:13px;color:#64748b;margin:0 0 6px 0">上传项目投喂包（招标/清单/图纸等合并文本），录入交易中心真实评标结果（5/7评委+最终得分），系统学习高分逻辑并生成编制指导。</p>
         <p style="font-size:12px;color:#475569;margin:0 0 10px 0">系统会将学习到的高分逻辑与编制指导持久保存，并用于本项目的预评分权重与编制系统指令；再次执行学习进化可基于新录入的真实评标升级这些经验。</p>
@@ -15591,10 +12990,11 @@ def index(
         <div id="evalResult" class="result-block" style="display:none"></div>
       </div>
 
-      <div class="section card">
+      <div class="section card" id="section-output">
         <h2>原始输出（最后一次请求）</h2>
         <pre id="output">（操作后这里显示原始 JSON）</pre>
       </div>
+      </main>
 
       <script>
         (function () {
@@ -15696,10 +13096,6 @@ def index(
               const v = String((el && el.value) || '').trim();
               if (v) return v;
             }
-            try {
-              const qid = new URL(window.location.href).searchParams.get('project_id') || '';
-              if (String(qid).trim()) return String(qid).trim();
-            } catch (_) {}
             return '';
           }
           function fallbackApiKey() {
@@ -16438,24 +13834,20 @@ def index(
             }
             if (actionId === 'btnMaterialDepthReportDownload') {
               const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/materials/depth_report.md';
-              const a = document.createElement('a');
-              a.href = dlUrl;
-              a.download = 'material_depth_report_' + projectId + '.md';
-              document.body.appendChild(a);
-              a.click();
-              a.remove();
+              await window.__qingtianDownloadProtected(
+                dlUrl,
+                'material_depth_report_' + projectId + '.md'
+              );
               fallbackSetResult(cfg.resultId, '资料深读体检报告下载已触发。', false);
               fallbackSetOutput('[' + actionId + '] download ' + dlUrl);
               return true;
             }
             if (actionId === 'btnMaterialKnowledgeProfileDownload') {
               const dlUrl = '/api/v1/projects/' + encodeURIComponent(projectId) + '/materials/knowledge_profile.md';
-              const a = document.createElement('a');
-              a.href = dlUrl;
-              a.download = 'material_knowledge_profile_' + projectId + '.md';
-              document.body.appendChild(a);
-              a.click();
-              a.remove();
+              await window.__qingtianDownloadProtected(
+                dlUrl,
+                'material_knowledge_profile_' + projectId + '.md'
+              );
               fallbackSetResult(cfg.resultId, '资料知识画像报告下载已触发。', false);
               fallbackSetOutput('[' + actionId + '] download ' + dlUrl);
               return true;
@@ -16612,6 +14004,11 @@ def index(
           if (!el) return;
           const wrapped = async (ev) => {
             if (ev) ev.preventDefault();
+            if (el.dataset.qingtianBusy === 'true') return;
+            const restoreDisabled = el.disabled;
+            el.dataset.qingtianBusy = 'true';
+            el.setAttribute('aria-busy', 'true');
+            el.disabled = true;
             try {
               await fn(ev);
             } catch (err) {
@@ -16621,6 +14018,13 @@ def index(
                 setResultError(cfg.resultId, msg);
               }
               reportClientError('按钮[' + id + ']执行失败', err);
+            } finally {
+              delete el.dataset.qingtianBusy;
+              el.setAttribute('aria-busy', 'false');
+              el.disabled = restoreDisabled;
+              if (typeof updateProjectBoundControlsState === 'function') {
+                updateProjectBoundControlsState();
+              }
             }
           };
           if (SAFE_CLICK_HANDLERS[id]) {
@@ -16645,6 +14049,22 @@ def index(
           return true;
         };
         function safeChange(id, fn) { const el = document.getElementById(id); if (el) el.onchange = fn; }
+        function initializeProductAccessibility() {
+          document.querySelectorAll('.result-block').forEach((el) => {
+            el.setAttribute('role', 'status');
+            el.setAttribute('aria-live', 'polite');
+            el.setAttribute('aria-atomic', 'false');
+          });
+          document.querySelectorAll('[id$="Message"], [id$="Status"]').forEach((el) => {
+            if (!el.hasAttribute('aria-live')) el.setAttribute('aria-live', 'polite');
+          });
+          const output = document.getElementById('output');
+          if (output) {
+            output.setAttribute('role', 'status');
+            output.setAttribute('aria-live', 'polite');
+            output.setAttribute('aria-atomic', 'false');
+          }
+        }
         function storageGet(key) {
           try { return localStorage.getItem(key) || ''; } catch (_) { return ''; }
         }
@@ -16653,6 +14073,27 @@ def index(
         }
         function storageRemove(key) {
           try { localStorage.removeItem(key); } catch (_) {}
+        }
+        function redactStoredApiKey(value) {
+          const text = String(value == null ? '' : value);
+          const storedKey = storageGet('api_key');
+          return storedKey ? text.split(storedKey).join('[redacted]') : text;
+        }
+        function authAwareErrorMessage(res, text, fallback='服务请求失败') {
+          let payload = {};
+          try { payload = JSON.parse(String(text || '{}')); } catch (_) {}
+          const detail = (payload && typeof payload.detail === 'object') ? payload.detail : {};
+          const code = String((detail && detail.code) || (payload && payload.code) || '');
+          if (code === 'AUTH_KEY_MISSING') return '未保存 API key，请先在认证区保存。';
+          if (code === 'AUTH_KEY_INVALID') return 'API key 缺失或错误，请重新保存。';
+          if (code === 'AUTH_NOT_CONFIGURED') return '服务未配置认证，请联系服务管理员。';
+          const status = res && typeof res.status === 'number' ? res.status : 0;
+          if (status === 401) return 'API key 缺失或错误，请重新保存。';
+          if (status === 503) return '服务未配置认证或暂不可用。';
+          const rawDetail = (payload && typeof payload.detail === 'string')
+            ? payload.detail
+            : String(text || '').slice(0, 200);
+          return redactStoredApiKey(rawDetail || (status ? ('HTTP ' + status) : fallback));
         }
         function pickProjectFromSelect(sel) {
           if (!sel) return '';
@@ -16693,10 +14134,6 @@ def index(
             const v = String((el && el.value) || '').trim();
             if (v) return v;
           }
-          try {
-            const qid = new URL(window.location.href).searchParams.get('project_id') || '';
-            if (String(qid).trim()) return String(qid).trim();
-          } catch (_) {}
           return '';
         }
         function selectedScoreScaleMax() {
@@ -17246,6 +14683,38 @@ def index(
           el.textContent = msg || '';
           el.style.color = isError ? '#b91c1c' : '#15803d';
         }
+        function setApiKeyStatus(msg, isError) {
+          const el = document.getElementById('apiKeyStatus');
+          if (!el) return;
+          el.textContent = msg || '';
+          el.style.color = isError ? '#b91c1c' : '#15803d';
+        }
+        function syncApiKeyStatus() {
+          setApiKeyStatus(storageGet('api_key') ? '已保存' : '未保存 key', false);
+        }
+        safeClick('saveApiKey', () => {
+          const input = document.getElementById('apiKeyInput');
+          const key = String((input && input.value) || '').trim();
+          if (!key) {
+            setApiKeyStatus('未保存 key，请输入 API key。', true);
+            return;
+          }
+          try {
+            localStorage.setItem("api_key", key);
+          } catch (_) {
+            setApiKeyStatus('无法保存 API key，请检查浏览器存储权限。', true);
+            return;
+          }
+          if (input) input.value = '';
+          setApiKeyStatus('已保存', false);
+        });
+        safeClick('clearApiKey', () => {
+          try { localStorage.removeItem("api_key"); } catch (_) {}
+          const input = document.getElementById('apiKeyInput');
+          if (input) input.value = '';
+          setApiKeyStatus('未保存 key', false);
+        });
+        syncApiKeyStatus();
         function setSelfCheckResult(summary, details, isError) {
           const el = document.getElementById('selfCheckResult');
           if (!el) return;
@@ -17430,12 +14899,10 @@ def index(
           }
           const url = '/api/v1/projects/' + encodeURIComponent(currentId) + '/analysis_bundle.md';
           setScoringFactorsResult('正在准备下载…', '若浏览器未自动下载，请检查弹窗或下载权限设置。', false);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = 'analysis_bundle_' + currentId + '.md';
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
+          await window.__qingtianDownloadProtected(
+            url,
+            'analysis_bundle_' + currentId + '.md'
+          );
         }
         async function refreshProjects() {
           setSelectMsg('正在加载…', false);
@@ -17472,10 +14939,10 @@ def index(
             return at.localeCompare(bt);
           });
           if (!res.ok) {
-            const errMsg = (typeof list === 'object' && list && list.detail) ? String(list.detail) : (text || '').slice(0, 200);
-            setSelectMsg('刷新失败: ' + res.status + ' ' + errMsg, true);
+            const errMsg = authAwareErrorMessage(res, text, '刷新项目列表失败');
+            setSelectMsg('刷新失败: ' + errMsg, true);
             const out = document.getElementById('output');
-            if (out) { out.textContent = '刷新失败: ' + res.status + '\\n' + text; out.scrollIntoView({ behavior: 'smooth' }); }
+            if (out) { out.textContent = '刷新失败: ' + errMsg; out.scrollIntoView({ behavior: 'smooth' }); }
             return;
           }
           setSelectMsg(list.length ? '已加载 ' + list.length + ' 个项目，请在上方下拉框选择' : '暂无项目，请先在「1) 创建项目」中创建', false);
@@ -17697,9 +15164,8 @@ def index(
               setCreateMsg('创建成功，已刷新下方列表，请选择项目', false);
               await refreshProjects();
             } else {
-              let detail = text;
-              try { const j = JSON.parse(text); detail = (j && j.detail) || text; } catch (_) {}
-              setCreateMsg('创建失败: ' + res.status + ' ' + (detail || '').slice(0, 100), true);
+              const detail = authAwareErrorMessage(res, text, '创建项目失败');
+              setCreateMsg('创建失败: ' + detail, true);
               const outSc = document.getElementById('output');
               if (outSc) outSc.scrollIntoView({ behavior: 'smooth' });
             }
@@ -18421,12 +15887,10 @@ def index(
           if (!ensureProjectForAction('materialDepthReportResult')) return;
           const id = pid();
           const url = '/api/v1/projects/' + encodeURIComponent(id) + '/materials/depth_report.md';
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = 'material_depth_report_' + id + '.md';
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
+          await window.__qingtianDownloadProtected(
+            url,
+            'material_depth_report_' + id + '.md'
+          );
           setResultSuccess('materialDepthReportResult', '资料深读体检报告下载已触发。');
         });
         safeClick('btnMaterialKnowledgeProfile', async () => {
@@ -18458,12 +15922,10 @@ def index(
           if (!ensureProjectForAction('materialKnowledgeProfileResult')) return;
           const id = pid();
           const url = '/api/v1/projects/' + encodeURIComponent(id) + '/materials/knowledge_profile.md';
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = 'material_knowledge_profile_' + id + '.md';
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
+          await window.__qingtianDownloadProtected(
+            url,
+            'material_knowledge_profile_' + id + '.md'
+          );
           setResultSuccess('materialKnowledgeProfileResult', '资料知识画像报告下载已触发。');
         });
 
@@ -19992,15 +17454,13 @@ def index(
           el.innerHTML = html;
           const dlBtn = document.getElementById('btnEvidenceTraceDownload');
           if (dlBtn) {
-            dlBtn.onclick = () => {
+            dlBtn.onclick = async () => {
               const sid = String(data.submission_id || '').trim();
               if (!sid) return;
-              const a = document.createElement('a');
-              a.href = '/api/v1/projects/' + encodeURIComponent(projectId) + '/submissions/' + encodeURIComponent(sid) + '/evidence_trace.md';
-              a.download = 'evidence_trace_' + projectId + '_' + sid + '.md';
-              document.body.appendChild(a);
-              a.click();
-              a.remove();
+              await window.__qingtianDownloadProtected(
+                '/api/v1/projects/' + encodeURIComponent(projectId) + '/submissions/' + encodeURIComponent(sid) + '/evidence_trace.md',
+                'evidence_trace_' + projectId + '_' + sid + '.md'
+              );
             };
           }
         });
@@ -20634,6 +18094,7 @@ def index(
         });
 
         // 关闭“硬接管”兜底，避免覆盖 safeClick 的详细渲染结果。
+        initializeProductAccessibility();
         initWeightsSection();
         syncGroundTruthJudgeInputs();
         updateProjectBoundControlsState();

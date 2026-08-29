@@ -1,0 +1,51 @@
+name: qingtian
+
+services:
+  app:
+    image: ${QINGTIAN_IMAGE:-qingtian-bizsystem:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${QINGTIAN_BIND_ADDRESS:-127.0.0.1}:${QINGTIAN_PORT:-8000}:8000"
+    environment:
+      QINGTIAN_ENV: production
+      QINGTIAN_API_KEYS_FILE: /run/secrets/qingtian_api_keys
+      QINGTIAN_DATA_DIR: /var/lib/qingtian
+      QINGTIAN_STORAGE_BACKEND: sqlite
+      QINGTIAN_SQLITE_PATH: /var/lib/qingtian/qingtian.sqlite3
+      PORT: "8000"
+      WEB_CONCURRENCY: "1"
+      RATE_LIMIT_ENABLED: "true"
+      RATE_LIMIT_DEFAULT: ${RATE_LIMIT_DEFAULT:-100/minute}
+      RATE_LIMIT_SCORE: ${RATE_LIMIT_SCORE:-30/minute}
+      RATE_LIMIT_UPLOAD: ${RATE_LIMIT_UPLOAD:-20/minute}
+    secrets:
+      - qingtian_api_keys
+    volumes:
+      - qingtian_data:/var/lib/qingtian
+      - qingtian_config:/srv/qingtian/app/resources
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    stop_grace_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  qingtian_data:
+  qingtian_config:
+
+secrets:
+  qingtian_api_keys:
+    file: ${QINGTIAN_API_KEYS_FILE:-./secrets/api_keys.txt}

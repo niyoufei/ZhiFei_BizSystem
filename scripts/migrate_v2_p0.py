@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from app.engine.dimensions import DIMENSIONS
 from app.storage import (
+    atomic_json_transaction,
     ensure_data_dirs,
     load_expert_profiles,
     load_projects,
@@ -53,6 +54,7 @@ def build_profile(name: str, raw: dict[str, int]) -> dict:
     }
 
 
+@atomic_json_transaction("expert_profiles", "projects", "score_reports", "submissions")
 def main() -> None:
     ensure_data_dirs()
     projects = load_projects()
