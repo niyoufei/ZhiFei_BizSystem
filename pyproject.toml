@@ -11,24 +11,25 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-  "fastapi",
+  "fastapi==0.118",
   "numpy",
   "openpyxl",
   "pillow",
-  "pydantic",
+  "pydantic==2.11.9",
   "pymupdf",
   "pytesseract",
   "python-docx",
   "python-dotenv",
-  "python-multipart",
+  "python-multipart==0.0.20",
   "PyYAML",
+  "starlette==0.48",
   "typer",
   "uvicorn",
 ]
 [project.optional-dependencies]
 dev = [
   "black",
-  "httpx",
+  "httpx==0.28.1",
   "pre-commit",
   "pygments<2.19",
   "pytest",

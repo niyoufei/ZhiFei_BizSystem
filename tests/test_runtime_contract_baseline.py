@@ -5,11 +5,9 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
-import os
 import re
 import sys
 import types
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,7 +16,6 @@ from fastapi import FastAPI
 from fastapi.datastructures import DefaultPlaceholder
 from fastapi.routing import APIRoute
 from starlette.routing import Route
-
 
 ROUTE_MANIFEST_SHA256 = "852a6fa50cc45cfeed121802b9027251947d59d7b3008ed0a4cd0da7fe89cd8c"
 OPENAPI_CANONICAL_SHA256 = "7ba83f46c53faee76d2ffc94f772143a46cf5be24fb8e03ac20040dc0e67d105"

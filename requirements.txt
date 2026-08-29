@@ -1,10 +1,10 @@
-fastapi
-httpx
+fastapi==0.118.0
+httpx==0.28.1
 python-dotenv
-python-multipart
+python-multipart==0.0.20
 uvicorn
 typer
-pydantic
+pydantic==2.11.9
 PyYAML
 pytest
 Pygments<2.19
@@ -21,5 +21,6 @@ streamlit
 pre-commit
 tqdm
 slowapi
+starlette==0.48.0
 prometheus-client
 numpy
