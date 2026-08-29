@@ -66,6 +66,7 @@ from fastapi.routing import APIRoute
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.routing import Match
 
+import app.adaptive_configuration_service as adaptive_configuration_service
 import app.anchor_requirement_service as anchor_requirement_service
 import app.calibration_model_service as calibration_model_service
 import app.document_parser as _document_parser
@@ -5854,7 +5855,7 @@ def config_reload_endpoint(
     """
     强制重新加载配置文件。
 
-    立即从磁盘重新加载 rubric.yaml 和 lexicon.yaml 配置文件。
+    立即从磁盘重新加载当前有效配置；优先读取原子快照，缺失时读取旧版配置文件。
     用于在修改配置文件后立即生效，无需重启服务。
 
     **需要 API Key 认证**
@@ -10667,7 +10668,7 @@ def adaptive_apply(
 
     **需要 API Key 认证**
 
-    ⚠️ 此操作会修改系统配置文件（lexicon.yaml、rubric.yaml）
+    ⚠️ 此操作会发布包含词库与评分规则的原子配置快照
 
     支持 Accept-Language header 进行多语言响应。
     """
@@ -10675,47 +10676,19 @@ def adaptive_apply(
     submissions = [s for s in load_submissions() if s["project_id"] == project_id]
     if not submissions:
         raise HTTPException(status_code=404, detail=t("api.no_submissions", locale=locale))
-    config = load_config()
-    stats_result = build_adaptive_suggestions(submissions, config.lexicon)
-    stats = stats_result["penalty_stats"]
-    patch = build_adaptive_patch(config.lexicon, stats)
-
-    from pathlib import Path
-
-    import yaml
-
-    res_dir = Path(__file__).resolve().parent / "resources"
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    all_changes: list[str] = []
-
-    # 词库补丁：备份并写回
-    lexicon_path = res_dir / "lexicon.yaml"
-    lex_backup = lexicon_path.with_name(f"lexicon.yaml.bak_{ts}")
-    lex_backup.write_text(lexicon_path.read_text(encoding="utf-8"), encoding="utf-8")
-    updated_lexicon, lex_changes = apply_adaptive_patch(config.lexicon, patch)
-    lexicon_path.write_text(yaml.safe_dump(updated_lexicon, allow_unicode=True), encoding="utf-8")
-    all_changes.extend(lex_changes)
-
-    # 规则补丁：备份并写回
-    rubric_path = res_dir / "rubric.yaml"
-    rubric_backup = rubric_path.with_name(f"rubric.yaml.bak_{ts}")
-    rubric_backup.write_text(rubric_path.read_text(encoding="utf-8"), encoding="utf-8")
-    updated_rubric, rubric_changes = apply_rubric_patch(
-        config.rubric, patch.get("rubric_adjustments", {})
+    result = adaptive_configuration_service.apply_and_persist(
+        project_id,
+        submissions,
+        resources_dir=Path(__file__).resolve().parent / "resources",
+        backup_timestamp=datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"),
+        load_config=load_config,
+        reload_config=reload_config,
+        build_adaptive_suggestions=build_adaptive_suggestions,
+        build_adaptive_patch=build_adaptive_patch,
+        apply_adaptive_patch=apply_adaptive_patch,
+        apply_rubric_patch=apply_rubric_patch,
     )
-    rubric_path.write_text(yaml.safe_dump(updated_rubric, allow_unicode=True), encoding="utf-8")
-    all_changes.extend(rubric_changes)
-
-    # 使内存中的配置失效，下次 load_config 会重新读盘
-    reload_config()
-
-    return AdaptiveApplyResult(
-        project_id=project_id,
-        applied=True,
-        changes=all_changes,
-        backup_path=str(lex_backup),
-        source=stats_result.get("source") or {},
-    )
+    return AdaptiveApplyResult(**result)
 
 
 @router.get(

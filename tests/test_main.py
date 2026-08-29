@@ -4367,46 +4367,25 @@ class TestAdaptiveApplyEndpoint:
         response = client.post("/api/v1/projects/p1/adaptive_apply")
         assert response.status_code == 404
 
-    @patch("yaml.safe_dump")
-    @patch("pathlib.Path")
-    @patch("app.main.apply_adaptive_patch")
-    @patch("app.main.build_adaptive_patch")
-    @patch("app.main.build_adaptive_suggestions")
-    @patch("app.main.load_config")
+    @patch("app.main.adaptive_configuration_service.apply_and_persist")
     @patch("app.main.load_submissions")
     @patch("app.main.ensure_data_dirs")
     def test_adaptive_apply_success(
         self,
         mock_ensure,
         mock_load_sub,
-        mock_config,
-        mock_suggestions,
-        mock_patch,
-        mock_apply,
-        mock_path,
-        mock_yaml_dump,
+        mock_apply_and_persist,
         client,
     ):
         """Adaptive apply should update lexicon and return result."""
         mock_load_sub.return_value = [{"id": "s1", "project_id": "p1"}]
-        mock_config.return_value = MagicMock(lexicon={})
-        mock_suggestions.return_value = {"penalty_stats": {}}
-        mock_patch.return_value = {"lexicon_additions": {}, "rubric_adjustments": {}}
-        mock_apply.return_value = ({"updated": True}, ["change1", "change2"])
-
-        # Mock Path operations
-        mock_lexicon_path = MagicMock()
-        mock_lexicon_path.read_text.return_value = "old: content"
-        mock_backup_path = MagicMock()
-        mock_backup_path.__str__ = MagicMock(return_value="/backup/path.yaml")
-        mock_lexicon_path.with_name.return_value = mock_backup_path
-
-        # Configure Path mock chain
-        mock_path_instance = MagicMock()
-        mock_path_instance.resolve.return_value.parent.__truediv__ = (
-            lambda self, x: mock_lexicon_path
-        )
-        mock_path.return_value = mock_path_instance
+        mock_apply_and_persist.return_value = {
+            "project_id": "p1",
+            "applied": True,
+            "changes": ["change1", "change2"],
+            "backup_path": "/backup/path.yaml",
+            "source": {},
+        }
 
         response = client.post("/api/v1/projects/p1/adaptive_apply")
         assert response.status_code == 200
@@ -4414,6 +4393,7 @@ class TestAdaptiveApplyEndpoint:
         assert data["project_id"] == "p1"
         assert data["applied"] is True
         assert "changes" in data
+        mock_apply_and_persist.assert_called_once()
 
 
 class TestMainExecution:
