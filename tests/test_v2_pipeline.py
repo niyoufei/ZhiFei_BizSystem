@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -689,6 +690,162 @@ class TestPatchPackageEndpoints:
         assert data["deployed"] is True
         mock_save_packages.assert_called_once()
         mock_save_deploys.assert_called_once()
+
+    @patch("app.main.save_patch_deployments")
+    @patch("app.main.load_patch_deployments")
+    @patch("app.main.save_patch_packages")
+    @patch("app.main.load_patch_packages")
+    @patch("app.main.ensure_data_dirs")
+    def test_patch_deploy_rejects_candidate_without_writes(
+        self,
+        mock_ensure,
+        mock_load_packages,
+        mock_save_packages,
+        mock_load_deploys,
+        mock_save_deploys,
+    ):
+        mock_load_packages.return_value = [
+            {"id": "pck1", "project_id": "p1", "status": "candidate"}
+        ]
+
+        resp = _client().post("/api/v1/patches/pck1/deploy", json={"action": "deploy"})
+
+        assert resp.status_code == 422
+        assert "shadow_pass" in resp.json()["detail"]
+        mock_save_packages.assert_not_called()
+        mock_load_deploys.assert_not_called()
+        mock_save_deploys.assert_not_called()
+
+    @patch("app.main.save_patch_deployments")
+    @patch("app.main.load_patch_deployments")
+    @patch("app.main.save_patch_packages")
+    @patch("app.main.load_patch_packages")
+    @patch("app.main.ensure_data_dirs")
+    def test_patch_deploy_rejects_explicit_rollback_target_without_writes(
+        self,
+        mock_ensure,
+        mock_load_packages,
+        mock_save_packages,
+        mock_load_deploys,
+        mock_save_deploys,
+    ):
+        mock_load_packages.return_value = [
+            {"id": "pck1", "project_id": "p1", "status": "shadow_pass"},
+            {"id": "pck-other", "project_id": "p2", "status": "deployed"},
+        ]
+
+        resp = _client().post(
+            "/api/v1/patches/pck1/deploy",
+            json={"action": "deploy", "rollback_to_version": "pck-other"},
+        )
+
+        assert resp.status_code == 422
+        assert "deploy 不接受" in resp.json()["detail"]
+        mock_save_packages.assert_not_called()
+        mock_load_deploys.assert_not_called()
+        mock_save_deploys.assert_not_called()
+
+    @patch("app.main.save_patch_deployments")
+    @patch("app.main.load_patch_deployments")
+    @patch("app.main.save_patch_packages")
+    @patch("app.main.load_patch_packages")
+    @patch("app.main.ensure_data_dirs")
+    def test_patch_rollback_promotes_same_project_target(
+        self,
+        mock_ensure,
+        mock_load_packages,
+        mock_save_packages,
+        mock_load_deploys,
+        mock_save_deploys,
+    ):
+        mock_load_packages.return_value = [
+            {
+                "id": "pck1",
+                "project_id": "p1",
+                "status": "deployed",
+                "rollback_pointer": "pck0",
+            },
+            {"id": "pck0", "project_id": "p1", "status": "shadow_pass"},
+        ]
+        mock_load_deploys.return_value = []
+
+        resp = _client().post("/api/v1/patches/pck1/deploy", json={"action": "rollback"})
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["deployed"] is False
+        assert data["rollback_to_version"] == "pck0"
+        saved_packages = mock_save_packages.call_args[0][0]
+        statuses = {item["id"]: item["status"] for item in saved_packages}
+        assert statuses == {"pck1": "rolled_back", "pck0": "deployed"}
+        mock_save_deploys.assert_called_once()
+
+    @patch("app.main.save_patch_deployments")
+    @patch("app.main.load_patch_deployments")
+    @patch("app.main.save_patch_packages")
+    @patch("app.main.load_patch_packages")
+    @patch("app.main.ensure_data_dirs")
+    def test_patch_rollback_rejects_cross_project_target_without_writes(
+        self,
+        mock_ensure,
+        mock_load_packages,
+        mock_save_packages,
+        mock_load_deploys,
+        mock_save_deploys,
+    ):
+        mock_load_packages.return_value = [
+            {
+                "id": "pck1",
+                "project_id": "p1",
+                "status": "deployed",
+                "rollback_pointer": "pck-other",
+            },
+            {"id": "pck-other", "project_id": "p2", "status": "shadow_pass"},
+        ]
+
+        resp = _client().post("/api/v1/patches/pck1/deploy", json={"action": "rollback"})
+
+        assert resp.status_code == 422
+        assert "不属于当前项目" in resp.json()["detail"]
+        mock_save_packages.assert_not_called()
+        mock_load_deploys.assert_not_called()
+        mock_save_deploys.assert_not_called()
+
+    @patch("app.main.save_patch_deployments")
+    @patch("app.main.load_patch_deployments")
+    @patch("app.main.save_patch_packages")
+    @patch("app.main.load_patch_packages")
+    @patch("app.main.ensure_data_dirs")
+    def test_patch_transition_restores_packages_when_deployment_write_fails(
+        self,
+        mock_ensure,
+        mock_load_packages,
+        mock_save_packages,
+        mock_load_deploys,
+        mock_save_deploys,
+    ):
+        original_packages = [
+            {
+                "id": "pck1",
+                "project_id": "p1",
+                "status": "shadow_pass",
+                "rollback_pointer": "pck0",
+            },
+            {"id": "pck0", "project_id": "p1", "status": "deployed"},
+        ]
+        mock_load_packages.return_value = copy.deepcopy(original_packages)
+        mock_load_deploys.return_value = []
+        mock_save_deploys.side_effect = [OSError("controlled deployment write failure"), None]
+
+        with pytest.raises(OSError, match="controlled deployment write failure"):
+            _client().post("/api/v1/patches/pck1/deploy", json={"action": "deploy"})
+
+        assert mock_save_packages.call_count == 2
+        restored_packages = mock_save_packages.call_args_list[1].args[0]
+        assert restored_packages == original_packages
+        assert mock_save_deploys.call_count == 2
+        restored_deployments = mock_save_deploys.call_args_list[1].args[0]
+        assert restored_deployments == []
 
 
 class TestGroundTruthAutoSync:

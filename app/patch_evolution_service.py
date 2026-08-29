@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from typing import Any, Callable, Dict, List, Optional
 
 Record = Dict[str, object]
@@ -16,6 +17,10 @@ class PatchDeltaCasesNotFoundError(LookupError):
 
 
 class UnsupportedPatchActionError(ValueError):
+    pass
+
+
+class InvalidPatchTransitionError(ValueError):
     pass
 
 
@@ -327,6 +332,7 @@ def deploy_or_rollback_patch(
     new_id: Callable[[], str],
 ) -> Record:
     packages = load_patch_packages()
+    original_packages = copy.deepcopy(packages)
     patch = next((item for item in packages if str(item.get("id")) == patch_id), None)
     if patch is None:
         raise PatchNotFoundError
@@ -336,17 +342,67 @@ def deploy_or_rollback_patch(
         raise UnsupportedPatchActionError
 
     project_id = str(patch.get("project_id") or "")
+    timestamp = now_iso()
     deployed = action == "deploy"
     if deployed:
+        if str(patch.get("status") or "") != "shadow_pass":
+            raise InvalidPatchTransitionError("补丁仅可从 shadow_pass 状态发布")
+        if str(rollback_to_version or "").strip():
+            raise InvalidPatchTransitionError("deploy 不接受 rollback_to_version")
+        rollback_target_id = str(patch.get("rollback_pointer") or "").strip()
+        if rollback_target_id:
+            rollback_target = next(
+                (
+                    item
+                    for item in packages
+                    if str(item.get("id") or "") == rollback_target_id
+                    and str(item.get("project_id") or "") == project_id
+                    and item is not patch
+                ),
+                None,
+            )
+            if rollback_target is None:
+                raise InvalidPatchTransitionError("回滚目标不存在或不属于当前项目")
+            if str(rollback_target.get("status") or "") not in {
+                "deployed",
+                "shadow_pass",
+                "rolled_back",
+            }:
+                raise InvalidPatchTransitionError("回滚目标必须是已通过 shadow 验证的历史补丁")
         for item in packages:
             if str(item.get("project_id")) == project_id and str(item.get("status")) == "deployed":
                 item["status"] = "shadow_pass"
-                item["updated_at"] = now_iso()
+                item["updated_at"] = timestamp
         patch["status"] = "deployed"
     else:
+        if str(patch.get("status") or "") != "deployed":
+            raise InvalidPatchTransitionError("仅可回滚当前 deployed 状态的补丁")
+        rollback_target_id = str(rollback_to_version or patch.get("rollback_pointer") or "").strip()
+        rollback_target = next(
+            (
+                item
+                for item in packages
+                if str(item.get("id") or "") == rollback_target_id
+                and str(item.get("project_id") or "") == project_id
+                and item is not patch
+            ),
+            None,
+        )
+        if rollback_target is None:
+            raise InvalidPatchTransitionError("回滚目标不存在或不属于当前项目")
+        if str(rollback_target.get("status") or "") not in {"shadow_pass", "rolled_back"}:
+            raise InvalidPatchTransitionError("回滚目标必须是已通过 shadow 验证的历史补丁")
+        for item in packages:
+            if (
+                str(item.get("project_id") or "") == project_id
+                and str(item.get("status") or "") == "deployed"
+            ):
+                item["status"] = "shadow_pass"
+                item["updated_at"] = timestamp
         patch["status"] = "rolled_back"
-    patch["updated_at"] = now_iso()
-    save_patch_packages(packages)
+        rollback_target["status"] = "deployed"
+        rollback_target["updated_at"] = timestamp
+    patch["updated_at"] = timestamp
 
     record = {
         "id": new_id(),
@@ -355,12 +411,41 @@ def deploy_or_rollback_patch(
         "action": action,
         "deployed": deployed,
         "metrics_before_after": patch.get("shadow_metrics") or {},
-        "rollback_to_version": rollback_to_version or patch.get("rollback_pointer"),
-        "created_at": now_iso(),
+        "rollback_to_version": rollback_target_id or None,
+        "created_at": timestamp,
     }
     deployments = load_patch_deployments()
+    original_deployments = copy.deepcopy(deployments)
     deployments.append(record)
-    save_patch_deployments(deployments)
+    package_write_attempted = False
+    deployment_write_attempted = False
+    try:
+        package_write_attempted = True
+        save_patch_packages(packages)
+        deployment_write_attempted = True
+        save_patch_deployments(deployments)
+    except BaseException as transition_error:
+        restore_errors: List[str] = []
+        if package_write_attempted:
+            try:
+                save_patch_packages(original_packages)
+            except BaseException as restore_error:
+                restore_errors.append(f"patch package restore failed: {restore_error}")
+        if deployment_write_attempted:
+            try:
+                save_patch_deployments(original_deployments)
+            except BaseException as restore_error:
+                restore_errors.append(f"patch deployment restore failed: {restore_error}")
+        if restore_errors:
+            note = "; ".join(restore_errors)
+            add_note = getattr(transition_error, "add_note", None)
+            if callable(add_note):
+                add_note(note)
+            else:
+                notes = list(getattr(transition_error, "__notes__", []))
+                notes.append(note)
+                transition_error.__notes__ = notes
+        raise
     return record
 
 

@@ -10229,6 +10229,8 @@ def deploy_or_rollback_patch(
         raise HTTPException(status_code=404, detail="补丁包不存在")
     except patch_evolution_service.UnsupportedPatchActionError:
         raise HTTPException(status_code=422, detail="action 仅支持 deploy 或 rollback")
+    except patch_evolution_service.InvalidPatchTransitionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     return PatchDeploymentRecord(**record)
 
 
