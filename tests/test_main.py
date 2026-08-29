@@ -129,8 +129,47 @@ class TestIndexEndpoint:
         """Index endpoint should return HTML page."""
         response = client.get("/")
         assert response.status_code == 200
-        assert "<html>" in response.text
+        assert "<html" in response.text
         assert "青天评标系统" in response.text
+
+    def test_index_exposes_responsive_semantic_workflow_navigation(self, client):
+        """The primary workflow should remain usable by keyboard and on narrow screens."""
+        page = client.get("/").text
+
+        assert '<html lang="zh-CN">' in page
+        assert '<meta name="viewport" content="width=device-width, initial-scale=1">' in page
+        assert '<a class="skip-link" href="#mainContent">跳到主要内容</a>' in page
+        assert '<nav class="workflow-nav" aria-label="主要工作流程">' in page
+        assert '<main id="mainContent" tabindex="-1">' in page
+        for section_id in (
+            "apiKeyControls",
+            "section-create",
+            "section-project",
+            "section-materials",
+            "section-shigong",
+            "section-compare",
+            "section-evolution",
+            "section-output",
+        ):
+            assert f'id="{section_id}"' in page
+            assert f'href="#{section_id}"' in page or section_id == "mainContent"
+        assert "@media (max-width: 760px)" in page
+        assert "@media (prefers-reduced-motion: reduce)" in page
+        assert ":focus-visible" in page
+
+    def test_index_prevents_duplicate_actions_and_announces_async_results(self, client):
+        """Async buttons should be single-flight and result changes should be announced."""
+        page = client.get("/").text
+
+        assert "if (el.dataset.qingtianBusy === 'true') return;" in page
+        assert "el.dataset.qingtianBusy = 'true';" in page
+        assert "el.setAttribute('aria-busy', 'true');" in page
+        assert "delete el.dataset.qingtianBusy;" in page
+        assert "el.setAttribute('aria-busy', 'false');" in page
+        assert "initializeProductAccessibility();" in page
+        assert "document.querySelectorAll('.result-block')" in page
+        assert "el.setAttribute('role', 'status');" in page
+        assert "el.setAttribute('aria-live', 'polite');" in page
 
     def test_index_contains_forms(self, client):
         """Index page should contain all forms."""

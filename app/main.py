@@ -12048,9 +12048,10 @@ def index(
     initial_materials_empty_display = "block"
     initial_submissions_empty_display = "block"
     html = """
-    <html>
+    <html lang="zh-CN">
     <head>
       <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
       <title>青天评标系统</title>
       <style>
         :root { --bg:#f4f6fb; --card:#fff; --border:#dbe2ef; --primary:#2563eb; --text:#1e293b; }
@@ -12061,6 +12062,7 @@ def index(
         button { padding: 10px 16px; background: var(--primary); color: #fff; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; }
         button:hover { opacity: 0.9; }
         button:disabled { opacity: 0.45; cursor: not-allowed; }
+        button[aria-busy="true"]::after { content:""; display:inline-block; width:.75em; height:.75em; margin-left:8px; border:2px solid currentColor; border-right-color:transparent; border-radius:50%; animation:qingtian-spin .7s linear infinite; }
         button.secondary { background: #64748b; }
         button.btn-danger { background: #dc2626; color: #fff; position:relative; z-index:2; pointer-events:auto; }
         pre { white-space: pre-wrap; font-size: 12px; margin: 0; line-height: 1.45; }
@@ -12096,13 +12098,45 @@ def index(
         .weight-row input[type="range"] { width:100%; }
         .weight-row .raw-value { font-weight:600; color:#0f172a; text-align:right; }
         .weight-row .norm-value { color:#334155; text-align:right; font-size:12px; }
+        .skip-link { position:fixed; left:16px; top:-64px; z-index:1000; padding:10px 14px; border-radius:8px; background:#0f172a; color:#fff; text-decoration:none; }
+        .skip-link:focus { top:12px; }
+        .workflow-nav { position:sticky; top:0; z-index:20; display:flex; gap:8px; overflow-x:auto; margin:0 0 16px; padding:10px; border:1px solid var(--border); border-radius:12px; background:rgba(255,255,255,.96); box-shadow:0 4px 18px rgba(15,23,42,.08); }
+        .workflow-nav a { flex:0 0 auto; padding:7px 10px; border-radius:7px; color:#1d4ed8; font-size:13px; font-weight:650; text-decoration:none; }
+        .workflow-nav a:hover { background:#dbeafe; }
+        .section { scroll-margin-top:76px; }
+        :where(a,button,input,select,textarea,summary):focus-visible { outline:3px solid #f59e0b; outline-offset:3px; }
+        @keyframes qingtian-spin { to { transform:rotate(360deg); } }
+        @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior:auto !important; animation-duration:.01ms !important; animation-iteration-count:1 !important; } }
+        @media (max-width: 760px) {
+          body { padding:12px; }
+          h1 { font-size:1.55rem; }
+          h2 { font-size:1.3rem; }
+          .card { padding:14px; border-radius:10px; }
+          .toolbar, .inline-form, .action-row { align-items:stretch; }
+          input[type="text"], input[type="password"], select, textarea { box-sizing:border-box; width:100%; min-width:0; margin-right:0; }
+          button { min-height:44px; }
+          table { display:block; overflow-x:auto; white-space:nowrap; }
+          .weight-row { grid-template-columns:1fr 52px 72px; }
+          .weight-row label { grid-column:1 / -1; }
+        }
       </style>
     </head>
     <body>
+      <a class="skip-link" href="#mainContent">跳到主要内容</a>
       <h1>青天评标系统 - 上传与对比 (v2)</h1>
       <p style="margin:-8px 0 16px 0;padding:10px;background:#e0f2fe;border-radius:6px;font-size:14px;">
         <strong>首次使用：</strong>① 创建项目 → ② 刷新并选择项目 → ③ 上传施组文件 → ④ 点击“评分施组”出分。数据保存在本机，无需额外配置。
       </p>
+      <nav class="workflow-nav" aria-label="主要工作流程">
+        <a href="#apiKeyControls">认证</a>
+        <a href="#section-create">创建项目</a>
+        <a href="#section-project">选择项目</a>
+        <a href="#section-materials">上传资料</a>
+        <a href="#section-shigong">上传与评分施组</a>
+        <a href="#section-compare">对比洞察</a>
+        <a href="#section-evolution">学习进化</a>
+        <a href="#section-output">原始输出</a>
+      </nav>
       __GLOBAL_NOTICE_HTML__
       <script>
         (function () {
@@ -12500,6 +12534,7 @@ def index(
         })();
       </script>
 
+      <main id="mainContent" tabindex="-1">
       <div class="section card" id="apiKeyControls">
         <h2>API 访问认证</h2>
         <div class="toolbar">
@@ -12511,7 +12546,7 @@ def index(
         <p id="apiKeyStatus" class="muted" aria-live="polite">未保存 key</p>
       </div>
 
-      <div class="section card">
+      <div class="section card" id="section-create">
         <h2>1) 创建项目</h2>
         <form id="createProject" method="post" action="/web/create_project">
           项目名称：<input name="name" placeholder="例如：XX标段施组评审" />
@@ -12522,7 +12557,7 @@ def index(
         <p style="margin:4px 0 0 0;font-size:13px;color:#64748b">创建后可从下方下拉选择项目，或复制返回的 id 使用。</p>
       </div>
 
-      <div class="section card">
+      <div class="section card" id="section-project">
         <h2>2) 选择项目</h2>
         <div class="toolbar">
           <button type="button" id="refreshProjects">刷新项目列表</button>
@@ -12559,7 +12594,7 @@ def index(
         <p class="muted">下方所有操作将使用选中的项目。选择项目后建议先上传项目资料（招标、清单等），再上传施组进行评分。删除项目会同时删除该项目全部资料与记录。</p>
       </div>
 
-      <div class="section card">
+      <div class="section card" id="section-delivery">
         <h2>评分报告 / 证据链交付入口</h2>
         <p class="muted">本区集中提示已有交付路径，便于验收人员核对评分报告、证据链、评分依据、分析包和对比报告等交付物；页面仅提示交付路径，不新增后端接口，不改变运行逻辑，不接核心评分主链。</p>
         <ul style="margin:8px 0 0 18px;color:#334155;font-size:13px;line-height:1.7">
@@ -12652,7 +12687,7 @@ def index(
         </div>
       </div>
 
-      <div class="section card">
+      <div class="section card" id="section-weights">
         <h2>2.5) 青天评标关注度（16维）</h2>
         <p style="font-size:12px;color:#64748b;margin:-4px 0 10px 0">先设置16维关注度，再点击“应用到本项目并重算”。同一项目内所有施组将统一按该配置重算，历史快照会保留。</p>
         <div id="expertProfileStatus" style="font-size:13px;color:#334155;margin-bottom:8px">__EXPERT_PROFILE_STATUS__</div>
@@ -12763,7 +12798,7 @@ def index(
         <div id="perTenderResult" class="result-block" style="display:none"></div>
       </div>
 
-      <div class="section card">
+      <div class="section card" id="section-compare">
         <h2>5) 对比与洞察</h2>
         <p style="font-size:12px;color:#64748b;margin:-4px 0 8px 0">对比排名：看多份施组分数排序；对比报告：看叙述性差异；洞察：看弱项与扣分建议；学习画像：生成维度权重供后续评分参考。</p>
         <div class="action-row">
@@ -12802,7 +12837,7 @@ def index(
         <div id="adaptiveApplyResult" class="result-block" style="display:none"></div>
       </div>
 
-      <div class="section card">
+      <div class="section card" id="section-evolution">
         <h2>7) 自我学习与进化</h2>
         <p style="font-size:13px;color:#64748b;margin:0 0 6px 0">上传项目投喂包（招标/清单/图纸等合并文本），录入交易中心真实评标结果（5/7评委+最终得分），系统学习高分逻辑并生成编制指导。</p>
         <p style="font-size:12px;color:#475569;margin:0 0 10px 0">系统会将学习到的高分逻辑与编制指导持久保存，并用于本项目的预评分权重与编制系统指令；再次执行学习进化可基于新录入的真实评标升级这些经验。</p>
@@ -12919,10 +12954,11 @@ def index(
         <div id="evalResult" class="result-block" style="display:none"></div>
       </div>
 
-      <div class="section card">
+      <div class="section card" id="section-output">
         <h2>原始输出（最后一次请求）</h2>
         <pre id="output">（操作后这里显示原始 JSON）</pre>
       </div>
+      </main>
 
       <script>
         (function () {
@@ -13932,6 +13968,11 @@ def index(
           if (!el) return;
           const wrapped = async (ev) => {
             if (ev) ev.preventDefault();
+            if (el.dataset.qingtianBusy === 'true') return;
+            const restoreDisabled = el.disabled;
+            el.dataset.qingtianBusy = 'true';
+            el.setAttribute('aria-busy', 'true');
+            el.disabled = true;
             try {
               await fn(ev);
             } catch (err) {
@@ -13941,6 +13982,13 @@ def index(
                 setResultError(cfg.resultId, msg);
               }
               reportClientError('按钮[' + id + ']执行失败', err);
+            } finally {
+              delete el.dataset.qingtianBusy;
+              el.setAttribute('aria-busy', 'false');
+              el.disabled = restoreDisabled;
+              if (typeof updateProjectBoundControlsState === 'function') {
+                updateProjectBoundControlsState();
+              }
             }
           };
           if (SAFE_CLICK_HANDLERS[id]) {
@@ -13965,6 +14013,22 @@ def index(
           return true;
         };
         function safeChange(id, fn) { const el = document.getElementById(id); if (el) el.onchange = fn; }
+        function initializeProductAccessibility() {
+          document.querySelectorAll('.result-block').forEach((el) => {
+            el.setAttribute('role', 'status');
+            el.setAttribute('aria-live', 'polite');
+            el.setAttribute('aria-atomic', 'false');
+          });
+          document.querySelectorAll('[id$="Message"], [id$="Status"]').forEach((el) => {
+            if (!el.hasAttribute('aria-live')) el.setAttribute('aria-live', 'polite');
+          });
+          const output = document.getElementById('output');
+          if (output) {
+            output.setAttribute('role', 'status');
+            output.setAttribute('aria-live', 'polite');
+            output.setAttribute('aria-atomic', 'false');
+          }
+        }
         function storageGet(key) {
           try { return localStorage.getItem(key) || ''; } catch (_) { return ''; }
         }
@@ -17994,6 +18058,7 @@ def index(
         });
 
         // 关闭“硬接管”兜底，避免覆盖 safeClick 的详细渲染结果。
+        initializeProductAccessibility();
         initWeightsSection();
         syncGroundTruthJudgeInputs();
         updateProjectBoundControlsState();
