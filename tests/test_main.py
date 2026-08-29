@@ -781,7 +781,7 @@ class TestHealthEndpoints:
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "healthy"
-        assert data["version"] == "1.0.0"
+        assert data["version"] == "1.1.0rc1"
 
     def test_health_response_structure(self, client):
         """Health response should have correct structure."""
@@ -4570,7 +4570,7 @@ class TestMainExecution:
 
     def test_app_version(self):
         """App should have correct version."""
-        assert app.version == "1.0.0"
+        assert app.version == "1.1.0rc1"
 
 
 class TestApiI18n:

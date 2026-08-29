@@ -120,6 +120,8 @@ def test_container_and_compose_pin_security_persistence_and_health_contracts():
         'ENTRYPOINT ["python", "-m", "scripts.container_entrypoint"]',
         'CMD ["python", "scripts/container_healthcheck.py"]',
         "tesseract-ocr-chi-sim",
+        "org.opencontainers.image.version",
+        "APP_VERSION=1.1.0-rc.1",
     ):
         assert required in dockerfile
     assert service["read_only"] is True

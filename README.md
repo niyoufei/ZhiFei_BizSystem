@@ -177,7 +177,7 @@ python3 -m app.main
 
 ```bash
 curl -X POST http://localhost:8000/score \
-  -H "X-API-Key: your-secret-key-1" \
+  -H "X-API-Key: ${QINGTIAN_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{"text": "施工组织设计文本..."}'
 ```

@@ -340,6 +340,7 @@ from app.storage import (
     save_score_reports,
     save_submissions,
 )
+from app.version import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -4706,7 +4707,7 @@ def _build_constraint_pack(project_id: str) -> Dict[str, object]:
 
 app = FastAPI(
     title="青天评标系统 API",
-    version="1.0.0",
+    version=__version__,
     description="""
 ## 施工组织设计智能评审系统
 
@@ -4745,6 +4746,41 @@ app = FastAPI(
         "url": "https://opensource.org/licenses/MIT",
     },
 )
+
+
+def _normalize_openapi_compatibility(schema: dict[str, Any]) -> None:
+    """Preserve the certified OpenAPI surface across framework security updates."""
+    component_schemas = schema.get("components", {}).get("schemas", {})
+    for component in component_schemas.values():
+        pending: list[Any] = [component]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, dict):
+                if value.get("contentMediaType") == "application/octet-stream":
+                    value.pop("contentMediaType")
+                    value["format"] = "binary"
+                pending.extend(value.values())
+            elif isinstance(value, list):
+                pending.extend(value)
+
+    validation_error = component_schemas.get("ValidationError")
+    if isinstance(validation_error, dict):
+        properties = validation_error.get("properties")
+        if isinstance(properties, dict):
+            properties.pop("input", None)
+            properties.pop("ctx", None)
+
+
+_framework_openapi = app.openapi
+
+
+def _certified_openapi() -> dict[str, Any]:
+    schema = _framework_openapi()
+    _normalize_openapi_compatibility(schema)
+    return schema
+
+
+app.openapi = _certified_openapi
 
 # Setup rate limiting (infrastructure ready, decorators disabled due to compatibility)
 setup_rate_limiting(app)
@@ -5080,7 +5116,7 @@ def health_check() -> HealthResponse:
     - 不检查外部依赖
     - 响应时间应小于 100ms
     """
-    return HealthResponse(status="healthy", version="1.0.0")
+    return HealthResponse(status="healthy", version=__version__)
 
 
 @app.get(

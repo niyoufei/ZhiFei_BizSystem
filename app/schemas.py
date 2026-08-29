@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+from app.version import __version__
+
 # ==================== 健康检查模型 ====================
 
 
@@ -13,7 +15,9 @@ class HealthResponse(BaseModel):
     status: str = Field(..., description="服务状态：healthy/unhealthy")
     version: str = Field(..., description="API 版本号")
 
-    model_config = {"json_schema_extra": {"examples": [{"status": "healthy", "version": "1.0.0"}]}}
+    model_config = {
+        "json_schema_extra": {"examples": [{"status": "healthy", "version": __version__}]}
+    }
 
 
 class ReadyResponse(BaseModel):

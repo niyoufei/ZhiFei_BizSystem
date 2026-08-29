@@ -17,11 +17,19 @@ from fastapi.datastructures import DefaultPlaceholder
 from fastapi.routing import APIRoute
 from starlette.routing import Route
 
-ROUTE_MANIFEST_SHA256 = "852a6fa50cc45cfeed121802b9027251947d59d7b3008ed0a4cd0da7fe89cd8c"
-# R3C28 changed only the two atomic-configuration endpoint descriptions.
-OPENAPI_CANONICAL_SHA256 = "630607dd633f58ea5b1349831cf9b1b4ce76ba12118803f21ad1645ee49a7f61"
-AUTH_MATRIX_SHA256 = "c65f5c1c39dc89a57144b92be5c25ce51cf08c744464e4c718ba44a4482dfc67"
-FRONTEND_ADAPTER_SHA256 = "4afc2aa2d276f5e1c6b50ca3a62381a5a163b641233585f2e9cff642780569fb"
+ROUTE_MANIFEST_SHA256 = (
+    "852a6fa50cc45cfeed121802b9027251947d59d7b3008ed0a4cd0da7fe89cd8c"  # gitleaks:allow
+)
+# R7 adds the certified 1.1.0rc1 OpenAPI and health-example version metadata.
+OPENAPI_CANONICAL_SHA256 = (
+    "335199e1a5043fcefa957b85b6686c6bc36d10ec8d250a7b3f169eec87e02b78"  # gitleaks:allow
+)
+AUTH_MATRIX_SHA256 = (
+    "c65f5c1c39dc89a57144b92be5c25ce51cf08c744464e4c718ba44a4482dfc67"  # gitleaks:allow
+)
+FRONTEND_ADAPTER_SHA256 = (
+    "4afc2aa2d276f5e1c6b50ca3a62381a5a163b641233585f2e9cff642780569fb"  # gitleaks:allow
+)
 
 HTTP_METHOD_KEYS = {"get", "put", "post", "delete", "options", "head", "patch", "trace"}
 
@@ -82,9 +90,7 @@ def _stable_type(value: Any) -> str:
         value = value.value
     if value is None:
         return "-"
-    return getattr(value, "__name__", None) or re.sub(
-        r"\s+", "", str(value).replace("typing.", "")
-    )
+    return getattr(value, "__name__", None) or re.sub(r"\s+", "", str(value).replace("typing.", ""))
 
 
 def _route_records(app: FastAPI, verify_api_key: Any) -> list[dict[str, Any]]:
@@ -106,14 +112,10 @@ def _route_records(app: FastAPI, verify_api_key: Any) -> list[dict[str, Any]]:
                 "include_in_schema": bool(getattr(route, "include_in_schema", False)),
                 "declared_status": getattr(route, "status_code", None) or 200,
                 "response_model": (
-                    _stable_type(getattr(route, "response_model", None))
-                    if is_api_route
-                    else "-"
+                    _stable_type(getattr(route, "response_model", None)) if is_api_route else "-"
                 ),
                 "response_class": (
-                    _stable_type(getattr(route, "response_class", None))
-                    if is_api_route
-                    else "-"
+                    _stable_type(getattr(route, "response_class", None)) if is_api_route else "-"
                 ),
                 "declared_responses": (
                     ",".join(sorted(map(str, (getattr(route, "responses", {}) or {}).keys())))
@@ -130,13 +132,11 @@ def _single_api_route(app: FastAPI, path: str, method: str) -> APIRoute:
     matches = [
         route
         for route in app.routes
-        if isinstance(route, APIRoute)
-        and route.path == path
-        and method in (route.methods or set())
+        if isinstance(route, APIRoute) and route.path == path and method in (route.methods or set())
     ]
-    assert len(matches) == 1, (
-        f"route count difference for {method} {path}: expected=1 actual={len(matches)}"
-    )
+    assert (
+        len(matches) == 1
+    ), f"route count difference for {method} {path}: expected=1 actual={len(matches)}"
     return matches[0]
 
 
@@ -148,9 +148,7 @@ def _operation(openapi: dict[str, Any], path: str, method: str) -> dict[str, Any
     return operation
 
 
-def _multipart_object_schema(
-    openapi: dict[str, Any], path: str, method: str
-) -> dict[str, Any]:
+def _multipart_object_schema(openapi: dict[str, Any], path: str, method: str) -> dict[str, Any]:
     operation = _operation(openapi, path, method)
     content = operation.get("requestBody", {}).get("content", {})
     assert "multipart/form-data" in content, (
@@ -205,13 +203,11 @@ def test_formal_app_factory_and_route_counts(runtime_modules) -> None:
 def test_openapi_versions_and_counts(runtime_modules) -> None:
     openapi = runtime_modules.main.app.openapi()
     assert openapi.get("openapi") == "3.1.0"
-    assert openapi.get("info", {}).get("version") == "1.0.0"
+    assert openapi.get("info", {}).get("version") == "1.1.0rc1"
 
     paths = openapi.get("paths", {})
     operations = sum(
-        method.lower() in HTTP_METHOD_KEYS
-        for path_item in paths.values()
-        for method in path_item
+        method.lower() in HTTP_METHOD_KEYS for path_item in paths.values() for method in path_item
     )
     schemas = openapi.get("components", {}).get("schemas", {})
     _assert_count("OpenAPI path", len(paths), 120)
@@ -226,8 +222,8 @@ def test_auth_contract(runtime_modules) -> None:
     assert auth.API_KEY_HEADER_NAME == "X-API-Key"
 
     openapi = app.openapi()
-    api_key_scheme = openapi.get("components", {}).get("securitySchemes", {}).get(
-        "APIKeyHeader", {}
+    api_key_scheme = (
+        openapi.get("components", {}).get("securitySchemes", {}).get("APIKeyHeader", {})
     )
     assert api_key_scheme == {"type": "apiKey", "in": "header", "name": "X-API-Key"}
 
@@ -239,7 +235,8 @@ def test_auth_contract(runtime_modules) -> None:
     api_compat_routes = [
         route
         for route in app.routes
-        if isinstance(route, APIRoute) and route.path.startswith("/api/")
+        if isinstance(route, APIRoute)
+        and route.path.startswith("/api/")
         and not route.path.startswith("/api/v1/")
     ]
     _assert_count("protected /api/v1 route", len(api_v1_routes), 95)
@@ -249,9 +246,9 @@ def test_auth_contract(runtime_modules) -> None:
 
     for path in ("/health", "/ready"):
         route = _single_api_route(app, path, "GET")
-        assert not _requires_api_key(route, main.verify_api_key), (
-            f"auth difference for GET {path}: expected=no_auth actual=auth"
-        )
+        assert not _requires_api_key(
+            route, main.verify_api_key
+        ), f"auth difference for GET {path}: expected=no_auth actual=auth"
 
 
 @pytest.mark.parametrize(
@@ -277,9 +274,9 @@ def test_root_and_frontend_adapter_contract(runtime_modules) -> None:
     app = main.app
     for method in ("GET", "HEAD"):
         route = _single_api_route(app, "/", method)
-        assert route.include_in_schema is False, (
-            f"schema visibility difference for {method} /: expected=hidden actual=schema"
-        )
+        assert (
+            route.include_in_schema is False
+        ), f"schema visibility difference for {method} /: expected=hidden actual=schema"
 
     records = _route_records(app, main.verify_api_key)
     web_records = [record for record in records if record["path"].startswith("/web/")]
@@ -327,60 +324,69 @@ def test_root_and_frontend_adapter_contract(runtime_modules) -> None:
         ),
         ("POST", "/web/upload_shigong", "web_upload_shigong", "auth", "hidden"),
     ]
-    assert actual == expected, f"/web/* adapter state difference:\nexpected={expected}\nactual={actual}"
+    assert (
+        actual == expected
+    ), f"/web/* adapter state difference:\nexpected={expected}\nactual={actual}"
 
 
 def test_frozen_runtime_contract_hashes(runtime_modules) -> None:
     main = runtime_modules.main
     records = _route_records(main.app, main.verify_api_key)
 
-    route_manifest = "\n".join(
-        "\t".join(
-            map(
-                str,
+    route_manifest = (
+        "\n".join(
+            "\t".join(
+                map(
+                    str,
+                    [
+                        record["methods"],
+                        record["path"],
+                        record["endpoint"],
+                        record["route_class"],
+                        record["owner"],
+                        record["category"],
+                        "auth" if record["auth"] else "no_auth",
+                        "schema" if record["include_in_schema"] else "hidden",
+                        record["declared_status"],
+                        record["response_model"],
+                        record["response_class"],
+                        record["declared_responses"],
+                    ],
+                )
+            )
+            for record in records
+        )
+        + "\n"
+    )
+    auth_matrix = (
+        "\n".join(
+            "\t".join(
+                [
+                    record["methods"],
+                    record["path"],
+                    "auth" if record["auth"] else "no_auth",
+                ]
+            )
+            for record in records
+        )
+        + "\n"
+    )
+    frontend_records = [record for record in records if record["category"] in {"/", "web"}]
+    frontend_adapter = (
+        "\n".join(
+            "\t".join(
                 [
                     record["methods"],
                     record["path"],
                     record["endpoint"],
-                    record["route_class"],
-                    record["owner"],
-                    record["category"],
                     "auth" if record["auth"] else "no_auth",
                     "schema" if record["include_in_schema"] else "hidden",
-                    record["declared_status"],
-                    record["response_model"],
-                    record["response_class"],
-                    record["declared_responses"],
-                ],
+                ]
             )
+            for record in frontend_records
         )
-        for record in records
-    ) + "\n"
-    auth_matrix = "\n".join(
-        "\t".join(
-            [
-                record["methods"],
-                record["path"],
-                "auth" if record["auth"] else "no_auth",
-            ]
-        )
-        for record in records
-    ) + "\n"
-    frontend_records = [
-        record for record in records if record["category"] in {"/", "web"}
-    ]
-    frontend_adapter = "\n".join(
-        "\t".join(
-            [
-                record["methods"],
-                record["path"],
-                record["endpoint"],
-                "auth" if record["auth"] else "no_auth",
-                "schema" if record["include_in_schema"] else "hidden",
-            ]
-        )
-        for record in frontend_records
-    ) + "\n"
+        + "\n"
+    )
     openapi_canonical = json.dumps(
         main.app.openapi(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
