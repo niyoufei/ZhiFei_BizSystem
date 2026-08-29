@@ -73,6 +73,7 @@ import app.engine.local_llm_ollama_preview_adapter as local_llm_ollama_preview_a
 import app.engine.local_llm_preview_mock as local_llm_preview_mock
 import app.engine.zdoc_zbid_preview_receiver as zdoc_zbid_preview_receiver
 import app.evidence_trace_service as evidence_trace_service
+import app.evolution_report_service as evolution_report_service
 import app.feedback_closed_loop_service as feedback_closed_loop_service
 import app.ground_truth_sync_service as ground_truth_sync_service
 import app.latest_report_service as latest_report_service
@@ -4257,70 +4258,30 @@ def _sync_feedback_weights_to_evolution(
     project_id: str,
     weight_update: Dict[str, object],
 ) -> Dict[str, object]:
-    if not bool(weight_update.get("updated")):
-        return {"synced": False, "reason": "weight_not_updated"}
-    multipliers = weight_update.get("new_dimension_multipliers") or {}
-    if not isinstance(multipliers, dict) or not multipliers:
-        return {"synced": False, "reason": "missing_multipliers"}
-    reports = load_evolution_reports()
-    evo = reports.get(project_id) or {}
-    scoring_evolution = (
-        evo.get("scoring_evolution") if isinstance(evo.get("scoring_evolution"), dict) else {}
+    return evolution_report_service.sync_feedback_weights(
+        project_id,
+        weight_update,
+        dimension_ids=DIMENSION_IDS,
+        load_evolution_reports=load_evolution_reports,
+        save_evolution_reports=save_evolution_reports,
+        now_iso=_now_iso,
     )
-    scoring_evolution = dict(scoring_evolution or {})
-    scoring_evolution["dimension_multipliers"] = {
-        dim_id: float(multipliers.get(dim_id, 1.0)) for dim_id in DIMENSION_IDS
-    }
-    scoring_evolution.setdefault("rationale", {})
-    scoring_evolution["updated_by_feedback"] = True
-    scoring_evolution["updated_by_feedback_at"] = _now_iso()
-    evo["scoring_evolution"] = scoring_evolution
-    evo.setdefault("project_id", project_id)
-    evo.setdefault("sample_count", 0)
-    evo["updated_at"] = _now_iso()
-    reports[project_id] = evo
-    save_evolution_reports(reports)
-    return {
-        "synced": True,
-        "dimension_multipliers_count": len(scoring_evolution.get("dimension_multipliers") or {}),
-    }
 
 
 @atomic_json_transaction("evolution_reports")
 def _refresh_evolution_report_from_ground_truth(project_id: str) -> Dict[str, object]:
-    projects = load_projects()
-    project = next((p for p in projects if str(p.get("id")) == project_id), None)
-    if project is None:
-        return {"refreshed": False, "reason": "project_not_found"}
-    project_score_scale = _resolve_project_score_scale_max(project)
-    records_raw = [r for r in load_ground_truth() if str(r.get("project_id")) == project_id]
-    records = [
-        _ground_truth_record_for_learning(
-            r if isinstance(r, dict) else {},
-            default_score_scale_max=project_score_scale,
-        )
-        for r in records_raw
-    ]
-    ctx_data = load_project_context().get(project_id) or {}
-    project_context = str(ctx_data.get("text") or "").strip()
-    materials_text = _merge_materials_text(project_id)
-    if materials_text:
-        project_context = (
-            (project_context + "\n\n" + materials_text) if project_context else materials_text
-        )
-
-    report = build_evolution_report(project_id, records, project_context)
-    reports = load_evolution_reports()
-    prev = reports.get(project_id) or {}
-    # 自动闭环刷新时仅更新规则进化结果与编制指导；保留已有 LLM 增强来源标记。
-    if isinstance(prev.get("enhanced_by"), str):
-        report["enhanced_by"] = prev.get("enhanced_by")
-    reports[project_id] = report
-    save_evolution_reports(reports)
-    return {
-        "refreshed": True,
-        "sample_count": int(report.get("sample_count", 0) or 0),
-    }
+    return evolution_report_service.refresh_from_ground_truth(
+        project_id,
+        load_projects=load_projects,
+        resolve_project_score_scale_max=_resolve_project_score_scale_max,
+        load_ground_truth=load_ground_truth,
+        normalize_ground_truth_record=_ground_truth_record_for_learning,
+        load_project_context=load_project_context,
+        merge_materials_text=_merge_materials_text,
+        build_evolution_report=build_evolution_report,
+        load_evolution_reports=load_evolution_reports,
+        save_evolution_reports=save_evolution_reports,
+    )
 
 
 def _run_feedback_closed_loop(project_id: str, *, locale: str, trigger: str) -> Dict[str, object]:
@@ -11589,34 +11550,19 @@ def evolve_project(
     project = next((p for p in projects if p["id"] == project_id), None)
     if project is None:
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    project_score_scale = _resolve_project_score_scale_max(project)
-    records_raw = [r for r in load_ground_truth() if r.get("project_id") == project_id]
-    records = [
-        _ground_truth_record_for_learning(
-            r if isinstance(r, dict) else {},
-            default_score_scale_max=project_score_scale,
-        )
-        for r in records_raw
-    ]
-    ctx_data = load_project_context().get(project_id) or {}
-    project_context = (ctx_data.get("text") or "").strip()
-    materials_text = _merge_materials_text(project_id)
-    if materials_text:
-        project_context = (
-            (project_context + "\n\n" + materials_text) if project_context else materials_text
-        )
-    report = build_evolution_report(project_id, records, project_context)
-    enhanced = enhance_evolution_report_with_llm(project_id, report, records, project_context)
-    if enhanced is not None:
-        report["high_score_logic"] = enhanced.get("high_score_logic", report["high_score_logic"])
-        report["writing_guidance"] = enhanced.get("writing_guidance", report["writing_guidance"])
-        report["sample_count"] = enhanced.get("sample_count", report["sample_count"])
-        report["updated_at"] = enhanced.get("updated_at", report["updated_at"])
-        report["enhanced_by"] = enhanced.get("enhanced_by")  # 可追溯：spark | openai | gemini
-        # 保留规则版产出的 scoring_evolution、compilation_instructions（LLM 仅增强文字部分）
-    reports = load_evolution_reports()
-    reports[project_id] = report
-    save_evolution_reports(reports)
+    report = evolution_report_service.generate_and_persist(
+        project_id,
+        project,
+        resolve_project_score_scale_max=_resolve_project_score_scale_max,
+        load_ground_truth=load_ground_truth,
+        normalize_ground_truth_record=_ground_truth_record_for_learning,
+        load_project_context=load_project_context,
+        merge_materials_text=_merge_materials_text,
+        build_evolution_report=build_evolution_report,
+        enhance_evolution_report=enhance_evolution_report_with_llm,
+        load_evolution_reports=load_evolution_reports,
+        save_evolution_reports=save_evolution_reports,
+    )
     return EvolutionReport(**report)
 
 
