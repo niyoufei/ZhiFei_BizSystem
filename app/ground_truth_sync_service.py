@@ -77,6 +77,7 @@ def sync_ground_truth_record_to_qingtian(
             "updated_at": current_time,
             "expert_profile_id_used": profile_snapshot.get("id") if profile_snapshot else None,
             "source_ground_truth_id": source_gt_id,
+            "ground_truth_generated": True,
             "bidder_name": f"GT_{source_gt_id[:8]}",
         }
         submissions.append(matched_submission)

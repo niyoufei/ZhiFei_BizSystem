@@ -4396,6 +4396,46 @@ class TestAdaptiveApplyEndpoint:
         mock_apply_and_persist.assert_called_once()
 
 
+class TestGroundTruthDeleteEndpoint:
+    @patch(
+        "app.main.ground_truth_write_service.delete_ground_truth_cascade",
+        return_value=True,
+    )
+    @patch("app.main.load_projects", return_value=[{"id": "p1"}])
+    @patch("app.main.ensure_data_dirs")
+    def test_delete_ground_truth_delegates_and_returns_204(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_delete,
+        client,
+    ):
+        response = client.delete("/api/v1/projects/p1/ground_truth/gt1")
+
+        assert response.status_code == 204
+        mock_delete.assert_called_once()
+        assert mock_delete.call_args.args == ("p1", "gt1")
+
+    @patch(
+        "app.main.ground_truth_write_service.delete_ground_truth_cascade",
+        return_value=False,
+    )
+    @patch("app.main.load_projects", return_value=[{"id": "p1"}])
+    @patch("app.main.ensure_data_dirs")
+    def test_delete_ground_truth_missing_record_preserves_404_contract(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_delete,
+        client,
+    ):
+        response = client.delete("/api/v1/projects/p1/ground_truth/missing")
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == "真实评标记录不存在"
+        mock_delete.assert_called_once()
+
+
 class TestMainExecution:
     """Tests for main module execution."""
 

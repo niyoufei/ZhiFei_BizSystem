@@ -77,6 +77,7 @@ import app.evidence_trace_service as evidence_trace_service
 import app.evolution_report_service as evolution_report_service
 import app.feedback_closed_loop_service as feedback_closed_loop_service
 import app.ground_truth_sync_service as ground_truth_sync_service
+import app.ground_truth_write_service as ground_truth_write_service
 import app.latest_report_service as latest_report_service
 import app.learning_profile_service as learning_profile_service
 import app.material_delete_service as material_delete_service
@@ -4615,6 +4616,7 @@ def _auto_update_feature_confidence_on_ground_truth(
     "project_requirements",
     "projects",
     "qingtian_results",
+    "score_history",
     "score_reports",
     "submissions",
 )
@@ -11138,6 +11140,7 @@ def _new_ground_truth_record(
     "project_requirements",
     "projects",
     "qingtian_results",
+    "score_history",
     "score_reports",
     "submissions",
 )
@@ -11204,6 +11207,7 @@ def add_ground_truth(
     "project_requirements",
     "projects",
     "qingtian_results",
+    "score_history",
     "score_reports",
     "submissions",
 )
@@ -11443,6 +11447,7 @@ def list_ground_truth(
     "evidence_units",
     "ground_truth",
     "qingtian_results",
+    "score_history",
     "score_reports",
     "submissions",
 )
@@ -11457,56 +11462,29 @@ def delete_ground_truth(
     projects = load_projects()
     if not any(p["id"] == project_id for p in projects):
         raise HTTPException(status_code=404, detail=t("api.project_not_found", locale=locale))
-    records = load_ground_truth()
-    if not any(r.get("id") == record_id and r.get("project_id") == project_id for r in records):
-        raise HTTPException(status_code=404, detail="真实评标记录不存在")
-    removed = next(
-        (r for r in records if r.get("id") == record_id and r.get("project_id") == project_id),
-        None,
+    deleted = ground_truth_write_service.delete_ground_truth_cascade(
+        project_id,
+        record_id,
+        load_ground_truth=load_ground_truth,
+        save_ground_truth=save_ground_truth,
+        load_qingtian_results=load_qingtian_results,
+        save_qingtian_results=save_qingtian_results,
+        load_submissions=load_submissions,
+        save_submissions=save_submissions,
+        load_score_reports=load_score_reports,
+        save_score_reports=save_score_reports,
+        load_evidence_units=load_evidence_units,
+        save_evidence_units=save_evidence_units,
+        load_score_history=load_score_history,
+        save_score_history=save_score_history,
+        load_calibration_samples=load_calibration_samples,
+        save_calibration_samples=save_calibration_samples,
+        load_delta_cases=load_delta_cases,
+        save_delta_cases=save_delta_cases,
+        refresh_project_reflection_objects=_refresh_project_reflection_objects,
     )
-    records = [
-        r for r in records if not (r.get("id") == record_id and r.get("project_id") == project_id)
-    ]
-    save_ground_truth(records)
-    if removed is not None:
-        gt_id = str(removed.get("id") or "")
-        qtrs = load_qingtian_results()
-        linked_submission_ids = {
-            str(q.get("submission_id") or "")
-            for q in qtrs
-            if str((q.get("raw_payload") or {}).get("ground_truth_record_id") or "") == gt_id
-        }
-        qtrs = [
-            q
-            for q in qtrs
-            if str((q.get("raw_payload") or {}).get("ground_truth_record_id") or "") != gt_id
-        ]
-        save_qingtian_results(qtrs)
-
-        submissions = load_submissions()
-        auto_submission_ids = {
-            str(s.get("id") or "")
-            for s in submissions
-            if str(s.get("source_ground_truth_id") or "") == gt_id
-            and str(s.get("project_id")) == project_id
-        }
-        remove_submission_ids = linked_submission_ids.union(auto_submission_ids)
-        if remove_submission_ids:
-            submissions = [
-                s for s in submissions if str(s.get("id") or "") not in remove_submission_ids
-            ]
-            save_submissions(submissions)
-            reports = load_score_reports()
-            reports = [
-                r for r in reports if str(r.get("submission_id") or "") not in remove_submission_ids
-            ]
-            save_score_reports(reports)
-            units = load_evidence_units()
-            units = [
-                u for u in units if str(u.get("submission_id") or "") not in remove_submission_ids
-            ]
-            save_evidence_units(units)
-        _refresh_project_reflection_objects(project_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="真实评标记录不存在")
 
 
 @router.post(
