@@ -87,6 +87,7 @@ import app.material_upload_service as material_upload_service
 import app.patch_evolution_service as patch_evolution_service
 import app.project_context_service as project_context_service
 import app.project_delete_service as project_delete_service
+import app.project_lifecycle_service as project_lifecycle_service
 import app.project_profile_service as project_profile_service
 import app.qingtian_result_service as qingtian_result_service
 import app.reflection_sample_service as reflection_sample_service
@@ -953,113 +954,34 @@ def _ensure_project_expert_profile(
 def _recover_missing_project_from_artifacts(
     project_id: str, projects: List[Dict[str, object]]
 ) -> Optional[Dict[str, object]]:
-    projects[:] = load_projects()
-    pid = str(project_id or "").strip()
-    if not pid:
-        return None
-    for p in projects:
-        if str(p.get("id") or "") == pid:
-            return p
-
-    submissions = [s for s in load_submissions() if str(s.get("project_id") or "") == pid]
-    materials = [m for m in load_materials() if str(m.get("project_id") or "") == pid]
-    ground_truth = [g for g in load_ground_truth() if str(g.get("project_id") or "") == pid]
-    evo_reports = load_evolution_reports()
-    has_evolution = pid in evo_reports
-
-    if not submissions and not materials and not ground_truth and not has_evolution:
-        return None
-
-    name_seed = ""
-    for row in materials + submissions:
-        filename = str(row.get("filename") or "").strip()
-        if filename:
-            name_seed = filename
-            break
-    if name_seed:
-        stem = name_seed.rsplit(".", 1)[0].strip()
-        recovered_name = (stem or name_seed) + "（恢复）"
-    else:
-        recovered_name = f"恢复项目_{pid[:8]}"
-
-    time_points: List[str] = []
-    for row in submissions:
-        created_at = str(row.get("created_at") or "").strip()
-        updated_at = str(row.get("updated_at") or "").strip()
-        if created_at:
-            time_points.append(created_at)
-        if updated_at:
-            time_points.append(updated_at)
-    for row in materials + ground_truth:
-        created_at = str(row.get("created_at") or "").strip()
-        if created_at:
-            time_points.append(created_at)
-    evo_updated_at = str((evo_reports.get(pid) or {}).get("updated_at") or "").strip()
-    if evo_updated_at:
-        time_points.append(evo_updated_at)
-    created_at = min(time_points) if time_points else _now_iso()
-    updated_at = max(time_points) if time_points else _now_iso()
-
-    score_scale_max = DEFAULT_SCORE_SCALE_MAX
-    for s in submissions:
-        report = s.get("report")
-        if not isinstance(report, dict):
-            continue
-        meta = report.get("meta")
-        if not isinstance(meta, dict):
-            continue
-        raw = meta.get("score_scale_max")
-        if str(raw) == "5":
-            score_scale_max = 5
-            break
-        if str(raw) == "100":
-            score_scale_max = 100
-
-    recovered = {
-        "id": pid,
-        "name": recovered_name,
-        "meta": {"score_scale_max": score_scale_max},
-        "region": DEFAULT_REGION,
-        "expert_profile_id": None,
-        "qingtian_model_version": DEFAULT_QINGTIAN_MODEL_VERSION,
-        "scoring_engine_version_locked": DEFAULT_SCORING_ENGINE_LOCKED,
-        "calibrator_version_locked": DEFAULT_CALIBRATOR_LOCKED,
-        "status": "scoring_preparation",
-        "created_at": created_at,
-        "updated_at": updated_at,
-    }
-    _ensure_project_v2_fields(recovered)
-    projects.append(recovered)
-    save_projects(projects)
-    return recovered
+    return project_lifecycle_service.recover_missing_project_from_artifacts(
+        project_id,
+        projects,
+        load_projects=load_projects,
+        load_submissions=load_submissions,
+        load_materials=load_materials,
+        load_ground_truth=load_ground_truth,
+        load_evolution_reports=load_evolution_reports,
+        save_projects=save_projects,
+        ensure_project_v2_fields=_ensure_project_v2_fields,
+        now_iso=_now_iso,
+        default_score_scale_max=DEFAULT_SCORE_SCALE_MAX,
+        default_region=DEFAULT_REGION,
+        default_qingtian_model_version=DEFAULT_QINGTIAN_MODEL_VERSION,
+        default_scoring_engine_locked=DEFAULT_SCORING_ENGINE_LOCKED,
+        default_calibrator_locked=DEFAULT_CALIBRATOR_LOCKED,
+    )
 
 
 def _recover_latest_orphan_project(
     projects: List[Dict[str, object]],
 ) -> Optional[Dict[str, object]]:
-    existing_ids = {str(p.get("id") or "") for p in projects}
-    latest_pid = ""
-    latest_at = ""
-
-    for row in load_submissions():
-        pid = str(row.get("project_id") or "").strip()
-        if not pid or pid in existing_ids:
-            continue
-        ts = str(row.get("updated_at") or row.get("created_at") or "").strip()
-        if ts and ts > latest_at:
-            latest_at = ts
-            latest_pid = pid
-    for row in load_materials():
-        pid = str(row.get("project_id") or "").strip()
-        if not pid or pid in existing_ids:
-            continue
-        ts = str(row.get("created_at") or "").strip()
-        if ts and ts > latest_at:
-            latest_at = ts
-            latest_pid = pid
-    if not latest_pid:
-        return None
-    return _recover_missing_project_from_artifacts(latest_pid, projects)
+    return project_lifecycle_service.recover_latest_orphan_project(
+        projects,
+        load_submissions=load_submissions,
+        load_materials=load_materials,
+        recover_missing_project=_recover_missing_project_from_artifacts,
+    )
 
 
 def _find_project(project_id: str, projects: List[Dict[str, object]]) -> Dict[str, object]:
@@ -5975,26 +5897,23 @@ def create_project(
     **需要 API Key 认证**
     """
     ensure_data_dirs()
-    projects = load_projects()
-    if any(p["name"] == payload.name for p in projects):
-        raise HTTPException(status_code=422, detail="项目名称已存在，请更换名称")
-    project_id = str(uuid4())
-    record = {
-        "id": project_id,
-        "name": payload.name,
-        "meta": payload.meta or {},
-        "region": DEFAULT_REGION,
-        "expert_profile_id": None,
-        "qingtian_model_version": DEFAULT_QINGTIAN_MODEL_VERSION,
-        "scoring_engine_version_locked": DEFAULT_SCORING_ENGINE_LOCKED,
-        "calibrator_version_locked": DEFAULT_CALIBRATOR_LOCKED,
-        "status": "scoring_preparation",
-        "created_at": _now_iso(),
-        "updated_at": _now_iso(),
-    }
-    _ensure_project_v2_fields(record)
-    projects.append(record)
-    save_projects(projects)
+    record = project_lifecycle_service.create_project_record(
+        name=payload.name,
+        meta=payload.meta,
+        load_projects=load_projects,
+        save_projects=save_projects,
+        duplicate_name_error=lambda: HTTPException(
+            status_code=422,
+            detail="项目名称已存在，请更换名称",
+        ),
+        new_id=lambda: str(uuid4()),
+        now_iso=_now_iso,
+        ensure_project_v2_fields=_ensure_project_v2_fields,
+        default_region=DEFAULT_REGION,
+        default_qingtian_model_version=DEFAULT_QINGTIAN_MODEL_VERSION,
+        default_scoring_engine_locked=DEFAULT_SCORING_ENGINE_LOCKED,
+        default_calibrator_locked=DEFAULT_CALIBRATOR_LOCKED,
+    )
     return ProjectRecord(**record)
 
 
@@ -6007,22 +5926,13 @@ def list_projects() -> list[ProjectRecord]:
     返回系统中已创建的所有项目记录。
     """
     ensure_data_dirs()
-    projects = load_projects()
-    if not os.environ.get("PYTEST_CURRENT_TEST"):
-        active_projects = [
-            p
-            for p in projects
-            if str(p.get("id") or "") != "p1" and not str(p.get("name") or "").startswith("E2E_")
-        ]
-        if not active_projects:
-            recovered = _recover_latest_orphan_project(projects)
-            if recovered is not None:
-                projects = load_projects()
-    changed = False
-    for p in projects:
-        changed = _ensure_project_v2_fields(p) or changed
-    if changed:
-        save_projects(projects)
+    projects = project_lifecycle_service.list_project_records(
+        load_projects=load_projects,
+        save_projects=save_projects,
+        ensure_project_v2_fields=_ensure_project_v2_fields,
+        recovery_enabled=not bool(os.environ.get("PYTEST_CURRENT_TEST")),
+        recover_latest_orphan_project=_recover_latest_orphan_project,
+    )
     return [ProjectRecord(**p) for p in projects]
 
 
