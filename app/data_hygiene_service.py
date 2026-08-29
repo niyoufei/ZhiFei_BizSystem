@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import Any, Callable, Dict, List
+
+from app.repository_uow import RepositoryUnitOfWork, repositories_from_callbacks
 
 Record = Dict[str, object]
 Records = List[Record]
@@ -30,19 +31,6 @@ DATA_HYGIENE_STORES = (
     "score_reports",
     "submissions",
 )
-
-
-def _append_rollback_note(error: BaseException, rollback_error: BaseException) -> None:
-    note = (
-        "data-hygiene rollback also failed: " f"{type(rollback_error).__name__}: {rollback_error}"
-    )
-    add_note = getattr(error, "add_note", None)
-    if callable(add_note):
-        add_note(note)
-        return
-    notes = list(getattr(error, "__notes__", []))
-    notes.append(note)
-    error.__notes__ = notes
 
 
 def _build_report_locked(
@@ -265,40 +253,19 @@ def build_data_hygiene_report(
     savers: SaverMap,
     now_iso: Callable[[], str],
 ) -> Record:
-    @atomic_json_transaction(*DATA_HYGIENE_STORES)
-    def build() -> Record:
-        if not apply:
-            return _build_report_locked(
-                apply=False,
-                loaders=loaders,
-                savers=savers,
-                now_iso=now_iso,
-            )
+    unit_of_work = RepositoryUnitOfWork(
+        repositories_from_callbacks(loaders=loaders, savers=savers),
+        transaction_factory=atomic_json_transaction,
+    )
 
-        originals = {name: deepcopy(loaders[name]()) for name in savers}
-        attempted: List[str] = []
-        tracked_savers: SaverMap = {}
-        for name, saver in savers.items():
+    def build(repositories) -> Record:
+        session_loaders = {name: repositories[name].load for name in DATA_HYGIENE_STORES}
+        session_savers = {name: repositories[name].save for name in savers}
+        return _build_report_locked(
+            apply=apply,
+            loaders=session_loaders,
+            savers=session_savers,
+            now_iso=now_iso,
+        )
 
-            def tracked_save(data: Any, *, _name=name, _saver=saver) -> None:
-                if _name not in attempted:
-                    attempted.append(_name)
-                _saver(data)
-
-            tracked_savers[name] = tracked_save
-        try:
-            return _build_report_locked(
-                apply=True,
-                loaders=loaders,
-                savers=tracked_savers,
-                now_iso=now_iso,
-            )
-        except BaseException as error:
-            for name in reversed(attempted):
-                try:
-                    savers[name](deepcopy(originals[name]))
-                except BaseException as rollback_error:
-                    _append_rollback_note(error, rollback_error)
-            raise
-
-    return build()
+    return unit_of_work.run(DATA_HYGIENE_STORES, build)
