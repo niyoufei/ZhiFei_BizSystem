@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import os
 from typing import Optional
@@ -12,6 +13,8 @@ from fastapi.security import APIKeyHeader
 # API Key 配置
 API_KEYS_ENV = "API_KEYS"
 API_KEY_HEADER_NAME = "X-API-Key"
+LOCAL_WEB_SESSION_COOKIE = "qingtian_local_ui_session"
+_LOCAL_WEB_SESSION_CONTEXT = b"qingtian-local-web-session-v1"
 
 # Security schemes
 api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
@@ -36,6 +39,33 @@ def is_auth_enabled() -> bool:
         True 如果配置了至少一个 API Key，否则 False
     """
     return len(get_valid_api_keys()) > 0
+
+
+def create_local_web_session_token() -> str | None:
+    """Return an opaque same-origin UI token without exposing the API key."""
+    valid_keys = get_valid_api_keys()
+    if not valid_keys:
+        return None
+    return hmac.new(
+        valid_keys[0].encode("utf-8"),
+        _LOCAL_WEB_SESSION_CONTEXT,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def resolve_local_web_session_key(token: str | None) -> str | None:
+    """Resolve a valid local UI session token to its server-side API key."""
+    if not token:
+        return None
+    for valid_key in get_valid_api_keys():
+        expected = hmac.new(
+            valid_key.encode("utf-8"),
+            _LOCAL_WEB_SESSION_CONTEXT,
+            hashlib.sha256,
+        ).hexdigest()
+        if hmac.compare_digest(token, expected):
+            return valid_key
+    return None
 
 
 def verify_api_key(

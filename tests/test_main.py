@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 import tempfile
@@ -586,6 +587,11 @@ class TestWebFallbackOps:
         assert "project_id" not in location
         assert "secret-project-id" not in location
         assert "secret-project-name" not in location
+        assert mock_upload_material.call_count == 2
+        assert all(
+            call.kwargs.get("defer_material_analysis") is True
+            for call in mock_upload_material.call_args_list
+        )
 
     @patch("app.main.upload_shigong")
     def test_web_upload_shigong_success(self, mock_upload_shigong, client):
@@ -1500,6 +1506,40 @@ class TestMaterialsEndpoint:
         data = response.json()
         assert data["status"] == "ok"
         assert "material" in data
+
+    @patch("app.main._rebuild_project_anchors_and_requirements")
+    @patch("app.main._write_material_upload_transaction")
+    @patch("app.main.load_projects")
+    @patch("app.main.ensure_data_dirs")
+    def test_web_ui_upload_can_defer_expensive_analysis(
+        self,
+        mock_ensure,
+        mock_load_projects,
+        mock_write_upload,
+        mock_rebuild_constraints,
+        client,
+    ):
+        mock_load_projects.return_value = [{"id": "p1"}]
+        mock_write_upload.return_value = {
+            "id": "m1",
+            "project_id": "p1",
+            "material_type": "drawing",
+            "filename": "drawing.pdf",
+            "path": "/tmp/drawing.pdf",
+            "created_at": "2026-08-30T00:00:00+00:00",
+        }
+
+        response = client.post(
+            "/api/v1/projects/p1/materials",
+            headers={"X-QingTian-Defer-Material-Analysis": "1"},
+            data={"material_type": "drawing"},
+            files={"file": ("drawing.pdf", BytesIO(b"pdf"), "application/pdf")},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["constraint_sync"] == {"rebuilt": False, "deferred": True}
+        mock_write_upload.assert_called_once()
+        mock_rebuild_constraints.assert_not_called()
 
     def test_material_upload_transaction_serializes_same_target(
         self,
@@ -5143,13 +5183,27 @@ class TestProjectLevelCacheIntegration:
         assert data["total_score"] == 82.5
 
         # 验证缓存被检查
-        mock_cache_get.assert_called_once_with("测试文本", None)
+        mock_cache_get.assert_called_once()
+        cache_context_hash = mock_cache_get.call_args[0][1]
+        assert isinstance(cache_context_hash, str)
+        assert len(cache_context_hash) == 64
         # 验证结果被缓存
         mock_cache_set.assert_called_once()
+        assert mock_cache_set.call_args[0][2] == cache_context_hash
         cached_report = mock_cache_set.call_args[0][1]
         assert cached_report["total_score"] == 75.0
         assert cached_report["rule_total_score"] == 75.0
+        assert cached_report["assessment_contract_hash"] == cache_context_hash
         mock_commit_result.assert_called_once()
+        committed_report = mock_commit_result.call_args.kwargs["record"]["report"]
+        committed_snapshot = mock_commit_result.call_args.kwargs["snapshot"]
+        assert committed_report["assessment_contract_hash"] == cache_context_hash
+        assert committed_snapshot["assessment_contract_hash"] == cache_context_hash
+        post_processing = committed_snapshot["assessment_contract"]["inputs"][
+            "post_processing"
+        ]
+        assert post_processing["evolution_total_score_scale"] == 1.1
+        assert post_processing["evolution_total_score_scale_applied"] is True
 
     @patch("app.main.submission_scoring_service.commit_inline_scoring_result")
     @patch("app.main.get_cached_score")
@@ -5199,6 +5253,11 @@ class TestProjectLevelCacheIntegration:
         # 验证 score_text 没有被调用（使用了缓存）
         mock_score.assert_not_called()
         mock_commit_result.assert_called_once()
+        cache_context_hash = mock_cache_get.call_args[0][1]
+        committed_report = mock_commit_result.call_args.kwargs["record"]["report"]
+        committed_snapshot = mock_commit_result.call_args.kwargs["snapshot"]
+        assert committed_report["assessment_contract_hash"] == cache_context_hash
+        assert committed_snapshot["assessment_contract_hash"] == cache_context_hash
 
     @patch("app.main.submission_scoring_service.commit_inline_scoring_result")
     @patch("app.main.load_evolution_reports")
@@ -5481,6 +5540,58 @@ class TestComputeMultipliersHash:
         hash1 = _compute_multipliers_hash({"D01": 1.2, "D02": 1.1})
         hash2 = _compute_multipliers_hash({"D01": 1.2, "D02": 1.1})
         assert hash1 == hash2
+
+
+class TestProjectScoreCacheContextHash:
+    def test_isolates_project_approved_profile_and_engine(self):
+        from app.main import _compute_project_score_cache_context_hash
+
+        config = MagicMock(
+            rubric={"dimensions": {"D01": {"weight": 1.0}}},
+            lexicon={"quality": ["质量"]},
+        )
+        base_project = {
+            "id": "p1",
+            "region": "CN",
+            "scoring_engine_version_locked": "v1",
+            "meta": {
+                "tender_profile_state": {
+                    "approved": True,
+                    "profile": {"version": "tender-v1", "items": [{"id": "T01"}]},
+                }
+            },
+        }
+
+        def context_hash(
+            *,
+            project_id: str = "p1",
+            project=None,
+            scoring_engine_version: str = "v1",
+        ) -> str:
+            return _compute_project_score_cache_context_hash(
+                project_id=project_id,
+                project=project or base_project,
+                config=config,
+                multipliers={"D01": 1.2},
+                profile_snapshot={"id": "expert-1", "weights_norm": {"D01": 1.0}},
+                scoring_engine_version=scoring_engine_version,
+                engine_version="v1",
+                deployed_patch=None,
+            )
+
+        base_hash = context_hash()
+        other_project_hash = context_hash(project_id="p2")
+        changed_profile_project = copy.deepcopy(base_project)
+        changed_profile_project["meta"]["tender_profile_state"]["profile"]["version"] = (
+            "tender-v2"
+        )
+        changed_profile_hash = context_hash(project=changed_profile_project)
+        changed_engine_hash = context_hash(scoring_engine_version="v1.1")
+
+        assert len(base_hash) == 64
+        assert len(
+            {base_hash, other_project_hash, changed_profile_hash, changed_engine_hash}
+        ) == 4
 
     def test_compute_multipliers_hash_different_input(self):
         """Different multipliers should produce different hash."""

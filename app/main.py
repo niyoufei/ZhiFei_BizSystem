@@ -64,11 +64,13 @@ from fastapi import (
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.routing import APIRoute
+from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.routing import Match
 
 import app.adaptive_configuration_service as adaptive_configuration_service
 import app.anchor_requirement_service as anchor_requirement_service
+import app.assessment_contract_service as assessment_contract_service
 import app.calibration_model_service as calibration_model_service
 import app.data_hygiene_service as data_hygiene_service
 import app.document_parser as _document_parser
@@ -95,7 +97,15 @@ import app.reflection_sample_service as reflection_sample_service
 import app.rescore_service as rescore_service
 import app.scoring_basis_service as scoring_basis_service
 import app.submission_scoring_service as submission_scoring_service
-from app.auth import get_auth_status, verify_api_key, verify_metrics_api_key
+import app.tender_criteria_service as tender_criteria_service
+from app.auth import (
+    LOCAL_WEB_SESSION_COOKIE,
+    create_local_web_session_token,
+    get_auth_status,
+    resolve_local_web_session_key,
+    verify_api_key,
+    verify_metrics_api_key,
+)
 from app.cache import (
     cache_score_result,
     clear_score_cache,
@@ -298,6 +308,8 @@ from app.schemas import (
     ScoringReadinessResponse,
     SelfCheckResponse,
     SubmissionRecord,
+    TenderProfileApproveRequest,
+    TenderProfileStateResponse,
     TrendAnalysis,
     WritingGuidance,
 )
@@ -3159,12 +3171,16 @@ def _build_score_report_snapshot(
     rule_dim_scores = report.get("rule_dim_scores")
     if not isinstance(rule_dim_scores, dict):
         rule_dim_scores = report.get("dimension_scores", {})
-    return {
+    snapshot = {
         "id": str(uuid4()),
         "submission_id": submission_id,
         "project_id": project.get("id"),
         "scoring_engine_version": scoring_engine_version,
         "expert_profile_snapshot": profile_snapshot or {},
+        "total_score": float(report.get("total_score", report.get("rule_total_score", 0.0))),
+        "legacy_score": copy.deepcopy(report.get("legacy_score")),
+        "tender_score": copy.deepcopy(report.get("tender_score")),
+        "dimension_scores": copy.deepcopy(report.get("dimension_scores", {})),
         "rule_dim_scores": rule_dim_scores,
         "rule_total_score": float(report.get("rule_total_score", report.get("total_score", 0.0))),
         "dim_total_80": float(report.get("dim_total_80", 0.0)),
@@ -3179,8 +3195,13 @@ def _build_score_report_snapshot(
         "lint_findings": report.get("lint_findings", []),
         "suggestions": report.get("suggestions", []),
         "material_consistency": report.get("material_consistency", {}),
+        "meta": copy.deepcopy(report.get("meta", {})),
         "created_at": _now_iso(),
     }
+    snapshot.update(
+        assessment_contract_service.score_report_snapshot_contract_fields(report)
+    )
+    return snapshot
 
 
 def _normalize_dimension_id(dim_id: str) -> str:
@@ -3418,12 +3439,20 @@ def _auto_govern_deployed_patch(
     )
 
 
-def _apply_deployed_patch_to_report(project_id: str, report: Dict[str, object]) -> None:
+def _apply_deployed_patch_to_report(
+    project_id: str,
+    report: Dict[str, object],
+    *,
+    deployed_patch: Optional[Dict[str, object]] = None,
+    deployed_patch_resolved: bool = False,
+) -> None:
     patch_evolution_service.apply_deployed_patch_to_report(
         project_id,
         report,
         load_patch_packages=load_patch_packages,
         compute_v2_rule_total=compute_v2_rule_total,
+        deployed_patch=deployed_patch,
+        deployed_patch_resolved=deployed_patch_resolved,
     )
 
 
@@ -3637,7 +3666,12 @@ def _apply_prediction_to_report(
     *,
     submission_like: Dict[str, object],
     project: Dict[str, object],
+    calibrator_model: Optional[Dict[str, object]] = None,
+    calibrator_model_resolved: bool = False,
 ) -> Optional[str]:
+    kwargs: Dict[str, object] = {}
+    if calibrator_model_resolved:
+        kwargs["calibrator_model"] = calibrator_model
     return calibration_model_service.apply_prediction_to_report(
         report,
         submission_like=submission_like,
@@ -3648,6 +3682,7 @@ def _apply_prediction_to_report(
         fuse_rule_and_llm_scores=_fuse_rule_and_llm_scores,
         to_float_or_none=_to_float_or_none,
         clip_score=_clip_score,
+        **kwargs,
     )
 
 
@@ -3739,8 +3774,17 @@ def _score_submission_for_project(
     anchors: Optional[List[Dict[str, object]]] = None,
     requirements: Optional[List[Dict[str, object]]] = None,
     material_quality_snapshot: Optional[Dict[str, object]] = None,
+    assessment_contract: Optional[Dict[str, object]] = None,
+    deployed_patch: Optional[Dict[str, object]] = None,
+    deployed_patch_resolved: bool = False,
+    evolution_total_scale_applied: bool = False,
 ) -> tuple[Dict[str, object], List[Dict[str, object]]]:
     engine_version = _determine_engine_version(project, scoring_engine_version)
+    selected_patch = (
+        deployed_patch
+        if deployed_patch_resolved
+        else _select_deployed_patch(project_id)
+    )
     if engine_version == "v2":
         anchors_from_payload = anchors is not None
         requirements_from_payload = requirements is not None
@@ -3819,11 +3863,58 @@ def _score_submission_for_project(
             )
         except submission_scoring_service.PreparedScoringInputError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
-        _apply_deployed_patch_to_report(project_id, report)
+        _apply_deployed_patch_to_report(
+            project_id,
+            report,
+            deployed_patch=selected_patch,
+            deployed_patch_resolved=True,
+        )
+        selected_calibrator = _select_calibrator_model(project)
+        contract = assessment_contract or _build_project_assessment_contract(
+            project_id=project_id,
+            project=project,
+            config=config,
+            multipliers=multipliers,
+            profile_snapshot=profile_snapshot,
+            scoring_engine_version=scoring_engine_version,
+            engine_version=engine_version,
+            deployed_patch=selected_patch,
+            calibrator_model=selected_calibrator,
+            resolved_scoring_inputs={
+                "submission_text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "anchors": anchors,
+                "requirements": requirements,
+                "runtime_custom_requirements": runtime_custom_requirements,
+                "runtime_requirement_meta": runtime_req_meta,
+                "constraints_rebuilt": constraints_rebuilt,
+                "material_quality_snapshot": snapshot_for_meta,
+                "material_required_types": material_required_types,
+                "material_utilization_policy": material_utilization_policy,
+                "strict_pre_flight": strict_pre_flight,
+            },
+            post_processing=_assessment_post_processing_context(
+                project_id,
+                project=project,
+                evolution_total_scale_applied=evolution_total_scale_applied,
+            ),
+        )
         if _report_is_blocked(report):
+            assessment_contract_service.attach_assessment_contract(report, contract)
             return report, evidence_units
         submission_like = {"id": submission_id, "project_id": project_id, "text": text}
-        _apply_prediction_to_report(report, submission_like=submission_like, project=project)
+        _apply_prediction_to_report(
+            report,
+            submission_like=submission_like,
+            project=project,
+            calibrator_model=selected_calibrator,
+            calibrator_model_resolved=True,
+        )
+        tender_criteria_service.apply_approved_tender_score(
+            project=project,
+            report=report,
+            document_text=text,
+        )
+        assessment_contract_service.attach_assessment_contract(report, contract)
         _mark_report_scored(report, trigger="score_engine")
         return report, evidence_units
 
@@ -3839,7 +3930,36 @@ def _score_submission_for_project(
         rule_dim_scores_from_legacy=_rule_dim_scores_from_legacy,
         build_evidence_trace_summary=_build_evidence_trace_summary,
     )
-    _apply_deployed_patch_to_report(project_id, legacy)
+    _apply_deployed_patch_to_report(
+        project_id,
+        legacy,
+        deployed_patch=selected_patch,
+        deployed_patch_resolved=True,
+    )
+    tender_criteria_service.apply_approved_tender_score(
+        project=project,
+        report=legacy,
+        document_text=text,
+    )
+    contract = assessment_contract or _build_project_assessment_contract(
+        project_id=project_id,
+        project=project,
+        config=config,
+        multipliers=multipliers,
+        profile_snapshot=profile_snapshot,
+        scoring_engine_version=scoring_engine_version,
+        engine_version=engine_version,
+        deployed_patch=selected_patch,
+        resolved_scoring_inputs={
+            "submission_text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()
+        },
+        post_processing=_assessment_post_processing_context(
+            project_id,
+            project=project,
+            evolution_total_scale_applied=evolution_total_scale_applied,
+        ),
+    )
+    assessment_contract_service.attach_assessment_contract(legacy, contract)
     _mark_report_scored(legacy, trigger="score_engine")
     return legacy, evidence_units
 
@@ -4810,11 +4930,39 @@ def _route_requires_api_key(request: Request) -> bool:
     return False
 
 
+def _is_loopback_web_request(request: Request) -> bool:
+    return str(request.url.hostname or "").lower() in {"127.0.0.1", "localhost", "::1"}
+
+
+def _inject_local_web_session_key(request: Request) -> str | None:
+    """Authenticate the local UI without exposing credentials to page scripts."""
+    if request.headers.get("X-API-Key") or not _is_loopback_web_request(request):
+        return None
+    fetch_site = str(request.headers.get("Sec-Fetch-Site") or "").lower()
+    if fetch_site and fetch_site not in {"same-origin", "none"}:
+        return None
+    api_key = resolve_local_web_session_key(
+        request.cookies.get(LOCAL_WEB_SESSION_COOKIE)
+    )
+    if not api_key:
+        return None
+    request.scope["headers"] = [
+        *request.scope.get("headers", []),
+        (b"x-api-key", api_key.encode("utf-8")),
+    ]
+    request._headers = Headers(scope=request.scope)
+    return api_key
+
+
 @app.middleware("http")
 async def _authenticate_before_body_parsing(request: Request, call_next):
     if _route_requires_api_key(request):
+        local_session_key = _inject_local_web_session_key(request)
         try:
-            verify_api_key(api_key_header=request.headers.get("X-API-Key"))
+            verify_api_key(
+                api_key_header=local_session_key
+                or request.headers.get("X-API-Key")
+            )
         except HTTPException as exc:
             return JSONResponse(
                 status_code=exc.status_code,
@@ -5483,6 +5631,14 @@ def cache_stats() -> CacheStatsResponse:
     return CacheStatsResponse(**stats)
 
 
+def _defer_material_analysis_for_ui(request: Request) -> bool:
+    """Keep the internal web upload fast without changing the public default."""
+    return (
+        str(request.headers.get("X-QingTian-Defer-Material-Analysis", "")).strip()
+        == "1"
+    )
+
+
 @router.post(
     "/cache/clear",
     response_model=CacheClearResponse,
@@ -6012,6 +6168,106 @@ def list_projects() -> list[ProjectRecord]:
         recover_latest_orphan_project=_recover_latest_orphan_project,
     )
     return [ProjectRecord(**p) for p in projects]
+
+
+def _merge_tender_materials_text(project_id: str) -> str:
+    sections: List[str] = []
+    rows = [m for m in load_materials() if str(m.get("project_id")) == str(project_id)]
+    rows.sort(key=lambda item: str(item.get("created_at") or ""))
+    for row in rows:
+        filename = str(row.get("filename") or "").strip()
+        material_type = _normalize_material_type(
+            row.get("material_type"), filename=filename
+        )
+        if material_type != "tender_qa":
+            continue
+        path = Path(str(row.get("path") or "").strip())
+        if not path.exists():
+            continue
+        try:
+            text = str(_read_uploaded_file_content(path.read_bytes(), path.name) or "").strip()
+        except Exception:
+            continue
+        if not text:
+            continue
+        sections.append(f"--- {filename or '招标资料'} ---\n{text}")
+    return "\n\n".join(sections)
+
+
+@atomic_json_transaction("projects")
+def _save_project_tender_profile_state(project_id: str, state: Dict[str, object]) -> Dict[str, object]:
+    projects = load_projects()
+    project = _find_project(project_id, projects)
+    meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
+    meta = dict(meta)
+    meta["tender_profile_state"] = copy.deepcopy(state)
+    project["meta"] = meta
+    project["updated_at"] = _now_iso()
+    save_projects(projects)
+    return copy.deepcopy(state)
+
+
+@router.get(
+    "/projects/{project_id}/tender-profile",
+    response_model=TenderProfileStateResponse,
+    tags=["按标分析"],
+    responses={**RESPONSES_401, **RESPONSES_404},
+)
+def get_project_tender_profile(
+    project_id: str,
+    api_key: Optional[str] = Depends(verify_api_key),
+) -> TenderProfileStateResponse:
+    project = _find_project(project_id, load_projects())
+    state = tender_criteria_service.project_tender_profile_state(project)
+    return TenderProfileStateResponse(project_id=project_id, **state)
+
+
+@router.post(
+    "/projects/{project_id}/tender-profile/extract",
+    response_model=TenderProfileStateResponse,
+    tags=["按标分析"],
+    responses={**RESPONSES_401, **RESPONSES_404, **RESPONSES_422},
+)
+def extract_project_tender_profile(
+    project_id: str,
+    api_key: Optional[str] = Depends(verify_api_key),
+) -> TenderProfileStateResponse:
+    project = _find_project(project_id, load_projects())
+    source_text = _merge_tender_materials_text(project_id)
+    if not source_text.strip():
+        raise HTTPException(status_code=422, detail="未找到可解析的招标文件和答疑资料。")
+    state = tender_criteria_service.extract_tender_profile_draft(
+        project_id=project_id,
+        project_name=str(project.get("name") or "当前项目"),
+        source_text=source_text,
+    )
+    saved = _save_project_tender_profile_state(project_id, state)
+    return TenderProfileStateResponse(project_id=project_id, **saved)
+
+
+@router.put(
+    "/projects/{project_id}/tender-profile/approve",
+    response_model=TenderProfileStateResponse,
+    tags=["按标分析"],
+    responses={**RESPONSES_401, **RESPONSES_404, **RESPONSES_422},
+)
+def approve_project_tender_profile(
+    project_id: str,
+    payload: TenderProfileApproveRequest,
+    api_key: Optional[str] = Depends(verify_api_key),
+) -> TenderProfileStateResponse:
+    project = _find_project(project_id, load_projects())
+    draft_state = tender_criteria_service.project_tender_profile_state(project)
+    try:
+        state = tender_criteria_service.approve_tender_profile(
+            profile_payload=payload.profile,
+            draft_state=draft_state,
+            attention_profile=payload.attention_profile,
+        )
+    except TenderProfileValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    saved = _save_project_tender_profile_state(project_id, state)
+    return TenderProfileStateResponse(project_id=project_id, **saved)
 
 
 @router.get(
@@ -6725,6 +6981,7 @@ def upload_material(
     project_id: str,
     file: UploadFile = File(...),
     material_type: str = Form(MATERIAL_TYPE_DEFAULT),
+    defer_material_analysis: bool = Depends(_defer_material_analysis_for_ui),
     api_key: Optional[str] = Depends(verify_api_key),
     locale: str = Depends(get_locale),
 ) -> dict:
@@ -6773,6 +7030,7 @@ def upload_material(
         record=record,
         invalidate_material_index_cache=_invalidate_material_index_cache,
         rebuild_project_anchors_and_requirements=_rebuild_project_anchors_and_requirements,
+        sync_constraints=not defer_material_analysis,
     )
 
 
@@ -8976,11 +9234,67 @@ def _render_material_knowledge_profile_markdown(payload: Dict[str, object]) -> s
 
 def _compute_multipliers_hash(multipliers: dict) -> str:
     """计算 multipliers 的 hash，用于缓存 key"""
-    import hashlib
-    import json
-
     content = json.dumps(multipliers, sort_keys=True)
     return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+
+
+def _build_project_assessment_contract(
+    *,
+    project_id: str,
+    project: Dict[str, object],
+    config: object,
+    multipliers: Optional[Dict[str, float]],
+    profile_snapshot: Optional[Dict[str, object]],
+    scoring_engine_version: str,
+    engine_version: str,
+    deployed_patch: Optional[Dict[str, object]],
+    calibrator_model: Optional[Dict[str, object]] = None,
+    resolved_scoring_inputs: Optional[Dict[str, object]] = None,
+    post_processing: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    rubric = getattr(config, "rubric", {})
+    lexicon = getattr(config, "lexicon", {})
+    return assessment_contract_service.build_assessment_contract(
+        project_id=project_id,
+        project=project,
+        config_rubric=rubric,
+        config_lexicon=lexicon,
+        multipliers=multipliers,
+        profile_snapshot=profile_snapshot,
+        scoring_engine_version=scoring_engine_version,
+        engine_version=engine_version,
+        deployed_patch=deployed_patch,
+        calibrator_model=calibrator_model,
+        resolved_scoring_inputs=resolved_scoring_inputs,
+        post_processing=post_processing,
+    )
+
+
+def _compute_project_score_cache_context_hash(
+    *,
+    project_id: str,
+    project: Dict[str, object],
+    config: object,
+    multipliers: Optional[Dict[str, float]],
+    profile_snapshot: Optional[Dict[str, object]],
+    scoring_engine_version: str,
+    engine_version: str,
+    deployed_patch: Optional[Dict[str, object]],
+    post_processing: Optional[Dict[str, object]] = None,
+) -> str:
+    """Use the certified assessment contract identity as the v1 cache context."""
+    contract = _build_project_assessment_contract(
+        project_id=project_id,
+        project=project,
+        config=config,
+        multipliers=multipliers,
+        profile_snapshot=profile_snapshot,
+        scoring_engine_version=scoring_engine_version,
+        engine_version=engine_version,
+        deployed_patch=deployed_patch,
+        post_processing=post_processing,
+    )
+    return str(contract["contract_hash"])
 
 
 def _get_effective_dimension_multipliers(project_id: str) -> Dict[str, float]:
@@ -8999,8 +9313,36 @@ def _get_evolution_total_score_scale(project_id: str) -> float | None:
     return None
 
 
+def _assessment_post_processing_context(
+    project_id: str,
+    *,
+    project: Dict[str, object],
+    evolution_total_scale_applied: bool,
+) -> Dict[str, object]:
+    meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
+    tender_state = (
+        meta.get("tender_profile_state")
+        if isinstance(meta.get("tender_profile_state"), dict)
+        else {}
+    )
+    scale = _get_evolution_total_score_scale(project_id)
+    scale_is_effective = scale is not None and abs(float(scale) - 1.0) >= 1e-6
+    will_apply = (
+        bool(evolution_total_scale_applied)
+        and not bool(tender_state.get("approved"))
+        and scale_is_effective
+    )
+    return {
+        "evolution_total_score_scale": float(scale) if scale is not None else None,
+        "evolution_total_score_scale_applied": will_apply,
+    }
+
+
 def _apply_evolution_total_scale(project_id: str, report: Dict[str, object]) -> None:
     """若进化报告有 total_score_scale，对总分进行缩放（原地修改 report）。"""
+    meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+    if meta.get("score_basis") == "approved_tender_profile":
+        return
     scale = _get_evolution_total_score_scale(project_id)
     if scale is None or abs(scale - 1.0) < 1e-6:
         return
@@ -9134,13 +9476,38 @@ def score_text_for_project(
     submission_id = str(uuid4())
     scoring_engine_version = str(project.get("scoring_engine_version_locked") or "v1")
     engine_version = _determine_engine_version(project, scoring_engine_version)
-    cache_payload: Optional[tuple[str, Dict[str, object], Optional[str]]] = None
+    cache_payload: Optional[tuple[str, Dict[str, object], str]] = None
 
     if engine_version == "v1":
-        config_hash = _compute_multipliers_hash(multipliers) if multipliers else None
-        cached_result = get_cached_score(payload.text, config_hash)
+        selected_patch = _select_deployed_patch(project_id)
+        assessment_contract = _build_project_assessment_contract(
+            project_id=project_id,
+            project=project,
+            config=config,
+            multipliers=multipliers,
+            profile_snapshot=profile_snapshot,
+            scoring_engine_version=scoring_engine_version,
+            engine_version=engine_version,
+            deployed_patch=selected_patch,
+            resolved_scoring_inputs={
+                "submission_text_sha256": hashlib.sha256(
+                    payload.text.encode("utf-8")
+                ).hexdigest()
+            },
+            post_processing=_assessment_post_processing_context(
+                project_id,
+                project=project,
+                evolution_total_scale_applied=True,
+            ),
+        )
+        cache_context_hash = str(assessment_contract["contract_hash"])
+        cached_result = get_cached_score(payload.text, cache_context_hash)
         if cached_result is not None:
             report = dict(cached_result)
+            assessment_contract_service.attach_assessment_contract(
+                report,
+                assessment_contract,
+            )
         else:
             raw_report, _ = _score_submission_for_project(
                 submission_id=submission_id,
@@ -9151,9 +9518,13 @@ def score_text_for_project(
                 multipliers=multipliers,
                 profile_snapshot=profile_snapshot,
                 scoring_engine_version=scoring_engine_version,
+                assessment_contract=assessment_contract,
+                deployed_patch=selected_patch,
+                deployed_patch_resolved=True,
+                evolution_total_scale_applied=True,
             )
             # 缓存仅存“未缩放原始分”，避免后续读取时重复应用 total_score_scale。
-            cache_payload = (payload.text, raw_report, config_hash)
+            cache_payload = (payload.text, raw_report, cache_context_hash)
             report = dict(raw_report)
         _apply_evolution_total_scale(project_id, report)
         evidence_units: List[Dict[str, object]] = []
@@ -9167,6 +9538,7 @@ def score_text_for_project(
             multipliers=multipliers,
             profile_snapshot=profile_snapshot,
             scoring_engine_version=scoring_engine_version,
+            evolution_total_scale_applied=True,
         )
         _apply_evolution_total_scale(project_id, report)
 
@@ -11873,13 +12245,17 @@ def web_upload_materials(
                 project_id=pid,
                 file=f,
                 material_type=material_type,
+                defer_material_analysis=True,
                 api_key=api_key,
                 locale="zh",
             )
             ok_count += 1
         except Exception:  # noqa: BLE001 - web fallback should keep processing
             fail_count += 1
-    msg = f"资料上传完成：成功 {ok_count}，失败 {fail_count}"
+    msg = (
+        f"资料上传完成：成功 {ok_count}，失败 {fail_count}。"
+        "文件已保存，系统将在提取评审标准或评分时按需分析。"
+    )
     return RedirectResponse(
         url="/?msg_type="
         + ("error" if fail_count > 0 else "success")
