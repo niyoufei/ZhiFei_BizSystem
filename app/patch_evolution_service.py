@@ -182,11 +182,15 @@ def apply_deployed_patch_to_report(
     *,
     load_patch_packages: Callable[[], Records],
     compute_v2_rule_total: Callback,
+    deployed_patch: Optional[Record] = None,
+    deployed_patch_resolved: bool = False,
 ) -> None:
-    patch = select_deployed_patch(
-        project_id,
-        load_patch_packages=load_patch_packages,
-    )
+    patch = deployed_patch
+    if not deployed_patch_resolved:
+        patch = select_deployed_patch(
+            project_id,
+            load_patch_packages=load_patch_packages,
+        )
     if not patch:
         return
     payload = patch.get("patch_payload") or {}

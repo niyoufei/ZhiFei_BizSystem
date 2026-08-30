@@ -341,6 +341,7 @@ def prepare_rescore_batch(
             anchors=anchors,
             requirements=requirements,
             material_quality_snapshot=material_quality_snapshot,
+            evolution_total_scale_applied=True,
         )
         apply_evolution_total_scale(project_id, report)
         if not report_is_blocked(report):
