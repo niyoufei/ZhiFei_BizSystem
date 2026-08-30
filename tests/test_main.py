@@ -140,11 +140,10 @@ class TestIndexEndpoint:
         assert '<html lang="zh-CN">' in page
         assert '<meta name="viewport" content="width=device-width, initial-scale=1">' in page
         assert '<a class="skip-link" href="#mainContent">跳到主要内容</a>' in page
-        assert '<nav class="workflow-nav" aria-label="主要工作流程">' in page
+        assert '<aside class="app-sidebar" aria-label="主导航">' in page
+        assert '<nav class="workflow-progress"' not in page
         assert '<main id="mainContent" tabindex="-1">' in page
         for section_id in (
-            "apiKeyControls",
-            "section-create",
             "section-project",
             "section-materials",
             "section-shigong",
@@ -153,10 +152,37 @@ class TestIndexEndpoint:
             "section-output",
         ):
             assert f'id="{section_id}"' in page
-            assert f'href="#{section_id}"' in page or section_id == "mainContent"
+            if section_id != "section-project":
+                assert f'href="#{section_id}"' in page
+        assert 'id="projectCreatePanel"' in page
+        assert "选择或新建评审项目" in page
+        assert "选择或新建项目 → 上传招标资料 → 提取并确认评审标准" in page
+        assert '<summary>开始新评审（新建项目）</summary>' in page
+        assert 'id="projectNextStep"' in page
+        assert 'href="#section-materials">下一步：上传或核对招标资料' in page
         assert "@media (max-width: 760px)" in page
         assert "@media (prefers-reduced-motion: reduce)" in page
         assert ":focus-visible" in page
+        assert 'class="project-tools"' in page
+        assert 'class="secondary-actions"' in page
+        assert 'class="governance-panel"' in page
+        assert 'class="log-panel"' in page
+
+    def test_index_frontend_project_refresh_preserves_selection_and_skips_e2e(self, client):
+        page = client.get("/").text
+
+        assert "async function refreshProjects(preferredProjectId = '')" in page
+        assert "const current = preferred || pid() || storageGet('selected_project_id')" in page
+        assert "startsWith('E2E_')" in page
+        assert "regularProjects.length === 1 ? regularProjects[0].id : ''" in page
+        assert "sel.value = list[list.length - 1].id;" not in page
+
+    def test_index_frontend_create_project_selects_new_project_and_guides_next_step(self, client):
+        page = client.get("/").text
+
+        assert "await refreshProjects((created && created.id) || '');" in page
+        assert "项目已创建并切换为当前项目。下一步：上传招标资料。" in page
+        assert "if (createPanel) createPanel.open = false;" in page
 
     def test_index_prevents_duplicate_actions_and_announces_async_results(self, client):
         """Async buttons should be single-flight and result changes should be announced."""
@@ -168,9 +194,52 @@ class TestIndexEndpoint:
         assert "delete el.dataset.qingtianBusy;" in page
         assert "el.setAttribute('aria-busy', 'false');" in page
         assert "initializeProductAccessibility();" in page
+        assert "initializeSectionNavigation();" in page
         assert "document.querySelectorAll('.result-block')" in page
         assert "el.setAttribute('role', 'status');" in page
         assert "el.setAttribute('aria-live', 'polite');" in page
+        assert "function initializeDisclosureStateHints(root=document)" in page
+        assert "function initializeResultBlockToggles()" in page
+        assert "result.before(toggle);" in page
+        assert "toggle.textContent = expanded ? '收起结果' : '展开上次结果';" in page
+        assert "attributeFilter: ['style']" in page
+        assert "subtree: false" in page
+
+    def test_index_uses_single_fast_material_upload_path_with_progress(self, client):
+        page = client.get("/").text
+
+        for button_id in (
+            "btnUploadMaterials",
+            "btnUploadBoq",
+            "btnUploadDrawing",
+            "btnUploadSitePhotos",
+        ):
+            assert f'<button type="submit" id="{button_id}">' in page
+        assert "X-QingTian-Defer-Material-Analysis" in page
+        assert "fetchWithUploadTimeout" in page
+        assert "正在上传 ' + (index + 1) + '/' + files.length" in page
+        assert "已有资料批次正在上传，请等待完成后再提交。" in page
+
+    def test_index_defers_heavy_readiness_analysis_until_scoring(self, client):
+        page = client.get("/").text
+
+        project_switch = page.split("async function onProjectChanged()", 1)[1].split(
+            "const elRefresh", 1
+        )[0]
+        submissions_refresh = page.split(
+            "async function refreshSubmissions", 1
+        )[1].split("async function refreshGroundTruthSubmissionOptions", 1)[0]
+        materials_refresh = page.split("async function refreshMaterials", 1)[1].split(
+            "bindDeleteRowHandlers();", 1
+        )[0]
+        scoring_action = page.split("async function scoreShigongAction()", 1)[1].split(
+            "const scoreScaleSelect", 1
+        )[0]
+
+        assert "refreshScoringReadiness" not in project_switch
+        assert "refreshScoringReadiness" not in submissions_refresh
+        assert "refreshScoringReadiness" not in materials_refresh
+        assert "await refreshScoringReadiness(projectId, projectSwitchSeq);" in scoring_action
 
     def test_index_contains_forms(self, client):
         """Index page should contain all forms."""
@@ -203,7 +272,9 @@ class TestIndexEndpoint:
         assert 'id="groundTruthFile"' not in response.text
         assert "/ground_truth/from_submission" in response.text
         assert 'id="section-adaptive" style="display:none"' in response.text
-        assert "V2 反演校准闭环（核心能力，强烈建议执行）" in response.text
+        assert "模型校准" in response.text
+        assert "运行自动校准" in response.text
+        assert "补丁管理（专业人员）" in response.text
         assert ".dxf" in response.text
 
     def test_index_replaces_server_side_placeholders(self, client):
@@ -303,22 +374,56 @@ class TestIndexEndpoint:
         ):
             assert f"safeClick('{button_id}'" in page
 
-    def test_index_frontend_has_per_tender_minimal_panel(self, client):
-        """014 frontend gate should expose a minimal per-tender analysis panel."""
+    def test_index_frontend_has_project_tender_profile_workflow(self, client):
+        """The UI should expose extract-review-approve before project scoring."""
         response = client.get("/")
         assert response.status_code == 200
         page = response.text
-        assert "按标分析（per-tender）" in page
-        assert "/api/v1/per-tender/analyze" in page
+        assert "项目评审标准" in page
+        assert "/tender-profile/extract" in page
+        assert "/tender-profile/approve" in page
         assert 'id="perTenderProfileJson"' in page
-        assert "profile JSON" in page
-        assert 'id="perTenderDocumentText"' in page
-        assert 'id="btnPerTenderAnalyze"' in page
-        assert "运行按标分析" in page
+        assert 'id="btnExtractTenderProfile"' in page
+        assert 'id="btnApproveTenderProfile"' in page
+        assert "确认并用于评分" in page
         assert 'id="perTenderResult"' in page
-        assert "provided_evidence: {}" in page
-        assert "judge_scores: []" in page
-        assert "calibration_samples: []" in page
+        assert "人工确认后才进入正式评分" in page
+        assert "const extractedItems =" in page
+        assert "未生成可确认的评审标准" in page
+        assert "关注度用于安排证据检索、人工复核和优化优先级" in page
+        assert 'data-attention-level="' in page
+        assert "最低 " in page and "默认 " in page and "最高 " in page
+        assert 'id="tenderProfileWarnings"' not in page
+        assert "人工复核提示" not in page
+        assert "红线复核：" not in page
+        assert 'data-attention-toggle' in page
+        assert 'aria-valuetext="' in page
+        assert "initializeTenderAttentionInteractions();" in page
+        assert "attention_profile:attentionProfile || null" in page
+        assert "已随评审标准锁定" in page
+        assert 'id="tenderProjectContext"' in page
+        assert "selectionContext.scene_labels" in page
+        assert 'id="tenderCatalogSummary"' in page
+        assert 'aria-labelledby="tenderCatalogSummaryTitle"' in page
+        assert "selectionContext.catalog_summary" in page
+        assert "catalogSummary.combined_catalog_total" in page
+        assert "catalogSummary.enabled_unique_count" in page
+        assert "catalogSummary.evidence_link_count" in page
+        assert "catalogSummary.catalog_version" in page
+        assert "工程类别" in page
+        assert "类别科目库" in page
+        assert "本项目启用" in page
+        assert "系统依据本项目招标条款和工程场景筛选适用科目" in page
+        assert "未启用科目不代表缺项、扣分或必须补齐" in page
+        assert "categoryLabels.join(' + ')" in page
+        assert "catalogEl.hidden = !hasCatalogSummary" in page
+        assert "已形成 " in page and " 次证据—科目关联" in page
+        assert "类别科目库完成率" not in page
+        assert "尚缺科目" not in page
+        assert "标准38项" not in page
+        assert "个专家细分项" in page
+        assert "暂无专家细分项" in page
+        assert "展开 6 个评分点" not in page
 
     def test_index_frontend_has_ollama_preview_export_actions(self, client):
         """Ollama preview result actions should be client-side and preview-only."""
@@ -426,16 +531,12 @@ class TestIndexEndpoint:
         ):
             assert f"ensureProjectForAction('{guard_result_id}')" in page
 
-    def test_index_upload_buttons_use_inline_fallback_click_and_form_submit_compat(self, client):
-        """Upload/score buttons should keep submit fallback while inline fallback click avoids full-page jumps."""
+    def test_index_upload_buttons_keep_form_submit_and_fallback_action_compat(self, client):
+        """Upload/score buttons should keep native form submit and fallback action compatibility."""
         response = client.get("/")
         assert response.status_code == 200
         page = response.text
-        assert (
-            '<button type="submit" id="btnUploadMaterials" onclick="if (window.__zhifeiFallbackClick) '
-            "{ return window.__zhifeiFallbackClick(event, 'btnUploadMaterials'); } return true;\">上传资料</button>"
-            in page
-        )
+        assert '<button type="submit" id="btnUploadMaterials">上传资料</button>' in page
         assert (
             'id="btnUploadShigong" name="submit_action" value="upload" onclick="if (window.__zhifeiFallbackClick) '
             "{ return window.__zhifeiFallbackClick(event, 'btnUploadShigong'); } return true;\""
