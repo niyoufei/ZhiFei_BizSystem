@@ -20,6 +20,7 @@ dynamic = [
   "version",
 ]
 dependencies = [
+  "cryptography>=44,<47",
   "fastapi==0.135",
   "numpy",
   "openpyxl",
