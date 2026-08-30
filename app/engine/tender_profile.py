@@ -432,7 +432,8 @@ def _parse_hard_redline(raw: object, index: int) -> HardRedline:
     )
 
 
-def _contract_profile_from_dict(data: object) -> TenderProfile:
+def tender_profile_from_dict(data: object) -> TenderProfile:
+    """Build and validate a project-scoped tender profile from JSON-compatible data."""
     if not isinstance(data, dict):
         raise TenderProfileValidationError("tender profile 必须是 JSON 对象")
 
@@ -523,7 +524,7 @@ def load_tender_profile(path: str | Path) -> TenderProfile:
         raise TenderProfileValidationError(f"配置文件读取失败: {p} ({exc})") from exc
 
     try:
-        return _contract_profile_from_dict(data)
+        return tender_profile_from_dict(data)
     except TenderProfileValidationError as exc:
         raise TenderProfileValidationError(f"{p}: {exc}") from exc
 
