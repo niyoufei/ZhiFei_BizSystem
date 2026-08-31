@@ -26,6 +26,10 @@ def get_latest_report_projection(
             "id": latest.get("id"),
             "submission_id": latest.get("submission_id"),
             "scoring_engine_version": latest.get("scoring_engine_version"),
+            "total_score": latest.get("total_score"),
+            "legacy_score": latest.get("legacy_score"),
+            "tender_score": latest.get("tender_score"),
+            "dimension_scores": latest.get("dimension_scores", {}),
             "rule_total_score": latest.get("rule_total_score"),
             "pred_total_score": latest.get("pred_total_score"),
             "llm_total_score": latest.get("llm_total_score"),
@@ -37,6 +41,13 @@ def get_latest_report_projection(
             "lint_findings": latest.get("lint_findings", []),
             "suggestions": latest.get("suggestions", []),
             "expert_profile_snapshot": latest.get("expert_profile_snapshot", {}),
+            "meta": latest.get("meta", {}),
+            "assessment_contract_status": latest.get("assessment_contract_status"),
+            "assessment_contract_hash": latest.get("assessment_contract_hash"),
+            "assessment_contract_schema_version": latest.get(
+                "assessment_contract_schema_version"
+            ),
+            "assessment_contract": latest.get("assessment_contract"),
             "created_at": latest.get("created_at"),
         }
     else:

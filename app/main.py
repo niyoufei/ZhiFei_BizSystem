@@ -64,11 +64,13 @@ from fastapi import (
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.routing import APIRoute
+from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.routing import Match
 
 import app.adaptive_configuration_service as adaptive_configuration_service
 import app.anchor_requirement_service as anchor_requirement_service
+import app.assessment_contract_service as assessment_contract_service
 import app.calibration_model_service as calibration_model_service
 import app.data_hygiene_service as data_hygiene_service
 import app.document_parser as _document_parser
@@ -95,7 +97,15 @@ import app.reflection_sample_service as reflection_sample_service
 import app.rescore_service as rescore_service
 import app.scoring_basis_service as scoring_basis_service
 import app.submission_scoring_service as submission_scoring_service
-from app.auth import get_auth_status, verify_api_key, verify_metrics_api_key
+import app.tender_criteria_service as tender_criteria_service
+from app.auth import (
+    LOCAL_WEB_SESSION_COOKIE,
+    create_local_web_session_token,
+    get_auth_status,
+    resolve_local_web_session_key,
+    verify_api_key,
+    verify_metrics_api_key,
+)
 from app.cache import (
     cache_score_result,
     clear_score_cache,
@@ -298,6 +308,8 @@ from app.schemas import (
     ScoringReadinessResponse,
     SelfCheckResponse,
     SubmissionRecord,
+    TenderProfileApproveRequest,
+    TenderProfileStateResponse,
     TrendAnalysis,
     WritingGuidance,
 )
@@ -3159,12 +3171,16 @@ def _build_score_report_snapshot(
     rule_dim_scores = report.get("rule_dim_scores")
     if not isinstance(rule_dim_scores, dict):
         rule_dim_scores = report.get("dimension_scores", {})
-    return {
+    snapshot = {
         "id": str(uuid4()),
         "submission_id": submission_id,
         "project_id": project.get("id"),
         "scoring_engine_version": scoring_engine_version,
         "expert_profile_snapshot": profile_snapshot or {},
+        "total_score": float(report.get("total_score", report.get("rule_total_score", 0.0))),
+        "legacy_score": copy.deepcopy(report.get("legacy_score")),
+        "tender_score": copy.deepcopy(report.get("tender_score")),
+        "dimension_scores": copy.deepcopy(report.get("dimension_scores", {})),
         "rule_dim_scores": rule_dim_scores,
         "rule_total_score": float(report.get("rule_total_score", report.get("total_score", 0.0))),
         "dim_total_80": float(report.get("dim_total_80", 0.0)),
@@ -3179,8 +3195,13 @@ def _build_score_report_snapshot(
         "lint_findings": report.get("lint_findings", []),
         "suggestions": report.get("suggestions", []),
         "material_consistency": report.get("material_consistency", {}),
+        "meta": copy.deepcopy(report.get("meta", {})),
         "created_at": _now_iso(),
     }
+    snapshot.update(
+        assessment_contract_service.score_report_snapshot_contract_fields(report)
+    )
+    return snapshot
 
 
 def _normalize_dimension_id(dim_id: str) -> str:
@@ -3418,12 +3439,20 @@ def _auto_govern_deployed_patch(
     )
 
 
-def _apply_deployed_patch_to_report(project_id: str, report: Dict[str, object]) -> None:
+def _apply_deployed_patch_to_report(
+    project_id: str,
+    report: Dict[str, object],
+    *,
+    deployed_patch: Optional[Dict[str, object]] = None,
+    deployed_patch_resolved: bool = False,
+) -> None:
     patch_evolution_service.apply_deployed_patch_to_report(
         project_id,
         report,
         load_patch_packages=load_patch_packages,
         compute_v2_rule_total=compute_v2_rule_total,
+        deployed_patch=deployed_patch,
+        deployed_patch_resolved=deployed_patch_resolved,
     )
 
 
@@ -3637,7 +3666,12 @@ def _apply_prediction_to_report(
     *,
     submission_like: Dict[str, object],
     project: Dict[str, object],
+    calibrator_model: Optional[Dict[str, object]] = None,
+    calibrator_model_resolved: bool = False,
 ) -> Optional[str]:
+    kwargs: Dict[str, object] = {}
+    if calibrator_model_resolved:
+        kwargs["calibrator_model"] = calibrator_model
     return calibration_model_service.apply_prediction_to_report(
         report,
         submission_like=submission_like,
@@ -3648,6 +3682,7 @@ def _apply_prediction_to_report(
         fuse_rule_and_llm_scores=_fuse_rule_and_llm_scores,
         to_float_or_none=_to_float_or_none,
         clip_score=_clip_score,
+        **kwargs,
     )
 
 
@@ -3739,8 +3774,17 @@ def _score_submission_for_project(
     anchors: Optional[List[Dict[str, object]]] = None,
     requirements: Optional[List[Dict[str, object]]] = None,
     material_quality_snapshot: Optional[Dict[str, object]] = None,
+    assessment_contract: Optional[Dict[str, object]] = None,
+    deployed_patch: Optional[Dict[str, object]] = None,
+    deployed_patch_resolved: bool = False,
+    evolution_total_scale_applied: bool = False,
 ) -> tuple[Dict[str, object], List[Dict[str, object]]]:
     engine_version = _determine_engine_version(project, scoring_engine_version)
+    selected_patch = (
+        deployed_patch
+        if deployed_patch_resolved
+        else _select_deployed_patch(project_id)
+    )
     if engine_version == "v2":
         anchors_from_payload = anchors is not None
         requirements_from_payload = requirements is not None
@@ -3819,11 +3863,58 @@ def _score_submission_for_project(
             )
         except submission_scoring_service.PreparedScoringInputError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
-        _apply_deployed_patch_to_report(project_id, report)
+        _apply_deployed_patch_to_report(
+            project_id,
+            report,
+            deployed_patch=selected_patch,
+            deployed_patch_resolved=True,
+        )
+        selected_calibrator = _select_calibrator_model(project)
+        contract = assessment_contract or _build_project_assessment_contract(
+            project_id=project_id,
+            project=project,
+            config=config,
+            multipliers=multipliers,
+            profile_snapshot=profile_snapshot,
+            scoring_engine_version=scoring_engine_version,
+            engine_version=engine_version,
+            deployed_patch=selected_patch,
+            calibrator_model=selected_calibrator,
+            resolved_scoring_inputs={
+                "submission_text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "anchors": anchors,
+                "requirements": requirements,
+                "runtime_custom_requirements": runtime_custom_requirements,
+                "runtime_requirement_meta": runtime_req_meta,
+                "constraints_rebuilt": constraints_rebuilt,
+                "material_quality_snapshot": snapshot_for_meta,
+                "material_required_types": material_required_types,
+                "material_utilization_policy": material_utilization_policy,
+                "strict_pre_flight": strict_pre_flight,
+            },
+            post_processing=_assessment_post_processing_context(
+                project_id,
+                project=project,
+                evolution_total_scale_applied=evolution_total_scale_applied,
+            ),
+        )
         if _report_is_blocked(report):
+            assessment_contract_service.attach_assessment_contract(report, contract)
             return report, evidence_units
         submission_like = {"id": submission_id, "project_id": project_id, "text": text}
-        _apply_prediction_to_report(report, submission_like=submission_like, project=project)
+        _apply_prediction_to_report(
+            report,
+            submission_like=submission_like,
+            project=project,
+            calibrator_model=selected_calibrator,
+            calibrator_model_resolved=True,
+        )
+        tender_criteria_service.apply_approved_tender_score(
+            project=project,
+            report=report,
+            document_text=text,
+        )
+        assessment_contract_service.attach_assessment_contract(report, contract)
         _mark_report_scored(report, trigger="score_engine")
         return report, evidence_units
 
@@ -3839,7 +3930,36 @@ def _score_submission_for_project(
         rule_dim_scores_from_legacy=_rule_dim_scores_from_legacy,
         build_evidence_trace_summary=_build_evidence_trace_summary,
     )
-    _apply_deployed_patch_to_report(project_id, legacy)
+    _apply_deployed_patch_to_report(
+        project_id,
+        legacy,
+        deployed_patch=selected_patch,
+        deployed_patch_resolved=True,
+    )
+    tender_criteria_service.apply_approved_tender_score(
+        project=project,
+        report=legacy,
+        document_text=text,
+    )
+    contract = assessment_contract or _build_project_assessment_contract(
+        project_id=project_id,
+        project=project,
+        config=config,
+        multipliers=multipliers,
+        profile_snapshot=profile_snapshot,
+        scoring_engine_version=scoring_engine_version,
+        engine_version=engine_version,
+        deployed_patch=selected_patch,
+        resolved_scoring_inputs={
+            "submission_text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()
+        },
+        post_processing=_assessment_post_processing_context(
+            project_id,
+            project=project,
+            evolution_total_scale_applied=evolution_total_scale_applied,
+        ),
+    )
+    assessment_contract_service.attach_assessment_contract(legacy, contract)
     _mark_report_scored(legacy, trigger="score_engine")
     return legacy, evidence_units
 
@@ -4810,11 +4930,39 @@ def _route_requires_api_key(request: Request) -> bool:
     return False
 
 
+def _is_loopback_web_request(request: Request) -> bool:
+    return str(request.url.hostname or "").lower() in {"127.0.0.1", "localhost", "::1"}
+
+
+def _inject_local_web_session_key(request: Request) -> str | None:
+    """Authenticate the local UI without exposing credentials to page scripts."""
+    if request.headers.get("X-API-Key") or not _is_loopback_web_request(request):
+        return None
+    fetch_site = str(request.headers.get("Sec-Fetch-Site") or "").lower()
+    if fetch_site and fetch_site not in {"same-origin", "none"}:
+        return None
+    api_key = resolve_local_web_session_key(
+        request.cookies.get(LOCAL_WEB_SESSION_COOKIE)
+    )
+    if not api_key:
+        return None
+    request.scope["headers"] = [
+        *request.scope.get("headers", []),
+        (b"x-api-key", api_key.encode("utf-8")),
+    ]
+    request._headers = Headers(scope=request.scope)
+    return api_key
+
+
 @app.middleware("http")
 async def _authenticate_before_body_parsing(request: Request, call_next):
     if _route_requires_api_key(request):
+        local_session_key = _inject_local_web_session_key(request)
         try:
-            verify_api_key(api_key_header=request.headers.get("X-API-Key"))
+            verify_api_key(
+                api_key_header=local_session_key
+                or request.headers.get("X-API-Key")
+            )
         except HTTPException as exc:
             return JSONResponse(
                 status_code=exc.status_code,
@@ -5483,6 +5631,14 @@ def cache_stats() -> CacheStatsResponse:
     return CacheStatsResponse(**stats)
 
 
+def _defer_material_analysis_for_ui(request: Request) -> bool:
+    """Keep the internal web upload fast without changing the public default."""
+    return (
+        str(request.headers.get("X-QingTian-Defer-Material-Analysis", "")).strip()
+        == "1"
+    )
+
+
 @router.post(
     "/cache/clear",
     response_model=CacheClearResponse,
@@ -6012,6 +6168,106 @@ def list_projects() -> list[ProjectRecord]:
         recover_latest_orphan_project=_recover_latest_orphan_project,
     )
     return [ProjectRecord(**p) for p in projects]
+
+
+def _merge_tender_materials_text(project_id: str) -> str:
+    sections: List[str] = []
+    rows = [m for m in load_materials() if str(m.get("project_id")) == str(project_id)]
+    rows.sort(key=lambda item: str(item.get("created_at") or ""))
+    for row in rows:
+        filename = str(row.get("filename") or "").strip()
+        material_type = _normalize_material_type(
+            row.get("material_type"), filename=filename
+        )
+        if material_type != "tender_qa":
+            continue
+        path = Path(str(row.get("path") or "").strip())
+        if not path.exists():
+            continue
+        try:
+            text = str(_read_uploaded_file_content(path.read_bytes(), path.name) or "").strip()
+        except Exception:
+            continue
+        if not text:
+            continue
+        sections.append(f"--- {filename or '招标资料'} ---\n{text}")
+    return "\n\n".join(sections)
+
+
+@atomic_json_transaction("projects")
+def _save_project_tender_profile_state(project_id: str, state: Dict[str, object]) -> Dict[str, object]:
+    projects = load_projects()
+    project = _find_project(project_id, projects)
+    meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
+    meta = dict(meta)
+    meta["tender_profile_state"] = copy.deepcopy(state)
+    project["meta"] = meta
+    project["updated_at"] = _now_iso()
+    save_projects(projects)
+    return copy.deepcopy(state)
+
+
+@router.get(
+    "/projects/{project_id}/tender-profile",
+    response_model=TenderProfileStateResponse,
+    tags=["按标分析"],
+    responses={**RESPONSES_401, **RESPONSES_404},
+)
+def get_project_tender_profile(
+    project_id: str,
+    api_key: Optional[str] = Depends(verify_api_key),
+) -> TenderProfileStateResponse:
+    project = _find_project(project_id, load_projects())
+    state = tender_criteria_service.project_tender_profile_state(project)
+    return TenderProfileStateResponse(project_id=project_id, **state)
+
+
+@router.post(
+    "/projects/{project_id}/tender-profile/extract",
+    response_model=TenderProfileStateResponse,
+    tags=["按标分析"],
+    responses={**RESPONSES_401, **RESPONSES_404, **RESPONSES_422},
+)
+def extract_project_tender_profile(
+    project_id: str,
+    api_key: Optional[str] = Depends(verify_api_key),
+) -> TenderProfileStateResponse:
+    project = _find_project(project_id, load_projects())
+    source_text = _merge_tender_materials_text(project_id)
+    if not source_text.strip():
+        raise HTTPException(status_code=422, detail="未找到可解析的招标文件和答疑资料。")
+    state = tender_criteria_service.extract_tender_profile_draft(
+        project_id=project_id,
+        project_name=str(project.get("name") or "当前项目"),
+        source_text=source_text,
+    )
+    saved = _save_project_tender_profile_state(project_id, state)
+    return TenderProfileStateResponse(project_id=project_id, **saved)
+
+
+@router.put(
+    "/projects/{project_id}/tender-profile/approve",
+    response_model=TenderProfileStateResponse,
+    tags=["按标分析"],
+    responses={**RESPONSES_401, **RESPONSES_404, **RESPONSES_422},
+)
+def approve_project_tender_profile(
+    project_id: str,
+    payload: TenderProfileApproveRequest,
+    api_key: Optional[str] = Depends(verify_api_key),
+) -> TenderProfileStateResponse:
+    project = _find_project(project_id, load_projects())
+    draft_state = tender_criteria_service.project_tender_profile_state(project)
+    try:
+        state = tender_criteria_service.approve_tender_profile(
+            profile_payload=payload.profile,
+            draft_state=draft_state,
+            attention_profile=payload.attention_profile,
+        )
+    except TenderProfileValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    saved = _save_project_tender_profile_state(project_id, state)
+    return TenderProfileStateResponse(project_id=project_id, **saved)
 
 
 @router.get(
@@ -6725,6 +6981,7 @@ def upload_material(
     project_id: str,
     file: UploadFile = File(...),
     material_type: str = Form(MATERIAL_TYPE_DEFAULT),
+    defer_material_analysis: bool = Depends(_defer_material_analysis_for_ui),
     api_key: Optional[str] = Depends(verify_api_key),
     locale: str = Depends(get_locale),
 ) -> dict:
@@ -6773,6 +7030,7 @@ def upload_material(
         record=record,
         invalidate_material_index_cache=_invalidate_material_index_cache,
         rebuild_project_anchors_and_requirements=_rebuild_project_anchors_and_requirements,
+        sync_constraints=not defer_material_analysis,
     )
 
 
@@ -8976,11 +9234,67 @@ def _render_material_knowledge_profile_markdown(payload: Dict[str, object]) -> s
 
 def _compute_multipliers_hash(multipliers: dict) -> str:
     """计算 multipliers 的 hash，用于缓存 key"""
-    import hashlib
-    import json
-
     content = json.dumps(multipliers, sort_keys=True)
     return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+
+
+def _build_project_assessment_contract(
+    *,
+    project_id: str,
+    project: Dict[str, object],
+    config: object,
+    multipliers: Optional[Dict[str, float]],
+    profile_snapshot: Optional[Dict[str, object]],
+    scoring_engine_version: str,
+    engine_version: str,
+    deployed_patch: Optional[Dict[str, object]],
+    calibrator_model: Optional[Dict[str, object]] = None,
+    resolved_scoring_inputs: Optional[Dict[str, object]] = None,
+    post_processing: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    rubric = getattr(config, "rubric", {})
+    lexicon = getattr(config, "lexicon", {})
+    return assessment_contract_service.build_assessment_contract(
+        project_id=project_id,
+        project=project,
+        config_rubric=rubric,
+        config_lexicon=lexicon,
+        multipliers=multipliers,
+        profile_snapshot=profile_snapshot,
+        scoring_engine_version=scoring_engine_version,
+        engine_version=engine_version,
+        deployed_patch=deployed_patch,
+        calibrator_model=calibrator_model,
+        resolved_scoring_inputs=resolved_scoring_inputs,
+        post_processing=post_processing,
+    )
+
+
+def _compute_project_score_cache_context_hash(
+    *,
+    project_id: str,
+    project: Dict[str, object],
+    config: object,
+    multipliers: Optional[Dict[str, float]],
+    profile_snapshot: Optional[Dict[str, object]],
+    scoring_engine_version: str,
+    engine_version: str,
+    deployed_patch: Optional[Dict[str, object]],
+    post_processing: Optional[Dict[str, object]] = None,
+) -> str:
+    """Use the certified assessment contract identity as the v1 cache context."""
+    contract = _build_project_assessment_contract(
+        project_id=project_id,
+        project=project,
+        config=config,
+        multipliers=multipliers,
+        profile_snapshot=profile_snapshot,
+        scoring_engine_version=scoring_engine_version,
+        engine_version=engine_version,
+        deployed_patch=deployed_patch,
+        post_processing=post_processing,
+    )
+    return str(contract["contract_hash"])
 
 
 def _get_effective_dimension_multipliers(project_id: str) -> Dict[str, float]:
@@ -8999,8 +9313,36 @@ def _get_evolution_total_score_scale(project_id: str) -> float | None:
     return None
 
 
+def _assessment_post_processing_context(
+    project_id: str,
+    *,
+    project: Dict[str, object],
+    evolution_total_scale_applied: bool,
+) -> Dict[str, object]:
+    meta = project.get("meta") if isinstance(project.get("meta"), dict) else {}
+    tender_state = (
+        meta.get("tender_profile_state")
+        if isinstance(meta.get("tender_profile_state"), dict)
+        else {}
+    )
+    scale = _get_evolution_total_score_scale(project_id)
+    scale_is_effective = scale is not None and abs(float(scale) - 1.0) >= 1e-6
+    will_apply = (
+        bool(evolution_total_scale_applied)
+        and not bool(tender_state.get("approved"))
+        and scale_is_effective
+    )
+    return {
+        "evolution_total_score_scale": float(scale) if scale is not None else None,
+        "evolution_total_score_scale_applied": will_apply,
+    }
+
+
 def _apply_evolution_total_scale(project_id: str, report: Dict[str, object]) -> None:
     """若进化报告有 total_score_scale，对总分进行缩放（原地修改 report）。"""
+    meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+    if meta.get("score_basis") == "approved_tender_profile":
+        return
     scale = _get_evolution_total_score_scale(project_id)
     if scale is None or abs(scale - 1.0) < 1e-6:
         return
@@ -9134,13 +9476,38 @@ def score_text_for_project(
     submission_id = str(uuid4())
     scoring_engine_version = str(project.get("scoring_engine_version_locked") or "v1")
     engine_version = _determine_engine_version(project, scoring_engine_version)
-    cache_payload: Optional[tuple[str, Dict[str, object], Optional[str]]] = None
+    cache_payload: Optional[tuple[str, Dict[str, object], str]] = None
 
     if engine_version == "v1":
-        config_hash = _compute_multipliers_hash(multipliers) if multipliers else None
-        cached_result = get_cached_score(payload.text, config_hash)
+        selected_patch = _select_deployed_patch(project_id)
+        assessment_contract = _build_project_assessment_contract(
+            project_id=project_id,
+            project=project,
+            config=config,
+            multipliers=multipliers,
+            profile_snapshot=profile_snapshot,
+            scoring_engine_version=scoring_engine_version,
+            engine_version=engine_version,
+            deployed_patch=selected_patch,
+            resolved_scoring_inputs={
+                "submission_text_sha256": hashlib.sha256(
+                    payload.text.encode("utf-8")
+                ).hexdigest()
+            },
+            post_processing=_assessment_post_processing_context(
+                project_id,
+                project=project,
+                evolution_total_scale_applied=True,
+            ),
+        )
+        cache_context_hash = str(assessment_contract["contract_hash"])
+        cached_result = get_cached_score(payload.text, cache_context_hash)
         if cached_result is not None:
             report = dict(cached_result)
+            assessment_contract_service.attach_assessment_contract(
+                report,
+                assessment_contract,
+            )
         else:
             raw_report, _ = _score_submission_for_project(
                 submission_id=submission_id,
@@ -9151,9 +9518,13 @@ def score_text_for_project(
                 multipliers=multipliers,
                 profile_snapshot=profile_snapshot,
                 scoring_engine_version=scoring_engine_version,
+                assessment_contract=assessment_contract,
+                deployed_patch=selected_patch,
+                deployed_patch_resolved=True,
+                evolution_total_scale_applied=True,
             )
             # 缓存仅存“未缩放原始分”，避免后续读取时重复应用 total_score_scale。
-            cache_payload = (payload.text, raw_report, config_hash)
+            cache_payload = (payload.text, raw_report, cache_context_hash)
             report = dict(raw_report)
         _apply_evolution_total_scale(project_id, report)
         evidence_units: List[Dict[str, object]] = []
@@ -9167,6 +9538,7 @@ def score_text_for_project(
             multipliers=multipliers,
             profile_snapshot=profile_snapshot,
             scoring_engine_version=scoring_engine_version,
+            evolution_total_scale_applied=True,
         )
         _apply_evolution_total_scale(project_id, report)
 
@@ -11873,13 +12245,17 @@ def web_upload_materials(
                 project_id=pid,
                 file=f,
                 material_type=material_type,
+                defer_material_analysis=True,
                 api_key=api_key,
                 locale="zh",
             )
             ok_count += 1
         except Exception:  # noqa: BLE001 - web fallback should keep processing
             fail_count += 1
-    msg = f"资料上传完成：成功 {ok_count}，失败 {fail_count}"
+    msg = (
+        f"资料上传完成：成功 {ok_count}，失败 {fail_count}。"
+        "文件已保存，系统将在提取评审标准或评分时按需分析。"
+    )
     return RedirectResponse(
         url="/?msg_type="
         + ("error" if fail_count > 0 else "success")
@@ -12046,6 +12422,7 @@ def index_head() -> Response:
 
 @app.get("/", tags=["系统状态"], include_in_schema=False)
 def index(
+    request: Request,
     created: Optional[str] = Query(None),
     create_error: Optional[str] = Query(None),
     msg: Optional[str] = Query(None),
@@ -12059,7 +12436,7 @@ def index(
     if created == "1":
         create_notice_html = (
             '<p style="margin:6px 0 0 0;font-size:13px;color:#15803d">'
-            "项目已创建，请使用 API key 刷新项目列表。</p>"
+            "项目已创建，项目列表将自动刷新。</p>"
         )
     elif create_error:
         create_notice_html = (
@@ -12178,9 +12555,6 @@ def index(
         .weight-row .norm-value { color:#334155; text-align:right; font-size:12px; }
         .skip-link { position:fixed; left:16px; top:-64px; z-index:1000; padding:10px 14px; border-radius:8px; background:#0f172a; color:#fff; text-decoration:none; }
         .skip-link:focus { top:12px; }
-        .workflow-nav { position:sticky; top:0; z-index:20; display:flex; gap:8px; overflow-x:auto; margin:0 0 16px; padding:10px; border:1px solid var(--border); border-radius:12px; background:rgba(255,255,255,.96); box-shadow:0 4px 18px rgba(15,23,42,.08); }
-        .workflow-nav a { flex:0 0 auto; padding:7px 10px; border-radius:7px; color:#1d4ed8; font-size:13px; font-weight:650; text-decoration:none; }
-        .workflow-nav a:hover { background:#dbeafe; }
         .section { scroll-margin-top:76px; }
         :where(a,button,input,select,textarea,summary):focus-visible { outline:3px solid #f59e0b; outline-offset:3px; }
         @keyframes qingtian-spin { to { transform:rotate(360deg); } }
@@ -12197,24 +12571,198 @@ def index(
           .weight-row { grid-template-columns:1fr 52px 72px; }
           .weight-row label { grid-column:1 / -1; }
         }
+        :root {
+          --navy-950:#0b1220; --navy-900:#101828; --navy-800:#1d2939;
+          --blue-600:#2457e6; --blue-700:#1d4ed8; --indigo-500:#4f46e5;
+          --success:#16875f; --warning:#b76e00; --danger:#d92d20;
+          --surface:#ffffff; --surface-soft:#f7f9fc; --border:#e1e7ef;
+          --text:#172033; --muted-text:#667085;
+        }
+        html { scroll-behavior:smooth; }
+        body { max-width:none; min-height:100vh; padding:0; font-family:Inter,"SF Pro Text","Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif; background:#f4f7fb; color:var(--text); -webkit-font-smoothing:antialiased; }
+        .app-sidebar { position:fixed; inset:0 auto 0 0; z-index:40; width:240px; box-sizing:border-box; padding:24px 16px; color:#d0d5dd; background:var(--navy-900); border-right:1px solid rgba(255,255,255,.06); overflow-y:auto; }
+        .brand { display:flex; align-items:center; gap:11px; margin:0 6px 28px; }
+        .brand-mark { width:36px; height:36px; display:grid; place-items:center; border-radius:10px; font-weight:900; color:#fff; background:var(--blue-600); box-shadow:0 6px 16px rgba(36,87,230,.28); }
+        .brand strong { display:block; color:#fff; font-size:16px; letter-spacing:.01em; }
+        .brand small { display:block; margin-top:2px; color:#98a2b3; font-size:9px; letter-spacing:.1em; }
+        .side-label { margin:20px 12px 8px; color:#667085; font-size:10px; font-weight:800; letter-spacing:.14em; text-transform:uppercase; }
+        .side-nav { display:grid; gap:5px; }
+        .side-nav a { display:flex; align-items:center; gap:10px; min-height:40px; box-sizing:border-box; padding:9px 11px; border-radius:8px; color:#b7c0ce; text-decoration:none; font-size:13px; font-weight:650; transition:background-color .16s ease,color .16s ease; }
+        .side-nav a:hover,.side-nav a:focus-visible { color:#fff; background:#1d2939; transform:none; }
+        .side-nav a.active { color:#fff; background:#263750; box-shadow:inset 3px 0 #60a5fa; }
+        .side-dot { width:6px; height:6px; border-radius:50%; background:#667085; }
+        .side-nav a.active .side-dot { background:#7dd3fc; box-shadow:none; }
+        .workspace { margin-left:240px; min-height:100vh; padding:24px clamp(22px,3vw,44px) 48px; }
+        .hero { position:relative; overflow:hidden; margin-bottom:16px; padding:28px 32px; border:1px solid rgba(255,255,255,.08); border-radius:16px; color:#fff; background:linear-gradient(120deg,#13233c 0%,#1e4aa8 58%,#315bd5 100%); box-shadow:0 10px 30px rgba(25,55,110,.16); }
+        .hero::after { content:""; position:absolute; width:280px; height:280px; right:-92px; top:-174px; border:1px solid rgba(255,255,255,.14); border-radius:50%; background:rgba(255,255,255,.04); }
+        .hero-top { position:relative; z-index:1; display:flex; align-items:flex-start; justify-content:space-between; gap:18px; }
+        .hero h1 { margin:0; max-width:850px; font-size:clamp(28px,3.2vw,44px); line-height:1.1; letter-spacing:-.035em; }
+        .hero-subtitle { margin:9px 0 0; color:#dbe7fa; font-size:16px; font-weight:550; }
+        .hero-badge { flex:0 0 auto; padding:7px 11px; border:1px solid rgba(255,255,255,.22); border-radius:999px; background:rgba(255,255,255,.08); font-size:10px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; }
+        main { display:grid; grid-template-columns:repeat(12,minmax(0,1fr)); gap:18px; }
+        .section { grid-column:span 12; margin:0; }
+        .card { border:1px solid var(--border); border-radius:14px; padding:22px 24px; margin:0; background:var(--surface); box-shadow:0 2px 8px rgba(16,24,40,.045); }
+        .card[data-eyebrow]::before { content:attr(data-eyebrow); display:block; margin-bottom:7px; color:#7c8a9f; font-size:10px; font-weight:800; letter-spacing:.13em; }
+        .card h2 { margin:0 0 14px; color:#1d2939; font-size:19px; letter-spacing:-.015em; }
+        #section-project,#section-materials,#section-tender-profile,#section-shigong { grid-column:span 12; }
+        #section-delivery { display:none; }
+        #section-evolution { order:80; }
+        #section-weights { order:90; }
+        #section-output { order:100; }
+        .project-picker { display:grid; grid-template-columns:minmax(240px,1fr) auto; gap:8px 10px; align-items:end; }
+        .project-picker-label { grid-column:1 / -1; color:#344054; font-size:13px; font-weight:700; }
+        .project-picker select { width:100%; min-width:0; }
+        .project-context { grid-column:1 / -1; display:flex; align-items:center; min-height:28px; color:#667085; font-size:12px; }
+        .project-flow-hint { margin:12px 0 14px; padding:10px 12px; border:1px solid #dbe5f2; border-radius:9px; color:#344054; background:#f8fbff; font-size:12px; }
+        .project-next-step { display:none; margin:8px 0 0; color:#1d4ed8; font-size:13px; font-weight:700; text-decoration:none; }
+        .project-next-step:hover { text-decoration:underline; }
+        .project-create-panel { margin-top:12px; padding:10px 12px; border:1px solid #dbe5f2; border-radius:10px; background:#f8fbff; }
+        .project-create-panel > summary { color:#2457e6; font-size:13px; }
+        .project-create-content { margin-top:12px; padding-top:12px; border-top:1px solid #dbe5f2; }
+        .project-create-content .muted { margin:0 0 10px; }
+        .project-create-form { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; }
+        .project-create-form input { width:100%; min-width:0; }
+        .project-tools { margin-top:12px; padding:10px 12px; border:1px solid #e4e7ec; border-radius:10px; background:#fafbfc; }
+        .project-tools > summary { color:#475467; font-size:13px; }
+        .project-tools-grid { display:grid; gap:14px; margin-top:12px; }
+        .project-tools h3 { margin:0 0 8px; color:#344054; font-size:13px; }
+        .result-toggle { display:block; margin:10px 0 0 auto; min-height:32px; padding:6px 10px; font-size:12px; }
+        .result-toggle[hidden] { display:none !important; }
+        summary[data-disclosure-action]::after { content:attr(data-disclosure-action); float:right; margin-left:12px; color:#2457e6; font-size:12px; font-weight:700; }
+        .secondary-actions { margin-top:12px; padding:10px 12px; border:1px solid #e4e7ec; border-radius:10px; background:#fafbfc; }
+        .secondary-actions > summary { color:#475467; font-size:13px; }
+        .secondary-actions .action-row { margin:12px 0 2px; }
+        .danger-zone { padding:12px; border:1px solid #fecdca; border-radius:9px; background:#fffafa; }
+        .danger-zone .toolbar { align-items:flex-start; }
+        .danger-zone select { min-width:220px; }
+        .section-description { margin:-7px 0 12px; color:#667085; font-size:13px; }
+        .section-toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:0 0 10px; }
+        .section-toolbar strong { color:#344054; font-size:14px; }
+        #section-materials .upload-zones { grid-template-columns:repeat(2,minmax(0,1fr)); }
+        #section-materials .upload-zone { border-style:dashed; background:#fbfcfe; }
+        .governance-panel { margin-top:12px; border:1px solid #e4e7ec; border-radius:11px; background:#fafbfc; }
+        .governance-panel > summary { padding:12px 14px; color:#344054; font-size:13px; }
+        .governance-content { padding:2px 14px 16px; border-top:1px solid #e4e7ec; }
+        .log-panel { margin:0; }
+        .log-panel > summary { color:#475467; font-size:13px; }
+        .log-panel pre { margin-top:12px; padding:14px; border-radius:9px; color:#d0d5dd; background:#101828; }
+        button { min-height:40px; border-radius:8px; background:var(--blue-600); box-shadow:0 1px 2px rgba(16,24,40,.08); transition:background-color .15s ease,box-shadow .15s ease,transform .15s ease; }
+        button:hover { opacity:1; background:var(--blue-700); box-shadow:0 2px 5px rgba(16,24,40,.12); }
+        button:active { transform:translateY(1px); }
+        button.secondary { color:#344054; border:1px solid #d0d5dd; background:#fff; box-shadow:0 1px 2px rgba(16,24,40,.04); }
+        button.secondary:hover { color:#1d2939; background:#f8fafc; border-color:#b8c1ce; }
+        button.btn-danger { color:#fff; border-color:var(--danger); background:var(--danger); }
+        button.btn-danger:hover { background:#b42318; }
+        input[type="text"],input[type="password"],input[type="number"],input[type="file"],select,textarea { min-height:40px; box-sizing:border-box; border-color:#d0d5dd; border-radius:8px; background:#fff; color:#1d2939; }
+        input[type="file"] { padding:5px; color:#667085; border:1px solid #d0d5dd; }
+        input[type="file"]::file-selector-button { min-height:30px; margin-right:10px; padding:6px 10px; border:0; border-radius:6px; color:#344054; background:#f2f4f7; font:inherit; font-size:12px; font-weight:700; cursor:pointer; }
+        input[type="file"]::file-selector-button:hover { background:#e4e7ec; }
+        input:focus,select:focus,textarea:focus { border-color:#84a7ff; box-shadow:0 0 0 3px rgba(36,87,230,.10); outline:none; }
+        table { overflow:hidden; border-radius:12px; border-style:hidden; box-shadow:0 0 0 1px var(--border); }
+        th { color:#475467; background:#f8fafc; border-color:#e4e7ec; font-size:12px; font-weight:700; letter-spacing:.02em; text-transform:none; }
+        td { border-color:#e4e7ec; }
+        tbody tr:hover { background:#f8fbff; }
+        .status-pill { display:inline-flex; align-items:center; gap:6px; padding:5px 9px; border-radius:999px; font-size:12px; font-weight:800; }
+        .status-pill.draft { color:#9a5b00; background:#fff4d6; }
+        .status-pill.approved { color:#087849; background:#dcfce7; }
+        .status-pill.empty { color:#5d6b82; background:#edf1f7; }
+        .criteria-summary { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin:14px 0; }
+        .criteria-metric { padding:14px 16px; border:1px solid #dbe5f2; border-radius:13px; background:linear-gradient(180deg,#fff,#f7faff); }
+        .criteria-metric b { display:block; color:#1746a2; font-size:24px; line-height:1.1; }
+        .criteria-metric span { color:#67758c; font-size:12px; }
+        .criteria-card { padding:14px; border:1px solid #dfe7f2; border-radius:12px; background:#fbfdff; }
+        .criteria-card + .criteria-card { margin-top:10px; }
+        .criteria-card-head { display:flex; justify-content:space-between; gap:12px; font-weight:750; }
+        .criteria-evidence { margin:8px 0 0; color:#5b687d; font-size:12px; }
+        .criteria-attention-note { margin:10px 0 12px; padding:10px 12px; border:1px solid #dbe5f2; border-radius:10px; color:#475467; background:#f8fbff; font-size:12px; }
+        .criteria-context-summary { display:block; margin-top:5px; color:#2457e6; font-weight:750; }
+        .criteria-catalog-summary { margin:0 0 12px; padding:14px; border:1px solid #dbe5f2; border-radius:12px; background:#fff; }
+        .criteria-catalog-summary[hidden] { display:none !important; }
+        .criteria-catalog-summary h3 { margin:0 0 10px; color:#344054; font-size:13px; }
+        .criteria-catalog-stats { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin:0; }
+        .criteria-catalog-stats > div { padding:10px 12px; border:1px solid #e4e7ec; border-radius:9px; background:#f8fafc; }
+        .criteria-catalog-stats dt { color:#667085; font-size:10px; font-weight:800; letter-spacing:.04em; }
+        .criteria-catalog-stats dd { margin:3px 0 0; color:#1d2939; font-size:15px; font-weight:800; }
+        .criteria-catalog-note { margin:10px 0 0; color:#475467; font-size:11px; line-height:1.55; }
+        .criteria-catalog-meta { display:flex; flex-wrap:wrap; gap:6px 14px; margin:6px 0 0; color:#667085; font-size:10px; }
+        .evidence-attention-list { display:grid; gap:10px; margin-top:12px; }
+        .evidence-attention-row { padding:12px; border:1px solid #e1e7ef; border-radius:11px; background:#fff; }
+        .evidence-attention-main { display:grid; grid-template-columns:minmax(260px,1.25fr) minmax(300px,1fr) auto; gap:14px; align-items:center; }
+        .evidence-copy { min-width:0; }
+        .evidence-copy strong { display:block; color:#26364d; font-size:13px; line-height:1.55; }
+        .origin-badge { display:inline-flex; margin:0 7px 4px 0; padding:3px 6px; border-radius:999px; color:#2457e6; background:#edf4ff; font-size:10px; font-weight:800; vertical-align:middle; }
+        .origin-badge.expert { color:#475467; background:#eef1f5; }
+        .attention-control { min-width:0; }
+        .attention-control-top { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:5px; }
+        .attention-control-top label { color:#475467; font-size:11px; font-weight:750; }
+        .attention-output { flex:0 0 auto; min-width:68px; padding:3px 7px; border-radius:999px; color:#1746a2; background:#eef4ff; font-size:11px; font-weight:800; font-variant-numeric:tabular-nums; text-align:center; }
+        .attention-control input[type="range"] { width:100%; min-height:24px; margin:0; padding:0; border:0; accent-color:var(--blue-600); box-shadow:none; cursor:pointer; }
+        .attention-control input[type="range"]:disabled { cursor:not-allowed; opacity:.62; }
+        .attention-scale-labels { display:flex; justify-content:space-between; gap:8px; color:#8995a8; font-size:10px; font-variant-numeric:tabular-nums; }
+        .attention-toggle { min-height:38px; padding:7px 10px; white-space:normal; color:#344054; border:1px solid #d0d5dd; background:#fff; box-shadow:none; font-size:11px; }
+        .attention-empty { color:#7c8a9f; font-size:11px; }
+        .attention-toggle:hover { background:#f8fafc; }
+        .expert-points { margin-top:10px; padding:10px 12px; border-left:2px solid #bfd4ff; border-radius:0 9px 9px 0; background:#f8fbff; }
+        .expert-point-row { display:grid; grid-template-columns:minmax(260px,1.25fr) minmax(300px,1fr); gap:14px; align-items:center; padding:9px 0; }
+        .expert-point-row + .expert-point-row { border-top:1px solid #e1e9f4; }
+        .expert-point-copy strong { display:block; color:#344054; font-size:12px; }
+        .expert-point-copy p { margin:3px 0 0; color:#667085; font-size:11px; line-height:1.45; }
+        .criteria-source { margin-top:10px; }
+        .criteria-source > summary { color:#667085; font-size:11px; }
+        .criteria-source p { margin:7px 0 0; color:#667085; font-size:11px; }
+        .attention-lock { color:#667085; font-size:10px; font-weight:700; }
+        .calibration-panel { margin:16px 0 8px; padding:18px; border:1px solid #d7e1ef; border-radius:14px; background:#f8fbff; }
+        .calibration-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; }
+        .calibration-heading h3 { margin:0; color:#1d3557; font-size:18px; }
+        .calibration-heading p { margin:5px 0 0; color:#64748b; font-size:13px; }
+        .calibration-badge { flex:0 0 auto; padding:5px 9px; border-radius:999px; color:#1d4ed8; background:#dbeafe; font-size:11px; font-weight:800; }
+        .calibration-primary { display:flex; flex-wrap:wrap; gap:10px; margin:15px 0 12px; }
+        .calibration-panel details { margin-top:8px; padding:10px 12px; border:1px solid #dce5f1; border-radius:10px; background:#fff; }
+        .calibration-panel details summary { color:#344767; font-size:13px; }
+        .calibration-advanced { display:flex; flex-wrap:wrap; align-items:center; gap:9px; margin-top:12px; }
+        .calibration-advanced label { color:#475569; font-size:13px; font-weight:700; }
+        .calibration-advanced input { flex:1 1 240px; min-width:220px; }
+        @media (max-width:980px) {
+          .app-sidebar { position:static; width:auto; padding:15px 18px; }
+          .brand { margin:0 0 12px; }
+          .side-label { display:none; }
+          .side-nav { display:flex; overflow-x:auto; }
+          .side-nav a { flex:0 0 auto; }
+          .workspace { margin-left:0; padding:16px; }
+          #section-materials .upload-zones { grid-template-columns:1fr; }
+          .evidence-attention-main,.expert-point-row { grid-template-columns:1fr; }
+          .attention-toggle { width:100%; min-height:44px; }
+        }
+        @media (max-width:760px) {
+          .criteria-summary { grid-template-columns:1fr; }
+          .criteria-catalog-stats { grid-template-columns:1fr; }
+          .criteria-card { padding:12px; }
+          .expert-points { margin-left:0; padding:10px; }
+        }
       </style>
     </head>
     <body>
       <a class="skip-link" href="#mainContent">跳到主要内容</a>
-      <h1>青天评标系统 - 上传与对比 (v2)</h1>
-      <p style="margin:-8px 0 16px 0;padding:10px;background:#e0f2fe;border-radius:6px;font-size:14px;">
-        <strong>首次使用：</strong>① 创建项目 → ② 刷新并选择项目 → ③ 上传施组文件 → ④ 点击“评分施组”出分。数据保存在本机，无需额外配置。
-      </p>
-      <nav class="workflow-nav" aria-label="主要工作流程">
-        <a href="#apiKeyControls">认证</a>
-        <a href="#section-create">创建项目</a>
-        <a href="#section-project">选择项目</a>
-        <a href="#section-materials">上传资料</a>
-        <a href="#section-shigong">上传与评分施组</a>
-        <a href="#section-compare">对比洞察</a>
-        <a href="#section-evolution">学习进化</a>
-        <a href="#section-output">原始输出</a>
-      </nav>
+      <aside class="app-sidebar" aria-label="主导航">
+        <div class="brand"><span class="brand-mark">青</span><div><strong>青天 AI 评审</strong><small>AI TENDER REVIEW</small></div></div>
+        <div class="side-label">评审工作台</div>
+        <nav class="side-nav">
+          <a class="active" aria-current="page" href="#mainContent"><span class="side-dot" aria-hidden="true"></span>项目概览</a>
+          <a href="#section-materials"><span class="side-dot" aria-hidden="true"></span>招标资料</a>
+          <a href="#section-tender-profile"><span class="side-dot" aria-hidden="true"></span>评审标准</a>
+          <a href="#section-shigong"><span class="side-dot" aria-hidden="true"></span>施组评分</a>
+          <a href="#section-compare"><span class="side-dot" aria-hidden="true"></span>结果与洞察</a>
+        </nav>
+        <div class="side-label">模型与系统</div>
+        <nav class="side-nav">
+          <a href="#section-evolution"><span class="side-dot" aria-hidden="true"></span>学习与校准</a>
+          <a href="#section-output"><span class="side-dot" aria-hidden="true"></span>运行日志</a>
+        </nav>
+      </aside>
+      <div class="workspace">
+      <header class="hero">
+        <div class="hero-top"><div><h1>青天 · 标书 AI 评审系统</h1><p class="hero-subtitle">让施工组织设计真正按本项目评审标准逐项核验、逐项得分</p></div><span class="hero-badge">Enterprise Review Workspace</span></div>
+      </header>
       __GLOBAL_NOTICE_HTML__
       <script>
         (function () {
@@ -12228,10 +12776,6 @@ def index(
           }
           function apiHeaders(isJson) {
             const h = {};
-            try {
-              const k = localStorage.getItem('api_key') || '';
-              if (k) h['X-API-Key'] = k;
-            } catch (_) {}
             if (isJson) h['Content-Type'] = 'application/json';
             return h;
           }
@@ -12333,7 +12877,7 @@ def index(
             if (!cfg) return true;
             const projectId = pickProjectId();
             if (!projectId) {
-              setResult(cfg.resultId, '请先在「2) 选择项目」中选择项目', true);
+              setResult(cfg.resultId, '请先在项目工作区选择项目', true);
               setOutput('[' + actionId + '] 缺少项目ID');
               return false;
             }
@@ -12448,7 +12992,7 @@ def index(
                 sel.innerHTML = '';
                 const lead = document.createElement('option');
                 lead.value = '';
-                lead.textContent = subs.length ? '-- 请选择步骤4已上传施组文件 --' : '-- 暂无施组，请先在步骤4上传 --';
+                lead.textContent = subs.length ? '-- 请选择已上传施组文件 --' : '-- 暂无已上传施组 --';
                 sel.appendChild(lead);
                 subs.forEach((s) => {
                   const opt = document.createElement('option');
@@ -12613,63 +13157,62 @@ def index(
       </script>
 
       <main id="mainContent" tabindex="-1">
-      <div class="section card" id="apiKeyControls">
-        <h2>API 访问认证</h2>
-        <div class="toolbar">
-          <label for="apiKeyInput">API key：</label>
-          <input id="apiKeyInput" type="password" autocomplete="off" placeholder="输入 X-API-Key" />
-          <button type="button" id="saveApiKey">保存</button>
-          <button type="button" id="clearApiKey" class="secondary">清除</button>
-        </div>
-        <p id="apiKeyStatus" class="muted" aria-live="polite">未保存 key</p>
-      </div>
-
-      <div class="section card" id="section-create">
-        <h2>1) 创建项目</h2>
-        <form id="createProject" method="post" action="/web/create_project">
-          项目名称：<input name="name" placeholder="例如：XX标段施组评审" />
-          <button type="submit" id="btnCreateProject">创建</button>
-        </form>
-        __CREATE_NOTICE_HTML__
-        <p id="createProjectMessage" style="margin:8px 0 0 0;font-size:13px;min-height:1.2em"></p>
-        <p style="margin:4px 0 0 0;font-size:13px;color:#64748b">创建后可从下方下拉选择项目，或复制返回的 id 使用。</p>
-      </div>
-
-      <div class="section card" id="section-project">
-        <h2>2) 选择项目</h2>
-        <div class="toolbar">
-          <button type="button" id="refreshProjects">刷新项目列表</button>
-          <span style="margin-left:4px">项目：</span>
+      <div class="section card" id="section-project" data-eyebrow="PROJECT WORKSPACE">
+        <h2>选择或新建评审项目</h2>
+        <p class="section-description">已有任务请直接选择；仅在开始一项新的独立评审时新建项目。创建成功后会自动切换到该项目。</p>
+        <p class="project-flow-hint"><strong>标准流程</strong>：选择或新建项目 → 上传招标资料 → 提取并确认评审标准 → 上传施组并评分 → 查看结果与洞察</p>
+        <div class="project-picker">
+          <label class="project-picker-label" for="projectSelect">继续已有项目</label>
           <select id="projectSelect">
-            <option value="">-- 请先刷新并选择项目 --</option>
+            <option value="">选择一个项目</option>
             __PROJECT_OPTIONS__
           </select>
-          <span id="currentProjectTag" style="margin-left:4px;font-size:12px;color:#475569"></span>
-          <form id="deleteProjectForm" method="post" action="/web/delete_project" class="inline-form">
-            <input type="hidden" name="project_id" id="deleteProjectId" value="__SELECTED_PROJECT_ID__" />
-            <button type="submit" id="deleteCurrentProject" class="secondary" style="background:#dc2626">删除当前项目</button>
-          </form>
-          <div class="inline-form" style="align-items:center;gap:6px">
-            <span style="margin-left:4px;font-size:12px;color:#475569">批量删除：</span>
-            <select id="projectDeleteSelect" multiple size="3" style="min-width:260px;max-width:420px"></select>
-            <button type="button" id="deleteSelectedProjects" class="secondary" style="background:#b91c1c">删除所选项目</button>
-          </div>
+          <button type="button" id="refreshProjects" class="secondary">刷新列表</button>
+          <span id="currentProjectTag" class="project-context"></span>
         </div>
-        <details style="margin-top:8px">
-          <summary style="cursor:pointer;color:#334155;font-size:13px">高级工具（系统诊断 / 评分体系 / 分析包）</summary>
-          <div class="toolbar" style="margin-top:8px">
+        <p id="selectProjectMessage" style="margin:4px 0 0 0;font-size:13px;min-height:1.2em"></p>
+        <a id="projectNextStep" class="project-next-step" href="#section-materials">下一步：上传或核对招标资料 →</a>
+        <details class="project-create-panel" id="projectCreatePanel">
+          <summary>开始新评审（新建项目）</summary>
+          <div class="project-create-content">
+            <p class="muted">每项独立招标评审建立一个项目；创建后无需再次选择，系统会直接进入该项目工作空间。</p>
+            <form id="createProject" method="post" action="/web/create_project" class="project-create-form">
+              <input name="name" aria-label="项目名称" placeholder="输入新项目名称" />
+              <button type="submit" id="btnCreateProject">创建项目</button>
+            </form>
+            <p id="createProjectMessage" style="margin:8px 0 0 0;font-size:13px;min-height:1.2em"></p>
+          </div>
+        </details>
+        __CREATE_NOTICE_HTML__
+        <details class="project-tools">
+          <summary>项目管理与高级工具</summary>
+          <div class="project-tools-grid">
+            <div>
+              <h3>诊断与导出</h3>
+              <div class="toolbar">
             <button type="button" id="btnSelfCheck" class="secondary">系统自检</button>
             <button type="button" id="btnScoringFactors" class="secondary">评分体系一览</button>
             <button type="button" id="btnScoringFactorsMd" class="secondary">评分体系Markdown</button>
             <button type="button" id="btnAnalysisBundle" class="secondary">项目分析包</button>
             <button type="button" id="btnAnalysisBundleDownload" class="secondary">下载分析包(.md)</button>
             <button type="button" id="btnCleanupE2EProjects" class="secondary" style="background:#b45309">清理E2E测试项目</button>
+              </div>
+            </div>
+            <div class="danger-zone">
+              <h3>危险操作</h3>
+              <div class="toolbar">
+                <form id="deleteProjectForm" method="post" action="/web/delete_project" class="inline-form">
+                  <input type="hidden" name="project_id" id="deleteProjectId" value="__SELECTED_PROJECT_ID__" />
+                  <button type="submit" id="deleteCurrentProject" class="btn-danger">删除当前项目</button>
+                </form>
+                <select id="projectDeleteSelect" multiple size="3" aria-label="批量选择待删除项目"></select>
+                <button type="button" id="deleteSelectedProjects" class="btn-danger">删除所选项目</button>
+              </div>
+            </div>
           </div>
         </details>
-        <p id="selectProjectMessage" style="margin:8px 0 0 0;font-size:13px;min-height:1.2em"></p>
         <div id="selfCheckResult" class="result-block" style="display:none"></div>
         <div id="scoringFactorsResult" class="result-block" style="display:none"></div>
-        <p class="muted">下方所有操作将使用选中的项目。选择项目后建议先上传项目资料（招标、清单等），再上传施组进行评分。删除项目会同时删除该项目全部资料与记录。</p>
       </div>
 
       <div class="section card" id="section-delivery">
@@ -12699,19 +13242,24 @@ def index(
         </div>
       </div>
 
-      <div class="section card" id="section-materials">
-        <h2>3) 项目资料</h2>
-        <p style="font-size:13px;color:#64748b;margin:-8px 0 8px 0">评分会读取本区资料并注入到锚点/要求矩阵中，作为后续施组打分依据。请按资料类型上传，避免混投。</p>
-        <div style="margin-bottom:10px">
+      <div class="section card" id="section-materials" data-eyebrow="SOURCE DOCUMENTS">
+        <h2>招标资料</h2>
+        <p class="section-description">上传招标文件、清单、图纸和现场照片，作为项目评审标准与证据核验依据。</p>
+        <div class="section-toolbar">
           <strong>本项目资料列表</strong>
-          <button type="button" id="btnRefreshMaterials" class="secondary" style="margin-left:8px">刷新</button>
-          <button type="button" id="btnMaterialDepthReport" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialDepthReport')">深读体检</button>
-          <button type="button" id="btnMaterialDepthReportDownload" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialDepthReportDownload')">下载体检报告(.md)</button>
-          <button type="button" id="btnMaterialKnowledgeProfile" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialKnowledgeProfile')">知识画像</button>
-          <button type="button" id="btnMaterialKnowledgeProfileDownload" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialKnowledgeProfileDownload')">下载知识画像(.md)</button>
+          <button type="button" id="btnRefreshMaterials" class="secondary">刷新列表</button>
         </div>
         <table id="materialsTable"><thead><tr><th>资料类型</th><th>文件名</th><th>上传时间</th><th>操作</th></tr></thead><tbody>__MATERIAL_ROWS__</tbody></table>
         <p id="materialsEmpty" style="font-size:13px;color:#64748b;margin:6px 0 0 0;display:__MATERIALS_EMPTY_DISPLAY__">暂无资料，请下方添加。</p>
+        <details class="secondary-actions">
+          <summary>资料分析与报告</summary>
+          <div class="action-row">
+            <button type="button" id="btnMaterialDepthReport" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialDepthReport')">深读体检</button>
+            <button type="button" id="btnMaterialDepthReportDownload" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialDepthReportDownload')">下载体检报告</button>
+            <button type="button" id="btnMaterialKnowledgeProfile" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialKnowledgeProfile')">知识画像</button>
+            <button type="button" id="btnMaterialKnowledgeProfileDownload" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnMaterialKnowledgeProfileDownload')">下载知识画像</button>
+          </div>
+        </details>
         <div id="materialDepthReportResult" class="result-block" style="display:none"></div>
         <div id="materialKnowledgeProfileResult" class="result-block" style="display:none"></div>
         <div class="upload-box">
@@ -12723,7 +13271,7 @@ def index(
                 <input type="hidden" name="project_id" id="uploadMaterialProjectId" value="__SELECTED_PROJECT_ID__" />
                 <input type="hidden" name="material_type" value="tender_qa" />
                 <input type="file" name="file" accept=".txt,.md,.pdf,.doc,.docx,.docm,.json" multiple />
-                <button type="submit" id="btnUploadMaterials" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadMaterials'); } return true;">上传资料</button>
+                <button type="submit" id="btnUploadMaterials">上传资料</button>
                 <span class="note">支持：TXT/MD/PDF/DOC/DOCX/DOCM/JSON，支持一次选择多个文件。</span>
               </form>
               <p id="materialsActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
@@ -12734,7 +13282,7 @@ def index(
                 <input type="hidden" name="project_id" id="uploadMaterialBoqProjectId" value="__SELECTED_PROJECT_ID__" />
                 <input type="hidden" name="material_type" value="boq" />
                 <input type="file" name="file" accept=".xlsx,.xls,.xlsm,.csv,.pdf,.doc,.docx,.txt,.json" multiple />
-                <button type="submit" id="btnUploadBoq" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadBoq'); } return true;">上传清单</button>
+                <button type="submit" id="btnUploadBoq">上传清单</button>
                 <span class="note">支持：XLSX/XLS/XLSM/CSV/PDF/DOC/DOCX/TXT/JSON，支持一次选择多个文件。</span>
               </form>
               <p id="materialsActionStatusBoq" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
@@ -12745,7 +13293,7 @@ def index(
                 <input type="hidden" name="project_id" id="uploadMaterialDrawingProjectId" value="__SELECTED_PROJECT_ID__" />
                 <input type="hidden" name="material_type" value="drawing" />
                 <input type="file" name="file" accept=".pdf,.doc,.docx,.xlsx,.xls,.dxf,.dwg,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff,.json,.txt" multiple />
-                <button type="submit" id="btnUploadDrawing" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadDrawing'); } return true;">上传图纸</button>
+                <button type="submit" id="btnUploadDrawing">上传图纸</button>
                 <span class="note">支持：PDF/DOC/DOCX/XLSX/XLS/DXF/DWG/图片/JSON/TXT，支持一次选择多个文件。</span>
               </form>
               <p id="materialsActionStatusDrawing" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
@@ -12756,7 +13304,7 @@ def index(
                 <input type="hidden" name="project_id" id="uploadMaterialPhotoProjectId" value="__SELECTED_PROJECT_ID__" />
                 <input type="hidden" name="material_type" value="site_photo" />
                 <input type="file" name="file" accept=".png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff" multiple />
-                <button type="submit" id="btnUploadSitePhotos" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadSitePhotos'); } return true;">上传照片</button>
+                <button type="submit" id="btnUploadSitePhotos">上传照片</button>
                 <span class="note">支持：PNG/JPG/JPEG/WEBP/BMP/TIF/TIFF，支持一次选择多个文件。</span>
               </form>
               <p id="materialsActionStatusPhoto" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
@@ -12765,9 +13313,10 @@ def index(
         </div>
       </div>
 
-      <div class="section card" id="section-weights">
-        <h2>2.5) 青天评标关注度（16维）</h2>
-        <p style="font-size:12px;color:#64748b;margin:-4px 0 10px 0">先设置16维关注度，再点击“应用到本项目并重算”。同一项目内所有施组将统一按该配置重算，历史快照会保留。</p>
+      <div class="section card" id="section-weights" data-eyebrow="LEGACY DIAGNOSTICS">
+        <details>
+        <summary>高级兼容诊断：固定 16 维关注度（不决定项目主评分）</summary>
+        <p style="font-size:12px;color:#64748b;margin:10px 0">此配置仅保留给历史诊断、校准和对比；项目主分以已确认的招标评审标准为准。</p>
         <div id="expertProfileStatus" style="font-size:13px;color:#334155;margin-bottom:8px">__EXPERT_PROFILE_STATUS__</div>
         <div id="expertWeightsPanel" style="display:grid;grid-template-columns:1fr;gap:8px;margin-bottom:10px">__EXPERT_WEIGHTS_ROWS__</div>
         <div style="font-size:13px;color:#0f172a;margin-bottom:8px">
@@ -12778,16 +13327,53 @@ def index(
           <button type="button" id="btnWeightsSave" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnWeightsSave')">保存为专家配置</button>
           <button type="button" id="btnWeightsApply" onclick="return window.__zhifeiFallbackClick(event, 'btnWeightsApply')">应用到本项目并重算所有施组</button>
         </div>
+        </details>
       </div>
 
-      <div class="section card" id="section-shigong">
-        <h2>4) 项目施组</h2>
-        <p style="font-size:13px;color:#64748b;margin:-8px 0 8px 0">每份施组单独打分。支持 .txt、.docx、.pdf、.json、.xlsx/.xls、.dxf。基于下方列表进行对比与洞察。</p>
+      <div class="section card" id="section-tender-profile" data-eyebrow="REVIEW CRITERIA">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap">
+          <div><h2>项目评审标准</h2><p class="muted">从招标文件中提取评分项、分值、证据要求和红线；人工确认后才进入正式评分。</p></div>
+          <span id="tenderProfileStatus" class="status-pill empty">尚未提取</span>
+        </div>
+        <div class="action-row">
+          <button type="button" id="btnExtractTenderProfile">从招标资料提取</button>
+          <button type="button" id="btnLoadTenderProfile" class="secondary">刷新当前标准</button>
+          <button type="button" id="btnApproveTenderProfile" disabled>确认并用于评分</button>
+          <span class="note">确认前请核对分值合计、评分项边界和来源原文。</span>
+        </div>
+        <div class="criteria-summary">
+          <div class="criteria-metric"><b id="tenderCriteriaCount">0</b><span>评分项</span></div>
+          <div class="criteria-metric"><b id="tenderScoreScale">-</b><span>项目评分满分</span></div>
+          <div class="criteria-metric"><b id="tenderConfidence">-</b><span>提取置信度</span></div>
+        </div>
+        <p class="criteria-attention-note">关注度用于安排证据检索、人工复核和优化优先级，不改变招标文件确定的 5 分及评分档位。一级内容来自招标原文，二级内容为专家细分。<span id="tenderProjectContext" class="criteria-context-summary" style="display:none"></span></p>
+        <section id="tenderCatalogSummary" class="criteria-catalog-summary" aria-labelledby="tenderCatalogSummaryTitle" hidden>
+          <h3 id="tenderCatalogSummaryTitle">专业科目适用情况</h3>
+          <dl class="criteria-catalog-stats">
+            <div><dt>工程类别</dt><dd id="tenderCatalogCategories">-</dd></div>
+            <div><dt>类别科目库</dt><dd id="tenderCatalogTotal">-</dd></div>
+            <div><dt>本项目启用</dt><dd id="tenderCatalogEnabled">-</dd></div>
+          </dl>
+          <p class="criteria-catalog-note">系统依据本项目招标条款和工程场景筛选适用科目；未启用科目不代表缺项、扣分或必须补齐。</p>
+          <p class="criteria-catalog-meta"><span id="tenderCatalogLinks" hidden></span><span id="tenderCatalogVersion" hidden></span></p>
+        </section>
+        <div id="tenderProfileItems"><p class="muted">上传招标资料后点击“从招标资料提取”。</p></div>
+        <details style="margin-top:14px">
+          <summary>高级编辑与来源 JSON</summary>
+          <p class="note">可在确认前修订名称、分值、档位和证据要求；系统会再次校验分值合计。</p>
+          <textarea id="perTenderProfileJson" rows="16" style="width:100%;box-sizing:border-box;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px" placeholder="提取后将在此显示可编辑 profile JSON"></textarea>
+        </details>
+        <div id="perTenderResult" class="result-block" style="display:none"></div>
+      </div>
+
+      <div class="section card" id="section-shigong" data-eyebrow="TECHNICAL PROPOSAL SCORING">
+        <h2>施工组织设计评分</h2>
+        <p class="section-description">确认评审标准后上传施组文件，系统将按招标条款逐项核验并计算项目得分。</p>
         <div style="margin-bottom:10px">
           <strong>本项目施组列表</strong>
           <button type="button" id="btnRefreshSubmissions" class="secondary" style="margin-left:8px">刷新</button>
         </div>
-        <table id="submissionsTable"><thead><tr><th>文件名</th><th>总分</th><th>上传时间</th><th>操作</th></tr></thead><tbody>__SUBMISSION_ROWS__</tbody></table>
+        <table id="submissionsTable"><thead><tr><th>文件名</th><th>项目标准得分</th><th>上传时间</th><th>操作</th></tr></thead><tbody>__SUBMISSION_ROWS__</tbody></table>
         <p id="submissionsEmpty" style="font-size:13px;color:#64748b;margin:6px 0 0 0;display:__SUBMISSIONS_EMPTY_DISPLAY__">暂无施组，请下方添加。</p>
         <div class="upload-box">
           <form id="uploadShigong" method="post" action="/web/upload_shigong" enctype="multipart/form-data" class="inline-form">
@@ -12795,12 +13381,9 @@ def index(
             <input type="hidden" name="project_id" id="uploadShigongProjectId" value="__SELECTED_PROJECT_ID__" />
             <input type="file" name="file" accept=".txt,.docx,.pdf,.json,.xlsx,.xls,.dxf" multiple />
             <button type="submit" id="btnUploadShigong" name="submit_action" value="upload" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnUploadShigong'); } return true;">上传施组</button>
-            <button type="submit" id="btnScoreShigong" class="secondary" formaction="/web/score_shigong" name="submit_action" value="score" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnScoreShigong'); } return true;">评分施组</button>
-            <span style="margin-left:8px;color:#334155;font-size:13px">满分标准：</span>
-            <select id="scoreScaleSelect" name="score_scale_max" style="margin-left:4px">
-              <option value="100">100分制</option>
-              <option value="5">5分制</option>
-            </select>
+            <button type="submit" id="btnScoreShigong" class="secondary" formaction="/web/score_shigong" name="submit_action" value="score" onclick="if (window.__zhifeiFallbackClick) { return window.__zhifeiFallbackClick(event, 'btnScoreShigong'); } return true;">按确认标准评分</button>
+            <label for="scoreScaleSelect" class="note">兼容报表折算：</label>
+            <select id="scoreScaleSelect" name="score_scale_max"><option value="100">100分制</option><option value="5">5分制</option></select>
             <span class="note">支持一次选择多个文件（Mac 按 Command，Windows 按 Ctrl）。</span>
           </form>
           <p id="shigongActionStatus" style="margin:6px 0 0 0;font-size:12px;color:#475569;min-height:1.2em"></p>
@@ -12809,87 +13392,25 @@ def index(
         </div>
       </div>
 
-      <div class="section card" id="section-per-tender">
-        <h2>按标分析（per-tender）</h2>
-        <p class="note" style="margin:-4px 0 10px 0">使用虚构 profile 与粘贴文本调用后端按标分析接口；hard redline 仅作为提示展示。</p>
-        <div class="field-group" style="align-items:stretch">
-          <label for="perTenderProfileJson" style="flex-basis:100%;font-weight:700">profile JSON</label>
-          <textarea id="perTenderProfileJson" rows="14" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px">{
-  "tender_id": "synthetic-014",
-  "tender_name": "014 synthetic tender",
-  "version": "v014",
-  "score_scale": 10,
-  "legacy_dimension_refs": ["dim_01", "dim_02"],
-  "scoring_items": [
-    {
-      "item_id": "deployment",
-      "name": "施工部署",
-      "max_score": 4,
-      "legacy_dimension_refs": ["dim_01"],
-      "evidence_requirements": ["项目经理", "施工计划"],
-      "bands": [
-        {"band_id": "basic", "label": "基本", "min_score": 0, "max_score": 2},
-        {"band_id": "strong", "label": "优秀", "min_score": 2, "max_score": 4}
-      ]
-    },
-    {
-      "item_id": "resources",
-      "name": "资源配置",
-      "max_score": 3,
-      "legacy_dimension_refs": ["dim_02"],
-      "evidence_requirements": ["劳动力", "机械设备"],
-      "bands": [
-        {"band_id": "basic", "label": "基本", "min_score": 0, "max_score": 1.5},
-        {"band_id": "strong", "label": "优秀", "min_score": 1.5, "max_score": 3}
-      ]
-    },
-    {
-      "item_id": "safety",
-      "name": "质量安全",
-      "max_score": 3,
-      "legacy_dimension_refs": ["dim_03"],
-      "evidence_requirements": ["质量验收", "安全员"],
-      "bands": [
-        {"band_id": "basic", "label": "基本", "min_score": 0, "max_score": 1.5},
-        {"band_id": "strong", "label": "优秀", "min_score": 1.5, "max_score": 3}
-      ]
-    }
-  ],
-  "hard_redlines": [
-    {
-      "redline_id": "site_plan_required",
-      "description": "施工总平面布置图缺失需提示风险",
-      "action": "manual_review",
-      "applies_to": ["deployment"]
-    }
-  ],
-  "source_note": "synthetic inline profile for 014 frontend test"
-}</textarea>
-        </div>
-        <div class="field-group" style="align-items:stretch">
-          <label for="perTenderDocumentText" style="flex-basis:100%;font-weight:700">document_text</label>
-          <textarea id="perTenderDocumentText" rows="5" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc">本施工组织设计由项目经理牵头，劳动力和机械设备按每日计划投入。质量验收由质量员旁站复检，安全员每日检查不少于2次。</textarea>
-        </div>
-        <div class="action-row">
-          <button type="button" id="btnPerTenderAnalyze">运行按标分析</button>
-        </div>
-        <div id="perTenderResult" class="result-block" style="display:none"></div>
-      </div>
-
-      <div class="section card" id="section-compare">
-        <h2>5) 对比与洞察</h2>
-        <p style="font-size:12px;color:#64748b;margin:-4px 0 8px 0">对比排名：看多份施组分数排序；对比报告：看叙述性差异；洞察：看弱项与扣分建议；学习画像：生成维度权重供后续评分参考。</p>
+      <div class="section card" id="section-compare" data-eyebrow="COMPARISON & INSIGHTS">
+        <h2>对比与洞察</h2>
+        <p class="section-description">比较多份施组的排名、差异、弱项与证据覆盖，形成可执行的优化建议。</p>
         <div class="action-row">
           <button type="button" id="btnCompare" onclick="return window.__zhifeiFallbackClick(event, 'btnCompare')">对比排名</button>
           <button type="button" id="btnCompareReport" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnCompareReport')">对比报告（叙述）</button>
-          <button type="button" id="btnCompareReportCopy" class="secondary" disabled>复制优化清单</button>
-          <button type="button" id="btnCompareReportExport" class="secondary" disabled>导出优化清单 JSON</button>
-          <span id="compareReportActionStatus" class="note">生成对比报告后可复制或导出优化清单。</span>
-          <button type="button" id="btnInsights" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnInsights')">洞察</button>
-          <button type="button" id="btnLearning" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnLearning')">生成学习画像</button>
-          <button type="button" id="btnEvidenceTrace" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnEvidenceTrace')">证据追溯（最新施组）</button>
-          <button type="button" id="btnScoringBasis" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnScoringBasis')">评分依据（最新施组）</button>
         </div>
+        <details class="secondary-actions">
+          <summary>更多分析与导出</summary>
+          <div class="action-row">
+            <button type="button" id="btnCompareReportCopy" class="secondary" disabled>复制优化清单</button>
+            <button type="button" id="btnCompareReportExport" class="secondary" disabled>导出优化清单 JSON</button>
+            <span id="compareReportActionStatus" class="note">生成对比报告后可复制或导出优化清单。</span>
+            <button type="button" id="btnInsights" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnInsights')">洞察</button>
+            <button type="button" id="btnLearning" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnLearning')">生成学习画像</button>
+            <button type="button" id="btnEvidenceTrace" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnEvidenceTrace')">证据追溯（最新施组）</button>
+            <button type="button" id="btnScoringBasis" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnScoringBasis')">评分依据（最新施组）</button>
+          </div>
+        </details>
         <div id="compareResult" class="result-block" style="display:none"></div>
         <div id="compareReportResult" class="result-block" style="display:none"></div>
         <div id="insightsResult" class="result-block" style="display:none"></div>
@@ -12915,10 +13436,12 @@ def index(
         <div id="adaptiveApplyResult" class="result-block" style="display:none"></div>
       </div>
 
-      <div class="section card" id="section-evolution">
-        <h2>7) 自我学习与进化</h2>
-        <p style="font-size:13px;color:#64748b;margin:0 0 6px 0">上传项目投喂包（招标/清单/图纸等合并文本），录入交易中心真实评标结果（5/7评委+最终得分），系统学习高分逻辑并生成编制指导。</p>
-        <p style="font-size:12px;color:#475569;margin:0 0 10px 0">系统会将学习到的高分逻辑与编制指导持久保存，并用于本项目的预评分权重与编制系统指令；再次执行学习进化可基于新录入的真实评标升级这些经验。</p>
+      <div class="section card" id="section-evolution" data-eyebrow="LEARNING & CALIBRATION">
+        <h2>学习与校准</h2>
+        <p class="section-description">录入真实评标结果，让系统学习高分逻辑、校准评分预测并生成后续编制指导。</p>
+        <details class="governance-panel">
+          <summary>打开学习与模型治理工作区</summary>
+          <div class="governance-content">
         <div style="margin-bottom:10px">
           <strong>真实评标列表（本项目 / 其它项目）</strong>
           <span style="margin-left:8px">查看范围：</span>
@@ -12950,13 +13473,13 @@ def index(
         <table id="feedMaterialsTable"><thead><tr><th>文件名</th><th>上传时间</th><th>操作</th></tr></thead><tbody></tbody></table>
         <p id="feedMaterialsEmpty" style="font-size:13px;color:#64748b;margin:6px 0 10px 0;display:none">暂无投喂包，请在上方或「3) 项目资料」上传。</p>
         <div style="margin-bottom:10px">
-          <strong>真实评标录入：</strong>从步骤4已上传施组中选择 + 评委分 + 最终分 →
+          <strong>真实评标录入：</strong>选择已上传施组，填写评委分与最终分 →
           <button type="button" id="btnAddGroundTruth" onclick="return window.__zhifeiFallbackClick(event, 'btnAddGroundTruth')">录入所选文件</button>
         </div>
         <div class="field-group">
           <label>施组文件：</label>
           <select id="groundTruthSubmissionSelect" style="margin-left:8px;min-width:360px">
-            <option value="">-- 请选择步骤4已上传施组文件 --</option>
+            <option value="">-- 请选择已上传施组文件 --</option>
           </select>
           <button type="button" id="btnRefreshGroundTruthSubmissionOptions" class="secondary" style="margin-left:8px" onclick="return window.__zhifeiFallbackClick(event, 'btnRefreshGroundTruthSubmissionOptions')">刷新施组选项</button>
           <span class="note">无需重复上传，直接复用「4) 项目施组」已上传文件。</span>
@@ -12989,35 +13512,45 @@ def index(
           <button type="button" id="btnWritingGuidance" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnWritingGuidance')">查看编制指导</button>
           <button type="button" id="btnCompilationInstructions" class="secondary" onclick="return window.__zhifeiFallbackClick(event, 'btnCompilationInstructions')">编制系统指令（可导出为编制约束）</button>
         </div>
-        <details open style="margin:12px 0 8px 0;padding:10px;border:2px solid #f59e0b;border-radius:8px;background:#fff7ed">
-          <summary style="cursor:pointer;color:#9a3412"><strong>V2 反演校准闭环（核心能力，强烈建议执行）</strong></summary>
-          <p style="margin:8px 0 10px 0;color:#7c2d12;font-size:13px">
-            该闭环会自动训练并部署校准器（CV闸门）、回填预测分，并联动补丁影子评估/发布。
-            为使系统评分持续逼近青天标准，建议每次录入真实评标后执行一次「一键闭环执行」。
-          </p>
-          <div style="margin-top:8px">
-            <button type="button" id="btnRebuildDelta" class="secondary">重建 DELTA_CASE</button>
-            <button type="button" id="btnRebuildSamples" class="secondary">重建 FEATURE_ROW</button>
-            <button type="button" id="btnTrainCalibratorV2" class="secondary">训练并部署校准器</button>
-            <button type="button" id="btnApplyCalibPredict" class="secondary">回填预测分</button>
-            <button type="button" id="btnAutoRunReflection">一键闭环执行</button>
-            <button type="button" id="btnEvalMetricsV2" class="secondary">评估 V1/V2/校准</button>
-            <button type="button" id="btnEvalSummaryV2" class="secondary">跨项目汇总评估</button>
+        <section class="calibration-panel" aria-labelledby="calibrationTitle">
+          <div class="calibration-heading">
+            <div>
+              <h3 id="calibrationTitle">模型校准</h3>
+              <p>录入真实评标结果后运行一次，让系统依据最新样本修正评分预测。</p>
+            </div>
+            <span class="calibration-badge">新增真实结果后执行</span>
           </div>
-          <div style="margin-top:8px">
-            补丁类型：
-            <select id="patchType" style="margin:0 8px">
-              <option value="threshold">threshold</option>
-              <option value="requirement">requirement</option>
-              <option value="keywords">keywords</option>
-            </select>
-            <button type="button" id="btnMinePatchV2" class="secondary">挖掘 PATCH_PACKAGE</button>
-            <input id="patchIdInput" placeholder="补丁ID（可留空自动取最新）" style="width:260px;margin-left:8px" />
-            <button type="button" id="btnShadowPatchV2" class="secondary">影子评估</button>
-            <button type="button" id="btnDeployPatchV2" class="secondary">发布补丁</button>
-            <button type="button" id="btnRollbackPatchV2" class="secondary">回滚补丁</button>
+          <div class="calibration-primary">
+            <button type="button" id="btnAutoRunReflection">运行自动校准</button>
+            <button type="button" id="btnEvalMetricsV2" class="secondary">查看校准效果</button>
+            <button type="button" id="btnEvalSummaryV2" class="secondary">查看跨项目效果</button>
           </div>
-        </details>
+          <details>
+            <summary>分步校准操作（高级）</summary>
+            <div class="calibration-advanced">
+              <button type="button" id="btnRebuildDelta" class="secondary">重新生成训练差异</button>
+              <button type="button" id="btnRebuildSamples" class="secondary">重新生成训练特征</button>
+              <button type="button" id="btnTrainCalibratorV2" class="secondary">训练并启用校准模型</button>
+              <button type="button" id="btnApplyCalibPredict" class="secondary">更新历史预测分</button>
+            </div>
+          </details>
+          <details>
+            <summary>补丁管理（专业人员）</summary>
+            <div class="calibration-advanced">
+              <label for="patchType">补丁类型</label>
+              <select id="patchType">
+                <option value="threshold">评分阈值</option>
+                <option value="requirement">评审要求</option>
+                <option value="keywords">识别关键词</option>
+              </select>
+              <button type="button" id="btnMinePatchV2" class="secondary">生成候选补丁</button>
+              <input id="patchIdInput" placeholder="补丁编号（留空使用最新）" />
+              <button type="button" id="btnShadowPatchV2" class="secondary">安全预演</button>
+              <button type="button" id="btnDeployPatchV2" class="secondary">应用补丁</button>
+              <button type="button" id="btnRollbackPatchV2" class="secondary">撤销补丁</button>
+            </div>
+          </details>
+        </section>
         <div id="evolveResult" class="result-block" style="display:none"></div>
         <div id="ollamaPreviewResult" class="result-block" style="display:none"></div>
         <div id="evolutionHealthResult" class="result-block" style="display:none"></div>
@@ -13030,11 +13563,16 @@ def index(
         <div id="patchShadowResult" class="result-block" style="display:none"></div>
         <div id="patchDeployResult" class="result-block" style="display:none"></div>
         <div id="evalResult" class="result-block" style="display:none"></div>
+          </div>
+        </details>
       </div>
 
-      <div class="section card" id="section-output">
-        <h2>原始输出（最后一次请求）</h2>
-        <pre id="output">（操作后这里显示原始 JSON）</pre>
+      <div class="section card" id="section-output" data-eyebrow="SYSTEM LOG">
+        <h2>运行日志</h2>
+        <details class="log-panel">
+          <summary>查看最近一次请求的技术输出</summary>
+          <pre id="output">（操作后这里显示原始 JSON）</pre>
+        </details>
       </div>
       </main>
 
@@ -13139,9 +13677,6 @@ def index(
               if (v) return v;
             }
             return '';
-          }
-          function fallbackApiKey() {
-            try { return localStorage.getItem('api_key') || ''; } catch (_) { return ''; }
           }
           function fallbackCollectWeightsRaw() {
             const m = {};
@@ -13415,16 +13950,10 @@ def index(
             if (typeof ev.stopImmediatePropagation === 'function') ev.stopImmediatePropagation();
           }
           function fallbackJsonBodyHeaders() {
-            const headers = { 'Content-Type': 'application/json' };
-            const key = fallbackApiKey();
-            if (key) headers['X-API-Key'] = key;
-            return headers;
+            return { 'Content-Type': 'application/json' };
           }
           function fallbackAuthHeaders() {
-            const headers = {};
-            const key = fallbackApiKey();
-            if (key) headers['X-API-Key'] = key;
-            return headers;
+            return {};
           }
           async function fallbackFetchScoringReadiness(projectId) {
             const pid = String(projectId || '').trim();
@@ -13781,14 +14310,7 @@ def index(
               return { body: JSON.stringify(payload), headers: fallbackJsonBodyHeaders() };
             }
             if (actionId === 'btnAdaptiveApply') {
-              let key = fallbackApiKey();
-              if (!key) {
-                const prompted = prompt('应用补丁将修改 lexicon 配置，需要 API Key。请输入 X-API-Key（无则留空）：');
-                key = prompted == null ? '' : prompted;
-              }
-              const headers = {};
-              if (key) headers['X-API-Key'] = key;
-              return { body: null, headers };
+              return { body: null, headers: {} };
             }
             if (actionId === 'btnLearning' || actionId === 'btnEvolve') {
               return { body: null, headers: fallbackAuthHeaders() };
@@ -13806,7 +14328,7 @@ def index(
             if (!cfg) return false;
             const projectId = fallbackGetProjectId();
             if (!projectId) {
-              fallbackSetResult(cfg.resultId, '请先在「2) 选择项目」中选择项目', true);
+              fallbackSetResult(cfg.resultId, '请先在项目工作区选择项目', true);
               fallbackSetOutput('[' + actionId + '] 缺少项目ID');
               return false;
             }
@@ -13869,7 +14391,7 @@ def index(
             if (actionId === 'btnAddGroundTruth') {
               const selectedSubmissionId = String(((document.getElementById('groundTruthSubmissionSelect') || {}).value) || '').trim();
               if (!selectedSubmissionId) {
-                fallbackSetResult(cfg.resultId, '请先在“施组文件”下拉框选择步骤4已上传施组。', true);
+                fallbackSetResult(cfg.resultId, '请先在“施组文件”下拉框选择已上传施组。', true);
                 fallbackSetOutput('[' + actionId + '] 未选择施组文件');
                 return false;
               }
@@ -14091,6 +14613,67 @@ def index(
           return true;
         };
         function safeChange(id, fn) { const el = document.getElementById(id); if (el) el.onchange = fn; }
+        function materialTypeLabel(typeKey) {
+          const t = String(typeKey || '').trim();
+          if (t === 'boq') return '清单';
+          if (t === 'drawing') return '图纸';
+          if (t === 'site_photo') return '现场照片';
+          return '招标文件和答疑';
+        }
+        function initializeDisclosureStateHints(root=document) {
+          root.querySelectorAll('details').forEach((details) => {
+            if (details.dataset.qingtianDisclosureReady === 'true') return;
+            const summary = details.querySelector(':scope > summary');
+            if (!summary) return;
+            details.dataset.qingtianDisclosureReady = 'true';
+            const compactLabel = summary.textContent.trim() === '展开';
+            const sync = () => {
+              summary.setAttribute('aria-expanded', String(details.open));
+              summary.title = details.open ? '点击收起' : '点击展开';
+              if (compactLabel) {
+                summary.textContent = details.open ? '收起' : '展开';
+              } else if (details.open) {
+                summary.dataset.disclosureAction = '收起';
+              } else {
+                delete summary.dataset.disclosureAction;
+              }
+            };
+            details.addEventListener('toggle', sync);
+            sync();
+          });
+        }
+        function initializeResultBlockToggles() {
+          document.querySelectorAll('.result-block[id]').forEach((result) => {
+            if (result.dataset.qingtianResultToggleReady === 'true') return;
+            result.dataset.qingtianResultToggleReady = 'true';
+            const toggle = document.createElement('button');
+            toggle.type = 'button';
+            toggle.className = 'result-toggle secondary';
+            toggle.setAttribute('aria-controls', result.id);
+            result.before(toggle);
+            const sync = () => {
+              const hasContent = result.innerHTML.trim().length > 0;
+              const expanded = hasContent && result.style.display !== 'none';
+              toggle.hidden = !hasContent;
+              toggle.textContent = expanded ? '收起结果' : '展开上次结果';
+              toggle.setAttribute('aria-expanded', String(expanded));
+              initializeDisclosureStateHints(result);
+            };
+            toggle.addEventListener('click', () => {
+              const expand = result.style.display === 'none';
+              result.style.display = expand ? 'block' : 'none';
+              sync();
+            });
+            const observer = new MutationObserver(sync);
+            observer.observe(result, {
+              attributes: true,
+              attributeFilter: ['style'],
+              childList: true,
+              subtree: false,
+            });
+            sync();
+          });
+        }
         function initializeProductAccessibility() {
           document.querySelectorAll('.result-block').forEach((el) => {
             el.setAttribute('role', 'status');
@@ -14106,6 +14689,37 @@ def index(
             output.setAttribute('aria-live', 'polite');
             output.setAttribute('aria-atomic', 'false');
           }
+          initializeDisclosureStateHints(document);
+          initializeResultBlockToggles();
+        }
+        function initializeSectionNavigation() {
+          const links = Array.from(document.querySelectorAll('.app-sidebar .side-nav a[href^="#"]'));
+          const setActive = (href) => {
+            links.forEach((link) => {
+              const isActive = link.getAttribute('href') === href;
+              link.classList.toggle('active', isActive);
+              if (isActive) link.setAttribute('aria-current', 'page');
+              else link.removeAttribute('aria-current');
+            });
+          };
+          const sections = links
+            .map((link) => ({ link, target: document.querySelector(link.getAttribute('href')) }))
+            .filter(({ target }) => target && target.id !== 'mainContent');
+          if ('IntersectionObserver' in window) {
+            const observer = new IntersectionObserver((entries) => {
+              const visible = entries
+                .filter((entry) => entry.isIntersecting)
+                .sort((a, b) => b.intersectionRatio - a.intersectionRatio);
+              if (visible[0]) setActive('#' + visible[0].target.id);
+            }, { rootMargin: '-18% 0px -68% 0px', threshold: [0, 0.05, 0.25] });
+            sections.forEach(({ target }) => observer.observe(target));
+          }
+          window.addEventListener('scroll', () => {
+            if (window.scrollY < 180) setActive('#mainContent');
+          }, { passive: true });
+          links.forEach((link) => {
+            link.addEventListener('click', () => setActive(link.getAttribute('href')));
+          });
         }
         function storageGet(key) {
           try { return localStorage.getItem(key) || ''; } catch (_) { return ''; }
@@ -14117,20 +14731,18 @@ def index(
           try { localStorage.removeItem(key); } catch (_) {}
         }
         function redactStoredApiKey(value) {
-          const text = String(value == null ? '' : value);
-          const storedKey = storageGet('api_key');
-          return storedKey ? text.split(storedKey).join('[redacted]') : text;
+          return String(value == null ? '' : value);
         }
         function authAwareErrorMessage(res, text, fallback='服务请求失败') {
           let payload = {};
           try { payload = JSON.parse(String(text || '{}')); } catch (_) {}
           const detail = (payload && typeof payload.detail === 'object') ? payload.detail : {};
           const code = String((detail && detail.code) || (payload && payload.code) || '');
-          if (code === 'AUTH_KEY_MISSING') return '未保存 API key，请先在认证区保存。';
-          if (code === 'AUTH_KEY_INVALID') return 'API key 缺失或错误，请重新保存。';
+          if (code === 'AUTH_KEY_MISSING') return '本机工作台认证会话无效，请刷新页面。';
+          if (code === 'AUTH_KEY_INVALID') return '本机工作台认证会话无效，请刷新页面。';
           if (code === 'AUTH_NOT_CONFIGURED') return '服务未配置认证，请联系服务管理员。';
           const status = res && typeof res.status === 'number' ? res.status : 0;
-          if (status === 401) return 'API key 缺失或错误，请重新保存。';
+          if (status === 401) return '本机工作台认证会话无效，请刷新页面。';
           if (status === 503) return '服务未配置认证或暂不可用。';
           const rawDetail = (payload && typeof payload.detail === 'string')
             ? payload.detail
@@ -14222,9 +14834,7 @@ def index(
           el.value = (raw === '5') ? '5' : '100';
         }
         function apiHeaders(isJson=true) {
-          const k = storageGet('api_key');
           const h = {};
-          if (k) h['X-API-Key'] = k;
           if (isJson) h['Content-Type'] = 'application/json';
           return h;
         }
@@ -14341,12 +14951,12 @@ def index(
             el.title = hasProject ? '' : '请先选择项目后执行（点击会显示提示）';
           });
           if (!hasProject) {
-            setActionStatus('materialsActionStatus', '请先在「2) 选择项目」中选择项目。', true);
-            setActionStatus('materialsActionStatusBoq', '请先在「2) 选择项目」中选择项目。', true);
-            setActionStatus('materialsActionStatusDrawing', '请先在「2) 选择项目」中选择项目。', true);
-            setActionStatus('materialsActionStatusPhoto', '请先在「2) 选择项目」中选择项目。', true);
-            setActionStatus('shigongActionStatus', '请先在「2) 选择项目」中选择项目。', true);
-            setActionStatus('feedActionStatus', '请先在「2) 选择项目」中选择项目。', true);
+            setActionStatus('materialsActionStatus', '请先在项目工作区选择项目。', true);
+            setActionStatus('materialsActionStatusBoq', '请先在项目工作区选择项目。', true);
+            setActionStatus('materialsActionStatusDrawing', '请先在项目工作区选择项目。', true);
+            setActionStatus('materialsActionStatusPhoto', '请先在项目工作区选择项目。', true);
+            setActionStatus('shigongActionStatus', '请先在项目工作区选择项目。', true);
+            setActionStatus('feedActionStatus', '请先在项目工作区选择项目。', true);
           }
         }
 
@@ -14441,7 +15051,7 @@ def index(
             gtSubmissionSel.innerHTML = '';
             const opt = document.createElement('option');
             opt.value = '';
-            opt.textContent = hasProject ? '-- 待加载步骤4施组文件 --' : '-- 请先选择项目 --';
+            opt.textContent = hasProject ? '-- 正在加载已上传施组 --' : '-- 请先选择项目 --';
             gtSubmissionSel.appendChild(opt);
             gtSubmissionSel.value = '';
           }
@@ -14450,32 +15060,32 @@ def index(
           ).forEach((el) => { if (el) el.value = ''; });
           setActionStatus(
             'materialsActionStatus',
-            hasProject ? '待机：可上传招标文件和答疑。' : '请先在「2) 选择项目」中选择项目。',
+            hasProject ? '待机：可上传招标文件和答疑。' : '请先在项目工作区选择项目。',
             !hasProject
           );
           setActionStatus(
             'materialsActionStatusBoq',
-            hasProject ? '待机：可上传清单。' : '请先在「2) 选择项目」中选择项目。',
+            hasProject ? '待机：可上传清单。' : '请先在项目工作区选择项目。',
             !hasProject
           );
           setActionStatus(
             'materialsActionStatusDrawing',
-            hasProject ? '待机：可上传图纸。' : '请先在「2) 选择项目」中选择项目。',
+            hasProject ? '待机：可上传图纸。' : '请先在项目工作区选择项目。',
             !hasProject
           );
           setActionStatus(
             'materialsActionStatusPhoto',
-            hasProject ? '待机：可上传现场照片。' : '请先在「2) 选择项目」中选择项目。',
+            hasProject ? '待机：可上传现场照片。' : '请先在项目工作区选择项目。',
             !hasProject
           );
           setActionStatus(
             'shigongActionStatus',
-            hasProject ? '待机：可上传施组或点击“评分施组”。' : '请先在「2) 选择项目」中选择项目。',
+            hasProject ? '待机：可上传施组或执行评分。' : '请先在项目工作区选择项目。',
             !hasProject
           );
           setActionStatus(
             'feedActionStatus',
-            hasProject ? '待机：可上传投喂包或录入真实评标。' : '请先在「2) 选择项目」中选择项目。',
+            hasProject ? '待机：可上传项目资料或录入真实评标。' : '请先在项目工作区选择项目。',
             !hasProject
           );
           if (hasProject) {
@@ -14725,38 +15335,6 @@ def index(
           el.textContent = msg || '';
           el.style.color = isError ? '#b91c1c' : '#15803d';
         }
-        function setApiKeyStatus(msg, isError) {
-          const el = document.getElementById('apiKeyStatus');
-          if (!el) return;
-          el.textContent = msg || '';
-          el.style.color = isError ? '#b91c1c' : '#15803d';
-        }
-        function syncApiKeyStatus() {
-          setApiKeyStatus(storageGet('api_key') ? '已保存' : '未保存 key', false);
-        }
-        safeClick('saveApiKey', () => {
-          const input = document.getElementById('apiKeyInput');
-          const key = String((input && input.value) || '').trim();
-          if (!key) {
-            setApiKeyStatus('未保存 key，请输入 API key。', true);
-            return;
-          }
-          try {
-            localStorage.setItem("api_key", key);
-          } catch (_) {
-            setApiKeyStatus('无法保存 API key，请检查浏览器存储权限。', true);
-            return;
-          }
-          if (input) input.value = '';
-          setApiKeyStatus('已保存', false);
-        });
-        safeClick('clearApiKey', () => {
-          try { localStorage.removeItem("api_key"); } catch (_) {}
-          const input = document.getElementById('apiKeyInput');
-          if (input) input.value = '';
-          setApiKeyStatus('未保存 key', false);
-        });
-        syncApiKeyStatus();
         function setSelfCheckResult(summary, details, isError) {
           const el = document.getElementById('selfCheckResult');
           if (!el) return;
@@ -14946,9 +15524,10 @@ def index(
             'analysis_bundle_' + currentId + '.md'
           );
         }
-        async function refreshProjects() {
+        async function refreshProjects(preferredProjectId = '') {
           setSelectMsg('正在加载…', false);
-          const current = pid() || storageGet('selected_project_id') || '';
+          const preferred = String(preferredProjectId || '').trim();
+          const current = preferred || pid() || storageGet('selected_project_id') || '';
           const deleteSel = document.getElementById('projectDeleteSelect');
           const prevDeleteIds = deleteSel
             ? Array.from(deleteSel.selectedOptions || []).map((o) => String(o.value || ''))
@@ -14987,7 +15566,9 @@ def index(
             if (out) { out.textContent = '刷新失败: ' + errMsg; out.scrollIntoView({ behavior: 'smooth' }); }
             return;
           }
-          setSelectMsg(list.length ? '已加载 ' + list.length + ' 个项目，请在上方下拉框选择' : '暂无项目，请先在「1) 创建项目」中创建', false);
+          const createPanel = document.getElementById('projectCreatePanel');
+          if (!list.length && createPanel) createPanel.open = true;
+          setSelectMsg(list.length ? '已加载 ' + list.length + ' 个项目' : '暂无项目，请在下方新建项目。', false);
           const sel = document.getElementById('projectSelect');
           sel.innerHTML = '<option value="">-- 选择项目 --</option>';
           list.forEach(p => {
@@ -15019,8 +15600,11 @@ def index(
           if (deleteSelectedBtn) deleteSelectedBtn.disabled = !list.length;
           if (current && list.some(p => p.id === current)) {
             sel.value = current;
-          } else if (list.length > 0) {
-            sel.value = list[list.length - 1].id;
+          } else {
+            const regularProjects = list.filter(
+              (p) => !String((p && p.name) || '').startsWith('E2E_')
+            );
+            sel.value = regularProjects.length === 1 ? regularProjects[0].id : '';
           }
           if (sel.value) {
             storageSet('selected_project_id', sel.value);
@@ -15039,15 +15623,27 @@ def index(
           applyProjectScoreScale(selectedId);
           updateProjectBoundControlsState();
           resetProjectPanelsToStandby(selectedId);
+          const nextStep = document.getElementById('projectNextStep');
+          if (nextStep) nextStep.style.display = selectedId ? 'inline-flex' : 'none';
           if (!selectedId) {
-            setSelectMsg('请先在上方选择项目。', true);
+            const projectSelect = document.getElementById('projectSelect');
+            const hasProjects = projectSelect
+              ? Array.from(projectSelect.options || []).some((option) => Boolean(option.value))
+              : false;
+            if (!hasProjects) {
+              const createPanel = document.getElementById('projectCreatePanel');
+              if (createPanel) createPanel.open = true;
+              setSelectMsg('暂无项目，请在下方新建项目。', false);
+            } else {
+              setSelectMsg('请选择当前项目。', true);
+            }
             return;
           }
           await Promise.all([
             (typeof loadExpertProfile === 'function') ? loadExpertProfile(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshSubmissions === 'function') ? refreshSubmissions(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshMaterials === 'function') ? refreshMaterials(selectedId, switchSeq) : Promise.resolve(),
-            (typeof refreshScoringReadiness === 'function') ? refreshScoringReadiness(selectedId, switchSeq) : Promise.resolve(),
+            (typeof loadTenderProfile === 'function') ? loadTenderProfile(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshFeedMaterials === 'function') ? refreshFeedMaterials(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshGroundTruth === 'function') ? refreshGroundTruth(selectedId, switchSeq) : Promise.resolve(),
             (typeof refreshGroundTruthSubmissionOptions === 'function') ? refreshGroundTruthSubmissionOptions(selectedId, switchSeq) : Promise.resolve(),
@@ -15196,15 +15792,20 @@ def index(
               if (out) { out.textContent = '请求失败: ' + (err.message || err); out.scrollIntoView({ behavior: 'smooth' }); }
               return;
             }
-            const outEl = document.getElementById('output');
-            if (outEl) outEl.textContent = text;
             if (res && res.ok) {
+              let created = {};
               try {
-                const created = JSON.parse(text || '{}');
+                created = JSON.parse(text || '{}');
                 if (created && created.id) storageSet('selected_project_id', created.id);
               } catch (_) {}
-              setCreateMsg('创建成功，已刷新下方列表，请选择项目', false);
-              await refreshProjects();
+              formCreate.reset();
+              await refreshProjects((created && created.id) || '');
+              const createPanel = document.getElementById('projectCreatePanel');
+              if (createPanel) createPanel.open = false;
+              setCreateMsg('', false);
+              setSelectMsg('项目已创建并切换为当前项目。下一步：上传招标资料。', false);
+              const nextStep = document.getElementById('projectNextStep');
+              if (nextStep) nextStep.style.display = 'inline-flex';
             } else {
               const detail = authAwareErrorMessage(res, text, '创建项目失败');
               setCreateMsg('创建失败: ' + detail, true);
@@ -15233,6 +15834,31 @@ def index(
           site_photo: { formId: 'uploadMaterialPhoto', statusId: 'materialsActionStatusPhoto', typeLabel: '现场照片' },
         };
         const uploadMaterialsInFlightByType = {};
+        let materialUploadBatchInFlight = false;
+        const MATERIAL_UPLOAD_TIMEOUT_MS = 180000;
+        function setMaterialUploadControlsBusy(busy) {
+          Object.values(MATERIAL_UPLOAD_CONFIGS).forEach((item) => {
+            const form = document.getElementById(item.formId);
+            const button = form && form.querySelector ? form.querySelector('button[type="submit"]') : null;
+            if (!button) return;
+            button.disabled = Boolean(busy);
+            button.setAttribute('aria-busy', String(Boolean(busy)));
+          });
+        }
+        async function fetchWithUploadTimeout(url, options, timeoutMs = MATERIAL_UPLOAD_TIMEOUT_MS) {
+          const controller = new AbortController();
+          const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            return await fetch(url, Object.assign({}, options || {}, { signal: controller.signal }));
+          } catch (err) {
+            if (err && err.name === 'AbortError') {
+              throw new Error('单个文件上传超过 3 分钟，已停止等待；请检查文件后重试。');
+            }
+            throw err;
+          } finally {
+            window.clearTimeout(timer);
+          }
+        }
         function bindMaterialUploadForm(materialType) {
           const cfg = MATERIAL_UPLOAD_CONFIGS[materialType];
           if (!cfg) return;
@@ -15251,11 +15877,13 @@ def index(
         bindMaterialUploadForm('site_photo');
         async function uploadMaterialsAction(materialType = 'tender_qa') {
           const cfg = MATERIAL_UPLOAD_CONFIGS[materialType] || MATERIAL_UPLOAD_CONFIGS.tender_qa;
-          if (uploadMaterialsInFlightByType[materialType]) {
-            setActionStatus(cfg.statusId, cfg.typeLabel + '上传进行中，请稍候…', false);
+          if (materialUploadBatchInFlight || uploadMaterialsInFlightByType[materialType]) {
+            setActionStatus(cfg.statusId, '已有资料批次正在上传，请等待完成后再提交。', false);
             return;
           }
+          materialUploadBatchInFlight = true;
           uploadMaterialsInFlightByType[materialType] = true;
+          setMaterialUploadControlsBusy(true);
           try {
             const projectId = pid();
             if (!projectId) {
@@ -15274,21 +15902,23 @@ def index(
               setActionStatus(cfg.statusId, '请先选择至少 1 个' + cfg.typeLabel + '文件。', true);
               return;
             }
-            const headers = {};
-            const apiKey = storageGet('api_key');
-            if (apiKey) headers['X-API-Key'] = apiKey;
+            const headers = { 'X-QingTian-Defer-Material-Analysis': '1' };
             const out = document.getElementById('output');
-            if (out) out.textContent = cfg.typeLabel + '上传中（' + files.length + ' 个）...';
-            setActionStatus(cfg.statusId, cfg.typeLabel + '上传中（' + files.length + ' 个）...', false);
+            if (out) out.textContent = cfg.typeLabel + '准备上传（共 ' + files.length + ' 个）...';
+            setActionStatus(cfg.statusId, cfg.typeLabel + '准备上传（共 ' + files.length + ' 个）...', false);
             let okCount = 0;
             let failCount = 0;
             const details = [];
-            for (const f of files) {
+            for (let index = 0; index < files.length; index += 1) {
+              const f = files[index];
+              const progress = '正在上传 ' + (index + 1) + '/' + files.length + '：' + f.name;
+              setActionStatus(cfg.statusId, progress, false);
+              if (out) out.textContent = cfg.typeLabel + ' · ' + progress + NL + details.join(NL);
               const fd = new FormData();
               fd.append('file', f);
               fd.append('material_type', materialType);
               try {
-                const res = await fetch('/api/v1/projects/' + projectId + '/materials', {
+                const res = await fetchWithUploadTimeout('/api/v1/projects/' + encodeURIComponent(projectId) + '/materials', {
                   method: 'POST',
                   headers,
                   body: fd,
@@ -15311,7 +15941,8 @@ def index(
             if (out) out.textContent = cfg.typeLabel + '上传完成：成功 ' + okCount + '，失败 ' + failCount + NL + details.join(NL);
             setActionStatus(
               cfg.statusId,
-              '上传完成：成功 ' + okCount + '，失败 ' + failCount + '。',
+              '上传完成：成功 ' + okCount + '，失败 ' + failCount
+                + '。文件已保存；系统将在提取评审标准或评分时按需分析。',
               failCount > 0
             );
             if (okCount > 0) {
@@ -15321,6 +15952,9 @@ def index(
             if (fileInput && failCount === 0) fileInput.value = '';
           } finally {
             uploadMaterialsInFlightByType[materialType] = false;
+            materialUploadBatchInFlight = false;
+            setMaterialUploadControlsBusy(false);
+            updateProjectBoundControlsState();
           }
         }
 
@@ -15376,8 +16010,6 @@ def index(
               return;
             }
             const headers = {};
-            const apiKey = storageGet('api_key');
-            if (apiKey) headers['X-API-Key'] = apiKey;
             const o = document.getElementById('output');
             if (o) o.textContent = '施组上传中（' + files.length + ' 个）...';
             setActionStatus('shigongActionStatus', '施组上传中（' + files.length + ' 个）...', false);
@@ -15646,7 +16278,6 @@ def index(
               emptyEl.style.display = 'block';
             }
             if (typeof clearMaterialUtilizationPanel === 'function') clearMaterialUtilizationPanel();
-            if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             return;
           }
           if (!Array.isArray(subs) || subs.length === 0) {
@@ -15655,7 +16286,6 @@ def index(
               emptyEl.style.display = 'block';
             }
             if (typeof clearMaterialUtilizationPanel === 'function') clearMaterialUtilizationPanel();
-            if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             return;
           }
           if (emptyEl) emptyEl.style.display = 'none';
@@ -15665,6 +16295,7 @@ def index(
             const pred = (rep && rep.pred_total_score != null) ? rep.pred_total_score : null;
             const rule = (rep && rep.rule_total_score != null) ? rep.rule_total_score : null;
             const llm = (rep && rep.llm_total_score != null) ? rep.llm_total_score : null;
+            const tenderScore = (rep && typeof rep.tender_score === 'object') ? rep.tender_score : null;
             const scoringStatus = String((rep && rep.scoring_status) || '').toLowerCase();
             const isPending = scoringStatus === 'pending';
             const isBlocked = scoringStatus === 'blocked';
@@ -15681,6 +16312,9 @@ def index(
               scoreHtml = '<span class="note">待评分</span>';
             } else if (isBlocked) {
               scoreHtml = '<span class="error">待补资料后重评分</span>';
+            } else if (tenderScore) {
+              scoreHtml = '<strong>' + escapeHtmlText(String(tenderScore.raw_total)) + ' / ' + escapeHtmlText(String(tenderScore.score_scale)) + '</strong>';
+              scoreHtml += '<div class="note">项目评审标准 · 折算 ' + escapeHtmlText(String(tenderScore.normalized_total)) + ' / 100</div>';
             } else if (pred != null) {
               scoreHtml = escapeHtmlText(String(pred));
               const notes = [];
@@ -15761,7 +16395,6 @@ def index(
             else clearMaterialUtilizationPanel();
           }
           updateTableEmptyState('submissionsTable', 'submissionsEmpty');
-          if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
           await refreshGroundTruthSubmissionOptions(id, switchSeq);
         }
         async function refreshGroundTruthSubmissionOptions(expectedProjectId=null, switchSeq=null) {
@@ -15778,7 +16411,7 @@ def index(
             sel.value = '';
             return;
           }
-          pendingOpt.textContent = '-- 加载步骤4施组中... --';
+            pendingOpt.textContent = '-- 正在加载已上传施组 --';
           sel.appendChild(pendingOpt);
           sel.disabled = true;
           let res;
@@ -15810,13 +16443,13 @@ def index(
             return;
           }
           if (!subs.length) {
-            leadOpt.textContent = '-- 暂无施组，请先在步骤4上传 --';
+            leadOpt.textContent = '-- 暂无已上传施组 --';
             sel.appendChild(leadOpt);
             sel.value = '';
             sel.disabled = false;
             return;
           }
-          leadOpt.textContent = '-- 请选择步骤4已上传施组文件 --';
+          leadOpt.textContent = '-- 请选择已上传施组文件 --';
           sel.appendChild(leadOpt);
           subs.forEach((s) => {
             const opt = document.createElement('option');
@@ -15870,7 +16503,6 @@ def index(
               emptyEl.textContent = '资料列表加载失败（HTTP ' + String(res.status || 0) + '）';
               emptyEl.style.display = 'block';
             }
-            if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             return;
           }
           if (!Array.isArray(mats) || mats.length === 0) {
@@ -15878,7 +16510,6 @@ def index(
               emptyEl.textContent = '暂无资料，请下方添加。';
               emptyEl.style.display = 'block';
             }
-            if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
             return;
           }
           if (emptyEl) emptyEl.style.display = 'none';
@@ -15893,7 +16524,6 @@ def index(
             if (tbody) tbody.appendChild(tr);
           });
           updateTableEmptyState('materialsTable', 'materialsEmpty');
-          if (typeof refreshScoringReadiness === 'function') await refreshScoringReadiness(id, switchSeq);
         }
         bindDeleteRowHandlers();
         const btnRefSub = document.getElementById('btnRefreshSubmissions');
@@ -16135,7 +16765,7 @@ def index(
           if (!ensureProjectForAction('evolveResult')) return;
           setResultLoading('evolveResult', '施组选项刷新中...');
           await refreshGroundTruthSubmissionOptions();
-          setResultSuccess('evolveResult', '施组选项已刷新：请在下拉框中选择步骤4已上传施组。');
+          setResultSuccess('evolveResult', '施组选项已刷新：请在下拉框中选择已上传施组。');
         });
 
         function showJson(id, data) {
@@ -17091,7 +17721,7 @@ def index(
         }
         function ensureProjectForAction(resultId) {
           if (pid()) return true;
-          setResultError(resultId, '请先在「2) 选择项目」中选择项目');
+          setResultError(resultId, '请先在项目工作区选择项目');
           return false;
         }
         function actionProjectId() {
@@ -17619,14 +18249,7 @@ def index(
           if (!ensureProjectForAction('adaptiveApplyResult')) return;
           setResultLoading('adaptiveApplyResult', '应用补丁中...');
           const projectId = actionProjectId();
-          const storedApiKey = storageGet('api_key');
-          let apiKey = storedApiKey || '';
-          if (!apiKey) {
-            const prompted = prompt('应用补丁将修改 lexicon 配置，需要 API Key。请输入 X-API-Key（无则留空）：');
-            apiKey = prompted == null ? '' : prompted;
-          }
           const headers = {};
-          if (apiKey) headers['X-API-Key'] = apiKey;
           const res = await fetch('/api/v1/projects/' + projectId + '/adaptive_apply', { method: 'POST', headers });
           const text = await res.text();
           document.getElementById('output').textContent = text;
@@ -17646,8 +18269,6 @@ def index(
           const feedInput = document.getElementById('feedFile');
           const files = Array.from((feedInput && feedInput.files) || []);
           const headers = {};
-          const apiKey = storageGet('api_key');
-          if (apiKey) headers['X-API-Key'] = apiKey;
           const requestCount = files.length > 0 ? files.length : 1;
           setResultLoading('evolveResult', '投喂包上传中（请求 ' + requestCount + ' 次）...');
           document.getElementById('output').textContent = '投喂包上传中（请求 ' + requestCount + ' 次）...';
@@ -17701,13 +18322,13 @@ def index(
           const submissionSelect = document.getElementById('groundTruthSubmissionSelect');
           const submissionId = String((submissionSelect && submissionSelect.value) || '').trim();
           if (!submissionId) {
-            setResultError('evolveResult', '请先在“施组文件”下拉框选择步骤4已上传施组。');
+            setResultError('evolveResult', '请先在“施组文件”下拉框选择已上传施组。');
             return;
           }
           const judgeScores = collectGroundTruthJudgeScores();
           const finalScore = parseFloat(document.getElementById('gtFinal').value) || 0;
-          setResultLoading('evolveResult', '真实评标录入中（基于步骤4已上传施组）...');
-          document.getElementById('output').textContent = '真实评标录入中（基于步骤4已上传施组）...';
+          setResultLoading('evolveResult', '正在录入真实评标（基于已上传施组）...');
+          document.getElementById('output').textContent = '正在录入真实评标（基于已上传施组）...';
           const payload = {
             submission_id: submissionId,
             judge_scores: judgeScores,
@@ -17764,6 +18385,242 @@ def index(
             html += '<p style="font-size:12px;margin-top:8px">点击「编制系统指令」可查看/导出编制约束（必备章节、图表、禁止表述等）。</p>';
             el.innerHTML = html;
           } else { el.innerHTML = '<span class="error">' + (data.detail || '请求失败，若需认证请设置 API Key') + '</span>'; }
+        });
+        let latestTenderProfileState = null;
+        function formatAttentionValue(value) {
+          const number = Number(value);
+          return Number.isInteger(number) ? String(number) : number.toFixed(1);
+        }
+        function attentionValueText(attention) {
+          const current = Number(attention && attention.current);
+          const minimum = Number(attention && attention.min);
+          const defaultValue = Number(attention && attention.default);
+          const maximum = Number(attention && attention.max);
+          let label = current === defaultValue ? '默认' : (current === minimum ? '最低' : (current === maximum ? '最高' : (current < defaultValue ? '低于默认' : '高于默认')));
+          return formatAttentionValue(current) + ' · ' + label;
+        }
+        function renderTenderAttentionControl(attention, itemIndex, evidenceIndex, pointIndex, approved, label) {
+          const settings = (attention && typeof attention === 'object') ? attention : { min:0, default:5, max:10, current:5 };
+          const level = pointIndex == null ? 'evidence' : 'point';
+          const suffix = pointIndex == null ? '' : '-' + String(pointIndex);
+          const inputId = 'tenderAttention-' + String(itemIndex) + '-' + String(evidenceIndex) + suffix;
+          const outputId = inputId + '-output';
+          const disabled = approved ? ' disabled' : '';
+          return '<div class="attention-control">'
+            + '<div class="attention-control-top"><label for="' + inputId + '">' + escapeHtmlText(label) + '</label>'
+            + '<output id="' + outputId + '" class="attention-output" for="' + inputId + '">' + escapeHtmlText(attentionValueText(settings)) + '</output></div>'
+            + '<input type="range" id="' + inputId + '" min="' + escapeHtmlText(formatAttentionValue(settings.min)) + '" max="' + escapeHtmlText(formatAttentionValue(settings.max)) + '" step="0.5" value="' + escapeHtmlText(formatAttentionValue(settings.current)) + '" data-attention-level="' + level + '" data-item-index="' + String(itemIndex) + '" data-evidence-index="' + String(evidenceIndex) + '"' + (pointIndex == null ? '' : ' data-point-index="' + String(pointIndex) + '"') + ' aria-describedby="' + outputId + '" aria-valuetext="' + escapeHtmlText(attentionValueText(settings)) + '"' + disabled + '>'
+            + '<div class="attention-scale-labels"><span>最低 ' + escapeHtmlText(formatAttentionValue(settings.min)) + '</span><span>默认 ' + escapeHtmlText(formatAttentionValue(settings.default)) + '</span><span>最高 ' + escapeHtmlText(formatAttentionValue(settings.max)) + '</span></div>'
+            + (approved ? '<span class="attention-lock">已随评审标准锁定</span>' : '')
+            + '</div>';
+        }
+        function initializeTenderAttentionInteractions() {
+          const root = document.getElementById('tenderProfileItems');
+          if (!root || root.dataset.attentionBound === '1') return;
+          root.dataset.attentionBound = '1';
+          root.addEventListener('click', (event) => {
+            const target = event.target instanceof Element ? event.target : null;
+            const toggle = target && target.closest('[data-attention-toggle]');
+            if (!toggle) return;
+            const panel = document.getElementById(toggle.getAttribute('aria-controls') || '');
+            if (!panel) return;
+            const expanded = toggle.getAttribute('aria-expanded') !== 'true';
+            toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            panel.hidden = !expanded;
+            const pointCount = String(toggle.dataset.pointCount || '0');
+            const evidenceLabel = String(toggle.dataset.evidenceLabel || '当前证据');
+            toggle.textContent = (expanded ? '收起' : '展开') + ' ' + pointCount + ' 个专家细分项';
+            toggle.setAttribute('aria-label', (expanded ? '收起' : '展开') + '“' + evidenceLabel + '”的 ' + pointCount + ' 个专家细分项');
+          });
+          root.addEventListener('input', (event) => {
+            const input = event.target instanceof HTMLInputElement ? event.target : null;
+            if (!input || !input.matches('input[data-attention-level]')) return;
+            const state = latestTenderProfileState;
+            const attentionProfile = state && state.attention_profile;
+            if (!attentionProfile || !Array.isArray(attentionProfile.items) || state.approved === true) return;
+            const itemRow = attentionProfile.items[Number(input.dataset.itemIndex)];
+            const evidence = itemRow && Array.isArray(itemRow.evidence) ? itemRow.evidence[Number(input.dataset.evidenceIndex)] : null;
+            const pointIndex = input.dataset.pointIndex;
+            const targetRow = pointIndex == null ? evidence : (evidence && Array.isArray(evidence.expert_points) ? evidence.expert_points[Number(pointIndex)] : null);
+            if (!targetRow || !targetRow.attention) return;
+            targetRow.attention.current = Number(input.value);
+            const valueText = attentionValueText(targetRow.attention);
+            input.setAttribute('aria-valuetext', valueText);
+            const output = document.getElementById(input.getAttribute('aria-describedby') || '');
+            if (output) output.textContent = valueText;
+            const resultEl = document.getElementById('perTenderResult');
+            if (resultEl) {
+              resultEl.style.display = 'block';
+              resultEl.innerHTML = '<span class="success">关注度已调整，确认评审标准时将一并保存；招标分值不变。</span>';
+            }
+          });
+        }
+        function renderTenderProfileState(data) {
+          const state = (data && typeof data === 'object') ? data : {};
+          latestTenderProfileState = state;
+          const profile = (state.profile && typeof state.profile === 'object') ? state.profile : null;
+          const items = profile && Array.isArray(profile.scoring_items) ? profile.scoring_items : [];
+          const sources = Array.isArray(state.sources) ? state.sources : [];
+          const sourceByItem = {};
+          sources.forEach((row) => { if (row && row.item_id) sourceByItem[row.item_id] = row; });
+          const statusEl = document.getElementById('tenderProfileStatus');
+          const approveBtn = document.getElementById('btnApproveTenderProfile');
+          const editor = document.getElementById('perTenderProfileJson');
+          const itemsEl = document.getElementById('tenderProfileItems');
+          const approved = state.approved === true;
+          const statusText = approved ? '已确认生效' : (profile ? '草案待确认' : '尚未提取');
+          if (statusEl) {
+            statusEl.textContent = statusText;
+            statusEl.className = 'status-pill ' + (approved ? 'approved' : (profile ? 'draft' : 'empty'));
+          }
+          if (approveBtn) approveBtn.disabled = !profile || approved;
+          if (editor && document.activeElement !== editor) editor.value = profile ? JSON.stringify(profile, null, 2) : '';
+          const countEl = document.getElementById('tenderCriteriaCount');
+          const scaleEl = document.getElementById('tenderScoreScale');
+          const confidenceEl = document.getElementById('tenderConfidence');
+          const contextEl = document.getElementById('tenderProjectContext');
+          const catalogEl = document.getElementById('tenderCatalogSummary');
+          if (countEl) countEl.textContent = String(items.length);
+          if (scaleEl) scaleEl.textContent = profile ? String(profile.score_scale) : '-';
+          if (confidenceEl) confidenceEl.textContent = (state.confidence == null) ? '-' : Math.round(Number(state.confidence) * 100) + '%';
+          const selectionContext = state.attention_profile && state.attention_profile.selection_context;
+          const sceneLabels = selectionContext && Array.isArray(selectionContext.scene_labels) ? selectionContext.scene_labels : [];
+          const catalogSummary = selectionContext && selectionContext.catalog_summary && typeof selectionContext.catalog_summary === 'object' ? selectionContext.catalog_summary : null;
+          const catalogCategories = catalogSummary && Array.isArray(catalogSummary.categories) ? catalogSummary.categories : [];
+          const categoryLabels = catalogCategories.map((row) => String((row && row.label) || '').trim()).filter(Boolean);
+          const catalogTotal = catalogSummary ? Number(catalogSummary.combined_catalog_total) : NaN;
+          const enabledCount = catalogSummary ? Number(catalogSummary.enabled_unique_count) : NaN;
+          const hasCatalogSummary = categoryLabels.length > 0 && Number.isFinite(catalogTotal) && catalogTotal >= 0 && Number.isFinite(enabledCount) && enabledCount >= 0;
+          if (contextEl) {
+            contextEl.style.display = !hasCatalogSummary && sceneLabels.length ? 'block' : 'none';
+            contextEl.textContent = !hasCatalogSummary && sceneLabels.length ? '已识别项目场景：' + sceneLabels.join(' + ') + '；专家细分项已按招标条款和项目场景动态选择。' : '';
+          }
+          if (catalogEl) {
+            catalogEl.hidden = !hasCatalogSummary;
+            if (hasCatalogSummary) {
+              const categoriesEl = document.getElementById('tenderCatalogCategories');
+              const totalEl = document.getElementById('tenderCatalogTotal');
+              const enabledEl = document.getElementById('tenderCatalogEnabled');
+              const linksEl = document.getElementById('tenderCatalogLinks');
+              const versionEl = document.getElementById('tenderCatalogVersion');
+              if (categoriesEl) categoriesEl.textContent = categoryLabels.join(' + ');
+              if (totalEl) totalEl.textContent = String(catalogTotal) + ' 项可选科目';
+              if (enabledEl) enabledEl.textContent = String(enabledCount) + ' 项';
+              const linkCount = Number(catalogSummary.evidence_link_count);
+              if (linksEl) {
+                linksEl.hidden = !Number.isFinite(linkCount) || linkCount < 0;
+                linksEl.textContent = !linksEl.hidden ? '已形成 ' + String(linkCount) + ' 次证据—科目关联' : '';
+              }
+              const catalogVersion = String(catalogSummary.catalog_version || '').trim();
+              if (versionEl) {
+                versionEl.hidden = !catalogVersion;
+                versionEl.textContent = catalogVersion ? '科目库版本：' + catalogVersion : '';
+              }
+            }
+          }
+          if (!itemsEl) return;
+          if (!items.length) {
+            itemsEl.innerHTML = '<p class="muted">尚无评审标准。请先上传招标资料，再执行提取。</p>';
+            return;
+          }
+          const attentionItems = state.attention_profile && Array.isArray(state.attention_profile.items) ? state.attention_profile.items : [];
+          const attentionByItem = {};
+          attentionItems.forEach((row, rowIndex) => { if (row && row.item_id) attentionByItem[row.item_id] = { row:row, index:rowIndex }; });
+          itemsEl.innerHTML = items.map((item, index) => {
+            const source = sourceByItem[item.item_id] || {};
+            const requirements = Array.isArray(item.evidence_requirements) ? item.evidence_requirements : [];
+            const attentionMatch = attentionByItem[item.item_id] || { row:{ evidence:[] }, index:index };
+            const evidenceRows = Array.isArray(attentionMatch.row.evidence) ? attentionMatch.row.evidence : [];
+            const evidenceHtml = evidenceRows.length ? evidenceRows.map((evidence, evidenceIndex) => {
+              const points = Array.isArray(evidence.expert_points) ? evidence.expert_points : [];
+              const panelId = 'expertPoints-' + String(attentionMatch.index) + '-' + String(evidenceIndex);
+              const evidenceLabel = String(evidence.requirement || requirements[evidenceIndex] || '当前证据').slice(0, 72);
+              const pointsHtml = points.map((point, pointIndex) => '<div class="expert-point-row">'
+                + '<div class="expert-point-copy"><span class="origin-badge expert">专家细分</span><strong>' + escapeHtmlText(point.name || '未命名评分点') + '</strong><p>' + escapeHtmlText(point.description || '') + '</p></div>'
+                + renderTenderAttentionControl(point.attention, attentionMatch.index, evidenceIndex, pointIndex, approved, '专家细分项关注度')
+                + '</div>').join('');
+              const toggleHtml = points.length
+                ? '<button type="button" class="attention-toggle" data-attention-toggle data-point-count="' + String(points.length) + '" data-evidence-label="' + escapeHtmlText(evidenceLabel) + '" aria-label="展开“' + escapeHtmlText(evidenceLabel) + '”的 ' + String(points.length) + ' 个专家细分项" aria-expanded="false" aria-controls="' + panelId + '">展开 ' + String(points.length) + ' 个专家细分项</button>'
+                : '<span class="attention-empty">暂无专家细分项</span>';
+              return '<div class="evidence-attention-row">'
+                + '<div class="evidence-attention-main">'
+                + '<div class="evidence-copy"><span class="origin-badge">招标原文</span><strong>' + escapeHtmlText(evidence.requirement || requirements[evidenceIndex] || '待补充') + '</strong></div>'
+                + renderTenderAttentionControl(evidence.attention, attentionMatch.index, evidenceIndex, null, approved, '证据关注度')
+                + toggleHtml
+                + '</div><div id="' + panelId + '" class="expert-points" hidden>' + pointsHtml + '</div></div>';
+            }).join('') : '<p class="criteria-evidence"><strong>评分证据：</strong>' + escapeHtmlText(requirements.join('；') || '待补充') + '</p>';
+            return '<article class="criteria-card">'
+              + '<div class="criteria-card-head"><span>' + escapeHtmlText(String(index + 1) + '. ' + (item.name || item.item_id || '未命名评分项')) + '</span><span>' + escapeHtmlText(item.max_score) + ' 分</span></div>'
+              + '<div class="evidence-attention-list">' + evidenceHtml + '</div>'
+              + '<details class="criteria-source"><summary>查看招标原文来源</summary><p>' + escapeHtmlText((source.source_locator || '待核对') + (source.source_text ? ' · ' + source.source_text : '')) + '</p></details>'
+              + '</article>';
+          }).join('');
+        }
+        initializeTenderAttentionInteractions();
+        async function loadTenderProfile(expectedProjectId=null, switchSeq=null) {
+          const projectId = expectedProjectId || actionProjectId();
+          if (!projectId) { renderTenderProfileState({}); return; }
+          let res, data;
+          try {
+            res = await fetch('/api/v1/projects/' + encodeURIComponent(projectId) + '/tender-profile');
+            data = await res.json().catch(() => ({}));
+          } catch (err) {
+            renderTenderProfileState({ warnings: ['评审标准加载失败：' + String((err && err.message) || err)] });
+            return;
+          }
+          if (switchSeq != null && typeof isStaleProjectResponse === 'function' && isStaleProjectResponse(projectId, switchSeq)) return;
+          if (!res.ok) {
+            renderTenderProfileState({ warnings: [String(data.detail || ('HTTP ' + res.status))] });
+            return;
+          }
+          renderTenderProfileState(data);
+        }
+        safeClick('btnLoadTenderProfile', async () => { await loadTenderProfile(); });
+        safeClick('btnExtractTenderProfile', async () => {
+          if (!ensureProjectForAction('perTenderResult')) return;
+          const projectId = actionProjectId();
+          const resultEl = document.getElementById('perTenderResult');
+          if (resultEl) { resultEl.style.display = 'block'; resultEl.innerHTML = '<span class="success">正在读取招标资料并提取评审标准...</span>'; }
+          const res = await fetch('/api/v1/projects/' + encodeURIComponent(projectId) + '/tender-profile/extract', { method:'POST' });
+          const data = await res.json().catch(() => ({}));
+          showJson('output', formatApiOutput(res, data));
+          if (!res.ok) {
+            if (resultEl) resultEl.innerHTML = '<span class="error">提取失败：' + escapeHtmlText(data.detail || ('HTTP ' + res.status)) + '</span>';
+            return;
+          }
+          renderTenderProfileState(data);
+          const extractedItems = data && data.profile && Array.isArray(data.profile.scoring_items)
+            ? data.profile.scoring_items
+            : [];
+          if (resultEl && !extractedItems.length) {
+            resultEl.innerHTML = '<span class="error">未生成可确认的评审标准。请确认招标资料包含“详细评审标准、评分项和分值”，或在高级编辑中补录。</span>';
+            return;
+          }
+          if (resultEl) resultEl.innerHTML = '<span class="success">已生成评审标准草案。请核对来源与分值，确认后才会进入正式评分。</span>';
+        });
+        safeClick('btnApproveTenderProfile', async () => {
+          if (!ensureProjectForAction('perTenderResult')) return;
+          const editor = document.getElementById('perTenderProfileJson');
+          const resultEl = document.getElementById('perTenderResult');
+          let profile;
+          try { profile = JSON.parse((editor && editor.value) || '{}'); }
+          catch (err) {
+            if (resultEl) { resultEl.style.display='block'; resultEl.innerHTML='<span class="error">JSON 格式错误：' + escapeHtmlText(String((err && err.message) || err)) + '</span>'; }
+            return;
+          }
+          const projectId = actionProjectId();
+          const attentionProfile = latestTenderProfileState && latestTenderProfileState.attention_profile;
+          const res = await fetch('/api/v1/projects/' + encodeURIComponent(projectId) + '/tender-profile/approve', {
+            method:'PUT', headers:apiHeaders(true), body:JSON.stringify({ profile:profile, attention_profile:attentionProfile || null })
+          });
+          const data = await res.json().catch(() => ({}));
+          showJson('output', formatApiOutput(res, data));
+          if (!res.ok) {
+            if (resultEl) { resultEl.style.display='block'; resultEl.innerHTML='<span class="error">确认失败：' + escapeHtmlText(data.detail || ('HTTP ' + res.status)) + '</span>'; }
+            return;
+          }
+          renderTenderProfileState(data);
+          if (resultEl) { resultEl.style.display='block'; resultEl.innerHTML='<span class="success">评审标准已确认生效；后续施组将按这些项目级条款逐项评分。</span>'; }
         });
         safeClick('btnPerTenderAnalyze', async () => {
           const profileEl = document.getElementById('perTenderProfileJson');
@@ -18137,12 +18994,14 @@ def index(
 
         // 关闭“硬接管”兜底，避免覆盖 safeClick 的详细渲染结果。
         initializeProductAccessibility();
+        initializeSectionNavigation();
         initWeightsSection();
         syncGroundTruthJudgeInputs();
         updateProjectBoundControlsState();
         refreshProjects();
 
       </script>
+      </div>
     </body>
     </html>
     """
@@ -18158,7 +19017,7 @@ def index(
     html = html.replace("__SUBMISSION_ROWS__", initial_submission_rows_html)
     html = html.replace("__SUBMISSIONS_EMPTY_DISPLAY__", initial_submissions_empty_display)
     html = html.replace("__PROJECT_SCORE_SCALE_MAX__", str(score_scale_initial))
-    return Response(
+    response = Response(
         content=html.encode("utf-8"),
         media_type="text/html; charset=utf-8",
         headers={
@@ -18168,6 +19027,18 @@ def index(
             "Expires": "0",
         },
     )
+    local_session_token = create_local_web_session_token()
+    if local_session_token and _is_loopback_web_request(request):
+        response.set_cookie(
+            LOCAL_WEB_SESSION_COOKIE,
+            local_session_token,
+            max_age=12 * 60 * 60,
+            httponly=True,
+            samesite="strict",
+            secure=False,
+            path="/",
+        )
+    return response
 
 
 def create_app() -> FastAPI:
@@ -18181,6 +19052,7 @@ if __name__ == "__main__":
     import time
     import webbrowser
 
+    host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8000"))
 
     def _open_browser() -> None:
@@ -18197,4 +19069,4 @@ if __name__ == "__main__":
 
     import uvicorn
 
-    uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("app.main:app", host=host, port=port, reload=False)

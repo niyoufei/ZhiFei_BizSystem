@@ -13,6 +13,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, TypeVar
 
+import app.assessment_contract_service as assessment_contract_service
 from app.sqlite_repository import SQLiteRepositoryBackend
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -459,11 +460,18 @@ def save_expert_profiles(data: List[Dict[str, Any]]) -> None:
 
 def load_score_reports() -> List[Dict[str, Any]]:
     """评分报告快照列表（不覆盖历史）"""
-    return _load_store("score_reports")
+    return [
+        assessment_contract_service.normalize_score_report_snapshot(row)
+        for row in _load_store("score_reports")
+    ]
 
 
 def save_score_reports(data: List[Dict[str, Any]]) -> None:
-    _save_store("score_reports", data)
+    normalized = [
+        assessment_contract_service.normalize_score_report_snapshot(deepcopy(row))
+        for row in data
+    ]
+    _save_store("score_reports", normalized)
 
 
 def load_project_anchors() -> List[Dict[str, Any]]:

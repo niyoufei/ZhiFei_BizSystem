@@ -253,6 +253,31 @@ class ProjectRecord(BaseModel):
     }
 
 
+class TenderProfileApproveRequest(BaseModel):
+    """人工复核后批准生效的项目级评审标准。"""
+
+    profile: Dict[str, Any] = Field(..., description="符合 TenderProfile 契约的评分标准")
+    attention_profile: Optional[Dict[str, Any]] = Field(
+        None,
+        description="两级证据关注度；仅控制检索与复核优先级，不改变招标分值",
+    )
+
+
+class TenderProfileStateResponse(BaseModel):
+    project_id: str
+    status: str
+    approved: bool
+    needs_review: bool
+    confidence: Optional[float] = None
+    profile: Optional[Dict[str, Any]] = None
+    attention_profile: Optional[Dict[str, Any]] = None
+    sources: List[Dict[str, Any]] = Field(default_factory=list)
+    redline_sources: List[Dict[str, Any]] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+    extracted_at: Optional[str] = None
+    approved_at: Optional[str] = None
+
+
 class MaterialRecord(BaseModel):
     id: str
     project_id: str

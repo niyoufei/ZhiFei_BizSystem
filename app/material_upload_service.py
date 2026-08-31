@@ -118,8 +118,16 @@ def build_material_upload_response(
     record: Record,
     invalidate_material_index_cache: Callable[[str], None],
     rebuild_project_anchors_and_requirements: Callable[[str], Tuple[List[Record], List[Record]]],
+    sync_constraints: bool = True,
 ) -> Record:
     invalidate_material_index_cache(project_id)
+
+    if not sync_constraints:
+        return {
+            "status": "ok",
+            "material": record,
+            "constraint_sync": {"rebuilt": False, "deferred": True},
+        }
 
     constraint_sync: Record = {"rebuilt": False}
     try:

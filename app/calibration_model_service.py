@@ -3,12 +3,17 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
+from uuid import uuid4
+
+import app.assessment_contract_service as assessment_contract_service
 
 Record = Dict[str, object]
 Records = List[Record]
 Callback = Callable[..., Any]
 TransactionDecorator = Callable[[Callable[[], Any]], Callable[[], Any]]
 TransactionFactory = Callable[..., TransactionDecorator]
+
+_UNRESOLVED_CALIBRATOR = object()
 
 
 class UnsupportedCalibrationModelTypeError(ValueError):
@@ -112,12 +117,17 @@ def apply_prediction_to_report(
     fuse_rule_and_llm_scores: Callback,
     to_float_or_none: Callback,
     clip_score: Callback,
+    calibrator_model: object = _UNRESOLVED_CALIBRATOR,
 ) -> Optional[str]:
-    model = select_calibrator_model(
-        project,
-        load_calibration_models=load_calibration_models,
+    model = (
+        select_calibrator_model(
+            project,
+            load_calibration_models=load_calibration_models,
+        )
+        if calibrator_model is _UNRESOLVED_CALIBRATOR
+        else calibrator_model
     )
-    if not model:
+    if not isinstance(model, dict):
         report["pred_total_score"] = None
         report["llm_total_score"] = None
         report["pred_confidence"] = None
@@ -214,6 +224,77 @@ def extract_auto_candidates(model_artifact: Dict[str, Any]) -> List[Dict[str, An
             }
         )
     return normalized
+
+
+def _latest_project_reports_by_submission(
+    reports: Records,
+    *,
+    project_id: str,
+) -> Dict[str, Record]:
+    latest: Dict[str, Record] = {}
+    for report in reports:
+        if str(report.get("project_id")) != project_id:
+            continue
+        submission_id = str(report.get("submission_id") or "")
+        if not submission_id:
+            continue
+        previous = latest.get(submission_id)
+        if previous is None or str(report.get("created_at") or "") >= str(
+            previous.get("created_at") or ""
+        ):
+            latest[submission_id] = report
+    return latest
+
+
+def _derive_calibrated_report_snapshot(
+    report: Record,
+    *,
+    submission: Record,
+    project: Record,
+    model: Record,
+    load_calibration_models: Callable[[], Records],
+    build_feature_row: Callback,
+    predict_with_model: Callback,
+    fuse_rule_and_llm_scores: Callback,
+    to_float_or_none: Callback,
+    clip_score: Callback,
+) -> Record:
+    derived = deepcopy(report)
+    parent_id = str(report.get("id") or "")
+    apply_prediction_to_report(
+        derived,
+        submission_like=deepcopy(submission),
+        project=project,
+        load_calibration_models=load_calibration_models,
+        build_feature_row=build_feature_row,
+        predict_with_model=predict_with_model,
+        fuse_rule_and_llm_scores=fuse_rule_and_llm_scores,
+        to_float_or_none=to_float_or_none,
+        clip_score=clip_score,
+        calibrator_model=model,
+    )
+    assessment_contract_service.rebind_report_calibrator_contract(
+        derived,
+        project=project,
+        calibrator_model=model,
+    )
+    derived["id"] = str(uuid4())
+    derived["created_at"] = datetime.now(timezone.utc).isoformat()
+    derived["calibration_parent_report_id"] = parent_id or None
+    return derived
+
+
+def _rebind_current_report_contract(
+    report: Record,
+    *,
+    project: Record,
+    model: Record,
+) -> None:
+    assessment_contract_service.rebind_report_calibrator_contract(
+        report,
+        project=project,
+        calibrator_model=model,
+    )
 
 
 def build_calibrator_summary(
@@ -628,26 +709,31 @@ def _apply_calibration_prediction(
         if str(submission.get("project_id")) == project_id
     }
     reports = load_score_reports()
-    updated_reports = 0
-    for report in reports:
-        if str(report.get("project_id")) != project_id:
-            continue
-        submission_id = str(report.get("submission_id") or "")
+    derived_reports: Records = []
+    latest_reports = _latest_project_reports_by_submission(
+        reports,
+        project_id=project_id,
+    )
+    for submission_id, report in latest_reports.items():
         submission = submission_map.get(submission_id)
-        if not submission_id or not submission:
+        if not submission:
             continue
-        apply_prediction_to_report(
-            report,
-            submission_like=submission,
-            project=project,
-            load_calibration_models=load_calibration_models,
-            build_feature_row=build_feature_row,
-            predict_with_model=predict_with_model,
-            fuse_rule_and_llm_scores=fuse_rule_and_llm_scores,
-            to_float_or_none=to_float_or_none,
-            clip_score=clip_score,
+        derived_reports.append(
+            _derive_calibrated_report_snapshot(
+                report,
+                submission=submission,
+                project=project,
+                model=model,
+                load_calibration_models=load_calibration_models,
+                build_feature_row=build_feature_row,
+                predict_with_model=predict_with_model,
+                fuse_rule_and_llm_scores=fuse_rule_and_llm_scores,
+                to_float_or_none=to_float_or_none,
+                clip_score=clip_score,
+            )
         )
-        updated_reports += 1
+    reports.extend(derived_reports)
+    updated_reports = len(derived_reports)
     save_score_reports(reports)
 
     updated_submissions = 0
@@ -667,6 +753,12 @@ def _apply_calibration_prediction(
             fuse_rule_and_llm_scores=fuse_rule_and_llm_scores,
             to_float_or_none=to_float_or_none,
             clip_score=clip_score,
+            calibrator_model=model,
+        )
+        _rebind_current_report_contract(
+            report,
+            project=project,
+            model=model,
         )
         updated_submissions += 1
     save_submissions(submissions)
@@ -895,25 +987,31 @@ def _run_auto_calibration_lifecycle(
             if str(submission.get("project_id")) == project_id
         }
         reports = load_score_reports()
-        for report in reports:
-            if str(report.get("project_id")) != project_id:
-                continue
-            submission_id = str(report.get("submission_id") or "")
+        derived_reports: Records = []
+        latest_reports = _latest_project_reports_by_submission(
+            reports,
+            project_id=project_id,
+        )
+        for submission_id, report in latest_reports.items():
             submission = submission_map.get(submission_id)
             if not submission:
                 continue
-            apply_prediction_to_report(
-                report,
-                submission_like=submission,
-                project=project,
-                load_calibration_models=load_calibration_models,
-                build_feature_row=build_feature_row,
-                predict_with_model=predict_with_model,
-                fuse_rule_and_llm_scores=fuse_rule_and_llm_scores,
-                to_float_or_none=to_float_or_none,
-                clip_score=clip_score,
+            derived_reports.append(
+                _derive_calibrated_report_snapshot(
+                    report,
+                    submission=submission,
+                    project=project,
+                    model=record,
+                    load_calibration_models=load_calibration_models,
+                    build_feature_row=build_feature_row,
+                    predict_with_model=predict_with_model,
+                    fuse_rule_and_llm_scores=fuse_rule_and_llm_scores,
+                    to_float_or_none=to_float_or_none,
+                    clip_score=clip_score,
+                )
             )
-            updated_reports += 1
+        reports.extend(derived_reports)
+        updated_reports = len(derived_reports)
         save_score_reports(reports)
 
         for submission in submissions:
@@ -932,6 +1030,12 @@ def _run_auto_calibration_lifecycle(
                 fuse_rule_and_llm_scores=fuse_rule_and_llm_scores,
                 to_float_or_none=to_float_or_none,
                 clip_score=clip_score,
+                calibrator_model=record,
+            )
+            _rebind_current_report_contract(
+                report,
+                project=project,
+                model=record,
             )
             updated_submissions += 1
         save_submissions(submissions)

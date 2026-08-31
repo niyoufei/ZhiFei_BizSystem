@@ -165,37 +165,50 @@ class TestWebUIIntegration:
 
 
 class TestEmbeddedAuthControls:
-    """Authentication controls and public redirect metadata boundaries."""
+    """Local UI session and public redirect metadata boundaries."""
 
-    def test_root_exposes_password_save_and_clear_controls(self):
-        client = TestClient(app)
+    def test_root_uses_hidden_local_session_instead_of_key_controls(self):
+        client = TestClient(app, base_url="http://127.0.0.1")
         response = client.get("/")
 
         assert response.status_code == 200
         page = response.text
-        assert 'id="apiKeyInput" type="password"' in page
-        assert 'id="saveApiKey"' in page
-        assert 'id="clearApiKey"' in page
-        assert 'id="apiKeyStatus"' in page
-        assert 'localStorage.setItem("api_key", key)' in page
-        assert 'localStorage.removeItem("api_key")' in page
-        assert "if (input) input.value = '';" in page
-        assert "setApiKeyStatus('已保存', false)" in page
-        assert "未保存 key" in page
-        assert "AUTH_KEY_MISSING" in page
-        assert "AUTH_KEY_INVALID" in page
-        assert "AUTH_NOT_CONFIGURED" in page
+        assert "API 访问认证" not in page
+        assert 'id="apiKeyInput"' not in page
+        assert "X-API-Key" not in page
+        assert "api_key" not in page
+        cookie = response.headers["set-cookie"]
+        assert "qingtian_local_ui_session=" in cookie
+        assert "HttpOnly" in cookie
+        assert "SameSite=strict" in cookie
 
-    def test_business_fetches_use_header_without_key_urls_or_console_output(self):
-        client = TestClient(app)
+    def test_local_session_authenticates_business_requests_without_page_key(self):
+        client = TestClient(
+            app,
+            base_url="http://127.0.0.1",
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
         page = client.get("/").text
+        response = client.get("/__ping__")
 
-        assert "X-API-Key" in page
+        assert response.status_code == 200
+        assert "X-API-Key" not in page
         assert "?api_key" not in page
         assert "console.log" not in page
         assert "__qingtianDownloadProtected" in page
         assert "await response.blob()" in page
         assert "await res.text()" in page
+
+    def test_non_loopback_page_does_not_receive_automatic_session(self):
+        client = TestClient(app, base_url="http://example.test")
+
+        page_response = client.get("/")
+        protected_response = client.get("/__ping__")
+
+        assert "qingtian_local_ui_session=" not in page_response.headers.get(
+            "set-cookie", ""
+        )
+        assert protected_response.status_code == 401
 
     @patch("app.main.create_project")
     def test_create_project_redirect_is_generic(self, create_project):
@@ -221,6 +234,6 @@ class TestEmbeddedAuthControls:
         )
 
         assert response.status_code == 200
-        assert "项目已创建，请使用 API key 刷新项目列表。" in response.text
+        assert "项目已创建，项目列表将自动刷新。" in response.text
         assert "secret-project-name" not in response.text
         assert "secret-project-id" not in response.text

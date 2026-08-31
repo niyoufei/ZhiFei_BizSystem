@@ -348,9 +348,9 @@ def test_public_root_does_not_load_or_embed_business_data():
 
     assert response.status_code == 200
     assert "__qingtianApiKeyFetchInstalled" in response.text
-    assert "X-API-Key" in response.text
+    assert "X-API-Key" not in response.text
     assert "?api_key" not in response.text
-    assert "项目已创建，请使用 API key 刷新项目列表。" in response.text
+    assert "项目已创建，项目列表将自动刷新。" in response.text
     assert "secret-project-name" not in response.text
     assert "secret-project-id" not in response.text
     ensure_data_dirs.assert_not_called()

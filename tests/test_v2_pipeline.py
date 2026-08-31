@@ -53,6 +53,10 @@ class TestLatestReportEndpoint:
                     {"issue_code": "MissingRequirement", "why_it_matters": "缺少节点"}
                 ],
                 "suggestions": [{"title": "补齐节点计划", "expected_gain": 3.2}],
+                "assessment_contract_status": "certified",
+                "assessment_contract_hash": "a" * 64,
+                "assessment_contract_schema_version": "assessment-contract-v1",
+                "assessment_contract": {"contract_hash": "a" * 64},
                 "created_at": "2026-02-06T10:07:10Z",
             }
         ]
@@ -63,6 +67,9 @@ class TestLatestReportEndpoint:
         assert data["ui_summary"]["pred_total_score"] == 86.1
         assert len(data["ui_summary"]["top_conflicts"]) == 1
         assert len(data["ui_summary"]["top_missing_requirements"]) == 1
+        assert data["report"]["assessment_contract_status"] == "certified"
+        assert data["report"]["assessment_contract_hash"] == "a" * 64
+        assert data["report"]["assessment_contract"]["contract_hash"] == "a" * 64
 
 
 class TestQingTianEndpoint:
@@ -384,6 +391,14 @@ class TestCalibratorEndpoints:
         assert report["total_score"] == 40.5
         assert report["score_blend"]["rule_weight"] == 0.7
         assert report["score_blend"]["llm_weight"] == 0.3
+
+        saved_reports = mock_save_reports.call_args[0][0]
+        assert len(saved_reports) == 2
+        assert saved_reports[0]["id"] == "r1"
+        assert "pred_total_score" not in saved_reports[0]
+        assert saved_reports[1]["calibration_parent_report_id"] == "r1"
+        assert saved_reports[1]["pred_total_score"] == 40.5
+        assert saved_reports[1]["assessment_contract_status"] == "legacy_unversioned"
 
     @patch("app.main.save_submissions")
     @patch("app.main.save_score_reports")
