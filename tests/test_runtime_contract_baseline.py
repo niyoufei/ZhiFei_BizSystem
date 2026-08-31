@@ -18,14 +18,14 @@ from fastapi.routing import APIRoute
 from starlette.routing import Route
 
 ROUTE_MANIFEST_SHA256 = (
-    "852a6fa50cc45cfeed121802b9027251947d59d7b3008ed0a4cd0da7fe89cd8c"  # gitleaks:allow
+    "0a6f4e19746e670650d905827ff370d91a91e8801110516d89fd4d22c27e555a"  # gitleaks:allow
 )
-# R8 adds certified metrics auth and 1.1.0rc4 version metadata.
+# R8 adds certified metrics auth, project tender-profile routes, and 1.1.0rc4 metadata.
 OPENAPI_CANONICAL_SHA256 = (
-    "45d464725c4b87c84ca4bb4e41a836a81602298f4cf5ae08ee48ba1d6f17484a"  # gitleaks:allow
+    "99fff399685c5f2d847283d313613f994fb70c85e808d8ece8419b316bce5f3f"  # gitleaks:allow
 )
 AUTH_MATRIX_SHA256 = (
-    "c65f5c1c39dc89a57144b92be5c25ce51cf08c744464e4c718ba44a4482dfc67"  # gitleaks:allow
+    "7449e522e84619757d94a88e3db58479a3d9ba7b7d00a0d970ee5beb1e0fb45b"  # gitleaks:allow
 )
 FRONTEND_ADAPTER_SHA256 = (
     "4afc2aa2d276f5e1c6b50ca3a62381a5a163b641233585f2e9cff642780569fb"  # gitleaks:allow
@@ -181,9 +181,9 @@ def test_formal_app_factory_and_route_counts(runtime_modules) -> None:
     assert main.create_app() is app, "create_app() must return the app.main:app singleton"
 
     records = _route_records(app, main.verify_api_key, main.verify_metrics_api_key)
-    _assert_count("HTTP Route/APIRoute object", len(records), 146)
-    _assert_count("method-path binding", sum(len(route.methods or []) for route in app.routes), 165)
-    _assert_count("FastAPI APIRoute", sum(isinstance(route, APIRoute) for route in app.routes), 142)
+    _assert_count("HTTP Route/APIRoute object", len(records), 149)
+    _assert_count("method-path binding", sum(len(route.methods or []) for route in app.routes), 168)
+    _assert_count("FastAPI APIRoute", sum(isinstance(route, APIRoute) for route in app.routes), 145)
     _assert_count(
         "built-in Starlette Route",
         sum(isinstance(route, Route) and not isinstance(route, APIRoute) for route in app.routes),
@@ -194,9 +194,9 @@ def test_formal_app_factory_and_route_counts(runtime_modules) -> None:
         owner: sum(record["owner"] == owner for record in records)
         for owner in {"router", "compat_router", "app"}
     }
-    assert owners == {"router": 95, "compat_router": 28, "app": 23}, (
+    assert owners == {"router": 98, "compat_router": 28, "app": 23}, (
         "router classification count difference: "
-        f"expected={{'router': 95, 'compat_router': 28, 'app': 23}} actual={owners}"
+        f"expected={{'router': 98, 'compat_router': 28, 'app': 23}} actual={owners}"
     )
 
 
@@ -210,9 +210,9 @@ def test_openapi_versions_and_counts(runtime_modules) -> None:
         method.lower() in HTTP_METHOD_KEYS for path_item in paths.values() for method in path_item
     )
     schemas = openapi.get("components", {}).get("schemas", {})
-    _assert_count("OpenAPI path", len(paths), 120)
-    _assert_count("OpenAPI operation", operations, 127)
-    _assert_count("OpenAPI component schema", len(schemas), 97)
+    _assert_count("OpenAPI path", len(paths), 123)
+    _assert_count("OpenAPI operation", operations, 130)
+    _assert_count("OpenAPI component schema", len(schemas), 99)
 
 
 def test_auth_contract(runtime_modules) -> None:
@@ -239,7 +239,7 @@ def test_auth_contract(runtime_modules) -> None:
         and route.path.startswith("/api/")
         and not route.path.startswith("/api/v1/")
     ]
-    _assert_count("protected /api/v1 route", len(api_v1_routes), 95)
+    _assert_count("protected /api/v1 route", len(api_v1_routes), 98)
     _assert_count("protected /api compatibility route", len(api_compat_routes), 28)
     assert all(_requires_api_key(route, main.verify_api_key) for route in api_v1_routes)
     assert all(_requires_api_key(route, main.verify_api_key) for route in api_compat_routes)
