@@ -94,7 +94,7 @@ def test_extract_recovers_split_pdf_table_technical_criterion():
     assert all(2 <= count <= 8 for count in point_counts)
     assert sum(point_counts) != 36
     assert state["attention_profile"]["selection_context"]["version"] == (
-        "expert-point-selector-v3"
+        "expert-point-selector-v4"
     )
     for row in evidence_rows:
         attention = row["attention"]
@@ -163,18 +163,22 @@ def test_standard_six_umbrella_requirements_enable_exact_scene_catalog(
     context = state["attention_profile"]["selection_context"]
     evidence_rows = state["attention_profile"]["items"][0]["evidence"]
     point_counts = [len(row["expert_points"]) for row in evidence_rows]
-    assert context["version"] == "expert-point-selector-v3"
+    assert context["version"] == "expert-point-selector-v4"
     assert context["scene_tags"] == [scene_tag]
+    assert context["primary_scene_tag"] == scene_tag
+    assert context["supporting_scene_tags"] == []
     assert context["catalog_summary"]["categories"] == [
         {
             "tag": scene_tag,
             "label": tender_criteria_service.PROJECT_TYPE_CATALOGS[scene_tag]["label"],
             "catalog_total": expected_total,
+            "role": "primary",
         }
     ]
     assert point_counts == expected_counts
     assert sum(point_counts) == expected_total
     assert context["catalog_summary"]["combined_catalog_total"] == expected_total
+    assert context["catalog_summary"]["baseline_catalog_total"] == expected_total
     assert context["catalog_summary"]["enabled_unique_count"] == expected_total
     assert context["catalog_summary"]["evidence_link_count"] == expected_total
     assert all(
@@ -288,10 +292,10 @@ def test_catalog_summary_deduplicates_reused_catalog_entries_across_evidence():
     assert summary["evidence_link_count"] == 14
 
 
-def test_compound_scene_uses_catalog_id_deduplicated_union():
+def test_compound_scene_uses_primary_catalog_for_umbrella_requirements():
     state = extract_tender_profile_draft(
         project_id="p-compound",
-        project_name="市政园林景观工程",
+        project_name="办公楼新建及室外市政、机电安装、园林景观工程",
         source_text=SPLIT_TABLE_TENDER_TEXT,
     )
     context = state["attention_profile"]["selection_context"]
@@ -302,10 +306,58 @@ def test_compound_scene_uses_catalog_id_deduplicated_union():
         for point in evidence["expert_points"]
     ]
 
-    assert context["scene_tags"] == ["municipal", "landscape"]
+    scene_tags = ["new_building", "municipal", "mep_installation", "landscape"]
+    assert context["scene_tags"] == scene_tags
+    assert context["primary_scene_tag"] == "new_building"
+    assert context["supporting_scene_tags"] == scene_tags[1:]
     assert len(catalog_ids) == len(set(catalog_ids))
-    assert context["catalog_summary"]["enabled_unique_count"] == len(catalog_ids)
-    assert context["catalog_summary"]["combined_catalog_total"] == len(catalog_ids)
+    assert len(catalog_ids) == 38
+    assert set(catalog_ids) == {
+        entry["catalog_id"]
+        for entry in tender_criteria_service.combined_catalog_entries(("new_building",))
+    }
+    summary = context["catalog_summary"]
+    assert summary["baseline_catalog_total"] == 38
+    assert summary["combined_catalog_total"] == len(
+        tender_criteria_service.combined_catalog_entries(scene_tags)
+    )
+    assert summary["enabled_unique_count"] == 38
+    assert context["optimization_policy"] == {
+        "version": "secondary-subject-optimization-v1",
+        "mode": "versioned_offline",
+        "state": "baseline_locked",
+        "baseline": "primary-scene-catalog",
+        "evidence_source": "verified_real_cases",
+        "promotion_gate": "external_expert_benchmark",
+        "auto_apply": False,
+    }
+
+
+def test_compound_scene_supporting_catalog_requires_focused_tender_signal():
+    state = extract_tender_profile_draft(
+        project_id="p-compound-focused",
+        project_name="市政园林景观工程",
+        source_text="""
+        第三章 评审标准
+        施工组织设计（5分）
+        1.苗木成活率目标及补植养护措施应明确。
+        """,
+    )
+
+    catalog_ids = {
+        point["catalog_id"]
+        for item in state["attention_profile"]["items"]
+        for evidence in item["evidence"]
+        for point in evidence["expert_points"]
+    }
+    landscape_ids = {
+        entry["catalog_id"]
+        for entry in tender_criteria_service.combined_catalog_entries(("landscape",))
+    }
+
+    assert catalog_ids
+    assert catalog_ids & landscape_ids
+    assert len(catalog_ids) <= tender_criteria_service._V3_FOCUSED_MAX_EXPERT_POINTS
 
 
 @pytest.mark.parametrize(
@@ -318,6 +370,7 @@ def test_compound_scene_uses_catalog_id_deduplicated_union():
         ("滨湖办公楼维修改造工程", "", ("building_renovation",)),
         ("市政道路及园林景观工程", "", ("municipal", "landscape")),
         ("办公楼新建及室外市政工程", "", ("new_building", "municipal")),
+        ("市政道路及办公楼新建工程", "", ("municipal", "new_building")),
         ("市政道路工程", "正文提到办公楼新建", ("municipal",)),
         ("", "本项目为办公楼新建工程", ("new_building",)),
     ),
@@ -427,7 +480,50 @@ def test_existing_v2_profile_round_trips_without_id_or_current_drift():
         build_evidence_attention_profile(draft["profile"], strict_v2)
 
 
-def test_legacy_profile_without_context_migrates_to_v3():
+def test_existing_v3_profile_round_trips_without_catalog_drift():
+    draft = extract_tender_profile_draft(
+        project_id="p1",
+        project_name="滨湖办公楼新建工程",
+        source_text=SPLIT_TABLE_TENDER_TEXT,
+    )
+    v3 = copy.deepcopy(draft["attention_profile"])
+    scene_tags = tuple(v3["selection_context"]["scene_tags"])
+    summary = v3["selection_context"]["catalog_summary"]
+    v3["selection_context"] = {
+        "version": "expert-point-selector-v3",
+        "scene_tags": list(scene_tags),
+        "scene_labels": [
+            tender_criteria_service._PROJECT_SCENE_CANDIDATES[tag]["label"]
+            for tag in scene_tags
+        ],
+        "sizing_policy": "catalog-scope-v1",
+        "catalog_summary": {
+            "categories": [
+                {
+                    "tag": tag,
+                    "label": tender_criteria_service.PROJECT_TYPE_CATALOGS[tag]["label"],
+                    "catalog_total": tender_criteria_service.catalog_total(tag),
+                }
+                for tag in scene_tags
+            ],
+            "combined_catalog_total": len(
+                tender_criteria_service.combined_catalog_entries(scene_tags)
+            ),
+            "enabled_unique_count": summary["enabled_unique_count"],
+            "evidence_link_count": summary["evidence_link_count"],
+            "catalog_version": summary["catalog_version"],
+        },
+        "allocations": copy.deepcopy(v3["selection_context"]["allocations"]),
+    }
+
+    normalized = build_evidence_attention_profile(draft["profile"], v3)
+
+    assert normalized["selection_context"]["version"] == "expert-point-selector-v3"
+    assert normalized["selection_context"] == v3["selection_context"]
+    assert _point_signature(normalized) == _point_signature(v3)
+
+
+def test_legacy_profile_without_context_migrates_to_v4():
     draft = extract_tender_profile_draft(
         project_id="p1",
         project_name="滨湖办公楼新建工程",
@@ -438,7 +534,7 @@ def test_legacy_profile_without_context_migrates_to_v3():
 
     migrated = build_evidence_attention_profile(draft["profile"], legacy)
 
-    assert migrated["selection_context"]["version"] == "expert-point-selector-v3"
+    assert migrated["selection_context"]["version"] == "expert-point-selector-v4"
     assert all(
         point["catalog_id"] and point["catalog_code"]
         for item in migrated["items"]

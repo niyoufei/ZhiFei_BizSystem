@@ -175,6 +175,16 @@ _EXPERT_ATTENTION_TEMPLATES: dict[str, dict[str, object]] = {
 
 _EXPERT_SELECTOR_V2 = "expert-point-selector-v2"
 _EXPERT_SELECTOR_V3 = "expert-point-selector-v3"
+_EXPERT_SELECTOR_V4 = "expert-point-selector-v4"
+_SUBJECT_OPTIMIZATION_POLICY = {
+    "version": "secondary-subject-optimization-v1",
+    "mode": "versioned_offline",
+    "state": "baseline_locked",
+    "baseline": "primary-scene-catalog",
+    "evidence_source": "verified_real_cases",
+    "promotion_gate": "external_expert_benchmark",
+    "auto_apply": False,
+}
 _MIN_EXPERT_POINTS = 2
 _V2_MAX_EXPERT_POINTS = 8
 _V3_MAX_EXPERT_POINTS = 64
@@ -499,7 +509,26 @@ def _infer_scene_tags(project_name: str, source_context: str) -> tuple[str, ...]
             "mep_installation": any(signal in compact for signal in _MEP_SCENE_SIGNALS),
             "landscape": any(signal in compact for signal in _LANDSCAPE_SCENE_SIGNALS),
         }
-        return tuple(tag for tag in PROJECT_TYPE_CATALOGS if matched[tag])
+        signal_groups = {
+            "new_building": _BUILDING_SCENE_SIGNALS,
+            "building_renovation": _BUILDING_SCENE_SIGNALS,
+            "municipal": _MUNICIPAL_SCENE_SIGNALS,
+            "mep_installation": _MEP_SCENE_SIGNALS,
+            "landscape": _LANDSCAPE_SCENE_SIGNALS,
+        }
+
+        def first_anchor(tag: str) -> int:
+            positions = [
+                compact.find(signal)
+                for signal in signal_groups[tag]
+                if compact.find(signal) >= 0
+            ]
+            return min(positions) if positions else len(compact)
+
+        catalog_order = {tag: index for index, tag in enumerate(PROJECT_TYPE_CATALOGS)}
+        matched_tags = [tag for tag in PROJECT_TYPE_CATALOGS if matched[tag]]
+        matched_tags.sort(key=lambda tag: (first_anchor(tag), catalog_order[tag]))
+        return tuple(matched_tags)
 
     # Project names carry the user's intended engineering category.  Tender
     # body text is only a fallback because it routinely mentions adjacent
@@ -517,7 +546,11 @@ def _submitted_selection_context(
     if not isinstance(context, dict):
         raise TenderProfileValidationError("attention_profile.selection_context 必须是对象")
     version = str(context.get("version") or "")
-    if version not in {_EXPERT_SELECTOR_V2, _EXPERT_SELECTOR_V3}:
+    if version not in {
+        _EXPERT_SELECTOR_V2,
+        _EXPERT_SELECTOR_V3,
+        _EXPERT_SELECTOR_V4,
+    }:
         raise TenderProfileValidationError("attention_profile.selection_context.version 非法")
     raw_tags = context.get("scene_tags")
     if not isinstance(raw_tags, list):
@@ -525,7 +558,11 @@ def _submitted_selection_context(
     tag_set = {str(tag) for tag in raw_tags}
     if len(tag_set) != len(raw_tags) or not tag_set.issubset(PROJECT_TYPE_CATALOGS):
         raise TenderProfileValidationError("attention_profile.selection_context.scene_tags 非法")
-    canonical_tags = tuple(tag for tag in PROJECT_TYPE_CATALOGS if tag in tag_set)
+    canonical_tags = (
+        tuple(str(tag) for tag in raw_tags)
+        if version == _EXPERT_SELECTOR_V4
+        else tuple(tag for tag in PROJECT_TYPE_CATALOGS if tag in tag_set)
+    )
     return version, canonical_tags
 
 
@@ -810,6 +847,32 @@ def _select_expert_points_v3(
     return scope, themes, tuple(selected)
 
 
+def _select_expert_points_v4(
+    requirement: str,
+    *,
+    item_name: str,
+    tender_name: str,
+    scene_tags: Sequence[str],
+) -> tuple[str, tuple[str, ...], tuple[dict[str, object], ...]]:
+    """Keep umbrella requirements on one primary catalog.
+
+    Supporting scenes remain available for focused or composite tender clauses,
+    but they no longer contribute their complete catalogs to generic umbrella
+    requirements.  This preserves the original compact per-project baseline.
+    """
+    themes = _expert_template_keys(requirement)
+    scope = _requirement_scope(requirement, themes)
+    selection_scene_tags = (
+        tuple(scene_tags[:1]) if scope == "umbrella" else tuple(scene_tags)
+    )
+    return _select_expert_points_v3(
+        requirement,
+        item_name=item_name,
+        tender_name=tender_name,
+        scene_tags=selection_scene_tags,
+    )
+
+
 def _attention_setting(values: Sequence[float], *, current: float | None = None) -> dict[str, float]:
     minimum, default, maximum = (float(value) for value in values)
     return {
@@ -935,7 +998,7 @@ def build_evidence_attention_profile(
         submitted_selector_version, scene_tags = _submitted_selection_context(
             submitted_attention_profile
         )
-    selector_version = submitted_selector_version or _EXPERT_SELECTOR_V3
+    selector_version = submitted_selector_version or _EXPERT_SELECTOR_V4
     if submitted_selector_version is None:
         scene_tags = _infer_scene_tags(profile.tender_name, source_context)
 
@@ -977,8 +1040,15 @@ def build_evidence_attention_profile(
                     tender_name=profile.tender_name,
                     scene_tags=scene_tags,
                 )
-            else:
+            elif selector_version == _EXPERT_SELECTOR_V3:
                 scope, allocation_themes, selected_points = _select_expert_points_v3(
+                    str(requirement),
+                    item_name=item.name,
+                    tender_name=profile.tender_name,
+                    scene_tags=scene_tags,
+                )
+            else:
+                scope, allocation_themes, selected_points = _select_expert_points_v4(
                     str(requirement),
                     item_name=item.name,
                     tender_name=profile.tender_name,
@@ -1028,7 +1098,7 @@ def build_evidence_attention_profile(
                     point_row["catalog_id"] = catalog_id
                     point_row["catalog_code"] = catalog_code
                 point_rows.append(point_row)
-            if selector_version == _EXPERT_SELECTOR_V3:
+            if selector_version in {_EXPERT_SELECTOR_V3, _EXPERT_SELECTOR_V4}:
                 allocations.append(
                     {
                         "evidence_id": evidence_id,
@@ -1068,41 +1138,83 @@ def build_evidence_attention_profile(
             ],
         }
     else:
+        primary_scene_tag = scene_tags[0] if scene_tags else None
+        supporting_scene_tags = list(scene_tags[1:])
         combined_catalog_total = (
             len(combined_catalog_entries(scene_tags)) if scene_tags else 0
         )
+        baseline_catalog_total = (
+            catalog_total(primary_scene_tag) if primary_scene_tag is not None else 0
+        )
+        categories = [
+            {
+                "tag": tag,
+                "label": str(PROJECT_TYPE_CATALOGS[tag]["label"]),
+                "catalog_total": catalog_total(tag),
+                **(
+                    {"role": "primary" if tag == primary_scene_tag else "supporting"}
+                    if selector_version == _EXPERT_SELECTOR_V4
+                    else {}
+                ),
+            }
+            for tag in scene_tags
+        ]
         catalog_summary = {
-            "categories": [
-                {
-                    "tag": tag,
-                    "label": str(PROJECT_TYPE_CATALOGS[tag]["label"]),
-                    "catalog_total": catalog_total(tag),
-                }
-                for tag in scene_tags
-            ],
+            "categories": categories,
             "combined_catalog_total": combined_catalog_total,
             "enabled_unique_count": len(enabled_catalog_ids),
             "evidence_link_count": evidence_link_count,
             "catalog_version": CATALOG_VERSION,
         }
+        if selector_version == _EXPERT_SELECTOR_V4:
+            catalog_summary.update(
+                {
+                    "baseline_catalog_total": baseline_catalog_total,
+                    "primary_category": categories[0] if categories else None,
+                    "supporting_categories": categories[1:],
+                }
+            )
         selection_context = {
-            "version": _EXPERT_SELECTOR_V3,
+            "version": selector_version,
             "scene_tags": list(scene_tags),
             "scene_labels": [
                 str(_PROJECT_SCENE_CANDIDATES[tag]["label"]) for tag in scene_tags
             ],
-            "sizing_policy": "catalog-scope-v1",
+            "sizing_policy": (
+                "primary-scene-baseline-v1"
+                if selector_version == _EXPERT_SELECTOR_V4
+                else "catalog-scope-v1"
+            ),
             "catalog_summary": catalog_summary,
             "allocations": allocations,
         }
-        if submitted_selector_version == _EXPERT_SELECTOR_V3:
+        if selector_version == _EXPERT_SELECTOR_V4:
+            selection_context.update(
+                {
+                    "primary_scene_tag": primary_scene_tag,
+                    "supporting_scene_tags": supporting_scene_tags,
+                    "optimization_policy": copy.deepcopy(
+                        _SUBJECT_OPTIMIZATION_POLICY
+                    ),
+                }
+            )
+        if submitted_selector_version in {_EXPERT_SELECTOR_V3, _EXPERT_SELECTOR_V4}:
             assert isinstance(submitted_attention_profile, dict)
             submitted_context = submitted_attention_profile.get("selection_context")
             if not isinstance(submitted_context, dict):
                 raise TenderProfileValidationError(
                     "attention_profile.selection_context 必须是对象"
                 )
-            for field_name in ("sizing_policy", "catalog_summary", "allocations"):
+            fields = ["sizing_policy", "catalog_summary", "allocations"]
+            if selector_version == _EXPERT_SELECTOR_V4:
+                fields.extend(
+                    (
+                        "primary_scene_tag",
+                        "supporting_scene_tags",
+                        "optimization_policy",
+                    )
+                )
+            for field_name in fields:
                 if submitted_context.get(field_name) != selection_context[field_name]:
                     raise TenderProfileValidationError(
                         f"attention_profile.selection_context.{field_name} 与专家目录不一致"

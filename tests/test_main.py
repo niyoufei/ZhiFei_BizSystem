@@ -406,6 +406,7 @@ class TestIndexEndpoint:
         assert 'id="tenderCatalogSummary"' in page
         assert 'aria-labelledby="tenderCatalogSummaryTitle"' in page
         assert "selectionContext.catalog_summary" in page
+        assert "catalogSummary.baseline_catalog_total" in page
         assert "catalogSummary.combined_catalog_total" in page
         assert "catalogSummary.enabled_unique_count" in page
         assert "catalogSummary.evidence_link_count" in page
@@ -413,8 +414,11 @@ class TestIndexEndpoint:
         assert "工程类别" in page
         assert "类别科目库" in page
         assert "本项目启用" in page
-        assert "系统依据本项目招标条款和工程场景筛选适用科目" in page
+        assert "系统以核心工程类型建立紧凑科目基线" in page
+        assert "关联专业仅在招标条款明确命中时补充" in page
         assert "未启用科目不代表缺项、扣分或必须补齐" in page
+        assert 'id="tenderOptimizationPolicy"' in page
+        assert "动态优化：基线锁定，等待真实案例门禁" in page
         assert "categoryLabels.join(' + ')" in page
         assert "catalogEl.hidden = !hasCatalogSummary" in page
         assert "已形成 " in page and " 次证据—科目关联" in page
