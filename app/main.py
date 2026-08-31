@@ -13354,8 +13354,8 @@ def index(
             <div><dt>类别科目库</dt><dd id="tenderCatalogTotal">-</dd></div>
             <div><dt>本项目启用</dt><dd id="tenderCatalogEnabled">-</dd></div>
           </dl>
-          <p class="criteria-catalog-note">系统依据本项目招标条款和工程场景筛选适用科目；未启用科目不代表缺项、扣分或必须补齐。</p>
-          <p class="criteria-catalog-meta"><span id="tenderCatalogLinks" hidden></span><span id="tenderCatalogVersion" hidden></span></p>
+          <p class="criteria-catalog-note">系统以核心工程类型建立紧凑科目基线；关联专业仅在招标条款明确命中时补充。未启用科目不代表缺项、扣分或必须补齐。</p>
+          <p class="criteria-catalog-meta"><span id="tenderCatalogLinks" hidden></span><span id="tenderCatalogVersion" hidden></span><span id="tenderOptimizationPolicy" hidden></span></p>
         </section>
         <div id="tenderProfileItems"><p class="muted">上传招标资料后点击“从招标资料提取”。</p></div>
         <details style="margin-top:14px">
@@ -18488,7 +18488,9 @@ def index(
           const catalogSummary = selectionContext && selectionContext.catalog_summary && typeof selectionContext.catalog_summary === 'object' ? selectionContext.catalog_summary : null;
           const catalogCategories = catalogSummary && Array.isArray(catalogSummary.categories) ? catalogSummary.categories : [];
           const categoryLabels = catalogCategories.map((row) => String((row && row.label) || '').trim()).filter(Boolean);
-          const catalogTotal = catalogSummary ? Number(catalogSummary.combined_catalog_total) : NaN;
+          const baselineCatalogTotal = catalogSummary ? Number(catalogSummary.baseline_catalog_total) : NaN;
+          const combinedCatalogTotal = catalogSummary ? Number(catalogSummary.combined_catalog_total) : NaN;
+          const catalogTotal = Number.isFinite(baselineCatalogTotal) ? baselineCatalogTotal : combinedCatalogTotal;
           const enabledCount = catalogSummary ? Number(catalogSummary.enabled_unique_count) : NaN;
           const hasCatalogSummary = categoryLabels.length > 0 && Number.isFinite(catalogTotal) && catalogTotal >= 0 && Number.isFinite(enabledCount) && enabledCount >= 0;
           if (contextEl) {
@@ -18503,8 +18505,17 @@ def index(
               const enabledEl = document.getElementById('tenderCatalogEnabled');
               const linksEl = document.getElementById('tenderCatalogLinks');
               const versionEl = document.getElementById('tenderCatalogVersion');
-              if (categoriesEl) categoriesEl.textContent = categoryLabels.join(' + ');
-              if (totalEl) totalEl.textContent = String(catalogTotal) + ' 项可选科目';
+              const optimizationEl = document.getElementById('tenderOptimizationPolicy');
+              const primaryCategory = catalogSummary.primary_category && typeof catalogSummary.primary_category === 'object' ? catalogSummary.primary_category : null;
+              const primaryLabel = primaryCategory ? String(primaryCategory.label || '').trim() : '';
+              const supportingCategories = Array.isArray(catalogSummary.supporting_categories) ? catalogSummary.supporting_categories : [];
+              const supportingLabels = supportingCategories.map((row) => String((row && row.label) || '').trim()).filter(Boolean);
+              if (categoriesEl) {
+                categoriesEl.textContent = primaryLabel
+                  ? '核心：' + primaryLabel + (supportingLabels.length ? '；关联：' + supportingLabels.join(' + ') : '')
+                  : categoryLabels.join(' + ');
+              }
+              if (totalEl) totalEl.textContent = String(catalogTotal) + ' 项基线科目';
               if (enabledEl) enabledEl.textContent = String(enabledCount) + ' 项';
               const linkCount = Number(catalogSummary.evidence_link_count);
               if (linksEl) {
@@ -18515,6 +18526,11 @@ def index(
               if (versionEl) {
                 versionEl.hidden = !catalogVersion;
                 versionEl.textContent = catalogVersion ? '科目库版本：' + catalogVersion : '';
+              }
+              const optimizationPolicy = selectionContext.optimization_policy && typeof selectionContext.optimization_policy === 'object' ? selectionContext.optimization_policy : null;
+              if (optimizationEl) {
+                optimizationEl.hidden = !optimizationPolicy;
+                optimizationEl.textContent = optimizationPolicy ? '动态优化：基线锁定，等待真实案例门禁' : '';
               }
             }
           }
